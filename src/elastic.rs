@@ -6,22 +6,20 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
 
-use crate::common::{
-    DefaultHashBuilder, TryReserveError,
-    config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
-    control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
-    entry::{EntryView, OccupiedError as CommonOccupiedError},
-    iter::{
-        IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
-        Values as CommonValues,
-    },
-    layout::{Entry as SlotEntry, GROUP_SIZE, RawTable},
-    math::{
-        capacity_for, ceil_three_quarters, floor_half_reserve_slots, level_salt, max_insertions,
-        round_up_to_pow2_groups, sanitize_reserve_fraction, usize_to_f64,
-    },
-    simd::ProbeOps,
+use crate::common::config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY};
+use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps};
+use crate::common::entry::{EntryView, OccupiedError as CommonOccupiedError};
+use crate::common::iter::{
+    IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
+    Values as CommonValues,
 };
+use crate::common::layout::{Entry as SlotEntry, GROUP_SIZE, RawTable};
+use crate::common::math::{
+    capacity_for, ceil_three_quarters, floor_half_reserve_slots, level_salt, max_insertions,
+    round_up_to_pow2_groups, sanitize_reserve_fraction, usize_to_f64,
+};
+use crate::common::simd::ProbeOps;
+use crate::common::{DefaultHashBuilder, TryReserveError};
 
 const DEFAULT_PROBE_SCALE: f64 = 16.0;
 

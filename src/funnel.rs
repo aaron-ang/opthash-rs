@@ -7,23 +7,21 @@ use std::mem;
 use std::ops::Range;
 use std::ptr;
 
-use crate::common::{
-    DefaultHashBuilder, TryReserveError,
-    config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
-    control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
-    entry::{EntryView, OccupiedError as CommonOccupiedError},
-    iter::{
-        IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
-        Values as CommonValues,
-    },
-    layout::{Entry as SlotEntry, GROUP_SIZE, RawTable, try_zeroed_boxed_slice},
-    math::{
-        capacity_for, ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize, level_salt,
-        max_insertions, round_to_usize, round_up_to_group, round_up_to_pow2_groups,
-        sanitize_reserve_fraction, usize_to_f64,
-    },
-    simd::{ProbeOps, prefetch_read},
+use crate::common::config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY};
+use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps};
+use crate::common::entry::{EntryView, OccupiedError as CommonOccupiedError};
+use crate::common::iter::{
+    IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
+    Values as CommonValues,
 };
+use crate::common::layout::{Entry as SlotEntry, GROUP_SIZE, RawTable, try_zeroed_boxed_slice};
+use crate::common::math::{
+    capacity_for, ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize, level_salt,
+    max_insertions, round_to_usize, round_up_to_group, round_up_to_pow2_groups,
+    sanitize_reserve_fraction, usize_to_f64,
+};
+use crate::common::simd::{ProbeOps, prefetch_read};
+use crate::common::{DefaultHashBuilder, TryReserveError};
 
 pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
 
