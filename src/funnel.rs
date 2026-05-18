@@ -2259,6 +2259,8 @@ impl<'a, K, V> Iterator for FunnelIter<'a, K, V> {
     }
 }
 
+impl<K, V> std::iter::FusedIterator for FunnelIter<'_, K, V> {}
+
 impl<'a, K, V> IntoIterator for &'a FunnelHashMap<K, V>
 where
     K: Eq + Hash,
@@ -2740,6 +2742,8 @@ impl<K, V> Iterator for FunnelIntoIter<K, V> {
         }
     }
 }
+
+impl<K, V> std::iter::FusedIterator for FunnelIntoIter<K, V> {}
 
 impl<K, V> Drop for FunnelIntoIter<K, V> {
     fn drop(&mut self) {

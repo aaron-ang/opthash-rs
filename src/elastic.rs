@@ -1162,6 +1162,8 @@ impl<'a, K, V> Iterator for ElasticIter<'a, K, V> {
     }
 }
 
+impl<K, V> std::iter::FusedIterator for ElasticIter<'_, K, V> {}
+
 impl<'a, K, V> IntoIterator for &'a ElasticHashMap<K, V>
 where
     K: Eq + Hash,
@@ -1300,6 +1302,8 @@ impl<K, V> Iterator for ElasticIntoIter<K, V> {
         None
     }
 }
+
+impl<K, V> std::iter::FusedIterator for ElasticIntoIter<K, V> {}
 
 impl<K, V> Drop for ElasticIntoIter<K, V> {
     fn drop(&mut self) {
