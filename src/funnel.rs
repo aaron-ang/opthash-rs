@@ -1,5 +1,11 @@
 use std::borrow::Borrow;
+use std::fmt;
 use std::hash::{BuildHasher, Hash};
+use std::iter::FusedIterator;
+use std::marker::PhantomData;
+use std::mem;
+use std::ops::Range;
+use std::ptr;
 
 use crate::common::{
     DefaultHashBuilder, TryReserveError,
@@ -156,7 +162,7 @@ impl<K, V> BucketLevel<K, V> {
 
     /// Slot index range covering all entries in `bucket_idx`.
     #[inline]
-    fn bucket_range(&self, bucket_idx: usize) -> std::ops::Range<usize> {
+    fn bucket_range(&self, bucket_idx: usize) -> Range<usize> {
         let start = bucket_idx * self.bucket_size;
         start..start + self.bucket_size
     }
@@ -294,7 +300,7 @@ impl<K, V> SpecialFallback<K, V> {
     }
 
     #[inline]
-    fn bucket_range(&self, bucket_idx: usize) -> std::ops::Range<usize> {
+    fn bucket_range(&self, bucket_idx: usize) -> Range<usize> {
         let start = bucket_idx * self.bucket_size;
         let end = (start + self.bucket_size).min(self.table.capacity());
         start..end
@@ -396,8 +402,8 @@ pub struct FunnelHashMap<K, V> {
     hash_builder: DefaultHashBuilder,
 }
 
-impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for FunnelHashMap<K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for FunnelHashMap<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunnelHashMap")
             .field("len", &self.len)
             .field("capacity", &self.capacity)
@@ -905,8 +911,8 @@ where
     pub fn iter_mut(&mut self) -> FunnelIterMut<'_, K, V> {
         let levels_len = self.levels.len();
         let levels = self.levels.as_mut_ptr();
-        let primary = std::ptr::from_mut(&mut self.special.primary);
-        let fallback = std::ptr::from_mut(&mut self.special.fallback);
+        let primary = ptr::from_mut(&mut self.special.primary);
+        let fallback = ptr::from_mut(&mut self.special.fallback);
         FunnelIterMut {
             levels,
             levels_len,
@@ -915,7 +921,7 @@ where
             phase: FunnelIterPhase::Levels,
             level_idx: 0,
             slot_idx: 0,
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -1236,7 +1242,7 @@ where
         self.len = 0;
         self.max_populated_level = 0;
 
-        let hash_builder = std::mem::take(&mut self.hash_builder);
+        let hash_builder = mem::take(&mut self.hash_builder);
         let mut new_map = Self::with_options_and_hasher(
             FunnelOptions {
                 capacity: new_capacity,
@@ -1359,15 +1365,15 @@ where
                 slot_idx,
             } => {
                 let entry = unsafe { self.levels[level_idx].table.get_mut(slot_idx) };
-                std::mem::replace(&mut entry.value, value)
+                mem::replace(&mut entry.value, value)
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
                 let entry = unsafe { self.special.primary.table.get_mut(slot_idx) };
-                std::mem::replace(&mut entry.value, value)
+                mem::replace(&mut entry.value, value)
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let entry = unsafe { self.special.fallback.table.get_mut(slot_idx) };
-                std::mem::replace(&mut entry.value, value)
+                mem::replace(&mut entry.value, value)
             }
         }
     }
@@ -2195,8 +2201,8 @@ pub struct FunnelIter<'a, K, V> {
     slot_idx: usize,
 }
 
-impl<K, V> std::fmt::Debug for FunnelIter<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K, V> fmt::Debug for FunnelIter<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunnelIter")
             .field("phase", &self.phase)
             .field("level_idx", &self.level_idx)
@@ -2259,7 +2265,7 @@ impl<'a, K, V> Iterator for FunnelIter<'a, K, V> {
     }
 }
 
-impl<K, V> std::iter::FusedIterator for FunnelIter<'_, K, V> {}
+impl<K, V> FusedIterator for FunnelIter<'_, K, V> {}
 
 impl<'a, K, V> IntoIterator for &'a FunnelHashMap<K, V>
 where
@@ -2293,8 +2299,8 @@ pub struct Drain<'a, K, V> {
     slot_idx: usize,
 }
 
-impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Drain<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Drain<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Drain").finish_non_exhaustive()
     }
 }
@@ -2370,7 +2376,7 @@ impl<K, V> Iterator for Drain<'_, K, V> {
 }
 
 impl<K, V> ExactSizeIterator for Drain<'_, K, V> {}
-impl<K, V> std::iter::FusedIterator for Drain<'_, K, V> {}
+impl<K, V> FusedIterator for Drain<'_, K, V> {}
 
 impl<K, V> Drop for Drain<'_, K, V> {
     fn drop(&mut self) {
@@ -2409,12 +2415,12 @@ where
     slot_idx: usize,
 }
 
-impl<K, V, F> std::fmt::Debug for ExtractIf<'_, K, V, F>
+impl<K, V, F> fmt::Debug for ExtractIf<'_, K, V, F>
 where
     K: Eq + Hash,
     F: FnMut(&K, &mut V) -> bool,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExtractIf").finish_non_exhaustive()
     }
 }
@@ -2536,7 +2542,7 @@ pub struct FunnelIterMut<'a, K, V> {
     phase: FunnelIterPhase,
     level_idx: usize,
     slot_idx: usize,
-    _marker: std::marker::PhantomData<&'a mut FunnelHashMap<K, V>>,
+    _marker: PhantomData<&'a mut FunnelHashMap<K, V>>,
 }
 
 // SAFETY: `FunnelIterMut` acts as an exclusive borrow of the underlying
@@ -2566,9 +2572,9 @@ impl<'a, K, V> Iterator for FunnelIterMut<'a, K, V> {
                                 // `Entry<K, V>`. We never revisit this slot,
                                 // so the returned borrows stay disjoint.
                                 let entry = unsafe { level.table.get_mut(idx) };
-                                let key: &'a K = unsafe { &*std::ptr::from_ref(&entry.key) };
+                                let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                                 let val: &'a mut V =
-                                    unsafe { &mut *std::ptr::from_mut(&mut entry.value) };
+                                    unsafe { &mut *ptr::from_mut(&mut entry.value) };
                                 return Some((key, val));
                             }
                         }
@@ -2591,9 +2597,8 @@ impl<'a, K, V> Iterator for FunnelIterMut<'a, K, V> {
                             // SAFETY: see above; occupied ⇒ valid entry,
                             // distinct slot each call.
                             let entry = unsafe { primary.table.get_mut(idx) };
-                            let key: &'a K = unsafe { &*std::ptr::from_ref(&entry.key) };
-                            let val: &'a mut V =
-                                unsafe { &mut *std::ptr::from_mut(&mut entry.value) };
+                            let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
+                            let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
                             return Some((key, val));
                         }
                     }
@@ -2610,9 +2615,8 @@ impl<'a, K, V> Iterator for FunnelIterMut<'a, K, V> {
                         if fallback.table.control_at(idx).is_occupied() {
                             // SAFETY: occupied ⇒ valid entry, distinct slot.
                             let entry = unsafe { fallback.table.get_mut(idx) };
-                            let key: &'a K = unsafe { &*std::ptr::from_ref(&entry.key) };
-                            let val: &'a mut V =
-                                unsafe { &mut *std::ptr::from_mut(&mut entry.value) };
+                            let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
+                            let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
                             return Some((key, val));
                         }
                     }
@@ -2624,8 +2628,8 @@ impl<'a, K, V> Iterator for FunnelIterMut<'a, K, V> {
     }
 }
 
-impl<K, V> std::fmt::Debug for FunnelIterMut<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K, V> fmt::Debug for FunnelIterMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunnelIterMut")
             .field("level_idx", &self.level_idx)
             .field("slot_idx", &self.slot_idx)
@@ -2658,8 +2662,8 @@ impl<'a, K, V> Iterator for FunnelValuesMut<'a, K, V> {
     }
 }
 
-impl<K, V> std::fmt::Debug for FunnelValuesMut<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K, V> fmt::Debug for FunnelValuesMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunnelValuesMut")
             .field("level_idx", &self.inner.level_idx)
             .field("slot_idx", &self.inner.slot_idx)
@@ -2743,7 +2747,7 @@ impl<K, V> Iterator for FunnelIntoIter<K, V> {
     }
 }
 
-impl<K, V> std::iter::FusedIterator for FunnelIntoIter<K, V> {}
+impl<K, V> FusedIterator for FunnelIntoIter<K, V> {}
 
 impl<K, V> Drop for FunnelIntoIter<K, V> {
     fn drop(&mut self) {
@@ -2754,8 +2758,8 @@ impl<K, V> Drop for FunnelIntoIter<K, V> {
     }
 }
 
-impl<K, V> std::fmt::Debug for FunnelIntoIter<K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K, V> fmt::Debug for FunnelIntoIter<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunnelIntoIter")
             .field("level_idx", &self.level_idx)
             .field("slot_idx", &self.slot_idx)

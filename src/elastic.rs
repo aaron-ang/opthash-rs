@@ -1,5 +1,10 @@
 use std::borrow::Borrow;
+use std::fmt;
 use std::hash::{BuildHasher, Hash};
+use std::iter::FusedIterator;
+use std::marker::PhantomData;
+use std::mem;
+use std::ptr;
 
 use crate::common::{
     DefaultHashBuilder, TryReserveError,
@@ -209,8 +214,8 @@ pub struct ElasticHashMap<K, V> {
     hash_builder: DefaultHashBuilder,
 }
 
-impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for ElasticHashMap<K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for ElasticHashMap<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ElasticHashMap")
             .field("len", &self.len)
             .field("capacity", &self.capacity)
@@ -399,7 +404,7 @@ where
             self.find_slot_indices_with_hash(&key, key_hash, key_fingerprint)
         {
             let entry = unsafe { self.levels[level_idx].table.get_mut(slot_idx) };
-            let old = std::mem::replace(&mut entry.value, value);
+            let old = mem::replace(&mut entry.value, value);
             return Some(old);
         }
 
@@ -627,7 +632,7 @@ where
             levels_len,
             level_idx: 0,
             slot_idx: 0,
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -833,7 +838,7 @@ where
     /// Replaces the entry's value and returns the old one.
     pub fn insert(&mut self, value: V) -> V {
         let entry = unsafe { self.map.levels[self.level_idx].table.get_mut(self.slot_idx) };
-        std::mem::replace(&mut entry.value, value)
+        mem::replace(&mut entry.value, value)
     }
 
     /// Removes the entry and returns its value.
@@ -994,8 +999,8 @@ pub struct Drain<'a, K, V> {
     slot_idx: usize,
 }
 
-impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Drain<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Drain<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Drain").finish_non_exhaustive()
     }
 }
@@ -1030,7 +1035,7 @@ impl<K, V> Iterator for Drain<'_, K, V> {
 }
 
 impl<K, V> ExactSizeIterator for Drain<'_, K, V> {}
-impl<K, V> std::iter::FusedIterator for Drain<'_, K, V> {}
+impl<K, V> FusedIterator for Drain<'_, K, V> {}
 
 impl<K, V> Drop for Drain<'_, K, V> {
     fn drop(&mut self) {
@@ -1063,12 +1068,12 @@ where
     slot_idx: usize,
 }
 
-impl<K, V, F> std::fmt::Debug for ExtractIf<'_, K, V, F>
+impl<K, V, F> fmt::Debug for ExtractIf<'_, K, V, F>
 where
     K: Eq + Hash,
     F: FnMut(&K, &mut V) -> bool,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExtractIf").finish_non_exhaustive()
     }
 }
@@ -1132,8 +1137,8 @@ pub struct ElasticIter<'a, K, V> {
     slot_idx: usize,
 }
 
-impl<K, V> std::fmt::Debug for ElasticIter<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K, V> fmt::Debug for ElasticIter<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ElasticIter")
             .field("level_idx", &self.level_idx)
             .field("slot_idx", &self.slot_idx)
@@ -1162,7 +1167,7 @@ impl<'a, K, V> Iterator for ElasticIter<'a, K, V> {
     }
 }
 
-impl<K, V> std::iter::FusedIterator for ElasticIter<'_, K, V> {}
+impl<K, V> FusedIterator for ElasticIter<'_, K, V> {}
 
 impl<'a, K, V> IntoIterator for &'a ElasticHashMap<K, V>
 where
@@ -1192,7 +1197,7 @@ pub struct ElasticIterMut<'a, K, V> {
     levels_len: usize,
     level_idx: usize,
     slot_idx: usize,
-    _marker: std::marker::PhantomData<&'a mut ElasticHashMap<K, V>>,
+    _marker: PhantomData<&'a mut ElasticHashMap<K, V>>,
 }
 
 // SAFETY: behaves as `&mut [Level<K, V>]` for its lifetime.
@@ -1216,8 +1221,8 @@ impl<'a, K, V> Iterator for ElasticIterMut<'a, K, V> {
                     // through raw ptr so returned refs outlive the per-iter
                     // `level` reborrow; never revisit the slot ⇒ disjoint.
                     let entry = unsafe { level.table.get_mut(idx) };
-                    let key: &'a K = unsafe { &*std::ptr::from_ref(&entry.key) };
-                    let val: &'a mut V = unsafe { &mut *std::ptr::from_mut(&mut entry.value) };
+                    let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
+                    let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
                     return Some((key, val));
                 }
             }
@@ -1228,8 +1233,8 @@ impl<'a, K, V> Iterator for ElasticIterMut<'a, K, V> {
     }
 }
 
-impl<K, V> std::fmt::Debug for ElasticIterMut<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K, V> fmt::Debug for ElasticIterMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ElasticIterMut")
             .field("level_idx", &self.level_idx)
             .field("slot_idx", &self.slot_idx)
@@ -1262,8 +1267,8 @@ impl<'a, K, V> Iterator for ElasticValuesMut<'a, K, V> {
     }
 }
 
-impl<K, V> std::fmt::Debug for ElasticValuesMut<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K, V> fmt::Debug for ElasticValuesMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ElasticValuesMut")
             .field("level_idx", &self.inner.level_idx)
             .field("slot_idx", &self.inner.slot_idx)
@@ -1303,7 +1308,7 @@ impl<K, V> Iterator for ElasticIntoIter<K, V> {
     }
 }
 
-impl<K, V> std::iter::FusedIterator for ElasticIntoIter<K, V> {}
+impl<K, V> FusedIterator for ElasticIntoIter<K, V> {}
 
 impl<K, V> Drop for ElasticIntoIter<K, V> {
     fn drop(&mut self) {
@@ -1313,8 +1318,8 @@ impl<K, V> Drop for ElasticIntoIter<K, V> {
     }
 }
 
-impl<K, V> std::fmt::Debug for ElasticIntoIter<K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<K, V> fmt::Debug for ElasticIntoIter<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ElasticIntoIter")
             .field("level_idx", &self.level_idx)
             .field("slot_idx", &self.slot_idx)
@@ -1368,7 +1373,7 @@ where
         self.len = 0;
         self.max_populated_level = 0;
 
-        let hash_builder = std::mem::take(&mut self.hash_builder);
+        let hash_builder = mem::take(&mut self.hash_builder);
         let mut new_map = Self::with_options_and_hasher(
             ElasticOptions {
                 capacity: new_capacity,

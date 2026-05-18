@@ -1,3 +1,4 @@
+use std::fmt;
 use std::iter::FusedIterator;
 
 /// Projects the `K` from a borrowing `(&K, &V)` iterator.
@@ -44,8 +45,8 @@ where
 
 impl<I, K, V> FusedIterator for Keys<I> where I: FusedIterator<Item = (K, V)> {}
 
-impl<I> std::fmt::Debug for Keys<I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<I> fmt::Debug for Keys<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Keys").finish_non_exhaustive()
     }
 }
@@ -94,8 +95,8 @@ where
 
 impl<I, K, V> FusedIterator for Values<I> where I: FusedIterator<Item = (K, V)> {}
 
-impl<I> std::fmt::Debug for Values<I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<I> fmt::Debug for Values<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Values").finish_non_exhaustive()
     }
 }
@@ -136,8 +137,8 @@ where
 
 impl<I, K, V> FusedIterator for IntoKeys<I> where I: FusedIterator<Item = (K, V)> {}
 
-impl<I> std::fmt::Debug for IntoKeys<I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<I> fmt::Debug for IntoKeys<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IntoKeys").finish_non_exhaustive()
     }
 }
@@ -178,8 +179,8 @@ where
 
 impl<I, K, V> FusedIterator for IntoValues<I> where I: FusedIterator<Item = (K, V)> {}
 
-impl<I> std::fmt::Debug for IntoValues<I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<I> fmt::Debug for IntoValues<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IntoValues").finish_non_exhaustive()
     }
 }

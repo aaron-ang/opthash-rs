@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fmt;
 
 /// Read-only view into an occupied entry. Implemented by each map's
@@ -52,7 +53,7 @@ where
     }
 }
 
-impl<E, V> std::error::Error for OccupiedError<E, V>
+impl<E, V> Error for OccupiedError<E, V>
 where
     E: EntryView<Value = V>,
     E::Key: fmt::Debug,
