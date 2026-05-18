@@ -5,7 +5,7 @@ mod funnel;
 #[cfg(feature = "python")]
 mod python;
 
-pub use common::DefaultHashBuilder;
+pub use common::{DefaultHashBuilder, TryReserveError};
 pub use elastic::{
     Drain as ElasticDrain, ElasticHashMap, ElasticIntoIter, ElasticIntoKeys, ElasticIntoValues,
     ElasticIter, ElasticIterMut, ElasticOptions, ElasticValuesMut, Entry as ElasticEntry,
