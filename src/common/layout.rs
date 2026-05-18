@@ -2,10 +2,21 @@ use std::alloc::{self, Layout};
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 
+use super::TryReserveError;
 use super::bitmask::BitMask;
+use super::math::round_up_to_group;
 use super::simd::{eq_mask_16, free_mask_16};
 
-use super::math::round_up_to_group;
+/// Fallibly allocates a zero-filled `Box<[T]>`.
+pub(crate) fn try_zeroed_boxed_slice<T: Default + Clone>(
+    len: usize,
+) -> Result<Box<[T]>, TryReserveError> {
+    let mut buf: Vec<T> = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|_| TryReserveError::AllocError)?;
+    buf.resize(len, T::default());
+    Ok(buf.into_boxed_slice())
+}
 
 pub(crate) const GROUP_SIZE: usize = 16;
 

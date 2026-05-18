@@ -1,19 +1,22 @@
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
 
-use crate::common::DefaultHashBuilder;
-use crate::common::TryReserveError;
-use crate::common::simd::{ProbeOps, prefetch_read};
-
 use crate::common::{
+    DefaultHashBuilder, TryReserveError,
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
-    layout::{Entry as SlotEntry, GROUP_SIZE, RawTable},
+    entry::{EntryView, OccupiedError as CommonOccupiedError},
+    iter::{
+        IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
+        Values as CommonValues,
+    },
+    layout::{Entry as SlotEntry, GROUP_SIZE, RawTable, try_zeroed_boxed_slice},
     math::{
         capacity_for, ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize, level_salt,
         max_insertions, round_to_usize, round_up_to_group, round_up_to_pow2_groups,
         sanitize_reserve_fraction, usize_to_f64,
     },
+    simd::{ProbeOps, prefetch_read},
 };
 
 pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
@@ -871,13 +874,13 @@ where
     /// Borrowing iterator over `&K`. Order matches [`Self::iter`].
     #[must_use]
     pub fn keys(&self) -> Keys<'_, K, V> {
-        Keys { inner: self.iter() }
+        Keys::new(self.iter())
     }
 
     /// Borrowing iterator over `&V`. Order matches [`Self::iter`].
     #[must_use]
     pub fn values(&self) -> Values<'_, K, V> {
-        Values { inner: self.iter() }
+        Values::new(self.iter())
     }
 
     /// Reference to the map's [`BuildHasher`].
@@ -926,17 +929,13 @@ where
     /// Consuming iterator yielding owned keys. Mirrors `HashMap::into_keys`.
     #[must_use]
     pub fn into_keys(self) -> FunnelIntoKeys<K, V> {
-        FunnelIntoKeys {
-            inner: self.into_iter(),
-        }
+        FunnelIntoKeys::new(self.into_iter())
     }
 
     /// Consuming iterator yielding owned values. Mirrors `HashMap::into_values`.
     #[must_use]
     pub fn into_values(self) -> FunnelIntoValues<K, V> {
-        FunnelIntoValues {
-            inner: self.into_iter(),
-        }
+        FunnelIntoValues::new(self.into_iter())
     }
 
     /// Returns an [`Entry`] for in-place manipulation of `key`'s slot.
@@ -2157,47 +2156,20 @@ where
 }
 
 /// Error returned by [`FunnelHashMap::try_insert`] on key collision.
-pub struct OccupiedError<'a, K, V> {
-    /// The existing entry.
-    pub entry: OccupiedEntry<'a, K, V>,
-    /// The value that was rejected.
-    pub value: V,
-}
+pub type OccupiedError<'a, K, V> = CommonOccupiedError<OccupiedEntry<'a, K, V>, V>;
 
-impl<K, V> std::fmt::Debug for OccupiedError<'_, K, V>
+impl<K, V> EntryView for OccupiedEntry<'_, K, V>
 where
-    K: Eq + Hash + std::fmt::Debug,
-    V: std::fmt::Debug,
+    K: Eq + Hash,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OccupiedError")
-            .field("key", self.entry.key())
-            .field("value", &self.value)
-            .finish()
+    type Key = K;
+    type Value = V;
+    fn view_key(&self) -> &K {
+        self.key()
     }
-}
-
-impl<K, V> std::fmt::Display for OccupiedError<'_, K, V>
-where
-    K: Eq + Hash + std::fmt::Debug,
-    V: std::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "tried to insert {:?}, but key {:?} was already present with {:?}",
-            self.value,
-            self.entry.key(),
-            self.entry.get(),
-        )
+    fn view_value(&self) -> &V {
+        self.get()
     }
-}
-
-impl<K, V> std::error::Error for OccupiedError<'_, K, V>
-where
-    K: Eq + Hash + std::fmt::Debug,
-    V: std::fmt::Debug,
-{
 }
 
 /// Three-phase iterator state: walk all bucket levels, then the special
@@ -2544,44 +2516,9 @@ where
 }
 
 /// `&K` iterator returned by [`FunnelHashMap::keys`].
-#[derive(Clone)]
-pub struct Keys<'a, K, V> {
-    inner: FunnelIter<'a, K, V>,
-}
-
-impl<'a, K, V> Iterator for Keys<'a, K, V> {
-    type Item = &'a K;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, _)| k)
-    }
-}
-
-impl<K, V> std::fmt::Debug for Keys<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Keys").finish_non_exhaustive()
-    }
-}
-
+pub type Keys<'a, K, V> = CommonKeys<FunnelIter<'a, K, V>>;
 /// `&V` iterator returned by [`FunnelHashMap::values`].
-#[derive(Clone)]
-pub struct Values<'a, K, V> {
-    inner: FunnelIter<'a, K, V>,
-}
-
-impl<'a, K, V> Iterator for Values<'a, K, V> {
-    type Item = &'a V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
-    }
-}
-
-impl<K, V> std::fmt::Debug for Values<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Values").finish_non_exhaustive()
-    }
-}
+pub type Values<'a, K, V> = CommonValues<FunnelIter<'a, K, V>>;
 
 /// `(&K, &mut V)` iterator. Visits bucket levels → special primary →
 /// special fallback. Skips FREE / TOMBSTONE.
@@ -2840,57 +2777,9 @@ where
 }
 
 /// Owned `K` iterator returned by [`FunnelHashMap::into_keys`].
-pub struct FunnelIntoKeys<K, V> {
-    inner: FunnelIntoIter<K, V>,
-}
-
-impl<K, V> Iterator for FunnelIntoKeys<K, V> {
-    type Item = K;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, _)| k)
-    }
-}
-
-impl<K, V> std::fmt::Debug for FunnelIntoKeys<K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FunnelIntoKeys")
-            .field("level_idx", &self.inner.level_idx)
-            .field("slot_idx", &self.inner.slot_idx)
-            .finish_non_exhaustive()
-    }
-}
-
+pub type FunnelIntoKeys<K, V> = CommonIntoKeys<FunnelIntoIter<K, V>>;
 /// Owned `V` iterator returned by [`FunnelHashMap::into_values`].
-pub struct FunnelIntoValues<K, V> {
-    inner: FunnelIntoIter<K, V>,
-}
-
-impl<K, V> Iterator for FunnelIntoValues<K, V> {
-    type Item = V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
-    }
-}
-
-impl<K, V> std::fmt::Debug for FunnelIntoValues<K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FunnelIntoValues")
-            .field("level_idx", &self.inner.level_idx)
-            .field("slot_idx", &self.inner.slot_idx)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Fallibly allocates a zero-filled `Box<[T]>`.
-fn try_zeroed_boxed_slice<T: Default + Clone>(len: usize) -> Result<Box<[T]>, TryReserveError> {
-    let mut buf: Vec<T> = Vec::new();
-    buf.try_reserve_exact(len)
-        .map_err(|_| TryReserveError::AllocError)?;
-    buf.resize(len, T::default());
-    Ok(buf.into_boxed_slice())
-}
+pub type FunnelIntoValues<K, V> = CommonIntoValues<FunnelIntoIter<K, V>>;
 
 /// Number of bucket levels for a given reserve fraction. Tighter reserve →
 /// more levels (more probing budget per insert).

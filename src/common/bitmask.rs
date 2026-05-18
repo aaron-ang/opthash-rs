@@ -1,13 +1,3 @@
-//! Architecture-abstracted bitmask over a control group.
-//!
-//! On `x86_64`, the mask is a `u16` where bit `i` indicates slot `i`.
-//! On aarch64, the mask is a `u64` where nibble `i` (4 bits) indicates slot `i`
-//! — this is the native representation produced by `vshrn_n_u16`, which is
-//! cheaper than synthesizing a 1-bit-per-byte movemask via `vaddv_u8`.
-//!
-//! Callers use `BitMask` via its iterator and helper methods; the underlying
-//! representation is hidden.
-
 #[cfg(target_arch = "aarch64")]
 pub(crate) type BitMaskWord = u64;
 #[cfg(not(target_arch = "aarch64"))]
@@ -18,6 +8,8 @@ pub(crate) const BITMASK_STRIDE: u32 = 4;
 #[cfg(not(target_arch = "aarch64"))]
 pub(crate) const BITMASK_STRIDE: u32 = 1;
 
+/// Per-slot match mask over a control group. `u16` on `x86_64` (1 bit/slot),
+/// `u64` on `aarch64` (4 bits/slot — native `vshrn_n_u16` output).
 pub(crate) struct BitMask(pub(crate) BitMaskWord);
 
 impl BitMask {

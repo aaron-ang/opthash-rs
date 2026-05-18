@@ -1,18 +1,21 @@
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
 
-use crate::common::DefaultHashBuilder;
-use crate::common::TryReserveError;
-use crate::common::simd::ProbeOps;
-
 use crate::common::{
+    DefaultHashBuilder, TryReserveError,
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
+    entry::{EntryView, OccupiedError as CommonOccupiedError},
+    iter::{
+        IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
+        Values as CommonValues,
+    },
     layout::{Entry as SlotEntry, GROUP_SIZE, RawTable},
     math::{
         capacity_for, ceil_three_quarters, floor_half_reserve_slots, level_salt, max_insertions,
         round_up_to_pow2_groups, sanitize_reserve_fraction, usize_to_f64,
     },
+    simd::ProbeOps,
 };
 
 const DEFAULT_PROBE_SCALE: f64 = 16.0;
@@ -600,13 +603,13 @@ where
     /// `&K` iterator. Order matches [`Self::iter`].
     #[must_use]
     pub fn keys(&self) -> Keys<'_, K, V> {
-        Keys { inner: self.iter() }
+        Keys::new(self.iter())
     }
 
     /// `&V` iterator. Order matches [`Self::iter`].
     #[must_use]
     pub fn values(&self) -> Values<'_, K, V> {
-        Values { inner: self.iter() }
+        Values::new(self.iter())
     }
 
     /// Reference to the map's [`BuildHasher`].
@@ -638,17 +641,13 @@ where
     /// Consuming iterator over owned keys. Mirrors `HashMap::into_keys`.
     #[must_use]
     pub fn into_keys(self) -> ElasticIntoKeys<K, V> {
-        ElasticIntoKeys {
-            inner: self.into_iter(),
-        }
+        ElasticIntoKeys::new(self.into_iter())
     }
 
     /// Consuming iterator over owned values. Mirrors `HashMap::into_values`.
     #[must_use]
     pub fn into_values(self) -> ElasticIntoValues<K, V> {
-        ElasticIntoValues {
-            inner: self.into_iter(),
-        }
+        ElasticIntoValues::new(self.into_iter())
     }
 
     /// Returns an [`Entry`] for in-place manipulation of `key`'s slot.
@@ -970,47 +969,20 @@ where
 }
 
 /// Error returned by [`ElasticHashMap::try_insert`] on key collision.
-pub struct OccupiedError<'a, K, V> {
-    /// The existing entry.
-    pub entry: OccupiedEntry<'a, K, V>,
-    /// The value that was rejected.
-    pub value: V,
-}
+pub type OccupiedError<'a, K, V> = CommonOccupiedError<OccupiedEntry<'a, K, V>, V>;
 
-impl<K, V> std::fmt::Debug for OccupiedError<'_, K, V>
+impl<K, V> EntryView for OccupiedEntry<'_, K, V>
 where
-    K: Eq + Hash + std::fmt::Debug,
-    V: std::fmt::Debug,
+    K: Eq + Hash,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OccupiedError")
-            .field("key", self.entry.key())
-            .field("value", &self.value)
-            .finish()
+    type Key = K;
+    type Value = V;
+    fn view_key(&self) -> &K {
+        self.key()
     }
-}
-
-impl<K, V> std::fmt::Display for OccupiedError<'_, K, V>
-where
-    K: Eq + Hash + std::fmt::Debug,
-    V: std::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "tried to insert {:?}, but key {:?} was already present with {:?}",
-            self.value,
-            self.entry.key(),
-            self.entry.get(),
-        )
+    fn view_value(&self) -> &V {
+        self.get()
     }
-}
-
-impl<K, V> std::error::Error for OccupiedError<'_, K, V>
-where
-    K: Eq + Hash + std::fmt::Debug,
-    V: std::fmt::Debug,
-{
 }
 
 /// Draining iterator. Yields and removes every `(K, V)` entry; the map is
@@ -1203,44 +1175,9 @@ where
 }
 
 /// `&K` iterator returned by [`ElasticHashMap::keys`].
-#[derive(Clone)]
-pub struct Keys<'a, K, V> {
-    inner: ElasticIter<'a, K, V>,
-}
-
-impl<'a, K, V> Iterator for Keys<'a, K, V> {
-    type Item = &'a K;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, _)| k)
-    }
-}
-
-impl<K, V> std::fmt::Debug for Keys<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Keys").finish_non_exhaustive()
-    }
-}
-
+pub type Keys<'a, K, V> = CommonKeys<ElasticIter<'a, K, V>>;
 /// `&V` iterator returned by [`ElasticHashMap::values`].
-#[derive(Clone)]
-pub struct Values<'a, K, V> {
-    inner: ElasticIter<'a, K, V>,
-}
-
-impl<'a, K, V> Iterator for Values<'a, K, V> {
-    type Item = &'a V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
-    }
-}
-
-impl<K, V> std::fmt::Debug for Values<'_, K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Values").finish_non_exhaustive()
-    }
-}
+pub type Values<'a, K, V> = CommonValues<ElasticIter<'a, K, V>>;
 
 /// `(&K, &mut V)` iterator. Walks levels in storage order, skipping FREE
 /// and TOMBSTONE slots.
@@ -1398,48 +1335,9 @@ where
 }
 
 /// Owned `K` iterator returned by [`ElasticHashMap::into_keys`].
-pub struct ElasticIntoKeys<K, V> {
-    inner: ElasticIntoIter<K, V>,
-}
-
-impl<K, V> Iterator for ElasticIntoKeys<K, V> {
-    type Item = K;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, _)| k)
-    }
-}
-
-impl<K, V> std::fmt::Debug for ElasticIntoKeys<K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ElasticIntoKeys")
-            .field("level_idx", &self.inner.level_idx)
-            .field("slot_idx", &self.inner.slot_idx)
-            .finish_non_exhaustive()
-    }
-}
-
+pub type ElasticIntoKeys<K, V> = CommonIntoKeys<ElasticIntoIter<K, V>>;
 /// Owned `V` iterator returned by [`ElasticHashMap::into_values`].
-pub struct ElasticIntoValues<K, V> {
-    inner: ElasticIntoIter<K, V>,
-}
-
-impl<K, V> Iterator for ElasticIntoValues<K, V> {
-    type Item = V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
-    }
-}
-
-impl<K, V> std::fmt::Debug for ElasticIntoValues<K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ElasticIntoValues")
-            .field("level_idx", &self.inner.level_idx)
-            .field("slot_idx", &self.inner.slot_idx)
-            .finish_non_exhaustive()
-    }
-}
+pub type ElasticIntoValues<K, V> = CommonIntoValues<ElasticIntoIter<K, V>>;
 
 impl<K, V> ElasticHashMap<K, V>
 where
