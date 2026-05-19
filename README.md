@@ -90,8 +90,7 @@ RawTable (shared by both maps)
              └──── slots (T-aligned) ────┘     └─ controls (16-aligned) ──┘
                                                ▲ ctrl_offset
 
-  No per-group metadata. Occupancy is derived from SIMD scans of the control bytes
-  (eq_mask_16 for fingerprints, free_mask_16 for free slots).
+  Occupancy is derived from SIMD scans of the control bytes.
 
 
 ElasticHashMap
@@ -157,6 +156,6 @@ See [benches/README.md](benches/README.md) for bench target layout, charts, CLI 
 
 [^foldhash]: `foldhash` crate. <https://crates.io/crates/foldhash>. Default `BuildHasher` (`foldhash::fast::RandomState`) wired up in [`src/common/mod.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/mod.rs).
 
-[^prefetch2007]: Shimin Chen, Anastassia Ailamaki, Phillip B. Gibbons, Todd C. Mowry. *Improving Hash Join Performance through Prefetching* (ACM TODS 2007). PDF: <https://www.cs.cmu.edu/~chensm/papers/hashjoin_tods_preliminary.pdf>. Motivates the intra-probe `prefetch_read(group_data_ptr(next))` issued one group ahead in `find_in_special_primary` / `find_in_special_primary_with_candidate` (see [`src/funnel.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/funnel.rs)).
+[^prefetch2007]: Shimin Chen, Anastassia Ailamaki, Phillip B. Gibbons, Todd C. Mowry. *Improving Hash Join Performance through Prefetching* (ACM TODS 2007). PDF: <https://www.cs.cmu.edu/~chensm/papers/hashjoin_tods_preliminary.pdf>. Motivates the intra-probe issued one group ahead (see [`src/funnel.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/funnel.rs)).
 
 [^fastmod]: Daniel Lemire. *Faster Remainders when the Divisor is a Constant: Beating Compilers and libdivide* (2019). <https://lemire.me/blog/2019/02/08/faster-remainders-when-the-divisor-is-a-constant-beating-compilers-and-libdivide/>. Algorithm behind `fastmod_magic` / `fastmod_u32` in [`src/common/math.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/math.rs), used by `BucketLevel::bucket_index` to map a hash to a bucket without a hardware divide.

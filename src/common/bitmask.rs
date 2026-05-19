@@ -10,6 +10,7 @@ pub(crate) const BITMASK_STRIDE: u32 = 1;
 
 /// Per-slot match mask over a control group. `u16` on `x86_64` (1 bit/slot),
 /// `u64` on `aarch64` (4 bits/slot — native `vshrn_n_u16` output).
+#[derive(Clone, Copy)]
 pub(crate) struct BitMask(pub(crate) BitMaskWord);
 
 impl BitMask {

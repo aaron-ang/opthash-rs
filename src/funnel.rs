@@ -9,6 +9,7 @@ use std::ptr;
 
 use allocator_api2::boxed::Box as ABox;
 
+use crate::common::bitmask::BitMask;
 use crate::common::config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY};
 use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps};
 use crate::common::entry::{EntryView, OccupiedError as CommonOccupiedError};
@@ -22,7 +23,7 @@ use crate::common::math::{
     max_insertions, round_to_usize, round_up_to_group, round_up_to_pow2_groups,
     sanitize_reserve_fraction, usize_to_f64,
 };
-use crate::common::simd::{ProbeOps, prefetch_read};
+use crate::common::simd::{ProbeOps, occupied_mask_16, prefetch_read};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
 pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
@@ -990,7 +991,9 @@ where
             fallback: &self.special.fallback,
             phase: FunnelIterPhase::Levels,
             level_idx: 0,
-            slot_idx: 0,
+            next_group_slot: 0,
+            current_group_slot: 0,
+            current_mask: BitMask(0),
         }
     }
 
@@ -2336,7 +2339,9 @@ enum FunnelIterPhase {
 
 /// Borrowing iterator over occupied entries.
 /// Visits each region in funnel order: bucket levels → special primary → special fallback.
-/// Skips FREE and TOMBSTONE control bytes.
+/// Skips FREE and TOMBSTONE control bytes via SIMD group scans — each `next()`
+/// consumes the lowest pending occupied bit; refills the mask one group at a
+/// time when exhausted.
 #[derive(Clone)]
 pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
     levels: &'a [BucketLevel<K, V, A>],
@@ -2344,7 +2349,14 @@ pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
     fallback: &'a SpecialFallback<K, V, A>,
     phase: FunnelIterPhase,
     level_idx: usize,
-    slot_idx: usize,
+    /// Slot index immediately past the most recently scanned group within
+    /// the current phase's table. The next group's controls start here.
+    next_group_slot: usize,
+    /// Slot index of the group corresponding to `current_mask`.
+    current_group_slot: usize,
+    /// Pending occupied bits for `current_group_slot`'s group. Drained one
+    /// bit per `next()` call.
+    current_mask: BitMask,
 }
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelIter<'_, K, V, A> {
@@ -2352,7 +2364,7 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelIter<'_, K, V, A> {
         f.debug_struct("FunnelIter")
             .field("phase", &self.phase)
             .field("level_idx", &self.level_idx)
-            .field("slot_idx", &self.slot_idx)
+            .field("next_group_slot", &self.next_group_slot)
             .finish_non_exhaustive()
     }
 }
@@ -2362,51 +2374,69 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            match self.phase {
-                FunnelIterPhase::Levels => {
-                    while self.level_idx < self.levels.len() {
-                        let table = &self.levels[self.level_idx].table;
-                        while self.slot_idx < table.capacity() {
-                            let idx = self.slot_idx;
-                            self.slot_idx += 1;
-                            if table.control_at(idx).is_occupied() {
-                                let entry = unsafe { table.get_ref(idx) };
-                                return Some((&entry.key, &entry.value));
-                            }
-                        }
-                        self.level_idx += 1;
-                        self.slot_idx = 0;
-                    }
-                    self.phase = FunnelIterPhase::Primary;
-                    self.slot_idx = 0;
-                }
-                FunnelIterPhase::Primary => {
-                    let table = &self.primary.table;
-                    while self.slot_idx < table.capacity() {
-                        let idx = self.slot_idx;
-                        self.slot_idx += 1;
-                        if table.control_at(idx).is_occupied() {
-                            let entry = unsafe { table.get_ref(idx) };
-                            return Some((&entry.key, &entry.value));
-                        }
-                    }
-                    self.phase = FunnelIterPhase::Fallback;
-                    self.slot_idx = 0;
-                }
-                FunnelIterPhase::Fallback => {
-                    let table = &self.fallback.table;
-                    while self.slot_idx < table.capacity() {
-                        let idx = self.slot_idx;
-                        self.slot_idx += 1;
-                        if table.control_at(idx).is_occupied() {
-                            let entry = unsafe { table.get_ref(idx) };
-                            return Some((&entry.key, &entry.value));
-                        }
-                    }
-                    self.phase = FunnelIterPhase::Done;
-                }
-                FunnelIterPhase::Done => return None,
+            // Drain pending bits before scanning new groups.
+            if let Some(bit) = self.current_mask.next() {
+                let slot_idx = self.current_group_slot + bit;
+                let table = match self.phase {
+                    FunnelIterPhase::Levels => &self.levels[self.level_idx].table,
+                    FunnelIterPhase::Primary => &self.primary.table,
+                    FunnelIterPhase::Fallback => &self.fallback.table,
+                    FunnelIterPhase::Done => unreachable!(),
+                };
+                let entry = unsafe { table.get_ref(slot_idx) };
+                return Some((&entry.key, &entry.value));
             }
+
+            // Refill mask from next group in the current phase's table.
+            let table: &RawTable<SlotEntry<K, V>, A> = match self.phase {
+                FunnelIterPhase::Levels => {
+                    if self.level_idx >= self.levels.len() {
+                        self.phase = FunnelIterPhase::Primary;
+                        self.next_group_slot = 0;
+                        continue;
+                    }
+                    &self.levels[self.level_idx].table
+                }
+                FunnelIterPhase::Primary => &self.primary.table,
+                FunnelIterPhase::Fallback => &self.fallback.table,
+                FunnelIterPhase::Done => return None,
+            };
+            let table_capacity = table.capacity();
+
+            if self.next_group_slot >= table_capacity {
+                // Table exhausted; advance.
+                match self.phase {
+                    FunnelIterPhase::Levels => {
+                        self.level_idx += 1;
+                        self.next_group_slot = 0;
+                        if self.level_idx >= self.levels.len() {
+                            self.phase = FunnelIterPhase::Primary;
+                        }
+                    }
+                    FunnelIterPhase::Primary => {
+                        self.phase = FunnelIterPhase::Fallback;
+                        self.next_group_slot = 0;
+                    }
+                    FunnelIterPhase::Fallback => {
+                        self.phase = FunnelIterPhase::Done;
+                    }
+                    FunnelIterPhase::Done => return None,
+                }
+                continue;
+            }
+
+            // Scan one group.
+            let group_idx = self.next_group_slot / GROUP_SIZE;
+            let group_ptr = table.group_data_ptr(group_idx);
+            let mut mask = unsafe { occupied_mask_16(group_ptr) };
+            // Last group may extend past `capacity`; mask out the tail.
+            let group_end = self.next_group_slot + GROUP_SIZE;
+            if group_end > table_capacity {
+                mask = mask.truncate_to(table_capacity - self.next_group_slot);
+            }
+            self.current_mask = mask;
+            self.current_group_slot = self.next_group_slot;
+            self.next_group_slot = group_end;
         }
     }
 }
