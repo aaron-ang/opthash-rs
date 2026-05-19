@@ -722,46 +722,31 @@ where
 
         let (primary_step, primary_candidate) =
             self.find_in_special_primary_with_candidate(key_hash, key_fingerprint, &key);
-        match primary_step {
+        let primary_candidate =
+            primary_candidate.map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx });
+
+        let insertion_slot = match primary_step {
             LookupStep::Found(slot_idx) => {
                 return Some(
                     self.replace_existing_value(SlotLocation::SpecialPrimary { slot_idx }, value),
                 );
             }
-            LookupStep::StopSearch => {
-                if let Some(location) = level_candidate {
-                    return self.insert_at_location_after_resize_check(
-                        Some(location),
-                        key_hash,
-                        key,
+            LookupStep::StopSearch => level_candidate.or(primary_candidate),
+            LookupStep::Continue => {
+                let (fallback_match, fallback_candidate) =
+                    self.find_in_special_fallback_with_candidate(key_hash, key_fingerprint, &key);
+                if let Some(slot_idx) = fallback_match {
+                    return Some(self.replace_existing_value(
+                        SlotLocation::SpecialFallback { slot_idx },
                         value,
-                        key_fingerprint,
-                    );
+                    ));
                 }
-                return self.insert_at_location_after_resize_check(
-                    primary_candidate.map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx }),
-                    key_hash,
-                    key,
-                    value,
-                    key_fingerprint,
-                );
+                level_candidate.or(primary_candidate).or_else(|| {
+                    fallback_candidate.map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
+                })
             }
-            LookupStep::Continue => {}
-        }
+        };
 
-        let (fallback_match, fallback_candidate) =
-            self.find_in_special_fallback_with_candidate(key_hash, key_fingerprint, &key);
-        if let Some(slot_idx) = fallback_match {
-            return Some(
-                self.replace_existing_value(SlotLocation::SpecialFallback { slot_idx }, value),
-            );
-        }
-
-        let insertion_slot = level_candidate
-            .or_else(|| primary_candidate.map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx }))
-            .or_else(|| {
-                fallback_candidate.map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
-            });
         self.insert_at_location_after_resize_check(
             insertion_slot,
             key_hash,
