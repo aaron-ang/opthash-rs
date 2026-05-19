@@ -613,6 +613,42 @@ where
         Some(unsafe { out.assume_init() })
     }
 
+    /// Unsafe variant of [`Self::get_disjoint_mut`] that skips the
+    /// alias check. Mirrors [`std::collections::HashMap::get_disjoint_unchecked_mut`].
+    ///
+    /// # Safety
+    ///
+    /// All input keys must resolve to distinct entries; otherwise the
+    /// returned references alias and behavior is undefined.
+    pub unsafe fn get_disjoint_unchecked_mut<Q, const N: usize>(
+        &mut self,
+        keys: [&Q; N],
+    ) -> Option<[&mut V; N]>
+    where
+        K: Borrow<Q> + Eq,
+        Q: Hash + Eq + ?Sized,
+    {
+        let mut locations: [(usize, usize); N] = [(0, 0); N];
+        for (i, key) in keys.iter().enumerate() {
+            let key_hash = self.hash_key(*key);
+            let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+            locations[i] = self.find_slot_indices_with_hash(*key, key_hash, key_fingerprint)?;
+        }
+
+        // SAFETY: caller guarantees distinct locations. Raw pointer into
+        // `levels` lets us hand out disjoint borrows without reborrowing
+        // the slice each iteration.
+        let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
+        let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
+        let out_ptr = out.as_mut_ptr().cast::<&mut V>();
+        for (i, (level_idx, slot_idx)) in locations.into_iter().enumerate() {
+            let level = unsafe { &mut *levels_ptr.add(level_idx) };
+            let value_ref: &mut V = unsafe { &mut level.table.get_mut(slot_idx).value };
+            unsafe { out_ptr.add(i).write(value_ref) };
+        }
+        Some(unsafe { out.assume_init() })
+    }
+
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
@@ -2286,6 +2322,32 @@ mod tests {
         map.insert(1, 100);
         map.insert(2, 200);
         let _ = map.get_disjoint_mut([&1, &1]);
+    }
+
+    #[test]
+    fn get_disjoint_unchecked_mut_returns_all_refs_on_hits() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..16 {
+            map.insert(i, i * 10);
+        }
+
+        // SAFETY: keys are distinct.
+        let got = unsafe { map.get_disjoint_unchecked_mut([&1, &3, &7, &15]) }.expect("all hits");
+        assert_eq!(*got[0], 10);
+        assert_eq!(*got[1], 30);
+        assert_eq!(*got[2], 70);
+        assert_eq!(*got[3], 150);
+    }
+
+    #[test]
+    fn get_disjoint_unchecked_mut_returns_none_if_any_missing() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
+        for i in 0..8 {
+            map.insert(i, i);
+        }
+
+        // SAFETY: keys are distinct (and one misses, returning None).
+        assert!(unsafe { map.get_disjoint_unchecked_mut([&0, &1, &99]) }.is_none());
     }
 
     #[test]

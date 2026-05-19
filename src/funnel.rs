@@ -898,6 +898,57 @@ where
         Some(unsafe { out.assume_init() })
     }
 
+    /// Unsafe variant of [`Self::get_disjoint_mut`] that skips the
+    /// alias check. Mirrors [`std::collections::HashMap::get_disjoint_unchecked_mut`].
+    ///
+    /// # Safety
+    ///
+    /// All input keys must resolve to distinct entries; otherwise the
+    /// returned references alias and behavior is undefined.
+    pub unsafe fn get_disjoint_unchecked_mut<Q, const N: usize>(
+        &mut self,
+        keys: [&Q; N],
+    ) -> Option<[&mut V; N]>
+    where
+        K: Borrow<Q> + Eq,
+        Q: Hash + Eq + ?Sized,
+    {
+        let mut locations: [SlotLocation; N] = [SlotLocation::SpecialPrimary { slot_idx: 0 }; N];
+        for (i, key) in keys.iter().enumerate() {
+            let key_hash = self.hash_key(*key);
+            let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+            locations[i] = self.find_slot_location_with_hash(*key, key_hash, key_fingerprint)?;
+        }
+
+        // SAFETY: caller guarantees distinct locations. Raw pointers let
+        // us hand out disjoint borrows into `levels` / `special` without
+        // reborrowing the slices each iteration.
+        let levels_ptr: *mut BucketLevel<K, V, A> = self.levels.as_mut_ptr();
+        let primary_ptr: *mut SpecialPrimary<K, V, A> = &raw mut self.special.primary;
+        let fallback_ptr: *mut SpecialFallback<K, V, A> = &raw mut self.special.fallback;
+        let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
+        let out_ptr = out.as_mut_ptr().cast::<&mut V>();
+        for (i, loc) in locations.into_iter().enumerate() {
+            let value_ref: &mut V = match loc {
+                SlotLocation::Level {
+                    level_idx,
+                    slot_idx,
+                } => unsafe {
+                    let level = &mut *levels_ptr.add(level_idx);
+                    &mut level.table.get_mut(slot_idx).value
+                },
+                SlotLocation::SpecialPrimary { slot_idx } => unsafe {
+                    &mut (*primary_ptr).table.get_mut(slot_idx).value
+                },
+                SlotLocation::SpecialFallback { slot_idx } => unsafe {
+                    &mut (*fallback_ptr).table.get_mut(slot_idx).value
+                },
+            };
+            unsafe { out_ptr.add(i).write(value_ref) };
+        }
+        Some(unsafe { out.assume_init() })
+    }
+
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
@@ -3420,6 +3471,32 @@ mod tests {
         map.insert(1, 100);
         map.insert(2, 200);
         let _ = map.get_disjoint_mut([&1, &1]);
+    }
+
+    #[test]
+    fn get_disjoint_unchecked_mut_returns_all_refs_on_hits() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
+        for i in 0..16 {
+            map.insert(i, i * 10);
+        }
+
+        // SAFETY: keys are distinct.
+        let got = unsafe { map.get_disjoint_unchecked_mut([&1, &3, &7, &15]) }.expect("all hits");
+        assert_eq!(*got[0], 10);
+        assert_eq!(*got[1], 30);
+        assert_eq!(*got[2], 70);
+        assert_eq!(*got[3], 150);
+    }
+
+    #[test]
+    fn get_disjoint_unchecked_mut_returns_none_if_any_missing() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(32);
+        for i in 0..8 {
+            map.insert(i, i);
+        }
+
+        // SAFETY: keys are distinct (and one misses, returning None).
+        assert!(unsafe { map.get_disjoint_unchecked_mut([&0, &1, &99]) }.is_none());
     }
 
     #[test]
