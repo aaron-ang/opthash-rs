@@ -1744,7 +1744,6 @@ where
 
         let group_count = level.table.group_count();
         let mask = level.group_count_mask;
-        let capacity = level.capacity();
         let mut group_idx = Self::triangular_group_start(level, key_hash);
         let mut delta: usize = 0;
 
@@ -1757,10 +1756,7 @@ where
                     return Some(slot_idx);
                 }
             }
-            let empty_mask = level.table.group_match_mask(group_idx, CTRL_EMPTY);
-            if let Some(off) = empty_mask.lowest()
-                && group_idx * GROUP_SIZE + off < capacity
-            {
+            if level.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
                 return None;
             }
             delta += 1;

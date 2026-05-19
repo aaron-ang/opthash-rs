@@ -80,8 +80,8 @@ impl<T, A: Allocator> RawTable<T, A> {
             return Self::empty_in(alloc);
         }
 
-        let padded_capacity = round_up_to_group(capacity);
-        let group_count = padded_capacity / GROUP_SIZE;
+        let capacity = round_up_to_group(capacity);
+        let group_count = capacity / GROUP_SIZE;
         let (layout, ctrl_offset) = Self::unified_layout(capacity, group_count);
 
         let data_ptr = alloc
@@ -106,8 +106,8 @@ impl<T, A: Allocator> RawTable<T, A> {
             return Ok(Self::empty_in(alloc));
         }
 
-        let padded_capacity = round_up_to_group(capacity);
-        let group_count = padded_capacity / GROUP_SIZE;
+        let capacity = round_up_to_group(capacity);
+        let group_count = capacity / GROUP_SIZE;
         let (layout, ctrl_offset) = Self::try_unified_layout(capacity, group_count).ok_or(())?;
 
         let data_ptr = alloc.allocate_zeroed(layout).map_err(|_| ())?.cast::<u8>();
