@@ -189,10 +189,8 @@ impl<T> RawTable<T> {
         self.set_control(idx, super::control::CTRL_TOMBSTONE);
     }
 
-    /// Erase `idx`. Returns `true` if a tombstone was set (probe chain must
-    /// continue past this slot), `false` if the slot was reset to `EMPTY`
-    /// because the group already had an `EMPTY` ctrl — making this slot empty
-    /// preserves probe termination and avoids load-factor inflation.
+    /// Erase `idx`. Returns `true` if tombstone set; `false` if slot reset to `EMPTY`
+    /// because the group already terminated probing — avoids load-factor inflation.
     #[inline]
     pub fn erase(&mut self, idx: usize) -> bool {
         let group_idx = idx / GROUP_SIZE;
