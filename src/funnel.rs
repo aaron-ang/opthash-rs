@@ -2444,6 +2444,9 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Per-yield ctrl byte update is skipped: Drain::drop wipes all ctrls
+        // via `clear_all_controls` regardless, and the scanner only advances
+        // forward so yielded slots are never re-read.
         loop {
             match self.phase {
                 DrainPhase::Levels => {
@@ -2451,10 +2454,6 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
                         let level = &mut self.map.levels[self.level_idx];
                         if let Some(idx) = self.scanner.next_in(&level.table) {
                             let entry = unsafe { level.table.take(idx) };
-                            if level.table.erase(idx) {
-                                level.tombstones += 1;
-                            }
-                            level.len -= 1;
                             self.map.len -= 1;
                             return Some((entry.key, entry.value));
                         }
@@ -2468,10 +2467,6 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
                     let primary = &mut self.map.special.primary;
                     if let Some(idx) = self.scanner.next_in(&primary.table) {
                         let entry = unsafe { primary.table.take(idx) };
-                        if primary.table.erase(idx) {
-                            primary.tombstones += 1;
-                        }
-                        primary.len -= 1;
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
@@ -2482,10 +2477,6 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
                     let fallback = &mut self.map.special.fallback;
                     if let Some(idx) = self.scanner.next_in(&fallback.table) {
                         let entry = unsafe { fallback.table.take(idx) };
-                        if fallback.table.erase(idx) {
-                            fallback.tombstones += 1;
-                        }
-                        fallback.len -= 1;
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }

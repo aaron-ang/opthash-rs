@@ -1114,13 +1114,13 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Per-yield ctrl byte update is skipped: Drain::drop wipes all ctrls
+        // via `clear_all_controls` regardless, and the scanner only advances
+        // forward so yielded slots are never re-read.
         while self.level_idx < self.map.levels.len() {
             let level = &mut self.map.levels[self.level_idx];
             if let Some(idx) = self.scanner.next_in(&level.table) {
                 let entry = unsafe { level.table.take(idx) };
-                level.table.mark_tombstone(idx);
-                level.len -= 1;
-                level.tombstones += 1;
                 self.map.len -= 1;
                 return Some((entry.key, entry.value));
             }
