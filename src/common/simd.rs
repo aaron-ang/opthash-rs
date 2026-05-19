@@ -260,10 +260,8 @@ pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> BitMask {
     }
 }
 
-/// Returns a per-slot bitmask of bytes that have any low-7 bit set
-/// (i.e. occupied — fingerprint 1..=127), with the high bit clear. Padding
-/// bytes (control byte 0 = `CTRL_EMPTY`) and tombstones (0x80) both have
-/// `b & 0x7F == 0` and are excluded.
+/// Bitmask of occupied slots (low-7-bit fingerprint set, high bit clear).
+/// Padding and tombstones are excluded.
 ///
 /// # Safety
 ///
@@ -369,11 +367,10 @@ unsafe fn free_mask_16_neon(ptr: *const u8) -> BitMask {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn occupied_mask_16_neon(ptr: *const u8) -> BitMask {
+    // vtstq_u8(a, b) gives 0xFF where (a AND b) != 0 — with b = 0x7F that's
+    // exactly the occupied set.
     unsafe {
         let bytes = vld1q_u8(ptr);
-        // `vtstq_u8(a, b)` returns 0xFF lanes where `(a AND b) != 0`, 0
-        // otherwise. With b = 0x7F, any byte with low-7 bits set (a valid
-        // fingerprint) yields 0xFF — exactly the occupied set.
         let occ_cmp = core::arch::aarch64::vtstq_u8(bytes, vdupq_n_u8(FINGERPRINT_MASK));
         nibble_mask_from_cmp(occ_cmp)
     }
@@ -425,11 +422,10 @@ unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn occupied_mask_16_sse2(ptr: *const u8) -> BitMask {
+    // cmpgt against zero on the low-7-bit mask yields 0xFF for occupied lanes.
     unsafe {
         let data = _mm_loadu_si128(ptr.cast::<__m128i>());
         let masked = _mm_and_si128(data, _mm_set1_epi8(FINGERPRINT_MASK as i8));
-        // `cmpgt` instead of `cmpeq(.., 0)` so we get 0xFF for occupied
-        // (positive fingerprint), 0 otherwise.
         let occ = _mm_cmpgt_epi8(masked, _mm_setzero_si128());
         #[allow(clippy::cast_possible_truncation)]
         {

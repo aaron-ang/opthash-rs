@@ -2337,11 +2337,9 @@ enum FunnelIterPhase {
     Done,
 }
 
-/// Borrowing iterator over occupied entries.
-/// Visits each region in funnel order: bucket levels → special primary → special fallback.
-/// Skips FREE and TOMBSTONE control bytes via SIMD group scans — each `next()`
-/// consumes the lowest pending occupied bit; refills the mask one group at a
-/// time when exhausted.
+/// Borrowing iterator over occupied entries. Visits bucket levels → special
+/// primary → special fallback. SIMD-scans one group at a time, yielding bits
+/// from a cached mask before refilling.
 #[derive(Clone)]
 pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
     levels: &'a [BucketLevel<K, V, A>],
@@ -2349,13 +2347,11 @@ pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
     fallback: &'a SpecialFallback<K, V, A>,
     phase: FunnelIterPhase,
     level_idx: usize,
-    /// Slot index immediately past the most recently scanned group within
-    /// the current phase's table. The next group's controls start here.
+    /// Slot index of the next group to scan within the current phase's table.
     next_group_slot: usize,
-    /// Slot index of the group corresponding to `current_mask`.
+    /// Slot index of the group `current_mask` was derived from.
     current_group_slot: usize,
-    /// Pending occupied bits for `current_group_slot`'s group. Drained one
-    /// bit per `next()` call.
+    /// Pending occupied bits for that group; drained one per `next()`.
     current_mask: BitMask,
 }
 
