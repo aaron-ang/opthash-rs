@@ -210,6 +210,7 @@ impl ProbeOps {
 /// # Safety
 ///
 /// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
+#[inline]
 #[must_use]
 pub(crate) unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> BitMask {
     #[cfg(target_arch = "aarch64")]
@@ -235,6 +236,7 @@ pub(crate) unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> BitMask {
 /// # Safety
 ///
 /// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
+#[inline]
 #[must_use]
 pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> BitMask {
     #[cfg(target_arch = "aarch64")]
@@ -261,6 +263,7 @@ pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> BitMask {
 /// # Safety
 ///
 /// `ptr` must be valid to read 32 bytes.
+#[inline]
 #[must_use]
 pub(crate) unsafe fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
     #[cfg(target_arch = "x86_64")]
