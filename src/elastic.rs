@@ -1560,6 +1560,7 @@ where
     /// Locate `key` across all populated levels. Returns `(level, slot)` on
     /// hit. Bounded by `max_populated_level + 1` so empty trailing levels
     /// don't get probed.
+    #[inline]
     fn find_slot_indices_with_hash<Q>(
         &self,
         key: &Q,

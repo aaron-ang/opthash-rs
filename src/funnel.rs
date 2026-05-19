@@ -1321,6 +1321,7 @@ where
     /// `Err(Some(insert_location))` with the first non-full bucket's
     /// candidate slot if known (used by insert to skip a re-search).
     /// `Err(None)` when no insert candidate was seen and the search exhausted.
+    #[inline]
     fn find_in_levels_with_candidate<Q>(
         &self,
         key: &Q,
@@ -1538,6 +1539,7 @@ where
         primary.table.first_free_in_group(group_idx)
     }
 
+    #[inline]
     fn find_in_level_bucket<Q>(
         key_hash: u64,
         key_fingerprint: u8,
@@ -1585,6 +1587,7 @@ where
         LookupStep::Continue
     }
 
+    #[inline]
     fn find_in_level_bucket_with_candidate<Q>(
         key_hash: u64,
         key_fingerprint: u8,
@@ -1653,6 +1656,7 @@ where
     /// candidate tracking). Bounded by `primary_probe_limit` groups; if
     /// reached without a match and no tombstones seen, returns `StopSearch`
     /// so the caller skips fallback.
+    #[inline]
     fn find_in_special_primary<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> LookupStep
     where
         K: Borrow<Q>,
@@ -1696,6 +1700,7 @@ where
 
     /// Like `find_in_special_primary`, but also remembers the first
     /// FREE-or-TOMBSTONE slot seen so insert can land there without a re-scan.
+    #[inline]
     fn find_in_special_primary_with_candidate<Q>(
         &self,
         key_hash: u64,
@@ -1762,6 +1767,7 @@ where
 
     /// Probe the special fallback for `key`. Bucket-local search like
     /// `BucketLevel`, but with larger buckets sized for primary spillover.
+    #[inline]
     fn find_in_special_fallback<Q>(
         &self,
         key_hash: u64,
@@ -1814,6 +1820,7 @@ where
 
     /// Like `find_in_special_fallback`, but also tracks the first
     /// FREE-or-TOMBSTONE slot for insert.
+    #[inline]
     fn find_in_special_fallback_with_candidate<Q>(
         &self,
         key_hash: u64,
@@ -1861,6 +1868,7 @@ where
         )
     }
 
+    #[inline]
     fn find_slot_location_with_hash<Q>(
         &self,
         key: &Q,
