@@ -841,27 +841,30 @@ where
             } => {
                 let level = &mut self.levels[level_idx];
                 let removed = unsafe { level.table.take(slot_idx) };
-                level.table.mark_tombstone(slot_idx);
+                if level.table.erase(slot_idx) {
+                    level.tombstones += 1;
+                }
                 level.len -= 1;
-                level.tombstones += 1;
                 let needs_resize = level.tombstones > level.capacity() / 2;
                 (removed, needs_resize)
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
                 let primary = &mut self.special.primary;
                 let removed = unsafe { primary.table.take(slot_idx) };
-                primary.table.mark_tombstone(slot_idx);
+                if primary.table.erase(slot_idx) {
+                    primary.tombstones += 1;
+                }
                 primary.len -= 1;
-                primary.tombstones += 1;
                 let needs_resize = primary.tombstones > primary.table.capacity() / 2;
                 (removed, needs_resize)
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let fallback = &mut self.special.fallback;
                 let removed = unsafe { fallback.table.take(slot_idx) };
-                fallback.table.mark_tombstone(slot_idx);
+                if fallback.table.erase(slot_idx) {
+                    fallback.tombstones += 1;
+                }
                 fallback.len -= 1;
-                fallback.tombstones += 1;
                 let needs_resize = fallback.tombstones > fallback.capacity() / 2;
                 (removed, needs_resize)
             }
@@ -2011,27 +2014,30 @@ where
             } => {
                 let level = &mut self.map.levels[level_idx];
                 let removed = unsafe { level.table.take(slot_idx) };
-                level.table.mark_tombstone(slot_idx);
+                if level.table.erase(slot_idx) {
+                    level.tombstones += 1;
+                }
                 level.len -= 1;
-                level.tombstones += 1;
                 let needs_resize = level.tombstones > level.capacity() / 2;
                 (removed, needs_resize)
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
                 let primary = &mut self.map.special.primary;
                 let removed = unsafe { primary.table.take(slot_idx) };
-                primary.table.mark_tombstone(slot_idx);
+                if primary.table.erase(slot_idx) {
+                    primary.tombstones += 1;
+                }
                 primary.len -= 1;
-                primary.tombstones += 1;
                 let needs_resize = primary.tombstones > primary.table.capacity() / 2;
                 (removed, needs_resize)
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let fallback = &mut self.map.special.fallback;
                 let removed = unsafe { fallback.table.take(slot_idx) };
-                fallback.table.mark_tombstone(slot_idx);
+                if fallback.table.erase(slot_idx) {
+                    fallback.tombstones += 1;
+                }
                 fallback.len -= 1;
-                fallback.tombstones += 1;
                 let needs_resize = fallback.tombstones > fallback.capacity() / 2;
                 (removed, needs_resize)
             }
@@ -2317,9 +2323,10 @@ impl<K, V> Iterator for Drain<'_, K, V> {
                             self.slot_idx += 1;
                             if level.table.control_at(idx).is_occupied() {
                                 let entry = unsafe { level.table.take(idx) };
-                                level.table.mark_tombstone(idx);
+                                if level.table.erase(idx) {
+                                    level.tombstones += 1;
+                                }
                                 level.len -= 1;
-                                level.tombstones += 1;
                                 self.map.len -= 1;
                                 return Some((entry.key, entry.value));
                             }
@@ -2337,9 +2344,10 @@ impl<K, V> Iterator for Drain<'_, K, V> {
                         self.slot_idx += 1;
                         if primary.table.control_at(idx).is_occupied() {
                             let entry = unsafe { primary.table.take(idx) };
-                            primary.table.mark_tombstone(idx);
+                            if primary.table.erase(idx) {
+                                primary.tombstones += 1;
+                            }
                             primary.len -= 1;
-                            primary.tombstones += 1;
                             self.map.len -= 1;
                             return Some((entry.key, entry.value));
                         }
@@ -2354,9 +2362,10 @@ impl<K, V> Iterator for Drain<'_, K, V> {
                         self.slot_idx += 1;
                         if fallback.table.control_at(idx).is_occupied() {
                             let entry = unsafe { fallback.table.take(idx) };
-                            fallback.table.mark_tombstone(idx);
+                            if fallback.table.erase(idx) {
+                                fallback.tombstones += 1;
+                            }
                             fallback.len -= 1;
-                            fallback.tombstones += 1;
                             self.map.len -= 1;
                             return Some((entry.key, entry.value));
                         }
@@ -2445,9 +2454,10 @@ where
                             let entry = unsafe { level.table.get_mut(idx) };
                             if (self.pred)(&entry.key, &mut entry.value) {
                                 let removed = unsafe { level.table.take(idx) };
-                                level.table.mark_tombstone(idx);
+                                if level.table.erase(idx) {
+                                    level.tombstones += 1;
+                                }
                                 level.len -= 1;
-                                level.tombstones += 1;
                                 self.map.len -= 1;
                                 return Some((removed.key, removed.value));
                             }
@@ -2469,9 +2479,10 @@ where
                         let entry = unsafe { primary.table.get_mut(idx) };
                         if (self.pred)(&entry.key, &mut entry.value) {
                             let removed = unsafe { primary.table.take(idx) };
-                            primary.table.mark_tombstone(idx);
+                            if primary.table.erase(idx) {
+                                primary.tombstones += 1;
+                            }
                             primary.len -= 1;
-                            primary.tombstones += 1;
                             self.map.len -= 1;
                             return Some((removed.key, removed.value));
                         }
@@ -2490,9 +2501,10 @@ where
                         let entry = unsafe { fallback.table.get_mut(idx) };
                         if (self.pred)(&entry.key, &mut entry.value) {
                             let removed = unsafe { fallback.table.take(idx) };
-                            fallback.table.mark_tombstone(idx);
+                            if fallback.table.erase(idx) {
+                                fallback.tombstones += 1;
+                            }
                             fallback.len -= 1;
-                            fallback.tombstones += 1;
                             self.map.len -= 1;
                             return Some((removed.key, removed.value));
                         }

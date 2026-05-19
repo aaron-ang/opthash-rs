@@ -5,7 +5,7 @@ use std::ptr::{self, NonNull};
 use super::TryReserveError;
 use super::bitmask::BitMask;
 use super::math::round_up_to_group;
-use super::simd::{eq_mask_16, free_mask_16};
+use super::simd::{CTRL_EMPTY, eq_mask_16, free_mask_16};
 
 /// Fallibly allocates a zero-filled `Box<[T]>`.
 pub(crate) fn try_zeroed_boxed_slice<T: Default + Clone>(
@@ -187,6 +187,24 @@ impl<T> RawTable<T> {
     #[inline]
     pub fn mark_tombstone(&mut self, idx: usize) {
         self.set_control(idx, super::control::CTRL_TOMBSTONE);
+    }
+
+    /// Erase `idx`. Returns `true` if a tombstone was set (probe chain must
+    /// continue past this slot), `false` if the slot was reset to `EMPTY`
+    /// because the group already had an `EMPTY` ctrl — making this slot empty
+    /// preserves probe termination and avoids load-factor inflation.
+    #[inline]
+    pub fn erase(&mut self, idx: usize) -> bool {
+        let group_idx = idx / GROUP_SIZE;
+        let ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
+        let group_has_empty = unsafe { eq_mask_16(ptr, CTRL_EMPTY).any() };
+        if group_has_empty {
+            self.set_control(idx, CTRL_EMPTY);
+            false
+        } else {
+            self.set_control(idx, super::control::CTRL_TOMBSTONE);
+            true
+        }
     }
 
     #[inline]
