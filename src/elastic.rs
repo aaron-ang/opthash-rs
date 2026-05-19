@@ -1624,6 +1624,7 @@ where
     /// batch-targeted level pair first (`choose_slot_targeted`); falls back
     /// to a full sweep across all levels when the targeted slot is full
     /// (e.g. tombstones in earlier levels are the only reusable slots).
+    #[inline]
     fn choose_slot_for_new_key(&mut self, key_hash: u64) -> Option<(usize, usize)> {
         if self.levels.is_empty() {
             return None;
@@ -1646,6 +1647,7 @@ where
     /// `current_free_slots > half_reserve_threshold` and `next_free_slots`
     /// thresholds. Per the elastic-hashing schedule, this is what keeps
     /// expected probe count low at high load.
+    #[inline]
     fn choose_slot_targeted(&self, key_hash: u64) -> Option<(usize, usize)> {
         if self.current_batch_index == 0 {
             return self
@@ -1768,6 +1770,7 @@ where
     /// Probe-bounded variant of `first_free_uniform`: scans at most
     /// `max_groups` groups. Used by the elastic schedule when
     /// `current_level` still has reserve headroom.
+    #[inline]
     fn first_free_limited(
         &self,
         key_hash: u64,
@@ -1796,6 +1799,7 @@ where
 
     /// Triangular scan over all groups for the first FREE-or-TOMBSTONE slot.
     /// Returns `None` only if the level is completely OCCUPIED.
+    #[inline]
     fn first_free_uniform(&self, key_hash: u64, level_idx: usize) -> Option<usize> {
         let level = &self.levels[level_idx];
         if level.len >= level.capacity() {
