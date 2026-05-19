@@ -599,16 +599,20 @@ where
             }
         }
 
-        // SAFETY: locations are unique (checked above) and point to occupied
-        // slots. Raw pointer into `levels` lets us hand out disjoint borrows
-        // without reborrowing the slice each iteration.
+        // SAFETY: locations are unique (checked above). Raw-pointer chain
+        // projects to each value without forming an intermediate
+        // `&mut Level` / `&mut RawTable`, so two keys hitting the same
+        // level can't alias under Stacked Borrows.
         let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
         let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
         let out_ptr = out.as_mut_ptr().cast::<&mut V>();
         for (i, (level_idx, slot_idx)) in locations.into_iter().enumerate() {
-            let level = unsafe { &mut *levels_ptr.add(level_idx) };
-            let value_ref: &mut V = unsafe { &mut level.table.get_mut(slot_idx).value };
-            unsafe { out_ptr.add(i).write(value_ref) };
+            let lvl_ptr: *mut Level<K, V, A> = unsafe { levels_ptr.add(level_idx) };
+            let table_ptr: *mut RawTable<SlotEntry<K, V>, A> = unsafe { &raw mut (*lvl_ptr).table };
+            let entry_ptr: *mut SlotEntry<K, V> =
+                unsafe { RawTable::slot_ptr_raw(table_ptr, slot_idx) };
+            let value_ptr: *mut V = unsafe { &raw mut (*entry_ptr).value };
+            unsafe { out_ptr.add(i).write(&mut *value_ptr) };
         }
         Some(unsafe { out.assume_init() })
     }
@@ -635,16 +639,18 @@ where
             locations[i] = self.find_slot_indices_with_hash(*key, key_hash, key_fingerprint)?;
         }
 
-        // SAFETY: caller guarantees distinct locations. Raw pointer into
-        // `levels` lets us hand out disjoint borrows without reborrowing
-        // the slice each iteration.
+        // SAFETY: caller guarantees distinct locations. Raw-pointer chain as
+        // in the checked variant — no intermediate `&mut Level`.
         let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
         let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
         let out_ptr = out.as_mut_ptr().cast::<&mut V>();
         for (i, (level_idx, slot_idx)) in locations.into_iter().enumerate() {
-            let level = unsafe { &mut *levels_ptr.add(level_idx) };
-            let value_ref: &mut V = unsafe { &mut level.table.get_mut(slot_idx).value };
-            unsafe { out_ptr.add(i).write(value_ref) };
+            let lvl_ptr: *mut Level<K, V, A> = unsafe { levels_ptr.add(level_idx) };
+            let table_ptr: *mut RawTable<SlotEntry<K, V>, A> = unsafe { &raw mut (*lvl_ptr).table };
+            let entry_ptr: *mut SlotEntry<K, V> =
+                unsafe { RawTable::slot_ptr_raw(table_ptr, slot_idx) };
+            let value_ptr: *mut V = unsafe { &raw mut (*entry_ptr).value };
+            unsafe { out_ptr.add(i).write(&mut *value_ptr) };
         }
         Some(unsafe { out.assume_init() })
     }

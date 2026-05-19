@@ -869,31 +869,19 @@ where
             }
         }
 
-        // SAFETY: locations are unique (checked above) and point to occupied
-        // slots. Raw pointers let us hand out disjoint borrows into `levels`
-        // / `special` without reborrowing the slices each iteration.
+        // SAFETY: locations are unique (checked above). Raw-pointer chain
+        // projects to each value without forming an intermediate
+        // `&mut BucketLevel` / `&mut SpecialPrimary` / `&mut SpecialFallback`,
+        // so two keys hitting the same sub-table can't alias under Stacked Borrows.
         let levels_ptr: *mut BucketLevel<K, V, A> = self.levels.as_mut_ptr();
         let primary_ptr: *mut SpecialPrimary<K, V, A> = &raw mut self.special.primary;
         let fallback_ptr: *mut SpecialFallback<K, V, A> = &raw mut self.special.fallback;
         let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
         let out_ptr = out.as_mut_ptr().cast::<&mut V>();
         for (i, loc) in locations.into_iter().enumerate() {
-            let value_ref: &mut V = match loc {
-                SlotLocation::Level {
-                    level_idx,
-                    slot_idx,
-                } => unsafe {
-                    let level = &mut *levels_ptr.add(level_idx);
-                    &mut level.table.get_mut(slot_idx).value
-                },
-                SlotLocation::SpecialPrimary { slot_idx } => unsafe {
-                    &mut (*primary_ptr).table.get_mut(slot_idx).value
-                },
-                SlotLocation::SpecialFallback { slot_idx } => unsafe {
-                    &mut (*fallback_ptr).table.get_mut(slot_idx).value
-                },
-            };
-            unsafe { out_ptr.add(i).write(value_ref) };
+            let value_ptr: *mut V =
+                unsafe { funnel_slot_value_ptr(levels_ptr, primary_ptr, fallback_ptr, loc) };
+            unsafe { out_ptr.add(i).write(&mut *value_ptr) };
         }
         Some(unsafe { out.assume_init() })
     }
@@ -920,31 +908,17 @@ where
             locations[i] = self.find_slot_location_with_hash(*key, key_hash, key_fingerprint)?;
         }
 
-        // SAFETY: caller guarantees distinct locations. Raw pointers let
-        // us hand out disjoint borrows into `levels` / `special` without
-        // reborrowing the slices each iteration.
+        // SAFETY: caller guarantees distinct locations. Raw-pointer chain
+        // as in the checked variant — no intermediate `&mut BucketLevel`.
         let levels_ptr: *mut BucketLevel<K, V, A> = self.levels.as_mut_ptr();
         let primary_ptr: *mut SpecialPrimary<K, V, A> = &raw mut self.special.primary;
         let fallback_ptr: *mut SpecialFallback<K, V, A> = &raw mut self.special.fallback;
         let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
         let out_ptr = out.as_mut_ptr().cast::<&mut V>();
         for (i, loc) in locations.into_iter().enumerate() {
-            let value_ref: &mut V = match loc {
-                SlotLocation::Level {
-                    level_idx,
-                    slot_idx,
-                } => unsafe {
-                    let level = &mut *levels_ptr.add(level_idx);
-                    &mut level.table.get_mut(slot_idx).value
-                },
-                SlotLocation::SpecialPrimary { slot_idx } => unsafe {
-                    &mut (*primary_ptr).table.get_mut(slot_idx).value
-                },
-                SlotLocation::SpecialFallback { slot_idx } => unsafe {
-                    &mut (*fallback_ptr).table.get_mut(slot_idx).value
-                },
-            };
-            unsafe { out_ptr.add(i).write(value_ref) };
+            let value_ptr: *mut V =
+                unsafe { funnel_slot_value_ptr(levels_ptr, primary_ptr, fallback_ptr, loc) };
+            unsafe { out_ptr.add(i).write(&mut *value_ptr) };
         }
         Some(unsafe { out.assume_init() })
     }
@@ -3010,6 +2984,42 @@ pub type FunnelIntoKeys<K, V, S = DefaultHashBuilder, A = Global> =
 /// Owned `V` iterator returned by [`FunnelHashMap::into_values`].
 pub type FunnelIntoValues<K, V, S = DefaultHashBuilder, A = Global> =
     CommonIntoValues<FunnelIntoIter<K, V, S, A>>;
+
+/// Raw-pointer projection from a `SlotLocation` to its value, without forming
+/// any intermediate `&mut BucketLevel` / `&mut SpecialPrimary` /
+/// `&mut SpecialFallback`. Used by `get_disjoint_mut*` to hand out disjoint
+/// `&mut V` even when multiple keys live in the same sub-table.
+///
+/// # Safety
+///
+/// - `levels_ptr` must point to a live `[BucketLevel<K, V, A>]` whose `level_idx`
+///   slot exists; same for `primary_ptr` / `fallback_ptr`.
+/// - The `slot_idx` carried by `loc` must reference an occupied slot.
+#[inline]
+unsafe fn funnel_slot_value_ptr<K, V, A: Allocator + Clone>(
+    levels_ptr: *mut BucketLevel<K, V, A>,
+    primary_ptr: *mut SpecialPrimary<K, V, A>,
+    fallback_ptr: *mut SpecialFallback<K, V, A>,
+    loc: SlotLocation,
+) -> *mut V {
+    let (table_ptr, slot_idx) = match loc {
+        SlotLocation::Level {
+            level_idx,
+            slot_idx,
+        } => unsafe {
+            let lvl_ptr = levels_ptr.add(level_idx);
+            (&raw mut (*lvl_ptr).table, slot_idx)
+        },
+        SlotLocation::SpecialPrimary { slot_idx } => {
+            (unsafe { &raw mut (*primary_ptr).table }, slot_idx)
+        }
+        SlotLocation::SpecialFallback { slot_idx } => {
+            (unsafe { &raw mut (*fallback_ptr).table }, slot_idx)
+        }
+    };
+    let entry_ptr: *mut SlotEntry<K, V> = unsafe { RawTable::slot_ptr_raw(table_ptr, slot_idx) };
+    unsafe { &raw mut (*entry_ptr).value }
+}
 
 /// Number of bucket levels for a given reserve fraction. Tighter reserve →
 /// more levels (more probing budget per insert).

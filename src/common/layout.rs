@@ -152,6 +152,20 @@ impl<T, A: Allocator> RawTable<T, A> {
         self.data_ptr.as_ptr().cast::<T>()
     }
 
+    /// Raw pointer to slot `idx` without reborrowing `&self`. Lets callers
+    /// project to disjoint `&mut V` from multiple slots without going
+    /// through `&mut RawTable` (which would alias under Stacked Borrows).
+    ///
+    /// # Safety
+    ///
+    /// `this` must point to a live `RawTable`. `idx` must be `< capacity()`.
+    #[inline]
+    pub(crate) unsafe fn slot_ptr_raw(this: *mut Self, idx: usize) -> *mut T {
+        let data_field: *mut NonNull<u8> = unsafe { &raw mut (*this).data_ptr };
+        let base: *mut u8 = unsafe { data_field.read() }.as_ptr();
+        unsafe { base.cast::<T>().add(idx) }
+    }
+
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
         unsafe { self.data_ptr.as_ptr().add(self.ctrl_offset) }
