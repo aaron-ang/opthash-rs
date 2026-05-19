@@ -7,6 +7,8 @@ use std::mem;
 use std::ops::Range;
 use std::ptr;
 
+use allocator_api2::boxed::Box as ABox;
+
 use crate::common::config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY};
 use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps};
 use crate::common::entry::{EntryView, OccupiedError as CommonOccupiedError};
@@ -14,14 +16,14 @@ use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     Values as CommonValues,
 };
-use crate::common::layout::{Entry as SlotEntry, GROUP_SIZE, RawTable, try_zeroed_boxed_slice};
+use crate::common::layout::{Entry as SlotEntry, GROUP_SIZE, RawTable, try_zeroed_boxed_slice_in};
 use crate::common::math::{
     capacity_for, ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize, level_salt,
     max_insertions, round_to_usize, round_up_to_group, round_up_to_pow2_groups,
     sanitize_reserve_fraction, usize_to_f64,
 };
 use crate::common::simd::{ProbeOps, prefetch_read};
-use crate::common::{DefaultHashBuilder, TryReserveError};
+use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
 pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
 
@@ -81,9 +83,9 @@ impl FunnelOptions {
 /// inserts hash a key to one bucket and probe within that bucket only.
 /// If the bucket is full the insert spills to the next level (or the
 /// special array). Bucket-local probing keeps lookup cost bounded.
-struct BucketLevel<K, V> {
+struct BucketLevel<K, V, A: Allocator = Global> {
     /// Structure of Arrays control bytes + entries.
-    table: RawTable<SlotEntry<K, V>>,
+    table: RawTable<SlotEntry<K, V>, A>,
     /// Live entry count.
     len: usize,
     /// Deleted-slot count.
@@ -99,8 +101,8 @@ struct BucketLevel<K, V> {
     bucket_count_magic: u64,
 }
 
-impl<K, V> BucketLevel<K, V> {
-    fn with_bucket_count(bucket_count: usize, bucket_size: usize, salt: u64) -> Self {
+impl<K, V, A: Allocator> BucketLevel<K, V, A> {
+    fn with_bucket_count_in(bucket_count: usize, bucket_size: usize, salt: u64, alloc: A) -> Self {
         let total_capacity = bucket_count.saturating_mul(bucket_size);
         let bucket_count_magic = if bucket_count > 1 {
             fastmod_magic(bucket_count)
@@ -108,7 +110,7 @@ impl<K, V> BucketLevel<K, V> {
             0
         };
         Self {
-            table: RawTable::new(total_capacity),
+            table: RawTable::new_in(total_capacity, alloc),
             len: 0,
             tombstones: 0,
             bucket_size,
@@ -118,11 +120,12 @@ impl<K, V> BucketLevel<K, V> {
         }
     }
 
-    /// Fallible counterpart to [`BucketLevel::with_bucket_count`].
-    fn try_with_bucket_count(
+    /// Fallible counterpart to [`BucketLevel::with_bucket_count_in`].
+    fn try_with_bucket_count_in(
         bucket_count: usize,
         bucket_size: usize,
         salt: u64,
+        alloc: A,
     ) -> Result<Self, TryReserveError> {
         let total_capacity = bucket_count.saturating_mul(bucket_size);
         let bucket_count_magic = if bucket_count > 1 {
@@ -130,7 +133,8 @@ impl<K, V> BucketLevel<K, V> {
         } else {
             0
         };
-        let table = RawTable::try_new(total_capacity).map_err(|()| TryReserveError::AllocError)?;
+        let table = RawTable::try_new_in(total_capacity, alloc)
+            .map_err(|()| TryReserveError::AllocError)?;
         Ok(Self {
             table,
             len: 0,
@@ -166,7 +170,7 @@ impl<K, V> BucketLevel<K, V> {
     }
 }
 
-impl<K, V> Drop for BucketLevel<K, V> {
+impl<K, V, A: Allocator> Drop for BucketLevel<K, V, A> {
     fn drop(&mut self) {
         for idx in 0..self.table.capacity() {
             if self.table.control_at(idx).is_occupied() {
@@ -179,9 +183,9 @@ impl<K, V> Drop for BucketLevel<K, V> {
 /// Fallback table for keys that didn't fit in any bucket level. SIMD-group
 /// open addressing with per-key odd-step probing over pow2 `group_count`
 /// (step coprime to `group_count` ⇒ permutation over all groups).
-struct SpecialPrimary<K, V> {
+struct SpecialPrimary<K, V, A: Allocator = Global> {
     /// `SoA` control bytes + entries.
-    table: RawTable<SlotEntry<K, V>>,
+    table: RawTable<SlotEntry<K, V>, A>,
     /// Live entry count.
     len: usize,
     /// Total tombstones; drives the global 50%-capacity resize trigger.
@@ -189,13 +193,13 @@ struct SpecialPrimary<K, V> {
     /// `group_count - 1`. Pow2 by construction.
     group_count_mask: usize,
     /// Per-group packed fingerprint metadata for fast scans.
-    group_summaries: Box<[u128]>,
+    group_summaries: ABox<[u128], A>,
 }
 
-impl<K, V> SpecialPrimary<K, V> {
-    fn with_capacity(capacity: usize) -> Self {
+impl<K, V, A: Allocator + Clone> SpecialPrimary<K, V, A> {
+    fn with_capacity_in(capacity: usize, alloc: A) -> Self {
         let inflated = round_up_to_pow2_groups(capacity);
-        let table = RawTable::new(inflated);
+        let table = RawTable::new_in(inflated, alloc.clone());
         let group_count = table.group_count();
         debug_assert!(
             group_count == 0 || group_count.is_power_of_two(),
@@ -206,16 +210,18 @@ impl<K, V> SpecialPrimary<K, V> {
             len: 0,
             tombstones: 0,
             group_count_mask: group_count.saturating_sub(1),
-            group_summaries: vec![0; group_count].into_boxed_slice(),
+            group_summaries: try_zeroed_boxed_slice_in(group_count, alloc)
+                .expect("group_summaries alloc"),
         }
     }
 
-    /// Fallible counterpart to [`SpecialPrimary::with_capacity`].
-    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
+    /// Fallible counterpart to [`SpecialPrimary::with_capacity_in`].
+    fn try_with_capacity_in(capacity: usize, alloc: A) -> Result<Self, TryReserveError> {
         let inflated = round_up_to_pow2_groups(capacity);
-        let table = RawTable::try_new(inflated).map_err(|()| TryReserveError::AllocError)?;
+        let table = RawTable::try_new_in(inflated, alloc.clone())
+            .map_err(|()| TryReserveError::AllocError)?;
         let group_count = table.group_count();
-        let group_summaries = try_zeroed_boxed_slice::<u128>(group_count)?;
+        let group_summaries = try_zeroed_boxed_slice_in::<u128, _>(group_count, alloc)?;
         Ok(Self {
             table,
             len: 0,
@@ -226,7 +232,7 @@ impl<K, V> SpecialPrimary<K, V> {
     }
 }
 
-impl<K, V> Drop for SpecialPrimary<K, V> {
+impl<K, V, A: Allocator> Drop for SpecialPrimary<K, V, A> {
     fn drop(&mut self) {
         for idx in 0..self.table.capacity() {
             if self.table.control_at(idx).is_occupied() {
@@ -240,9 +246,9 @@ impl<K, V> Drop for SpecialPrimary<K, V> {
 /// budget. Bucketed like `BucketLevel` but with larger buckets (`2 *
 /// primary_probe_limit`) so a key that's been pushed this far almost
 /// certainly fits.
-struct SpecialFallback<K, V> {
+struct SpecialFallback<K, V, A: Allocator = Global> {
     /// Structure of Arrays control bytes + entries.
-    table: RawTable<SlotEntry<K, V>>,
+    table: RawTable<SlotEntry<K, V>, A>,
     /// Live entry count.
     len: usize,
     /// Deleted-slot count.
@@ -254,15 +260,15 @@ struct SpecialFallback<K, V> {
     bucket_count: usize,
 }
 
-impl<K, V> SpecialFallback<K, V> {
-    fn with_capacity(capacity: usize, bucket_size: usize) -> Self {
+impl<K, V, A: Allocator> SpecialFallback<K, V, A> {
+    fn with_capacity_in(capacity: usize, bucket_size: usize, alloc: A) -> Self {
         let bucket_count = if bucket_size == 0 {
             0
         } else {
             capacity.div_ceil(bucket_size)
         };
         Self {
-            table: RawTable::new(capacity),
+            table: RawTable::new_in(capacity, alloc),
             len: 0,
             tombstones: 0,
             bucket_size,
@@ -270,14 +276,19 @@ impl<K, V> SpecialFallback<K, V> {
         }
     }
 
-    /// Fallible counterpart to [`SpecialFallback::with_capacity`].
-    fn try_with_capacity(capacity: usize, bucket_size: usize) -> Result<Self, TryReserveError> {
+    /// Fallible counterpart to [`SpecialFallback::with_capacity_in`].
+    fn try_with_capacity_in(
+        capacity: usize,
+        bucket_size: usize,
+        alloc: A,
+    ) -> Result<Self, TryReserveError> {
         let bucket_count = if bucket_size == 0 {
             0
         } else {
             capacity.div_ceil(bucket_size)
         };
-        let table = RawTable::try_new(capacity).map_err(|()| TryReserveError::AllocError)?;
+        let table =
+            RawTable::try_new_in(capacity, alloc).map_err(|()| TryReserveError::AllocError)?;
         Ok(Self {
             table,
             len: 0,
@@ -305,7 +316,7 @@ impl<K, V> SpecialFallback<K, V> {
     }
 }
 
-impl<K, V> Drop for SpecialFallback<K, V> {
+impl<K, V, A: Allocator> Drop for SpecialFallback<K, V, A> {
     fn drop(&mut self) {
         for idx in 0..self.table.capacity() {
             if self.table.control_at(idx).is_occupied() {
@@ -318,35 +329,44 @@ impl<K, V> Drop for SpecialFallback<K, V> {
 /// Combines the special primary (probed first) and the special fallback
 /// (when primary hits its probe limit). Together they catch keys that
 /// overflowed every bucket level.
-struct SpecialArray<K, V> {
+struct SpecialArray<K, V, A: Allocator + Clone = Global> {
     /// Probed first; bounded by `primary_probe_limit`.
-    primary: SpecialPrimary<K, V>,
+    primary: SpecialPrimary<K, V, A>,
     /// Probed after primary hits its limit.
-    fallback: SpecialFallback<K, V>,
+    fallback: SpecialFallback<K, V, A>,
 }
 
-impl<K, V> SpecialArray<K, V> {
-    fn with_capacity(capacity: usize, primary_probe_limit: usize) -> Self {
+impl<K, V, A: Allocator + Clone> SpecialArray<K, V, A> {
+    fn with_capacity_in(capacity: usize, primary_probe_limit: usize, alloc: A) -> Self {
         let fallback_bucket_size = (2usize.saturating_mul(primary_probe_limit)).max(2);
         let primary_capacity = capacity.div_ceil(2);
         let fallback_capacity = capacity.saturating_sub(primary_capacity);
         Self {
-            primary: SpecialPrimary::with_capacity(primary_capacity),
-            fallback: SpecialFallback::with_capacity(fallback_capacity, fallback_bucket_size),
+            primary: SpecialPrimary::with_capacity_in(primary_capacity, alloc.clone()),
+            fallback: SpecialFallback::with_capacity_in(
+                fallback_capacity,
+                fallback_bucket_size,
+                alloc,
+            ),
         }
     }
 
-    /// Fallible counterpart to [`SpecialArray::with_capacity`].
-    fn try_with_capacity(
+    /// Fallible counterpart to [`SpecialArray::with_capacity_in`].
+    fn try_with_capacity_in(
         capacity: usize,
         primary_probe_limit: usize,
+        alloc: A,
     ) -> Result<Self, TryReserveError> {
         let fallback_bucket_size = (2usize.saturating_mul(primary_probe_limit)).max(2);
         let primary_capacity = capacity.div_ceil(2);
         let fallback_capacity = capacity.saturating_sub(primary_capacity);
         Ok(Self {
-            primary: SpecialPrimary::try_with_capacity(primary_capacity)?,
-            fallback: SpecialFallback::try_with_capacity(fallback_capacity, fallback_bucket_size)?,
+            primary: SpecialPrimary::try_with_capacity_in(primary_capacity, alloc.clone())?,
+            fallback: SpecialFallback::try_with_capacity_in(
+                fallback_capacity,
+                fallback_bucket_size,
+                alloc,
+            )?,
         })
     }
 }
@@ -379,11 +399,11 @@ enum LookupStep {
 /// `special.primary`, then `special.fallback`. Lookups follow the same
 /// order. The funnel structure trades a small probe budget per level for
 /// hard worst-case guarantees on lookup cost.
-pub struct FunnelHashMap<K, V> {
+pub struct FunnelHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     /// Bucket-grouped levels, each half the size of the previous.
-    levels: Vec<BucketLevel<K, V>>,
+    levels: Vec<BucketLevel<K, V, A>>,
     /// Overflow-catching tables (primary + fallback).
-    special: SpecialArray<K, V>,
+    special: SpecialArray<K, V, A>,
     /// Total live entries across levels + special.
     len: usize,
     /// Total slot count.
@@ -397,10 +417,14 @@ pub struct FunnelHashMap<K, V> {
     /// Highest level index ever written; bounds the lookup probe loop.
     max_populated_level: usize,
     /// Hash builder. Cloned across resizes to preserve probe sequences.
-    hash_builder: DefaultHashBuilder,
+    hash_builder: S,
+    /// Allocator used for all per-capacity allocations (tables, summaries).
+    alloc: A,
 }
 
-impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for FunnelHashMap<K, V> {
+impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug
+    for FunnelHashMap<K, V, S, A>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunnelHashMap")
             .field("len", &self.len)
@@ -410,7 +434,7 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for FunnelHashMap<K, V> {
     }
 }
 
-impl<K, V> Default for FunnelHashMap<K, V>
+impl<K, V> Default for FunnelHashMap<K, V, DefaultHashBuilder, Global>
 where
     K: Eq + Hash,
 {
@@ -419,7 +443,8 @@ where
     }
 }
 
-impl<K, V> FunnelHashMap<K, V>
+// Global allocator + default hasher constructors.
+impl<K, V> FunnelHashMap<K, V, DefaultHashBuilder, Global>
 where
     K: Eq + Hash,
 {
@@ -434,27 +459,87 @@ where
     }
 
     #[must_use]
-    pub fn with_hasher(hash_builder: DefaultHashBuilder) -> Self {
-        Self::with_options_and_hasher(FunnelOptions::default(), hash_builder)
-    }
-
-    #[must_use]
-    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: DefaultHashBuilder) -> Self {
-        Self::with_options_and_hasher(FunnelOptions::with_capacity(capacity), hash_builder)
-    }
-
-    #[must_use]
     pub fn with_options(options: FunnelOptions) -> Self {
-        Self::with_options_and_hasher(options, DefaultHashBuilder::default())
+        Self::with_options_and_hasher_in(options, DefaultHashBuilder::default(), Global)
+    }
+}
+
+// Global allocator + custom hasher constructors.
+impl<K, V, S> FunnelHashMap<K, V, S, Global>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    #[must_use]
+    pub fn with_hasher(hash_builder: S) -> Self {
+        Self::with_options_and_hasher_in(FunnelOptions::default(), hash_builder, Global)
+    }
+
+    #[must_use]
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
+        Self::with_options_and_hasher_in(
+            FunnelOptions::with_capacity(capacity),
+            hash_builder,
+            Global,
+        )
+    }
+
+    #[must_use]
+    pub fn with_options_and_hasher(options: FunnelOptions, hash_builder: S) -> Self {
+        Self::with_options_and_hasher_in(options, hash_builder, Global)
+    }
+}
+
+// Custom allocator + default hasher constructors.
+impl<K, V, A> FunnelHashMap<K, V, DefaultHashBuilder, A>
+where
+    K: Eq + Hash,
+    A: Allocator + Clone,
+{
+    #[must_use]
+    pub fn new_in(alloc: A) -> Self {
+        Self::with_options_and_hasher_in(
+            FunnelOptions::default(),
+            DefaultHashBuilder::default(),
+            alloc,
+        )
+    }
+
+    #[must_use]
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+        Self::with_options_and_hasher_in(
+            FunnelOptions::with_capacity(capacity),
+            DefaultHashBuilder::default(),
+            alloc,
+        )
+    }
+}
+
+impl<K, V, S, A> FunnelHashMap<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    #[must_use]
+    pub fn with_hasher_in(hash_builder: S, alloc: A) -> Self {
+        Self::with_options_and_hasher_in(FunnelOptions::default(), hash_builder, alloc)
+    }
+
+    #[must_use]
+    pub fn with_capacity_and_hasher_in(capacity: usize, hash_builder: S, alloc: A) -> Self {
+        Self::with_options_and_hasher_in(
+            FunnelOptions::with_capacity(capacity),
+            hash_builder,
+            alloc,
+        )
     }
 
     /// Full constructor. `resize` also calls this with the existing
-    /// `hash_builder` so all keys keep the same hash sequence across grows.
+    /// `hash_builder` and allocator so all keys keep the same hash sequence
+    /// across grows.
     #[must_use]
-    pub fn with_options_and_hasher(
-        options: FunnelOptions,
-        hash_builder: DefaultHashBuilder,
-    ) -> Self {
+    pub fn with_options_and_hasher_in(options: FunnelOptions, hash_builder: S, alloc: A) -> Self {
         let reserve_fraction =
             sanitize_reserve_fraction(options.reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
         let capacity = options.capacity;
@@ -482,11 +567,17 @@ where
             .into_iter()
             .enumerate()
             .map(|(level_idx, bucket_count)| {
-                BucketLevel::with_bucket_count(bucket_count, bucket_width, level_salt(level_idx))
+                BucketLevel::with_bucket_count_in(
+                    bucket_count,
+                    bucket_width,
+                    level_salt(level_idx),
+                    alloc.clone(),
+                )
             })
             .collect::<Vec<_>>();
 
-        let special = SpecialArray::with_capacity(special_capacity, primary_probe_limit);
+        let special =
+            SpecialArray::with_capacity_in(special_capacity, primary_probe_limit, alloc.clone());
 
         Self {
             levels,
@@ -498,7 +589,14 @@ where
             primary_probe_limit,
             max_populated_level: 0,
             hash_builder,
+            alloc,
         }
+    }
+
+    /// Reference to the map's allocator.
+    #[must_use]
+    pub fn allocator(&self) -> &A {
+        &self.alloc
     }
 
     #[must_use]
@@ -538,7 +636,10 @@ where
     ///
     /// [`TryReserveError::CapacityOverflow`] if `self.len + additional`
     /// overflows; [`TryReserveError::AllocError`] on allocator failure.
-    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
+    where
+        S: Clone,
+    {
         let needed = self
             .len
             .checked_add(additional)
@@ -771,9 +872,9 @@ where
         // SAFETY: locations are unique (checked above) and point to occupied
         // slots. Raw pointers let us hand out disjoint borrows into `levels`
         // / `special` without reborrowing the slices each iteration.
-        let levels_ptr: *mut BucketLevel<K, V> = self.levels.as_mut_ptr();
-        let primary_ptr: *mut SpecialPrimary<K, V> = &raw mut self.special.primary;
-        let fallback_ptr: *mut SpecialFallback<K, V> = &raw mut self.special.fallback;
+        let levels_ptr: *mut BucketLevel<K, V, A> = self.levels.as_mut_ptr();
+        let primary_ptr: *mut SpecialPrimary<K, V, A> = &raw mut self.special.primary;
+        let fallback_ptr: *mut SpecialFallback<K, V, A> = &raw mut self.special.fallback;
         let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
         let out_ptr = out.as_mut_ptr().cast::<&mut V>();
         for (i, loc) in locations.into_iter().enumerate() {
@@ -877,24 +978,24 @@ where
 
     /// Borrowing iterator over `&K`. Order matches [`Self::iter`].
     #[must_use]
-    pub fn keys(&self) -> Keys<'_, K, V> {
+    pub fn keys(&self) -> Keys<'_, K, V, A> {
         Keys::new(self.iter())
     }
 
     /// Borrowing iterator over `&V`. Order matches [`Self::iter`].
     #[must_use]
-    pub fn values(&self) -> Values<'_, K, V> {
+    pub fn values(&self) -> Values<'_, K, V, A> {
         Values::new(self.iter())
     }
 
     /// Reference to the map's [`BuildHasher`].
     #[must_use]
-    pub fn hasher(&self) -> &DefaultHashBuilder {
+    pub fn hasher(&self) -> &S {
         &self.hash_builder
     }
 
     #[must_use]
-    pub fn iter(&self) -> FunnelIter<'_, K, V> {
+    pub fn iter(&self) -> FunnelIter<'_, K, V, A> {
         FunnelIter {
             levels: &self.levels,
             primary: &self.special.primary,
@@ -906,7 +1007,7 @@ where
     }
 
     /// Mutable iterator yielding `(&K, &mut V)`. Mirrors `HashMap::iter_mut`.
-    pub fn iter_mut(&mut self) -> FunnelIterMut<'_, K, V> {
+    pub fn iter_mut(&mut self) -> FunnelIterMut<'_, K, V, A> {
         let levels_len = self.levels.len();
         let levels = self.levels.as_mut_ptr();
         let primary = ptr::from_mut(&mut self.special.primary);
@@ -924,7 +1025,7 @@ where
     }
 
     /// Mutable iterator yielding `&mut V`. Mirrors `HashMap::values_mut`.
-    pub fn values_mut(&mut self) -> FunnelValuesMut<'_, K, V> {
+    pub fn values_mut(&mut self) -> FunnelValuesMut<'_, K, V, A> {
         FunnelValuesMut {
             inner: self.iter_mut(),
         }
@@ -932,19 +1033,19 @@ where
 
     /// Consuming iterator yielding owned keys. Mirrors `HashMap::into_keys`.
     #[must_use]
-    pub fn into_keys(self) -> FunnelIntoKeys<K, V> {
+    pub fn into_keys(self) -> FunnelIntoKeys<K, V, S, A> {
         FunnelIntoKeys::new(self.into_iter())
     }
 
     /// Consuming iterator yielding owned values. Mirrors `HashMap::into_values`.
     #[must_use]
-    pub fn into_values(self) -> FunnelIntoValues<K, V> {
+    pub fn into_values(self) -> FunnelIntoValues<K, V, S, A> {
         FunnelIntoValues::new(self.into_iter())
     }
 
     /// Returns an [`Entry`] for in-place manipulation of `key`'s slot.
     /// Mirrors [`std::collections::HashMap::entry`].
-    pub fn entry(&mut self, key: K) -> Entry<'_, K, V> {
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, S, A> {
         let key_hash = self.hash_key(&key);
         let key_fingerprint = ControlOps::control_fingerprint(key_hash);
         if let Some(location) = self.find_slot_location_with_hash(&key, key_hash, key_fingerprint) {
@@ -967,7 +1068,11 @@ where
     /// # Errors
     ///
     /// Returns [`OccupiedError`] if `key` was already present.
-    pub fn try_insert(&mut self, key: K, value: V) -> Result<&mut V, OccupiedError<'_, K, V>> {
+    pub fn try_insert(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> Result<&mut V, OccupiedError<'_, K, V, S, A>> {
         match self.entry(key) {
             Entry::Occupied(entry) => Err(OccupiedError { entry, value }),
             Entry::Vacant(entry) => Ok(entry.insert(value)),
@@ -1014,7 +1119,7 @@ where
 
     /// Returns a draining iterator that empties the map. Mirrors
     /// [`std::collections::HashMap::drain`].
-    pub fn drain(&mut self) -> Drain<'_, K, V> {
+    pub fn drain(&mut self) -> Drain<'_, K, V, S, A> {
         Drain {
             map: self,
             phase: DrainPhase::Levels,
@@ -1026,7 +1131,7 @@ where
     /// Yields and removes `(K, V)` pairs where `f` returned `true`; kept
     /// entries remain in the map. Mirrors
     /// [`std::collections::HashMap::extract_if`].
-    pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, K, V, F>
+    pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, K, V, F, S, A>
     where
         F: FnMut(&K, &mut V) -> bool,
     {
@@ -1092,15 +1197,19 @@ where
 
     /// Fallible counterpart to [`Self::resize`]. Allocates the new map
     /// before touching `self`, so `Err` leaves the map intact.
-    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError> {
+    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
+    where
+        S: Clone,
+    {
         let hash_builder = self.hash_builder.clone();
-        let mut new_map = Self::try_with_options_and_hasher(
+        let mut new_map = Self::try_with_options_and_hasher_in(
             FunnelOptions {
                 capacity: new_capacity,
                 reserve_fraction: self.reserve_fraction,
                 primary_probe_limit: Some(self.primary_probe_limit),
             },
             hash_builder,
+            self.alloc.clone(),
         )?;
 
         for level in &mut self.levels {
@@ -1142,11 +1251,12 @@ where
         Ok(())
     }
 
-    /// Fallible counterpart to [`Self::with_options_and_hasher`]. Returns
+    /// Fallible counterpart to [`Self::with_options_and_hasher_in`]. Returns
     /// `Err(TryReserveError::AllocError)` if any backing allocation fails.
-    fn try_with_options_and_hasher(
+    fn try_with_options_and_hasher_in(
         options: FunnelOptions,
-        hash_builder: DefaultHashBuilder,
+        hash_builder: S,
+        alloc: A,
     ) -> Result<Self, TryReserveError> {
         let reserve_fraction =
             sanitize_reserve_fraction(options.reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
@@ -1171,19 +1281,24 @@ where
 
         let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
         let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
-        let mut levels: Vec<BucketLevel<K, V>> = Vec::new();
+        let mut levels: Vec<BucketLevel<K, V, A>> = Vec::new();
         levels
             .try_reserve_exact(level_bucket_counts.len())
             .map_err(|_| TryReserveError::AllocError)?;
         for (level_idx, bucket_count) in level_bucket_counts.into_iter().enumerate() {
-            levels.push(BucketLevel::try_with_bucket_count(
+            levels.push(BucketLevel::try_with_bucket_count_in(
                 bucket_count,
                 bucket_width,
                 level_salt(level_idx),
+                alloc.clone(),
             )?);
         }
 
-        let special = SpecialArray::try_with_capacity(special_capacity, primary_probe_limit)?;
+        let special = SpecialArray::try_with_capacity_in(
+            special_capacity,
+            primary_probe_limit,
+            alloc.clone(),
+        )?;
 
         Ok(Self {
             levels,
@@ -1195,12 +1310,13 @@ where
             primary_probe_limit,
             max_populated_level: 0,
             hash_builder,
+            alloc,
         })
     }
 
-    /// Drain all live entries (across levels + special), build a fresh map
-    /// at `new_capacity`, reinsert. Also serves as a no-grow rehash when
-    /// called with the current capacity.
+    /// Drain all live entries (across levels + special), rebuild levels +
+    /// special in-place at `new_capacity`, reinsert. Also serves as a
+    /// no-grow rehash when called with the current capacity.
     fn resize(&mut self, new_capacity: usize) {
         let mut entries = Vec::with_capacity(self.len);
 
@@ -1237,24 +1353,46 @@ where
         self.special.fallback.len = 0;
         self.special.fallback.tombstones = 0;
 
-        self.len = 0;
-        self.max_populated_level = 0;
-
-        let hash_builder = mem::take(&mut self.hash_builder);
-        let mut new_map = Self::with_options_and_hasher(
-            FunnelOptions {
-                capacity: new_capacity,
-                reserve_fraction: self.reserve_fraction,
-                primary_probe_limit: Some(self.primary_probe_limit),
-            },
-            hash_builder,
+        let level_count = compute_level_count(self.reserve_fraction);
+        let bucket_width = round_up_to_group(compute_bucket_width(self.reserve_fraction));
+        let mut special_capacity =
+            choose_special_capacity(new_capacity, self.reserve_fraction, bucket_width);
+        let mut main_capacity = new_capacity.saturating_sub(special_capacity);
+        let main_remainder = main_capacity % bucket_width.max(1);
+        if main_remainder != 0 {
+            main_capacity = main_capacity.saturating_sub(main_remainder);
+            special_capacity = new_capacity.saturating_sub(main_capacity);
+        }
+        let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
+        let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
+        let new_levels = level_bucket_counts
+            .into_iter()
+            .enumerate()
+            .map(|(level_idx, bucket_count)| {
+                BucketLevel::with_bucket_count_in(
+                    bucket_count,
+                    bucket_width,
+                    level_salt(level_idx),
+                    self.alloc.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let new_special = SpecialArray::with_capacity_in(
+            special_capacity,
+            self.primary_probe_limit,
+            self.alloc.clone(),
         );
 
-        for (key, value) in entries {
-            new_map.insert_new_entry_unchecked(key, value);
-        }
+        self.levels = new_levels;
+        self.special = new_special;
+        self.capacity = new_capacity;
+        self.max_insertions = max_insertions(new_capacity, self.reserve_fraction);
+        self.max_populated_level = 0;
+        self.len = 0;
 
-        *self = new_map;
+        for (key, value) in entries {
+            self.insert_new_entry_unchecked(key, value);
+        }
     }
 
     #[inline]
@@ -1464,7 +1602,7 @@ where
         self.len += 1;
     }
 
-    fn first_free_in_level_bucket(key_hash: u64, level: &BucketLevel<K, V>) -> Option<usize> {
+    fn first_free_in_level_bucket(key_hash: u64, level: &BucketLevel<K, V, A>) -> Option<usize> {
         if level.len >= level.capacity() || level.bucket_count == 0 {
             return None;
         }
@@ -1529,7 +1667,7 @@ where
 
     #[inline]
     fn first_free_in_special_primary_group(
-        primary: &SpecialPrimary<K, V>,
+        primary: &SpecialPrimary<K, V, A>,
         group_idx: usize,
     ) -> Option<usize> {
         primary.table.first_free_in_group(group_idx)
@@ -1539,7 +1677,7 @@ where
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
-        level: &BucketLevel<K, V>,
+        level: &BucketLevel<K, V, A>,
     ) -> LookupStep
     where
         K: Borrow<Q>,
@@ -1586,7 +1724,7 @@ where
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
-        level: &BucketLevel<K, V>,
+        level: &BucketLevel<K, V, A>,
     ) -> (LookupStep, Option<usize>)
     where
         K: Borrow<Q>,
@@ -1905,22 +2043,24 @@ where
 
 /// A view into a single entry in a [`FunnelHashMap`], which may be either
 /// vacant or occupied. Constructed via [`FunnelHashMap::entry`].
-pub enum Entry<'a, K: 'a, V: 'a> {
+pub enum Entry<'a, K: 'a, V: 'a, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     /// Slot is occupied; key already lives in the map.
-    Occupied(OccupiedEntry<'a, K, V>),
+    Occupied(OccupiedEntry<'a, K, V, S, A>),
     /// Slot is vacant; the supplied key does not exist in the map yet.
-    Vacant(VacantEntry<'a, K, V>),
+    Vacant(VacantEntry<'a, K, V, S, A>),
 }
 
 /// View of an occupied entry in a [`FunnelHashMap`].
-pub struct OccupiedEntry<'a, K, V> {
-    map: &'a mut FunnelHashMap<K, V>,
+pub struct OccupiedEntry<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
+    map: &'a mut FunnelHashMap<K, V, S, A>,
     location: SlotLocation,
 }
 
-impl<'a, K, V> OccupiedEntry<'a, K, V>
+impl<'a, K, V, S, A> OccupiedEntry<'a, K, V, S, A>
 where
     K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
 {
     /// Returns a reference to the entry's key.
     #[must_use]
@@ -2048,15 +2188,17 @@ where
 }
 
 /// View of a vacant entry in a [`FunnelHashMap`].
-pub struct VacantEntry<'a, K, V> {
-    map: &'a mut FunnelHashMap<K, V>,
+pub struct VacantEntry<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
+    map: &'a mut FunnelHashMap<K, V, S, A>,
     key: K,
     key_hash: u64,
 }
 
-impl<'a, K, V> VacantEntry<'a, K, V>
+impl<'a, K, V, S, A> VacantEntry<'a, K, V, S, A>
 where
     K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
 {
     /// Returns a reference to the key that would be inserted.
     pub fn key(&self) -> &K {
@@ -2089,9 +2231,11 @@ where
     }
 }
 
-impl<'a, K, V> Entry<'a, K, V>
+impl<'a, K, V, S, A> Entry<'a, K, V, S, A>
 where
     K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
 {
     /// Returns a mutable reference to the entry's value, inserting `default`
     /// first if vacant.
@@ -2144,9 +2288,11 @@ where
     }
 }
 
-impl<'a, K, V> Entry<'a, K, V>
+impl<'a, K, V, S, A> Entry<'a, K, V, S, A>
 where
     K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
     V: Default,
 {
     /// Returns a mutable reference to the value, inserting `V::default()`
@@ -2160,11 +2306,14 @@ where
 }
 
 /// Error returned by [`FunnelHashMap::try_insert`] on key collision.
-pub type OccupiedError<'a, K, V> = CommonOccupiedError<OccupiedEntry<'a, K, V>, V>;
+pub type OccupiedError<'a, K, V, S = DefaultHashBuilder, A = Global> =
+    CommonOccupiedError<OccupiedEntry<'a, K, V, S, A>, V>;
 
-impl<K, V> EntryView for OccupiedEntry<'_, K, V>
+impl<K, V, S, A> EntryView for OccupiedEntry<'_, K, V, S, A>
 where
     K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
 {
     type Key = K;
     type Value = V;
@@ -2190,16 +2339,16 @@ enum FunnelIterPhase {
 /// Visits each region in funnel order: bucket levels → special primary → special fallback.
 /// Skips FREE and TOMBSTONE control bytes.
 #[derive(Clone)]
-pub struct FunnelIter<'a, K, V> {
-    levels: &'a [BucketLevel<K, V>],
-    primary: &'a SpecialPrimary<K, V>,
-    fallback: &'a SpecialFallback<K, V>,
+pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
+    levels: &'a [BucketLevel<K, V, A>],
+    primary: &'a SpecialPrimary<K, V, A>,
+    fallback: &'a SpecialFallback<K, V, A>,
     phase: FunnelIterPhase,
     level_idx: usize,
     slot_idx: usize,
 }
 
-impl<K, V> fmt::Debug for FunnelIter<'_, K, V> {
+impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelIter<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunnelIter")
             .field("phase", &self.phase)
@@ -2209,7 +2358,7 @@ impl<K, V> fmt::Debug for FunnelIter<'_, K, V> {
     }
 }
 
-impl<'a, K, V> Iterator for FunnelIter<'a, K, V> {
+impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2263,14 +2412,16 @@ impl<'a, K, V> Iterator for FunnelIter<'a, K, V> {
     }
 }
 
-impl<K, V> FusedIterator for FunnelIter<'_, K, V> {}
+impl<K, V, A: Allocator + Clone> FusedIterator for FunnelIter<'_, K, V, A> {}
 
-impl<'a, K, V> IntoIterator for &'a FunnelHashMap<K, V>
+impl<'a, K, V, S, A> IntoIterator for &'a FunnelHashMap<K, V, S, A>
 where
     K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
 {
     type Item = (&'a K, &'a V);
-    type IntoIter = FunnelIter<'a, K, V>;
+    type IntoIter = FunnelIter<'a, K, V, A>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -2290,20 +2441,20 @@ enum DrainPhase {
 /// Draining iterator. Yields and removes every `(K, V)` entry; the map is
 /// empty once the iterator is consumed or dropped. Returned by
 /// [`FunnelHashMap::drain`].
-pub struct Drain<'a, K, V> {
-    map: &'a mut FunnelHashMap<K, V>,
+pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
+    map: &'a mut FunnelHashMap<K, V, S, A>,
     phase: DrainPhase,
     level_idx: usize,
     slot_idx: usize,
 }
 
-impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Drain<'_, K, V> {
+impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Drain").finish_non_exhaustive()
     }
 }
 
-impl<K, V> Iterator for Drain<'_, K, V> {
+impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2373,10 +2524,10 @@ impl<K, V> Iterator for Drain<'_, K, V> {
     }
 }
 
-impl<K, V> ExactSizeIterator for Drain<'_, K, V> {}
-impl<K, V> FusedIterator for Drain<'_, K, V> {}
+impl<K, V, S, A: Allocator + Clone> ExactSizeIterator for Drain<'_, K, V, S, A> {}
+impl<K, V, S, A: Allocator + Clone> FusedIterator for Drain<'_, K, V, S, A> {}
 
-impl<K, V> Drop for Drain<'_, K, V> {
+impl<K, V, S, A: Allocator + Clone> Drop for Drain<'_, K, V, S, A> {
     fn drop(&mut self) {
         // Drain any unyielded entries so values run their `Drop`.
         for _ in &mut *self {}
@@ -2401,21 +2552,23 @@ impl<K, V> Drop for Drain<'_, K, V> {
 /// Filtering drain. Yields and removes entries for which the predicate
 /// returns `true`; the rest stay in the map. Returned by
 /// [`FunnelHashMap::extract_if`].
-pub struct ExtractIf<'a, K, V, F>
+pub struct ExtractIf<'a, K, V, F, S = DefaultHashBuilder, A: Allocator + Clone = Global>
 where
     K: Eq + Hash,
+    S: BuildHasher,
     F: FnMut(&K, &mut V) -> bool,
 {
-    map: &'a mut FunnelHashMap<K, V>,
+    map: &'a mut FunnelHashMap<K, V, S, A>,
     pred: F,
     phase: DrainPhase,
     level_idx: usize,
     slot_idx: usize,
 }
 
-impl<K, V, F> fmt::Debug for ExtractIf<'_, K, V, F>
+impl<K, V, F, S, A: Allocator + Clone> fmt::Debug for ExtractIf<'_, K, V, F, S, A>
 where
     K: Eq + Hash,
+    S: BuildHasher,
     F: FnMut(&K, &mut V) -> bool,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2423,9 +2576,10 @@ where
     }
 }
 
-impl<K, V, F> Iterator for ExtractIf<'_, K, V, F>
+impl<K, V, F, S, A: Allocator + Clone> Iterator for ExtractIf<'_, K, V, F, S, A>
 where
     K: Eq + Hash,
+    S: BuildHasher,
     F: FnMut(&K, &mut V) -> bool,
 {
     type Item = (K, V);
@@ -2509,9 +2663,10 @@ where
     }
 }
 
-impl<K, V, F> Drop for ExtractIf<'_, K, V, F>
+impl<K, V, F, S, A: Allocator + Clone> Drop for ExtractIf<'_, K, V, F, S, A>
 where
     K: Eq + Hash,
+    S: BuildHasher,
     F: FnMut(&K, &mut V) -> bool,
 {
     fn drop(&mut self) {
@@ -2522,9 +2677,9 @@ where
 }
 
 /// `&K` iterator returned by [`FunnelHashMap::keys`].
-pub type Keys<'a, K, V> = CommonKeys<FunnelIter<'a, K, V>>;
+pub type Keys<'a, K, V, A = Global> = CommonKeys<FunnelIter<'a, K, V, A>>;
 /// `&V` iterator returned by [`FunnelHashMap::values`].
-pub type Values<'a, K, V> = CommonValues<FunnelIter<'a, K, V>>;
+pub type Values<'a, K, V, A = Global> = CommonValues<FunnelIter<'a, K, V, A>>;
 
 /// `(&K, &mut V)` iterator. Visits bucket levels → special primary →
 /// special fallback. Skips FREE / TOMBSTONE.
@@ -2532,23 +2687,23 @@ pub type Values<'a, K, V> = CommonValues<FunnelIter<'a, K, V>>;
 /// SAFETY: raw pointers to each region + `PhantomData<&'a mut FunnelHashMap>`
 /// tie the iterator to the map's exclusive borrow. Each `next()` returns a
 /// borrow of a strictly newer slot ⇒ disjoint.
-pub struct FunnelIterMut<'a, K, V> {
-    levels: *mut BucketLevel<K, V>,
+pub struct FunnelIterMut<'a, K, V, A: Allocator + Clone = Global> {
+    levels: *mut BucketLevel<K, V, A>,
     levels_len: usize,
-    primary: *mut SpecialPrimary<K, V>,
-    fallback: *mut SpecialFallback<K, V>,
+    primary: *mut SpecialPrimary<K, V, A>,
+    fallback: *mut SpecialFallback<K, V, A>,
     phase: FunnelIterPhase,
     level_idx: usize,
     slot_idx: usize,
-    _marker: PhantomData<&'a mut FunnelHashMap<K, V>>,
+    _marker: PhantomData<&'a mut SpecialArray<K, V, A>>,
 }
 
 // SAFETY: `FunnelIterMut` acts as an exclusive borrow of the underlying
-// map regions for its lifetime, matching `&mut FunnelHashMap<K, V>`.
-unsafe impl<K: Send, V: Send> Send for FunnelIterMut<'_, K, V> {}
-unsafe impl<K: Sync, V: Sync> Sync for FunnelIterMut<'_, K, V> {}
+// map regions for its lifetime, matching `&mut FunnelHashMap<K, V, S, A>`.
+unsafe impl<K: Send, V: Send, A: Allocator + Clone + Send> Send for FunnelIterMut<'_, K, V, A> {}
+unsafe impl<K: Sync, V: Sync, A: Allocator + Clone + Sync> Sync for FunnelIterMut<'_, K, V, A> {}
 
-impl<'a, K, V> Iterator for FunnelIterMut<'a, K, V> {
+impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
     type Item = (&'a K, &'a mut V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2626,7 +2781,7 @@ impl<'a, K, V> Iterator for FunnelIterMut<'a, K, V> {
     }
 }
 
-impl<K, V> fmt::Debug for FunnelIterMut<'_, K, V> {
+impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelIterMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunnelIterMut")
             .field("level_idx", &self.level_idx)
@@ -2635,12 +2790,14 @@ impl<K, V> fmt::Debug for FunnelIterMut<'_, K, V> {
     }
 }
 
-impl<'a, K, V> IntoIterator for &'a mut FunnelHashMap<K, V>
+impl<'a, K, V, S, A> IntoIterator for &'a mut FunnelHashMap<K, V, S, A>
 where
     K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
 {
     type Item = (&'a K, &'a mut V);
-    type IntoIter = FunnelIterMut<'a, K, V>;
+    type IntoIter = FunnelIterMut<'a, K, V, A>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
@@ -2648,11 +2805,11 @@ where
 }
 
 /// `&mut V` iterator returned by [`FunnelHashMap::values_mut`].
-pub struct FunnelValuesMut<'a, K, V> {
-    inner: FunnelIterMut<'a, K, V>,
+pub struct FunnelValuesMut<'a, K, V, A: Allocator + Clone = Global> {
+    inner: FunnelIterMut<'a, K, V, A>,
 }
 
-impl<'a, K, V> Iterator for FunnelValuesMut<'a, K, V> {
+impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelValuesMut<'a, K, V, A> {
     type Item = &'a mut V;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2660,7 +2817,7 @@ impl<'a, K, V> Iterator for FunnelValuesMut<'a, K, V> {
     }
 }
 
-impl<K, V> fmt::Debug for FunnelValuesMut<'_, K, V> {
+impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelValuesMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunnelValuesMut")
             .field("level_idx", &self.inner.level_idx)
@@ -2673,14 +2830,14 @@ impl<K, V> fmt::Debug for FunnelValuesMut<'_, K, V> {
 ///
 /// SAFETY: each yielded slot is immediately tombstoned, so the map's
 /// `Drop` never revisits it. `Drop` drains the remainder per std semantics.
-pub struct FunnelIntoIter<K, V> {
-    map: FunnelHashMap<K, V>,
+pub struct FunnelIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
+    map: FunnelHashMap<K, V, S, A>,
     phase: FunnelIterPhase,
     level_idx: usize,
     slot_idx: usize,
 }
 
-impl<K, V> Iterator for FunnelIntoIter<K, V> {
+impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2745,9 +2902,9 @@ impl<K, V> Iterator for FunnelIntoIter<K, V> {
     }
 }
 
-impl<K, V> FusedIterator for FunnelIntoIter<K, V> {}
+impl<K, V, S, A: Allocator + Clone> FusedIterator for FunnelIntoIter<K, V, S, A> {}
 
-impl<K, V> Drop for FunnelIntoIter<K, V> {
+impl<K, V, S, A: Allocator + Clone> Drop for FunnelIntoIter<K, V, S, A> {
     fn drop(&mut self) {
         // Drain the remainder so each owned `(K, V)` runs its `Drop`. After
         // this, the map's own `Drop` finds only tombstones and is a no-op
@@ -2756,7 +2913,7 @@ impl<K, V> Drop for FunnelIntoIter<K, V> {
     }
 }
 
-impl<K, V> fmt::Debug for FunnelIntoIter<K, V> {
+impl<K, V, S, A: Allocator + Clone> fmt::Debug for FunnelIntoIter<K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FunnelIntoIter")
             .field("level_idx", &self.level_idx)
@@ -2765,12 +2922,14 @@ impl<K, V> fmt::Debug for FunnelIntoIter<K, V> {
     }
 }
 
-impl<K, V> IntoIterator for FunnelHashMap<K, V>
+impl<K, V, S, A> IntoIterator for FunnelHashMap<K, V, S, A>
 where
     K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
 {
     type Item = (K, V);
-    type IntoIter = FunnelIntoIter<K, V>;
+    type IntoIter = FunnelIntoIter<K, V, S, A>;
 
     fn into_iter(self) -> Self::IntoIter {
         FunnelIntoIter {
@@ -2783,9 +2942,11 @@ where
 }
 
 /// Owned `K` iterator returned by [`FunnelHashMap::into_keys`].
-pub type FunnelIntoKeys<K, V> = CommonIntoKeys<FunnelIntoIter<K, V>>;
+pub type FunnelIntoKeys<K, V, S = DefaultHashBuilder, A = Global> =
+    CommonIntoKeys<FunnelIntoIter<K, V, S, A>>;
 /// Owned `V` iterator returned by [`FunnelHashMap::into_values`].
-pub type FunnelIntoValues<K, V> = CommonIntoValues<FunnelIntoIter<K, V>>;
+pub type FunnelIntoValues<K, V, S = DefaultHashBuilder, A = Global> =
+    CommonIntoValues<FunnelIntoIter<K, V, S, A>>;
 
 /// Number of bucket levels for a given reserve fraction. Tighter reserve →
 /// more levels (more probing budget per insert).

@@ -39,7 +39,7 @@ jobs:
         with:
           components: clippy
       - name: Clippy
-        run: cargo clippy --all-features -- -W clippy::pedantic
+        run: cargo clippy --features python -- -W clippy::pedantic
       - name: Test
         run: cargo test
 

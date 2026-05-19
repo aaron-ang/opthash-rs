@@ -1,17 +1,21 @@
-use std::alloc::{self, Layout};
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
+
+use allocator_api2::alloc::{Allocator, Global, Layout, handle_alloc_error};
+use allocator_api2::boxed::Box;
+use allocator_api2::vec::Vec;
 
 use super::TryReserveError;
 use super::bitmask::BitMask;
 use super::math::round_up_to_group;
 use super::simd::{eq_mask_16, free_mask_16};
 
-/// Fallibly allocates a zero-filled `Box<[T]>`.
-pub(crate) fn try_zeroed_boxed_slice<T: Default + Clone>(
+/// Fallibly allocates a zero-filled `Box<[T], A>` in `alloc`.
+pub(crate) fn try_zeroed_boxed_slice_in<T: Default + Clone, A: Allocator>(
     len: usize,
-) -> Result<Box<[T]>, TryReserveError> {
-    let mut buf: Vec<T> = Vec::new();
+    alloc: A,
+) -> Result<Box<[T], A>, TryReserveError> {
+    let mut buf: Vec<T, A> = Vec::new_in(alloc);
     buf.try_reserve_exact(len)
         .map_err(|_| TryReserveError::AllocError)?;
     buf.resize(len, T::default());
@@ -37,21 +41,22 @@ pub(crate) struct Entry<K, V> {
 ///
 /// `data_ptr` points to the start of the slots array. Control bytes live at
 /// a fixed offset after the slots, accessed via `ctrl_ptr()`.
-pub(crate) struct RawTable<T> {
+pub(crate) struct RawTable<T, A: Allocator = Global> {
     data_ptr: NonNull<u8>,
     capacity: usize,
     group_count: usize,
     ctrl_offset: usize,
+    alloc: A,
     _marker: PhantomData<T>,
 }
 
-// SAFETY: RawTable<T> owns its allocation exclusively; data_ptr is not aliased.
-// Sending across threads is sound when T: Send (same as Box<[T]>). Sync requires
-// T: Sync because shared &RawTable<T> can hand out shared &T via get_ref.
-unsafe impl<T: Send> Send for RawTable<T> {}
-unsafe impl<T: Sync> Sync for RawTable<T> {}
+// SAFETY: RawTable<T, A> owns its allocation exclusively; data_ptr is not aliased.
+// Sending across threads is sound when T: Send and A: Send. Sync requires T: Sync
+// because shared &RawTable<T, A> can hand out shared &T via get_ref.
+unsafe impl<T: Send, A: Allocator + Send> Send for RawTable<T, A> {}
+unsafe impl<T: Sync, A: Allocator + Sync> Sync for RawTable<T, A> {}
 
-impl<T> std::fmt::Debug for RawTable<T> {
+impl<T, A: Allocator> std::fmt::Debug for RawTable<T, A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RawTable")
             .field("capacity", &self.capacity)
@@ -60,67 +65,71 @@ impl<T> std::fmt::Debug for RawTable<T> {
     }
 }
 
-impl<T> Drop for RawTable<T> {
+impl<T, A: Allocator> Drop for RawTable<T, A> {
     fn drop(&mut self) {
         if self.capacity > 0 {
             let (layout, _) = Self::unified_layout(self.capacity, self.group_count);
-            unsafe { alloc::dealloc(self.data_ptr.as_ptr(), layout) };
+            unsafe { self.alloc.deallocate(self.data_ptr, layout) };
         }
     }
 }
 
-impl<T> RawTable<T> {
-    pub fn new(capacity: usize) -> Self {
+impl<T, A: Allocator> RawTable<T, A> {
+    pub fn new_in(capacity: usize, alloc: A) -> Self {
         if capacity == 0 {
-            return Self::empty();
+            return Self::empty_in(alloc);
         }
 
         let padded_capacity = round_up_to_group(capacity);
         let group_count = padded_capacity / GROUP_SIZE;
         let (layout, ctrl_offset) = Self::unified_layout(capacity, group_count);
 
-        let raw = unsafe { alloc::alloc_zeroed(layout) };
-        let data_ptr = NonNull::new(raw).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        let data_ptr = alloc
+            .allocate_zeroed(layout)
+            .unwrap_or_else(|_| handle_alloc_error(layout))
+            .cast::<u8>();
 
         Self {
             data_ptr,
             capacity,
             group_count,
             ctrl_offset,
+            alloc,
             _marker: PhantomData,
         }
     }
 
-    /// Fallible counterpart to [`RawTable::new`]. Returns `Err(())` on layout
+    /// Fallible counterpart to [`RawTable::new_in`]. Returns `Err(())` on layout
     /// overflow or allocator failure; used by `try_reserve`.
-    pub fn try_new(capacity: usize) -> Result<Self, ()> {
+    pub fn try_new_in(capacity: usize, alloc: A) -> Result<Self, ()> {
         if capacity == 0 {
-            return Ok(Self::empty());
+            return Ok(Self::empty_in(alloc));
         }
 
         let padded_capacity = round_up_to_group(capacity);
         let group_count = padded_capacity / GROUP_SIZE;
         let (layout, ctrl_offset) = Self::try_unified_layout(capacity, group_count).ok_or(())?;
 
-        let raw = unsafe { alloc::alloc_zeroed(layout) };
-        let data_ptr = NonNull::new(raw).ok_or(())?;
+        let data_ptr = alloc.allocate_zeroed(layout).map_err(|_| ())?.cast::<u8>();
 
         Ok(Self {
             data_ptr,
             capacity,
             group_count,
             ctrl_offset,
+            alloc,
             _marker: PhantomData,
         })
     }
 
     #[inline]
-    fn empty() -> Self {
+    fn empty_in(alloc: A) -> Self {
         Self {
             data_ptr: NonNull::dangling(),
             capacity: 0,
             group_count: 0,
             ctrl_offset: 0,
+            alloc,
             _marker: PhantomData,
         }
     }

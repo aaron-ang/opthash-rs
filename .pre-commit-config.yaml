@@ -34,7 +34,7 @@ repos:
     hooks:
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --all-features -- -W clippy::pedantic -D warnings
+        entry: cargo clippy --features python -- -W clippy::pedantic -D warnings
         language: system
         types: [rust]
         pass_filenames: false

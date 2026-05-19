@@ -7,6 +7,8 @@ pub(crate) mod layout;
 pub(crate) mod math;
 pub(crate) mod simd;
 
+pub use allocator_api2::alloc::{Allocator, Global};
+
 pub type DefaultHashBuilder = foldhash::fast::RandomState;
 
 /// Error returned by `try_reserve` when the map can't grow.
@@ -31,11 +33,12 @@ impl std::error::Error for TryReserveError {}
 
 #[cfg(test)]
 mod tests {
+    use super::Global;
     use super::layout::RawTable;
 
     #[test]
     fn group_masks_work_on_full_groups() {
-        let mut table: RawTable<u64> = RawTable::new(32);
+        let mut table: RawTable<u64> = RawTable::new_in(32, Global);
         table.set_control(16, 11);
         assert_eq!(table.group_match_mask(1, 11).lowest(), Some(0));
         assert!(table.group_free_mask(1).any());

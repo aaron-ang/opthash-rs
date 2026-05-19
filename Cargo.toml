@@ -26,8 +26,10 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 python = ["dep:pyo3"]
+nightly = ["allocator-api2/nightly", "hashbrown/nightly"]
 
 [dependencies]
+allocator-api2 = { version = "0.2", default-features = false, features = ["alloc"] }
 foldhash = "0.2"
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"], optional = true }
 

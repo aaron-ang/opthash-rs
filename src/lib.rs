@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "nightly", feature(allocator_api))]
+
 mod common;
 mod elastic;
 mod funnel;
