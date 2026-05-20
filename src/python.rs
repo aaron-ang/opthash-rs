@@ -65,9 +65,8 @@ fn build_funnel_options(
     Ok(opts)
 }
 
-/// Python type tag, packed into the low bit of `HashedAny::tagged` to
-/// short-circuit the str-vs-str fast path in `HashedAny::eq`. Only 1 bit is
-/// used so the trick works on both 32- and 64-bit `PyObject*` alignment.
+/// Type tag packed into `HashedAny::tagged`'s low bit so `PartialEq` can
+/// hit the str-vs-str fast path without re-running `Py_TYPE`.
 #[derive(Clone, Copy, PartialEq)]
 #[repr(usize)]
 enum HashKind {
@@ -77,47 +76,38 @@ enum HashKind {
 
 const KIND_MASK: usize = 0b1;
 
-/// Owning hashable wrapper around a `Py<PyAny>` used as a map key.
-///
-/// Caches `__hash__` so `Hash` is a single `write_isize`, and packs
-/// `HashKind` into the low bits of the object pointer so `PartialEq` can
-/// take the str-bytes fast path without re-detecting the type. Layout is
-/// `{pointer, isize}` — 16B on 64-bit (vs. 24B with a separate `kind` byte).
+/// Owning hashable wrapper for a `Py<PyAny>` map key. Caches `__hash__`
+/// and tag-packs `HashKind` into the pointer's low bit; 16B on 64-bit.
 struct HashedAny {
-    /// Owned `PyObject*` with the `HashKind` tag in bits covered by
-    /// `KIND_MASK`. `Drop` calls `Py_DECREF` on the masked pointer.
+    /// `PyObject*` OR'd with `HashKind`. `Drop` calls `Py_DECREF` on the masked pointer.
     tagged: NonNull<ffi::PyObject>,
     /// Cached `__hash__` result.
     hash: isize,
 }
 
-// SAFETY: same invariant as `Py<PyAny>` (which is `Send + Sync`): we own one
-// strong reference, refcount changes go through atomic `Py_INCREF` /
-// `Py_DECREF`, and the pointee is only dereferenced under `Python::attach`.
+// SAFETY: matches `Py<PyAny>` — atomic refcount, derefs only under `Python::attach`.
 unsafe impl Send for HashedAny {}
 unsafe impl Sync for HashedAny {}
 
-// Compact layout: {pointer, isize}, no padding. 16B on 64-bit, 8B on 32-bit.
 const _: () = assert!(std::mem::size_of::<HashedAny>() == 2 * std::mem::size_of::<usize>());
 
 impl HashedAny {
-    /// Pack `obj` and `kind` into a tagged `NonNull`. Does not touch the
-    /// refcount.
+    /// Tag-pack `obj` with `kind`. No refcount change.
     ///
     /// # Safety
-    /// `obj` must be non-null and its `KIND_MASK` bits must be zero —
-    /// `CPython` guarantees this since `PyObject` starts with a `Py_ssize_t`.
+    /// `obj` must be non-null with `KIND_MASK` bits zero (`CPython` guarantees
+    /// this since `PyObject` starts with a `Py_ssize_t`).
     #[inline]
     unsafe fn pack(obj: *mut ffi::PyObject, kind: HashKind) -> NonNull<ffi::PyObject> {
         assert!(!obj.is_null(), "PyObject pointer must be non-null");
-        // Runtime (not debug) assert: cold path, and silent corruption of a
-        // misaligned pointer would be far worse than one extra `cmp+jne`.
+        // Runtime (not debug) assert: silent pointer corruption is worse than
+        // one extra cmp+jne in this cold path.
         assert_eq!(
             obj as usize & KIND_MASK,
             0,
             "PyObject* low bits must be zero for tag packing"
         );
-        // SAFETY: `obj` is non-null and ORing in tag bits keeps it non-null.
+        // SAFETY: `obj` is non-null; ORing tag bits keeps it non-null.
         unsafe { NonNull::new_unchecked(((obj as usize) | (kind as usize)) as *mut ffi::PyObject) }
     }
 
@@ -133,10 +123,9 @@ impl HashedAny {
         }
     }
 
-    /// Build by computing `__hash__` once and bumping the object's refcount.
-    /// Goes through `Py_INCREF` on the raw pointer rather than
-    /// `Bound::clone().unbind() + forget` to avoid `Py<PyAny>` moves the
-    /// optimizer doesn't always elide.
+    /// Compute `__hash__` once and bump the object's refcount. Uses raw
+    /// `Py_INCREF` rather than `Bound::clone().unbind() + forget` to avoid
+    /// `Py<PyAny>` moves the optimizer doesn't always elide.
     fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
         let kind = Self::detect_kind(ob);
@@ -148,9 +137,9 @@ impl HashedAny {
         Ok(Self { tagged, hash })
     }
 
-    /// Refcount-bumping clone. Reuses the cached hash and tag.
+    /// Refcount-bumping clone. Reuses cached hash and tag.
     fn clone_with_py(&self, _py: Python<'_>) -> Self {
-        // SAFETY: we hold a strong reference to `obj_ptr()`; GIL is held.
+        // SAFETY: we hold a strong ref to `obj_ptr()`; GIL held.
         unsafe { ffi::Py_INCREF(self.obj_ptr()) };
         Self {
             tagged: self.tagged,
@@ -158,14 +147,14 @@ impl HashedAny {
         }
     }
 
-    /// Masked object pointer (tag bits stripped).
+    /// Object pointer with tag bits stripped.
     #[inline]
     fn obj_ptr(&self) -> *mut ffi::PyObject {
         ((self.tagged.as_ptr() as usize) & !KIND_MASK) as *mut ffi::PyObject
     }
 
-    /// Decoded `HashKind` tag. Exhaustive match (not catch-all) so a new
-    /// variant won't silently alias to `Other`.
+    /// Decoded `HashKind`. Exhaustive arms (not catch-all) so a new variant
+    /// can't silently alias `Other`.
     #[inline]
     fn kind(&self) -> HashKind {
         match (self.tagged.as_ptr() as usize) & KIND_MASK {
@@ -177,17 +166,17 @@ impl HashedAny {
         }
     }
 
-    /// Non-refcount-bumping borrow of the underlying object.
+    /// Borrowed handle (no refcount bump).
     #[inline]
     fn obj_borrowed<'a, 'py>(&'a self, py: Python<'py>) -> Borrowed<'a, 'py, PyAny> {
-        // SAFETY: we own a strong reference; the `'a` borrow keeps it live.
+        // SAFETY: we own a strong ref; `'a` keeps it live.
         unsafe { Borrowed::from_ptr(py, self.obj_ptr()) }
     }
 
-    /// Return a fresh owned `Py<PyAny>` (bumps refcount).
+    /// Fresh owned `Py<PyAny>` (bumps refcount).
     #[inline]
     fn obj_clone_ref(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: we own a strong reference; `to_owned()` bumps it.
+        // SAFETY: we own a strong ref; `to_owned()` bumps it.
         unsafe { Borrowed::from_ptr(py, self.obj_ptr()) }
             .to_owned()
             .unbind()
@@ -196,36 +185,27 @@ impl HashedAny {
 
 impl Drop for HashedAny {
     fn drop(&mut self) {
-        // `Py_DECREF` requires the GIL. Matches `Py<T>::drop`'s per-slot
-        // attach — bulk-drop paths (clear, resize teardown) inherit the
-        // same per-slot cost as the previous `Py<PyAny>` layout.
+        // `Py_DECREF` needs the GIL — per-slot attach matches `Py<T>::drop`.
         Python::attach(|_py| {
-            // SAFETY: we own one strong reference to the masked pointer.
+            // SAFETY: we own one strong ref to the masked pointer.
             unsafe { ffi::Py_DECREF(self.obj_ptr()) };
         });
     }
 }
 
-/// Borrow-only key wrapper for hash-table lookups.
-///
-/// Built by `ptr::read`-ing the input `Py<PyAny>` into a `ManuallyDrop` so no
-/// refcount bump occurs. The wrapped value is never dropped; the original
-/// `Bound`'s lifetime keeps the underlying object alive. Use when you only
-/// need to query the map (`get`, `contains_key`, `remove`) and won't keep the
-/// key around afterward.
+/// Borrow-only key wrapper for lookups (`get` / `contains_key` / `remove`).
+/// Wraps a `HashedAny` in `ManuallyDrop` so no refcount bump or `Py_DECREF`
+/// happens — the source `Bound` keeps the object live.
 struct ProbeKey {
     inner: ManuallyDrop<HashedAny>,
 }
 
 impl ProbeKey {
-    /// Build a non-owning probe borrowing `ob`'s `PyObject*` and cached hash.
+    /// Borrow `ob`'s `PyObject*` and cached hash without bumping refcount.
     ///
     /// # Safety
-    /// `ob` must outlive the returned `ProbeKey`. The probe holds the raw
-    /// pointer without refcount changes, so dropping the source `Bound`
-    /// first leaves it dangling. The function signature can't bind the
-    /// probe's lifetime to `ob`, so this is `unsafe fn` to force call sites
-    /// to confirm by inspection.
+    /// `ob` must outlive the returned `ProbeKey`. The signature can't bind
+    /// the probe's lifetime to `ob`, hence `unsafe fn`.
     unsafe fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
         let kind = HashedAny::detect_kind(ob);
@@ -236,7 +216,6 @@ impl ProbeKey {
         })
     }
 
-    /// Borrow as `&HashedAny` for use with map APIs that take a borrowed key.
     fn as_key(&self) -> &HashedAny {
         &self.inner
     }
@@ -249,9 +228,8 @@ impl Hash for HashedAny {
 }
 
 impl PartialEq for HashedAny {
-    /// Equality with three short-circuits before falling back to Python rich
-    /// compare: hash mismatch, pointer identity, and a UTF-8 bytes compare
-    /// when both sides are `str` (skips `PyObject_RichCompareBool` dispatch).
+    /// Three short-circuits before Python rich compare: hash mismatch,
+    /// pointer identity, and a UTF-8 bytes compare for str/str pairs.
     fn eq(&self, other: &Self) -> bool {
         if self.hash != other.hash {
             return false;
@@ -279,10 +257,9 @@ impl PartialEq for HashedAny {
 
 impl Eq for HashedAny {}
 
-/// Emits one full Python-facing map surface (map class + iterators + views)
-/// parameterized by backend type. Invoked once for `Elastic` and
-/// once for `Funnel` so behavior changes land in both maps simultaneously.
-/// `PyO3` can't express `#[pyclass]` over a generic, hence the macro.
+/// Emits one Python-facing map surface (class + iterators + views) per
+/// backend. `PyO3` can't `#[pyclass]` over a generic, hence the macro;
+/// invoked once each for `Elastic` and `Funnel` to keep behavior in sync.
 macro_rules! define_map_classes {
     (
         py_map = $PyMap:ident,
@@ -307,16 +284,14 @@ macro_rules! define_map_classes {
         /// `PyO3` wrapper around the Rust hash map.
         #[pyclass(name = $py_map_name, module = "opthash")]
         struct $PyMap {
-            /// Underlying Rust hash map.
             inner: $Inner<HashedAny, Py<PyAny>>,
-            /// Mutation counter. Iterators snapshot this at construction and
-            /// raise `RuntimeError` on next `__next__` if it changes.
+            /// Mutation counter snapshotted by iterators; mismatch on
+            /// `__next__` raises `RuntimeError`.
             generation: u64,
         }
 
         impl $PyMap {
-            /// Bump generation to invalidate any active iterator snapshots.
-            /// Call after every mutating operation.
+            /// Invalidate active iterator snapshots. Call after every mutation.
             #[inline]
             fn bump(&mut self) {
                 self.generation = self.generation.wrapping_add(1);
@@ -380,10 +355,8 @@ macro_rules! define_map_classes {
                 Ok(me)
             }
 
-            /// Support `Cls[K, V]` subscript syntax at runtime by returning a
-            /// `types.GenericAlias` (same factory `CPython` uses for
-            /// `dict[str, int]` etc). Required for parity with the typing
-            /// stub that declares the class as `Generic[K, V]`.
+            /// Runtime support for `Cls[K, V]` syntax via `types.GenericAlias`
+            /// — parity with the `Generic[K, V]` typing stub.
             #[classmethod]
             fn __class_getitem__<'py>(
                 cls: &Bound<'py, PyType>,
@@ -496,12 +469,10 @@ macro_rules! define_map_classes {
                 $ItemsView { map: slf.unbind() }
             }
 
-            /// Mirror of `dict.update`. Branches in priority order: same-type
-            /// (downcast for direct inner-map access), `PyDict`, mapping with
-            /// `keys()`, then iterable of `(k, v)` tuples. Each branch
-            /// reserves up front when size is known. `bump()` only fires when
-            /// at least one insert occurred so empty `update()` doesn't
-            /// invalidate active iterators.
+            /// Mirror of `dict.update`. Branches in priority order: same-type,
+            /// `PyDict`, mapping with `keys()`, then `(k, v)` iterable. Reserves
+            /// up front when length is known. `bump()` only on actual inserts —
+            /// empty `update()` keeps iterators valid.
             #[pyo3(signature = (other = None, **kwargs))]
             fn update(
                 &mut self,
@@ -726,9 +697,8 @@ macro_rules! define_map_classes {
         define_iter!($ValueIter, $value_iter_name, $PyMap);
         define_iter!($ItemIter, $item_iter_name, $PyMap);
 
-        /// Live view over the map's keys (mirrors `dict.keys()`). Holds a
-        /// `Py<map>` so each operation borrows current map state — no
-        /// snapshotting at view construction.
+        /// Live view over keys (mirrors `dict.keys()`). Holds `Py<map>` so
+        /// each op sees current state — no snapshot at view construction.
         #[pyclass(name = $keys_view_name, module = "opthash")]
         struct $KeysView {
             map: Py<$PyMap>,
@@ -842,7 +812,7 @@ macro_rules! define_map_classes {
             }
         }
 
-        /// Live view over the map's values (mirrors `dict.values()`).
+        /// Live view over values (mirrors `dict.values()`).
         #[pyclass(name = $values_view_name, module = "opthash")]
         struct $ValuesView {
             map: Py<$PyMap>,
@@ -886,8 +856,8 @@ macro_rules! define_map_classes {
             }
         }
 
-        /// Live view over the map's `(key, value)` pairs (mirrors
-        /// `dict.items()`). Set operations build fresh `(k, v)` `PyTuple`s.
+        /// Live view over `(key, value)` pairs (mirrors `dict.items()`).
+        /// Set ops build fresh `(k, v)` `PyTuple`s.
         #[pyclass(name = $items_view_name, module = "opthash")]
         struct $ItemsView {
             map: Py<$PyMap>,
@@ -1006,24 +976,17 @@ macro_rules! define_map_classes {
     };
 }
 
-/// Generates a single iterator pyclass.
-///
-/// `snapshot` holds the iter contents materialized eagerly at `__iter__`
-/// time. Trades memory for borrow-checker simplicity (no self-referencing
-/// borrow of the map). `expected_gen` is captured at iter construction;
-/// each `__next__` checks the map's current `generation` and raises
-/// `RuntimeError("dictionary changed size during iteration")` on mismatch.
+/// One iterator pyclass. `snapshot` is materialized eagerly at `__iter__`
+/// (trades memory for no self-referencing borrow). `__next__` checks the
+/// map's `generation` against `expected_gen` and raises `RuntimeError`
+/// on mismatch.
 macro_rules! define_iter {
     ($Iter:ident, $iter_name:literal, $PyMap:ident) => {
         #[pyclass(name = $iter_name, module = "opthash")]
         struct $Iter {
-            /// Source map. Held to check generation per `__next__`.
             map: Py<$PyMap>,
-            /// Eagerly materialized iter contents (keys / values / items).
             snapshot: Vec<Py<PyAny>>,
-            /// Map's `generation` at iter construction.
             expected_gen: u64,
-            /// Next index into `snapshot`.
             pos: usize,
         }
 
