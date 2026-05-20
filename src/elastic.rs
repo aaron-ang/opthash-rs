@@ -1830,10 +1830,6 @@ where
     /// `group_count` is pow2 by `partition_levels` construction.
     #[inline]
     fn triangular_group_start(level: &Level<K, V, A>, key_hash: u64) -> usize {
-        let group_count = level.table.group_count();
-        if group_count <= 1 {
-            return 0;
-        }
         let mixed = key_hash ^ level.salt;
         ProbeOps::hash_to_usize(mixed) & level.group_count_mask
     }

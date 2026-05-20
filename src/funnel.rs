@@ -1421,9 +1421,6 @@ where
     #[inline]
     fn special_primary_group_start(&self, key_hash: u64) -> usize {
         let mask = self.special.primary.group_count_mask;
-        if mask == 0 {
-            return 0;
-        }
         ProbeOps::hash_to_usize(key_hash.rotate_left(11)) & mask
     }
 
@@ -1698,7 +1695,7 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        if level.len == 0 || level.bucket_count == 0 {
+        if level.len == 0 {
             return LookupStep::Continue;
         }
 
@@ -1747,10 +1744,6 @@ where
         Q: Eq + ?Sized,
     {
         if level.len == 0 {
-            return (LookupStep::Continue, None);
-        }
-
-        if level.bucket_count == 0 {
             return (LookupStep::Continue, None);
         }
 
