@@ -1,5 +1,6 @@
-use super::config::{DEFAULT_RESERVE_FRACTION, MAX_RESERVE_FRACTION, MIN_RESERVE_FRACTION};
-use super::layout::GROUP_SIZE;
+use super::config::{
+    DEFAULT_RESERVE_FRACTION, GROUP_SIZE, MAX_RESERVE_FRACTION, MIN_RESERVE_FRACTION,
+};
 
 #[allow(clippy::cast_precision_loss)]
 #[inline]

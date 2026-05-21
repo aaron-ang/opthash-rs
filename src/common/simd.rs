@@ -15,8 +15,8 @@ use {
 };
 
 use super::bitmask::BitMask;
+use super::config::GROUP_SIZE;
 
-pub(crate) const CONTROL_GROUP_SIZE: usize = 16;
 pub(crate) const CTRL_EMPTY: u8 = 0;
 pub(crate) const CTRL_TOMBSTONE: u8 = 0x80;
 /// Low 7 bits hold the fingerprint; high bit distinguishes occupied (0) from
@@ -76,7 +76,7 @@ impl ControlOps {
             return None;
         }
 
-        if controls.len() - start < CONTROL_GROUP_SIZE {
+        if controls.len() - start < GROUP_SIZE {
             return controls[start..]
                 .iter()
                 .position(|&control| control == fingerprint)
@@ -85,7 +85,7 @@ impl ControlOps {
 
         let wide = Self::preferred_group_width();
         let mut index = start;
-        while wide > CONTROL_GROUP_SIZE && index + wide <= controls.len() {
+        while wide > GROUP_SIZE && index + wide <= controls.len() {
             let mask =
                 Self::control_match_fingerprint_group(&controls[index..index + wide], fingerprint);
             if mask != 0 {
@@ -94,15 +94,15 @@ impl ControlOps {
             index += wide;
         }
 
-        while index + CONTROL_GROUP_SIZE <= controls.len() {
+        while index + GROUP_SIZE <= controls.len() {
             let mask = Self::control_match_fingerprint_group(
-                &controls[index..index + CONTROL_GROUP_SIZE],
+                &controls[index..index + GROUP_SIZE],
                 fingerprint,
             );
             if mask != 0 {
                 return Some(index + mask.trailing_zeros() as usize);
             }
-            index += CONTROL_GROUP_SIZE;
+            index += GROUP_SIZE;
         }
 
         controls[index..]
@@ -121,14 +121,14 @@ impl ControlOps {
                 if std::is_x86_feature_detected!("avx2") {
                     32
                 } else {
-                    CONTROL_GROUP_SIZE
+                    GROUP_SIZE
                 }
             })
         }
 
         #[cfg(not(target_arch = "x86_64"))]
         {
-            CONTROL_GROUP_SIZE
+            GROUP_SIZE
         }
     }
 
@@ -143,7 +143,7 @@ impl ControlOps {
     #[must_use]
     pub(crate) fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u32 {
         match chunk.len() {
-            CONTROL_GROUP_SIZE => match_fingerprint_group_u32(chunk.as_ptr(), target),
+            GROUP_SIZE => match_fingerprint_group_u32(chunk.as_ptr(), target),
             32 => unsafe { eq_mask_32(chunk.as_ptr(), target) },
             _ => panic!("group matching requires 16 or 32 byte chunks"),
         }
@@ -167,7 +167,7 @@ fn match_fingerprint_group_u32(ptr: *const u8, target: u8) -> u32 {
     #[cfg(not(target_arch = "x86_64"))]
     {
         let mut m = 0u32;
-        for i in 0..CONTROL_GROUP_SIZE {
+        for i in 0..GROUP_SIZE {
             if unsafe { *ptr.add(i) } == target {
                 m |= 1 << i;
             }
@@ -209,7 +209,7 @@ impl ProbeOps {
 
 /// # Safety
 ///
-/// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
+/// `ptr` must be valid to read `GROUP_SIZE` bytes.
 #[inline]
 #[must_use]
 pub(crate) unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> BitMask {
@@ -224,7 +224,7 @@ pub(crate) unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> BitMask {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let mut m: u16 = 0;
-        for i in 0..CONTROL_GROUP_SIZE {
+        for i in 0..GROUP_SIZE {
             if unsafe { *ptr.add(i) } == target {
                 m |= 1u16 << i;
             }
@@ -235,7 +235,7 @@ pub(crate) unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> BitMask {
 
 /// # Safety
 ///
-/// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
+/// `ptr` must be valid to read `GROUP_SIZE` bytes.
 #[inline]
 #[must_use]
 pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> BitMask {
@@ -250,7 +250,7 @@ pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> BitMask {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let mut m: u16 = 0;
-        for i in 0..CONTROL_GROUP_SIZE {
+        for i in 0..GROUP_SIZE {
             let b = unsafe { *ptr.add(i) };
             if b == CTRL_EMPTY || b == CTRL_TOMBSTONE {
                 m |= 1u16 << i;
@@ -265,7 +265,7 @@ pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> BitMask {
 ///
 /// # Safety
 ///
-/// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
+/// `ptr` must be valid to read `GROUP_SIZE` bytes.
 #[inline]
 #[must_use]
 pub(crate) unsafe fn occupied_mask_16(ptr: *const u8) -> BitMask {
@@ -280,7 +280,7 @@ pub(crate) unsafe fn occupied_mask_16(ptr: *const u8) -> BitMask {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let mut m: u16 = 0;
-        for i in 0..CONTROL_GROUP_SIZE {
+        for i in 0..GROUP_SIZE {
             let b = unsafe { *ptr.add(i) };
             if (b & FINGERPRINT_MASK) != 0 {
                 m |= 1u16 << i;
@@ -304,8 +304,8 @@ pub(crate) unsafe fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
     }
 
     let lo = match_fingerprint_group_u32(ptr, target);
-    let hi = match_fingerprint_group_u32(unsafe { ptr.add(CONTROL_GROUP_SIZE) }, target);
-    lo | (hi << CONTROL_GROUP_SIZE)
+    let hi = match_fingerprint_group_u32(unsafe { ptr.add(GROUP_SIZE) }, target);
+    lo | (hi << GROUP_SIZE)
 }
 
 // ---------------------------------------------------------------------------

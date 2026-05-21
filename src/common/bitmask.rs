@@ -1,3 +1,5 @@
+use crate::common::config::GROUP_SIZE;
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) type BitMaskWord = u64;
 #[cfg(not(target_arch = "aarch64"))]
@@ -33,8 +35,8 @@ impl BitMask {
     /// Restrict the mask to the first `n` slots. Slots `>= n` are cleared.
     #[inline]
     pub(crate) fn truncate_to(self, n: usize) -> Self {
-        // A full group is GROUP_SIZE=16 slots. If n >= 16, no truncation.
-        if n >= 16 {
+        // A full group is GROUP_SIZE=16 slots. If n >= GROUP_SIZE, no truncation.
+        if n >= GROUP_SIZE {
             return self;
         }
         #[allow(clippy::cast_possible_truncation)]

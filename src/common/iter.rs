@@ -2,7 +2,8 @@ use std::fmt;
 use std::iter::FusedIterator;
 
 use crate::common::bitmask::BitMask;
-use crate::common::layout::{GROUP_SIZE, RawTable};
+use crate::common::config::GROUP_SIZE;
+use crate::common::layout::RawTable;
 use crate::common::simd::occupied_mask_16;
 
 /// SIMD scanner: yields one occupied slot at a time, refilling its mask one

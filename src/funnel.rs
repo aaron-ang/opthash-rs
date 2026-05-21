@@ -9,14 +9,14 @@ use std::ptr;
 
 use allocator_api2::boxed::Box as ABox;
 
-use crate::common::config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY};
+use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps};
 use crate::common::entry::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     OccupiedScanner, Values as CommonValues,
 };
-use crate::common::layout::{Entry as SlotEntry, GROUP_SIZE, RawTable, try_zeroed_boxed_slice_in};
+use crate::common::layout::{Entry as SlotEntry, RawTable, try_zeroed_boxed_slice_in};
 use crate::common::math::{
     capacity_for, ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize, level_salt,
     max_insertions, round_to_usize, round_up_to_group, round_up_to_pow2_groups,
@@ -1620,12 +1620,16 @@ where
 
         let bucket_idx = level.bucket_index(key_hash);
         let bucket_range = level.bucket_range(bucket_idx);
+        // SAFETY: `bucket_size` is `GROUP_SIZE`-aligned at construction.
+        // Hinting elides the `& ~0xF` LLVM emits to fold `(start / 16) * 16`.
         debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
+        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
+            unsafe { std::hint::unreachable_unchecked() };
+        }
         let group_idx = bucket_range.start / GROUP_SIZE;
         level
             .table
             .group_free_mask(group_idx)
-            .truncate_to(level.bucket_size)
             .lowest()
             .map(|offset| bucket_range.start + offset)
     }
@@ -1697,15 +1701,16 @@ where
 
         let bucket_idx = level.bucket_index(key_hash);
         let bucket_range = level.bucket_range(bucket_idx);
+        // SAFETY: `bucket_size` is `GROUP_SIZE`-aligned at construction.
+        // Hinting elides the `& ~0xF` LLVM emits to fold `(start / 16) * 16`.
         debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
+        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
+            unsafe { std::hint::unreachable_unchecked() };
+        }
         let group_idx = bucket_range.start / GROUP_SIZE;
 
         // SIMD fingerprint scan — same as _with_candidate.
-        for relative_idx in level
-            .table
-            .group_match_mask(group_idx, key_fingerprint)
-            .truncate_to(level.bucket_size)
-        {
+        for relative_idx in level.table.group_match_mask(group_idx, key_fingerprint) {
             let slot_idx = bucket_range.start + relative_idx;
             let entry = unsafe { level.table.get_ref(slot_idx) };
             if entry.key.borrow() == key {
@@ -1716,12 +1721,7 @@ where
         // StopSearch: bucket has an EMPTY byte → no key ever overflowed past
         // here. Tombstones in the bucket don't disable termination since the
         // empty byte still proves the probe chain terminated naturally.
-        if level
-            .table
-            .group_match_mask(group_idx, CTRL_EMPTY)
-            .truncate_to(level.bucket_size)
-            .any()
-        {
+        if level.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
             return LookupStep::StopSearch;
         }
 
@@ -1745,22 +1745,22 @@ where
 
         let bucket_idx = level.bucket_index(key_hash);
         let bucket_range = level.bucket_range(bucket_idx);
+        // SAFETY: `bucket_size` is `GROUP_SIZE`-aligned at construction.
+        // Hinting elides the `& ~0xF` LLVM emits to fold `(start / 16) * 16`.
         debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
+        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
+            unsafe { std::hint::unreachable_unchecked() };
+        }
         let group_idx = bucket_range.start / GROUP_SIZE;
 
         // SIMD fingerprint scan over the bucket's control bytes.
-        for relative_idx in level
-            .table
-            .group_match_mask(group_idx, key_fingerprint)
-            .truncate_to(level.bucket_size)
-        {
+        for relative_idx in level.table.group_match_mask(group_idx, key_fingerprint) {
             let slot_idx = bucket_range.start + relative_idx;
             let entry = unsafe { level.table.get_ref(slot_idx) };
             if entry.key.borrow() == key {
                 let free_candidate = level
                     .table
                     .group_free_mask(group_idx)
-                    .truncate_to(level.bucket_size)
                     .lowest()
                     .map(|o| bucket_range.start + o);
                 return (LookupStep::Found(slot_idx), free_candidate);
@@ -1771,16 +1771,10 @@ where
         let free_candidate = level
             .table
             .group_free_mask(group_idx)
-            .truncate_to(level.bucket_size)
             .lowest()
             .map(|o| bucket_range.start + o);
 
-        let step = if level
-            .table
-            .group_match_mask(group_idx, CTRL_EMPTY)
-            .truncate_to(level.bucket_size)
-            .any()
-        {
+        let step = if level.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
             LookupStep::StopSearch
         } else {
             LookupStep::Continue
@@ -2022,10 +2016,25 @@ where
             }
         }
 
+        // Cold path — only reached when overflow forced keys into the special tables
         if self.special.primary.len == 0 && self.special.fallback.len == 0 {
             return None;
         }
+        self.find_in_special_outline(key_hash, key_fingerprint, key)
+    }
 
+    #[cold]
+    #[inline(never)]
+    fn find_in_special_outline<Q>(
+        &self,
+        key_hash: u64,
+        key_fingerprint: u8,
+        key: &Q,
+    ) -> Option<SlotLocation>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
         match self.find_in_special_primary(key_hash, key_fingerprint, key) {
             LookupStep::Found(slot_idx) => return Some(SlotLocation::SpecialPrimary { slot_idx }),
             LookupStep::Continue => {}

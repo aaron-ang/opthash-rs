@@ -9,14 +9,14 @@ use std::ptr;
 use allocator_api2::boxed::Box as ABox;
 use allocator_api2::vec::Vec as AVec;
 
-use crate::common::config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY};
+use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps};
 use crate::common::entry::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     OccupiedScanner, Values as CommonValues,
 };
-use crate::common::layout::{Entry as SlotEntry, GROUP_SIZE, RawTable};
+use crate::common::layout::{Entry as SlotEntry, RawTable};
 use crate::common::math::{
     capacity_for, ceil_three_quarters, floor_half_reserve_slots, level_salt, max_insertions,
     round_up_to_pow2_groups, sanitize_reserve_fraction, usize_to_f64,
