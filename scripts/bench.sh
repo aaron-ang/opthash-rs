@@ -15,8 +15,7 @@
 #   BASELINE=        if set, passes --baseline <name>; else --save-baseline ref
 #   LOCK_DIR=        per-core flock files (default /tmp/opthash-bench-locks)
 #
-# Forwarded args (after `--`) are appended to the Criterion command line — pass
-# `--measurement-time 10 --sample-size 200` here for tighter confidence bands.
+# Forwarded args (after `--`) are appended to the Criterion command line
 
 set -euo pipefail
 

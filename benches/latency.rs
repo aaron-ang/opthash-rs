@@ -63,31 +63,21 @@ fn run_get_hit(map: &str, size: usize, samples: usize, warmup: usize) -> Histogr
     let pairs = make_pairs(size);
     let keys: Vec<u64> = pairs.iter().map(|&(k, _)| k).collect();
     let n = keys.len();
+
+    macro_rules! run {
+        ($build:expr) => {{
+            let m = $build(&pairs);
+            measure(samples, warmup, |i| {
+                m.get(black_box(&keys[scatter(i, n)])).copied()
+            })
+        }};
+    }
+
     match map {
-        "std" => {
-            let m = build_std_map(&pairs);
-            measure(samples, warmup, |i| {
-                m.get(black_box(&keys[scatter(i, n)])).copied()
-            })
-        }
-        "hashbrown" => {
-            let m = build_hashbrown_map(&pairs);
-            measure(samples, warmup, |i| {
-                m.get(black_box(&keys[scatter(i, n)])).copied()
-            })
-        }
-        "elastic" => {
-            let m = build_elastic_map(&pairs);
-            measure(samples, warmup, |i| {
-                m.get(black_box(&keys[scatter(i, n)])).copied()
-            })
-        }
-        "funnel" => {
-            let m = build_funnel_map(&pairs);
-            measure(samples, warmup, |i| {
-                m.get(black_box(&keys[scatter(i, n)])).copied()
-            })
-        }
+        "std" => run!(build_std_map),
+        "hashbrown" => run!(build_hashbrown_map),
+        "elastic" => run!(build_elastic_map),
+        "funnel" => run!(build_funnel_map),
         _ => unreachable!(),
     }
 }

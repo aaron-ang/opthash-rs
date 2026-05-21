@@ -37,6 +37,7 @@ pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"], option
 criterion = { version = "0.8", features = ["html_reports"] }
 hashbrown = "0.17"
 hdrhistogram = "7.5"
+iai-callgrind = "0.16"
 pprof = { version = "0.15", features = ["flamegraph"] }
 
 [[bench]]
@@ -45,4 +46,8 @@ harness = false
 
 [[bench]]
 name = "latency"
+harness = false
+
+[[bench]]
+name = "instr_count"
 harness = false
