@@ -88,7 +88,8 @@ impl<T, A: Allocator> RawTable<T, A> {
             .unwrap_or_else(|_| handle_alloc_error(layout))
             .cast::<u8>();
         // SAFETY: `ctrl_offset` is within the allocation produced for `layout`.
-        let ctrl_ptr = unsafe { NonNull::new_unchecked(data_ptr.as_ptr().add(ctrl_offset)) };
+        let ctrl_raw = unsafe { data_ptr.as_ptr().add(ctrl_offset) };
+        let ctrl_ptr = NonNull::new(ctrl_raw).expect("ctrl_ptr is data_ptr + offset, non-null");
 
         Self {
             data_ptr,
@@ -113,7 +114,8 @@ impl<T, A: Allocator> RawTable<T, A> {
 
         let data_ptr = alloc.allocate_zeroed(layout).map_err(|_| ())?.cast::<u8>();
         // SAFETY: `ctrl_offset` is within the allocation produced for `layout`.
-        let ctrl_ptr = unsafe { NonNull::new_unchecked(data_ptr.as_ptr().add(ctrl_offset)) };
+        let ctrl_raw = unsafe { data_ptr.as_ptr().add(ctrl_offset) };
+        let ctrl_ptr = NonNull::new(ctrl_raw).expect("ctrl_ptr is data_ptr + offset, non-null");
 
         Ok(Self {
             data_ptr,

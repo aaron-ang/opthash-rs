@@ -92,13 +92,12 @@ unsafe impl Sync for HashedAny {}
 const _: () = assert!(std::mem::size_of::<HashedAny>() == 2 * std::mem::size_of::<usize>());
 
 impl HashedAny {
-    /// Tag-pack `obj` with `kind`. No refcount change.
-    ///
-    /// # Safety
-    /// `obj` must be non-null with `KIND_MASK` bits zero (`CPython` guarantees
-    /// this since `PyObject` starts with a `Py_ssize_t`).
+    /// Tag-pack `obj` with `kind`. No refcount change. Panics if `obj` is null
+    /// or its `KIND_MASK` bits aren't zero — `CPython` guarantees the latter
+    /// (`PyObject` starts with a `Py_ssize_t`) and callers all source `obj`
+    /// from a live `Bound`'s `as_ptr()`.
     #[inline]
-    unsafe fn pack(obj: *mut ffi::PyObject, kind: HashKind) -> NonNull<ffi::PyObject> {
+    fn pack(obj: *mut ffi::PyObject, kind: HashKind) -> NonNull<ffi::PyObject> {
         assert!(!obj.is_null(), "PyObject pointer must be non-null");
         // Runtime (not debug) assert: silent pointer corruption is worse than
         // one extra cmp+jne in this cold path.
@@ -107,8 +106,9 @@ impl HashedAny {
             0,
             "PyObject* low bits must be zero for tag packing"
         );
-        // SAFETY: `obj` is non-null; ORing tag bits keeps it non-null.
-        unsafe { NonNull::new_unchecked(((obj as usize) | (kind as usize)) as *mut ffi::PyObject) }
+        // `obj` non-null (asserted above) + ORing tag bits keeps it non-null.
+        NonNull::new(((obj as usize) | (kind as usize)) as *mut ffi::PyObject)
+            .expect("tagged PyObject* non-null")
     }
 
     #[inline]
@@ -132,8 +132,7 @@ impl HashedAny {
         let raw = ob.as_ptr();
         // SAFETY: `Bound` guarantees `raw` is non-null and the GIL is held.
         unsafe { ffi::Py_INCREF(raw) };
-        // SAFETY: `raw` is a valid `PyObject*` with zeroed low bit.
-        let tagged = unsafe { Self::pack(raw, kind) };
+        let tagged = Self::pack(raw, kind);
         Ok(Self { tagged, hash })
     }
 
@@ -209,8 +208,7 @@ impl ProbeKey {
     unsafe fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
         let kind = HashedAny::detect_kind(ob);
-        // SAFETY: `ob.as_ptr()` is a valid, properly-aligned `PyObject*`.
-        let tagged = unsafe { HashedAny::pack(ob.as_ptr(), kind) };
+        let tagged = HashedAny::pack(ob.as_ptr(), kind);
         Ok(Self {
             inner: ManuallyDrop::new(HashedAny { tagged, hash }),
         })
