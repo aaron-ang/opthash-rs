@@ -58,14 +58,16 @@ const DELETE_MAP_SIZE: usize = 12_000;
 const DELETE_OP_COUNT: usize = 6_000;
 const RESIZE_INSERT_COUNT: usize = 8_000;
 
-/// Emits `group.bench_function for each impl
+/// Emits per-impl `bench_function` blocks
 macro_rules! bench_all_impls {
     ($group:expr, $batch:expr, $std_setup:expr, $hb_setup:expr, $el_setup:expr, $fn_setup:expr, $body:expr $(,)?) => {{
         let group = &mut $group;
-        group.bench_function("std", |b| b.iter_batched($std_setup, $body, $batch));
-        group.bench_function("hashbrown", |b| b.iter_batched($hb_setup, $body, $batch));
-        group.bench_function("elastic", |b| b.iter_batched($el_setup, $body, $batch));
-        group.bench_function("funnel", |b| b.iter_batched($fn_setup, $body, $batch));
+        group.bench_function("std", |b| b.iter_batched_ref($std_setup, $body, $batch));
+        group.bench_function("hashbrown", |b| {
+            b.iter_batched_ref($hb_setup, $body, $batch)
+        });
+        group.bench_function("elastic", |b| b.iter_batched_ref($el_setup, $body, $batch));
+        group.bench_function("funnel", |b| b.iter_batched_ref($fn_setup, $body, $batch));
     }};
 }
 
@@ -81,7 +83,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
         || HashbrownMap::<u64, u64>::with_capacity(INSERT_COUNT * 2),
         || ElasticHashMap::<u64, u64>::with_capacity(INSERT_COUNT * 2),
         || FunnelHashMap::<u64, u64>::with_capacity(INSERT_COUNT * 2),
-        |mut map| {
+        |map| {
             for &(key, value) in &pairs {
                 map.insert(black_box(key), black_box(value));
             }
@@ -162,7 +164,7 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
         || build_hashbrown_map(&initial_pairs),
         || build_elastic_map(&initial_pairs),
         || build_funnel_map(&initial_pairs),
-        |mut map| {
+        |map| {
             for idx in 0..DELETE_OP_COUNT {
                 black_box(map.remove(black_box(&initial_pairs[idx].0)));
                 let (key, value) = replacement_pairs[idx];
@@ -186,7 +188,7 @@ fn bench_resize_heavy_throughput(c: &mut Criterion) {
         HashbrownMap::<u64, u64>::new,
         ElasticHashMap::<u64, u64>::new,
         FunnelHashMap::<u64, u64>::new,
-        |mut map| {
+        |map| {
             for &(key, value) in &pairs {
                 black_box(map.insert(black_box(key), black_box(value)));
             }
