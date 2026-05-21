@@ -6,7 +6,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from plot_common import ASSETS_DIR, ROOT, apply_axis_style, save_svg
+from _plot_common import ASSETS_DIR, ROOT, apply_axis_style, save_svg
 
 
 BENCHMARKS_JSON = ROOT / ".benchmarks" / "python.json"
@@ -34,7 +34,7 @@ def load_means(path: Path) -> dict[str, dict[str, float]]:
     if not path.exists():
         sys.exit(
             f"missing {path.relative_to(ROOT)}\n"
-            "  run: pytest benches/ --benchmark-json=.benchmarks/python.json"
+            "  run: pytest benches/python/ --benchmark-json=.benchmarks/python.json"
         )
     data = json.loads(path.read_text())
     out: dict[str, dict[str, float]] = {}

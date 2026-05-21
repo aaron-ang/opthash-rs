@@ -1,6 +1,6 @@
 # Benchmarking
 
-Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`. A Python-side bench (`benches/python_throughput.py`) compares the opthash bindings against builtin `dict`.
+Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`. Python-side benches under `benches/python/` compare the opthash bindings against builtin `dict`.
 
 ## Results
 
@@ -16,6 +16,12 @@ Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `o
 
 ![Tail latency — get-hit @ 10M](../assets/latency-tail-10M-get-hit.svg)
 
+### Instructions per op (iai-callgrind, deterministic)
+
+Structural workload comparison — no CPU noise.
+
+![Instructions per op](../assets/benchmark-instr-count.svg)
+
 ### Python: opthash bindings vs builtin `dict`
 
 ![Python speedup chart](../assets/benchmark-python-speedup.svg)
@@ -30,11 +36,6 @@ Throughput workloads:
 4. `tiny_lookup_throughput`
 5. `delete_heavy_throughput`
 6. `resize_heavy_throughput`
-7. `mixed_lookup_throughput`
-
-The tiny-map workload exercises the internal tiny-table engine. Delete-heavy and resize-heavy expose tombstone handling and growth costs instead of only steady-state inserts.
-
-Latency workload: `get_hit_latency_<size>` — Criterion-mean per-lookup time across map sizes (configured at the top of `benches/speedup.rs`).
 
 Run:
 
@@ -45,37 +46,46 @@ cargo bench --bench speedup -- "get_hit"          # Criterion name filter
 
 ## `benches/latency.rs` — tail-latency histograms (hdrhistogram)
 
-Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and dumps them to JSON for plotting. Custom `harness = false` main, not Criterion. The size × op × map matrix and sample/warmup counts are hardcoded — edit the consts at the top of `benches/latency.rs` to change. Output: `target/latency/<map>/<size>/<op>.json`.
+Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and dumps them to JSON for plotting. Output: `target/latency/<map>/<size>/<op>.json`.
 
 ```bash
 cargo bench --bench latency
 ```
 
-## `benches/python_throughput.py` — Python bindings vs builtin `dict` (pytest-benchmark)
-
-End-to-end workloads (insert / get_hit / get_miss / mixed / delete). Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode, so this measures binding overhead as well as the map.
+## `benches/instr_count.rs` — deterministic instruction counts (iai-callgrind)
 
 ```bash
-pytest benches/python_throughput.py --benchmark-json=.benchmarks/python.json
+cargo install iai-callgrind-runner   # one-time
+cargo bench --bench instr_count
+```
+
+Output: `target/iai/opthash/instr_count/<group>/<bench>/callgrind.<bench>.out` — parsed by `scripts/generate_instr_count_chart.py` into `assets/benchmark-instr-count.svg`.
+
+## `benches/python/throughput.py` — Python bindings vs builtin `dict` (pytest-benchmark)
+
+End-to-end workloads. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode, so this measures binding overhead as well as the map.
+
+```bash
+pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 uv run --group charts python scripts/generate_python_chart.py
 ```
 
-## `benches/binding_overhead.py` — per-op binding overhead
+## `benches/python/binding_overhead.py` — per-op binding overhead
 
-Decomposes one `m[k]` call: `loop -> hash(k) -> dict[k] -> __contains__ -> __getitem__ -> .get()`. Δ between rows attributes each primitive's ns cost. Run with `python benches/binding_overhead.py`.
+Decomposes one `m[k]` call: `loop -> hash(k) -> dict[k] -> __contains__ -> __getitem__ -> .get()`. Δ between rows attributes each primitive's ns cost. Run with `python benches/python/binding_overhead.py`.
 
 For symbol-level attribution, drive a hot loop under `py-spy --native` and aggregate the folded-stack output:
 
 ```bash
 py-spy record --native --rate 1000 --duration 8 \
   --format raw --output /tmp/perf_raw.txt -- \
-  python benches/binding_overhead.py
+  python benches/python/binding_overhead.py
 ```
 
 ## Reports
 
 - Criterion HTML: `target/criterion/report/index.html`, per-workload pages below (e.g. `target/criterion/insert_throughput/report/index.html`)
-- Charts: `uv run scripts/generate_all_charts.py` writes every SVG to `assets/` (speedup bars, mean-latency line, tail CDFs per config)
+- Charts: `uv run scripts/generate_all_charts.py` writes every SVG to `assets/` (speedup bars, mean-latency line, tail CDF, instructions-per-op bars, Python speedup bars)
 
 ## Profiling / flamegraphs
 

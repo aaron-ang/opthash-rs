@@ -53,10 +53,10 @@ Re-pin `ref` whenever the harness env changes (sudo vs not, core pin) — Criter
 
 ### Python-side benchmarks
 
-`benches/python_throughput.py` — pytest-benchmark suite comparing `dict`, `ElasticHashMap`, and `FunnelHashMap` from Python across insert / get_hit / get_miss / mixed / delete workloads at N = 10K. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode.
+`benches/python/throughput.py` — pytest-benchmark suite comparing `dict`, `ElasticHashMap`, and `FunnelHashMap` from Python across insert / get_hit / get_miss / mixed / delete workloads at N = 10K. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode.
 
 ```bash
-pytest benches/python_throughput.py --benchmark-json=.benchmarks/python.json
+pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 
 uv run --group charts python scripts/generate_python_chart.py
 ```

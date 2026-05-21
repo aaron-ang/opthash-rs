@@ -1,7 +1,7 @@
 """Python-side benchmarks: opthash maps vs builtin dict.
 
 Run:
-    pytest benches/python_throughput.py --benchmark-json=.benchmarks/python.json
+    pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 
 Then chart:
     uv run --group charts python scripts/generate_python_chart.py

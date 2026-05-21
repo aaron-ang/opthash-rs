@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
@@ -21,10 +22,18 @@ IMPL_LABELS = {
 }
 IMPL_MARKERS = {"std": "o", "hashbrown": "v", "elastic": "s", "funnel": "D"}
 
-LATENCY_SIZES = ("100", "1K", "10K", "100K", "1M", "10M")
+_PAIRED = plt.get_cmap("Paired").colors
+IMPL_COLORS = {
+    "std": mcolors.to_hex(_PAIRED[0]),  # light blue   (baseline)
+    "hashbrown": mcolors.to_hex(_PAIRED[1]),  # dark  blue   (baseline)
+    "elastic": mcolors.to_hex(_PAIRED[6]),  # light orange (opthash)
+    "funnel": mcolors.to_hex(_PAIRED[7]),  # dark  orange (opthash)
+}
 
-TITLE_COLOR = "#2B2F36"
-SUBTITLE_COLOR = "0.35"
+LATENCY_SIZES = ("1K", "10K", "100K", "1M", "10M")
+
+TITLE_COLOR = "darkslategray"
+SUBTITLE_COLOR = "dimgray"
 
 
 def load_criterion_mean_ns(group: str, implementation: str) -> float:
