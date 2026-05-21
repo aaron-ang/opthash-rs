@@ -4,8 +4,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullLocator
 
-from plot_common import (
+from _plot_common import (
     ASSETS_DIR,
+    IMPL_COLORS,
     IMPLEMENTATIONS,
     IMPL_LABELS,
     IMPL_MARKERS,
@@ -16,9 +17,16 @@ from plot_common import (
     save_svg,
 )
 
+# Size (entries) at which `benches/latency.rs` records tail histograms.
+TAIL_SIZE = 10_000_000
+
 
 def plot_mean_latency_by_size(assets_dir: Path) -> None:
-    """Criterion-mean per-lookup latency vs map size. Reads target/criterion/."""
+    """Criterion-mean per-lookup latency vs map size. Linear y, categorical x.
+
+    Cache-hierarchy cliffs (L1→L2→L3→DRAM) appear as visible jumps; absolute
+    ns/op is readable directly.
+    """
     labels: list[str] = []
     means: dict[str, list[float]] = {impl: [] for impl in IMPLEMENTATIONS}
 
@@ -35,7 +43,7 @@ def plot_mean_latency_by_size(assets_dir: Path) -> None:
             means[impl].append(mean_ns)
 
     if not labels:
-        print("no Criterion latency data found, skipping")
+        print("no Criterion latency data found, skipping mean-latency plot")
         return
 
     x = np.arange(len(labels))
@@ -45,6 +53,7 @@ def plot_mean_latency_by_size(assets_dir: Path) -> None:
             x,
             means[impl],
             marker=IMPL_MARKERS[impl],
+            color=IMPL_COLORS[impl],
             linewidth=2,
             markersize=7,
             label=IMPL_LABELS[impl],
@@ -55,7 +64,7 @@ def plot_mean_latency_by_size(assets_dir: Path) -> None:
     apply_axis_style(
         ax,
         title="Get-Hit Latency vs Map Size",
-        subtitle="Mean per get() \u2014 lower is better",
+        subtitle="Mean per get() — lower is better",
         xlabel="Map size (entries)",
         ylabel="Latency per lookup (ns)",
         y_formatter=lambda v, _: f"{v:.0f}",
@@ -88,13 +97,13 @@ def _tail_x(q):
 
 
 def plot_tail_cdf(assets_dir: Path) -> None:
-    """Percentile-vs-latency tail plot for get-hit @ 10M, one line per impl."""
+    """Percentile-vs-latency tail plot for get-hit @ TAIL_SIZE, one line per impl."""
     fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+    max_x = _tail_x(TAIL_TICK_QS[-1])
 
     any_data = False
-    max_x = _tail_x(TAIL_TICK_QS[-1])
     for impl in IMPLEMENTATIONS:
-        doc = load_latency_json(impl, 10_000_000, "get-hit")
+        doc = load_latency_json(impl, TAIL_SIZE, "get-hit")
         if doc is None:
             continue
         buckets = doc.get("histogram", [])
@@ -110,6 +119,7 @@ def plot_tail_cdf(assets_dir: Path) -> None:
             x,
             y,
             marker=IMPL_MARKERS[impl],
+            color=IMPL_COLORS[impl],
             markersize=4,
             markevery=max(1, len(x) // 20),
             linewidth=2,
@@ -118,26 +128,23 @@ def plot_tail_cdf(assets_dir: Path) -> None:
 
     if not any_data:
         plt.close(fig)
-        print("no latency data for get-hit @ 10M, skipping tail plot")
+        print(f"no latency data for get-hit @ {TAIL_SIZE}, skipping tail plot")
         return
 
     tick_positions = [_tail_x(q) for q in TAIL_TICK_QS]
-
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(TAIL_TICK_LABELS, fontsize=12)
     ax.set_xlim(1.0, max_x * 1.3)
-
     ax.xaxis.set_minor_locator(NullLocator())
     ax.yaxis.set_major_locator(LogLocator(base=10.0))
     ax.yaxis.set_minor_locator(NullLocator())
     ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
-
     apply_axis_style(
         ax,
-        title="Tail Latency \u2014 Get Hit @ 10M entries",
-        subtitle="Latency at percentile p (log axes) \u2014 lower is better",
+        title=f"Tail Latency — Get Hit @ {TAIL_SIZE // 1_000_000}M entries",
+        subtitle="Latency at percentile p (log axes) — lower is better",
         xlabel="Percentile",
         ylabel="Latency (ns, log scale)",
     )

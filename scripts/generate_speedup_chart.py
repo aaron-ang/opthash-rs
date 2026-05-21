@@ -3,8 +3,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from plot_common import (
+from _plot_common import (
     ASSETS_DIR,
+    IMPL_COLORS,
     IMPLEMENTATIONS,
     apply_axis_style,
     load_criterion_mean_ns,
@@ -16,7 +17,6 @@ THROUGHPUT_WORKLOADS = (
     ("insert_throughput", "Insert"),
     ("get_hit_throughput", "Get Hit"),
     ("get_miss_throughput", "Get Miss"),
-    ("mixed_lookup_throughput", "Mixed"),
     ("tiny_lookup_throughput", "Tiny"),
     ("delete_heavy_throughput", "Delete"),
     ("resize_heavy_throughput", "Resize"),
@@ -49,8 +49,20 @@ def plot_throughput_speedup(assets_dir: Path) -> None:
     x = np.arange(len(labels))
     w = 0.34
 
-    elastic_bars = ax.bar(x - w / 2, elastic_speedups, width=w, label="ElasticHashMap")
-    funnel_bars = ax.bar(x + w / 2, funnel_speedups, width=w, label="FunnelHashMap")
+    elastic_bars = ax.bar(
+        x - w / 2,
+        elastic_speedups,
+        width=w,
+        label="ElasticHashMap",
+        color=IMPL_COLORS["elastic"],
+    )
+    funnel_bars = ax.bar(
+        x + w / 2,
+        funnel_speedups,
+        width=w,
+        label="FunnelHashMap",
+        color=IMPL_COLORS["funnel"],
+    )
 
     max_val = max(1.0, *(elastic_speedups + funnel_speedups))
     ax.set_ylim(0.0, max_val * 1.30)
