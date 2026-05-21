@@ -1755,6 +1755,8 @@ where
             unsafe { std::hint::unreachable_unchecked() };
         }
         let group_idx = bucket_range.start / GROUP_SIZE;
+        // Warm the slot region while the SIMD fingerprint scan runs.
+        level.table.prefetch_slot(bucket_range.start);
 
         // SIMD fingerprint scan over the bucket's control bytes.
         for relative_idx in level.table.group_match_mask(group_idx, key_fingerprint) {
