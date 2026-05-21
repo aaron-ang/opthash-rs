@@ -196,14 +196,13 @@ impl<T, A: Allocator> RawTable<T, A> {
         unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) }
     }
 
-    /// Prefetch the cache line containing slot `idx`. Call before a probable
+    /// Prefetch the cache line for slot `idx`. Call before a probable
     /// `get_ref(idx)` to overlap memory latency with the fingerprint scan.
     ///
     /// # Safety
     ///
-    /// `self.capacity > 0` and `idx < self.capacity`. On empty tables
-    /// `data_ptr` is `NonNull::dangling()`; pointer arithmetic on a dangling
-    /// ptr is UB regardless of whether the result is dereferenced.
+    /// `capacity > 0 && idx < capacity`. Empty tables hold a dangling
+    /// `data_ptr` — any `.add(idx)` on it would be UB.
     #[inline]
     pub(crate) unsafe fn prefetch_slot(&self, idx: usize) {
         debug_assert!(self.capacity > 0, "prefetch_slot: empty table");

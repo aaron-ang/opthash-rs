@@ -1708,10 +1708,9 @@ where
             unsafe { std::hint::unreachable_unchecked() };
         }
         let group_idx = bucket_range.start / GROUP_SIZE;
-        // Warm the slot region while the SIMD fingerprint scan runs — most
-        // hits land in this bucket, so this hides the slot-load latency.
-        // SAFETY: `level.len > 0` guarded above ⇒ `capacity > 0`;
-        // `bucket_range.start < capacity` by construction.
+        // Warm slot data while SIMD scan runs — hides slot-load latency.
+        // SAFETY: `level.len > 0` ⇒ `capacity > 0`; `bucket_range.start
+        // < capacity` by construction.
         unsafe { level.table.prefetch_slot(bucket_range.start) };
 
         // SIMD fingerprint scan — same as _with_candidate.
@@ -1757,8 +1756,8 @@ where
             unsafe { std::hint::unreachable_unchecked() };
         }
         let group_idx = bucket_range.start / GROUP_SIZE;
-        // SAFETY: `level.len > 0` guarded above ⇒ `capacity > 0`;
-        // `bucket_range.start < capacity` by construction.
+        // SAFETY: `level.len > 0` ⇒ `capacity > 0`; `bucket_range.start
+        // < capacity` by construction.
         unsafe { level.table.prefetch_slot(bucket_range.start) };
 
         // SIMD fingerprint scan over the bucket's control bytes.

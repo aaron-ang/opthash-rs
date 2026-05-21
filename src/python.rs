@@ -92,10 +92,9 @@ unsafe impl Sync for HashedAny {}
 const _: () = assert!(std::mem::size_of::<HashedAny>() == 2 * std::mem::size_of::<usize>());
 
 impl HashedAny {
-    /// Tag-pack `obj` with `kind`. No refcount change. Panics if `obj` is null
-    /// or its `KIND_MASK` bits aren't zero — `CPython` guarantees the latter
-    /// (`PyObject` starts with a `Py_ssize_t`) and callers all source `obj`
-    /// from a live `Bound`'s `as_ptr()`.
+    /// Tag-pack `obj` with `kind`. No refcount change. Panics on null `obj` or
+    /// non-zero `KIND_MASK` bits — both guaranteed by `CPython` for any
+    /// `PyObject*` sourced from a live `Bound::as_ptr()`.
     #[inline]
     fn pack(obj: *mut ffi::PyObject, kind: HashKind) -> NonNull<ffi::PyObject> {
         assert!(!obj.is_null(), "PyObject pointer must be non-null");
