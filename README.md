@@ -13,7 +13,7 @@ Both are open-addressing hash maps that achieve optimal expected probe complexit
 
 ## Data Structures
 
-Both maps share a common core: `RawTable`-backed multi-level layouts, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, tombstone accounting, and SwissTable-style triangular probing within every level [^swisstable] [^cppcon2017] [^hashbrown]. Per-level salt re-randomization [^cw1979] decorrelates probe paths across levels. Both maps prefetch the slot region the moment the bucket/group index resolves, so the fingerprint scan and the entry load overlap [^prefetch2007]. Funnel's bucket selection uses Lemire fastmod [^fastmod] to skip the hardware divide. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash) [^foldhash].
+Both maps share a common core: `RawTable`-backed multi-level layouts, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, tombstone accounting, and SwissTable-style triangular probing within every level [^swisstable] [^cppcon2017] [^hashbrown]. Per-level salt re-randomization [^cw1979] decorrelates probe paths across levels. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash) [^foldhash].
 
 - **`ElasticHashMap<K, V>`** — Flat `RawTable` per level with geometrically halving capacities; insertion uses per-level probe budgets.
 - **`FunnelHashMap<K, V>`** — Bucketed levels plus a split special array: `primary` (group-probed) and `fallback` (two-choice buckets).
@@ -84,17 +84,13 @@ RawTable (shared by both maps)
   fp = fingerprint (7-bit control byte)
   kv = key-value entry, __ = empty, xx = tombstone
 
-  Single allocation, slots first, controls at the end. `RawTable` caches
-  both bases so every probe is a field load — no `data_ptr + offset` add
-  on the hot path:
+  Single allocation, slots first, controls at the end:
 
   data_ptr ► [kv][kv][  ][kv][  ][kv]... [pad] [fp][fp][__][xx][__][fp]...
              └──── slots (T-aligned) ────┘     └─ controls (16-aligned) ──┘
                                                ▲ ctrl_ptr
 
-  Occupancy is derived from SIMD scans of the control bytes. The slot
-  region is prefetched the moment the bucket index resolves, so the
-  fingerprint scan and the entry load overlap.
+  Occupancy is derived from SIMD scans of the control bytes.
 
 
 ElasticHashMap
