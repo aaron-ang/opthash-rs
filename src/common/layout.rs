@@ -196,15 +196,21 @@ impl<T, A: Allocator> RawTable<T, A> {
 
     /// Prefetch the cache line containing slot `idx`. Call before a probable
     /// `get_ref(idx)` to overlap memory latency with the fingerprint scan.
+    ///
+    /// # Safety
+    ///
+    /// `self.capacity > 0` and `idx < self.capacity`. On empty tables
+    /// `data_ptr` is `NonNull::dangling()`; pointer arithmetic on a dangling
+    /// ptr is UB regardless of whether the result is dereferenced.
     #[inline]
-    pub fn prefetch_slot(&self, idx: usize) {
+    pub(crate) unsafe fn prefetch_slot(&self, idx: usize) {
+        debug_assert!(self.capacity > 0, "prefetch_slot: empty table");
         debug_assert!(
             idx < self.capacity,
             "prefetch_slot: idx {idx} >= capacity {}",
             self.capacity
         );
-        // SAFETY: slot pointer is always valid in the allocation (or null
-        // for empty tables — `prefetch_read` swallows null per its contract).
+        // SAFETY: caller upholds `capacity > 0` and `idx < capacity`.
         unsafe {
             super::simd::prefetch_read(self.slots_ptr().add(idx).cast::<u8>());
         }
