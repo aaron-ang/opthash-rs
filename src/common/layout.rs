@@ -42,9 +42,9 @@ pub(crate) struct Entry<K, V> {
 /// a fixed offset after the slots, accessed via `ctrl_ptr()`.
 pub(crate) struct RawTable<T, A: Allocator = Global> {
     data_ptr: NonNull<u8>,
+    ctrl_ptr: NonNull<u8>,
     capacity: usize,
     group_count: usize,
-    ctrl_offset: usize,
     alloc: A,
     _marker: PhantomData<T>,
 }
@@ -87,12 +87,14 @@ impl<T, A: Allocator> RawTable<T, A> {
             .allocate_zeroed(layout)
             .unwrap_or_else(|_| handle_alloc_error(layout))
             .cast::<u8>();
+        // SAFETY: `ctrl_offset` is within the allocation produced for `layout`.
+        let ctrl_ptr = unsafe { NonNull::new_unchecked(data_ptr.as_ptr().add(ctrl_offset)) };
 
         Self {
             data_ptr,
+            ctrl_ptr,
             capacity,
             group_count,
-            ctrl_offset,
             alloc,
             _marker: PhantomData,
         }
@@ -110,12 +112,14 @@ impl<T, A: Allocator> RawTable<T, A> {
         let (layout, ctrl_offset) = Self::try_unified_layout(capacity, group_count).ok_or(())?;
 
         let data_ptr = alloc.allocate_zeroed(layout).map_err(|_| ())?.cast::<u8>();
+        // SAFETY: `ctrl_offset` is within the allocation produced for `layout`.
+        let ctrl_ptr = unsafe { NonNull::new_unchecked(data_ptr.as_ptr().add(ctrl_offset)) };
 
         Ok(Self {
             data_ptr,
+            ctrl_ptr,
             capacity,
             group_count,
-            ctrl_offset,
             alloc,
             _marker: PhantomData,
         })
@@ -125,9 +129,9 @@ impl<T, A: Allocator> RawTable<T, A> {
     fn empty_in(alloc: A) -> Self {
         Self {
             data_ptr: NonNull::dangling(),
+            ctrl_ptr: NonNull::dangling(),
             capacity: 0,
             group_count: 0,
-            ctrl_offset: 0,
             alloc,
             _marker: PhantomData,
         }
@@ -167,7 +171,7 @@ impl<T, A: Allocator> RawTable<T, A> {
 
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
-        unsafe { self.data_ptr.as_ptr().add(self.ctrl_offset) }
+        self.ctrl_ptr.as_ptr()
     }
 
     #[inline]
