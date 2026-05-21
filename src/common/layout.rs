@@ -189,6 +189,17 @@ impl<T, A: Allocator> RawTable<T, A> {
         unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) }
     }
 
+    /// Prefetch the cache line containing slot `idx`. Call before a probable
+    /// `get_ref(idx)` to overlap memory latency with the fingerprint scan.
+    #[inline]
+    pub fn prefetch_slot(&self, idx: usize) {
+        // SAFETY: slot pointer is always valid in the allocation (or null
+        // for empty tables — `prefetch_read` swallows null per its contract).
+        unsafe {
+            super::simd::prefetch_read(self.slots_ptr().add(idx).cast::<u8>());
+        }
+    }
+
     #[inline]
     pub fn control_at(&self, idx: usize) -> u8 {
         unsafe { *self.ctrl_ptr().add(idx) }

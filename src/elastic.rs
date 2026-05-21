@@ -1756,6 +1756,8 @@ where
         let mut delta: usize = 0;
 
         for _ in 0..group_count {
+            // Warm the slot region for this group while the SIMD scan runs.
+            level.table.prefetch_slot(group_idx * GROUP_SIZE);
             let match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
             for relative_idx in match_mask {
                 let slot_idx = group_idx * GROUP_SIZE + relative_idx;
