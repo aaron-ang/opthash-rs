@@ -9,7 +9,7 @@ use super::bitmask::BitMask;
 use super::config::{CONTROL_ALIGN, GROUP_SIZE};
 use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
 use super::math::align;
-use super::simd::{eq_mask_16, free_mask_16, prefetch_read};
+use super::simd::{eq_mask_16, free_mask_16, occupied_mask_16, prefetch_read};
 
 pub(crate) struct SlotEntry<K, V> {
     pub(crate) key: K,
@@ -357,6 +357,65 @@ impl<T, A: Allocator> RawTable<T, A> {
             Some(slot_idx)
         } else {
             None
+        }
+    }
+
+    /// Yield the next occupied slot; reset `cursor` before scanning a new table.
+    #[inline]
+    pub(crate) fn scan_next(&self, cursor: &mut OccupiedCursor) -> Option<usize> {
+        loop {
+            if let Some(bit) = cursor.current_mask.next() {
+                return Some(cursor.current_group_slot + bit);
+            }
+            if cursor.next_group_slot >= self.capacity {
+                return None;
+            }
+            let group_idx = cursor.next_group_slot / GROUP_SIZE;
+            let group_ptr = self.group_data_ptr(group_idx);
+            let mut mask = unsafe { occupied_mask_16(group_ptr) };
+            let group_end = cursor.next_group_slot + GROUP_SIZE;
+            if group_end > self.capacity {
+                mask = mask.truncate_to(self.capacity - cursor.next_group_slot);
+            }
+            cursor.current_mask = mask;
+            cursor.current_group_slot = cursor.next_group_slot;
+            cursor.next_group_slot = group_end;
+        }
+    }
+
+    /// Invoke `f(&mut self, idx)` for every occupied slot. `f` may freely
+    /// mutate the yielded slot's value and ctrl byte, but writes to any
+    /// other ctrl byte invalidate the cursor's cached group mask.
+    pub(crate) fn for_each_occupied_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut Self, usize),
+    {
+        let this: *mut Self = self;
+        let mut cursor = OccupiedCursor::new();
+        // SAFETY: per-iteration `&*this` and `&mut *this` reborrows are
+        // time-disjoint; `this` is valid for the borrow of `self`.
+        while let Some(idx) = unsafe { &*this }.scan_next(&mut cursor) {
+            f(unsafe { &mut *this }, idx);
+        }
+    }
+}
+
+/// Scan position for [`RawTable::scan_next`]: next group + cached mask of the
+/// in-progress group. Construct a fresh one before switching tables.
+#[derive(Clone, Copy)]
+pub(crate) struct OccupiedCursor {
+    next_group_slot: usize,
+    current_group_slot: usize,
+    current_mask: BitMask,
+}
+
+impl OccupiedCursor {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            next_group_slot: 0,
+            current_group_slot: 0,
+            current_mask: BitMask(0),
         }
     }
 }

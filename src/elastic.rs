@@ -16,9 +16,9 @@ use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
-    OccupiedScanner, Values as CommonValues,
+    Values as CommonValues,
 };
-use crate::common::layout::{RawTable, SlotEntry};
+use crate::common::layout::{OccupiedCursor, RawTable, SlotEntry};
 use crate::common::math::{align, capacity, cast, level_salt, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
@@ -807,9 +807,9 @@ where
     #[must_use]
     pub fn iter(&self) -> ElasticIter<'_, K, V, A> {
         ElasticIter {
-            levels: &self.levels,
-            level_idx: 0,
-            scanner: OccupiedScanner::new(),
+            tables: self.levels.iter(),
+            current: None,
+            cursor: OccupiedCursor::new(),
             remaining: self.len,
         }
     }
@@ -841,7 +841,7 @@ where
             levels,
             levels_len,
             level_idx: 0,
-            scanner: OccupiedScanner::new(),
+            cursor: OccupiedCursor::new(),
             remaining,
             _marker: PhantomData,
         }
@@ -958,7 +958,7 @@ where
         Drain {
             map: self,
             level_idx: 0,
-            scanner: OccupiedScanner::new(),
+            cursor: OccupiedCursor::new(),
         }
     }
 
@@ -973,7 +973,7 @@ where
             map: self,
             pred: f,
             level_idx: 0,
-            scanner: OccupiedScanner::new(),
+            cursor: OccupiedCursor::new(),
         }
     }
 
@@ -1222,7 +1222,7 @@ where
 pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     map: &'a mut ElasticHashMap<K, V, S, A>,
     level_idx: usize,
-    scanner: OccupiedScanner,
+    cursor: OccupiedCursor,
 }
 
 impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
@@ -1236,17 +1236,17 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Per-yield ctrl byte update is skipped: Drain::drop wipes all ctrls
-        // via `clear_all_controls` regardless, and the scanner only advances
+        // via `clear_all_controls` regardless, and the scan only advances
         // forward so yielded slots are never re-read.
         while self.level_idx < self.map.levels.len() {
             let level = &mut self.map.levels[self.level_idx];
-            if let Some(idx) = self.scanner.next_in(&level.table) {
+            if let Some(idx) = level.table.scan_next(&mut self.cursor) {
                 let entry = unsafe { level.table.take(idx) };
                 self.map.len -= 1;
                 return Some((entry.key, entry.value));
             }
             self.level_idx += 1;
-            self.scanner.reset();
+            self.cursor = OccupiedCursor::new();
         }
         None
     }
@@ -1288,7 +1288,7 @@ where
     map: &'a mut ElasticHashMap<K, V, S, A>,
     pred: F,
     level_idx: usize,
-    scanner: OccupiedScanner,
+    cursor: OccupiedCursor,
 }
 
 impl<K, V, F, S, A: Allocator + Clone> fmt::Debug for ExtractIf<'_, K, V, F, S, A>
@@ -1313,7 +1313,7 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         while self.level_idx < self.map.levels.len() {
             let level = &mut self.map.levels[self.level_idx];
-            while let Some(idx) = self.scanner.next_in(&level.table) {
+            while let Some(idx) = level.table.scan_next(&mut self.cursor) {
                 // In-place borrow so predicate mutations stick on kept entries.
                 let entry = unsafe { level.table.get_mut(idx) };
                 if (self.pred)(&entry.key, &mut entry.value) {
@@ -1326,7 +1326,7 @@ where
                 }
             }
             self.level_idx += 1;
-            self.scanner.reset();
+            self.cursor = OccupiedCursor::new();
         }
         None
     }
@@ -1350,20 +1350,18 @@ where
 }
 
 /// Borrowing iterator over occupied entries. Walks levels in order via
-/// [`OccupiedScanner`]; skips FREE and TOMBSTONE.
+/// [`OccupiedCursor`]; skips FREE and TOMBSTONE.
 #[derive(Clone)]
 pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
-    levels: &'a [Level<K, V, A>],
-    level_idx: usize,
-    scanner: OccupiedScanner,
+    tables: std::slice::Iter<'a, Level<K, V, A>>,
+    current: Option<&'a RawTable<SlotEntry<K, V>, A>>,
+    cursor: OccupiedCursor,
     remaining: usize,
 }
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticIter<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ElasticIter")
-            .field("level_idx", &self.level_idx)
-            .finish_non_exhaustive()
+        f.debug_struct("ElasticIter").finish_non_exhaustive()
     }
 }
 
@@ -1371,17 +1369,19 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIter<'a, K, V, A> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.level_idx < self.levels.len() {
-            let table = &self.levels[self.level_idx].table;
-            if let Some(slot_idx) = self.scanner.next_in(table) {
+        loop {
+            let Some(table) = self.current else {
+                self.current = Some(&self.tables.next()?.table);
+                self.cursor = OccupiedCursor::new();
+                continue;
+            };
+            if let Some(slot_idx) = table.scan_next(&mut self.cursor) {
                 let entry = unsafe { table.get_ref(slot_idx) };
                 self.remaining -= 1;
                 return Some((&entry.key, &entry.value));
             }
-            self.level_idx += 1;
-            self.scanner.reset();
+            self.current = None;
         }
-        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1421,7 +1421,7 @@ pub struct ElasticIterMut<'a, K, V, A: Allocator + Clone = Global> {
     levels: *mut Level<K, V, A>,
     levels_len: usize,
     level_idx: usize,
-    scanner: OccupiedScanner,
+    cursor: OccupiedCursor,
     remaining: usize,
     _marker: PhantomData<&'a mut [Level<K, V, A>]>,
 }
@@ -1438,8 +1438,8 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIterMut<'a, K, V, A> {
             // SAFETY: `level_idx < levels_len`; `self.levels` points at an
             // owned slice of initialized `Level`s. Fresh `&mut` each iter.
             let level = unsafe { &mut *self.levels.add(self.level_idx) };
-            if let Some(idx) = self.scanner.next_in(&level.table) {
-                // SAFETY: scanner only yields occupied slots; reborrow through
+            if let Some(idx) = level.table.scan_next(&mut self.cursor) {
+                // SAFETY: scan only yields occupied slots; reborrow through
                 // raw ptr so refs outlive the per-iter `level` reborrow.
                 let entry = unsafe { level.table.get_mut(idx) };
                 let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
@@ -1448,7 +1448,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIterMut<'a, K, V, A> {
                 return Some((key, val));
             }
             self.level_idx += 1;
-            self.scanner.reset();
+            self.cursor = OccupiedCursor::new();
         }
         None
     }
@@ -1515,7 +1515,7 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticValuesMut<'_, K, V, A> {
 pub struct ElasticIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     map: ElasticHashMap<K, V, S, A>,
     level_idx: usize,
-    scanner: OccupiedScanner,
+    cursor: OccupiedCursor,
 }
 
 impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
@@ -1524,8 +1524,8 @@ impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
     fn next(&mut self) -> Option<Self::Item> {
         while self.level_idx < self.map.levels.len() {
             let table = &mut self.map.levels[self.level_idx].table;
-            if let Some(idx) = self.scanner.next_in(table) {
-                // SAFETY: scanner only yields occupied slots. Tombstone-mark
+            if let Some(idx) = table.scan_next(&mut self.cursor) {
+                // SAFETY: scan only yields occupied slots. Tombstone-mark
                 // prevents map's Drop and future next() from revisiting.
                 let entry = unsafe { table.take(idx) };
                 table.mark_tombstone(idx);
@@ -1533,7 +1533,7 @@ impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
                 return Some((entry.key, entry.value));
             }
             self.level_idx += 1;
-            self.scanner.reset();
+            self.cursor = OccupiedCursor::new();
         }
         None
     }
@@ -1575,7 +1575,7 @@ where
         ElasticIntoIter {
             map: self,
             level_idx: 0,
-            scanner: OccupiedScanner::new(),
+            cursor: OccupiedCursor::new(),
         }
     }
 }
@@ -1659,13 +1659,11 @@ where
         self.len = 0;
 
         // `take` leaves ctrl stale; clear so Drop doesn't double-drop.
-        let mut scanner = OccupiedScanner::new();
         for mut level in old_levels {
-            scanner.reset();
-            while let Some(idx) = scanner.next_in(&level.table) {
-                let entry = unsafe { level.table.take(idx) };
+            level.table.for_each_occupied_mut(|table, idx| {
+                let entry = unsafe { table.take(idx) };
                 self.insert_unique(entry.key, entry.value);
-            }
+            });
             level.table.clear_all_controls();
         }
     }
@@ -1687,13 +1685,11 @@ where
             self.alloc.clone(),
         )?;
 
-        let mut scanner = OccupiedScanner::new();
         for level in &mut self.levels {
-            scanner.reset();
-            while let Some(idx) = scanner.next_in(&level.table) {
-                let entry = unsafe { level.table.take(idx) };
+            level.table.for_each_occupied_mut(|table, idx| {
+                let entry = unsafe { table.take(idx) };
                 new_map.insert_unique(entry.key, entry.value);
-            }
+            });
             level.table.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
@@ -2273,6 +2269,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -2501,6 +2501,28 @@ mod tests {
     }
 
     #[test]
+    fn keys_yields_inserted_keys_only() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i * 10);
+        }
+        let got: HashSet<i32> = map.keys().copied().collect();
+        let expected: HashSet<i32> = (0..30).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn values_yields_inserted_values_only() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i * 10);
+        }
+        let got: HashSet<i32> = map.values().copied().collect();
+        let expected: HashSet<i32> = (0..30).map(|i| i * 10).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
     fn hasher_returns_consistent_handle() {
         let map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
         let a: *const _ = map.hasher();
@@ -2673,9 +2695,6 @@ mod tests {
 
     #[test]
     fn into_keys_drops_values() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         struct DropCounter {
             counter: Arc<AtomicUsize>,
         }
@@ -2703,9 +2722,6 @@ mod tests {
 
     #[test]
     fn into_values_drops_keys() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         struct DropKey {
             id: usize,
             counter: Arc<AtomicUsize>,
@@ -2802,9 +2818,6 @@ mod tests {
 
     #[test]
     fn into_iter_partial_drop_drops_remaining() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         struct DropCounter {
             counter: Arc<AtomicUsize>,
         }

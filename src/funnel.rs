@@ -16,9 +16,9 @@ use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
-    OccupiedScanner, Values as CommonValues,
+    Values as CommonValues,
 };
-use crate::common::layout::{RawTable, SlotEntry, try_zeroed_boxed_slice_in};
+use crate::common::layout::{OccupiedCursor, RawTable, SlotEntry, try_zeroed_boxed_slice_in};
 use crate::common::math::{align, capacity, cast, level_salt, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
@@ -1195,12 +1195,13 @@ where
     #[must_use]
     pub fn iter(&self) -> FunnelIter<'_, K, V, A> {
         FunnelIter {
-            levels: &self.levels,
-            primary: &self.special.primary,
-            fallback: &self.special.fallback,
-            phase: FunnelIterPhase::Levels,
-            level_idx: 0,
-            scanner: OccupiedScanner::new(),
+            tables: FunnelTables {
+                levels: self.levels.iter(),
+                primary: Some(&self.special.primary.table),
+                fallback: Some(&self.special.fallback.table),
+            },
+            current: None,
+            cursor: OccupiedCursor::new(),
             remaining: self.len,
         }
     }
@@ -1219,7 +1220,7 @@ where
             fallback,
             phase: FunnelIterPhase::Levels,
             level_idx: 0,
-            scanner: OccupiedScanner::new(),
+            cursor: OccupiedCursor::new(),
             remaining,
             _marker: PhantomData,
         }
@@ -1325,7 +1326,7 @@ where
             map: self,
             phase: DrainPhase::Levels,
             level_idx: 0,
-            scanner: OccupiedScanner::new(),
+            cursor: OccupiedCursor::new(),
         }
     }
 
@@ -1341,7 +1342,7 @@ where
             pred: f,
             phase: DrainPhase::Levels,
             level_idx: 0,
-            scanner: OccupiedScanner::new(),
+            cursor: OccupiedCursor::new(),
         }
     }
 
@@ -1414,33 +1415,35 @@ where
             self.alloc.clone(),
         )?;
 
-        let mut scanner = OccupiedScanner::new();
         for level in &mut self.levels {
-            scanner.reset();
-            while let Some(idx) = scanner.next_in(&level.table) {
-                let entry = unsafe { level.table.take(idx) };
+            level.table.for_each_occupied_mut(|table, idx| {
+                let entry = unsafe { table.take(idx) };
                 new_map.insert_new_entry_unchecked(entry.key, entry.value);
-            }
+            });
             level.table.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
         }
 
-        scanner.reset();
-        while let Some(idx) = scanner.next_in(&self.special.primary.table) {
-            let entry = unsafe { self.special.primary.table.take(idx) };
-            new_map.insert_new_entry_unchecked(entry.key, entry.value);
-        }
+        self.special
+            .primary
+            .table
+            .for_each_occupied_mut(|table, idx| {
+                let entry = unsafe { table.take(idx) };
+                new_map.insert_new_entry_unchecked(entry.key, entry.value);
+            });
         self.special.primary.table.clear_all_controls();
         self.special.primary.len = 0;
         self.special.primary.tombstones = 0;
         self.special.primary.group_summaries.fill(0);
 
-        scanner.reset();
-        while let Some(idx) = scanner.next_in(&self.special.fallback.table) {
-            let entry = unsafe { self.special.fallback.table.take(idx) };
-            new_map.insert_new_entry_unchecked(entry.key, entry.value);
-        }
+        self.special
+            .fallback
+            .table
+            .for_each_occupied_mut(|table, idx| {
+                let entry = unsafe { table.take(idx) };
+                new_map.insert_new_entry_unchecked(entry.key, entry.value);
+            });
         self.special.fallback.table.clear_all_controls();
         self.special.fallback.len = 0;
         self.special.fallback.tombstones = 0;
@@ -1558,13 +1561,11 @@ where
         self.len = 0;
 
         // `take` leaves ctrl stale; clear so Drop doesn't double-drop.
-        let mut scanner = OccupiedScanner::new();
         for mut level in old_levels {
-            scanner.reset();
-            while let Some(idx) = scanner.next_in(&level.table) {
-                let entry = unsafe { level.table.take(idx) };
+            level.table.for_each_occupied_mut(|table, idx| {
+                let entry = unsafe { table.take(idx) };
                 self.insert_new_entry_unchecked(entry.key, entry.value);
-            }
+            });
             level.table.clear_all_controls();
         }
         let SpecialArray {
@@ -1572,17 +1573,15 @@ where
             mut fallback,
             total_len: _,
         } = old_special;
-        scanner.reset();
-        while let Some(idx) = scanner.next_in(&primary.table) {
-            let entry = unsafe { primary.table.take(idx) };
+        primary.table.for_each_occupied_mut(|table, idx| {
+            let entry = unsafe { table.take(idx) };
             self.insert_new_entry_unchecked(entry.key, entry.value);
-        }
+        });
         primary.table.clear_all_controls();
-        scanner.reset();
-        while let Some(idx) = scanner.next_in(&fallback.table) {
-            let entry = unsafe { fallback.table.take(idx) };
+        fallback.table.for_each_occupied_mut(|table, idx| {
+            let entry = unsafe { table.take(idx) };
             self.insert_new_entry_unchecked(entry.key, entry.value);
-        }
+        });
         fallback.table.clear_all_controls();
     }
 
@@ -2406,7 +2405,7 @@ where
 
 /// Three-phase iterator state: walk all bucket levels, then the special
 /// primary, then the special fallback.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum FunnelIterPhase {
     Levels,
     Primary,
@@ -2414,26 +2413,41 @@ enum FunnelIterPhase {
     Done,
 }
 
+/// Iterator over the funnel's tables: each level, then primary, then fallback.
+#[derive(Clone)]
+struct FunnelTables<'a, K, V, A: Allocator + Clone> {
+    levels: std::slice::Iter<'a, BucketLevel<K, V, A>>,
+    primary: Option<&'a RawTable<SlotEntry<K, V>, A>>,
+    fallback: Option<&'a RawTable<SlotEntry<K, V>, A>>,
+}
+
+impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelTables<'a, K, V, A> {
+    type Item = &'a RawTable<SlotEntry<K, V>, A>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(level) = self.levels.next() {
+            return Some(&level.table);
+        }
+        if let Some(t) = self.primary.take() {
+            return Some(t);
+        }
+        self.fallback.take()
+    }
+}
+
 /// Borrowing iterator over occupied entries. Visits bucket levels → special
 /// primary → special fallback. SIMD-scans one group at a time via
-/// [`OccupiedScanner`], yielding bits from a cached mask before refilling.
+/// [`OccupiedCursor`], yielding bits from a cached mask before refilling.
 #[derive(Clone)]
 pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
-    levels: &'a [BucketLevel<K, V, A>],
-    primary: &'a SpecialPrimary<K, V, A>,
-    fallback: &'a SpecialFallback<K, V, A>,
-    phase: FunnelIterPhase,
-    level_idx: usize,
-    scanner: OccupiedScanner,
+    tables: FunnelTables<'a, K, V, A>,
+    current: Option<&'a RawTable<SlotEntry<K, V>, A>>,
+    cursor: OccupiedCursor,
     remaining: usize,
 }
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelIter<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FunnelIter")
-            .field("phase", &self.phase)
-            .field("level_idx", &self.level_idx)
-            .finish_non_exhaustive()
+        f.debug_struct("FunnelIter").finish_non_exhaustive()
     }
 }
 
@@ -2442,42 +2456,17 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            match self.phase {
-                FunnelIterPhase::Levels => {
-                    while self.level_idx < self.levels.len() {
-                        let table = &self.levels[self.level_idx].table;
-                        if let Some(slot_idx) = self.scanner.next_in(table) {
-                            let entry = unsafe { table.get_ref(slot_idx) };
-                            self.remaining -= 1;
-                            return Some((&entry.key, &entry.value));
-                        }
-                        self.level_idx += 1;
-                        self.scanner.reset();
-                    }
-                    self.phase = FunnelIterPhase::Primary;
-                    self.scanner.reset();
-                }
-                FunnelIterPhase::Primary => {
-                    let table = &self.primary.table;
-                    if let Some(slot_idx) = self.scanner.next_in(table) {
-                        let entry = unsafe { table.get_ref(slot_idx) };
-                        self.remaining -= 1;
-                        return Some((&entry.key, &entry.value));
-                    }
-                    self.phase = FunnelIterPhase::Fallback;
-                    self.scanner.reset();
-                }
-                FunnelIterPhase::Fallback => {
-                    let table = &self.fallback.table;
-                    if let Some(slot_idx) = self.scanner.next_in(table) {
-                        let entry = unsafe { table.get_ref(slot_idx) };
-                        self.remaining -= 1;
-                        return Some((&entry.key, &entry.value));
-                    }
-                    self.phase = FunnelIterPhase::Done;
-                }
-                FunnelIterPhase::Done => return None,
+            let Some(table) = self.current else {
+                self.current = Some(self.tables.next()?);
+                self.cursor = OccupiedCursor::new();
+                continue;
+            };
+            if let Some(slot_idx) = table.scan_next(&mut self.cursor) {
+                let entry = unsafe { table.get_ref(slot_idx) };
+                self.remaining -= 1;
+                return Some((&entry.key, &entry.value));
             }
+            self.current = None;
         }
     }
 
@@ -2505,7 +2494,6 @@ where
 
 /// Walk phase shared by `Drain` and `ExtractIf`: levels first, then the
 /// special primary, then the special fallback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainPhase {
     Levels,
     Primary,
@@ -2520,7 +2508,7 @@ pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global
     map: &'a mut FunnelHashMap<K, V, S, A>,
     phase: DrainPhase,
     level_idx: usize,
-    scanner: OccupiedScanner,
+    cursor: OccupiedCursor,
 }
 
 impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
@@ -2534,37 +2522,37 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Per-yield ctrl byte update is skipped: Drain::drop wipes all ctrls
-        // via `clear_all_controls` regardless, and the scanner only advances
+        // via `clear_all_controls` regardless, and the scan only advances
         // forward so yielded slots are never re-read.
         loop {
             match self.phase {
                 DrainPhase::Levels => {
                     while self.level_idx < self.map.levels.len() {
                         let level = &mut self.map.levels[self.level_idx];
-                        if let Some(idx) = self.scanner.next_in(&level.table) {
+                        if let Some(idx) = level.table.scan_next(&mut self.cursor) {
                             let entry = unsafe { level.table.take(idx) };
                             self.map.len -= 1;
                             return Some((entry.key, entry.value));
                         }
                         self.level_idx += 1;
-                        self.scanner.reset();
+                        self.cursor = OccupiedCursor::new();
                     }
                     self.phase = DrainPhase::Primary;
-                    self.scanner.reset();
+                    self.cursor = OccupiedCursor::new();
                 }
                 DrainPhase::Primary => {
                     let primary = &mut self.map.special.primary;
-                    if let Some(idx) = self.scanner.next_in(&primary.table) {
+                    if let Some(idx) = primary.table.scan_next(&mut self.cursor) {
                         let entry = unsafe { primary.table.take(idx) };
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
                     self.phase = DrainPhase::Fallback;
-                    self.scanner.reset();
+                    self.cursor = OccupiedCursor::new();
                 }
                 DrainPhase::Fallback => {
                     let fallback = &mut self.map.special.fallback;
-                    if let Some(idx) = self.scanner.next_in(&fallback.table) {
+                    if let Some(idx) = fallback.table.scan_next(&mut self.cursor) {
                         let entry = unsafe { fallback.table.take(idx) };
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
@@ -2620,7 +2608,7 @@ where
     pred: F,
     phase: DrainPhase,
     level_idx: usize,
-    scanner: OccupiedScanner,
+    cursor: OccupiedCursor,
 }
 
 impl<K, V, F, S, A: Allocator + Clone> fmt::Debug for ExtractIf<'_, K, V, F, S, A>
@@ -2648,8 +2636,8 @@ where
                 DrainPhase::Levels => {
                     while self.level_idx < self.map.levels.len() {
                         let level = &mut self.map.levels[self.level_idx];
-                        while let Some(idx) = self.scanner.next_in(&level.table) {
-                            // SAFETY: scanner only yields occupied slots.
+                        while let Some(idx) = level.table.scan_next(&mut self.cursor) {
+                            // SAFETY: scan only yields occupied slots.
                             let entry = unsafe { level.table.get_mut(idx) };
                             if (self.pred)(&entry.key, &mut entry.value) {
                                 let removed = unsafe { level.table.take(idx) };
@@ -2662,14 +2650,14 @@ where
                             }
                         }
                         self.level_idx += 1;
-                        self.scanner.reset();
+                        self.cursor = OccupiedCursor::new();
                     }
                     self.phase = DrainPhase::Primary;
-                    self.scanner.reset();
+                    self.cursor = OccupiedCursor::new();
                 }
                 DrainPhase::Primary => {
                     let primary = &mut self.map.special.primary;
-                    while let Some(idx) = self.scanner.next_in(&primary.table) {
+                    while let Some(idx) = primary.table.scan_next(&mut self.cursor) {
                         let entry = unsafe { primary.table.get_mut(idx) };
                         if (self.pred)(&entry.key, &mut entry.value) {
                             let removed = unsafe { primary.table.take(idx) };
@@ -2683,11 +2671,11 @@ where
                         }
                     }
                     self.phase = DrainPhase::Fallback;
-                    self.scanner.reset();
+                    self.cursor = OccupiedCursor::new();
                 }
                 DrainPhase::Fallback => {
                     let fallback = &mut self.map.special.fallback;
-                    while let Some(idx) = self.scanner.next_in(&fallback.table) {
+                    while let Some(idx) = fallback.table.scan_next(&mut self.cursor) {
                         let entry = unsafe { fallback.table.get_mut(idx) };
                         if (self.pred)(&entry.key, &mut entry.value) {
                             let removed = unsafe { fallback.table.take(idx) };
@@ -2743,7 +2731,7 @@ pub struct FunnelIterMut<'a, K, V, A: Allocator + Clone = Global> {
     fallback: *mut SpecialFallback<K, V, A>,
     phase: FunnelIterPhase,
     level_idx: usize,
-    scanner: OccupiedScanner,
+    cursor: OccupiedCursor,
     remaining: usize,
     _marker: PhantomData<&'a mut SpecialArray<K, V, A>>,
 }
@@ -2766,8 +2754,8 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                         // `BucketLevel`s owned by the borrowed map. We hold
                         // an exclusive borrow for `'a` (via PhantomData).
                         let level = unsafe { &mut *self.levels.add(self.level_idx) };
-                        if let Some(idx) = self.scanner.next_in(&level.table) {
-                            // SAFETY: scanner only yields occupied slots; each
+                        if let Some(idx) = level.table.scan_next(&mut self.cursor) {
+                            // SAFETY: scan only yields occupied slots; each
                             // call yields a strictly newer slot, so borrows
                             // returned across calls are disjoint.
                             let entry = unsafe { level.table.get_mut(idx) };
@@ -2777,16 +2765,16 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                             return Some((key, val));
                         }
                         self.level_idx += 1;
-                        self.scanner.reset();
+                        self.cursor = OccupiedCursor::new();
                     }
                     self.phase = FunnelIterPhase::Primary;
-                    self.scanner.reset();
+                    self.cursor = OccupiedCursor::new();
                 }
                 FunnelIterPhase::Primary => {
                     // SAFETY: `self.primary` points at the borrowed map's
                     // `SpecialPrimary` for `'a`.
                     let primary = unsafe { &mut *self.primary };
-                    if let Some(idx) = self.scanner.next_in(&primary.table) {
+                    if let Some(idx) = primary.table.scan_next(&mut self.cursor) {
                         let entry = unsafe { primary.table.get_mut(idx) };
                         let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                         let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
@@ -2794,12 +2782,12 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                         return Some((key, val));
                     }
                     self.phase = FunnelIterPhase::Fallback;
-                    self.scanner.reset();
+                    self.cursor = OccupiedCursor::new();
                 }
                 FunnelIterPhase::Fallback => {
                     // SAFETY: same as the Primary arm, for `self.fallback`.
                     let fallback = unsafe { &mut *self.fallback };
-                    if let Some(idx) = self.scanner.next_in(&fallback.table) {
+                    if let Some(idx) = fallback.table.scan_next(&mut self.cursor) {
                         let entry = unsafe { fallback.table.get_mut(idx) };
                         let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                         let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
@@ -2879,7 +2867,7 @@ pub struct FunnelIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = G
     map: FunnelHashMap<K, V, S, A>,
     phase: FunnelIterPhase,
     level_idx: usize,
-    scanner: OccupiedScanner,
+    cursor: OccupiedCursor,
 }
 
 impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
@@ -2891,8 +2879,8 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
                 FunnelIterPhase::Levels => {
                     while self.level_idx < self.map.levels.len() {
                         let table = &mut self.map.levels[self.level_idx].table;
-                        if let Some(idx) = self.scanner.next_in(table) {
-                            // SAFETY: scanner only yields occupied indices.
+                        if let Some(idx) = table.scan_next(&mut self.cursor) {
+                            // SAFETY: scan only yields occupied indices.
                             // Tombstone-mark so the map's `Drop` skips it.
                             let entry = unsafe { table.take(idx) };
                             table.mark_tombstone(idx);
@@ -2900,25 +2888,25 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
                             return Some((entry.key, entry.value));
                         }
                         self.level_idx += 1;
-                        self.scanner.reset();
+                        self.cursor = OccupiedCursor::new();
                     }
                     self.phase = FunnelIterPhase::Primary;
-                    self.scanner.reset();
+                    self.cursor = OccupiedCursor::new();
                 }
                 FunnelIterPhase::Primary => {
                     let table = &mut self.map.special.primary.table;
-                    if let Some(idx) = self.scanner.next_in(table) {
+                    if let Some(idx) = table.scan_next(&mut self.cursor) {
                         let entry = unsafe { table.take(idx) };
                         table.mark_tombstone(idx);
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
                     self.phase = FunnelIterPhase::Fallback;
-                    self.scanner.reset();
+                    self.cursor = OccupiedCursor::new();
                 }
                 FunnelIterPhase::Fallback => {
                     let table = &mut self.map.special.fallback.table;
-                    if let Some(idx) = self.scanner.next_in(table) {
+                    if let Some(idx) = table.scan_next(&mut self.cursor) {
                         let entry = unsafe { table.take(idx) };
                         table.mark_tombstone(idx);
                         self.map.len -= 1;
@@ -2971,7 +2959,7 @@ where
             map: self,
             phase: FunnelIterPhase::Levels,
             level_idx: 0,
-            scanner: OccupiedScanner::new(),
+            cursor: OccupiedCursor::new(),
         }
     }
 }
@@ -3343,6 +3331,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -3623,6 +3615,28 @@ mod tests {
     }
 
     #[test]
+    fn keys_yields_inserted_keys_only() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
+        for i in 0..50 {
+            map.insert(i, i * 7);
+        }
+        let got: HashSet<i32> = map.keys().copied().collect();
+        let expected: HashSet<i32> = (0..50).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn values_yields_inserted_values_only() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
+        for i in 0..50 {
+            map.insert(i, i * 7);
+        }
+        let got: HashSet<i32> = map.values().copied().collect();
+        let expected: HashSet<i32> = (0..50).map(|i| i * 7).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
     fn hasher_returns_consistent_handle() {
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
         let a: *const _ = map.hasher();
@@ -3778,9 +3792,6 @@ mod tests {
 
     #[test]
     fn into_keys_drops_values() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         struct DropCounter {
             counter: Arc<AtomicUsize>,
         }
@@ -3808,9 +3819,6 @@ mod tests {
 
     #[test]
     fn into_values_drops_keys() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         struct DropKey {
             id: usize,
             counter: Arc<AtomicUsize>,
@@ -3872,9 +3880,6 @@ mod tests {
 
     #[test]
     fn into_iter_partial_drop_drops_remaining() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         struct DropCounter {
             counter: Arc<AtomicUsize>,
         }
