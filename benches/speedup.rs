@@ -574,7 +574,7 @@ fn bench_shrink_to_fit_throughput(c: &mut Criterion) {
     let pairs = make_pairs(MAP_SIZE);
     let keep: usize = MAP_SIZE / 10;
     let mut group = c.benchmark_group("shrink_to_fit_throughput");
-    group.throughput(Throughput::Elements((MAP_SIZE - keep) as u64));
+    group.throughput(Throughput::Elements(keep as u64));
 
     bench_all_impls!(
         group,
