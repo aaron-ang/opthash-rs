@@ -3,22 +3,18 @@
 //!
 //! ## LLVM elision pitfalls
 //!
-//! - `.count()` on iterators yielding `Copy` types with no-op `Drop` is
-//!   hoisted out — the optimizer drops the walk entirely. Fold xor over
-//!   yielded `(k, v)` so every pair has to be touched.
-//! - Bulk-destructive ops (`clear`, `drain`) over `(u64, u64)` payloads
-//!   become no-ops in the optimizer's eyes. Use the `DropU64` variant
-//!   (see [`common::DropU64`]) for groups whose dominant cost is `Drop`.
-//! - Loop-invariant lookups can be hoisted; wrap `.get(k)` results in
-//!   `black_box` per iteration.
+//! - `.count()` over `Copy`+no-op-`Drop` iterators is hoisted out. Fold
+//!   xor over `(k, v)` instead.
+//! - Bulk drops over `(u64, u64)` payload look side-effect-free to LLVM;
+//!   use `DropU64` for clear/drain (`drop_throughput` groups).
+//! - Wrap `.get(k)` results in `black_box` to keep loop-invariant lookups
+//!   from being hoisted.
 //!
-//! ## BatchSize choices
+//! ## BatchSize
 //!
-//! - Read-only ops (`iter`, `get_hit`, `get_miss`): `LargeInput` —
-//!   single map build amortized across iterations.
-//! - Destructive ops (`drain`, `extract_if`, `clear`, `clone`,
-//!   `grow_insert`): `PerIteration` — each iter needs a fresh fixture.
-//! - In-place mutation (`iter_mut`): `LargeInput` — non-destructive.
+//! `LargeInput` for non-destructive ops (`iter`, `iter_mut`, lookups).
+//! `PerIteration` for destructive ops (`drain`, `extract_if`, `clear`,
+//! `grow_insert`, `entry_or_insert`).
 
 mod common;
 
@@ -28,9 +24,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::{
-    LATENCY_SIZES, VALUE_XOR_MIX_ALT, build_elastic_drop_map, build_elastic_map,
-    build_funnel_drop_map, build_funnel_map, build_hashbrown_drop_map, build_hashbrown_map,
-    build_std_drop_map, build_std_map, drop_sink_value, key_at, make_pairs, size_label,
+    BigVal, LATENCY_SIZES, VALUE_XOR_MIX_ALT, build_elastic_big_map, build_elastic_drop_map,
+    build_elastic_map, build_funnel_big_map, build_funnel_drop_map, build_funnel_map,
+    build_hashbrown_big_map, build_hashbrown_drop_map, build_hashbrown_map, build_std_big_map,
+    build_std_drop_map, build_std_map, drop_sink_value, key_at, make_big_pairs, make_pairs,
+    size_label,
 };
 use criterion::{
     BatchSize, Criterion, Throughput, criterion_group, criterion_main, profiler::Profiler,
@@ -491,6 +489,94 @@ fn bench_get_hit_load_factor(c: &mut Criterion) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Large-value (memcpy axis) variants. 32-byte `BigVal` payload exercises
+// memcpy on insert-rehash, move-out on drain, and cache-line footprint
+// on get. Pair with the equivalent `(u64, u64)` group to attribute deltas.
+// ---------------------------------------------------------------------------
+
+fn bench_insert_big_throughput(c: &mut Criterion) {
+    let pairs = make_big_pairs(OP_COUNT);
+    let mut group = c.benchmark_group("insert_big_throughput");
+    group.throughput(Throughput::Elements(OP_COUNT as u64));
+
+    bench_all_impls!(
+        group,
+        BatchSize::PerIteration,
+        || StdHashMap::<u64, BigVal>::with_capacity(OP_COUNT),
+        || HashbrownMap::<u64, BigVal>::with_capacity(OP_COUNT),
+        || ElasticHashMap::<u64, BigVal>::with_capacity(OP_COUNT),
+        || FunnelHashMap::<u64, BigVal>::with_capacity(OP_COUNT),
+        |map| {
+            for &(key, value) in &pairs {
+                map.insert(black_box(key), black_box(value));
+            }
+            black_box(map.len())
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_get_hit_big_throughput(c: &mut Criterion) {
+    let pairs = make_big_pairs(MAP_SIZE);
+    let std_map = build_std_big_map(&pairs);
+    let hb_map = build_hashbrown_big_map(&pairs);
+    let el_map = build_elastic_big_map(&pairs);
+    let fn_map = build_funnel_big_map(&pairs);
+    let hit_keys: Vec<u64> = (0..OP_COUNT).map(|idx| pairs[idx % MAP_SIZE].0).collect();
+
+    let mut group = c.benchmark_group("get_hit_big_throughput");
+    group.throughput(Throughput::Elements(hit_keys.len() as u64));
+    group.bench_function("std", |b| {
+        b.iter(|| {
+            for key in &hit_keys {
+                black_box(std_map.get(black_box(key)));
+            }
+        });
+    });
+    group.bench_function("hashbrown", |b| {
+        b.iter(|| {
+            for key in &hit_keys {
+                black_box(hb_map.get(black_box(key)));
+            }
+        });
+    });
+    group.bench_function("elastic", |b| {
+        b.iter(|| {
+            for key in &hit_keys {
+                black_box(el_map.get(black_box(key)));
+            }
+        });
+    });
+    group.bench_function("funnel", |b| {
+        b.iter(|| {
+            for key in &hit_keys {
+                black_box(fn_map.get(black_box(key)));
+            }
+        });
+    });
+    group.finish();
+}
+
+fn bench_drain_big_throughput(c: &mut Criterion) {
+    let pairs = make_big_pairs(MAP_SIZE);
+    let mut group = c.benchmark_group("drain_big_throughput");
+    group.throughput(Throughput::Elements(MAP_SIZE as u64));
+
+    bench_all_impls!(
+        group,
+        BatchSize::PerIteration,
+        || build_std_big_map(&pairs),
+        || build_hashbrown_big_map(&pairs),
+        || build_elastic_big_map(&pairs),
+        || build_funnel_big_map(&pairs),
+        |map| { black_box(map.drain().fold(0u64, |a, (k, v)| a ^ k ^ v[0] ^ v[3])) },
+    );
+
+    group.finish();
+}
+
 fn bench_get_hit_latency(c: &mut Criterion) {
     for &size in LATENCY_SIZES {
         let pairs = make_pairs(size);
@@ -543,6 +629,9 @@ criterion_group!(
         bench_extract_if_throughput,
         bench_clear_drop_throughput,
         bench_entry_or_insert_throughput,
+        bench_insert_big_throughput,
+        bench_get_hit_big_throughput,
+        bench_drain_big_throughput,
         bench_get_hit_latency
 );
 criterion_main!(benches);

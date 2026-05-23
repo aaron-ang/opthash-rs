@@ -70,24 +70,11 @@ pub fn build_hashbrown_map(pairs: &[(u64, u64)]) -> HashbrownMap<u64, u64> {
     map
 }
 
-// ---------------------------------------------------------------------------
-// `DropU64` payload — Drop-bearing variant of `u64`.
-//
-// Several bench groups (clear, drain, extract_if) measure code paths whose
-// dominant cost is per-entry `Drop`. With `(u64, u64)` payload — `Copy`,
-// no-op `Drop` — LLVM can prove the walk is side-effect-free and elide
-// the entire loop, hiding regressions. `DropU64`'s `Drop` impl issues an
-// atomic xor against a global sink: observable to the optimizer, so the
-// drop loop has to actually execute, and trivially cheap at runtime (~1
-// ns per drop on modern x86).
-// ---------------------------------------------------------------------------
-
-/// Sink for [`DropU64::drop`] side-effects. Read in [`drop_sink_value`]
-/// after each bench to keep the writes observable.
+/// Side-effect sink for [`DropU64::drop`]; defeats LLVM elision of drop loops.
 pub static DROP_SINK: AtomicU64 = AtomicU64::new(0);
 
-/// Wrapper around `u64` whose `Drop` impl is observable. Keeps LLVM from
-/// eliding the drop loop in clear / drain / extract_if benches.
+/// `u64` with an observable `Drop`. Use for clear/drain/extract_if benches
+/// where `(u64, u64)` payload would let the optimizer skip the walk.
 #[derive(PartialEq, Eq, Hash)]
 pub struct DropU64(pub u64);
 
@@ -139,6 +126,62 @@ pub fn build_funnel_drop_map(n: usize) -> FunnelHashMap<DropU64, DropU64> {
     for idx in 0..n {
         let key = key_at(idx);
         map.insert(DropU64(key), DropU64(key ^ VALUE_XOR_MIX));
+    }
+    map
+}
+
+/// 32-byte Copy value for memcpy-cost benches (insert rehash, drain move-out,
+/// get cache footprint). Pair with `u64` keys.
+pub type BigVal = [u64; 4];
+
+#[inline]
+#[must_use]
+pub fn big_val(key: u64) -> BigVal {
+    [key, key ^ VALUE_XOR_MIX, key.wrapping_add(1), !key]
+}
+
+#[must_use]
+pub fn make_big_pairs(count: usize) -> Vec<(u64, BigVal)> {
+    (0..count)
+        .map(|idx| {
+            let key = key_at(idx);
+            (key, big_val(key))
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn build_std_big_map(pairs: &[(u64, BigVal)]) -> StdHashMap<u64, BigVal> {
+    let mut map = StdHashMap::with_capacity(pairs.len());
+    for &(key, value) in pairs {
+        map.insert(key, value);
+    }
+    map
+}
+
+#[must_use]
+pub fn build_hashbrown_big_map(pairs: &[(u64, BigVal)]) -> HashbrownMap<u64, BigVal> {
+    let mut map = HashbrownMap::with_capacity(pairs.len());
+    for &(key, value) in pairs {
+        map.insert(key, value);
+    }
+    map
+}
+
+#[must_use]
+pub fn build_elastic_big_map(pairs: &[(u64, BigVal)]) -> ElasticHashMap<u64, BigVal> {
+    let mut map = ElasticHashMap::with_capacity(pairs.len());
+    for &(key, value) in pairs {
+        map.insert(key, value);
+    }
+    map
+}
+
+#[must_use]
+pub fn build_funnel_big_map(pairs: &[(u64, BigVal)]) -> FunnelHashMap<u64, BigVal> {
+    let mut map = FunnelHashMap::with_capacity(pairs.len());
+    for &(key, value) in pairs {
+        map.insert(key, value);
     }
     map
 }
