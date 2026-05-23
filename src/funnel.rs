@@ -22,10 +22,6 @@ use crate::common::layout::{RawTable, SlotEntry, try_zeroed_boxed_slice_in};
 use crate::common::math::{align, capacity, cast, level_salt, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
-/// `reserve` slack multiplier. 3× holds across foldhash seeds; 2× sometimes
-/// triggers mid-reserve probe-budget exhaustion in the special array.
-const FUNNEL_RESERVE_OVERSIZE: usize = 3;
-
 /// Construction-time tuning for `FunnelHashMap`.
 #[derive(Debug, Clone, Copy)]
 pub struct FunnelOptions {
@@ -773,10 +769,10 @@ where
         self.max_insertions
     }
 
-    /// Grow capacity so at least `additional` more inserts fit without
-    /// triggering an internal resize. No-op if already large enough.
-    /// Targets `FUNNEL_RESERVE_OVERSIZE × needed` to keep probe-budget
-    /// exhaustion from firing mid-reserve.
+    /// Grow capacity so at least `additional` more inserts fit. No-op if
+    /// already large enough. Funnel's probe-budget exhaustion can still
+    /// trigger a resize mid-fill, so this matches std's "at least" wording
+    /// without promising no resize on every subsequent insert.
     ///
     /// # Panics
     ///
@@ -787,8 +783,7 @@ where
         if needed <= self.max_insertions {
             return;
         }
-        let target = needed.saturating_mul(FUNNEL_RESERVE_OVERSIZE);
-        let new_capacity = self.grow_capacity_for(target).expect("capacity overflow");
+        let new_capacity = self.grow_capacity_for(needed).expect("capacity overflow");
         self.resize(new_capacity);
     }
 
@@ -809,11 +804,8 @@ where
         if needed <= self.max_insertions {
             return Ok(());
         }
-        let target = needed
-            .checked_mul(FUNNEL_RESERVE_OVERSIZE)
-            .ok_or(TryReserveError::CapacityOverflow)?;
         let new_capacity = self
-            .grow_capacity_for(target)
+            .grow_capacity_for(needed)
             .ok_or(TryReserveError::CapacityOverflow)?;
         self.try_resize(new_capacity)
     }
