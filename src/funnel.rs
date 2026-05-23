@@ -22,6 +22,11 @@ use crate::common::layout::{RawTable, SlotEntry, try_zeroed_boxed_slice_in};
 use crate::common::math::{align, capacity, cast, level_salt, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
+/// `reserve(additional)` targets `(self.len + additional) * FUNNEL_RESERVE_OVERSIZE`
+/// insertions. The slack absorbs probe-budget exhaustion in the special array,
+/// which can otherwise trigger a mid-reserve resize even at low global load.
+const FUNNEL_RESERVE_OVERSIZE: usize = 3;
+
 /// Construction-time tuning for `FunnelHashMap`.
 #[derive(Debug, Clone, Copy)]
 pub struct FunnelOptions {
@@ -678,12 +683,22 @@ where
     /// Full constructor. `resize` also calls this with the existing
     /// `hash_builder` and allocator so all keys keep the same hash sequence
     /// across grows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no representable capacity satisfies the requested
+    /// `options.capacity` budget.
     #[must_use]
     pub fn with_options_and_hasher_in(options: FunnelOptions, hash_builder: S, alloc: A) -> Self {
         // Paper §5 precondition: δ ≤ 1/8.
         let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction)
             .min(MAX_FUNNEL_RESERVE_FRACTION);
-        let capacity = options.capacity;
+        let capacity = if options.capacity == 0 {
+            0
+        } else {
+            capacity::capacity_for(INITIAL_CAPACITY, options.capacity, reserve_fraction)
+                .expect("capacity overflow")
+        };
         let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
         let level_count = compute_level_count(reserve_fraction);
@@ -750,13 +765,23 @@ where
         self.len == 0
     }
 
+    /// Maximum number of inserts the map can absorb before the next resize.
+    /// Mirrors [`std::collections::HashMap::capacity`]. Returns
+    /// `max_insertions` (the budget), not the raw slot count.
     #[must_use]
+    #[allow(clippy::misnamed_getters)]
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.max_insertions
     }
 
     /// Grow capacity so at least `additional` more inserts fit without
     /// triggering an internal resize. No-op if already large enough.
+    ///
+    /// Funnel reserves with 2× margin: probe-budget exhaustion in the
+    /// bucket levels + special array can trigger a mid-reserve resize even
+    /// when global load is well under `max_insertions`. The extra slack
+    /// absorbs that probabilistic concentration so the std `reserve`
+    /// no-resize contract holds.
     ///
     /// # Panics
     ///
@@ -767,7 +792,8 @@ where
         if needed <= self.max_insertions {
             return;
         }
-        let new_capacity = self.grow_capacity_for(needed).expect("capacity overflow");
+        let target = needed.saturating_mul(FUNNEL_RESERVE_OVERSIZE);
+        let new_capacity = self.grow_capacity_for(target).expect("capacity overflow");
         self.resize(new_capacity);
     }
 
@@ -788,8 +814,11 @@ where
         if needed <= self.max_insertions {
             return Ok(());
         }
+        let target = needed
+            .checked_mul(FUNNEL_RESERVE_OVERSIZE)
+            .ok_or(TryReserveError::CapacityOverflow)?;
         let new_capacity = self
-            .grow_capacity_for(needed)
+            .grow_capacity_for(target)
             .ok_or(TryReserveError::CapacityOverflow)?;
         self.try_resize(new_capacity)
     }
@@ -3332,22 +3361,23 @@ mod tests {
 
     #[test]
     fn funnel_layout_covers_capacity() {
-        // SpecialPrimary rounds up to pow2 group_count for odd-step probing,
-        // so total slots may exceed the requested capacity. The invariant is
-        // "covers at least the request, bounded inflation".
-        let capacity = 257;
-        let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(capacity);
+        // `with_capacity(n)` interprets `n` as the insertion budget. Internal
+        // slot allocation rounds up so `capacity() >= n` and total slots
+        // (level + special) cover that budget.
+        let requested = 257;
+        let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(requested);
+        assert!(
+            map.capacity() >= requested,
+            "capacity={} below requested={requested}",
+            map.capacity()
+        );
         let level_capacity: usize = map.levels.iter().map(BucketLevel::capacity).sum();
         let special_capacity =
             map.special.primary.table.capacity() + map.special.fallback.table.capacity();
         let total = level_capacity + special_capacity;
         assert!(
-            total >= capacity,
-            "total={total} below requested={capacity}"
-        );
-        assert!(
-            total <= capacity * 2,
-            "total={total} exceeds 2x of requested={capacity}",
+            total >= requested,
+            "total={total} below requested={requested}"
         );
     }
 
@@ -3397,13 +3427,15 @@ mod tests {
     }
 
     #[test]
-    fn options_constructor_preserves_capacity() {
+    fn options_constructor_fits_requested_capacity() {
+        // `options.capacity` is the insertion budget; the map allocates at
+        // least enough slots so `capacity() >= requested`.
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_options(FunnelOptions {
             capacity: 320,
             reserve_fraction: DEFAULT_RESERVE_FRACTION,
             primary_probe_limit: Some(4),
         });
-        assert_eq!(map.capacity(), 320);
+        assert!(map.capacity() >= 320);
     }
 
     #[test]

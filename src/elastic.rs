@@ -391,11 +391,21 @@ where
     /// Full constructor. `resize` also calls this with the existing
     /// `hash_builder` and allocator so all keys keep the same hash sequence
     /// across grows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no representable capacity satisfies the requested
+    /// `options.capacity` budget.
     #[must_use]
     pub fn with_options_and_hasher_in(options: ElasticOptions, hash_builder: S, alloc: A) -> Self {
         let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction);
         let probe_scale = sanitize_probe_scale(options.probe_scale);
-        let capacity = options.capacity;
+        let capacity = if options.capacity == 0 {
+            0
+        } else {
+            capacity::capacity_for(INITIAL_CAPACITY, options.capacity, reserve_fraction)
+                .expect("capacity overflow")
+        };
         let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
         let level_capacities = partition_levels(capacity);
@@ -448,9 +458,13 @@ where
         self.len == 0
     }
 
+    /// Maximum number of inserts the map can absorb before the next resize.
+    /// Mirrors [`std::collections::HashMap::capacity`]. Returns
+    /// `max_insertions` (the budget), not the raw slot count.
     #[must_use]
+    #[allow(clippy::misnamed_getters)]
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.max_insertions
     }
 
     /// Grow capacity so at least `additional` more inserts fit without
@@ -2331,13 +2345,15 @@ mod tests {
     }
 
     #[test]
-    fn options_constructor_preserves_capacity() {
+    fn options_constructor_fits_requested_capacity() {
+        // `options.capacity` is the insertion budget; the map allocates at
+        // least enough slots so `capacity() >= requested`.
         let map: ElasticHashMap<i32, i32> = ElasticHashMap::with_options(ElasticOptions {
             capacity: 96,
             reserve_fraction: DEFAULT_RESERVE_FRACTION,
             probe_scale: 8.0,
         });
-        assert_eq!(map.capacity(), 96);
+        assert!(map.capacity() >= 96);
     }
 
     #[test]

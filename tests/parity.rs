@@ -753,6 +753,43 @@ macro_rules! parity_suite {
             }
 
             #[test]
+            fn test_reserve_shrink_to_fit() {
+                let mut m = HashMap::new();
+                m.insert(0, 0);
+                m.remove(&0);
+                assert!(m.capacity() >= m.len());
+                for i in 0..128 {
+                    m.insert(i, i);
+                }
+                m.reserve(256);
+
+                let usable_cap = m.capacity();
+                for i in 128..(128 + 256) {
+                    m.insert(i, i);
+                    assert_eq!(m.capacity(), usable_cap);
+                }
+
+                for i in 100..(128 + 256) {
+                    assert_eq!(m.remove(&i), Some(i));
+                }
+                m.shrink_to_fit();
+
+                assert_eq!(m.len(), 100);
+                assert!(!m.is_empty());
+                assert!(m.capacity() >= m.len());
+
+                for i in 0..100 {
+                    assert_eq!(m.remove(&i), Some(i));
+                }
+                m.shrink_to_fit();
+                m.insert(0, 0);
+
+                assert_eq!(m.len(), 1);
+                assert!(m.capacity() >= m.len());
+                assert_eq!(m.remove(&0), Some(0));
+            }
+
+            #[test]
             #[should_panic(expected = "duplicate keys")]
             fn test_get_disjoint_mut_duplicate() {
                 let mut map = HashMap::new();
