@@ -80,16 +80,22 @@ const TINY_OP_COUNT: usize = 500_000;
 /// Inserts per iteration of `resize_heavy_throughput`; triggers multiple resizes.
 const RESIZE_INSERT_COUNT: usize = 8_000;
 
-/// Emits per-impl `bench_function` blocks
+/// Emits per-impl `bench_function` blocks for a given op.
 macro_rules! bench_all_impls {
-    ($group:expr, $batch:expr, $std_setup:expr, $hb_setup:expr, $el_setup:expr, $fn_setup:expr, $body:expr $(,)?) => {{
+    ($group:expr, $op:literal, $batch:expr, $std_setup:expr, $hb_setup:expr, $el_setup:expr, $fn_setup:expr, $body:expr $(,)?) => {{
         let group = &mut $group;
-        group.bench_function("std", |b| b.iter_batched_ref($std_setup, $body, $batch));
-        group.bench_function("hashbrown", |b| {
+        group.bench_function(concat!($op, "_std"), |b| {
+            b.iter_batched_ref($std_setup, $body, $batch)
+        });
+        group.bench_function(concat!($op, "_hashbrown"), |b| {
             b.iter_batched_ref($hb_setup, $body, $batch)
         });
-        group.bench_function("elastic", |b| b.iter_batched_ref($el_setup, $body, $batch));
-        group.bench_function("funnel", |b| b.iter_batched_ref($fn_setup, $body, $batch));
+        group.bench_function(concat!($op, "_elastic"), |b| {
+            b.iter_batched_ref($el_setup, $body, $batch)
+        });
+        group.bench_function(concat!($op, "_funnel"), |b| {
+            b.iter_batched_ref($fn_setup, $body, $batch)
+        });
     }};
 }
 
@@ -100,6 +106,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
 
     bench_all_impls!(
         group,
+        "insert",
         BatchSize::PerIteration,
         || StdHashMap::with_capacity(OP_COUNT * 2),
         || HashbrownMap::with_capacity(OP_COUNT * 2),
@@ -118,37 +125,38 @@ fn bench_insert_throughput(c: &mut Criterion) {
 
 fn bench_one_lookup_group(
     c: &mut Criterion,
-    name: &str,
+    group_name: &str,
+    op_tag: &str,
     query_keys: &[u64],
     std_map: &StdHashMap<u64, u64>,
     hb_map: &HashbrownMap<u64, u64>,
     el_map: &ElasticHashMap<u64, u64>,
     fn_map: &FunnelHashMap<u64, u64>,
 ) {
-    let mut group = c.benchmark_group(name);
+    let mut group = c.benchmark_group(group_name);
     group.throughput(Throughput::Elements(query_keys.len() as u64));
-    group.bench_function("std", |b| {
+    group.bench_function(format!("{op_tag}_std"), |b| {
         b.iter(|| {
             for key in query_keys {
                 black_box(std_map.get(black_box(key)));
             }
         });
     });
-    group.bench_function("hashbrown", |b| {
+    group.bench_function(format!("{op_tag}_hashbrown"), |b| {
         b.iter(|| {
             for key in query_keys {
                 black_box(hb_map.get(black_box(key)));
             }
         });
     });
-    group.bench_function("elastic", |b| {
+    group.bench_function(format!("{op_tag}_elastic"), |b| {
         b.iter(|| {
             for key in query_keys {
                 black_box(el_map.get(black_box(key)));
             }
         });
     });
-    group.bench_function("funnel", |b| {
+    group.bench_function(format!("{op_tag}_funnel"), |b| {
         b.iter(|| {
             for key in query_keys {
                 black_box(fn_map.get(black_box(key)));
@@ -173,6 +181,7 @@ fn bench_lookups(c: &mut Criterion) {
     bench_one_lookup_group(
         c,
         "get_hit_throughput",
+        "get_hit",
         &hit_keys,
         &std_map,
         &hb_map,
@@ -182,6 +191,7 @@ fn bench_lookups(c: &mut Criterion) {
     bench_one_lookup_group(
         c,
         "get_miss_throughput",
+        "get_miss",
         &miss_keys,
         &std_map,
         &hb_map,
@@ -208,6 +218,7 @@ fn bench_tiny_lookup_throughput(c: &mut Criterion) {
     bench_one_lookup_group(
         c,
         "tiny_lookup_throughput",
+        "tiny_lookup",
         &query_keys,
         &std_map,
         &hb_map,
@@ -230,6 +241,7 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
 
     bench_all_impls!(
         group,
+        "delete",
         BatchSize::PerIteration,
         || build_std_map(&initial_pairs),
         || build_hashbrown_map(&initial_pairs),
@@ -261,6 +273,7 @@ fn bench_mixed_throughput(c: &mut Criterion) {
 
     bench_all_impls!(
         group,
+        "mixed",
         BatchSize::LargeInput,
         || build_std_map(&pairs),
         || build_hashbrown_map(&pairs),
@@ -288,6 +301,7 @@ fn bench_resize_heavy_throughput(c: &mut Criterion) {
 
     bench_all_impls!(
         group,
+        "resize",
         BatchSize::PerIteration,
         StdHashMap::new,
         HashbrownMap::new,
@@ -313,6 +327,7 @@ fn bench_iter_throughput(c: &mut Criterion) {
     // alone is hoisted out when the map is loop-invariant.
     bench_all_impls!(
         group,
+        "iter",
         BatchSize::LargeInput,
         || build_std_map(&pairs),
         || build_hashbrown_map(&pairs),
@@ -331,6 +346,7 @@ fn bench_iter_mut_throughput(c: &mut Criterion) {
 
     bench_all_impls!(
         group,
+        "iter_mut",
         BatchSize::LargeInput,
         || build_std_map(&pairs),
         || build_hashbrown_map(&pairs),
@@ -355,6 +371,7 @@ fn bench_drain_throughput(c: &mut Criterion) {
     // when both `K` and `V` are `Copy` with no-op `Drop`.
     bench_all_impls!(
         group,
+        "drain",
         BatchSize::PerIteration,
         || build_std_map(&pairs),
         || build_hashbrown_map(&pairs),
@@ -373,6 +390,7 @@ fn bench_extract_if_throughput(c: &mut Criterion) {
 
     bench_all_impls!(
         group,
+        "extract_if",
         BatchSize::PerIteration,
         || build_std_map(&pairs),
         || build_hashbrown_map(&pairs),
@@ -395,6 +413,7 @@ fn bench_clear_drop_throughput(c: &mut Criterion) {
 
     bench_all_impls!(
         group,
+        "clear",
         BatchSize::PerIteration,
         || build_std_drop_map(MAP_SIZE),
         || build_hashbrown_drop_map(MAP_SIZE),
@@ -416,6 +435,7 @@ fn bench_entry_or_insert_throughput(c: &mut Criterion) {
 
     bench_all_impls!(
         group,
+        "entry",
         BatchSize::PerIteration,
         || StdHashMap::with_capacity(MAP_SIZE),
         || HashbrownMap::with_capacity(MAP_SIZE),
@@ -441,6 +461,7 @@ fn bench_grow_insert_throughput(c: &mut Criterion) {
     // — no capacity hint, so each impl pays its growth-through-rehash cost.
     bench_all_impls!(
         group,
+        "grow_insert",
         BatchSize::PerIteration,
         StdHashMap::new,
         HashbrownMap::new,
@@ -480,6 +501,7 @@ fn bench_get_hit_load_factor(c: &mut Criterion) {
         bench_one_lookup_group(
             c,
             &format!("get_hit_load_{load_pct}"),
+            "get_hit",
             &hit_keys,
             &std_map,
             &hb_map,
@@ -502,6 +524,7 @@ fn bench_insert_big_throughput(c: &mut Criterion) {
 
     bench_all_impls!(
         group,
+        "insert_big",
         BatchSize::PerIteration,
         || StdHashMap::<u64, BigVal>::with_capacity(OP_COUNT),
         || HashbrownMap::<u64, BigVal>::with_capacity(OP_COUNT),
@@ -520,42 +543,26 @@ fn bench_insert_big_throughput(c: &mut Criterion) {
 
 fn bench_get_hit_big_throughput(c: &mut Criterion) {
     let pairs = make_big_pairs(MAP_SIZE);
-    let std_map = build_std_big_map(&pairs);
-    let hb_map = build_hashbrown_big_map(&pairs);
-    let el_map = build_elastic_big_map(&pairs);
-    let fn_map = build_funnel_big_map(&pairs);
     let hit_keys: Vec<u64> = (0..OP_COUNT).map(|idx| pairs[idx % MAP_SIZE].0).collect();
 
     let mut group = c.benchmark_group("get_hit_big_throughput");
     group.throughput(Throughput::Elements(hit_keys.len() as u64));
-    group.bench_function("std", |b| {
-        b.iter(|| {
+
+    bench_all_impls!(
+        group,
+        "get_hit_big",
+        BatchSize::LargeInput,
+        || build_std_big_map(&pairs),
+        || build_hashbrown_big_map(&pairs),
+        || build_elastic_big_map(&pairs),
+        || build_funnel_big_map(&pairs),
+        |map| {
             for key in &hit_keys {
-                black_box(std_map.get(black_box(key)));
+                black_box(map.get(black_box(key)));
             }
-        });
-    });
-    group.bench_function("hashbrown", |b| {
-        b.iter(|| {
-            for key in &hit_keys {
-                black_box(hb_map.get(black_box(key)));
-            }
-        });
-    });
-    group.bench_function("elastic", |b| {
-        b.iter(|| {
-            for key in &hit_keys {
-                black_box(el_map.get(black_box(key)));
-            }
-        });
-    });
-    group.bench_function("funnel", |b| {
-        b.iter(|| {
-            for key in &hit_keys {
-                black_box(fn_map.get(black_box(key)));
-            }
-        });
-    });
+        },
+    );
+
     group.finish();
 }
 
@@ -566,12 +573,116 @@ fn bench_drain_big_throughput(c: &mut Criterion) {
 
     bench_all_impls!(
         group,
+        "drain_big",
         BatchSize::PerIteration,
         || build_std_big_map(&pairs),
         || build_hashbrown_big_map(&pairs),
         || build_elastic_big_map(&pairs),
         || build_funnel_big_map(&pairs),
         |map| { black_box(map.drain().fold(0u64, |a, (k, v)| a ^ k ^ v[0] ^ v[3])) },
+    );
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Follow-ups to the iter / drop / memcpy axis: shrink_to_fit (capacity
+// reduction after removals), replace (insert with existing keys —
+// update-path codegen, distinct from vacant-slot insert), and extend
+// (bulk reserve+insert via `Iterator`).
+// ---------------------------------------------------------------------------
+
+fn bench_shrink_to_fit_throughput(c: &mut Criterion) {
+    let pairs = make_pairs(MAP_SIZE);
+    let keep: usize = MAP_SIZE / 10; // keep 10% — large gap to reclaim
+    let mut group = c.benchmark_group("shrink_to_fit_throughput");
+    group.throughput(Throughput::Elements((MAP_SIZE - keep) as u64));
+
+    bench_all_impls!(
+        group,
+        "shrink_to_fit",
+        BatchSize::PerIteration,
+        || {
+            let mut m = build_std_map(&pairs);
+            for (k, _) in pairs.iter().skip(keep) {
+                m.remove(k);
+            }
+            m
+        },
+        || {
+            let mut m = build_hashbrown_map(&pairs);
+            for (k, _) in pairs.iter().skip(keep) {
+                m.remove(k);
+            }
+            m
+        },
+        || {
+            let mut m = build_elastic_map(&pairs);
+            for (k, _) in pairs.iter().skip(keep) {
+                m.remove(k);
+            }
+            m
+        },
+        || {
+            let mut m = build_funnel_map(&pairs);
+            for (k, _) in pairs.iter().skip(keep) {
+                m.remove(k);
+            }
+            m
+        },
+        |map| {
+            map.shrink_to_fit();
+            black_box(map.capacity())
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_replace_throughput(c: &mut Criterion) {
+    let pairs = make_pairs(MAP_SIZE);
+    let mut group = c.benchmark_group("replace_throughput");
+    group.throughput(Throughput::Elements(MAP_SIZE as u64));
+
+    // Re-insert all keys with new values. Hits the update-existing-value
+    // branch in `insert` codegen — distinct from `insert_throughput` which
+    // only exercises vacant-slot inserts.
+    bench_all_impls!(
+        group,
+        "replace",
+        BatchSize::LargeInput,
+        || build_std_map(&pairs),
+        || build_hashbrown_map(&pairs),
+        || build_elastic_map(&pairs),
+        || build_funnel_map(&pairs),
+        |map| {
+            for &(key, value) in &pairs {
+                black_box(map.insert(black_box(key), black_box(value.wrapping_add(1))));
+            }
+            black_box(map.len())
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_extend_throughput(c: &mut Criterion) {
+    let pairs = make_pairs(MAP_SIZE);
+    let mut group = c.benchmark_group("extend_throughput");
+    group.throughput(Throughput::Elements(MAP_SIZE as u64));
+
+    bench_all_impls!(
+        group,
+        "extend",
+        BatchSize::PerIteration,
+        StdHashMap::new,
+        HashbrownMap::new,
+        ElasticHashMap::new,
+        FunnelHashMap::new,
+        |map| {
+            map.extend(pairs.iter().copied());
+            black_box(map.len())
+        },
     );
 
     group.finish();
@@ -587,7 +698,7 @@ fn bench_get_hit_latency(c: &mut Criterion) {
 
         macro_rules! latency_arm {
             ($name:literal, $build:expr) => {
-                group.bench_function($name, |b| {
+                group.bench_function(concat!("get_hit_", $name), |b| {
                     let map = $build(&pairs);
                     let mut i = 0;
                     b.iter(|| {
@@ -629,6 +740,9 @@ criterion_group!(
         bench_extract_if_throughput,
         bench_clear_drop_throughput,
         bench_entry_or_insert_throughput,
+        bench_replace_throughput,
+        bench_extend_throughput,
+        bench_shrink_to_fit_throughput,
         bench_insert_big_throughput,
         bench_get_hit_big_throughput,
         bench_drain_big_throughput,
