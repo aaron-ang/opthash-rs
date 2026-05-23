@@ -22,9 +22,8 @@ use crate::common::layout::{RawTable, SlotEntry, try_zeroed_boxed_slice_in};
 use crate::common::math::{align, capacity, cast, level_salt, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
-/// `reserve(additional)` targets `(self.len + additional) * FUNNEL_RESERVE_OVERSIZE`
-/// insertions. The slack absorbs probe-budget exhaustion in the special array,
-/// which can otherwise trigger a mid-reserve resize even at low global load.
+/// `reserve` slack multiplier. 3× holds across foldhash seeds; 2× sometimes
+/// triggers mid-reserve probe-budget exhaustion in the special array.
 const FUNNEL_RESERVE_OVERSIZE: usize = 3;
 
 /// Construction-time tuning for `FunnelHashMap`.
@@ -776,12 +775,8 @@ where
 
     /// Grow capacity so at least `additional` more inserts fit without
     /// triggering an internal resize. No-op if already large enough.
-    ///
-    /// Funnel reserves with 2× margin: probe-budget exhaustion in the
-    /// bucket levels + special array can trigger a mid-reserve resize even
-    /// when global load is well under `max_insertions`. The extra slack
-    /// absorbs that probabilistic concentration so the std `reserve`
-    /// no-resize contract holds.
+    /// Targets `FUNNEL_RESERVE_OVERSIZE × needed` to keep probe-budget
+    /// exhaustion from firing mid-reserve.
     ///
     /// # Panics
     ///

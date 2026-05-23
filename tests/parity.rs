@@ -629,6 +629,23 @@ macro_rules! parity_suite {
             }
 
             #[test]
+            fn test_capacity_not_less_than_len() {
+                let mut a = HashMap::new();
+                for i in 0..512 {
+                    a.insert(i, 0);
+                    assert!(a.capacity() >= a.len());
+                }
+                for i in 0..128 {
+                    a.remove(&i);
+                    assert!(a.capacity() >= a.len());
+                }
+                for i in 512..640 {
+                    a.insert(i, 0);
+                    assert!(a.capacity() >= a.len());
+                }
+            }
+
+            #[test]
             fn test_occupied_entry_key() {
                 let mut a = HashMap::new();
                 let key = "hello there";
