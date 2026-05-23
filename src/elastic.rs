@@ -2429,7 +2429,7 @@ mod tests {
             map.insert(i, i * 10);
         }
         let mut collected: Vec<(i32, i32)> = map.iter().map(|(&k, &v)| (k, v)).collect();
-        collected.sort();
+        collected.sort_unstable();
         let expected: Vec<(i32, i32)> = (0..50).map(|i| (i, i * 10)).collect();
         assert_eq!(collected, expected);
     }
@@ -2446,7 +2446,7 @@ mod tests {
         let keys: Vec<i32> = map.iter().map(|(&k, _)| k).collect();
         assert_eq!(keys.len(), 10);
         let mut sorted = keys;
-        sorted.sort();
+        sorted.sort_unstable();
         assert_eq!(sorted, (1..20).step_by(2).collect::<Vec<_>>());
     }
 

@@ -3534,7 +3534,7 @@ mod tests {
             map.insert(i, i * 7);
         }
         let mut collected: Vec<(i32, i32)> = map.iter().map(|(&k, &v)| (k, v)).collect();
-        collected.sort();
+        collected.sort_unstable();
         let expected: Vec<(i32, i32)> = (0..80).map(|i| (i, i * 7)).collect();
         assert_eq!(collected, expected);
     }
