@@ -101,6 +101,7 @@ where
     }
 }
 
+impl<I, K, V> ExactSizeIterator for Keys<I> where I: ExactSizeIterator<Item = (K, V)> {}
 impl<I, K, V> FusedIterator for Keys<I> where I: FusedIterator<Item = (K, V)> {}
 
 impl<I> fmt::Debug for Keys<I> {
@@ -151,6 +152,7 @@ where
     }
 }
 
+impl<I, K, V> ExactSizeIterator for Values<I> where I: ExactSizeIterator<Item = (K, V)> {}
 impl<I, K, V> FusedIterator for Values<I> where I: FusedIterator<Item = (K, V)> {}
 
 impl<I> fmt::Debug for Values<I> {
@@ -193,6 +195,7 @@ where
     }
 }
 
+impl<I, K, V> ExactSizeIterator for IntoKeys<I> where I: ExactSizeIterator<Item = (K, V)> {}
 impl<I, K, V> FusedIterator for IntoKeys<I> where I: FusedIterator<Item = (K, V)> {}
 
 impl<I> fmt::Debug for IntoKeys<I> {
@@ -235,6 +238,7 @@ where
     }
 }
 
+impl<I, K, V> ExactSizeIterator for IntoValues<I> where I: ExactSizeIterator<Item = (K, V)> {}
 impl<I, K, V> FusedIterator for IntoValues<I> where I: FusedIterator<Item = (K, V)> {}
 
 impl<I> fmt::Debug for IntoValues<I> {

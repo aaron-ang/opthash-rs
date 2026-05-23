@@ -158,14 +158,16 @@ pub(crate) unsafe fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
 /// case the prefetch is silently ignored by the hardware).
 #[inline]
 pub(crate) unsafe fn prefetch_read(ptr: *const u8) {
-    #[cfg(target_arch = "aarch64")]
+    // Skipped under Miri: it can't model asm/intrinsics, and prefetch is hint-only.
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     unsafe {
         core::arch::asm!("prfm pldl1keep, [{}]", in(reg) ptr, options(nostack, preserves_flags));
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     unsafe {
         _mm_prefetch(ptr.cast::<i8>(), _MM_HINT_T0);
     }
+    let _ = ptr;
 }
 
 // ---------------------------------------------------------------------------

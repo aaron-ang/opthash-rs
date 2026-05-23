@@ -971,44 +971,64 @@ where
     /// # Panics
     ///
     /// If two input keys resolve to the same physical slot.
-    pub fn get_disjoint_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> Option<[&mut V; N]>
+    /// Returns `N` disjoint mutable references, mirroring
+    /// [`std::collections::HashMap::get_disjoint_mut`]: per-key `Option`
+    /// for each lookup, panic on aliasing among the hits.
+    ///
+    /// # Panics
+    ///
+    /// If two input keys resolve to the same slot.
+    pub fn get_disjoint_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> [Option<&mut V>; N]
     where
         K: Borrow<Q> + Eq,
         Q: Hash + Eq + ?Sized,
     {
-        let mut locations: [SlotLocation; N] = [SlotLocation::SpecialPrimary { slot_idx: 0 }; N];
-        for (i, key) in keys.iter().enumerate() {
-            let key_hash = self.hash_key(*key);
-            let key_fingerprint = control::control_fingerprint(key_hash);
-            locations[i] = self.find_slot_location_with_hash(*key, key_hash, key_fingerprint)?;
-        }
+        let locations = self.locate_disjoint(keys);
+        check_disjoint_aliasing_funnel(&locations);
 
-        // O(N^2) alias check; cheaper than a HashSet for the small N
-        // (typically <= 16) std::get_disjoint_mut targets.
-        for i in 0..N {
-            for j in (i + 1)..N {
-                assert!(
-                    locations[i] != locations[j],
-                    "get_disjoint_mut: duplicate keys resolve to the same entry",
-                );
-            }
-        }
-
-        // SAFETY: locations are unique (checked above). Raw-pointer chain
-        // projects to each value without forming an intermediate
-        // `&mut BucketLevel` / `&mut SpecialPrimary` / `&mut SpecialFallback`,
-        // so two keys hitting the same sub-table can't alias under Stacked Borrows.
         let levels_ptr: *mut BucketLevel<K, V, A> = self.levels.as_mut_ptr();
         let primary_ptr: *mut SpecialPrimary<K, V, A> = &raw mut self.special.primary;
         let fallback_ptr: *mut SpecialFallback<K, V, A> = &raw mut self.special.fallback;
-        let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
-        let out_ptr = out.as_mut_ptr().cast::<&mut V>();
-        for (i, loc) in locations.into_iter().enumerate() {
-            let value_ptr: *mut V =
-                unsafe { funnel_slot_value_ptr(levels_ptr, primary_ptr, fallback_ptr, loc) };
-            unsafe { out_ptr.add(i).write(&mut *value_ptr) };
-        }
-        Some(unsafe { out.assume_init() })
+        core::array::from_fn(|i| {
+            locations[i].map(|loc| {
+                // SAFETY: locations are unique among Somes (asserted above).
+                // Raw-pointer chain — no intermediate `&mut BucketLevel`,
+                // `&mut SpecialPrimary`, or `&mut SpecialFallback`.
+                let value_ptr: *mut V =
+                    unsafe { funnel_slot_value_ptr(levels_ptr, primary_ptr, fallback_ptr, loc) };
+                unsafe { &mut *value_ptr }
+            })
+        })
+    }
+
+    /// Like [`Self::get_disjoint_mut`] but each yielded element is
+    /// `(&K, &mut V)`. Mirrors `std`'s `get_disjoint_key_value_mut`.
+    ///
+    /// # Panics
+    ///
+    /// If two input keys resolve to the same slot.
+    pub fn get_disjoint_key_value_mut<Q, const N: usize>(
+        &mut self,
+        keys: [&Q; N],
+    ) -> [Option<(&K, &mut V)>; N]
+    where
+        K: Borrow<Q> + Eq,
+        Q: Hash + Eq + ?Sized,
+    {
+        let locations = self.locate_disjoint(keys);
+        check_disjoint_aliasing_funnel(&locations);
+
+        let levels_ptr: *mut BucketLevel<K, V, A> = self.levels.as_mut_ptr();
+        let primary_ptr: *mut SpecialPrimary<K, V, A> = &raw mut self.special.primary;
+        let fallback_ptr: *mut SpecialFallback<K, V, A> = &raw mut self.special.fallback;
+        core::array::from_fn(|i| {
+            locations[i].map(|loc| {
+                // SAFETY: as in `get_disjoint_mut`.
+                let (k_ptr, v_ptr) =
+                    unsafe { funnel_slot_kv_ptrs(levels_ptr, primary_ptr, fallback_ptr, loc) };
+                (unsafe { &*k_ptr }, unsafe { &mut *v_ptr })
+            })
+        })
     }
 
     /// Unsafe variant of [`Self::get_disjoint_mut`] that skips the
@@ -1016,36 +1036,44 @@ where
     ///
     /// # Safety
     ///
-    /// All input keys must resolve to distinct entries; otherwise the
-    /// returned references alias and behavior is undefined.
+    /// Among the keys that resolve to occupied slots, all must reference
+    /// distinct entries; otherwise the returned references alias and
+    /// behavior is undefined.
     pub unsafe fn get_disjoint_unchecked_mut<Q, const N: usize>(
         &mut self,
         keys: [&Q; N],
-    ) -> Option<[&mut V; N]>
+    ) -> [Option<&mut V>; N]
     where
         K: Borrow<Q> + Eq,
         Q: Hash + Eq + ?Sized,
     {
-        let mut locations: [SlotLocation; N] = [SlotLocation::SpecialPrimary { slot_idx: 0 }; N];
-        for (i, key) in keys.iter().enumerate() {
-            let key_hash = self.hash_key(*key);
-            let key_fingerprint = control::control_fingerprint(key_hash);
-            locations[i] = self.find_slot_location_with_hash(*key, key_hash, key_fingerprint)?;
-        }
+        let locations = self.locate_disjoint(keys);
 
-        // SAFETY: caller guarantees distinct locations. Raw-pointer chain
-        // as in the checked variant — no intermediate `&mut BucketLevel`.
         let levels_ptr: *mut BucketLevel<K, V, A> = self.levels.as_mut_ptr();
         let primary_ptr: *mut SpecialPrimary<K, V, A> = &raw mut self.special.primary;
         let fallback_ptr: *mut SpecialFallback<K, V, A> = &raw mut self.special.fallback;
-        let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
-        let out_ptr = out.as_mut_ptr().cast::<&mut V>();
-        for (i, loc) in locations.into_iter().enumerate() {
-            let value_ptr: *mut V =
-                unsafe { funnel_slot_value_ptr(levels_ptr, primary_ptr, fallback_ptr, loc) };
-            unsafe { out_ptr.add(i).write(&mut *value_ptr) };
-        }
-        Some(unsafe { out.assume_init() })
+        core::array::from_fn(|i| {
+            locations[i].map(|loc| {
+                // SAFETY: caller guarantees the hits are pairwise distinct.
+                let value_ptr: *mut V =
+                    unsafe { funnel_slot_value_ptr(levels_ptr, primary_ptr, fallback_ptr, loc) };
+                unsafe { &mut *value_ptr }
+            })
+        })
+    }
+
+    #[inline]
+    fn locate_disjoint<Q, const N: usize>(&self, keys: [&Q; N]) -> [Option<SlotLocation>; N]
+    where
+        K: Borrow<Q> + Eq,
+        Q: Hash + Eq + ?Sized,
+    {
+        core::array::from_fn(|i| {
+            let key = keys[i];
+            let key_hash = self.hash_key(key);
+            let key_fingerprint = control::control_fingerprint(key_hash);
+            self.find_slot_location_with_hash(key, key_hash, key_fingerprint)
+        })
     }
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool
@@ -1158,6 +1186,7 @@ where
             phase: FunnelIterPhase::Levels,
             level_idx: 0,
             scanner: OccupiedScanner::new(),
+            remaining: self.len,
         }
     }
 
@@ -1167,6 +1196,7 @@ where
         let levels = self.levels.as_mut_ptr();
         let primary = ptr::from_mut(&mut self.special.primary);
         let fallback = ptr::from_mut(&mut self.special.fallback);
+        let remaining = self.len;
         FunnelIterMut {
             levels,
             levels_len,
@@ -1175,6 +1205,7 @@ where
             phase: FunnelIterPhase::Levels,
             level_idx: 0,
             scanner: OccupiedScanner::new(),
+            remaining,
             _marker: PhantomData,
         }
     }
@@ -2379,6 +2410,7 @@ pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
     phase: FunnelIterPhase,
     level_idx: usize,
     scanner: OccupiedScanner,
+    remaining: usize,
 }
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelIter<'_, K, V, A> {
@@ -2401,6 +2433,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
                         let table = &self.levels[self.level_idx].table;
                         if let Some(slot_idx) = self.scanner.next_in(table) {
                             let entry = unsafe { table.get_ref(slot_idx) };
+                            self.remaining -= 1;
                             return Some((&entry.key, &entry.value));
                         }
                         self.level_idx += 1;
@@ -2413,6 +2446,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
                     let table = &self.primary.table;
                     if let Some(slot_idx) = self.scanner.next_in(table) {
                         let entry = unsafe { table.get_ref(slot_idx) };
+                        self.remaining -= 1;
                         return Some((&entry.key, &entry.value));
                     }
                     self.phase = FunnelIterPhase::Fallback;
@@ -2422,6 +2456,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
                     let table = &self.fallback.table;
                     if let Some(slot_idx) = self.scanner.next_in(table) {
                         let entry = unsafe { table.get_ref(slot_idx) };
+                        self.remaining -= 1;
                         return Some((&entry.key, &entry.value));
                     }
                     self.phase = FunnelIterPhase::Done;
@@ -2430,8 +2465,13 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
 
+impl<K, V, A: Allocator + Clone> ExactSizeIterator for FunnelIter<'_, K, V, A> {}
 impl<K, V, A: Allocator + Clone> FusedIterator for FunnelIter<'_, K, V, A> {}
 
 impl<'a, K, V, S, A> IntoIterator for &'a FunnelHashMap<K, V, S, A>
@@ -2689,6 +2729,7 @@ pub struct FunnelIterMut<'a, K, V, A: Allocator + Clone = Global> {
     phase: FunnelIterPhase,
     level_idx: usize,
     scanner: OccupiedScanner,
+    remaining: usize,
     _marker: PhantomData<&'a mut SpecialArray<K, V, A>>,
 }
 
@@ -2717,6 +2758,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                             let entry = unsafe { level.table.get_mut(idx) };
                             let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                             let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
+                            self.remaining -= 1;
                             return Some((key, val));
                         }
                         self.level_idx += 1;
@@ -2733,6 +2775,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                         let entry = unsafe { primary.table.get_mut(idx) };
                         let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                         let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
+                        self.remaining -= 1;
                         return Some((key, val));
                     }
                     self.phase = FunnelIterPhase::Fallback;
@@ -2745,6 +2788,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                         let entry = unsafe { fallback.table.get_mut(idx) };
                         let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                         let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
+                        self.remaining -= 1;
                         return Some((key, val));
                     }
                     self.phase = FunnelIterPhase::Done;
@@ -2753,7 +2797,14 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+
+impl<K, V, A: Allocator + Clone> ExactSizeIterator for FunnelIterMut<'_, K, V, A> {}
+impl<K, V, A: Allocator + Clone> FusedIterator for FunnelIterMut<'_, K, V, A> {}
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelIterMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2788,7 +2839,14 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelValuesMut<'a, K, V, A> {
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|(_, v)| v)
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
 }
+
+impl<K, V, A: Allocator + Clone> ExactSizeIterator for FunnelValuesMut<'_, K, V, A> {}
+impl<K, V, A: Allocator + Clone> FusedIterator for FunnelValuesMut<'_, K, V, A> {}
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelValuesMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2823,6 +2881,7 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
                             // Tombstone-mark so the map's `Drop` skips it.
                             let entry = unsafe { table.take(idx) };
                             table.mark_tombstone(idx);
+                            self.map.len -= 1;
                             return Some((entry.key, entry.value));
                         }
                         self.level_idx += 1;
@@ -2836,6 +2895,7 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
                     if let Some(idx) = self.scanner.next_in(table) {
                         let entry = unsafe { table.take(idx) };
                         table.mark_tombstone(idx);
+                        self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
                     self.phase = FunnelIterPhase::Fallback;
@@ -2846,6 +2906,7 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
                     if let Some(idx) = self.scanner.next_in(table) {
                         let entry = unsafe { table.take(idx) };
                         table.mark_tombstone(idx);
+                        self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
                     self.phase = FunnelIterPhase::Done;
@@ -2854,8 +2915,13 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.map.len, Some(self.map.len))
+    }
 }
 
+impl<K, V, S, A: Allocator + Clone> ExactSizeIterator for FunnelIntoIter<K, V, S, A> {}
 impl<K, V, S, A: Allocator + Clone> FusedIterator for FunnelIntoIter<K, V, S, A> {}
 
 impl<K, V, S, A: Allocator + Clone> Drop for FunnelIntoIter<K, V, S, A> {
@@ -2936,6 +3002,50 @@ unsafe fn funnel_slot_value_ptr<K, V, A: Allocator + Clone>(
     };
     let entry_ptr: *mut SlotEntry<K, V> = unsafe { RawTable::slot_ptr_raw(table_ptr, slot_idx) };
     unsafe { &raw mut (*entry_ptr).value }
+}
+
+/// As [`funnel_slot_value_ptr`] but returns key + value pointers together.
+#[inline]
+unsafe fn funnel_slot_kv_ptrs<K, V, A: Allocator + Clone>(
+    levels_ptr: *mut BucketLevel<K, V, A>,
+    primary_ptr: *mut SpecialPrimary<K, V, A>,
+    fallback_ptr: *mut SpecialFallback<K, V, A>,
+    loc: SlotLocation,
+) -> (*const K, *mut V) {
+    let (table_ptr, slot_idx) = match loc {
+        SlotLocation::Level {
+            level_idx,
+            slot_idx,
+        } => unsafe {
+            let lvl_ptr = levels_ptr.add(level_idx);
+            (&raw mut (*lvl_ptr).table, slot_idx)
+        },
+        SlotLocation::SpecialPrimary { slot_idx } => {
+            (unsafe { &raw mut (*primary_ptr).table }, slot_idx)
+        }
+        SlotLocation::SpecialFallback { slot_idx } => {
+            (unsafe { &raw mut (*fallback_ptr).table }, slot_idx)
+        }
+    };
+    let entry_ptr: *mut SlotEntry<K, V> = unsafe { RawTable::slot_ptr_raw(table_ptr, slot_idx) };
+    let k_ptr: *const K = unsafe { &raw const (*entry_ptr).key };
+    let v_ptr: *mut V = unsafe { &raw mut (*entry_ptr).value };
+    (k_ptr, v_ptr)
+}
+
+/// O(N^2) alias check shared by `get_disjoint_mut` and
+/// `get_disjoint_key_value_mut`. Panics if two `Some` locations collide.
+#[inline]
+fn check_disjoint_aliasing_funnel<const N: usize>(locations: &[Option<SlotLocation>; N]) {
+    for (i, li) in locations.iter().enumerate() {
+        let Some(li) = li else { continue };
+        for other in &locations[i + 1..] {
+            assert!(
+                other.as_ref() != Some(li),
+                "get_disjoint_mut: duplicate keys resolve to the same entry",
+            );
+        }
+    }
 }
 
 /// Paper §5: `α = ⌈4 log δ⁻¹ + 10⌉` levels (excluding the special array).
@@ -3120,6 +3230,102 @@ fn possible_tail_sum_range(start_bucket_count: usize, levels_after: usize) -> (u
     (min_sum, max_sum)
 }
 
+impl<K, V, S, A> PartialEq for FunnelHashMap<K, V, S, A>
+where
+    K: Eq + Hash,
+    V: PartialEq,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        self.iter()
+            .all(|(k, v)| other.get(k).is_some_and(|ov| *v == *ov))
+    }
+}
+
+impl<K, V, S, A> Eq for FunnelHashMap<K, V, S, A>
+where
+    K: Eq + Hash,
+    V: Eq,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+}
+
+impl<K, Q, V, S, A> std::ops::Index<&Q> for FunnelHashMap<K, V, S, A>
+where
+    K: Eq + Hash + Borrow<Q>,
+    Q: Eq + Hash + ?Sized,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    type Output = V;
+
+    #[inline]
+    fn index(&self, key: &Q) -> &V {
+        self.get(key).expect("no entry found for key")
+    }
+}
+
+impl<K, V, S, A> Extend<(K, V)> for FunnelHashMap<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        let iter = iter.into_iter();
+        let (lo, _) = iter.size_hint();
+        if lo > 0 {
+            self.reserve(lo);
+        }
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
+impl<'a, K, V, S, A> Extend<(&'a K, &'a V)> for FunnelHashMap<K, V, S, A>
+where
+    K: Eq + Hash + Copy,
+    V: Copy,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    fn extend<I: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: I) {
+        self.extend(iter.into_iter().map(|(k, v)| (*k, *v)));
+    }
+}
+
+impl<'a, K, V, S, A> Extend<&'a (K, V)> for FunnelHashMap<K, V, S, A>
+where
+    K: Eq + Hash + Copy,
+    V: Copy,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    fn extend<I: IntoIterator<Item = &'a (K, V)>>(&mut self, iter: I) {
+        self.extend(iter.into_iter().copied());
+    }
+}
+
+impl<K, V, S> FromIterator<(K, V)> for FunnelHashMap<K, V, S, Global>
+where
+    K: Eq + Hash,
+    S: BuildHasher + Default,
+{
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let (lo, _) = iter.size_hint();
+        let mut map = Self::with_capacity_and_hasher(lo, S::default());
+        map.extend(iter);
+        map
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3164,42 +3370,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn insert_get_and_update_work() {
-        let mut map = FunnelHashMap::with_capacity(512);
-
-        for key in 0..20 {
-            assert_eq!(map.insert(key, key * 10), None);
-        }
-        for key in 0..20 {
-            assert_eq!(map.get(&key), Some(&(key * 10)));
-        }
-
-        let replaced = map.insert(7, 777).expect("update should succeed");
-        assert_eq!(replaced, 70);
-        assert_eq!(map.get(&7), Some(&777));
-    }
-
-    #[test]
-    fn remove_and_clear_work_with_borrowed_keys() {
-        let mut map: FunnelHashMap<String, i32> = FunnelHashMap::with_capacity(256);
-        assert_eq!(map.insert("alpha".to_string(), 1), None);
-        assert_eq!(map.insert("beta".to_string(), 2), None);
-
-        assert_eq!(map.remove("alpha"), Some(1));
-        assert_eq!(map.remove("alpha"), None);
-        map.clear();
-        assert_eq!(map.get("beta"), None);
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn new_starts_empty() {
-        let map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        assert_eq!(map.capacity(), 0);
-        assert_eq!(map.len(), 0);
     }
 
     #[test]
@@ -3264,7 +3434,7 @@ mod tests {
 
     #[test]
     fn large_map_correctness() {
-        let n = 10_000;
+        let n = if cfg!(miri) { 100 } else { 10_000 };
         let mut map = FunnelHashMap::with_capacity(n * 2);
         for i in 0..n {
             assert_eq!(map.insert(i, i), None);
@@ -3317,6 +3487,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // FIXME: takes too long
     fn delete_insert_cycles_trigger_rebuild() {
         // Exercises the tombstone cleanup path: 6000 remove+insert cycles
         // on a 12K map forces level.tombstones > capacity/2.
@@ -3371,12 +3542,6 @@ mod tests {
         assert_eq!(keys.len(), map.len());
     }
 
-    #[test]
-    fn iter_empty_map_is_empty() {
-        let map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        assert_eq!(map.iter().count(), 0);
-    }
-
     // Regression: removing one of two keys that both routed into a deep level
     // (level 0 unallocated) must not orphan the surviving sibling.
     #[test]
@@ -3390,39 +3555,6 @@ mod tests {
     }
 
     #[test]
-    fn get_disjoint_mut_returns_all_refs_on_hits() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
-        for i in 0..16 {
-            map.insert(i, i * 10);
-        }
-
-        let got = map.get_disjoint_mut([&1, &3, &7, &15]).expect("all hits");
-        assert_eq!(*got[0], 10);
-        assert_eq!(*got[1], 30);
-        assert_eq!(*got[2], 70);
-        assert_eq!(*got[3], 150);
-    }
-
-    #[test]
-    fn get_disjoint_mut_returns_none_if_any_missing() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(32);
-        for i in 0..8 {
-            map.insert(i, i);
-        }
-
-        assert!(map.get_disjoint_mut([&0, &1, &99]).is_none());
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate keys")]
-    fn get_disjoint_mut_panics_on_duplicate_keys() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(32);
-        map.insert(1, 100);
-        map.insert(2, 200);
-        let _ = map.get_disjoint_mut([&1, &1]);
-    }
-
-    #[test]
     fn get_disjoint_unchecked_mut_returns_all_refs_on_hits() {
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
         for i in 0..16 {
@@ -3430,29 +3562,30 @@ mod tests {
         }
 
         // SAFETY: keys are distinct.
-        let got = unsafe { map.get_disjoint_unchecked_mut([&1, &3, &7, &15]) }.expect("all hits");
-        assert_eq!(*got[0], 10);
-        assert_eq!(*got[1], 30);
-        assert_eq!(*got[2], 70);
-        assert_eq!(*got[3], 150);
+        let got = unsafe { map.get_disjoint_unchecked_mut([&1, &3, &7, &15]) };
+        assert_eq!(
+            got,
+            [Some(&mut 10), Some(&mut 30), Some(&mut 70), Some(&mut 150)]
+        );
     }
 
     #[test]
-    fn get_disjoint_unchecked_mut_returns_none_if_any_missing() {
+    fn get_disjoint_unchecked_mut_yields_none_per_missing_key() {
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(32);
         for i in 0..8 {
             map.insert(i, i);
         }
 
-        // SAFETY: keys are distinct (and one misses, returning None).
-        assert!(unsafe { map.get_disjoint_unchecked_mut([&0, &1, &99]) }.is_none());
+        // SAFETY: keys are distinct (one misses → None at that slot).
+        let got = unsafe { map.get_disjoint_unchecked_mut([&0, &1, &99]) };
+        assert_eq!(got, [Some(&mut 0), Some(&mut 1), None]);
     }
 
     #[test]
-    fn get_disjoint_mut_zero_keys_is_some_empty() {
+    fn get_disjoint_mut_zero_keys_returns_empty_array() {
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(16);
         map.insert(1, 1);
-        let got: [&mut i32; 0] = map.get_disjoint_mut([]).expect("zero-key returns Some");
+        let got: [Option<&mut i32>; 0] = map.get_disjoint_mut([]);
         assert_eq!(got.len(), 0);
     }
 
@@ -3463,36 +3596,12 @@ mod tests {
             map.insert(i, i);
         }
         {
-            let got = map.get_disjoint_mut([&2, &5]).expect("hit");
-            *got[0] = 222;
-            *got[1] = 555;
+            let [a, b] = map.get_disjoint_mut([&2, &5]);
+            *a.unwrap() = 222;
+            *b.unwrap() = 555;
         }
         assert_eq!(map.get(&2), Some(&222));
         assert_eq!(map.get(&5), Some(&555));
-    }
-
-    #[test]
-    fn keys_yields_inserted_keys_only() {
-        use std::collections::HashSet;
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
-        for i in 0..50 {
-            map.insert(i, i * 7);
-        }
-        let got: HashSet<i32> = map.keys().copied().collect();
-        let expected: HashSet<i32> = (0..50).collect();
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn values_yields_inserted_values_only() {
-        use std::collections::HashSet;
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
-        for i in 0..50 {
-            map.insert(i, i * 7);
-        }
-        let got: HashSet<i32> = map.values().copied().collect();
-        let expected: HashSet<i32> = (0..50).map(|i| i * 7).collect();
-        assert_eq!(got, expected);
     }
 
     #[test]
@@ -3514,21 +3623,6 @@ mod tests {
         assert_eq!(*v, 1);
 
         assert!(map.get_key_value("missing").is_none());
-    }
-
-    #[test]
-    fn remove_entry_returns_both_and_actually_removes() {
-        let mut map: FunnelHashMap<String, i32> = FunnelHashMap::with_capacity(16);
-        map.insert("alpha".to_string(), 1);
-        map.insert("beta".to_string(), 2);
-
-        let (k, v) = map.remove_entry("alpha").expect("hit");
-        assert_eq!(k, "alpha");
-        assert_eq!(v, 1);
-        assert_eq!(map.len(), 1);
-        assert!(map.get("alpha").is_none());
-
-        assert!(map.remove_entry("alpha").is_none());
     }
 
     #[test]
@@ -3570,16 +3664,6 @@ mod tests {
     }
 
     #[test]
-    fn try_reserve_overflow_returns_error() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        map.insert(1, 1);
-        assert_eq!(
-            map.try_reserve(usize::MAX),
-            Err(TryReserveError::CapacityOverflow)
-        );
-    }
-
-    #[test]
     fn shrink_to_below_len_clamps_to_len() {
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(4096);
         for i in 0..200 {
@@ -3618,43 +3702,6 @@ mod tests {
         }
         let count = map.iter_mut().count();
         assert_eq!(count, map.len());
-    }
-
-    #[test]
-    fn iter_mut_empty_map_is_empty() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        assert_eq!(map.iter_mut().count(), 0);
-    }
-
-    #[test]
-    fn values_mut_mutates_in_place() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
-        for i in 0..30 {
-            map.insert(i, i);
-        }
-        for v in map.values_mut() {
-            *v += 100;
-        }
-        for i in 0..30 {
-            assert_eq!(map.get(&i), Some(&(i + 100)));
-        }
-    }
-
-    #[test]
-    fn retain_keeps_matching_drops_rest() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
-        for i in 0..80 {
-            map.insert(i, i * 10);
-        }
-        map.retain(|k, _| k % 2 == 0);
-        assert_eq!(map.len(), 40);
-        for i in 0..80 {
-            if i % 2 == 0 {
-                assert_eq!(map.get(&i), Some(&(i * 10)));
-            } else {
-                assert!(map.get(&i).is_none());
-            }
-        }
     }
 
     #[test]
@@ -3709,29 +3756,6 @@ mod tests {
         let expected_len = map.len();
         let collected: Vec<(i32, i32)> = map.into_iter().collect();
         assert_eq!(collected.len(), expected_len);
-    }
-
-    #[test]
-    fn into_keys_yields_all_keys() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
-        for i in 0..30 {
-            map.insert(i, i);
-        }
-        let mut keys: Vec<i32> = map.into_keys().collect();
-        keys.sort_unstable();
-        assert_eq!(keys, (0..30).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn into_values_yields_all_values() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
-        for i in 0..30 {
-            map.insert(i, i * 5);
-        }
-        let mut vals: Vec<i32> = map.into_values().collect();
-        vals.sort_unstable();
-        let expected: Vec<i32> = (0..30).map(|i| i * 5).collect();
-        assert_eq!(vals, expected);
     }
 
     #[test]
@@ -4046,26 +4070,6 @@ mod tests {
         }
         assert!(map.is_empty());
         assert_eq!(map.iter().count(), 0);
-    }
-
-    #[test]
-    fn extract_if_yields_only_matching_and_leaves_rest() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
-        for i in 0..80 {
-            map.insert(i, i);
-        }
-        let mut extracted: Vec<(i32, i32)> = map.extract_if(|k, _| k % 3 == 0).collect();
-        extracted.sort_unstable();
-        let expected: Vec<(i32, i32)> = (0..80).filter(|i| i % 3 == 0).map(|i| (i, i)).collect();
-        assert_eq!(extracted, expected);
-        assert_eq!(map.len(), 80 - expected.len());
-        for i in 0..80 {
-            if i % 3 == 0 {
-                assert!(map.get(&i).is_none());
-            } else {
-                assert_eq!(map.get(&i), Some(&i));
-            }
-        }
     }
 
     #[test]

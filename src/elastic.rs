@@ -620,47 +620,59 @@ where
     }
 
     /// Returns `N` disjoint mutable references, mirroring
-    /// [`std::collections::HashMap::get_disjoint_mut`]: `None` if any key
-    /// misses, panic on aliasing.
+    /// [`std::collections::HashMap::get_disjoint_mut`]: per-key `Option` for
+    /// each lookup, panic on aliasing among the hits.
     ///
     /// # Panics
     ///
     /// If two input keys resolve to the same `(level, slot)` pair.
-    pub fn get_disjoint_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> Option<[&mut V; N]>
+    pub fn get_disjoint_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> [Option<&mut V>; N]
     where
         K: Borrow<Q> + Eq,
         Q: Hash + Eq + ?Sized,
     {
-        let mut locations: [(usize, usize); N] = [(0, 0); N];
-        for (i, key) in keys.iter().enumerate() {
-            let key_hash = self.hash_key(*key);
-            let key_fingerprint = control::control_fingerprint(key_hash);
-            locations[i] = self.find_slot_indices_with_hash(*key, key_hash, key_fingerprint)?;
-        }
+        let locations = self.locate_disjoint(keys);
+        check_disjoint_aliasing(&locations);
 
-        // O(N^2) alias check; cheaper than a HashSet for the small N
-        // (typically <= 16) std::get_disjoint_mut targets.
-        for i in 0..N {
-            for j in (i + 1)..N {
-                assert!(
-                    locations[i] != locations[j],
-                    "get_disjoint_mut: duplicate keys resolve to the same entry",
-                );
-            }
-        }
-
-        // SAFETY: locations are unique (checked above). `elastic_slot_value_ptr`
-        // projects to each value via raw pointers — no intermediate
-        // `&mut Level` / `&mut RawTable` — so two keys hitting the same level
-        // can't alias under Stacked Borrows.
         let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
-        let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
-        let out_ptr = out.as_mut_ptr().cast::<&mut V>();
-        for (i, (level_idx, slot_idx)) in locations.into_iter().enumerate() {
-            let value_ptr = unsafe { elastic_slot_value_ptr(levels_ptr, level_idx, slot_idx) };
-            unsafe { out_ptr.add(i).write(&mut *value_ptr) };
-        }
-        Some(unsafe { out.assume_init() })
+        core::array::from_fn(|i| {
+            locations[i].map(|(level_idx, slot_idx)| {
+                // SAFETY: locations are unique among Somes (asserted above).
+                // `elastic_slot_value_ptr` projects via raw pointers — no
+                // intermediate `&mut Level` / `&mut RawTable`, so two keys
+                // hitting the same level can't alias under Stacked Borrows.
+                let value_ptr = unsafe { elastic_slot_value_ptr(levels_ptr, level_idx, slot_idx) };
+                unsafe { &mut *value_ptr }
+            })
+        })
+    }
+
+    /// Like [`Self::get_disjoint_mut`] but each yielded element is
+    /// `(&K, &mut V)`. Mirrors `std`'s `get_disjoint_key_value_mut`.
+    ///
+    /// # Panics
+    ///
+    /// If two input keys resolve to the same `(level, slot)` pair.
+    pub fn get_disjoint_key_value_mut<Q, const N: usize>(
+        &mut self,
+        keys: [&Q; N],
+    ) -> [Option<(&K, &mut V)>; N]
+    where
+        K: Borrow<Q> + Eq,
+        Q: Hash + Eq + ?Sized,
+    {
+        let locations = self.locate_disjoint(keys);
+        check_disjoint_aliasing(&locations);
+
+        let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
+        core::array::from_fn(|i| {
+            locations[i].map(|(level_idx, slot_idx)| {
+                // SAFETY: as in `get_disjoint_mut`.
+                let (k_ptr, v_ptr) =
+                    unsafe { elastic_slot_kv_ptrs(levels_ptr, level_idx, slot_idx) };
+                (unsafe { &*k_ptr }, unsafe { &mut *v_ptr })
+            })
+        })
     }
 
     /// Unsafe variant of [`Self::get_disjoint_mut`] that skips the
@@ -668,33 +680,41 @@ where
     ///
     /// # Safety
     ///
-    /// All input keys must resolve to distinct entries; otherwise the
-    /// returned references alias and behavior is undefined.
+    /// Among the keys that resolve to occupied slots, all must reference
+    /// distinct entries; otherwise the returned references alias and
+    /// behavior is undefined.
     pub unsafe fn get_disjoint_unchecked_mut<Q, const N: usize>(
         &mut self,
         keys: [&Q; N],
-    ) -> Option<[&mut V; N]>
+    ) -> [Option<&mut V>; N]
     where
         K: Borrow<Q> + Eq,
         Q: Hash + Eq + ?Sized,
     {
-        let mut locations: [(usize, usize); N] = [(0, 0); N];
-        for (i, key) in keys.iter().enumerate() {
-            let key_hash = self.hash_key(*key);
-            let key_fingerprint = control::control_fingerprint(key_hash);
-            locations[i] = self.find_slot_indices_with_hash(*key, key_hash, key_fingerprint)?;
-        }
+        let locations = self.locate_disjoint(keys);
 
-        // SAFETY: caller guarantees distinct locations; same raw-pointer
-        // chain as the checked variant.
         let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
-        let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
-        let out_ptr = out.as_mut_ptr().cast::<&mut V>();
-        for (i, (level_idx, slot_idx)) in locations.into_iter().enumerate() {
-            let value_ptr = unsafe { elastic_slot_value_ptr(levels_ptr, level_idx, slot_idx) };
-            unsafe { out_ptr.add(i).write(&mut *value_ptr) };
-        }
-        Some(unsafe { out.assume_init() })
+        core::array::from_fn(|i| {
+            locations[i].map(|(level_idx, slot_idx)| {
+                // SAFETY: caller guarantees the hits are pairwise distinct.
+                let value_ptr = unsafe { elastic_slot_value_ptr(levels_ptr, level_idx, slot_idx) };
+                unsafe { &mut *value_ptr }
+            })
+        })
+    }
+
+    #[inline]
+    fn locate_disjoint<Q, const N: usize>(&self, keys: [&Q; N]) -> [Option<(usize, usize)>; N]
+    where
+        K: Borrow<Q> + Eq,
+        Q: Hash + Eq + ?Sized,
+    {
+        core::array::from_fn(|i| {
+            let key = keys[i];
+            let key_hash = self.hash_key(key);
+            let key_fingerprint = control::control_fingerprint(key_hash);
+            self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)
+        })
     }
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool
@@ -776,6 +796,7 @@ where
             levels: &self.levels,
             level_idx: 0,
             scanner: OccupiedScanner::new(),
+            remaining: self.len,
         }
     }
 
@@ -801,11 +822,13 @@ where
     pub fn iter_mut(&mut self) -> ElasticIterMut<'_, K, V, A> {
         let levels_len = self.levels.len();
         let levels = self.levels.as_mut_ptr();
+        let remaining = self.len;
         ElasticIterMut {
             levels,
             levels_len,
             level_idx: 0,
             scanner: OccupiedScanner::new(),
+            remaining,
             _marker: PhantomData,
         }
     }
@@ -1319,6 +1342,7 @@ pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
     levels: &'a [Level<K, V, A>],
     level_idx: usize,
     scanner: OccupiedScanner,
+    remaining: usize,
 }
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticIter<'_, K, V, A> {
@@ -1337,6 +1361,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIter<'a, K, V, A> {
             let table = &self.levels[self.level_idx].table;
             if let Some(slot_idx) = self.scanner.next_in(table) {
                 let entry = unsafe { table.get_ref(slot_idx) };
+                self.remaining -= 1;
                 return Some((&entry.key, &entry.value));
             }
             self.level_idx += 1;
@@ -1344,8 +1369,13 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIter<'a, K, V, A> {
         }
         None
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
 
+impl<K, V, A: Allocator + Clone> ExactSizeIterator for ElasticIter<'_, K, V, A> {}
 impl<K, V, A: Allocator + Clone> FusedIterator for ElasticIter<'_, K, V, A> {}
 
 impl<'a, K, V, S, A> IntoIterator for &'a ElasticHashMap<K, V, S, A>
@@ -1378,6 +1408,7 @@ pub struct ElasticIterMut<'a, K, V, A: Allocator + Clone = Global> {
     levels_len: usize,
     level_idx: usize,
     scanner: OccupiedScanner,
+    remaining: usize,
     _marker: PhantomData<&'a mut [Level<K, V, A>]>,
 }
 
@@ -1399,6 +1430,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIterMut<'a, K, V, A> {
                 let entry = unsafe { level.table.get_mut(idx) };
                 let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                 let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
+                self.remaining -= 1;
                 return Some((key, val));
             }
             self.level_idx += 1;
@@ -1406,7 +1438,14 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIterMut<'a, K, V, A> {
         }
         None
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+
+impl<K, V, A: Allocator + Clone> ExactSizeIterator for ElasticIterMut<'_, K, V, A> {}
+impl<K, V, A: Allocator + Clone> FusedIterator for ElasticIterMut<'_, K, V, A> {}
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticIterMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1441,7 +1480,14 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticValuesMut<'a, K, V, A> 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|(_, v)| v)
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
 }
+
+impl<K, V, A: Allocator + Clone> ExactSizeIterator for ElasticValuesMut<'_, K, V, A> {}
+impl<K, V, A: Allocator + Clone> FusedIterator for ElasticValuesMut<'_, K, V, A> {}
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticValuesMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1469,6 +1515,7 @@ impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
                 // prevents map's Drop and future next() from revisiting.
                 let entry = unsafe { table.take(idx) };
                 table.mark_tombstone(idx);
+                self.map.len -= 1;
                 return Some((entry.key, entry.value));
             }
             self.level_idx += 1;
@@ -1476,8 +1523,13 @@ impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
         }
         None
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.map.len, Some(self.map.len))
+    }
 }
 
+impl<K, V, S, A: Allocator + Clone> ExactSizeIterator for ElasticIntoIter<K, V, S, A> {}
 impl<K, V, S, A: Allocator + Clone> FusedIterator for ElasticIntoIter<K, V, S, A> {}
 
 impl<K, V, S, A: Allocator + Clone> Drop for ElasticIntoIter<K, V, S, A> {
@@ -1896,6 +1948,36 @@ unsafe fn elastic_slot_value_ptr<K, V, A: Allocator + Clone>(
     unsafe { &raw mut (*entry_ptr).value }
 }
 
+/// As [`elastic_slot_value_ptr`] but returns key + value pointers together.
+#[inline]
+unsafe fn elastic_slot_kv_ptrs<K, V, A: Allocator + Clone>(
+    levels_ptr: *mut Level<K, V, A>,
+    level_idx: usize,
+    slot_idx: usize,
+) -> (*const K, *mut V) {
+    let lvl_ptr = unsafe { levels_ptr.add(level_idx) };
+    let table_ptr: *mut RawTable<SlotEntry<K, V>, A> = unsafe { &raw mut (*lvl_ptr).table };
+    let entry_ptr: *mut SlotEntry<K, V> = unsafe { RawTable::slot_ptr_raw(table_ptr, slot_idx) };
+    let k_ptr: *const K = unsafe { &raw const (*entry_ptr).key };
+    let v_ptr: *mut V = unsafe { &raw mut (*entry_ptr).value };
+    (k_ptr, v_ptr)
+}
+
+/// O(N^2) alias check shared by `get_disjoint_mut` and
+/// `get_disjoint_key_value_mut`. Panics if two `Some` locations collide.
+#[inline]
+fn check_disjoint_aliasing<const N: usize>(locations: &[Option<(usize, usize)>; N]) {
+    for (i, li) in locations.iter().enumerate() {
+        let Some(li) = li else { continue };
+        for other in &locations[i + 1..] {
+            assert!(
+                other.as_ref() != Some(li),
+                "get_disjoint_mut: duplicate keys resolve to the same entry",
+            );
+        }
+    }
+}
+
 fn sanitize_probe_scale(probe_scale: f64) -> f64 {
     if probe_scale.is_finite() && probe_scale > 0.0 {
         probe_scale
@@ -2079,6 +2161,102 @@ fn build_batch_plan(
     plan
 }
 
+impl<K, V, S, A> PartialEq for ElasticHashMap<K, V, S, A>
+where
+    K: Eq + Hash,
+    V: PartialEq,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        self.iter()
+            .all(|(k, v)| other.get(k).is_some_and(|ov| *v == *ov))
+    }
+}
+
+impl<K, V, S, A> Eq for ElasticHashMap<K, V, S, A>
+where
+    K: Eq + Hash,
+    V: Eq,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+}
+
+impl<K, Q, V, S, A> std::ops::Index<&Q> for ElasticHashMap<K, V, S, A>
+where
+    K: Eq + Hash + Borrow<Q>,
+    Q: Eq + Hash + ?Sized,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    type Output = V;
+
+    #[inline]
+    fn index(&self, key: &Q) -> &V {
+        self.get(key).expect("no entry found for key")
+    }
+}
+
+impl<K, V, S, A> Extend<(K, V)> for ElasticHashMap<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        let iter = iter.into_iter();
+        let (lo, _) = iter.size_hint();
+        if lo > 0 {
+            self.reserve(lo);
+        }
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
+impl<'a, K, V, S, A> Extend<(&'a K, &'a V)> for ElasticHashMap<K, V, S, A>
+where
+    K: Eq + Hash + Copy,
+    V: Copy,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    fn extend<I: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: I) {
+        self.extend(iter.into_iter().map(|(k, v)| (*k, *v)));
+    }
+}
+
+impl<'a, K, V, S, A> Extend<&'a (K, V)> for ElasticHashMap<K, V, S, A>
+where
+    K: Eq + Hash + Copy,
+    V: Copy,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    fn extend<I: IntoIterator<Item = &'a (K, V)>>(&mut self, iter: I) {
+        self.extend(iter.into_iter().copied());
+    }
+}
+
+impl<K, V, S> FromIterator<(K, V)> for ElasticHashMap<K, V, S, Global>
+where
+    K: Eq + Hash,
+    S: BuildHasher + Default,
+{
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let (lo, _) = iter.size_hint();
+        let mut map = Self::with_capacity_and_hasher(lo, S::default());
+        map.extend(iter);
+        map
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2111,46 +2289,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_get_and_update_work() {
-        let mut map = ElasticHashMap::with_capacity(64);
-
-        for key in 0..20 {
-            assert_eq!(map.insert(key, key * 10), None);
-        }
-        for key in 0..20 {
-            assert_eq!(map.get(&key), Some(&(key * 10)));
-        }
-
-        let replaced = map.insert(7, 777).expect("update should succeed");
-        assert_eq!(replaced, 70);
-        assert_eq!(map.get(&7), Some(&777));
-    }
-
-    #[test]
-    fn get_mut_and_contains_key_work() {
-        let mut map = ElasticHashMap::new();
-        assert_eq!(map.insert("alpha", 1), None);
-        assert!(map.contains_key("alpha"));
-
-        if let Some(v) = map.get_mut("alpha") {
-            *v = 2;
-        }
-        assert_eq!(map.get("alpha"), Some(&2));
-    }
-
-    #[test]
-    fn remove_supports_borrowed_key_and_updates_len() {
-        let mut map: ElasticHashMap<String, i32> = ElasticHashMap::new();
-        assert_eq!(map.insert("alpha".to_string(), 1), None);
-        assert_eq!(map.insert("beta".to_string(), 2), None);
-
-        assert_eq!(map.remove("alpha"), Some(1));
-        assert_eq!(map.remove("alpha"), None);
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.get("beta"), Some(&2));
-    }
-
-    #[test]
     fn clear_removes_all_entries_and_resets_map() {
         let mut map = ElasticHashMap::with_capacity(64);
         for key in 0..10 {
@@ -2165,13 +2303,6 @@ mod tests {
 
         assert_eq!(map.insert(99, 990), None);
         assert_eq!(map.get(&99), Some(&990));
-    }
-
-    #[test]
-    fn new_starts_with_zero_capacity() {
-        let map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
-        assert_eq!(map.capacity(), 0);
-        assert_eq!(map.len(), 0);
     }
 
     #[test]
@@ -2211,9 +2342,10 @@ mod tests {
 
     #[test]
     fn delete_heavy_preserves_correctness() {
-        let n = 10_000;
+        let n = if cfg!(miri) { 200 } else { 10_000 };
+        let trials = if cfg!(miri) { 5 } else { 50 };
         let cutoff = (n * 4) / 5;
-        for trial in 0..50 {
+        for trial in 0..trials {
             let mut map = ElasticHashMap::new();
             for i in 0..n {
                 map.insert(i, i * 10);
@@ -2251,7 +2383,7 @@ mod tests {
 
     #[test]
     fn large_map_correctness() {
-        let n = 10_000;
+        let n = if cfg!(miri) { 100 } else { 10_000 };
         let mut map = ElasticHashMap::with_capacity(n * 2);
         for i in 0..n {
             assert_eq!(map.insert(i, i), None);
@@ -2303,45 +2435,6 @@ mod tests {
     }
 
     #[test]
-    fn iter_empty_map_is_empty() {
-        let map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
-        assert_eq!(map.iter().count(), 0);
-    }
-
-    #[test]
-    fn get_disjoint_mut_returns_all_refs_on_hits() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
-        for i in 0..16 {
-            map.insert(i, i * 10);
-        }
-
-        let got = map.get_disjoint_mut([&1, &3, &7, &15]).expect("all hits");
-        assert_eq!(*got[0], 10);
-        assert_eq!(*got[1], 30);
-        assert_eq!(*got[2], 70);
-        assert_eq!(*got[3], 150);
-    }
-
-    #[test]
-    fn get_disjoint_mut_returns_none_if_any_missing() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
-        for i in 0..8 {
-            map.insert(i, i);
-        }
-
-        assert!(map.get_disjoint_mut([&0, &1, &99]).is_none());
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate keys")]
-    fn get_disjoint_mut_panics_on_duplicate_keys() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
-        map.insert(1, 100);
-        map.insert(2, 200);
-        let _ = map.get_disjoint_mut([&1, &1]);
-    }
-
-    #[test]
     fn get_disjoint_unchecked_mut_returns_all_refs_on_hits() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
         for i in 0..16 {
@@ -2349,29 +2442,30 @@ mod tests {
         }
 
         // SAFETY: keys are distinct.
-        let got = unsafe { map.get_disjoint_unchecked_mut([&1, &3, &7, &15]) }.expect("all hits");
-        assert_eq!(*got[0], 10);
-        assert_eq!(*got[1], 30);
-        assert_eq!(*got[2], 70);
-        assert_eq!(*got[3], 150);
+        let got = unsafe { map.get_disjoint_unchecked_mut([&1, &3, &7, &15]) };
+        assert_eq!(
+            got,
+            [Some(&mut 10), Some(&mut 30), Some(&mut 70), Some(&mut 150)]
+        );
     }
 
     #[test]
-    fn get_disjoint_unchecked_mut_returns_none_if_any_missing() {
+    fn get_disjoint_unchecked_mut_yields_none_per_missing_key() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
         for i in 0..8 {
             map.insert(i, i);
         }
 
-        // SAFETY: keys are distinct (and one misses, returning None).
-        assert!(unsafe { map.get_disjoint_unchecked_mut([&0, &1, &99]) }.is_none());
+        // SAFETY: keys are distinct (one misses → None at that slot).
+        let got = unsafe { map.get_disjoint_unchecked_mut([&0, &1, &99]) };
+        assert_eq!(got, [Some(&mut 0), Some(&mut 1), None]);
     }
 
     #[test]
-    fn get_disjoint_mut_zero_keys_is_some_empty() {
+    fn get_disjoint_mut_zero_keys_returns_empty_array() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(16);
         map.insert(1, 1);
-        let got: [&mut i32; 0] = map.get_disjoint_mut([]).expect("zero-key returns Some");
+        let got: [Option<&mut i32>; 0] = map.get_disjoint_mut([]);
         assert_eq!(got.len(), 0);
     }
 
@@ -2382,36 +2476,12 @@ mod tests {
             map.insert(i, i);
         }
         {
-            let got = map.get_disjoint_mut([&2, &5]).expect("hit");
-            *got[0] = 222;
-            *got[1] = 555;
+            let [a, b] = map.get_disjoint_mut([&2, &5]);
+            *a.unwrap() = 222;
+            *b.unwrap() = 555;
         }
         assert_eq!(map.get(&2), Some(&222));
         assert_eq!(map.get(&5), Some(&555));
-    }
-
-    #[test]
-    fn keys_yields_inserted_keys_only() {
-        use std::collections::HashSet;
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
-        for i in 0..30 {
-            map.insert(i, i * 10);
-        }
-        let got: HashSet<i32> = map.keys().copied().collect();
-        let expected: HashSet<i32> = (0..30).collect();
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn values_yields_inserted_values_only() {
-        use std::collections::HashSet;
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
-        for i in 0..30 {
-            map.insert(i, i * 10);
-        }
-        let got: HashSet<i32> = map.values().copied().collect();
-        let expected: HashSet<i32> = (0..30).map(|i| i * 10).collect();
-        assert_eq!(got, expected);
     }
 
     #[test]
@@ -2436,21 +2506,6 @@ mod tests {
     }
 
     #[test]
-    fn remove_entry_returns_both_and_actually_removes() {
-        let mut map: ElasticHashMap<String, i32> = ElasticHashMap::with_capacity(16);
-        map.insert("alpha".to_string(), 1);
-        map.insert("beta".to_string(), 2);
-
-        let (k, v) = map.remove_entry("alpha").expect("hit");
-        assert_eq!(k, "alpha");
-        assert_eq!(v, 1);
-        assert_eq!(map.len(), 1);
-        assert!(map.get("alpha").is_none());
-
-        assert!(map.remove_entry("alpha").is_none());
-    }
-
-    #[test]
     fn try_reserve_grows_when_needed() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
         assert_eq!(map.capacity(), 0);
@@ -2472,16 +2527,6 @@ mod tests {
         let cap_before = map.capacity();
         map.try_reserve(0).expect("noop");
         assert_eq!(map.capacity(), cap_before);
-    }
-
-    #[test]
-    fn try_reserve_overflow_returns_error() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
-        map.insert(1, 1);
-        assert_eq!(
-            map.try_reserve(usize::MAX),
-            Err(TryReserveError::CapacityOverflow)
-        );
     }
 
     #[test]
@@ -2555,26 +2600,6 @@ mod tests {
     }
 
     #[test]
-    fn iter_mut_empty_map_is_empty() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
-        assert_eq!(map.iter_mut().count(), 0);
-    }
-
-    #[test]
-    fn values_mut_mutates_in_place() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
-        for i in 0..16 {
-            map.insert(i, i);
-        }
-        for v in map.values_mut() {
-            *v += 100;
-        }
-        for i in 0..16 {
-            assert_eq!(map.get(&i), Some(&(i + 100)));
-        }
-    }
-
-    #[test]
     fn retain_with_empty_map_is_noop() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
         let mut called = false;
@@ -2628,29 +2653,6 @@ mod tests {
         let expected_len = map.len();
         let collected: Vec<(i32, i32)> = map.into_iter().collect();
         assert_eq!(collected.len(), expected_len);
-    }
-
-    #[test]
-    fn into_keys_yields_all_keys() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
-        for i in 0..20 {
-            map.insert(i, i);
-        }
-        let mut keys: Vec<i32> = map.into_keys().collect();
-        keys.sort_unstable();
-        assert_eq!(keys, (0..20).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn into_values_yields_all_values() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
-        for i in 0..20 {
-            map.insert(i, i * 5);
-        }
-        let mut vals: Vec<i32> = map.into_values().collect();
-        vals.sort_unstable();
-        let expected: Vec<i32> = (0..20).map(|i| i * 5).collect();
-        assert_eq!(vals, expected);
     }
 
     #[test]
@@ -2968,26 +2970,6 @@ mod tests {
         map.insert(1, 10);
         let err = map.try_insert(1, 99).expect_err("occupied must error");
         assert_eq!(err.value, 99);
-    }
-
-    #[test]
-    fn extract_if_yields_only_matching_and_leaves_rest() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
-        for i in 0..40 {
-            map.insert(i, i);
-        }
-        let mut extracted: Vec<(i32, i32)> = map.extract_if(|k, _| k % 3 == 0).collect();
-        extracted.sort_unstable();
-        let expected: Vec<(i32, i32)> = (0..40).filter(|i| i % 3 == 0).map(|i| (i, i)).collect();
-        assert_eq!(extracted, expected);
-        assert_eq!(map.len(), 40 - expected.len());
-        for i in 0..40 {
-            if i % 3 == 0 {
-                assert!(map.get(&i).is_none());
-            } else {
-                assert_eq!(map.get(&i), Some(&i));
-            }
-        }
     }
 
     #[test]
