@@ -65,10 +65,9 @@ fn build_funnel_options(
     Ok(opts)
 }
 
-/// Type tag packed into `HashedAny::tagged`'s low bits so `PartialEq` can
-/// dispatch to a fast str-vs-str or int-vs-int path without re-running
-/// `Py_TYPE`.
-#[derive(Clone, Copy, PartialEq)]
+/// Type tag packed into `HashedAny::tagged`'s low bits so `PartialEq` skips
+/// `Py_TYPE` re-dispatch for str/str and int/int compares.
+#[derive(PartialEq, Eq)]
 #[repr(usize)]
 enum HashKind {
     Other = 0,
