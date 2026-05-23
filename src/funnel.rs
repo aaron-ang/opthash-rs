@@ -180,10 +180,16 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
     }
 
     /// Probe one bucket for `key`. SIMD fingerprint scan + key compare.
-    /// `StopSearch` on EMPTY byte: bucket never overflowed,
-    ///  so the key cannot be at a deeper level.
+    /// `StopSearch` on EMPTY byte: bucket never overflowed, so the key cannot
+    /// be at a deeper level. See [`Candidate`] for the tracking modes.
     #[inline]
-    fn find_in_bucket<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> LookupStep
+    fn find_in_bucket<Q>(
+        &self,
+        key_hash: u64,
+        key_fingerprint: u8,
+        key: &Q,
+        candidate: Candidate<'_, usize>,
+    ) -> LookupStep
     where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
@@ -212,69 +218,23 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
             }
         }
 
-        // StopSearch: bucket has an EMPTY byte → no key ever overflowed past here.
-        // Tombstones in the bucket don't disable termination since the
-        // empty byte still proves the probe chain terminated naturally.
+        if candidate.wants_free() {
+            let slot = self
+                .table
+                .group_free_mask(group_idx)
+                .lowest()
+                .map(|o| bucket_range.start + o);
+            candidate.record(slot);
+        }
+
+        // StopSearch: bucket has an EMPTY byte → no key ever overflowed past
+        // here. Tombstones don't disable termination since the empty byte
+        // still proves the probe chain terminated naturally.
         if self.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
-            return LookupStep::StopSearch;
-        }
-        LookupStep::Continue
-    }
-
-    /// Like [`Self::find_in_bucket`] but also returns the first free slot in
-    /// the bucket (insert candidate) alongside the lookup outcome.
-    #[inline]
-    fn find_in_bucket_with_candidate<Q>(
-        &self,
-        key_hash: u64,
-        key_fingerprint: u8,
-        key: &Q,
-    ) -> (LookupStep, Option<usize>)
-    where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
-    {
-        if self.len == 0 {
-            return (LookupStep::Continue, None);
-        }
-
-        let bucket_idx = self.bucket_index(key_hash);
-        let bucket_range = self.bucket_range(bucket_idx);
-        // SAFETY: `bucket_size` is `GROUP_SIZE`-aligned at construction.
-        // Hinting elides the `& ~0xF` LLVM emits to fold `(start / 16) * 16`.
-        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
-        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
-            unsafe { std::hint::unreachable_unchecked() };
-        }
-        let group_idx = bucket_range.start / GROUP_SIZE;
-        // SAFETY: `len > 0` ⇒ `capacity > 0`; `bucket_range.start < capacity`.
-        unsafe { self.table.prefetch_slot(bucket_range.start) };
-
-        for relative_idx in self.table.group_match_mask(group_idx, key_fingerprint) {
-            let slot_idx = bucket_range.start + relative_idx;
-            let entry = unsafe { self.table.get_ref(slot_idx) };
-            if entry.key.borrow() == key {
-                let free_candidate = self
-                    .table
-                    .group_free_mask(group_idx)
-                    .lowest()
-                    .map(|o| bucket_range.start + o);
-                return (LookupStep::Found(slot_idx), free_candidate);
-            }
-        }
-
-        let free_candidate = self
-            .table
-            .group_free_mask(group_idx)
-            .lowest()
-            .map(|o| bucket_range.start + o);
-
-        let step = if self.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
             LookupStep::StopSearch
         } else {
             LookupStep::Continue
-        };
-        (step, free_candidate)
+        }
     }
 }
 
@@ -529,6 +489,36 @@ enum LookupStep {
     Found(usize),
     Continue,
     StopSearch,
+}
+
+/// Candidate-tracking mode for `find_in_*` scans.
+///
+/// - `Lookup`: pure lookup — skip the free-slot SIMD scan.
+/// - `Track(out)`: record the first FREE-or-TOMBSTONE slot into `*out` when
+///   `*out` is `None`; if already `Some`, the scan acts like `Lookup` (caller
+///   has an earlier candidate, no need to find another).
+enum Candidate<'a, T> {
+    Lookup,
+    Track(&'a mut Option<T>),
+}
+
+impl<T> Candidate<'_, T> {
+    /// True when this scan should look for a free slot (caller passed
+    /// `Track` and `*out` is still `None`).
+    #[inline]
+    fn wants_free(&self) -> bool {
+        matches!(self, Candidate::Track(out) if out.is_none())
+    }
+
+    /// Record `slot` into `*out`, only if `Track` and `*out` is `None`.
+    #[inline]
+    fn record(self, slot: Option<T>) {
+        if let Candidate::Track(out) = self
+            && out.is_none()
+        {
+            *out = slot;
+        }
+    }
 }
 
 /// Open-addressed hash map using funnel hashing.
@@ -857,17 +847,23 @@ where
         let key_hash = self.hash_key(&key);
         let key_fingerprint = control::control_fingerprint(key_hash);
 
-        let level_candidate =
-            match self.find_in_levels_with_candidate(&key, key_hash, key_fingerprint) {
-                Ok(location) => return Some(self.replace_existing_value(location, value)),
-                Err(level_candidate) => level_candidate,
-            };
+        // Scan levels: on match, replace; on miss, retain the first free
+        // slot we saw as the insertion candidate.
+        let mut candidate: Option<SlotLocation> = None;
+        if let Some(location) = self.find_in_levels(
+            &key,
+            key_hash,
+            key_fingerprint,
+            Candidate::Track(&mut candidate),
+        ) {
+            return Some(self.replace_existing_value(location, value));
+        }
 
-        if let Some(location) = level_candidate
-            && self.special.total_len == 0
-        {
+        // Fast path: levels gave us a slot and the special array is empty,
+        // so primary/fallback can't hold the key — skip those scans.
+        if candidate.is_some() && self.special.total_len == 0 {
             return self.insert_at_location_after_resize_check(
-                Some(location),
+                candidate,
                 key_hash,
                 key,
                 value,
@@ -875,40 +871,38 @@ where
             );
         }
 
-        let (primary_step, primary_candidate) =
-            self.find_in_special_primary_with_candidate(key_hash, key_fingerprint, &key);
-        let primary_candidate =
-            primary_candidate.map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx });
-
-        let insertion_slot = match primary_step {
+        // Scan special primary, then (on Continue) fallback. Passing
+        // `Track(&mut candidate)` records the first free slot if we don't
+        // have one yet; if `candidate` is already `Some`, both scans act
+        // like `Lookup` and skip the free-slot SIMD work.
+        match self.find_in_special_primary(
+            key_hash,
+            key_fingerprint,
+            &key,
+            Candidate::Track(&mut candidate),
+        ) {
             LookupStep::Found(slot_idx) => {
                 return Some(
                     self.replace_existing_value(SlotLocation::SpecialPrimary { slot_idx }, value),
                 );
             }
-            LookupStep::StopSearch => level_candidate.or(primary_candidate),
+            LookupStep::StopSearch => {}
             LookupStep::Continue => {
-                let (fallback_match, fallback_candidate) =
-                    self.find_in_special_fallback_with_candidate(key_hash, key_fingerprint, &key);
-                if let Some(slot_idx) = fallback_match {
+                if let Some(slot_idx) = self.find_in_special_fallback(
+                    key_hash,
+                    key_fingerprint,
+                    &key,
+                    Candidate::Track(&mut candidate),
+                ) {
                     return Some(self.replace_existing_value(
                         SlotLocation::SpecialFallback { slot_idx },
                         value,
                     ));
                 }
-                level_candidate.or(primary_candidate).or_else(|| {
-                    fallback_candidate.map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
-                })
             }
-        };
+        }
 
-        self.insert_at_location_after_resize_check(
-            insertion_slot,
-            key_hash,
-            key,
-            value,
-            key_fingerprint,
-        )
+        self.insert_at_location_after_resize_check(candidate, key_hash, key, value, key_fingerprint)
     }
 
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
@@ -1615,46 +1609,56 @@ where
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
-    /// Search bucket levels for `key`. Returns `Ok(SlotLocation)` on hit, or
-    /// `Err(Some(insert_location))` with the first non-full bucket's
-    /// candidate slot if known (used by insert to skip a re-search).
-    /// `Err(None)` when no insert candidate was seen and the search exhausted.
+    /// Search bucket levels `L_0..=L_{max_populated}` for `key`. See
+    /// [`Candidate`] for tracking modes. Returns `Some(SlotLocation::Level)`
+    /// on hit; on miss returns `None` and `candidate` holds the first
+    /// non-full bucket's free slot (if any) when `Candidate::Track` was
+    /// requested.
     #[inline]
-    fn find_in_levels_with_candidate<Q>(
+    fn find_in_levels<Q>(
         &self,
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
-    ) -> Result<SlotLocation, Option<SlotLocation>>
+        candidate: Candidate<'_, SlotLocation>,
+    ) -> Option<SlotLocation>
     where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        let search_limit = (self.max_populated_level + 1).min(self.levels.len());
-        let mut candidate = None;
+        let wants_free = candidate.wants_free();
+        let mut local: Option<SlotLocation> = None;
 
+        let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            let (lookup_step, slot_candidate) =
-                level.find_in_bucket_with_candidate(key_hash, key_fingerprint, key);
-            if candidate.is_none() {
-                candidate = slot_candidate.map(|slot_idx| SlotLocation::Level {
+            // Per-level slot tracking, only while we still want a candidate.
+            let mut slot_candidate: Option<usize> = None;
+            let level_mode = if wants_free && local.is_none() {
+                Candidate::Track(&mut slot_candidate)
+            } else {
+                Candidate::Lookup
+            };
+            let lookup_step = level.find_in_bucket(key_hash, key_fingerprint, key, level_mode);
+            if let Some(slot_idx) = slot_candidate {
+                local = Some(SlotLocation::Level {
                     level_idx,
                     slot_idx,
                 });
             }
             match lookup_step {
                 LookupStep::Found(slot_idx) => {
-                    return Ok(SlotLocation::Level {
+                    return Some(SlotLocation::Level {
                         level_idx,
                         slot_idx,
                     });
                 }
                 LookupStep::Continue => {}
-                LookupStep::StopSearch => return Err(candidate),
+                LookupStep::StopSearch => break,
             }
         }
 
-        Err(candidate)
+        candidate.record(local);
+        None
     }
 
     #[inline]
@@ -1809,18 +1813,32 @@ where
         None
     }
 
-    /// Probe the special primary for `key` (lookup-only — no insert
-    /// candidate tracking). Bounded by `primary_probe_limit` groups; if
-    /// reached without a match and no tombstones seen, returns `StopSearch`
-    /// so the caller skips fallback.
+    /// Probe special primary for `key`. Bounded by `primary_probe_limit`
+    /// groups; if reached without a match and no tombstones seen, returns
+    /// `StopSearch` so the caller skips fallback. See [`Candidate`] for
+    /// tracking modes.
     #[inline]
-    fn find_in_special_primary<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> LookupStep
+    fn find_in_special_primary<Q>(
+        &self,
+        key_hash: u64,
+        key_fingerprint: u8,
+        key: &Q,
+        candidate: Candidate<'_, SlotLocation>,
+    ) -> LookupStep
     where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
+        let wants_free = candidate.wants_free();
         let primary = &self.special.primary;
-        if primary.len == 0 {
+
+        if primary.table.capacity() == 0 || primary.len == 0 {
+            if wants_free {
+                let slot = self
+                    .first_free_in_special_primary(key_hash)
+                    .map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx });
+                candidate.record(slot);
+            }
             return LookupStep::Continue;
         }
 
@@ -1828,193 +1846,134 @@ where
         let group_count = primary.table.group_count();
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
+        let mut local: Option<usize> = None;
         let mut group_idx = primary.group_start(key_hash);
         let step = primary.group_step(key_hash);
-        for _ in 0..group_limit {
-            if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
-                for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
-                    let slot_idx = group_idx * GROUP_SIZE + relative_idx;
-                    let entry = unsafe { primary.table.get_ref(slot_idx) };
-                    if entry.key.borrow() == key {
-                        return LookupStep::Found(slot_idx);
+
+        let outcome: LookupStep = 'probe: {
+            for _ in 0..group_limit {
+                // Track free slots only when asked AND we don't already have
+                // one. `first_free_in_group` doubles as the "any free?" check;
+                // when not tracking we use the cheaper EMPTY-only mask.
+                let has_free = if wants_free && local.is_none() {
+                    let slot = primary.table.first_free_in_group(group_idx);
+                    if let Some(s) = slot {
+                        local = Some(s);
+                    }
+                    slot.is_some()
+                } else {
+                    primary.table.group_match_mask(group_idx, CTRL_EMPTY).any()
+                };
+                if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
+                    for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
+                        let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                        let entry = unsafe { primary.table.get_ref(slot_idx) };
+                        if entry.key.borrow() == key {
+                            break 'probe LookupStep::Found(slot_idx);
+                        }
                     }
                 }
+                // StopSearch: probe chain terminated naturally — an EMPTY
+                // slot in the group, with no TOMBSTONE that might be hiding
+                // an overflow we'd need to chase.
+                if has_free
+                    && !primary
+                        .table
+                        .group_match_mask(group_idx, CTRL_TOMBSTONE)
+                        .any()
+                {
+                    break 'probe LookupStep::StopSearch;
+                }
+                let next = (group_idx + step) & mask;
+                // SAFETY: `primary.len > 0` ⇒ `capacity > 0`; `next` is wrapped
+                // by `group_count_mask` so `next < group_count`.
+                unsafe { primary.table.prefetch_group_controls(next) };
+                group_idx = next;
             }
-            if !primary
-                .table
-                .group_match_mask(group_idx, CTRL_TOMBSTONE)
-                .any()
-                && primary.table.group_match_mask(group_idx, CTRL_EMPTY).any()
-            {
-                return LookupStep::StopSearch;
-            }
-            let next = (group_idx + step) & mask;
-            // SAFETY: `primary.len > 0` ⇒ `capacity > 0`; `next` is wrapped
-            // by `group_count_mask` so `next < group_count`.
-            unsafe { primary.table.prefetch_group_controls(next) };
-            group_idx = next;
+            LookupStep::Continue
+        };
+
+        if wants_free {
+            candidate.record(local.map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx }));
         }
-        LookupStep::Continue
+        outcome
     }
 
-    /// Like `find_in_special_primary`, but also remembers the first
-    /// FREE-or-TOMBSTONE slot seen so insert can land there without a re-scan.
-    #[inline]
-    fn find_in_special_primary_with_candidate<Q>(
-        &self,
-        key_hash: u64,
-        key_fingerprint: u8,
-        key: &Q,
-    ) -> (LookupStep, Option<usize>)
-    where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
-    {
-        let primary = &self.special.primary;
-        if primary.table.capacity() == 0 {
-            return (LookupStep::Continue, None);
-        }
-        if primary.len == 0 {
-            return (
-                LookupStep::Continue,
-                self.first_free_in_special_primary(key_hash),
-            );
-        }
-
-        let fingerprint_mask = control::fingerprint_bit(key_fingerprint);
-        let group_count = primary.table.group_count();
-        let group_limit = self.primary_probe_limit.min(group_count.max(1));
-        let mask = primary.group_count_mask;
-        let mut candidate = None;
-        let mut group_idx = primary.group_start(key_hash);
-        let step = primary.group_step(key_hash);
-        for _ in 0..group_limit {
-            // Cache the free-in-group result so candidate-population and
-            // StopSearch share one SIMD scan per group.
-            let free_in_group = if candidate.is_none() {
-                let slot = primary.table.first_free_in_group(group_idx);
-                if let Some(slot) = slot {
-                    candidate = Some(slot);
-                }
-                slot.is_some()
-            } else {
-                primary.table.group_match_mask(group_idx, CTRL_EMPTY).any()
-            };
-            if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
-                for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
-                    let slot_idx = group_idx * GROUP_SIZE + relative_idx;
-                    let entry = unsafe { primary.table.get_ref(slot_idx) };
-                    if entry.key.borrow() == key {
-                        return (LookupStep::Found(slot_idx), candidate);
-                    }
-                }
-            }
-            if free_in_group
-                && !primary
-                    .table
-                    .group_match_mask(group_idx, CTRL_TOMBSTONE)
-                    .any()
-            {
-                return (LookupStep::StopSearch, candidate);
-            }
-            let next = (group_idx + step) & mask;
-            // SAFETY: `primary.table.capacity() > 0` ⇒ `group_count > 0`;
-            // `next` is wrapped by `group_count_mask` so `next < group_count`.
-            unsafe { primary.table.prefetch_group_controls(next) };
-            group_idx = next;
-        }
-        (LookupStep::Continue, candidate)
-    }
-
-    /// Probe the special fallback for `key`. Bucket-local search like
-    /// `BucketLevel`, but with larger buckets sized for primary spillover.
+    /// Probe special fallback for `key` across its two candidate buckets.
+    /// See [`Candidate`] for tracking modes.
     #[inline]
     fn find_in_special_fallback<Q>(
         &self,
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
+        candidate: Candidate<'_, SlotLocation>,
     ) -> Option<usize>
     where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
+        let wants_free = candidate.wants_free();
         let fallback = &self.special.fallback;
-        if fallback.len == 0 {
+
+        if fallback.table.capacity() == 0 || fallback.len == 0 {
+            if wants_free {
+                let slot = self
+                    .first_free_in_special_fallback(key_hash)
+                    .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx });
+                candidate.record(slot);
+            }
             return None;
         }
 
         let bucket_a = fallback.bucket_a(key_hash);
         let bucket_b = fallback.bucket_b(key_hash);
 
+        let mut local: Option<usize> = None;
+        let mut found: Option<usize> = None;
         for bucket_idx in [bucket_a, bucket_b] {
-            let range = fallback.bucket_range(bucket_idx);
-            let controls = unsafe {
-                std::slice::from_raw_parts(
-                    fallback.table.group_data_ptr(0).add(range.start),
-                    range.len(),
-                )
-            };
-
-            let mut match_offset = 0;
-            while let Some(relative_idx) =
-                control::find_next_fingerprint_in_controls(controls, key_fingerprint, match_offset)
-            {
-                let slot_idx = range.start + relative_idx;
-                let entry = unsafe { fallback.table.get_ref(slot_idx) };
-                if entry.key.borrow() == key {
-                    return Some(slot_idx);
-                }
-                match_offset = relative_idx + 1;
-            }
-        }
-
-        None
-    }
-
-    /// Like `find_in_special_fallback`, but also tracks the first
-    /// FREE-or-TOMBSTONE slot for insert.
-    #[inline]
-    fn find_in_special_fallback_with_candidate<Q>(
-        &self,
-        key_hash: u64,
-        key_fingerprint: u8,
-        key: &Q,
-    ) -> (Option<usize>, Option<usize>)
-    where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
-    {
-        let fallback = &self.special.fallback;
-        if fallback.capacity() == 0 {
-            return (None, None);
-        }
-        if fallback.len == 0 {
-            return (None, self.first_free_in_special_fallback(key_hash));
-        }
-
-        let bucket_a = fallback.bucket_a(key_hash);
-        let bucket_b = fallback.bucket_b(key_hash);
-        let mut candidate = None;
-
-        // Find a free slot in either bucket.
-        for &bucket_idx in &[bucket_a, bucket_b] {
-            if candidate.is_some() {
+            let need_match = found.is_none();
+            let need_candidate = wants_free && local.is_none();
+            if !need_match && !need_candidate {
                 break;
             }
             let range = fallback.bucket_range(bucket_idx);
-            for slot_idx in range {
-                if fallback.table.control_at(slot_idx).is_free() {
-                    candidate = Some(slot_idx);
-                    break;
+            if need_candidate {
+                for slot_idx in range.clone() {
+                    if fallback.table.control_at(slot_idx).is_free() {
+                        local = Some(slot_idx);
+                        break;
+                    }
+                }
+            }
+            if need_match {
+                let controls = unsafe {
+                    std::slice::from_raw_parts(
+                        fallback.table.group_data_ptr(0).add(range.start),
+                        range.len(),
+                    )
+                };
+                let mut match_offset = 0;
+                while let Some(relative_idx) = control::find_next_fingerprint_in_controls(
+                    controls,
+                    key_fingerprint,
+                    match_offset,
+                ) {
+                    let slot_idx = range.start + relative_idx;
+                    let entry = unsafe { fallback.table.get_ref(slot_idx) };
+                    if entry.key.borrow() == key {
+                        found = Some(slot_idx);
+                        break;
+                    }
+                    match_offset = relative_idx + 1;
                 }
             }
         }
 
-        (
-            self.find_in_special_fallback(key_hash, key_fingerprint, key),
-            candidate,
-        )
+        if wants_free {
+            candidate.record(local.map(|slot_idx| SlotLocation::SpecialFallback { slot_idx }));
+        }
+        found
     }
 
     #[inline]
@@ -2028,7 +1987,7 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        match self.levels[0].find_in_bucket(key_hash, key_fingerprint, key) {
+        match self.levels[0].find_in_bucket(key_hash, key_fingerprint, key, Candidate::Lookup) {
             LookupStep::Found(slot_idx) => {
                 return Some(SlotLocation::Level {
                     level_idx: 0,
@@ -2069,7 +2028,7 @@ where
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (offset, level) in self.levels[1..search_limit].iter().enumerate() {
-            match level.find_in_bucket(key_hash, key_fingerprint, key) {
+            match level.find_in_bucket(key_hash, key_fingerprint, key, Candidate::Lookup) {
                 LookupStep::Found(slot_idx) => {
                     return ControlFlow::Break(Some(SlotLocation::Level {
                         level_idx: offset + 1,
@@ -2095,13 +2054,13 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        match self.find_in_special_primary(key_hash, key_fingerprint, key) {
+        match self.find_in_special_primary(key_hash, key_fingerprint, key, Candidate::Lookup) {
             LookupStep::Found(slot_idx) => return Some(SlotLocation::SpecialPrimary { slot_idx }),
             LookupStep::Continue => {}
             LookupStep::StopSearch => return None,
         }
 
-        self.find_in_special_fallback(key_hash, key_fingerprint, key)
+        self.find_in_special_fallback(key_hash, key_fingerprint, key, Candidate::Lookup)
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
