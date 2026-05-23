@@ -257,13 +257,12 @@ impl PartialEq for HashedAny {
             {
                 return x == y;
             }
-            // Int/int fast path: avoid tp_richcompare dispatch when both
-            // values fit in `c_longlong`. Sign-of-overflow disagreement
-            // proves inequality without further work.
+            // Int/int: try `c_longlong` direct compare; fall through to rich
+            // compare only when both sides overflow in the same direction.
             if sk == HashKind::Int && ok == HashKind::Int {
                 let mut ovf_a: std::ffi::c_int = 0;
                 let mut ovf_b: std::ffi::c_int = 0;
-                // SAFETY: both pointers are live PyLong objects (kind tag).
+                // SAFETY: kind tag guarantees both are PyLong.
                 let a =
                     unsafe { ffi::PyLong_AsLongLongAndOverflow(self.obj_ptr(), &raw mut ovf_a) };
                 let b =
@@ -274,7 +273,6 @@ impl PartialEq for HashedAny {
                 if ovf_a != ovf_b {
                     return false;
                 }
-                // Same-sign overflow on both — fall through to rich compare.
             }
             self.obj_borrowed(py)
                 .eq(other.obj_borrowed(py))
@@ -459,10 +457,8 @@ macro_rules! define_map_classes {
             }
 
             fn clear(&mut self) {
-                // Acquire the GIL once and drop all entries inside the scope so
-                // each `HashedAny::drop`'s nested `Python::attach` becomes the
-                // cheap already-attached path. Saves N TLS+atomic ops vs the
-                // default per-drop attach/release cycle.
+                // One outer attach so per-entry `HashedAny::drop` hits the
+                // cheap already-attached path instead of re-acquiring GIL state.
                 Python::attach(|_py| self.inner.clear());
                 self.bump();
             }
@@ -1017,14 +1013,12 @@ macro_rules! define_map_classes {
 }
 
 /// One iterator pyclass. `snapshot` is materialized eagerly at `__iter__`
-/// (trades memory for no self-referencing borrow). `__next__` checks the
-/// map's `generation` against `expected_gen` and raises `RuntimeError`
-/// on mismatch.
+/// (trades memory for no self-referencing borrow). `__next__` checks
+/// `expected_gen` against the map's `generation` and raises on mismatch.
 ///
-/// Slots are `Option<Py<PyAny>>` (niche-packed to the same size as
-/// `Py<PyAny>`); `__next__` `.take()`s the slot, moving the existing
-/// strong ref to the caller. Saves one atomic refcount bump per yield
-/// vs cloning out of an always-`Some` Vec.
+/// Slot type is `Option<Py<PyAny>>` (niche-packed, same size as `Py`); each
+/// `__next__` `.take()`s the slot rather than cloning — saves one atomic
+/// refcount bump per yield.
 macro_rules! define_iter {
     ($Iter:ident, $iter_name:literal, $PyMap:ident) => {
         #[pyclass(name = $iter_name, module = "opthash")]
