@@ -130,8 +130,9 @@ pub fn build_funnel_drop_map(n: usize) -> FunnelHashMap<DropU64, DropU64> {
     map
 }
 
-/// 32-byte Copy value for memcpy-cost benches (insert rehash, drain move-out,
-/// get cache footprint). Pair with `u64` keys.
+/// 32-byte Copy value for memcpy-cost benches
+/// (insert rehash, drain move-out, get cache footprint).
+/// Pair with `u64` keys.
 pub type BigVal = [u64; 4];
 
 #[inline]
