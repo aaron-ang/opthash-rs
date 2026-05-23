@@ -283,6 +283,91 @@ fn bench_resize_heavy_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_iter_throughput(c: &mut Criterion) {
+    let pairs = make_pairs(MAP_SIZE);
+    let mut group = c.benchmark_group("iter_throughput");
+    group.throughput(Throughput::Elements(MAP_SIZE as u64));
+
+    // xor-fold the yielded pairs so LLVM can't elide the walk; `.count()`
+    // alone is hoisted out when the map is loop-invariant.
+    bench_all_impls!(
+        group,
+        BatchSize::LargeInput,
+        || build_std_map(&pairs),
+        || build_hashbrown_map(&pairs),
+        || build_elastic_map(&pairs),
+        || build_funnel_map(&pairs),
+        |map| black_box(map.iter().fold(0u64, |a, (k, v)| a ^ k ^ v)),
+    );
+
+    group.finish();
+}
+
+fn bench_iter_mut_throughput(c: &mut Criterion) {
+    let pairs = make_pairs(MAP_SIZE);
+    let mut group = c.benchmark_group("iter_mut_throughput");
+    group.throughput(Throughput::Elements(MAP_SIZE as u64));
+
+    bench_all_impls!(
+        group,
+        BatchSize::LargeInput,
+        || build_std_map(&pairs),
+        || build_hashbrown_map(&pairs),
+        || build_elastic_map(&pairs),
+        || build_funnel_map(&pairs),
+        |map| {
+            for (_, v) in map.iter_mut() {
+                *v = black_box(*v).wrapping_add(1);
+            }
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_drain_throughput(c: &mut Criterion) {
+    let pairs = make_pairs(MAP_SIZE);
+    let mut group = c.benchmark_group("drain_throughput");
+    group.throughput(Throughput::Elements(MAP_SIZE as u64));
+
+    // xor-fold pulls every yielded `(K, V)` out — defeats `.count()` elision
+    // when both `K` and `V` are `Copy` with no-op `Drop`.
+    bench_all_impls!(
+        group,
+        BatchSize::PerIteration,
+        || build_std_map(&pairs),
+        || build_hashbrown_map(&pairs),
+        || build_elastic_map(&pairs),
+        || build_funnel_map(&pairs),
+        |map| black_box(map.drain().fold(0u64, |a, (k, v)| a ^ k ^ v)),
+    );
+
+    group.finish();
+}
+
+fn bench_extract_if_throughput(c: &mut Criterion) {
+    let pairs = make_pairs(MAP_SIZE);
+    let mut group = c.benchmark_group("extract_if_throughput");
+    group.throughput(Throughput::Elements(MAP_SIZE as u64));
+
+    bench_all_impls!(
+        group,
+        BatchSize::PerIteration,
+        || build_std_map(&pairs),
+        || build_hashbrown_map(&pairs),
+        || build_elastic_map(&pairs),
+        || build_funnel_map(&pairs),
+        |map| {
+            black_box(
+                map.extract_if(|k, _v| *k % 2 == 0)
+                    .fold(0u64, |a, (k, v)| a ^ k ^ v),
+            )
+        },
+    );
+
+    group.finish();
+}
+
 fn bench_get_hit_latency(c: &mut Criterion) {
     for &size in LATENCY_SIZES {
         let pairs = make_pairs(size);
@@ -327,6 +412,10 @@ criterion_group!(
         bench_mixed_throughput,
         bench_delete_heavy_throughput,
         bench_resize_heavy_throughput,
+        bench_iter_throughput,
+        bench_iter_mut_throughput,
+        bench_drain_throughput,
+        bench_extract_if_throughput,
         bench_get_hit_latency
 );
 criterion_main!(benches);
