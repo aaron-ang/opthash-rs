@@ -1,3 +1,25 @@
+//! Speedup bench suite. Each group runs std / hashbrown / elastic / funnel
+//! over the same workload so CodSpeed can chart deltas per-PR.
+//!
+//! ## LLVM elision pitfalls
+//!
+//! - `.count()` on iterators yielding `Copy` types with no-op `Drop` is
+//!   hoisted out — the optimizer drops the walk entirely. Fold xor over
+//!   yielded `(k, v)` so every pair has to be touched.
+//! - Bulk-destructive ops (`clear`, `drain`) over `(u64, u64)` payloads
+//!   become no-ops in the optimizer's eyes. Use the `DropU64` variant
+//!   (see [`common::DropU64`]) for groups whose dominant cost is `Drop`.
+//! - Loop-invariant lookups can be hoisted; wrap `.get(k)` results in
+//!   `black_box` per iteration.
+//!
+//! ## BatchSize choices
+//!
+//! - Read-only ops (`iter`, `get_hit`, `get_miss`): `LargeInput` —
+//!   single map build amortized across iterations.
+//! - Destructive ops (`drain`, `extract_if`, `clear`, `clone`,
+//!   `grow_insert`): `PerIteration` — each iter needs a fresh fixture.
+//! - In-place mutation (`iter_mut`): `LargeInput` — non-destructive.
+
 mod common;
 
 use std::collections::HashMap as StdHashMap;
@@ -6,8 +28,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::{
-    LATENCY_SIZES, VALUE_XOR_MIX_ALT, build_elastic_map, build_funnel_map, build_hashbrown_map,
-    build_std_map, key_at, make_pairs, size_label,
+    LATENCY_SIZES, VALUE_XOR_MIX_ALT, build_elastic_drop_map, build_elastic_map,
+    build_funnel_drop_map, build_funnel_map, build_hashbrown_drop_map, build_hashbrown_map,
+    build_std_drop_map, build_std_map, drop_sink_value, key_at, make_pairs, size_label,
 };
 use criterion::{
     BatchSize, Criterion, Throughput, criterion_group, criterion_main, profiler::Profiler,
@@ -368,6 +391,106 @@ fn bench_extract_if_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_clear_drop_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("clear_drop_throughput");
+    group.throughput(Throughput::Elements(MAP_SIZE as u64));
+
+    bench_all_impls!(
+        group,
+        BatchSize::PerIteration,
+        || build_std_drop_map(MAP_SIZE),
+        || build_hashbrown_drop_map(MAP_SIZE),
+        || build_elastic_drop_map(MAP_SIZE),
+        || build_funnel_drop_map(MAP_SIZE),
+        |map| map.clear(),
+    );
+    // Touch the sink so the drop side-effects can't be optimized out at
+    // module scope.
+    black_box(drop_sink_value());
+
+    group.finish();
+}
+
+fn bench_entry_or_insert_throughput(c: &mut Criterion) {
+    let pairs = make_pairs(MAP_SIZE);
+    let mut group = c.benchmark_group("entry_or_insert_throughput");
+    group.throughput(Throughput::Elements(MAP_SIZE as u64));
+
+    bench_all_impls!(
+        group,
+        BatchSize::PerIteration,
+        || StdHashMap::with_capacity(MAP_SIZE),
+        || HashbrownMap::with_capacity(MAP_SIZE),
+        || ElasticHashMap::with_capacity(MAP_SIZE),
+        || FunnelHashMap::with_capacity(MAP_SIZE),
+        |map| {
+            for &(key, value) in &pairs {
+                *map.entry(black_box(key)).or_insert(black_box(value)) ^= 1;
+            }
+            black_box(map.len())
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_grow_insert_throughput(c: &mut Criterion) {
+    let pairs = make_pairs(MAP_SIZE);
+    let mut group = c.benchmark_group("grow_insert_throughput");
+    group.throughput(Throughput::Elements(MAP_SIZE as u64));
+
+    // Same op as `insert_throughput` but constructed via `Default::default()`
+    // — no capacity hint, so each impl pays its growth-through-rehash cost.
+    bench_all_impls!(
+        group,
+        BatchSize::PerIteration,
+        StdHashMap::new,
+        HashbrownMap::new,
+        ElasticHashMap::new,
+        FunnelHashMap::new,
+        |map| {
+            for &(key, value) in &pairs {
+                map.insert(black_box(key), black_box(value));
+            }
+            black_box(map.len())
+        },
+    );
+
+    group.finish();
+}
+
+/// Sweep `get_hit_throughput` across load factors. Elastic's pitch is
+/// graceful behavior near capacity; this measures it directly against the
+/// other impls at the same operating points.
+fn bench_get_hit_load_factor(c: &mut Criterion) {
+    const LOAD_PCTS: &[u32] = &[50, 75, 90];
+    let pairs = make_pairs(MAP_SIZE);
+    let hit_keys: Vec<u64> = (0..OP_COUNT).map(|idx| pairs[idx % MAP_SIZE].0).collect();
+
+    for &load_pct in LOAD_PCTS {
+        let cap = MAP_SIZE * 100 / load_pct as usize;
+        let mut std_map = StdHashMap::with_capacity(cap);
+        let mut hb_map = HashbrownMap::with_capacity(cap);
+        let mut el_map = ElasticHashMap::with_capacity(cap);
+        let mut fn_map = FunnelHashMap::with_capacity(cap);
+        for &(key, value) in &pairs {
+            std_map.insert(key, value);
+            hb_map.insert(key, value);
+            el_map.insert(key, value);
+            fn_map.insert(key, value);
+        }
+        bench_one_lookup_group(
+            c,
+            &format!("get_hit_load_{load_pct}"),
+            &hit_keys,
+            &std_map,
+            &hb_map,
+            &el_map,
+            &fn_map,
+        );
+    }
+}
+
 fn bench_get_hit_latency(c: &mut Criterion) {
     for &size in LATENCY_SIZES {
         let pairs = make_pairs(size);
@@ -407,7 +530,9 @@ criterion_group!(
         .measurement_time(Duration::from_secs(2));
     targets =
         bench_insert_throughput,
+        bench_grow_insert_throughput,
         bench_lookups,
+        bench_get_hit_load_factor,
         bench_tiny_lookup_throughput,
         bench_mixed_throughput,
         bench_delete_heavy_throughput,
@@ -416,6 +541,8 @@ criterion_group!(
         bench_iter_mut_throughput,
         bench_drain_throughput,
         bench_extract_if_throughput,
+        bench_clear_drop_throughput,
+        bench_entry_or_insert_throughput,
         bench_get_hit_latency
 );
 criterion_main!(benches);

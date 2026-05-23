@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap as StdHashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hashbrown::HashMap as HashbrownMap;
 use opthash::{ElasticHashMap, FunnelHashMap};
@@ -35,7 +36,7 @@ pub fn make_pairs(count: usize) -> Vec<(u64, u64)> {
 
 #[must_use]
 pub fn build_std_map(pairs: &[(u64, u64)]) -> StdHashMap<u64, u64> {
-    let mut map = StdHashMap::with_capacity(pairs.len() * 2);
+    let mut map = StdHashMap::with_capacity(pairs.len());
     for &(key, value) in pairs {
         map.insert(key, value);
     }
@@ -44,7 +45,7 @@ pub fn build_std_map(pairs: &[(u64, u64)]) -> StdHashMap<u64, u64> {
 
 #[must_use]
 pub fn build_elastic_map(pairs: &[(u64, u64)]) -> ElasticHashMap<u64, u64> {
-    let mut map = ElasticHashMap::with_capacity(pairs.len() * 2);
+    let mut map = ElasticHashMap::with_capacity(pairs.len());
     for &(key, value) in pairs {
         map.insert(key, value);
     }
@@ -53,7 +54,7 @@ pub fn build_elastic_map(pairs: &[(u64, u64)]) -> ElasticHashMap<u64, u64> {
 
 #[must_use]
 pub fn build_funnel_map(pairs: &[(u64, u64)]) -> FunnelHashMap<u64, u64> {
-    let mut map = FunnelHashMap::with_capacity(pairs.len() * 2);
+    let mut map = FunnelHashMap::with_capacity(pairs.len());
     for &(key, value) in pairs {
         map.insert(key, value);
     }
@@ -62,9 +63,82 @@ pub fn build_funnel_map(pairs: &[(u64, u64)]) -> FunnelHashMap<u64, u64> {
 
 #[must_use]
 pub fn build_hashbrown_map(pairs: &[(u64, u64)]) -> HashbrownMap<u64, u64> {
-    let mut map = HashbrownMap::with_capacity(pairs.len() * 2);
+    let mut map = HashbrownMap::with_capacity(pairs.len());
     for &(key, value) in pairs {
         map.insert(key, value);
+    }
+    map
+}
+
+// ---------------------------------------------------------------------------
+// `DropU64` payload — Drop-bearing variant of `u64`.
+//
+// Several bench groups (clear, drain, extract_if) measure code paths whose
+// dominant cost is per-entry `Drop`. With `(u64, u64)` payload — `Copy`,
+// no-op `Drop` — LLVM can prove the walk is side-effect-free and elide
+// the entire loop, hiding regressions. `DropU64`'s `Drop` impl issues an
+// atomic xor against a global sink: observable to the optimizer, so the
+// drop loop has to actually execute, and trivially cheap at runtime (~1
+// ns per drop on modern x86).
+// ---------------------------------------------------------------------------
+
+/// Sink for [`DropU64::drop`] side-effects. Read in [`drop_sink_value`]
+/// after each bench to keep the writes observable.
+pub static DROP_SINK: AtomicU64 = AtomicU64::new(0);
+
+/// Wrapper around `u64` whose `Drop` impl is observable. Keeps LLVM from
+/// eliding the drop loop in clear / drain / extract_if benches.
+#[derive(PartialEq, Eq, Hash)]
+pub struct DropU64(pub u64);
+
+impl Drop for DropU64 {
+    #[inline]
+    fn drop(&mut self) {
+        DROP_SINK.fetch_xor(self.0, Ordering::Relaxed);
+    }
+}
+
+#[must_use]
+pub fn drop_sink_value() -> u64 {
+    DROP_SINK.load(Ordering::Relaxed)
+}
+
+#[must_use]
+pub fn build_std_drop_map(n: usize) -> StdHashMap<DropU64, DropU64> {
+    let mut map = StdHashMap::with_capacity(n);
+    for idx in 0..n {
+        let key = key_at(idx);
+        map.insert(DropU64(key), DropU64(key ^ VALUE_XOR_MIX));
+    }
+    map
+}
+
+#[must_use]
+pub fn build_hashbrown_drop_map(n: usize) -> HashbrownMap<DropU64, DropU64> {
+    let mut map = HashbrownMap::with_capacity(n);
+    for idx in 0..n {
+        let key = key_at(idx);
+        map.insert(DropU64(key), DropU64(key ^ VALUE_XOR_MIX));
+    }
+    map
+}
+
+#[must_use]
+pub fn build_elastic_drop_map(n: usize) -> ElasticHashMap<DropU64, DropU64> {
+    let mut map = ElasticHashMap::with_capacity(n);
+    for idx in 0..n {
+        let key = key_at(idx);
+        map.insert(DropU64(key), DropU64(key ^ VALUE_XOR_MIX));
+    }
+    map
+}
+
+#[must_use]
+pub fn build_funnel_drop_map(n: usize) -> FunnelHashMap<DropU64, DropU64> {
+    let mut map = FunnelHashMap::with_capacity(n);
+    for idx in 0..n {
+        let key = key_at(idx);
+        map.insert(DropU64(key), DropU64(key ^ VALUE_XOR_MIX));
     }
     map
 }
