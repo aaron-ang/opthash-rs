@@ -770,9 +770,8 @@ where
     }
 
     /// Grow capacity so at least `additional` more inserts fit. No-op if
-    /// already large enough. Funnel's probe-budget exhaustion can still
-    /// trigger a resize mid-fill, so this matches std's "at least" wording
-    /// without promising no resize on every subsequent insert.
+    /// already large enough. Probe-budget exhaustion may still trigger a
+    /// resize mid-fill.
     ///
     /// # Panics
     ///
