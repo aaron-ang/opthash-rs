@@ -457,8 +457,7 @@ fn bench_grow_insert_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("grow_insert_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
-    // Same op as `insert_throughput` but constructed via `Default::default()`
-    // — no capacity hint, so each impl pays its growth-through-rehash cost.
+    // No `with_capacity` hint — each impl pays growth-through-rehash.
     bench_all_impls!(
         group,
         "grow_insert",
@@ -478,9 +477,7 @@ fn bench_grow_insert_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-/// Sweep `get_hit_throughput` across load factors. Elastic's pitch is
-/// graceful behavior near capacity; this measures it directly against the
-/// other impls at the same operating points.
+/// Sweep `get_hit` at 50/75/90% load — exercises Elastic's near-capacity behavior.
 fn bench_get_hit_load_factor(c: &mut Criterion) {
     const LOAD_PCTS: &[u32] = &[50, 75, 90];
     let pairs = make_pairs(MAP_SIZE);
@@ -511,11 +508,7 @@ fn bench_get_hit_load_factor(c: &mut Criterion) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Large-value (memcpy axis) variants. 32-byte `BigVal` payload exercises
-// memcpy on insert-rehash, move-out on drain, and cache-line footprint
-// on get. Pair with the equivalent `(u64, u64)` group to attribute deltas.
-// ---------------------------------------------------------------------------
+// 32-byte `BigVal` payload — memcpy axis. Pair with `(u64, u64)` to attribute deltas.
 
 fn bench_insert_big_throughput(c: &mut Criterion) {
     let pairs = make_big_pairs(OP_COUNT);
@@ -585,16 +578,23 @@ fn bench_drain_big_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-// ---------------------------------------------------------------------------
-// Follow-ups to the iter / drop / memcpy axis: shrink_to_fit (capacity
-// reduction after removals), replace (insert with existing keys —
-// update-path codegen, distinct from vacant-slot insert), and extend
-// (bulk reserve+insert via `Iterator`).
-// ---------------------------------------------------------------------------
+/// Build a populated map then remove all but the first `keep` entries —
+/// the realistic precondition for `shrink_to_fit` (post-bulk-delete state).
+macro_rules! sparse_setup {
+    ($builder:expr, $pairs:expr, $keep:expr) => {
+        || {
+            let mut m = $builder($pairs);
+            for (k, _) in $pairs.iter().skip($keep) {
+                m.remove(k);
+            }
+            m
+        }
+    };
+}
 
 fn bench_shrink_to_fit_throughput(c: &mut Criterion) {
     let pairs = make_pairs(MAP_SIZE);
-    let keep: usize = MAP_SIZE / 10; // keep 10% — large gap to reclaim
+    let keep: usize = MAP_SIZE / 10;
     let mut group = c.benchmark_group("shrink_to_fit_throughput");
     group.throughput(Throughput::Elements((MAP_SIZE - keep) as u64));
 
@@ -602,34 +602,10 @@ fn bench_shrink_to_fit_throughput(c: &mut Criterion) {
         group,
         "shrink_to_fit",
         BatchSize::PerIteration,
-        || {
-            let mut m = build_std_map(&pairs);
-            for (k, _) in pairs.iter().skip(keep) {
-                m.remove(k);
-            }
-            m
-        },
-        || {
-            let mut m = build_hashbrown_map(&pairs);
-            for (k, _) in pairs.iter().skip(keep) {
-                m.remove(k);
-            }
-            m
-        },
-        || {
-            let mut m = build_elastic_map(&pairs);
-            for (k, _) in pairs.iter().skip(keep) {
-                m.remove(k);
-            }
-            m
-        },
-        || {
-            let mut m = build_funnel_map(&pairs);
-            for (k, _) in pairs.iter().skip(keep) {
-                m.remove(k);
-            }
-            m
-        },
+        sparse_setup!(build_std_map, &pairs, keep),
+        sparse_setup!(build_hashbrown_map, &pairs, keep),
+        sparse_setup!(build_elastic_map, &pairs, keep),
+        sparse_setup!(build_funnel_map, &pairs, keep),
         |map| {
             map.shrink_to_fit();
             black_box(map.capacity())
@@ -639,14 +615,14 @@ fn bench_shrink_to_fit_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// Re-insert all keys with new values — hits the update-existing branch
+/// in `insert` codegen, distinct from the vacant-slot path covered by
+/// `insert_throughput`.
 fn bench_replace_throughput(c: &mut Criterion) {
     let pairs = make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("replace_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
-    // Re-insert all keys with new values. Hits the update-existing-value
-    // branch in `insert` codegen — distinct from `insert_throughput` which
-    // only exercises vacant-slot inserts.
     bench_all_impls!(
         group,
         "replace",
