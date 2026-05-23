@@ -65,17 +65,21 @@ fn build_funnel_options(
     Ok(opts)
 }
 
-/// Type tag packed into `HashedAny::tagged`'s low bit so `PartialEq` can
-/// hit the str-vs-str fast path without re-running `Py_TYPE`.
+/// Type tag packed into `HashedAny::tagged`'s low bits so `PartialEq` can
+/// dispatch to a fast str-vs-str or int-vs-int path without re-running
+/// `Py_TYPE`.
 #[derive(Clone, Copy, PartialEq)]
 #[repr(usize)]
 enum HashKind {
     Other = 0,
     Str = 1,
+    Int = 2,
 }
 
-/// Low-bit tag mask packing a [`HashKind`] into a `PyObject*` pointer.
-const KIND_MASK: usize = 0b1;
+/// Tag mask packing a [`HashKind`] into a `PyObject*` pointer. `CPython`
+/// aligns object headers to at least 8 bytes, so the low 3 bits are
+/// reliably zero — we use 2 of them.
+const KIND_MASK: usize = 0b11;
 
 /// Owning hashable wrapper for a `Py<PyAny>` map key. Caches `__hash__`
 /// and tag-packs `HashKind` into the pointer's low bit; 16B on 64-bit.
@@ -115,8 +119,11 @@ impl HashedAny {
     fn detect_kind(ob: &Bound<'_, PyAny>) -> HashKind {
         // SAFETY: `Bound` always holds a valid `PyObject*`.
         unsafe {
-            if ffi::Py_TYPE(ob.as_ptr()) == &raw mut ffi::PyUnicode_Type {
+            let ty = ffi::Py_TYPE(ob.as_ptr());
+            if ty == &raw mut ffi::PyUnicode_Type {
                 HashKind::Str
+            } else if ty == &raw mut ffi::PyLong_Type {
+                HashKind::Int
             } else {
                 HashKind::Other
             }
@@ -159,8 +166,10 @@ impl HashedAny {
         match (self.tagged.as_ptr() as usize) & KIND_MASK {
             x if x == HashKind::Other as usize => HashKind::Other,
             x if x == HashKind::Str as usize => HashKind::Str,
-            // SAFETY: `KIND_MASK == 0b1`, so the value is always 0 or 1.
-            // A new variant overlapping the mask must add an arm here.
+            x if x == HashKind::Int as usize => HashKind::Int,
+            // SAFETY: `KIND_MASK == 0b11` and every `HashKind` discriminant
+            // in [0, 3] has an arm above. A new variant overlapping the
+            // mask must add an arm here.
             _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }
@@ -226,8 +235,9 @@ impl Hash for HashedAny {
 }
 
 impl PartialEq for HashedAny {
-    /// Three short-circuits before Python rich compare: hash mismatch,
-    /// pointer identity, and a UTF-8 bytes compare for str/str pairs.
+    /// Short-circuits before falling back to Python rich compare: hash
+    /// mismatch, pointer identity, then a kind-tagged fast path —
+    /// str/str via UTF-8 bytes and int/int via `PyLong_AsLongLongAndOverflow`.
     fn eq(&self, other: &Self) -> bool {
         if self.hash != other.hash {
             return false;
@@ -235,16 +245,37 @@ impl PartialEq for HashedAny {
         if self.obj_ptr() == other.obj_ptr() {
             return true;
         }
+        let sk = self.kind();
+        let ok = other.kind();
         Python::attach(|py| {
             // Direct UTF-8 compare bypasses PyObject_RichCompareBool dispatch.
-            if self.kind() == HashKind::Str
-                && other.kind() == HashKind::Str
+            if sk == HashKind::Str
+                && ok == HashKind::Str
                 && let Ok(sa) = self.obj_borrowed(py).cast::<PyString>()
                 && let Ok(sb) = other.obj_borrowed(py).cast::<PyString>()
                 && let Ok(x) = sa.to_str()
                 && let Ok(y) = sb.to_str()
             {
                 return x == y;
+            }
+            // Int/int fast path: avoid tp_richcompare dispatch when both
+            // values fit in `c_longlong`. Sign-of-overflow disagreement
+            // proves inequality without further work.
+            if sk == HashKind::Int && ok == HashKind::Int {
+                let mut ovf_a: std::ffi::c_int = 0;
+                let mut ovf_b: std::ffi::c_int = 0;
+                // SAFETY: both pointers are live PyLong objects (kind tag).
+                let a =
+                    unsafe { ffi::PyLong_AsLongLongAndOverflow(self.obj_ptr(), &raw mut ovf_a) };
+                let b =
+                    unsafe { ffi::PyLong_AsLongLongAndOverflow(other.obj_ptr(), &raw mut ovf_b) };
+                if ovf_a == 0 && ovf_b == 0 {
+                    return a == b;
+                }
+                if ovf_a != ovf_b {
+                    return false;
+                }
+                // Same-sign overflow on both — fall through to rich compare.
             }
             self.obj_borrowed(py)
                 .eq(other.obj_borrowed(py))
