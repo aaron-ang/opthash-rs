@@ -429,7 +429,11 @@ macro_rules! define_map_classes {
             }
 
             fn clear(&mut self) {
-                self.inner.clear();
+                // Acquire the GIL once and drop all entries inside the scope so
+                // each `HashedAny::drop`'s nested `Python::attach` becomes the
+                // cheap already-attached path. Saves N TLS+atomic ops vs the
+                // default per-drop attach/release cycle.
+                Python::attach(|_py| self.inner.clear());
                 self.bump();
             }
 
