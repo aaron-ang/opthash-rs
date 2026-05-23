@@ -200,9 +200,9 @@ impl Drop for HashedAny {
     }
 }
 
-/// Borrow-only key wrapper for lookups (`get` / `contains_key` / `remove`).
-/// Wraps a `HashedAny` in `ManuallyDrop` so no refcount bump or `Py_DECREF`
-/// happens — the source `Bound` keeps the object live.
+/// Borrow-only key wrapper for non-owning lookups. Wraps a `HashedAny` in
+/// `ManuallyDrop` so no refcount bump or `Py_DECREF` happens — the source
+/// `Bound` keeps the object live.
 struct ProbeKey {
     inner: ManuallyDrop<HashedAny>,
 }
