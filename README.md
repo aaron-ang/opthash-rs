@@ -4,6 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/opthash?logo=pypi&logoColor=white&label=pypi)](https://pypi.org/project/opthash/)
 [![CI](https://github.com/aaron-ang/opthash-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/aaron-ang/opthash-rs/actions/workflows/ci.yml)
 [![Release](https://github.com/aaron-ang/opthash-rs/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/aaron-ang/opthash-rs/actions/workflows/release.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/aaron-ang/opthash-rs?utm_source=badge)
 [![Python](https://img.shields.io/pypi/pyversions/opthash?logo=python&logoColor=white)](https://pypi.org/project/opthash/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
@@ -116,8 +117,7 @@ FunnelHashMap
   levels: Vec<BucketLevel>
 
     Level 0
-      slots:     kv kv __ __ ... kv kv __ __ ... kv ...
-      controls:  fp fp __ __ ... fp fp __ __ ... fp ...
+      slots:     kv kv __ __ ... kv kv __ __ ... kv ...\n      controls:  fp fp __ __ ... fp fp __ __ ... fp ...
                  └── bucket 0 ──┘└── bucket 1 ──┘
 
     Level 1    (same layout, smaller buckets)

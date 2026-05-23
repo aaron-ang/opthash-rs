@@ -34,6 +34,7 @@ foldhash = "0.2"
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"], optional = true }
 
 [dev-dependencies]
+codspeed-criterion-compat = { version = "4", features = ["html_reports"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 hashbrown = "0.17"
 hdrhistogram = "7.5"
@@ -50,4 +51,8 @@ harness = false
 
 [[bench]]
 name = "instr_count"
+harness = false
+
+[[bench]]
+name = "codspeed"
 harness = false
