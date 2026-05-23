@@ -444,7 +444,11 @@ macro_rules! define_map_classes {
             fn __iter__(slf: Bound<'_, Self>) -> $KeyIter {
                 let py = slf.py();
                 let m = slf.borrow();
-                let snapshot = m.inner.iter().map(|(k, _)| k.obj_clone_ref(py)).collect();
+                let snapshot = m
+                    .inner
+                    .iter()
+                    .map(|(k, _)| Some(k.obj_clone_ref(py)))
+                    .collect();
                 let expected_gen = m.generation;
                 drop(m);
                 $KeyIter {
@@ -706,7 +710,11 @@ macro_rules! define_map_classes {
         impl $KeysView {
             fn __iter__(&self, py: Python<'_>) -> $KeyIter {
                 let m = self.map.borrow(py);
-                let snapshot = m.inner.iter().map(|(k, _)| k.obj_clone_ref(py)).collect();
+                let snapshot = m
+                    .inner
+                    .iter()
+                    .map(|(k, _)| Some(k.obj_clone_ref(py)))
+                    .collect();
                 $KeyIter {
                     map: self.map.clone_ref(py),
                     snapshot,
@@ -820,7 +828,7 @@ macro_rules! define_map_classes {
         impl $ValuesView {
             fn __iter__(&self, py: Python<'_>) -> $ValueIter {
                 let m = self.map.borrow(py);
-                let snapshot = m.inner.iter().map(|(_, v)| v.clone_ref(py)).collect();
+                let snapshot = m.inner.iter().map(|(_, v)| Some(v.clone_ref(py))).collect();
                 $ValueIter {
                     map: self.map.clone_ref(py),
                     snapshot,
@@ -865,12 +873,12 @@ macro_rules! define_map_classes {
         impl $ItemsView {
             fn __iter__(&self, py: Python<'_>) -> PyResult<$ItemIter> {
                 let m = self.map.borrow(py);
-                let snapshot: PyResult<Vec<Py<PyAny>>> = m
+                let snapshot: PyResult<Vec<Option<Py<PyAny>>>> = m
                     .inner
                     .iter()
                     .map(|(k, v)| {
                         let tup = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)])?;
-                        Ok(tup.into_any().unbind())
+                        Ok(Some(tup.into_any().unbind()))
                     })
                     .collect();
                 Ok($ItemIter {
@@ -978,12 +986,17 @@ macro_rules! define_map_classes {
 /// (trades memory for no self-referencing borrow). `__next__` checks the
 /// map's `generation` against `expected_gen` and raises `RuntimeError`
 /// on mismatch.
+///
+/// Slots are `Option<Py<PyAny>>` (niche-packed to the same size as
+/// `Py<PyAny>`); `__next__` `.take()`s the slot, moving the existing
+/// strong ref to the caller. Saves one atomic refcount bump per yield
+/// vs cloning out of an always-`Some` Vec.
 macro_rules! define_iter {
     ($Iter:ident, $iter_name:literal, $PyMap:ident) => {
         #[pyclass(name = $iter_name, module = "opthash")]
         struct $Iter {
             map: Py<$PyMap>,
-            snapshot: Vec<Py<PyAny>>,
+            snapshot: Vec<Option<Py<PyAny>>>,
             expected_gen: u64,
             pos: usize,
         }
@@ -999,12 +1012,11 @@ macro_rules! define_iter {
                         "dictionary changed size during iteration",
                     ));
                 }
-                if self.pos >= self.snapshot.len() {
+                let Some(slot) = self.snapshot.get_mut(self.pos) else {
                     return Ok(None);
-                }
-                let v = self.snapshot[self.pos].clone_ref(py);
+                };
                 self.pos += 1;
-                Ok(Some(v))
+                Ok(slot.take())
             }
         }
     };
