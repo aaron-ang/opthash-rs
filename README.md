@@ -117,7 +117,8 @@ FunnelHashMap
   levels: Vec<BucketLevel>
 
     Level 0
-      slots:     kv kv __ __ ... kv kv __ __ ... kv ...\n      controls:  fp fp __ __ ... fp fp __ __ ... fp ...
+      slots:     kv kv __ __ ... kv kv __ __ ... kv ...
+      controls:  fp fp __ __ ... fp fp __ __ ... fp ...
                  └── bucket 0 ──┘└── bucket 1 ──┘
 
     Level 1    (same layout, smaller buckets)

@@ -34,7 +34,7 @@ Repository = "https://github.com/aaron-ang/opthash-rs"
 Issues = "https://github.com/aaron-ang/opthash-rs/issues"
 
 [dependency-groups]
-test = ["pytest>=8", "hypothesis>=6", "pytest-benchmark>=5"]
+test = ["pytest>=8", "hypothesis>=6", "pytest-benchmark>=5", "pytest-codspeed>=4"]
 charts = ["matplotlib>=3.9"]
 
 [tool.uv]

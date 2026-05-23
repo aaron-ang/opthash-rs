@@ -60,6 +60,15 @@ pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 uv run --group charts python scripts/generate_python_chart.py
 ```
 
+### CodSpeed CI
+
+`.github/workflows/codspeed.yml` runs Callgrind-simulated benches on every PR + push to `main`. Two jobs:
+
+- **rust** — `cargo codspeed build --bench speedup` then `cargo codspeed run`. Only `speedup` is wired (uses `codspeed-criterion-compat` shim via the `criterion` dev-dep package rename). `latency.rs` is a custom `Instant` binary and `instr_count.rs` uses `iai-callgrind` directly, so both stay local-only.
+- **python** — `pytest benches/python/throughput.py --codspeed`. `pytest-codspeed` is API-compatible with `pytest-benchmark`, so no test edits needed.
+
+CodSpeed sim mode counts instructions + cache misses on a virtual CPU — deterministic, hardware-agnostic, **does not measure wallclock**. Use it for PR regression gating; keep `scripts/bench.sh` as the local wallclock ground truth.
+
 ### Charts
 
 - `uv run --group charts scripts/generate_speedup_chart.py` — throughput speedup bar chart

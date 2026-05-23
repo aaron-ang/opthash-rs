@@ -216,7 +216,7 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
         || build_funnel_map(&initial_pairs),
         |map| {
             for idx in 0..OP_COUNT {
-                black_box(map.remove(black_box(&initial_pairs[idx].0)));
+                black_box(map.remove(black_box(&initial_pairs[idx % MAP_SIZE].0)));
                 let (key, value) = replacement_pairs[idx];
                 black_box(map.insert(black_box(key), black_box(value)));
             }

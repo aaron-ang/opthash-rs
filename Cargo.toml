@@ -34,8 +34,11 @@ foldhash = "0.2"
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"], optional = true }
 
 [dev-dependencies]
-codspeed-criterion-compat = { version = "4", features = ["html_reports"] }
-criterion = { version = "0.8", features = ["html_reports"] }
+# Drop-in for criterion: locally (`cargo bench`) falls back to wallclock
+# criterion via cfg(not(codspeed)); under `cargo codspeed run` swaps to
+# Callgrind sim. Single source of truth — `benches/speedup.rs` is the
+# instrumentation target in CI.
+criterion = { package = "codspeed-criterion-compat", version = "4", features = ["html_reports"] }
 hashbrown = "0.17"
 hdrhistogram = "7.5"
 iai-callgrind = "0.16"
@@ -51,8 +54,4 @@ harness = false
 
 [[bench]]
 name = "instr_count"
-harness = false
-
-[[bench]]
-name = "codspeed"
 harness = false
