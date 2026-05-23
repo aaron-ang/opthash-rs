@@ -21,9 +21,26 @@ permissions:
   contents: read
 
 jobs:
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist
+          path: dist
+
   linux:
+    needs: sdist
     runs-on: ${{ matrix.platform.runner }}
     strategy:
+      max-parallel: 3
       matrix:
         platform:
           - runner: ubuntu-22.04
@@ -64,8 +81,10 @@ jobs:
           path: dist
 
   musllinux:
+    needs: sdist
     runs-on: ${{ matrix.platform.runner }}
     strategy:
+      max-parallel: 2
       matrix:
         platform:
           - runner: ubuntu-22.04
@@ -102,8 +121,10 @@ jobs:
           path: dist
 
   windows:
+    needs: sdist
     runs-on: ${{ matrix.platform.runner }}
     strategy:
+      max-parallel: 2
       matrix:
         platform:
           - runner: windows-latest
@@ -144,8 +165,10 @@ jobs:
           path: dist
 
   macos:
+    needs: sdist
     runs-on: ${{ matrix.platform.runner }}
     strategy:
+      max-parallel: 2
       matrix:
         platform:
           - runner: macos-15-intel
@@ -176,21 +199,6 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: wheels-macos-${{ matrix.platform.target }}
-          path: dist
-
-  sdist:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --out dist
-      - name: Upload sdist
-        uses: actions/upload-artifact@v6
-        with:
-          name: wheels-sdist
           path: dist
 
   release:
