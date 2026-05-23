@@ -45,10 +45,10 @@ BASELINE=ref scripts/bench.sh               # compare vs ref
 
 Example: `target/criterion/get_hit_throughput/elastic/change/estimates.json`
 
-### Tail-latency harness
+### Latency-chart harnesses (local-only, not on CodSpeed)
 
-- **`cargo bench --bench latency`** — HDR get-hit latency distribution (p50…p99999/max), fixed config: 10M × 4 maps × 1M samples × 10K warmup.
-- Output: `target/latency/<map>/<size>/<op>.json` — percentiles + histogram buckets + `clock_overhead_ns`.
+- **`cargo bench --bench mean_latency`** — Criterion sweep of `get_hit` over `LATENCY_SIZES` (1K → 10M); feeds the cache-cliff line chart. Output: `target/criterion/get_hit_latency_<size>/<impl>/`.
+- **`cargo bench --bench tail_latency`** — HDR get-hit distribution at SIZE=10M (1M samples × 4 maps × 10K warmup). Output: `target/latency/<map>/<size>/<op>.json` (serde_json) — percentiles + histogram buckets + `clock_overhead_ns`.
 
 ### Python-side benchmarks
 
@@ -67,7 +67,7 @@ uv run --group charts python scripts/generate_python_chart.py
 - **rust** — `cargo codspeed run --bench speedup`. The `criterion` dev-dep is a package rename to `codspeed-criterion-compat`; don't revert.
 - **python** — `pytest benches/python/throughput.py --codspeed`. `pytest-codspeed` is drop-in for `pytest-benchmark`.
 
-`latency.rs` is local-only. Sim counts instructions, not wallclock — `scripts/bench.sh` stays the local ground truth.
+`mean_latency.rs` and `tail_latency.rs` are local-only. Sim counts instructions, not wallclock — `scripts/bench.sh` stays the local ground truth.
 
 ### Charts
 

@@ -20,18 +20,19 @@ Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `o
 
 ![Python speedup chart](../assets/benchmark-python-speedup.svg)
 
-## `benches/speedup.rs` — throughput + mean latency (Criterion)
+## `benches/speedup.rs` — throughput (Criterion)
 
-Throughput workloads:
+Each group runs `std` / `hashbrown` / `elastic` / `funnel` side-by-side.
 
-1. `insert_throughput`
-2. `get_hit_throughput`
-3. `get_miss_throughput`
-4. `tiny_lookup_throughput`
-5. `delete_heavy_throughput`
-6. `resize_heavy_throughput`
+| axis     | groups                                                                         |
+| -------- | ------------------------------------------------------------------------------ |
+| insert   | `insert`, `grow_insert`, `insert_big`                                          |
+| lookup   | `get_hit`, `get_miss`, `tiny_lookup`, `get_hit_big`, `get_hit_load_{50,75,90}` |
+| mutate   | `mixed`, `delete`, `resize`, `replace`, `extend`, `entry`                      |
+| iter     | `iter`, `iter_mut`, `drain`, `drain_big`, `extract_if`                         |
+| capacity | `shrink_to_fit`, `clear_drop`                                                  |
 
-Run:
+`*_big` variants use a 32-byte (`[u64; 4]`) value to exercise the memcpy axis; pair with the `(u64, u64)` counterpart to attribute deltas. `clear_drop` uses a `Drop`-bearing payload so LLVM can't elide the walk.
 
 ```bash
 cargo bench --bench speedup
@@ -40,12 +41,21 @@ cargo bench --bench speedup -- "get_hit"          # Criterion name filter
 
 [.github/workflows/codspeed.yml](../.github/workflows/codspeed.yml) re-runs this bench under callgrind simulation per PR for deterministic instruction-count diffs.
 
-## `benches/latency.rs` — tail-latency histograms (hdrhistogram)
+## `benches/mean_latency.rs` — mean per-lookup latency by map size (Criterion)
 
-Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and dumps them to JSON for plotting. Output: `target/latency/<map>/<size>/<op>.json`.
+Sweeps `get_hit` across `LATENCY_SIZES` (1K → 10M) so the cache-hierarchy cliffs (L1 → L2 → L3 → DRAM) show up as visible jumps in the chart. Local-only.
 
 ```bash
-cargo bench --bench latency
+cargo bench --bench mean_latency
+uv run --group charts scripts/generate_latency_chart.py
+```
+
+## `benches/tail_latency.rs` — tail-latency histograms (hdrhistogram)
+
+HDR sampling at SIZE=10M. Writes percentiles + bucket counts to `target/latency/<map>/<size>/<op>.json`. Local-only.
+
+```bash
+cargo bench --bench tail_latency
 ```
 
 ## `benches/python/throughput.py` — Python bindings vs builtin `dict` (pytest-benchmark)

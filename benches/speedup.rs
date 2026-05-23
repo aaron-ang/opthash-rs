@@ -24,11 +24,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::{
-    LATENCY_SIZES, VALUE_XOR_MIX_ALT, build_elastic_big_map, build_elastic_drop_map,
-    build_elastic_map, build_funnel_big_map, build_funnel_drop_map, build_funnel_map,
-    build_hashbrown_big_map, build_hashbrown_drop_map, build_hashbrown_map, build_std_big_map,
-    build_std_drop_map, build_std_map, drop_sink_value, key_at, make_big_pairs, make_pairs,
-    size_label,
+    VALUE_XOR_MIX_ALT, build_elastic_big_map, build_elastic_drop_map, build_elastic_map,
+    build_funnel_big_map, build_funnel_drop_map, build_funnel_map, build_hashbrown_big_map,
+    build_hashbrown_drop_map, build_hashbrown_map, build_std_big_map, build_std_drop_map,
+    build_std_map, drop_sink_value, key_at, make_big_pairs, make_pairs,
 };
 use criterion::{
     BatchSize, Criterion, Throughput, criterion_group, criterion_main, profiler::Profiler,
@@ -624,37 +623,6 @@ fn bench_extend_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_get_hit_latency(c: &mut Criterion) {
-    for &size in LATENCY_SIZES {
-        let pairs = make_pairs(size);
-        let query_keys: Vec<u64> = (0..size).map(|idx| pairs[idx].0).collect();
-
-        let label = size_label(size);
-        let mut group = c.benchmark_group(format!("get_hit_latency_{label}"));
-
-        macro_rules! latency_arm {
-            ($name:literal, $build:expr) => {
-                group.bench_function(concat!("get_hit_", $name), |b| {
-                    let map = $build(&pairs);
-                    let mut i = 0;
-                    b.iter(|| {
-                        let key = &query_keys[i % size];
-                        i = i.wrapping_add(1);
-                        black_box(map.get(black_box(key)))
-                    });
-                });
-            };
-        }
-
-        latency_arm!("std", build_std_map);
-        latency_arm!("hashbrown", build_hashbrown_map);
-        latency_arm!("elastic", build_elastic_map);
-        latency_arm!("funnel", build_funnel_map);
-
-        group.finish();
-    }
-}
-
 criterion_group!(
     name = benches;
     config = Criterion::default()
@@ -681,7 +649,6 @@ criterion_group!(
         bench_shrink_to_fit_throughput,
         bench_insert_big_throughput,
         bench_get_hit_big_throughput,
-        bench_drain_big_throughput,
-        bench_get_hit_latency
+        bench_drain_big_throughput
 );
 criterion_main!(benches);

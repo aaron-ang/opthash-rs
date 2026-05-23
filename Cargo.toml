@@ -38,11 +38,17 @@ criterion = { package = "codspeed-criterion-compat", version = "4", features = [
 hashbrown = "0.17"
 hdrhistogram = "7.5"
 pprof = { version = "0.15", features = ["flamegraph"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [[bench]]
 name = "speedup"
 harness = false
 
 [[bench]]
-name = "latency"
+name = "mean_latency"
+harness = false
+
+[[bench]]
+name = "tail_latency"
 harness = false

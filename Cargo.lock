@@ -814,6 +814,8 @@ dependencies = [
  "hdrhistogram",
  "pprof",
  "pyo3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
