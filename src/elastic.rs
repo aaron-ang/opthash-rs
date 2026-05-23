@@ -2382,7 +2382,7 @@ mod tests {
                     "trial {trial}: key {i} missing after deletes"
                 );
             }
-            assert_eq!(map.len(), (n - cutoff) as usize);
+            assert_eq!(map.len(), usize::try_from(n - cutoff).unwrap());
             // Re-insert into tombstone-heavy map.
             for i in n..(n + n / 5) {
                 assert_eq!(map.insert(i, i), None);

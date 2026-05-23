@@ -1,5 +1,5 @@
 //! Speedup bench suite. Each group runs std / hashbrown / elastic / funnel
-//! over the same workload so CodSpeed can chart deltas per-PR.
+//! over the same workload so `CodSpeed` can chart deltas per-PR.
 //!
 //! ## LLVM elision pitfalls
 //!
@@ -10,7 +10,7 @@
 //! - Wrap `.get(k)` results in `black_box` to keep loop-invariant lookups
 //!   from being hoisted.
 //!
-//! ## BatchSize
+//! ## `BatchSize`
 //!
 //! `LargeInput` for non-destructive ops (`iter`, `iter_mut`, lookups).
 //! `PerIteration` for destructive ops (`drain`, `extract_if`, `clear`,
@@ -184,6 +184,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_one_lookup_group(
     c: &mut Criterion,
     group_name: &str,
@@ -321,7 +322,8 @@ fn bench_mixed_throughput(c: &mut Criterion) {
     let pairs = make_pairs(MAP_SIZE);
     let ops: Vec<(usize, bool)> = (0..OP_COUNT)
         .map(|i| {
-            let idx = ((i as u32).wrapping_mul(2_654_435_761) as usize) % MAP_SIZE;
+            let mixed = u32::try_from(i).unwrap().wrapping_mul(2_654_435_761);
+            let idx = mixed as usize % MAP_SIZE;
             (idx, i & 1 == 0)
         })
         .collect();
@@ -421,6 +423,7 @@ fn bench_extract_if_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+#[allow(clippy::redundant_closure_for_method_calls)]
 fn bench_clear_drop_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("clear_drop_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));

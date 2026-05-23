@@ -73,8 +73,8 @@ pub fn build_hashbrown_map(pairs: &[(u64, u64)]) -> HashbrownMap<u64, u64> {
 /// Side-effect sink for [`DropU64::drop`]; defeats LLVM elision of drop loops.
 pub static DROP_SINK: AtomicU64 = AtomicU64::new(0);
 
-/// `u64` with an observable `Drop`. Use for clear/drain/extract_if benches
-/// where `(u64, u64)` payload would let the optimizer skip the walk.
+/// `u64` with an observable `Drop`. Use for `clear`/`drain`/`extract_if`
+/// benches where `(u64, u64)` payload would let the optimizer skip the walk.
 #[derive(PartialEq, Eq, Hash)]
 pub struct DropU64(pub u64);
 
