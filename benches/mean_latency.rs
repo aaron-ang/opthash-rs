@@ -30,12 +30,8 @@ fn bench_get_hit_latency(c: &mut Criterion) {
             ($name:literal, $build:expr) => {
                 group.bench_function($name, |b| {
                     let map = $build(&pairs);
-                    let mut i = 0;
-                    b.iter(|| {
-                        let key = &query_keys[i % size];
-                        i = i.wrapping_add(1);
-                        black_box(map.get(black_box(key)))
-                    });
+                    let mut keys = query_keys.iter().cycle();
+                    b.iter(|| black_box(map.get(black_box(keys.next().unwrap()))));
                 });
             };
         }
