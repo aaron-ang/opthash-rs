@@ -45,7 +45,7 @@ BASELINE=ref scripts/bench.sh               # compare vs ref
 
 Example: `target/criterion/get_hit_throughput/elastic/change/estimates.json`
 
-### Latency-chart harnesses (local-only, not on CodSpeed)
+### Latency-chart harnesses
 
 - **`cargo bench --bench mean_latency`** — Criterion sweep of `get_hit` over `LATENCY_SIZES` (1K → 10M); feeds the cache-cliff line chart. Output: `target/criterion/get_hit_latency_<size>/<impl>/`.
 - **`cargo bench --bench tail_latency`** — HDR get-hit distribution at SIZE=10M (1M samples × 4 maps × 10K warmup). Output: `target/latency/<map>/<size>/<op>.json` (serde_json) — percentiles + histogram buckets + `clock_overhead_ns`.
@@ -57,7 +57,7 @@ Example: `target/criterion/get_hit_throughput/elastic/change/estimates.json`
 ```bash
 pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 
-uv run --group charts python scripts/generate_python_chart.py
+uv run scripts/generate_python_chart.py
 ```
 
 ### CodSpeed CI
@@ -71,10 +71,10 @@ uv run --group charts python scripts/generate_python_chart.py
 
 ### Charts
 
-- `uv run --group charts scripts/generate_speedup_chart.py` — throughput speedup bar chart
-- `uv run --group charts scripts/generate_latency_chart.py` — Criterion mean-latency line (`target/criterion/get_hit_latency_<size>`; sizes from `LATENCY_SIZES` in `benches/common.rs`) + HDR get-hit tail CDF @ 10M (`target/latency/`).
-- `uv run --group charts scripts/generate_all_charts.py` — regenerate everything
-- `uv run --group charts scripts/generate_python_chart.py` — Python-side dict-vs-opthash speedup (reads `.benchmarks/python.json`)
+- `uv run scripts/generate_speedup_chart.py` — throughput speedup bar chart
+- `uv run scripts/generate_latency_chart.py` — Criterion mean-latency line (`target/criterion/get_hit_latency_<size>`; sizes from `LATENCY_SIZES` in `benches/common.rs`) + HDR get-hit tail CDF @ 10M (`target/latency/`).
+- `uv run scripts/generate_all_charts.py` — regenerate everything
+- `uv run scripts/generate_python_chart.py` — Python-side dict-vs-opthash speedup (reads `.benchmarks/python.json`)
 
 Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loaders, axis styling) live in `scripts/plot_common.py`. The tail plotter subtracts `clock_overhead_ns` so percentiles reflect per-op latency, not per-(op + `Instant::now()`).
 

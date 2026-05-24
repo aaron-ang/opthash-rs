@@ -1,3 +1,12 @@
+//! HDR tail-latency histograms for get-hit at SIZE=10M. Writes
+//! percentiles + bucket counts to `target/latency/<map>/<size>/<op>.json`,
+//! consumed by `scripts/generate_latency_chart.py` for the tail CDF.
+//!
+//! ```sh
+//! cargo bench --bench tail_latency
+//! uv run scripts/generate_latency_chart.py
+//! ```
+
 mod common;
 
 use std::fs;

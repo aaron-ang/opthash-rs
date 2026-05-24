@@ -2,6 +2,7 @@
 name = "opthash"
 version = "0.7.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Rust implementations of Elastic Hashing and Funnel Hashing"
 readme = "README.md"
 repository = "https://github.com/aaron-ang/opthash-rs"

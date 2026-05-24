@@ -4,7 +4,7 @@ Run:
     pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 
 Then chart:
-    uv run --group charts python scripts/generate_python_chart.py
+    uv run scripts/generate_python_chart.py
 """
 
 import random

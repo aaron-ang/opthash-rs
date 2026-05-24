@@ -1,20 +1,6 @@
 //! Speedup bench suite. Each group runs std / hashbrown / elastic / funnel
-//! over the same workload so `CodSpeed` can chart deltas per-PR.
-//!
-//! ## LLVM elision pitfalls
-//!
-//! - `.count()` over `Copy`+no-op-`Drop` iterators is hoisted out. Fold
-//!   xor over `(k, v)` instead.
-//! - Bulk drops over `(u64, u64)` payload look side-effect-free to LLVM;
-//!   use `DropU64` for clear/drain (`drop_throughput` groups).
-//! - Wrap `.get(k)` results in `black_box` to keep loop-invariant lookups
-//!   from being hoisted.
-//!
-//! ## `BatchSize`
-//!
-//! `LargeInput` for non-destructive ops (`iter`, `iter_mut`, lookups).
-//! `PerIteration` for destructive ops (`drain`, `extract_if`, `clear`,
-//! `grow_insert`, `entry_or_insert`).
+//! side-by-side so `CodSpeed` can chart deltas per-PR. pprof flamegraphs
+//! via `--profile-time N`.
 
 mod common;
 

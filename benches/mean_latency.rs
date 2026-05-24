@@ -4,7 +4,7 @@
 //!
 //! ```sh
 //! cargo bench --bench mean_latency
-//! uv run --group charts scripts/generate_latency_chart.py
+//! uv run scripts/generate_latency_chart.py
 //! ```
 
 mod common;

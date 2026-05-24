@@ -1,3 +1,14 @@
+"""Per-op binding overhead. Decomposes one `m[k]` into its primitives
+(`hash(k)`, `dict[k]`, `__contains__`, `__getitem__`, `.get()`); Δ between
+rows attributes ns cost to each step.
+
+For symbol-level attribution, drive under py-spy --native:
+
+    py-spy record --native --rate 1000 --duration 8 \\
+      --format raw --output /tmp/perf_raw.txt -- \\
+      python benches/python/binding_overhead.py
+"""
+
 import time
 
 import opthash

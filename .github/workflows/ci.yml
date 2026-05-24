@@ -31,20 +31,34 @@ jobs:
           key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
       - run: uvx pre-commit run --all-files --show-diff-on-failure
 
-  rust:
+  rust-test:
+    needs: pre-commit
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        channel: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.channel }}
+      - name: Test
+        run: cargo test
+
+  msrv:
     needs: pre-commit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Clippy
-        run: cargo clippy --features python -- -W clippy::pedantic
-      - name: Test
-        run: cargo test
+      - name: Install cargo-msrv
+        run: cargo install cargo-msrv --locked
+      - name: Verify MSRV
+        run: cargo msrv verify
 
-  python:
+  python-test:
     needs: pre-commit
     runs-on: ubuntu-latest
     steps:
@@ -64,7 +78,7 @@ jobs:
           uv run pytest tests/
 
   miri:
-    needs: rust
+    needs: rust-test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
