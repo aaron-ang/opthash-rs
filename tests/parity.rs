@@ -1061,9 +1061,8 @@ macro_rules! parity_suite {
 parity_suite!(elastic_parity, ElasticHashMap, ElasticEntry);
 parity_suite!(funnel_parity, FunnelHashMap, FunnelEntry);
 
-/// Allocator-aware clone tests. Each test exercises `with_capacity_in` with a
-/// custom `Allocator` whose `Drop` count we observe, so leaks in the clone
-/// path show up as a non-zero `Arc<AtomicI8>`.
+/// Clone tests with a custom allocator whose Drop count we observe, so
+/// leaks of the allocator value itself show up as a non-zero counter.
 macro_rules! clone_alloc_suite {
     ($mod_name:ident, $TestMap:ident) => {
         mod $mod_name {

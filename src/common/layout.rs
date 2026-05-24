@@ -63,45 +63,46 @@ impl<T: Clone, A: Allocator + Clone> Clone for RawTable<T, A> {
             return Self::empty_in(self.alloc.clone());
         }
         let mut new = Self::new_in(self.capacity, self.alloc.clone());
-        // SAFETY: `new` was just allocated with the same shape as `self`; ctrls
-        // start at CTRL_EMPTY so unwinding mid-clone leaves `new` Drop-safe.
+        // SAFETY: shape matches `self`; ctrls start CTRL_EMPTY.
         unsafe { new.clone_payload_from(self) };
         new
     }
 
     fn clone_from(&mut self, source: &Self) {
-        if self.capacity != source.capacity {
-            // Capacity mismatch: cheapest to free + realloc via default path.
-            *self = source.clone();
-            return;
-        }
-        // Reuse the existing allocation: drop live entries (clearing the ctrl
-        // byte first so a panicking `T::drop` can't be re-entered by our own
-        // `Drop` during unwind), then re-clone from the source.
+        // Drop existing entries, clearing each ctrl byte before its
+        // `drop_in_place` so a panicking `T::drop` can't re-enter the same
+        // slot during unwind.
         for idx in 0..self.capacity {
             let ctrl = self.control_at(idx);
             if ctrl.is_occupied() {
                 self.set_control(idx, CTRL_EMPTY);
-                // SAFETY: ctrl marked the slot as occupied; we cleared it
-                // first so a panic here leaves a Drop-safe table.
+                // SAFETY: ctrl marked the slot initialized; we cleared it first.
                 unsafe { self.drop_in_place(idx) };
             } else if ctrl == CTRL_TOMBSTONE {
                 self.set_control(idx, CTRL_EMPTY);
             }
         }
+        if self.capacity != source.capacity {
+            // Reallocate at source's shape; keep our allocator (matches the
+            // fast path below). Old (now empty) table drops on assignment.
+            let mut new = Self::new_in(source.capacity, self.alloc.clone());
+            if source.capacity > 0 {
+                // SAFETY: shape matches source; ctrls start CTRL_EMPTY.
+                unsafe { new.clone_payload_from(source) };
+            }
+            *self = new;
+            return;
+        }
         if source.capacity == 0 {
             return;
         }
-        // SAFETY: capacities match (and thus group_count + layout); ctrls are
-        // all CTRL_EMPTY so partial-clone Drop only walks slots that have
-        // already been re-written.
+        // SAFETY: capacities match; ctrls are all CTRL_EMPTY.
         unsafe { self.clone_payload_from(source) };
     }
 }
 
 impl<T: Clone, A: Allocator + Clone> RawTable<T, A> {
-    /// Copy `source`'s control bytes + clone its occupied slots into `self`,
-    /// which must have matching capacity and all-EMPTY control bytes.
+    /// Copy `source`'s control bytes and clone its occupied slots into `self`.
     ///
     /// # Safety
     ///
@@ -113,10 +114,10 @@ impl<T: Clone, A: Allocator + Clone> RawTable<T, A> {
         for idx in 0..source.capacity {
             let ctrl = source.control_at(idx);
             if ctrl.is_occupied() {
-                // SAFETY: source ctrl marks idx occupied; idx < capacity.
+                // SAFETY: source ctrl marks idx occupied.
                 let cloned = unsafe { source.get_ref(idx) }.clone();
-                // Slot write precedes ctrl set, so a panic on a later clone
-                // leaves earlier slots in a Drop-safe state.
+                // write_with_control sets ctrl after the slot write, so a
+                // later clone-panic leaves earlier slots Drop-safe.
                 self.write_with_control(idx, cloned, ctrl);
             } else if ctrl == CTRL_TOMBSTONE {
                 self.set_control(idx, CTRL_TOMBSTONE);
@@ -127,10 +128,19 @@ impl<T: Clone, A: Allocator + Clone> RawTable<T, A> {
 
 impl<T, A: Allocator> Drop for RawTable<T, A> {
     fn drop(&mut self) {
-        if self.capacity > 0 {
-            let (layout, _) = Self::unified_layout(self.capacity, self.group_count);
-            unsafe { self.alloc.deallocate(self.data_ptr, layout) };
+        if self.capacity == 0 {
+            return;
         }
+        // Drop live entries before deallocating. A panicking `T::drop`
+        // unwinds out, skipping deallocation — leak over double-panic.
+        for idx in 0..self.capacity {
+            if self.control_at(idx).is_occupied() {
+                // SAFETY: ctrl marks this slot initialized.
+                unsafe { self.drop_in_place(idx) };
+            }
+        }
+        let (layout, _) = Self::unified_layout(self.capacity, self.group_count);
+        unsafe { self.alloc.deallocate(self.data_ptr, layout) };
     }
 }
 

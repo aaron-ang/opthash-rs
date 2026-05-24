@@ -256,16 +256,6 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for Level<K, V, A> {
     }
 }
 
-impl<K, V, A: Allocator + Clone> Drop for Level<K, V, A> {
-    fn drop(&mut self) {
-        for idx in 0..self.table.capacity() {
-            if self.table.control_at(idx).is_occupied() {
-                unsafe { self.table.drop_in_place(idx) };
-            }
-        }
-    }
-}
-
 /// Open-addressed hash map using elastic hashing.
 ///
 /// Splits capacity across geometrically shrinking `levels` and routes inserts
@@ -2221,8 +2211,7 @@ where
     }
 
     fn clone_from(&mut self, source: &Self) {
-        // Same-shape fast path: reuse every per-level allocation. Mismatched
-        // shape falls through to the default free + alloc.
+        // Fast path: reuse every per-level allocation when shapes match.
         let shape_matches = self.capacity == source.capacity
             && self.levels.len() == source.levels.len()
             && self
@@ -2378,9 +2367,8 @@ mod tests {
 
     #[test]
     fn retain_does_not_trigger_mid_iter_resize_with_clustered_tombstones() {
-        // Bulk-op iterators (`retain` → `extract_if`) bypass the per-remove
-        // resize check. `resize_if_needed` only runs from the iterator's Drop,
-        // and only at the same capacity — so the slot count must not change.
+        // `retain` cleans up only on iterator Drop, at the same capacity —
+        // slot count must not change.
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(256);
         let cap = i32::try_from(map.capacity()).expect("test capacity fits i32");
         let n = cap * 2 / 3;
@@ -2408,9 +2396,7 @@ mod tests {
 
     #[test]
     fn inserts_spill_to_deeper_levels_at_high_load() {
-        // Paper §4: batches fill L0 first, then push toward deeper levels.
-        // Filling near `max_insertions` must observe non-zero
-        // `max_populated_level`.
+        // Paper §4: batches push later inserts into deeper levels.
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(512);
         assert!(map.levels.len() > 1, "test requires multi-level layout");
         let max = i32::try_from(map.capacity()).expect("test capacity fits i32");

@@ -260,16 +260,6 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for BucketLevel<K, V, A> {
     }
 }
 
-impl<K, V, A: Allocator> Drop for BucketLevel<K, V, A> {
-    fn drop(&mut self) {
-        for idx in 0..self.table.capacity() {
-            if self.table.control_at(idx).is_occupied() {
-                unsafe { self.table.drop_in_place(idx) };
-            }
-        }
-    }
-}
-
 /// Half `B` of the special array `A_{α+1}` (paper §5):
 /// uniform-probing table capped at `primary_probe_limit` ≈ log log n probes.
 /// SIMD-group open addressing with per-key odd-step probing over pow2 `group_count`
@@ -360,16 +350,6 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for SpecialPrimary<K, V, A>
         self.tombstones = source.tombstones;
         self.group_count_mask = source.group_count_mask;
         self.group_summaries.clone_from(&source.group_summaries);
-    }
-}
-
-impl<K, V, A: Allocator> Drop for SpecialPrimary<K, V, A> {
-    fn drop(&mut self) {
-        for idx in 0..self.table.capacity() {
-            if self.table.control_at(idx).is_occupied() {
-                unsafe { self.table.drop_in_place(idx) };
-            }
-        }
     }
 }
 
@@ -470,16 +450,6 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for SpecialFallback<K, V, A
         self.tombstones = source.tombstones;
         self.bucket_count = source.bucket_count;
         self.bucket_size_log2 = source.bucket_size_log2;
-    }
-}
-
-impl<K, V, A: Allocator> Drop for SpecialFallback<K, V, A> {
-    fn drop(&mut self) {
-        for idx in 0..self.table.capacity() {
-            if self.table.control_at(idx).is_occupied() {
-                unsafe { self.table.drop_in_place(idx) };
-            }
-        }
     }
 }
 
@@ -3293,7 +3263,7 @@ where
     }
 
     fn clone_from(&mut self, source: &Self) {
-        // Same-shape fast path: reuse every per-level + special allocation.
+        // Fast path: reuse every per-level + special allocation when shapes match.
         let shape_matches = self.capacity == source.capacity
             && self.levels.len() == source.levels.len()
             && self
@@ -3523,9 +3493,8 @@ mod tests {
 
     #[test]
     fn retain_does_not_trigger_mid_iter_resize_with_clustered_tombstones() {
-        // Bulk-op iterators (`retain` → `extract_if`) bypass the per-remove
-        // resize check. `resize_if_needed` only runs from the iterator's Drop,
-        // and only at the same capacity — so the slot count must not change.
+        // `retain` cleans up only on iterator Drop, at the same capacity —
+        // slot count must not change.
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(1024);
         let max = i32::try_from(capacity::max_insertions(
             map.capacity(),
@@ -3556,9 +3525,7 @@ mod tests {
 
     #[test]
     fn bucket_overflow_promotes_max_populated_level() {
-        // Paper §5: when an `A_{i,j}` bucket overflows, keys spill to A_{i+1}.
-        // Beyond a low fill threshold some bucket on the way will overflow
-        // even though others have slack, so deeper levels must light up.
+        // Paper §5: A_{i,j} bucket overflow spills into A_{i+1}.
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(2048);
         assert!(map.levels.len() > 1, "test requires multi-level layout");
         let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
@@ -3577,8 +3544,7 @@ mod tests {
 
     #[test]
     fn reserve_fraction_clamped_to_funnel_max() {
-        // Funnel's correctness proof needs reserve_fraction <= 1/8. Any larger
-        // request is clamped down.
+        // Funnel's correctness proof requires reserve_fraction <= 1/8.
         let map: FunnelHashMap<i32, i32> =
             FunnelHashMap::with_options(FunnelOptions::with_capacity(256).reserve_fraction(0.5));
         assert!(
@@ -3590,8 +3556,7 @@ mod tests {
 
     #[test]
     fn primary_probe_limit_override_takes_effect() {
-        // When the caller pins `primary_probe_limit`, the map must store
-        // exactly that value (no log-log derivation).
+        // Explicit override skips the log-log derivation.
         let map: FunnelHashMap<i32, i32> =
             FunnelHashMap::with_options(FunnelOptions::with_capacity(1024).primary_probe_limit(7));
         assert_eq!(map.primary_probe_limit, 7);

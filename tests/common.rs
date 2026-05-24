@@ -287,8 +287,7 @@ macro_rules! common_suite {
                     let mut drain = map.drain();
                     let _first = drain.next();
                     let _second = drain.next();
-                    // Drop without exhausting; remaining entries must still be
-                    // freed and the map emptied (std semantics).
+                    // Drop without exhausting; remainder must still be freed.
                 }
                 assert!(map.is_empty());
                 assert_eq!(map.iter().count(), 0);
