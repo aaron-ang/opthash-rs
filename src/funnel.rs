@@ -3097,6 +3097,11 @@ fn choose_special_capacity(
         }
     }
 
+    // Paper §5: A_{α+1} must be non-empty. Floor at one bucket so the
+    // cascade always has a final landing spot.
+    if best_special_capacity == 0 {
+        best_special_capacity = bucket_size.min(total_capacity);
+    }
     best_special_capacity
 }
 
