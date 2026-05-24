@@ -195,13 +195,20 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
         Q: Eq + ?Sized,
     {
         if self.len == 0 {
-            // Empty level: no key here, but record the chosen bucket's first
-            // slot for the insert path so the candidate isn't lost. Skip if
-            // the level has zero capacity (partition allocated none here).
-            if candidate.wants_free() && self.table.capacity() > 0 {
+            if self.table.capacity() == 0 {
+                return LookupStep::Continue;
+            }
+            // Record the chosen bucket's first slot so the insert candidate
+            // isn't lost.
+            if candidate.wants_free() {
                 let bucket_idx = self.bucket_index(key_hash);
                 let bucket_start = bucket_idx << self.bucket_size_log2;
                 candidate.record(Some(bucket_start));
+            }
+            // No tombstones ⇒ the cascade never placed a key deeper than this
+            // level, so we can stop probing.
+            if self.tombstones == 0 {
+                return LookupStep::StopSearch;
             }
             return LookupStep::Continue;
         }
@@ -1665,12 +1672,9 @@ where
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
-    /// Paper §5: walk every `A_1..A_α` once, in order, stopping on the first
-    /// `StopSearch` (free slot in the chosen bucket). On hit returns
-    /// `Some(SlotLocation::Level)`; on miss returns `None` and `candidate`
-    /// holds the earliest level's free slot when `Candidate::Track` was
-    /// requested — i.e. inserts spill into deeper bucket levels before
-    /// reaching the special array, matching the paper's routing.
+    /// Paper §5: walk `A_1..A_α` in order, stopping on the first `StopSearch`.
+    /// `Candidate::Track` records the earliest level's free slot so inserts
+    /// spill into deeper bucket levels before reaching the special array.
     #[inline]
     fn find_in_levels<Q>(
         &self,
@@ -3533,11 +3537,8 @@ mod tests {
 
     #[test]
     fn bucket_overflow_promotes_max_populated_level() {
-        // Paper §5: A_{i,j} bucket overflow spills into A_{i+1}, never
-        // skipping bucket levels for the special array. Force the spill
-        // deterministically with a constant hasher so every key targets the
-        // same L0 bucket — past `bucket_size` inserts, overflow must land in
-        // L1 and bump `max_populated_level`.
+        // Paper §5: A_{i,j} overflow must spill into A_{i+1}, not skip to the
+        // special array. Constant hasher pins every key to the same L0 bucket.
         struct ConstHasher;
         impl std::hash::Hasher for ConstHasher {
             fn finish(&self) -> u64 {
@@ -3558,8 +3559,7 @@ mod tests {
             FunnelHashMap::with_capacity_and_hasher(2048, ConstHashBuilder);
         assert!(map.levels.len() > 1, "test requires multi-level layout");
         let l0_bucket_size = 1usize << map.levels[0].bucket_size_log2;
-        // One bucket holds at most `l0_bucket_size` keys; the next key over
-        // the limit must spill into L1.
+        // bucket holds at most l0_bucket_size; one more forces a spill.
         for i in 0..(l0_bucket_size as i32 + 1) {
             map.insert(i, i);
         }
