@@ -697,6 +697,55 @@ macro_rules! common_suite {
                     }
                 }
             }
+
+            #[test]
+            fn clear_removes_all_entries_and_resets_map() {
+                let mut map = HashMap::with_capacity(64);
+                for key in 0..10 {
+                    assert_eq!(map.insert(key, key * 10), None);
+                }
+
+                map.clear();
+                assert!(map.is_empty());
+                for key in 0..10 {
+                    assert_eq!(map.get(&key), None);
+                }
+
+                assert_eq!(map.insert(99, 990), None);
+                assert_eq!(map.get(&99), Some(&990));
+            }
+
+            #[test]
+            fn interleaved_insert_delete_correctness() {
+                let mut map = HashMap::with_capacity(256);
+                // Insert 100, delete odd keys, verify even keys survive.
+                for i in 0..100 {
+                    map.insert(i, i);
+                }
+                for i in (1..100).step_by(2) {
+                    assert!(map.remove(&i).is_some());
+                }
+                for i in (0..100).step_by(2) {
+                    assert_eq!(map.get(&i), Some(&i), "even key {i} missing");
+                }
+                for i in (1..100).step_by(2) {
+                    assert_eq!(map.get(&i), None, "odd key {i} should be gone");
+                }
+            }
+
+            #[test]
+            fn iter_mut_yields_mutable_values_in_some_order() {
+                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
+                for i in 0..50 {
+                    map.insert(i, i);
+                }
+                for (_, v) in &mut map {
+                    *v *= 2;
+                }
+                for i in 0..50 {
+                    assert_eq!(map.get(&i), Some(&(i * 2)), "key {i} not doubled");
+                }
+            }
         }
     };
 }

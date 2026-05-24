@@ -2377,23 +2377,6 @@ mod tests {
     }
 
     #[test]
-    fn clear_removes_all_entries_and_resets_map() {
-        let mut map = ElasticHashMap::with_capacity(64);
-        for key in 0..10 {
-            assert_eq!(map.insert(key, key * 10), None);
-        }
-
-        map.clear();
-        assert!(map.is_empty());
-        for key in 0..10 {
-            assert_eq!(map.get(&key), None);
-        }
-
-        assert_eq!(map.insert(99, 990), None);
-        assert_eq!(map.get(&99), Some(&990));
-    }
-
-    #[test]
     fn partial_group_capacity_works() {
         // Capacity 18 creates a partial last group (2 valid slots out of 16).
         let mut map = ElasticHashMap::with_capacity(18);
