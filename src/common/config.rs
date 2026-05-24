@@ -1,5 +1,6 @@
 /// `SwissTable` control-byte group width; SIMD scans operate one group at a time.
 pub(crate) const GROUP_SIZE: usize = 16;
+pub(crate) const GROUP_SIZE_F64: f64 = 16.0;
 /// First-allocation slot count when a map grows from empty.
 pub(crate) const INITIAL_CAPACITY: usize = 16;
 /// Default headroom: `max_insertions = capacity * (1 - reserve_fraction)`.

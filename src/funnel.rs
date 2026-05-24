@@ -581,8 +581,8 @@ impl<T> Candidate<'_, T> {
 /// order. The funnel structure trades a small probe budget per level for
 /// hard worst-case guarantees on lookup cost.
 pub struct FunnelHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    /// Bucket-grouped levels, each half the size of the previous.
-    levels: Vec<BucketLevel<K, V, A>>,
+    /// Bucket-grouped levels, each half the size of the previous; length fixed at ctor.
+    levels: Box<[BucketLevel<K, V, A>]>,
     /// Overflow-catching tables (primary + fallback).
     special: SpecialArray<K, V, A>,
     /// Total live entries across levels + special.
@@ -755,7 +755,7 @@ where
 
         let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
         let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
-        let levels: Vec<BucketLevel<K, V, A>> = level_bucket_counts
+        let levels: Box<[BucketLevel<K, V, A>]> = level_bucket_counts
             .into_iter()
             .enumerate()
             .map(|(level_idx, bucket_count)| {
@@ -1540,6 +1540,7 @@ where
                 alloc.clone(),
             )?);
         }
+        let levels = levels.into_boxed_slice();
 
         let special = SpecialArray::try_with_capacity_in(
             special_capacity,
@@ -1577,7 +1578,7 @@ where
         }
         let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
         let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
-        let new_levels: Vec<BucketLevel<K, V, A>> = level_bucket_counts
+        let new_levels: Box<[BucketLevel<K, V, A>]> = level_bucket_counts
             .into_iter()
             .enumerate()
             .map(|(level_idx, bucket_count)| {
@@ -3539,16 +3540,16 @@ mod tests {
         let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
             FunnelHashMap::with_capacity_and_hasher(2048, ConstHashBuilder);
         assert!(map.levels.len() > 1, "test requires multi-level layout");
-        let l0_bucket_size = 1usize << map.levels[0].bucket_size_log2;
+        let l0_bucket_size = i32::try_from(1usize << map.levels[0].bucket_size_log2).unwrap();
         // bucket holds at most l0_bucket_size; one more forces a spill.
-        for i in 0..(l0_bucket_size as i32 + 1) {
+        for i in 0..=(l0_bucket_size) {
             map.insert(i, i);
         }
         assert_eq!(
             map.max_populated_level, 1,
             "first bucket overflow should land in A_1, not the special array"
         );
-        for i in 0..(l0_bucket_size as i32 + 1) {
+        for i in 0..=(l0_bucket_size) {
             assert_eq!(map.get(&i), Some(&i));
         }
     }

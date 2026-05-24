@@ -6,11 +6,8 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
 
-use allocator_api2::boxed::Box as ABox;
-use allocator_api2::vec::Vec as AVec;
-
 use crate::common::config::{
-    DEFAULT_PROBE_SCALE, DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY,
+    DEFAULT_PROBE_SCALE, DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_F64, INITIAL_CAPACITY,
 };
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
@@ -19,7 +16,7 @@ use crate::common::iter::{
     Values as CommonValues,
 };
 use crate::common::layout::{OccupiedCursor, RawTable, SlotEntry};
-use crate::common::math::{self, align, capacity, cast, probe};
+use crate::common::math::{self, align, capacity, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
 /// Construction-time tuning for `ElasticHashMap`.
@@ -91,8 +88,10 @@ struct Level<K, V, A: Allocator + Clone = Global> {
     /// Cached `floor(reserve * cap / 2)` for the
     /// `current_free_slots > threshold` branch in slot selection.
     half_reserve_slot_threshold: usize,
-    /// Probe budget indexed by `free_slots()`.
-    limited_probe_budgets: ABox<[usize], A>,
+    /// Paper §2 `c` in `f(ε) = c·log²(ε⁻¹)` — `probe_scale / GROUP_SIZE`.
+    probe_scale_over_group_size: f64,
+    /// Paper §2 cap on `f(ε)` — `min(1 + c·log δ⁻¹, group_count)`.
+    budget_cap: f64,
 }
 
 impl<K, V, A: Allocator + Clone> Level<K, V, A> {
@@ -103,14 +102,15 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
         level_idx: usize,
         alloc: A,
     ) -> Self {
-        let table = RawTable::new_in(capacity, alloc.clone());
+        let table = RawTable::new_in(capacity, alloc);
         let group_count = table.group_count();
         debug_assert!(
             group_count == 0 || group_count.is_power_of_two(),
             "partition_levels must produce pow2 group_count",
         );
-        let limited_probe_budgets =
-            build_probe_budgets_in(capacity, group_count, reserve_fraction, probe_scale, alloc);
+        let probe_scale_over_group_size = probe_scale / GROUP_SIZE_F64;
+        let budget_cap =
+            compute_budget_cap(probe_scale_over_group_size, reserve_fraction, group_count);
         Self {
             table,
             len: 0,
@@ -121,7 +121,8 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
                 reserve_fraction,
                 capacity,
             ),
-            limited_probe_budgets,
+            probe_scale_over_group_size,
+            budget_cap,
         }
     }
 
@@ -133,16 +134,12 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
         level_idx: usize,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let table = RawTable::try_new_in(capacity, alloc.clone())
-            .map_err(|()| TryReserveError::AllocError)?;
+        let table =
+            RawTable::try_new_in(capacity, alloc).map_err(|()| TryReserveError::AllocError)?;
         let group_count = table.group_count();
-        let limited_probe_budgets = try_build_probe_budgets_in(
-            capacity,
-            group_count,
-            reserve_fraction,
-            probe_scale,
-            alloc,
-        )?;
+        let probe_scale_over_group_size = probe_scale / GROUP_SIZE_F64;
+        let budget_cap =
+            compute_budget_cap(probe_scale_over_group_size, reserve_fraction, group_count);
         Ok(Self {
             table,
             len: 0,
@@ -153,7 +150,8 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
                 reserve_fraction,
                 capacity,
             ),
-            limited_probe_budgets,
+            probe_scale_over_group_size,
+            budget_cap,
         })
     }
 
@@ -168,10 +166,22 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
         self.capacity().saturating_sub(self.len)
     }
 
-    /// Per-fill-level probe budget (tighter as the level fills).
+    /// Paper §2 `f(ε) = c·min(log² ε⁻¹, log δ⁻¹)` with `ε = free_slots/capacity`.
     #[inline]
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation
+    )]
     fn limited_group_budget(&self) -> usize {
-        self.limited_probe_budgets[self.free_slots()]
+        let capacity = self.capacity();
+        let free_slots = self.free_slots();
+        if capacity == 0 || free_slots == 0 {
+            return 1;
+        }
+        let log_inv_eps = (capacity as f64 / free_slots as f64).log2();
+        let raw = 1.0 + self.probe_scale_over_group_size * log_inv_eps * log_inv_eps;
+        raw.min(self.budget_cap) as usize
     }
 
     /// Triggers a no-grow rehash on remove when tombstones outnumber half
@@ -236,7 +246,8 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for Level<K, V, A> {
             group_count_mask: self.group_count_mask,
             tombstones: self.tombstones,
             half_reserve_slot_threshold: self.half_reserve_slot_threshold,
-            limited_probe_budgets: self.limited_probe_budgets.clone(),
+            probe_scale_over_group_size: self.probe_scale_over_group_size,
+            budget_cap: self.budget_cap,
         }
     }
 
@@ -247,8 +258,8 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for Level<K, V, A> {
         self.group_count_mask = source.group_count_mask;
         self.tombstones = source.tombstones;
         self.half_reserve_slot_threshold = source.half_reserve_slot_threshold;
-        self.limited_probe_budgets
-            .clone_from(&source.limited_probe_budgets);
+        self.probe_scale_over_group_size = source.probe_scale_over_group_size;
+        self.budget_cap = source.budget_cap;
     }
 }
 
@@ -260,8 +271,8 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for Level<K, V, A> {
 /// `len > 0`. Unlike standard open addressing, expected probe count stays
 /// low even at high load.
 pub struct ElasticHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    /// Geometrically shrinking partition of capacity.
-    levels: Vec<Level<K, V, A>>,
+    /// Geometrically shrinking partition of capacity; length fixed at ctor.
+    levels: Box<[Level<K, V, A>]>,
     /// Total live entries.
     len: usize,
     /// Total slot count across all levels.
@@ -273,7 +284,7 @@ pub struct ElasticHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = G
     /// Probe-budget multiplier. See `ElasticOptions`.
     probe_scale: f64,
     /// Per-batch insert quota; drives `current_batch_index` advancement.
-    batch_plan: Vec<usize>,
+    batch_plan: Box<[usize]>,
     /// Index into `batch_plan`. Selects which level pair new keys target.
     current_batch_index: usize,
     /// Remaining inserts in the current batch before advancing.
@@ -420,7 +431,7 @@ where
         let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
         let level_capacities = partition_levels(capacity);
-        let levels: Vec<Level<K, V, A>> = level_capacities
+        let levels: Box<[Level<K, V, A>]> = level_capacities
             .iter()
             .enumerate()
             .map(|(level_idx, &cap)| {
@@ -1641,7 +1652,7 @@ where
     /// performs a no-grow rehash that flushes accumulated tombstones.
     fn resize(&mut self, new_capacity: usize) {
         let level_capacities = partition_levels(new_capacity);
-        let new_levels: Vec<Level<K, V, A>> = level_capacities
+        let new_levels: Box<[Level<K, V, A>]> = level_capacities
             .iter()
             .enumerate()
             .map(|(level_idx, &cap)| {
@@ -1738,6 +1749,7 @@ where
                 alloc.clone(),
             )?);
         }
+        let levels = levels.into_boxed_slice();
 
         let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
         let batch_remaining = batch_plan.first().copied().unwrap_or(0);
@@ -2007,98 +2019,16 @@ fn sanitize_probe_scale(probe_scale: f64) -> f64 {
     }
 }
 
-/// Fallible counterpart to [`build_probe_budgets_in`]. Returns
-/// `Err(TryReserveError::AllocError)` on allocation failure.
-fn try_build_probe_budgets_in<A: Allocator>(
-    capacity: usize,
-    group_count: usize,
+/// `min(1 + c·log δ⁻¹, group_count)` — paper §2 cap on `f(ε)`.
+#[allow(clippy::cast_precision_loss)]
+fn compute_budget_cap(
+    probe_scale_over_group_size: f64,
     reserve_fraction: f64,
-    probe_scale: f64,
-    alloc: A,
-) -> Result<ABox<[usize], A>, TryReserveError> {
-    let mut budgets: AVec<usize, A> = AVec::new_in(alloc);
-    budgets
-        .try_reserve_exact(capacity.saturating_add(1))
-        .map_err(|_| TryReserveError::AllocError)?;
-    budgets.resize(capacity.saturating_add(1), 1);
-    if capacity == 0 {
-        return Ok(budgets.into_boxed_slice());
-    }
-    fill_probe_budgets(
-        &mut budgets,
-        capacity,
-        group_count,
-        reserve_fraction,
-        probe_scale,
-    );
-    Ok(budgets.into_boxed_slice())
-}
-
-fn build_probe_budgets_in<A: Allocator>(
-    capacity: usize,
     group_count: usize,
-    reserve_fraction: f64,
-    probe_scale: f64,
-    alloc: A,
-) -> ABox<[usize], A> {
-    let mut budgets: AVec<usize, A> = AVec::new_in(alloc);
-    budgets.resize(capacity.saturating_add(1), 1);
-    if capacity == 0 {
-        return budgets.into_boxed_slice();
-    }
-    fill_probe_budgets(
-        &mut budgets,
-        capacity,
-        group_count,
-        reserve_fraction,
-        probe_scale,
-    );
-    budgets.into_boxed_slice()
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn fill_probe_budgets(
-    budgets: &mut [usize],
-    capacity: usize,
-    group_count: usize,
-    reserve_fraction: f64,
-    probe_scale: f64,
-) {
-    let max_budget = group_count.max(1);
-    let cap_f = cast::usize_to_f64(capacity);
-    let log_cap = (1.0 / reserve_fraction).log2();
-
-    // Budget(fs) is a non-increasing staircase function of free_slots.
-    // Instead of computing log2/ceil per slot, find the threshold free_slots
-    // where each budget level transitions, then fill segments.
-    //
-    // Budget >= b when: fs < capacity / 2^sqrt((b-1)*GROUP_SIZE / probe_scale)
-    let mut thresholds: Vec<(usize, usize)> = Vec::new();
-    for b in 2..=max_budget {
-        let ratio = ((b - 1) * GROUP_SIZE) as f64 / probe_scale;
-        if ratio >= log_cap {
-            break;
-        }
-        let exact = cap_f / f64::exp2(ratio.sqrt());
-        let threshold = (exact.ceil() as usize).saturating_sub(1).min(capacity);
-        if threshold == 0 {
-            break;
-        }
-        thresholds.push((b, threshold));
-    }
-
-    // Fill from highest budget inward (thresholds decrease with increasing b).
-    let mut prev_end = 0;
-    for &(b, threshold) in thresholds.iter().rev() {
-        if threshold > prev_end {
-            budgets[(prev_end + 1)..=threshold].fill(b);
-            prev_end = threshold;
-        }
-    }
+) -> f64 {
+    let log_cap = 1.0 + probe_scale_over_group_size * (1.0 / reserve_fraction).log2();
+    let max_budget = group_count.max(1) as f64;
+    log_cap.min(max_budget).max(1.0)
 }
 
 /// Paper §4: split into `|A_{i+1}| = |A_i|/2 ± 1`, then round each up so
@@ -2138,9 +2068,9 @@ fn build_batch_plan(
     level_capacities: &[usize],
     reserve_fraction: f64,
     max_insertions: usize,
-) -> Vec<usize> {
+) -> Box<[usize]> {
     if level_capacities.is_empty() || max_insertions == 0 {
-        return Vec::new();
+        return Box::new([]);
     }
 
     let mut plan = Vec::with_capacity(level_capacities.len() + 1);
@@ -2179,7 +2109,7 @@ fn build_batch_plan(
         plan.push(max_insertions - inserted);
     }
 
-    plan
+    plan.into_boxed_slice()
 }
 
 impl<K, V, S, A> Clone for ElasticHashMap<K, V, S, A>
@@ -2209,7 +2139,6 @@ where
     fn clone_from(&mut self, source: &Self) {
         // Fast path: reuse every per-level allocation when shapes match.
         let shape_matches = self.capacity == source.capacity
-            && self.levels.len() == source.levels.len()
             && self
                 .levels
                 .iter()
