@@ -271,6 +271,25 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for BucketLevel<K, V, A> {
     }
 }
 
+/// Odd-step probe over pow2 group count (paper §5 `SpecialPrimary`). Step is
+/// coprime to `group_count` ⇒ visits every group within `group_count` advances.
+struct ProbeSeq {
+    group: usize,
+    step: usize,
+}
+
+impl ProbeSeq {
+    #[inline]
+    fn new(group: usize, step: usize) -> Self {
+        Self { group, step }
+    }
+
+    #[inline]
+    fn advance(&mut self, mask: usize) {
+        self.group = (self.group + self.step) & mask;
+    }
+}
+
 /// Half `B` of the special array `A_{α+1}` (paper §5):
 /// uniform-probing table capped at `primary_probe_limit` ≈ log log n probes.
 /// SIMD-group open addressing with per-key odd-step probing over pow2 `group_count`
@@ -1391,22 +1410,6 @@ where
         }
     }
 
-    /// Triggers a no-grow rehash if any region crossed its cleanup threshold
-    /// during a bulk op. Called once from each bulk-op iterator's `Drop`.
-    fn resize_if_needed(&mut self) {
-        let level_dirty = self
-            .levels
-            .iter()
-            .any(|level| level.tombstones > level.capacity() / 2);
-        let primary_dirty =
-            self.special.primary.tombstones > self.special.primary.table.capacity() / 2;
-        let fallback_dirty =
-            self.special.fallback.tombstones > self.special.fallback.capacity() / 2;
-        if level_dirty || primary_dirty || fallback_dirty {
-            self.resize(self.capacity);
-        }
-    }
-
     pub fn clear(&mut self) {
         for level in &mut self.levels {
             for idx in 0..level.table.capacity() {
@@ -1825,13 +1828,12 @@ where
         let group_count = primary.table.group_count();
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
-        let mut group_idx = primary.group_start(key_hash);
-        let step = primary.group_step(key_hash);
+        let mut probe = ProbeSeq::new(primary.group_start(key_hash), primary.group_step(key_hash));
         for _ in 0..group_limit {
-            if let Some(slot_idx) = primary.first_free_in_group(group_idx) {
+            if let Some(slot_idx) = primary.first_free_in_group(probe.group) {
                 return Some(slot_idx);
             }
-            group_idx = (group_idx + step) & mask;
+            probe.advance(mask);
         }
         None
     }
@@ -1890,8 +1892,7 @@ where
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
         let mut local: Option<usize> = None;
-        let mut group_idx = primary.group_start(key_hash);
-        let step = primary.group_step(key_hash);
+        let mut probe = ProbeSeq::new(primary.group_start(key_hash), primary.group_step(key_hash));
 
         let outcome: LookupStep = 'probe: {
             for _ in 0..group_limit {
@@ -1899,16 +1900,19 @@ where
                 // one. `first_free_in_group` doubles as the "any free?" check;
                 // when not tracking we use the cheaper EMPTY-only mask.
                 let has_free = if wants_free && local.is_none() {
-                    let slot = primary.table.first_free_in_group(group_idx);
+                    let slot = primary.table.first_free_in_group(probe.group);
                     if let Some(s) = slot {
                         local = Some(s);
                     }
                     slot.is_some()
                 } else {
-                    primary.table.group_match_mask(group_idx, CTRL_EMPTY).any()
+                    primary
+                        .table
+                        .group_match_mask(probe.group, CTRL_EMPTY)
+                        .any()
                 };
-                for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
-                    let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                for relative_idx in primary.table.group_match_mask(probe.group, key_fingerprint) {
+                    let slot_idx = probe.group * GROUP_SIZE + relative_idx;
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         break 'probe LookupStep::Found(slot_idx);
@@ -1920,12 +1924,12 @@ where
                 if has_free
                     && !primary
                         .table
-                        .group_match_mask(group_idx, CTRL_TOMBSTONE)
+                        .group_match_mask(probe.group, CTRL_TOMBSTONE)
                         .any()
                 {
                     break 'probe LookupStep::StopSearch;
                 }
-                group_idx = (group_idx + step) & mask;
+                probe.advance(mask);
             }
             LookupStep::Continue
         };
@@ -2702,9 +2706,8 @@ where
     F: FnMut(&K, &mut V) -> bool,
 {
     fn drop(&mut self) {
-        // Dropping `extract_if` early leaves unvisited entries in the map.
-        // Only consolidate any tombstone backlog from already-removed entries.
-        self.map.resize_if_needed();
+        // Tombstones from extracted entries are left in place; subsequent
+        // `remove` calls trigger consolidation when their threshold is crossed.
     }
 }
 

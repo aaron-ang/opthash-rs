@@ -987,14 +987,6 @@ where
             cursor: OccupiedCursor::new(),
         }
     }
-
-    /// Walk every level and rehash if any crossed the cleanup threshold while
-    /// resize was suppressed. Called once from each bulk-op iterator's `Drop`.
-    fn resize_if_needed(&mut self) {
-        if self.levels.iter().any(Level::needs_cleanup) {
-            self.resize(self.capacity);
-        }
-    }
 }
 
 /// A view into a single entry in an [`ElasticHashMap`], which may be either
@@ -1354,9 +1346,8 @@ where
     F: FnMut(&K, &mut V) -> bool,
 {
     fn drop(&mut self) {
-        // Dropping `extract_if` early leaves unvisited entries in the map.
-        // Only consolidate any tombstone backlog from already-removed entries.
-        self.map.resize_if_needed();
+        // Tombstones from extracted entries are left in place; subsequent
+        // `remove` calls trigger consolidation when their threshold is crossed.
     }
 }
 
