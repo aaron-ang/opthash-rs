@@ -1,7 +1,7 @@
 //! Parity tests against `hashbrown::HashMap`, ported from
 //! `hashbrown-0.17/src/map.rs::test_map` and run via macro against both maps.
 //!
-//! Tests requiring APIs opthash lacks (`Clone`, `EntryRef`, `raw_entry`,
+//! Tests requiring APIs opthash lacks (`EntryRef`, `raw_entry`,
 //! `raw_capacity`, `insert_unique_unchecked`, `replace_entry_with`) are omitted.
 
 macro_rules! parity_suite {
@@ -41,6 +41,12 @@ macro_rules! parity_suite {
                     DROP_VECTOR.with(|slot| {
                         slot.borrow_mut()[self.k] -= 1;
                     });
+                }
+            }
+
+            impl Clone for Droppable {
+                fn clone(&self) -> Self {
+                    Droppable::new(self.k)
                 }
             }
 
@@ -187,7 +193,8 @@ macro_rules! parity_suite {
                     hm
                 };
 
-                // Upstream's `drop(hm.clone())` check omitted: no Clone impl.
+                // By the way, ensure that cloning doesn't screw up the dropping.
+                drop(hm.clone());
 
                 {
                     let mut half = hm.into_iter().take(50);
@@ -870,9 +877,419 @@ macro_rules! parity_suite {
 
                 assert_eq!(iter.len(), 3);
             }
+
+            #[test]
+            fn test_clone() {
+                let mut m = HashMap::new();
+                assert_eq!(m.len(), 0);
+                assert!(m.insert(1, 2).is_none());
+                assert_eq!(m.len(), 1);
+                assert!(m.insert(2, 4).is_none());
+                assert_eq!(m.len(), 2);
+                let m2 = m.clone();
+                assert_eq!(*m2.get(&1).unwrap(), 2);
+                assert_eq!(*m2.get(&2).unwrap(), 4);
+                assert_eq!(m2.len(), 2);
+            }
+
+            #[test]
+            fn test_clone_from() {
+                let mut m = HashMap::new();
+                let mut m2 = HashMap::new();
+                assert_eq!(m.len(), 0);
+                assert!(m.insert(1, 2).is_none());
+                assert_eq!(m.len(), 1);
+                assert!(m.insert(2, 4).is_none());
+                assert_eq!(m.len(), 2);
+                m2.clone_from(&m);
+                assert_eq!(*m2.get(&1).unwrap(), 2);
+                assert_eq!(*m2.get(&2).unwrap(), 4);
+                assert_eq!(m2.len(), 2);
+            }
+
+            #[test]
+            #[should_panic = "panic in drop"]
+            fn test_clone_from_double_drop() {
+                #[derive(Clone)]
+                struct CheckedDrop {
+                    panic_in_drop: bool,
+                    dropped: bool,
+                }
+                impl Drop for CheckedDrop {
+                    fn drop(&mut self) {
+                        if self.panic_in_drop {
+                            self.dropped = true;
+                            panic!("panic in drop");
+                        }
+                        if self.dropped {
+                            panic!("double drop");
+                        }
+                        self.dropped = true;
+                    }
+                }
+                const DISARMED: CheckedDrop = CheckedDrop {
+                    panic_in_drop: false,
+                    dropped: false,
+                };
+                const ARMED: CheckedDrop = CheckedDrop {
+                    panic_in_drop: true,
+                    dropped: false,
+                };
+
+                let mut map1 = HashMap::new();
+                map1.insert(1, DISARMED);
+                map1.insert(2, DISARMED);
+                map1.insert(3, DISARMED);
+                map1.insert(4, DISARMED);
+
+                let mut map2 = HashMap::new();
+                map2.insert(1, DISARMED);
+                map2.insert(2, ARMED);
+                map2.insert(3, DISARMED);
+                map2.insert(4, DISARMED);
+
+                map2.clone_from(&map1);
+            }
+
+            #[test]
+            #[should_panic = "panic in clone"]
+            fn test_clone_from_memory_leaks() {
+                struct CheckedClone {
+                    panic_in_clone: bool,
+                    need_drop: Vec<i32>,
+                }
+                impl Clone for CheckedClone {
+                    fn clone(&self) -> Self {
+                        if self.panic_in_clone {
+                            panic!("panic in clone")
+                        }
+                        Self {
+                            panic_in_clone: self.panic_in_clone,
+                            need_drop: self.need_drop.clone(),
+                        }
+                    }
+                }
+                let mut map1 = HashMap::new();
+                map1.insert(
+                    1,
+                    CheckedClone {
+                        panic_in_clone: false,
+                        need_drop: vec![0, 1, 2],
+                    },
+                );
+                map1.insert(
+                    2,
+                    CheckedClone {
+                        panic_in_clone: false,
+                        need_drop: vec![3, 4, 5],
+                    },
+                );
+                map1.insert(
+                    3,
+                    CheckedClone {
+                        panic_in_clone: true,
+                        need_drop: vec![6, 7, 8],
+                    },
+                );
+                let _map2 = map1.clone();
+            }
+
+            #[test]
+            fn test_clone_of_empty_map() {
+                let map: HashMap<u32, u32> = HashMap::new();
+                let cloned = map.clone();
+                assert!(cloned.is_empty());
+                assert_eq!(cloned.len(), 0);
+            }
+
+            #[test]
+            fn test_clone_is_independent_of_source() {
+                let mut map: HashMap<i32, i32> = HashMap::new();
+                for i in 0..40 {
+                    map.insert(i, i * 7);
+                }
+                for i in 0..20 {
+                    map.remove(&i);
+                }
+
+                let mut cloned = map.clone();
+                assert_eq!(cloned.len(), map.len());
+                for i in 20..40 {
+                    assert_eq!(cloned.get(&i), Some(&(i * 7)));
+                }
+                for i in 0..20 {
+                    assert_eq!(cloned.get(&i), None);
+                }
+
+                // Mutating the clone must not bleed into the source.
+                cloned.insert(999, 0);
+                assert_eq!(map.get(&999), None);
+                assert_eq!(cloned.get(&999), Some(&0));
+            }
+
+            #[test]
+            fn test_clone_drops_each_value_exactly_once() {
+                use std::sync::Arc;
+                use std::sync::atomic::{AtomicUsize, Ordering};
+
+                struct DropCounter(Arc<AtomicUsize>);
+                impl Clone for DropCounter {
+                    fn clone(&self) -> Self {
+                        Self(Arc::clone(&self.0))
+                    }
+                }
+                impl Drop for DropCounter {
+                    fn drop(&mut self) {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+
+                let counter = Arc::new(AtomicUsize::new(0));
+                let mut map: HashMap<i32, DropCounter> = HashMap::with_capacity(32);
+                for i in 0..16 {
+                    map.insert(i, DropCounter(Arc::clone(&counter)));
+                }
+                let cloned = map.clone();
+                drop(map);
+                drop(cloned);
+                assert_eq!(counter.load(Ordering::SeqCst), 32);
+            }
         }
     };
 }
 
 parity_suite!(elastic_parity, ElasticHashMap, ElasticEntry);
 parity_suite!(funnel_parity, FunnelHashMap, FunnelEntry);
+
+/// Allocator-aware clone tests. Each test exercises `with_capacity_in` with a
+/// custom `Allocator` whose `Drop` count we observe, so leaks in the clone
+/// path show up as a non-zero `Arc<AtomicI8>`.
+macro_rules! clone_alloc_suite {
+    ($mod_name:ident, $TestMap:ident) => {
+        mod $mod_name {
+            use std::ptr::NonNull;
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicI8, Ordering};
+
+            use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
+            use opthash::$TestMap as HashMap;
+
+            struct MyAllocInner {
+                drop_count: Arc<AtomicI8>,
+            }
+
+            #[derive(Clone)]
+            struct MyAlloc {
+                _inner: Arc<MyAllocInner>,
+            }
+
+            impl MyAlloc {
+                fn new(drop_count: Arc<AtomicI8>) -> Self {
+                    MyAlloc {
+                        _inner: Arc::new(MyAllocInner { drop_count }),
+                    }
+                }
+            }
+
+            impl Drop for MyAllocInner {
+                fn drop(&mut self) {
+                    self.drop_count.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+
+            unsafe impl Allocator for MyAlloc {
+                fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+                    Global.allocate(layout)
+                }
+                unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+                    unsafe { Global.deallocate(ptr, layout) };
+                }
+            }
+
+            #[test]
+            fn test_hashmap_into_iter_bug() {
+                let dropped: Arc<AtomicI8> = Arc::new(AtomicI8::new(1));
+                {
+                    let mut map = HashMap::with_capacity_in(10, MyAlloc::new(dropped.clone()));
+                    for i in 0..10 {
+                        map.entry(i).or_insert_with(|| "i".to_owned());
+                    }
+                    for (k, v) in map {
+                        let _ = (k, v);
+                    }
+                }
+                assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            }
+
+            #[derive(Debug)]
+            struct CheckedCloneDrop<T> {
+                panic_in_clone: bool,
+                panic_in_drop: bool,
+                dropped: bool,
+                data: T,
+            }
+
+            impl<T> CheckedCloneDrop<T> {
+                fn new(panic_in_clone: bool, panic_in_drop: bool, data: T) -> Self {
+                    Self {
+                        panic_in_clone,
+                        panic_in_drop,
+                        dropped: false,
+                        data,
+                    }
+                }
+            }
+
+            impl<T: Clone> Clone for CheckedCloneDrop<T> {
+                fn clone(&self) -> Self {
+                    if self.panic_in_clone {
+                        panic!("panic in clone")
+                    }
+                    Self {
+                        panic_in_clone: self.panic_in_clone,
+                        panic_in_drop: self.panic_in_drop,
+                        dropped: self.dropped,
+                        data: self.data.clone(),
+                    }
+                }
+            }
+
+            impl<T> Drop for CheckedCloneDrop<T> {
+                fn drop(&mut self) {
+                    if self.panic_in_drop {
+                        self.dropped = true;
+                        panic!("panic in drop");
+                    }
+                    if self.dropped {
+                        panic!("double drop");
+                    }
+                    self.dropped = true;
+                }
+            }
+
+            const DISARMED: bool = false;
+            const ARMED: bool = true;
+            const ARMED_FLAGS: [bool; 8] = [
+                DISARMED, DISARMED, DISARMED, ARMED, DISARMED, DISARMED, DISARMED, DISARMED,
+            ];
+            const DISARMED_FLAGS: [bool; 8] = [DISARMED; 8];
+
+            fn build_test_map<T, F>(
+                clone_flags: [bool; 8],
+                drop_flags: [bool; 8],
+                mut fun: F,
+                alloc: MyAlloc,
+            ) -> HashMap<u64, CheckedCloneDrop<T>, opthash::DefaultHashBuilder, MyAlloc>
+            where
+                F: FnMut(u64) -> T,
+            {
+                let mut map = HashMap::with_capacity_in(clone_flags.len(), alloc);
+                for (i, (c, d)) in clone_flags.into_iter().zip(drop_flags).enumerate() {
+                    let i = i as u64;
+                    map.insert(i, CheckedCloneDrop::new(c, d, fun(i)));
+                }
+                map
+            }
+
+            #[test]
+            #[should_panic = "panic in clone"]
+            fn test_clone_memory_leaks_and_double_drop_one() {
+                let dropped: Arc<AtomicI8> = Arc::new(AtomicI8::new(2));
+                let map = build_test_map(
+                    ARMED_FLAGS,
+                    DISARMED_FLAGS,
+                    |n| vec![n],
+                    MyAlloc::new(dropped.clone()),
+                );
+                // Clone panics; partial allocations must unwind cleanly.
+                let _map2 = map.clone();
+            }
+
+            #[test]
+            #[should_panic = "panic in drop"]
+            fn test_clone_memory_leaks_and_double_drop_two() {
+                let dropped: Arc<AtomicI8> = Arc::new(AtomicI8::new(2));
+                let map = build_test_map(
+                    DISARMED_FLAGS,
+                    DISARMED_FLAGS,
+                    |n| n,
+                    MyAlloc::new(dropped.clone()),
+                );
+                let mut map2 = build_test_map(
+                    DISARMED_FLAGS,
+                    ARMED_FLAGS,
+                    |n| n,
+                    MyAlloc::new(dropped.clone()),
+                );
+                // `clone_from` drops `map2`'s existing entries; one panics in
+                // drop. Cleanup must not double-drop or abort.
+                map2.clone_from(&map);
+            }
+
+            #[test]
+            #[cfg(panic = "unwind")]
+            fn test_catch_panic_clone_from_when_len_is_equal() {
+                use std::thread;
+
+                let dropped: Arc<AtomicI8> = Arc::new(AtomicI8::new(2));
+                {
+                    let mut map = build_test_map(
+                        DISARMED_FLAGS,
+                        DISARMED_FLAGS,
+                        |n| vec![n],
+                        MyAlloc::new(dropped.clone()),
+                    );
+                    thread::scope(|s| {
+                        let handle = s.spawn(|| {
+                            let scope_map = build_test_map(
+                                ARMED_FLAGS,
+                                DISARMED_FLAGS,
+                                |n| vec![n * 2],
+                                MyAlloc::new(dropped.clone()),
+                            );
+                            map.clone_from(&scope_map);
+                            "clone_from should have panicked"
+                        });
+                        if let Ok(msg) = handle.join() {
+                            panic!("{msg}");
+                        }
+                    });
+                }
+                assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            }
+
+            #[test]
+            #[cfg(panic = "unwind")]
+            fn test_catch_panic_clone_from_when_len_is_not_equal() {
+                use std::thread;
+
+                let dropped: Arc<AtomicI8> = Arc::new(AtomicI8::new(2));
+                {
+                    // Source capacity differs from dest so clone_from falls
+                    // through to the free + realloc path.
+                    let mut map = HashMap::with_capacity_in(8, MyAlloc::new(dropped.clone()));
+                    map.insert(0, CheckedCloneDrop::new(DISARMED, DISARMED, vec![0u64]));
+                    thread::scope(|s| {
+                        let handle = s.spawn(|| {
+                            let scope_map = build_test_map(
+                                ARMED_FLAGS,
+                                DISARMED_FLAGS,
+                                |n| vec![n * 2],
+                                MyAlloc::new(dropped.clone()),
+                            );
+                            map.clone_from(&scope_map);
+                            "clone_from should have panicked"
+                        });
+                        if let Ok(msg) = handle.join() {
+                            panic!("{msg}");
+                        }
+                    });
+                }
+                assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            }
+        }
+    };
+}
+
+clone_alloc_suite!(elastic_clone_alloc, ElasticHashMap);
+clone_alloc_suite!(funnel_clone_alloc, FunnelHashMap);

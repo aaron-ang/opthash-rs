@@ -238,6 +238,28 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
     }
 }
 
+impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for BucketLevel<K, V, A> {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            len: self.len,
+            tombstones: self.tombstones,
+            salt: self.salt,
+            bucket_count_mask: self.bucket_count_mask,
+            bucket_size_log2: self.bucket_size_log2,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.table.clone_from(&source.table);
+        self.len = source.len;
+        self.tombstones = source.tombstones;
+        self.salt = source.salt;
+        self.bucket_count_mask = source.bucket_count_mask;
+        self.bucket_size_log2 = source.bucket_size_log2;
+    }
+}
+
 impl<K, V, A: Allocator> Drop for BucketLevel<K, V, A> {
     fn drop(&mut self) {
         for idx in 0..self.table.capacity() {
@@ -318,6 +340,26 @@ impl<K, V, A: Allocator + Clone> SpecialPrimary<K, V, A> {
     #[inline]
     fn first_free_in_group(&self, group_idx: usize) -> Option<usize> {
         self.table.first_free_in_group(group_idx)
+    }
+}
+
+impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for SpecialPrimary<K, V, A> {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            len: self.len,
+            tombstones: self.tombstones,
+            group_count_mask: self.group_count_mask,
+            group_summaries: self.group_summaries.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.table.clone_from(&source.table);
+        self.len = source.len;
+        self.tombstones = source.tombstones;
+        self.group_count_mask = source.group_count_mask;
+        self.group_summaries.clone_from(&source.group_summaries);
     }
 }
 
@@ -411,6 +453,26 @@ impl<K, V, A: Allocator> SpecialFallback<K, V, A> {
     }
 }
 
+impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for SpecialFallback<K, V, A> {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            len: self.len,
+            tombstones: self.tombstones,
+            bucket_count: self.bucket_count,
+            bucket_size_log2: self.bucket_size_log2,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.table.clone_from(&source.table);
+        self.len = source.len;
+        self.tombstones = source.tombstones;
+        self.bucket_count = source.bucket_count;
+        self.bucket_size_log2 = source.bucket_size_log2;
+    }
+}
+
 impl<K, V, A: Allocator> Drop for SpecialFallback<K, V, A> {
     fn drop(&mut self) {
         for idx in 0..self.table.capacity() {
@@ -468,6 +530,22 @@ impl<K, V, A: Allocator + Clone> SpecialArray<K, V, A> {
             )?,
             total_len: 0,
         })
+    }
+}
+
+impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for SpecialArray<K, V, A> {
+    fn clone(&self) -> Self {
+        Self {
+            primary: self.primary.clone(),
+            fallback: self.fallback.clone(),
+            total_len: self.total_len,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.primary.clone_from(&source.primary);
+        self.fallback.clone_from(&source.fallback);
+        self.total_len = source.total_len;
     }
 }
 
@@ -3192,6 +3270,56 @@ fn possible_tail_sum_range(start_bucket_count: usize, levels_after: usize) -> (u
     (min_sum, max_sum)
 }
 
+impl<K, V, S, A> Clone for FunnelHashMap<K, V, S, A>
+where
+    K: Clone,
+    V: Clone,
+    S: Clone,
+    A: Allocator + Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            levels: self.levels.clone(),
+            special: self.special.clone(),
+            len: self.len,
+            capacity: self.capacity,
+            max_insertions: self.max_insertions,
+            reserve_fraction: self.reserve_fraction,
+            primary_probe_limit: self.primary_probe_limit,
+            max_populated_level: self.max_populated_level,
+            hash_builder: self.hash_builder.clone(),
+            alloc: self.alloc.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        // Same-shape fast path: reuse every per-level + special allocation.
+        let shape_matches = self.capacity == source.capacity
+            && self.levels.len() == source.levels.len()
+            && self
+                .levels
+                .iter()
+                .zip(source.levels.iter())
+                .all(|(a, b)| a.table.capacity() == b.table.capacity())
+            && self.special.primary.table.capacity() == source.special.primary.table.capacity()
+            && self.special.fallback.table.capacity() == source.special.fallback.table.capacity();
+        if !shape_matches {
+            *self = source.clone();
+            return;
+        }
+        for (dst, src) in self.levels.iter_mut().zip(source.levels.iter()) {
+            dst.clone_from(src);
+        }
+        self.special.clone_from(&source.special);
+        self.len = source.len;
+        self.max_insertions = source.max_insertions;
+        self.reserve_fraction = source.reserve_fraction;
+        self.primary_probe_limit = source.primary_probe_limit;
+        self.max_populated_level = source.max_populated_level;
+        self.hash_builder.clone_from(&source.hash_builder);
+    }
+}
+
 impl<K, V, S, A> PartialEq for FunnelHashMap<K, V, S, A>
 where
     K: Eq + Hash,
@@ -3290,10 +3418,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
 
     #[test]
@@ -3337,81 +3461,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn insert_resizes_from_zero_capacity() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        map.insert(1, 10);
-        assert_eq!(map.get(&1), Some(&10));
-        assert!(map.capacity() > 0);
-    }
-
-    #[test]
-    fn insert_resizes_when_threshold_is_reached() {
-        let capacity = 64;
-        let mut map = FunnelHashMap::with_capacity(capacity);
-        let max_insertions = capacity::max_insertions(capacity, DEFAULT_RESERVE_FRACTION);
-
-        for key in 0..max_insertions + 10 {
-            let _ = map.insert(key, key * 10);
-        }
-        for key in 0..max_insertions + 10 {
-            assert_eq!(map.get(&key), Some(&(key * 10)));
-        }
-
-        assert!(map.capacity() > capacity);
-    }
-
-    #[test]
-    fn options_constructor_fits_requested_capacity() {
-        // `options.capacity` is the insertion budget; the map allocates at
-        // least enough slots so `capacity() >= requested`.
-        let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_options(FunnelOptions {
-            capacity: 320,
-            reserve_fraction: DEFAULT_RESERVE_FRACTION,
-            primary_probe_limit: Some(4),
-        });
-        assert!(map.capacity() >= 320);
-    }
-
-    #[test]
-    fn delete_heavy_preserves_correctness() {
-        let mut map = FunnelHashMap::with_capacity(400);
-        for i in 0..200 {
-            map.insert(i, i * 10);
-        }
-        for i in 0..160 {
-            assert_eq!(map.remove(&i), Some(i * 10));
-        }
-        for i in 160..200 {
-            assert_eq!(
-                map.get(&i),
-                Some(&(i * 10)),
-                "key {i} missing after deletes"
-            );
-        }
-        assert_eq!(map.len(), 40);
-        // Re-insert into tombstone-heavy map.
-        for i in 1000..1100 {
-            assert_eq!(map.insert(i, i), None);
-        }
-        for i in 1000..1100 {
-            assert_eq!(map.get(&i), Some(&i), "key {i} missing after re-insert");
-        }
-    }
-
-    #[test]
-    fn large_map_correctness() {
-        let n = if cfg!(miri) { 100 } else { 10_000 };
-        let mut map = FunnelHashMap::with_capacity(n * 2);
-        for i in 0..n {
-            assert_eq!(map.insert(i, i), None);
-        }
-        for i in 0..n {
-            assert_eq!(map.get(&i), Some(&i), "key {i} missing");
-        }
-        assert_eq!(map.len(), n);
     }
 
     #[test]
@@ -3486,31 +3535,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn iter_yields_every_inserted_pair_once() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
-        for i in 0..80 {
-            map.insert(i, i * 7);
-        }
-        let mut collected: Vec<(i32, i32)> = map.iter().map(|(&k, &v)| (k, v)).collect();
-        collected.sort_unstable();
-        let expected: Vec<(i32, i32)> = (0..80).map(|i| (i, i * 7)).collect();
-        assert_eq!(collected, expected);
-    }
-
-    #[test]
-    fn iter_skips_tombstones_after_remove() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
-        for i in 0..40 {
-            map.insert(i, i);
-        }
-        for i in (0..40).step_by(3) {
-            map.remove(&i);
-        }
-        let keys: Vec<i32> = map.iter().map(|(&k, _)| k).collect();
-        assert_eq!(keys.len(), map.len());
-    }
-
     // Regression: removing one of two keys that both routed into a deep level
     // (level 0 unallocated) must not orphan the surviving sibling.
     #[test]
@@ -3521,99 +3545,6 @@ mod tests {
         map.remove(&1);
         assert_eq!(map.get(&2), Some(&20));
         assert_eq!(map.len(), 1);
-    }
-
-    #[test]
-    fn get_disjoint_unchecked_mut_returns_all_refs_on_hits() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
-        for i in 0..16 {
-            map.insert(i, i * 10);
-        }
-
-        // SAFETY: keys are distinct.
-        let got = unsafe { map.get_disjoint_unchecked_mut([&1, &3, &7, &15]) };
-        assert_eq!(
-            got,
-            [Some(&mut 10), Some(&mut 30), Some(&mut 70), Some(&mut 150)]
-        );
-    }
-
-    #[test]
-    fn get_disjoint_unchecked_mut_yields_none_per_missing_key() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(32);
-        for i in 0..8 {
-            map.insert(i, i);
-        }
-
-        // SAFETY: keys are distinct (one misses → None at that slot).
-        let got = unsafe { map.get_disjoint_unchecked_mut([&0, &1, &99]) };
-        assert_eq!(got, [Some(&mut 0), Some(&mut 1), None]);
-    }
-
-    #[test]
-    fn get_disjoint_mut_zero_keys_returns_empty_array() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(16);
-        map.insert(1, 1);
-        let got: [Option<&mut i32>; 0] = map.get_disjoint_mut([]);
-        assert_eq!(got.len(), 0);
-    }
-
-    #[test]
-    fn get_disjoint_mut_mutation_propagates() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(32);
-        for i in 0..8 {
-            map.insert(i, i);
-        }
-        {
-            let [a, b] = map.get_disjoint_mut([&2, &5]);
-            *a.unwrap() = 222;
-            *b.unwrap() = 555;
-        }
-        assert_eq!(map.get(&2), Some(&222));
-        assert_eq!(map.get(&5), Some(&555));
-    }
-
-    #[test]
-    fn keys_yields_inserted_keys_only() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
-        for i in 0..50 {
-            map.insert(i, i * 7);
-        }
-        let got: HashSet<i32> = map.keys().copied().collect();
-        let expected: HashSet<i32> = (0..50).collect();
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn values_yields_inserted_values_only() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
-        for i in 0..50 {
-            map.insert(i, i * 7);
-        }
-        let got: HashSet<i32> = map.values().copied().collect();
-        let expected: HashSet<i32> = (0..50).map(|i| i * 7).collect();
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn hasher_returns_consistent_handle() {
-        let map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        let a: *const _ = map.hasher();
-        let b: *const _ = map.hasher();
-        assert!(std::ptr::eq(a, b));
-    }
-
-    #[test]
-    fn get_key_value_returns_both_on_hit_none_on_miss() {
-        let mut map: FunnelHashMap<String, i32> = FunnelHashMap::with_capacity(16);
-        map.insert("alpha".to_string(), 1);
-        map.insert("beta".to_string(), 2);
-
-        let (k, v) = map.get_key_value("alpha").expect("hit");
-        assert_eq!(k, "alpha");
-        assert_eq!(*v, 1);
-
-        assert!(map.get_key_value("missing").is_none());
     }
 
     #[test]
@@ -3628,449 +3559,6 @@ mod tests {
         for i in 0..50 {
             assert_eq!(map.get(&i), Some(&(i * 2)), "key {i} not doubled");
         }
-    }
-
-    #[test]
-    fn try_reserve_grows_when_needed() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        assert_eq!(map.capacity(), 0);
-        map.try_reserve(1024).expect("alloc should succeed");
-        let cap = map.capacity();
-        assert!(cap >= 1024, "reserve under-allocated: cap={cap}");
-        for i in 0..1024 {
-            map.insert(i, i * 2);
-        }
-        for i in 0..1024 {
-            assert_eq!(map.get(&i), Some(&(i * 2)));
-        }
-        assert_eq!(map.len(), 1024);
-    }
-
-    #[test]
-    fn try_reserve_zero_additional_is_noop() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
-        let cap_before = map.capacity();
-        map.try_reserve(0).expect("noop");
-        assert_eq!(map.capacity(), cap_before);
-    }
-
-    #[test]
-    fn shrink_to_below_len_clamps_to_len() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(4096);
-        for i in 0..200 {
-            map.insert(i, i);
-        }
-        let cap_before = map.capacity();
-        map.shrink_to(0);
-        let cap_after = map.capacity();
-        assert!(cap_after < cap_before);
-        assert!(cap_after >= map.len());
-        for i in 0..200 {
-            assert_eq!(map.get(&i), Some(&i));
-        }
-    }
-
-    #[test]
-    fn iter_mut_yields_each_entry_exactly_once() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
-        for i in 0..80 {
-            map.insert(i, i * 3);
-        }
-        let mut collected: Vec<(i32, i32)> = map.iter_mut().map(|(&k, v)| (k, *v)).collect();
-        collected.sort_unstable();
-        let expected: Vec<(i32, i32)> = (0..80).map(|i| (i, i * 3)).collect();
-        assert_eq!(collected, expected);
-    }
-
-    #[test]
-    fn iter_mut_skips_tombstones() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
-        for i in 0..40 {
-            map.insert(i, i);
-        }
-        for i in (0..40).step_by(2) {
-            map.remove(&i);
-        }
-        let count = map.iter_mut().count();
-        assert_eq!(count, map.len());
-    }
-
-    #[test]
-    fn retain_with_empty_map_is_noop() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        let mut called = false;
-        map.retain(|_, _| {
-            called = true;
-            true
-        });
-        assert!(!called);
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn retain_can_mutate_values_in_place() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
-        for i in 0..40 {
-            map.insert(i, i);
-        }
-        map.retain(|k, v| {
-            *v += 100;
-            k % 2 == 0
-        });
-        assert_eq!(map.len(), 20);
-        for i in (0..40).step_by(2) {
-            assert_eq!(map.get(&i), Some(&(i + 100)));
-        }
-    }
-
-    #[test]
-    fn into_iter_yields_all_entries() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
-        for i in 0..60 {
-            map.insert(i, i * 11);
-        }
-        let mut collected: Vec<(i32, i32)> = map.into_iter().collect();
-        collected.sort_unstable();
-        let expected: Vec<(i32, i32)> = (0..60).map(|i| (i, i * 11)).collect();
-        assert_eq!(collected, expected);
-    }
-
-    #[test]
-    fn into_iter_skips_tombstones() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
-        for i in 0..60 {
-            map.insert(i, i);
-        }
-        for i in (0..60).step_by(3) {
-            map.remove(&i);
-        }
-        let expected_len = map.len();
-        let collected: Vec<(i32, i32)> = map.into_iter().collect();
-        assert_eq!(collected.len(), expected_len);
-    }
-
-    #[test]
-    fn into_keys_drops_values() {
-        struct DropCounter {
-            counter: Arc<AtomicUsize>,
-        }
-        impl Drop for DropCounter {
-            fn drop(&mut self) {
-                self.counter.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let n: usize = 32;
-        let mut map: FunnelHashMap<usize, DropCounter> = FunnelHashMap::with_capacity(64);
-        for i in 0..n {
-            map.insert(
-                i,
-                DropCounter {
-                    counter: Arc::clone(&counter),
-                },
-            );
-        }
-        let keys: Vec<usize> = map.into_keys().collect();
-        assert_eq!(keys.len(), n);
-        assert_eq!(counter.load(Ordering::SeqCst), n);
-    }
-
-    #[test]
-    fn into_values_drops_keys() {
-        struct DropKey {
-            id: usize,
-            counter: Arc<AtomicUsize>,
-        }
-        impl std::hash::Hash for DropKey {
-            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-                self.id.hash(state);
-            }
-        }
-        impl PartialEq for DropKey {
-            fn eq(&self, other: &Self) -> bool {
-                self.id == other.id
-            }
-        }
-        impl Eq for DropKey {}
-        impl Drop for DropKey {
-            fn drop(&mut self) {
-                self.counter.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let n: usize = 32;
-        let mut map: FunnelHashMap<DropKey, usize> = FunnelHashMap::with_capacity(64);
-        for i in 0..n {
-            map.insert(
-                DropKey {
-                    id: i,
-                    counter: Arc::clone(&counter),
-                },
-                i,
-            );
-        }
-        let vals: Vec<usize> = map.into_values().collect();
-        assert_eq!(vals.len(), n);
-        assert_eq!(counter.load(Ordering::SeqCst), n);
-    }
-
-    #[test]
-    fn iter_mut_partial_consume_then_drop() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
-        for i in 0..40 {
-            map.insert(i, i);
-        }
-        {
-            let mut it = map.iter_mut();
-            for _ in 0..7 {
-                if let Some((_, v)) = it.next() {
-                    *v += 1000;
-                }
-            }
-            // it drops here; map is still consistent.
-        }
-        assert_eq!(map.len(), 40);
-        for i in 0..40 {
-            assert!(map.get(&i).is_some(), "key {i} disappeared");
-        }
-    }
-
-    #[test]
-    fn into_iter_partial_drop_drops_remaining() {
-        struct DropCounter {
-            counter: Arc<AtomicUsize>,
-        }
-        impl Drop for DropCounter {
-            fn drop(&mut self) {
-                self.counter.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let n: usize = 50;
-        let mut map: FunnelHashMap<usize, DropCounter> = FunnelHashMap::with_capacity(128);
-        for i in 0..n {
-            map.insert(
-                i,
-                DropCounter {
-                    counter: Arc::clone(&counter),
-                },
-            );
-        }
-        let take = 12;
-        let mut it = map.into_iter();
-        let mut taken: Vec<(usize, DropCounter)> = Vec::with_capacity(take);
-        for _ in 0..take {
-            taken.push(it.next().expect("element"));
-        }
-        drop(it);
-        assert_eq!(counter.load(Ordering::SeqCst), n - take);
-        drop(taken);
-        assert_eq!(counter.load(Ordering::SeqCst), n);
-    }
-
-    #[test]
-    fn entry_or_insert_creates_when_missing() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        let value = map.entry(1).or_insert(10);
-        assert_eq!(*value, 10);
-        assert_eq!(map.get(&1), Some(&10));
-        assert_eq!(map.len(), 1);
-    }
-
-    #[test]
-    fn entry_or_insert_returns_existing() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        map.insert(1, 10);
-        let value = map.entry(1).or_insert(99);
-        assert_eq!(*value, 10);
-        assert_eq!(map.get(&1), Some(&10));
-        assert_eq!(map.len(), 1);
-    }
-
-    #[test]
-    fn entry_or_insert_with_lazy_default_not_called_on_hit() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        map.insert(1, 10);
-        let mut called = false;
-        let value = map.entry(1).or_insert_with(|| {
-            called = true;
-            42
-        });
-        assert_eq!(*value, 10);
-        assert!(!called, "default closure must not run on occupied entry");
-    }
-
-    #[test]
-    fn entry_or_insert_with_key_uses_key_in_default() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        let value = map.entry(7).or_insert_with_key(|k| k * 100);
-        assert_eq!(*value, 700);
-        assert_eq!(map.get(&7), Some(&700));
-    }
-
-    #[test]
-    fn entry_and_modify_runs_on_occupied() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        map.insert(1, 10);
-        let value = map.entry(1).and_modify(|v| *v += 5).or_insert(0);
-        assert_eq!(*value, 15);
-        assert_eq!(map.get(&1), Some(&15));
-    }
-
-    #[test]
-    fn entry_and_modify_skips_on_vacant() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        let mut touched = false;
-        let value = map.entry(1).and_modify(|_| touched = true).or_insert(42);
-        assert_eq!(*value, 42);
-        assert!(!touched);
-        assert_eq!(map.get(&1), Some(&42));
-    }
-
-    #[test]
-    fn entry_occupied_get_mut_mutates() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        map.insert(1, 10);
-        if let Entry::Occupied(mut occ) = map.entry(1) {
-            *occ.get_mut() = 99;
-            assert_eq!(*occ.get(), 99);
-        } else {
-            panic!("expected occupied");
-        }
-        assert_eq!(map.get(&1), Some(&99));
-    }
-
-    #[test]
-    fn entry_occupied_into_mut_outlives_entry_borrow() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        map.insert(1, 10);
-        let value: &mut i32 = match map.entry(1) {
-            Entry::Occupied(occ) => occ.into_mut(),
-            Entry::Vacant(_) => panic!("expected occupied"),
-        };
-        *value = 123;
-        assert_eq!(map.get(&1), Some(&123));
-    }
-
-    #[test]
-    fn entry_occupied_insert_returns_old_and_replaces() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        map.insert(1, 10);
-        if let Entry::Occupied(mut occ) = map.entry(1) {
-            let old = occ.insert(99);
-            assert_eq!(old, 10);
-        } else {
-            panic!("expected occupied");
-        }
-        assert_eq!(map.get(&1), Some(&99));
-    }
-
-    #[test]
-    fn entry_occupied_remove_returns_value() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        map.insert(1, 10);
-        map.insert(2, 20);
-        if let Entry::Occupied(occ) = map.entry(1) {
-            assert_eq!(occ.remove(), 10);
-        } else {
-            panic!("expected occupied");
-        }
-        assert!(map.get(&1).is_none());
-        assert_eq!(map.get(&2), Some(&20));
-        assert_eq!(map.len(), 1);
-    }
-
-    #[test]
-    fn entry_vacant_insert_returns_mut_ref() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        let value: &mut i32 = match map.entry(5) {
-            Entry::Vacant(vac) => vac.insert(50),
-            Entry::Occupied(_) => panic!("expected vacant"),
-        };
-        *value += 1;
-        assert_eq!(map.get(&5), Some(&51));
-    }
-
-    #[test]
-    fn try_insert_succeeds_when_missing() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        let value = map.try_insert(1, 10).expect("vacant should succeed");
-        assert_eq!(*value, 10);
-        assert_eq!(map.get(&1), Some(&10));
-    }
-
-    #[test]
-    fn try_insert_fails_with_occupied_error_when_present() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        map.insert(1, 10);
-        let err = map.try_insert(1, 99).expect_err("occupied must error");
-        assert_eq!(err.entry.key(), &1);
-        assert_eq!(err.entry.get(), &10);
-        assert_eq!(map.get(&1), Some(&10));
-    }
-
-    #[test]
-    fn try_insert_occupied_error_carries_rejected_value() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
-        map.insert(1, 10);
-        let err = map.try_insert(1, 99).expect_err("occupied must error");
-        assert_eq!(err.value, 99);
-    }
-
-    #[test]
-    fn drain_yields_all_entries_then_empties_map() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
-        for i in 0..60 {
-            map.insert(i, i * 7);
-        }
-        let mut collected: Vec<(i32, i32)> = map.drain().collect();
-        collected.sort_unstable();
-        let expected: Vec<(i32, i32)> = (0..60).map(|i| (i, i * 7)).collect();
-        assert_eq!(collected, expected);
-        assert!(map.is_empty());
-        assert_eq!(map.iter().count(), 0);
-        // Reuse after drain.
-        map.insert(999, 999);
-        assert_eq!(map.get(&999), Some(&999));
-    }
-
-    #[test]
-    fn drain_partial_consume_then_drop_still_empties_map() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
-        for i in 0..60 {
-            map.insert(i, i);
-        }
-        {
-            let mut drain = map.drain();
-            let _first = drain.next();
-            let _second = drain.next();
-            // Drop here without exhausting; remaining entries must still be
-            // freed and the map emptied (std semantics).
-        }
-        assert!(map.is_empty());
-        assert_eq!(map.iter().count(), 0);
-    }
-
-    #[test]
-    fn extract_if_partial_consume_then_drop_keeps_remaining_in_map() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
-        for i in 0..60 {
-            map.insert(i, i);
-        }
-        let original_len = map.len();
-        let extracted_count;
-        {
-            let mut it = map.extract_if(|_, _| true);
-            assert!(it.next().is_some());
-            assert!(it.next().is_some());
-            extracted_count = 2;
-        }
-        assert_eq!(map.len(), original_len - extracted_count);
-        let remaining: Vec<i32> = map.iter().map(|(&k, _)| k).collect();
-        assert_eq!(remaining.len(), original_len - extracted_count);
     }
 
     #[test]
@@ -4100,54 +3588,5 @@ mod tests {
             }
         }
         assert!(map.capacity() <= initial_capacity * 2);
-    }
-
-    #[test]
-    fn shrink_to_above_capacity_is_noop() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
-        for i in 0..20 {
-            map.insert(i, i);
-        }
-        let cap = map.capacity();
-        map.shrink_to(cap * 4);
-        assert_eq!(map.capacity(), cap);
-    }
-
-    #[test]
-    fn shrink_to_fit_reduces_capacity_when_sparse() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(4096);
-        for i in 0..2000 {
-            map.insert(i, i);
-        }
-        for i in 0..1800 {
-            map.remove(&i);
-        }
-        let cap_before = map.capacity();
-        map.shrink_to_fit();
-        assert!(map.capacity() < cap_before);
-        for i in 1800..2000 {
-            assert_eq!(map.get(&i), Some(&i));
-        }
-    }
-
-    #[test]
-    fn shrink_then_insert_works() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(2048);
-        for i in 0..400 {
-            map.insert(i, i * 3);
-        }
-        for i in 0..300 {
-            map.remove(&i);
-        }
-        map.shrink_to_fit();
-        for i in 0..100 {
-            assert_eq!(map.insert(i, i * 5), None);
-        }
-        for i in 0..100 {
-            assert_eq!(map.get(&i), Some(&(i * 5)));
-        }
-        for i in 300..400 {
-            assert_eq!(map.get(&i), Some(&(i * 3)));
-        }
     }
 }

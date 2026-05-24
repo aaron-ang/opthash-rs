@@ -7,13 +7,22 @@ use allocator_api2::boxed::Box;
 use super::TryReserveError;
 use super::bitmask::BitMask;
 use super::config::{CONTROL_ALIGN, GROUP_SIZE};
-use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
+use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use super::math::align;
 use super::simd;
 
 pub(crate) struct SlotEntry<K, V> {
     pub(crate) key: K,
     pub(crate) value: V,
+}
+
+impl<K: Clone, V: Clone> Clone for SlotEntry<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            value: self.value.clone(),
+        }
+    }
 }
 
 /// A flat hash table: one allocation holds slots then control bytes.
@@ -45,6 +54,74 @@ impl<T, A: Allocator> std::fmt::Debug for RawTable<T, A> {
             .field("capacity", &self.capacity)
             .field("group_count", &self.group_count)
             .finish_non_exhaustive()
+    }
+}
+
+impl<T: Clone, A: Allocator + Clone> Clone for RawTable<T, A> {
+    fn clone(&self) -> Self {
+        if self.capacity == 0 {
+            return Self::empty_in(self.alloc.clone());
+        }
+        let mut new = Self::new_in(self.capacity, self.alloc.clone());
+        // SAFETY: `new` was just allocated with the same shape as `self`; ctrls
+        // start at CTRL_EMPTY so unwinding mid-clone leaves `new` Drop-safe.
+        unsafe { new.clone_payload_from(self) };
+        new
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        if self.capacity != source.capacity {
+            // Capacity mismatch: cheapest to free + realloc via default path.
+            *self = source.clone();
+            return;
+        }
+        // Reuse the existing allocation: drop live entries (clearing the ctrl
+        // byte first so a panicking `T::drop` can't be re-entered by our own
+        // `Drop` during unwind), then re-clone from the source.
+        for idx in 0..self.capacity {
+            let ctrl = self.control_at(idx);
+            if ctrl.is_occupied() {
+                self.set_control(idx, CTRL_EMPTY);
+                // SAFETY: ctrl marked the slot as occupied; we cleared it
+                // first so a panic here leaves a Drop-safe table.
+                unsafe { self.drop_in_place(idx) };
+            } else if ctrl == CTRL_TOMBSTONE {
+                self.set_control(idx, CTRL_EMPTY);
+            }
+        }
+        if source.capacity == 0 {
+            return;
+        }
+        // SAFETY: capacities match (and thus group_count + layout); ctrls are
+        // all CTRL_EMPTY so partial-clone Drop only walks slots that have
+        // already been re-written.
+        unsafe { self.clone_payload_from(source) };
+    }
+}
+
+impl<T: Clone, A: Allocator + Clone> RawTable<T, A> {
+    /// Copy `source`'s control bytes + clone its occupied slots into `self`,
+    /// which must have matching capacity and all-EMPTY control bytes.
+    ///
+    /// # Safety
+    ///
+    /// `self.capacity == source.capacity` and every ctrl byte in `self` is
+    /// `CTRL_EMPTY` on entry.
+    unsafe fn clone_payload_from(&mut self, source: &Self) {
+        debug_assert_eq!(self.capacity, source.capacity);
+        debug_assert_eq!(self.group_count, source.group_count);
+        for idx in 0..source.capacity {
+            let ctrl = source.control_at(idx);
+            if ctrl.is_occupied() {
+                // SAFETY: source ctrl marks idx occupied; idx < capacity.
+                let cloned = unsafe { source.get_ref(idx) }.clone();
+                // Slot write precedes ctrl set, so a panic on a later clone
+                // leaves earlier slots in a Drop-safe state.
+                self.write_with_control(idx, cloned, ctrl);
+            } else if ctrl == CTRL_TOMBSTONE {
+                self.set_control(idx, CTRL_TOMBSTONE);
+            }
+        }
     }
 }
 
