@@ -18,8 +18,8 @@ use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     Values as CommonValues,
 };
-use crate::common::layout::{OccupiedCursor, RawTable, SlotEntry, try_zeroed_boxed_slice_in};
-use crate::common::math::{align, capacity, cast, level_salt, probe};
+use crate::common::layout::{self, OccupiedCursor, RawTable, SlotEntry};
+use crate::common::math::{self, align, capacity, cast, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
 /// Construction-time tuning for `FunnelHashMap`.
@@ -280,7 +280,7 @@ impl<K, V, A: Allocator + Clone> SpecialPrimary<K, V, A> {
             len: 0,
             tombstones: 0,
             group_count_mask: group_count.saturating_sub(1),
-            group_summaries: try_zeroed_boxed_slice_in(group_count, alloc)
+            group_summaries: layout::try_zeroed_boxed_slice_in(group_count, alloc)
                 .expect("group_summaries alloc"),
         }
     }
@@ -291,7 +291,7 @@ impl<K, V, A: Allocator + Clone> SpecialPrimary<K, V, A> {
         let table = RawTable::try_new_in(inflated, alloc.clone())
             .map_err(|()| TryReserveError::AllocError)?;
         let group_count = table.group_count();
-        let group_summaries = try_zeroed_boxed_slice_in(group_count, alloc)?;
+        let group_summaries = layout::try_zeroed_boxed_slice_in(group_count, alloc)?;
         Ok(Self {
             table,
             len: 0,
@@ -711,7 +711,7 @@ where
                 BucketLevel::with_bucket_count_in(
                     bucket_count,
                     bucket_width,
-                    level_salt(level_idx),
+                    math::level_salt(level_idx),
                     alloc.clone(),
                 )
             })
@@ -1487,7 +1487,7 @@ where
             levels.push(BucketLevel::try_with_bucket_count_in(
                 bucket_count,
                 bucket_width,
-                level_salt(level_idx),
+                math::level_salt(level_idx),
                 alloc.clone(),
             )?);
         }
@@ -1535,7 +1535,7 @@ where
                 BucketLevel::with_bucket_count_in(
                     bucket_count,
                     bucket_width,
-                    level_salt(level_idx),
+                    math::level_salt(level_idx),
                     self.alloc.clone(),
                 )
             })

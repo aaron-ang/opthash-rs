@@ -1,5 +1,5 @@
 use super::config::GROUP_SIZE;
-use super::simd::{eq_mask_32, match_fingerprint_group_u32};
+use super::simd;
 
 /// Empty-slot sentinel control byte.
 pub(crate) const CTRL_EMPTY: u8 = 0;
@@ -118,8 +118,8 @@ fn preferred_group_width() -> usize {
 #[must_use]
 pub(crate) fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u32 {
     match chunk.len() {
-        GROUP_SIZE => match_fingerprint_group_u32(chunk.as_ptr(), target),
-        32 => unsafe { eq_mask_32(chunk.as_ptr(), target) },
+        GROUP_SIZE => simd::match_fingerprint_group_u32(chunk.as_ptr(), target),
+        32 => unsafe { simd::eq_mask_32(chunk.as_ptr(), target) },
         _ => panic!("group matching requires 16 or 32 byte chunks"),
     }
 }

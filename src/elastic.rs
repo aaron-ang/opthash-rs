@@ -19,7 +19,7 @@ use crate::common::iter::{
     Values as CommonValues,
 };
 use crate::common::layout::{OccupiedCursor, RawTable, SlotEntry};
-use crate::common::math::{align, capacity, cast, level_salt, probe};
+use crate::common::math::{self, align, capacity, cast, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
 /// Construction-time tuning for `ElasticHashMap`.
@@ -114,7 +114,7 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
         Self {
             table,
             len: 0,
-            salt: level_salt(level_idx),
+            salt: math::level_salt(level_idx),
             group_count_mask: group_count.wrapping_sub(1),
             tombstones: 0,
             half_reserve_slot_threshold: capacity::floor_half_reserve_slots(
@@ -146,7 +146,7 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
         Ok(Self {
             table,
             len: 0,
-            salt: level_salt(level_idx),
+            salt: math::level_salt(level_idx),
             group_count_mask: group_count.wrapping_sub(1),
             tombstones: 0,
             half_reserve_slot_threshold: capacity::floor_half_reserve_slots(

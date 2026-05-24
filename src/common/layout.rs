@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 
-use allocator_api2::alloc::{Allocator, Global, Layout, handle_alloc_error};
+use allocator_api2::alloc::{self, Allocator, Global, Layout};
 use allocator_api2::boxed::Box;
 
 use super::TryReserveError;
@@ -9,7 +9,7 @@ use super::bitmask::BitMask;
 use super::config::{CONTROL_ALIGN, GROUP_SIZE};
 use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
 use super::math::align;
-use super::simd::{eq_mask_16, free_mask_16, occupied_mask_16, prefetch_read};
+use super::simd;
 
 pub(crate) struct SlotEntry<K, V> {
     pub(crate) key: K,
@@ -69,7 +69,7 @@ impl<T, A: Allocator> RawTable<T, A> {
 
         let data_ptr = alloc
             .allocate_zeroed(layout)
-            .unwrap_or_else(|_| handle_alloc_error(layout))
+            .unwrap_or_else(|_| alloc::handle_alloc_error(layout))
             .cast::<u8>();
         // SAFETY: `ctrl_offset` is within the allocation produced for `layout`.
         let ctrl_raw = unsafe { data_ptr.as_ptr().add(ctrl_offset) };
@@ -197,7 +197,7 @@ impl<T, A: Allocator> RawTable<T, A> {
         );
         // SAFETY: caller upholds `capacity > 0` and `idx < capacity`.
         unsafe {
-            prefetch_read(self.slots_ptr().add(idx).cast::<u8>());
+            simd::prefetch_read(self.slots_ptr().add(idx).cast::<u8>());
         }
     }
 
@@ -217,7 +217,7 @@ impl<T, A: Allocator> RawTable<T, A> {
             self.group_count
         );
         // SAFETY: caller upholds `capacity > 0` and `group_idx < group_count`.
-        unsafe { prefetch_read(self.ctrl_ptr().add(group_idx * GROUP_SIZE)) };
+        unsafe { simd::prefetch_read(self.ctrl_ptr().add(group_idx * GROUP_SIZE)) };
     }
 
     #[inline]
@@ -267,7 +267,7 @@ impl<T, A: Allocator> RawTable<T, A> {
     pub fn erase(&mut self, idx: usize) -> bool {
         let group_idx = idx / GROUP_SIZE;
         let ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        let group_has_empty = unsafe { eq_mask_16(ptr, CTRL_EMPTY).any() };
+        let group_has_empty = unsafe { simd::eq_mask_16(ptr, CTRL_EMPTY).any() };
         if group_has_empty {
             self.set_control(idx, CTRL_EMPTY);
             false
@@ -335,7 +335,7 @@ impl<T, A: Allocator> RawTable<T, A> {
             self.group_count
         );
         let ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        unsafe { eq_mask_16(ptr, target) }
+        unsafe { simd::eq_mask_16(ptr, target) }
     }
 
     #[inline]
@@ -346,7 +346,7 @@ impl<T, A: Allocator> RawTable<T, A> {
             self.group_count
         );
         let ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        unsafe { free_mask_16(ptr) }
+        unsafe { simd::free_mask_16(ptr) }
     }
 
     #[inline]
@@ -372,7 +372,7 @@ impl<T, A: Allocator> RawTable<T, A> {
             }
             let group_idx = cursor.next_group_slot / GROUP_SIZE;
             let group_ptr = self.group_data_ptr(group_idx);
-            let mut mask = unsafe { occupied_mask_16(group_ptr) };
+            let mut mask = unsafe { simd::occupied_mask_16(group_ptr) };
             let group_end = cursor.next_group_slot + GROUP_SIZE;
             if group_end > self.capacity {
                 mask = mask.truncate_to(self.capacity - cursor.next_group_slot);
