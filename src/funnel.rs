@@ -195,6 +195,14 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
         Q: Eq + ?Sized,
     {
         if self.len == 0 {
+            // Empty level: no key here, but record the chosen bucket's first
+            // slot for the insert path so the candidate isn't lost. Skip if
+            // the level has zero capacity (partition allocated none here).
+            if candidate.wants_free() && self.table.capacity() > 0 {
+                let bucket_idx = self.bucket_index(key_hash);
+                let bucket_start = bucket_idx << self.bucket_size_log2;
+                candidate.record(Some(bucket_start));
+            }
             return LookupStep::Continue;
         }
 
@@ -1657,11 +1665,12 @@ where
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
-    /// Search bucket levels `L_0..=L_{max_populated}` for `key`. See
-    /// [`Candidate`] for tracking modes. Returns `Some(SlotLocation::Level)`
-    /// on hit; on miss returns `None` and `candidate` holds the first
-    /// non-full bucket's free slot (if any) when `Candidate::Track` was
-    /// requested.
+    /// Paper §5: walk every `A_1..A_α` once, in order, stopping on the first
+    /// `StopSearch` (free slot in the chosen bucket). On hit returns
+    /// `Some(SlotLocation::Level)`; on miss returns `None` and `candidate`
+    /// holds the earliest level's free slot when `Candidate::Track` was
+    /// requested — i.e. inserts spill into deeper bucket levels before
+    /// reaching the special array, matching the paper's routing.
     #[inline]
     fn find_in_levels<Q>(
         &self,
@@ -1677,8 +1686,7 @@ where
         let wants_free = candidate.wants_free();
         let mut local: Option<SlotLocation> = None;
 
-        let search_limit = (self.max_populated_level + 1).min(self.levels.len());
-        for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
+        for (level_idx, level) in self.levels.iter().enumerate() {
             // Per-level slot tracking, only while we still want a candidate.
             let mut slot_candidate: Option<usize> = None;
             let level_mode = if wants_free && local.is_none() {
@@ -3521,6 +3529,47 @@ mod tests {
             initial_capacity,
             "retain must not change the slot count, only rehash in place"
         );
+    }
+
+    #[test]
+    fn bucket_overflow_promotes_max_populated_level() {
+        // Paper §5: A_{i,j} bucket overflow spills into A_{i+1}, never
+        // skipping bucket levels for the special array. Force the spill
+        // deterministically with a constant hasher so every key targets the
+        // same L0 bucket — past `bucket_size` inserts, overflow must land in
+        // L1 and bump `max_populated_level`.
+        struct ConstHasher;
+        impl std::hash::Hasher for ConstHasher {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, _: &[u8]) {}
+        }
+        #[derive(Default, Clone)]
+        struct ConstHashBuilder;
+        impl std::hash::BuildHasher for ConstHashBuilder {
+            type Hasher = ConstHasher;
+            fn build_hasher(&self) -> Self::Hasher {
+                ConstHasher
+            }
+        }
+
+        let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
+            FunnelHashMap::with_capacity_and_hasher(2048, ConstHashBuilder);
+        assert!(map.levels.len() > 1, "test requires multi-level layout");
+        let l0_bucket_size = 1usize << map.levels[0].bucket_size_log2;
+        // One bucket holds at most `l0_bucket_size` keys; the next key over
+        // the limit must spill into L1.
+        for i in 0..(l0_bucket_size as i32 + 1) {
+            map.insert(i, i);
+        }
+        assert_eq!(
+            map.max_populated_level, 1,
+            "first bucket overflow should land in A_1, not the special array"
+        );
+        for i in 0..(l0_bucket_size as i32 + 1) {
+            assert_eq!(map.get(&i), Some(&i));
+        }
     }
 
     #[test]
