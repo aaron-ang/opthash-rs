@@ -67,7 +67,7 @@ fn build_funnel_options(
 
 /// Type tag packed into `HashedAny::tagged`'s low bits so `PartialEq` skips
 /// `Py_TYPE` re-dispatch for str/str and int/int compares.
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 #[repr(usize)]
 enum HashKind {
     Other = 0,

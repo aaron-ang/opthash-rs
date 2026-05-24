@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 /// Error returned by `try_reserve` when the map can't grow.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum TryReserveError {
     /// Capacity computation overflowed `usize`.
     CapacityOverflow,
