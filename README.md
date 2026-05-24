@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/opthash?logo=python&logoColor=white)](https://pypi.org/project/opthash/)
 [![CI](https://github.com/aaron-ang/opthash-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/aaron-ang/opthash-rs/actions/workflows/ci.yml)
 [![Python Release](https://github.com/aaron-ang/opthash-rs/actions/workflows/python-release.yml/badge.svg?branch=main)](https://github.com/aaron-ang/opthash-rs/actions/workflows/python-release.yml)
-[![Release-plz](https://github.com/aaron-ang/opthash-rs/actions/workflows/release-plz.yml/badge.svg?branch=main)](https://github.com/aaron-ang/opthash-rs/actions/workflows/release-plz.yml)
+[![Rust Release](https://github.com/aaron-ang/opthash-rs/actions/workflows/release-plz.yml/badge.svg?branch=main)](https://github.com/aaron-ang/opthash-rs/actions/workflows/release-plz.yml)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/aaron-ang/opthash-rs?utm_source=badge)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
