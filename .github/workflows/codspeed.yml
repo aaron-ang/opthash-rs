@@ -25,14 +25,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-codspeed
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: codspeed-rust-${{ hashFiles('Cargo.lock') }}
-          restore-keys: codspeed-rust-
+      - uses: Swatinem/rust-cache@v2
       - name: Build benchmarks
         run: cargo codspeed build --bench speedup
       - uses: CodSpeedHQ/action@v4
