@@ -273,6 +273,7 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for BucketLevel<K, V, A> {
 
 /// Odd-step probe over pow2 group count (paper §5 `SpecialPrimary`). Step is
 /// coprime to `group_count` ⇒ visits every group within `group_count` advances.
+/// Per-key step decorrelates probe paths across keys that share a start group.
 struct ProbeSeq {
     group: usize,
     step: usize,

@@ -215,23 +215,21 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
 
         let group_count = self.table.group_count();
         let mask = self.group_count_mask;
-        let mut group_idx = self.triangular_group_start(key_hash);
-        let mut delta: usize = 0;
+        let mut probe = probe::TriangularProbe::new(self.triangular_group_start(key_hash));
 
         for _ in 0..group_count {
-            let match_mask = self.table.group_match_mask(group_idx, key_fingerprint);
+            let match_mask = self.table.group_match_mask(probe.pos, key_fingerprint);
             for relative_idx in match_mask {
-                let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                let slot_idx = probe.pos * GROUP_SIZE + relative_idx;
                 let entry = unsafe { self.table.get_ref(slot_idx) };
                 if entry.key.borrow() == key {
                     return Some(slot_idx);
                 }
             }
-            if self.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
+            if self.table.group_match_mask(probe.pos, CTRL_EMPTY).any() {
                 return None;
             }
-            delta += 1;
-            group_idx = (group_idx + delta) & mask;
+            probe.advance(mask);
         }
         None
     }
@@ -1900,14 +1898,12 @@ where
         let group_count = level.table.group_count();
         let max_groups = max_groups.min(group_count.max(1));
         let mask = level.group_count_mask;
-        let mut group_idx = level.triangular_group_start(key_hash);
-        let mut delta: usize = 0;
+        let mut probe = probe::TriangularProbe::new(level.triangular_group_start(key_hash));
         for _ in 0..max_groups {
-            if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
+            if let Some(slot_idx) = level.table.first_free_in_group(probe.pos) {
                 return Some(slot_idx);
             }
-            delta += 1;
-            group_idx = (group_idx + delta) & mask;
+            probe.advance(mask);
         }
         None
     }
@@ -1923,14 +1919,12 @@ where
 
         let group_count = level.table.group_count();
         let mask = level.group_count_mask;
-        let mut group_idx = level.triangular_group_start(key_hash);
-        let mut delta: usize = 0;
+        let mut probe = probe::TriangularProbe::new(level.triangular_group_start(key_hash));
         for _ in 0..group_count {
-            if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
+            if let Some(slot_idx) = level.table.first_free_in_group(probe.pos) {
                 return Some(slot_idx);
             }
-            delta += 1;
-            group_idx = (group_idx + delta) & mask;
+            probe.advance(mask);
         }
         None
     }
