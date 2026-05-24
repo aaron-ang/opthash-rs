@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Run a Criterion bench with low-noise mitigations applied.
 #
-# Default (no sudo): pins to one core via taskset and disables ASLR via setarch.
+# Default (no sudo): pins to one core via taskset, disables ASLR via setarch,
+# and (if numactl is present and the host is multi-node) binds memory to the
+# pinned core's NUMA node.
 # Optional (with sudo): also sets the perf governor, disables Intel turbo, and
 # runs at SCHED_FIFO/99. The script gracefully degrades — sudo is not required.
 #
@@ -9,18 +11,32 @@
 # (cores at max cpufreq) via flock so concurrent runs don't collide. Falls
 # back to the full cluster CPU list when every core is claimed.
 #
-# Optional env knobs:
+# Env knobs:
 #   BENCH=all        cargo bench --bench target (default all = speedup + latency)
-#   CORE=            physical core to pin to via taskset; auto-claim if unset
-#   BASELINE=        if set, passes --baseline <name>; else --save-baseline ref
-#   LOCK_DIR=        per-core flock files (default /tmp/opthash-bench-locks)
+#   SAVE=            --save-baseline <name>; runs the bench and stores results
+#                    under <name>. Default: ref (only when neither BASELINE nor
+#                    LOAD is set).
+#   BASELINE=        --baseline <name>; compares against an existing baseline
+#                    without overwriting it.
+#   LOAD=            --load-baseline <name>; loads stored samples instead of
+#                    re-measuring. Use with BASELINE=other to compare two
+#                    stored baselines without rerunning. Implies a comparison
+#                    against BASELINE (defaults to ref).
+#
+# Common workflows:
+#   scripts/bench.sh                      # save baseline "ref"
+#   SAVE=attempt-a scripts/bench.sh       # store this run as "attempt-a"
+#   LOAD=attempt-a scripts/bench.sh       # compare attempt-a vs ref (no rerun)
+#   LOAD=attempt-a BASELINE=attempt-b scripts/bench.sh  # a vs b (no rerun)
 #
 # Forwarded args (after `--`) are appended to the Criterion command line
 
 set -euo pipefail
 
 BENCH=${BENCH:-all}
+SAVE=${SAVE:-}
 BASELINE=${BASELINE:-}
+LOAD=${LOAD:-}
 LOCK_DIR=${LOCK_DIR:-/tmp/opthash-bench-locks}
 
 # Low-noise primitives below are Linux-only; elsewhere we fall through to
@@ -109,8 +125,12 @@ if ((IS_LINUX)) && [[ $EUID -eq 0 ]]; then
 	fi
 fi
 
-if [[ -n "$BASELINE" ]]; then
+if [[ -n "$LOAD" ]]; then
+	criterion_args=(--load-baseline "$LOAD" --baseline "${BASELINE:-ref}")
+elif [[ -n "$BASELINE" ]]; then
 	criterion_args=(--baseline "$BASELINE")
+elif [[ -n "$SAVE" ]]; then
+	criterion_args=(--save-baseline "$SAVE")
 else
 	criterion_args=(--save-baseline ref)
 fi
@@ -121,7 +141,29 @@ else
 	bench_targets=("$BENCH")
 fi
 
-# Under sudo, prefix chrt and drop back to invoking user so build artifacts
+# Linux: use `taskset` to pin core and `setarch` to disable ASLR.
+pin_wrapper=()
+if ((IS_LINUX)) && [[ -n "${CORE:-}" ]]; then
+	pin_wrapper=(taskset -c "$CORE" setarch -R)
+fi
+
+# NUMA: bind memory to the node that owns the pinned core
+# so cache misses don't traverse the inter-socket interconnect.
+numa_wrapper=()
+if ((IS_LINUX)) && command -v numactl >/dev/null 2>&1 && [[ -n "${CORE:-}" ]]; then
+	node_count=$(find /sys/devices/system/node -maxdepth 1 -name 'node[0-9]*' -type d 2>/dev/null | wc -l)
+	if ((node_count > 1)); then
+		first_core=${CORE%%,*}
+		node_dir=$(find "/sys/devices/system/cpu/cpu${first_core}" -maxdepth 1 -name 'node[0-9]*' 2>/dev/null | head -1)
+		if [[ -n "$node_dir" ]]; then
+			numa_node=${node_dir##*/node}
+			numa_wrapper=(numactl --membind="$numa_node")
+			echo "info: NUMA pinning memory to node $numa_node" >&2
+		fi
+	fi
+fi
+
+# sudo: prefix chrt and drop back to invoking user so build artifacts
 # stay user-owned. SCHED_FIFO survives the UID drop (process attribute).
 launcher=()
 if ((IS_LINUX)) && [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v chrt >/dev/null 2>&1; then
@@ -129,12 +171,7 @@ if ((IS_LINUX)) && [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v chrt >
 		--preserve-env=PATH,CARGO_HOME,RUSTUP_HOME --)
 fi
 
-pin_wrapper=()
-if ((IS_LINUX)) && [[ -n "${CORE:-}" ]]; then
-	pin_wrapper=(taskset -c "$CORE" setarch -R)
-fi
-
 for target in "${bench_targets[@]}"; do
-	cmd=("${pin_wrapper[@]}" cargo bench --bench "$target" -- "${criterion_args[@]}" "$@")
+	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" cargo bench --bench "$target" -- "${criterion_args[@]}" "$@")
 	"${launcher[@]}" "${cmd[@]}"
 done

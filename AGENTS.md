@@ -27,23 +27,26 @@ Criterion suite comparing `ElasticHashMap`, `FunnelHashMap`, `std::HashMap`, `ha
 **Always use `scripts/bench.sh` for results you'll act on.** Raw `cargo bench` is unpinned — wall-clock noise can swing ±10% and flip the sign of real ±5% changes. Use raw cargo only for smoke runs / single-filter iteration.
 
 ```bash
-scripts/bench.sh                            # baseline → "ref"
-# … apply change …
-BASELINE=ref scripts/bench.sh               # compare vs ref
+scripts/bench.sh                            # measure + save as "ref"
+SAVE=opt1 scripts/bench.sh                  # measure + save as "opt1"
+LOAD=opt1 scripts/bench.sh                  # opt1 vs ref (no rerun)
+LOAD=opt1 BASELINE=opt2 scripts/bench.sh    # opt1 vs opt2 (no rerun)
 ```
+
+For A/B many optimizations against the same anchor: `SAVE=optN` each variant, then `LOAD=optN` to compare offline. Stored baselines persist in `target/criterion/`.
 
 - Wraps `cargo bench` with `taskset -c $CORE` + `setarch -R` (no privileges). `sudo` adds governor=performance, turbo off, SCHED_FIFO/99; drops back to `$SUDO_USER` for cargo.
 - `BENCH=all` (default) runs `speedup` then `latency`; set `BENCH=speedup|latency` for single-target.
-- Re-pin `ref` when env changes (sudo vs not, core pin) — baselines are wall-clock.
-- Pass through flags: `BASELINE=ref scripts/bench.sh -- --measurement-time 10`. Criterion name filter: `scripts/bench.sh -- "get_hit_latency"`.
+- Re-save `ref` when env changes (sudo vs not, core pin) — baselines are wall-clock.
+- Pass through flags: `SAVE=ref scripts/bench.sh -- --measurement-time 10`. Criterion name filter: `scripts/bench.sh -- "get_hit_latency"`.
 - `latency` bench writes histograms to `target/latency/` and ignores `--baseline`.
 
 **Read results from JSON, not stdout** (stdout truncates + mixes runs):
 
 - `target/criterion/<group>/<variant>/new/estimates.json` — absolute ns (`mean.point_estimate`)
-- `target/criterion/<group>/<variant>/change/estimates.json` — fractional change vs prev (e.g. +0.05 = 5% slower)
+- `target/criterion/<group>/<variant>/change/estimates.json` — fractional change vs the baseline this run compared against (e.g. +0.05 = 5% slower)
 
-Example: `target/criterion/get_hit_throughput/elastic/change/estimates.json`
+Variants are `<op>_<impl>` per [benches/speedup.rs](benches/speedup.rs) (e.g. `get_hit_funnel`, `insert_elastic`). Example: `target/criterion/get_hit_throughput/get_hit_funnel/change/estimates.json`.
 
 ### Latency-chart harnesses
 
