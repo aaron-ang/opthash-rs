@@ -148,6 +148,7 @@ pub(crate) unsafe fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
 ///
 /// `ptr` must be a valid, aligned pointer to readable memory (or null, in which
 /// case the prefetch is silently ignored by the hardware).
+#[allow(dead_code)]
 #[inline]
 pub(crate) unsafe fn prefetch_read(ptr: *const u8) {
     // aarch64 arm gated off Miri: it can't model inline asm.

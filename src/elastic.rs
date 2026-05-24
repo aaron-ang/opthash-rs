@@ -209,10 +209,6 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
         let mut delta: usize = 0;
 
         for _ in 0..group_count {
-            // Warm slot data while SIMD scan runs.
-            // SAFETY: `self.len > 0` ⇒ `capacity > 0`; `group_idx <
-            // group_count` ⇒ `group_idx * GROUP_SIZE < capacity`.
-            unsafe { self.table.prefetch_slot(group_idx * GROUP_SIZE) };
             let match_mask = self.table.group_match_mask(group_idx, key_fingerprint);
             for relative_idx in match_mask {
                 let slot_idx = group_idx * GROUP_SIZE + relative_idx;

@@ -7,8 +7,6 @@ use std::mem;
 use std::ops::{ControlFlow, Range};
 use std::ptr;
 
-use allocator_api2::boxed::Box as ABox;
-
 use crate::common::config::{
     DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY, MAX_FUNNEL_RESERVE_FRACTION,
 };
@@ -18,7 +16,7 @@ use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     Values as CommonValues,
 };
-use crate::common::layout::{self, OccupiedCursor, RawTable, SlotEntry};
+use crate::common::layout::{OccupiedCursor, RawTable, SlotEntry};
 use crate::common::math::{self, align, capacity, cast, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
@@ -222,8 +220,6 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
             unsafe { std::hint::unreachable_unchecked() };
         }
         let group_idx = bucket_range.start / GROUP_SIZE;
-        // SAFETY: `len > 0` ⇒ `capacity > 0`; `bucket_range.start < capacity`.
-        unsafe { self.table.prefetch_slot(bucket_range.start) };
 
         for relative_idx in self.table.group_match_mask(group_idx, key_fingerprint) {
             let slot_idx = bucket_range.start + relative_idx;
@@ -289,8 +285,6 @@ struct SpecialPrimary<K, V, A: Allocator = Global> {
     /// `group_count - 1`. `group_count` is pow2 by construction,
     ///  so `(idx + step) & mask` wraps in one op.
     group_count_mask: usize,
-    /// Per-group packed fingerprint metadata for fast scans.
-    group_summaries: ABox<[u128], A>,
 }
 
 impl<K, V, A: Allocator + Clone> SpecialPrimary<K, V, A> {
@@ -307,24 +301,20 @@ impl<K, V, A: Allocator + Clone> SpecialPrimary<K, V, A> {
             len: 0,
             tombstones: 0,
             group_count_mask: group_count.saturating_sub(1),
-            group_summaries: layout::try_zeroed_boxed_slice_in(group_count, alloc)
-                .expect("group_summaries alloc"),
         }
     }
 
     /// Fallible counterpart to [`SpecialPrimary::with_capacity_in`].
     fn try_with_capacity_in(capacity: usize, alloc: A) -> Result<Self, TryReserveError> {
         let inflated = align::round_up_to_pow2_groups(capacity);
-        let table = RawTable::try_new_in(inflated, alloc.clone())
-            .map_err(|()| TryReserveError::AllocError)?;
+        let table =
+            RawTable::try_new_in(inflated, alloc).map_err(|()| TryReserveError::AllocError)?;
         let group_count = table.group_count();
-        let group_summaries = layout::try_zeroed_boxed_slice_in(group_count, alloc)?;
         Ok(Self {
             table,
             len: 0,
             tombstones: 0,
             group_count_mask: group_count.saturating_sub(1),
-            group_summaries,
         })
     }
 
@@ -355,7 +345,6 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for SpecialPrimary<K, V, A>
             len: self.len,
             tombstones: self.tombstones,
             group_count_mask: self.group_count_mask,
-            group_summaries: self.group_summaries.clone(),
         }
     }
 
@@ -364,7 +353,6 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for SpecialPrimary<K, V, A>
         self.len = source.len;
         self.tombstones = source.tombstones;
         self.group_count_mask = source.group_count_mask;
-        self.group_summaries.clone_from(&source.group_summaries);
     }
 }
 
@@ -1439,7 +1427,6 @@ where
         self.special.primary.table.clear_all_controls();
         self.special.primary.len = 0;
         self.special.primary.tombstones = 0;
-        self.special.primary.group_summaries.fill(0);
 
         for idx in 0..self.special.fallback.table.capacity() {
             if self.special.fallback.table.control_at(idx).is_occupied() {
@@ -1492,7 +1479,6 @@ where
         self.special.primary.table.clear_all_controls();
         self.special.primary.len = 0;
         self.special.primary.tombstones = 0;
-        self.special.primary.group_summaries.fill(0);
 
         self.special
             .fallback
@@ -1801,7 +1787,6 @@ where
                 }
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
-                let group_idx = slot_idx / GROUP_SIZE;
                 let primary = &mut self.special.primary;
                 // Reusing a tombstone slot must decrement the counter;
                 // otherwise resize triggers on stale-since-resize counts.
@@ -1812,7 +1797,6 @@ where
                     key_fingerprint,
                 );
                 primary.len += 1;
-                primary.group_summaries[group_idx] |= control::fingerprint_bit(key_fingerprint);
                 if was_tombstone {
                     primary.tombstones -= 1;
                 }
@@ -1902,7 +1886,6 @@ where
             return LookupStep::Continue;
         }
 
-        let fingerprint_mask = control::fingerprint_bit(key_fingerprint);
         let group_count = primary.table.group_count();
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
@@ -1924,13 +1907,11 @@ where
                 } else {
                     primary.table.group_match_mask(group_idx, CTRL_EMPTY).any()
                 };
-                if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
-                    for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
-                        let slot_idx = group_idx * GROUP_SIZE + relative_idx;
-                        let entry = unsafe { primary.table.get_ref(slot_idx) };
-                        if entry.key.borrow() == key {
-                            break 'probe LookupStep::Found(slot_idx);
-                        }
+                for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
+                    let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                    let entry = unsafe { primary.table.get_ref(slot_idx) };
+                    if entry.key.borrow() == key {
+                        break 'probe LookupStep::Found(slot_idx);
                     }
                 }
                 // StopSearch: probe chain terminated naturally — an EMPTY
@@ -1944,11 +1925,7 @@ where
                 {
                     break 'probe LookupStep::StopSearch;
                 }
-                let next = (group_idx + step) & mask;
-                // SAFETY: `primary.len > 0` ⇒ `capacity > 0`; `next` is wrapped
-                // by `group_count_mask` so `next < group_count`.
-                unsafe { primary.table.prefetch_group_controls(next) };
-                group_idx = next;
+                group_idx = (group_idx + step) & mask;
             }
             LookupStep::Continue
         };
@@ -2604,7 +2581,6 @@ impl<K, V, S, A: Allocator + Clone> Drop for Drain<'_, K, V, S, A> {
         self.map.special.primary.table.clear_all_controls();
         self.map.special.primary.len = 0;
         self.map.special.primary.tombstones = 0;
-        self.map.special.primary.group_summaries.fill(0);
         self.map.special.fallback.table.clear_all_controls();
         self.map.special.fallback.len = 0;
         self.map.special.fallback.tombstones = 0;

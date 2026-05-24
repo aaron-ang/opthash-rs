@@ -40,12 +40,6 @@ pub(crate) fn control_fingerprint(hash: u64) -> u8 {
 
 #[inline]
 #[must_use]
-pub(crate) fn fingerprint_bit(fingerprint: u8) -> u128 {
-    1u128 << u32::from(fingerprint.saturating_sub(1))
-}
-
-#[inline]
-#[must_use]
 pub(crate) fn find_next_fingerprint_in_controls(
     controls: &[u8],
     fingerprint: u8,

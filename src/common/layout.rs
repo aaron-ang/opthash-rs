@@ -2,9 +2,7 @@ use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 
 use allocator_api2::alloc::{self, Allocator, Global, Layout};
-use allocator_api2::boxed::Box;
 
-use super::TryReserveError;
 use super::bitmask::BitMask;
 use super::config::{CONTROL_ALIGN, GROUP_SIZE};
 use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
@@ -274,6 +272,7 @@ impl<T, A: Allocator> RawTable<T, A> {
     ///
     /// `capacity > 0 && idx < capacity`. Empty tables hold a dangling
     /// `data_ptr` — any `.add(idx)` on it would be UB.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) unsafe fn prefetch_slot(&self, idx: usize) {
         debug_assert!(self.capacity > 0, "prefetch_slot: empty table");
@@ -295,6 +294,7 @@ impl<T, A: Allocator> RawTable<T, A> {
     ///
     /// `capacity > 0 && group_idx < group_count` — empty tables hold a
     /// dangling `ctrl_ptr`, so a nonzero offset would be UB.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) unsafe fn prefetch_group_controls(&self, group_idx: usize) {
         debug_assert!(self.capacity > 0, "prefetch_group_controls: empty table");
@@ -505,18 +505,6 @@ impl OccupiedCursor {
             current_mask: BitMask(0),
         }
     }
-}
-
-/// Fallibly allocates a zero-filled `Box<[T], A>`.
-/// Caller must ensure all-zero bytes are a valid value for `T`.
-pub(crate) fn try_zeroed_boxed_slice_in<T, A: Allocator>(
-    len: usize,
-    alloc: A,
-) -> Result<Box<[T], A>, TryReserveError> {
-    let uninit =
-        Box::try_new_zeroed_slice_in(len, alloc).map_err(|_| TryReserveError::AllocError)?;
-    // SAFETY: zero-initialized buffer; doc bounds `T` to zero-valid types.
-    Ok(unsafe { uninit.assume_init() })
 }
 
 #[cfg(test)]
