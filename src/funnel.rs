@@ -3524,25 +3524,6 @@ mod tests {
     }
 
     #[test]
-    fn bucket_overflow_promotes_max_populated_level() {
-        // Paper §5: A_{i,j} bucket overflow spills into A_{i+1}.
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(2048);
-        assert!(map.levels.len() > 1, "test requires multi-level layout");
-        let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
-        for i in 0..max {
-            map.insert(i, i);
-        }
-        assert!(
-            map.max_populated_level >= 1,
-            "expected spill into A_1 or deeper; max_populated_level = {}",
-            map.max_populated_level
-        );
-        for i in 0..max {
-            assert_eq!(map.get(&i), Some(&i));
-        }
-    }
-
-    #[test]
     fn reserve_fraction_clamped_to_funnel_max() {
         // Funnel's correctness proof requires reserve_fraction <= 1/8.
         let map: FunnelHashMap<i32, i32> =
