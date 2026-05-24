@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "nightly", feature(allocator_api))]
+
 //! Parity tests against `hashbrown::HashMap`, ported from
 //! `hashbrown-0.17/src/map.rs::test_map` and run via macro against both maps.
 //!
