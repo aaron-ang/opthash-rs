@@ -15,6 +15,19 @@ permissions:
   contents: read
 
 jobs:
+  conclusion:
+    needs: [pre-commit, rust-test, msrv, python-test, miri]
+    # !cancelled() executes the job regardless of whether the previous jobs passed, failed or get skipped.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Conclusion
+        run: |
+          # Print the dependent jobs to see them in the CI log
+          jq -C <<< '${{ toJson(needs) }}'
+          # Check if all jobs that we depend on (in the needs array) were successful.
+          jq --exit-status 'all(.result == "success")' <<< '${{ toJson(needs) }}'
+
   pre-commit:
     runs-on: ubuntu-latest
     steps:
@@ -44,8 +57,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.channel }}
+      - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test
+      - name: Test (nightly)
+        if: matrix.channel == 'nightly'
+        run: cargo test --features nightly
 
   msrv:
     needs: pre-commit
@@ -53,8 +70,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-msrv
-        run: cargo install cargo-msrv --locked
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-msrv
       - name: Verify MSRV
         run: cargo msrv verify
 
