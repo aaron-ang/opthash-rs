@@ -11,7 +11,6 @@ jobs:
     name: Release-plz release
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'aaron-ang' }}
-    environment: release
     permissions:
       contents: write
       pull-requests: read
