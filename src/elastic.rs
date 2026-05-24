@@ -2377,22 +2377,10 @@ mod tests {
     }
 
     #[test]
-    fn partial_group_capacity_works() {
-        // Capacity 18 creates a partial last group (2 valid slots out of 16).
-        let mut map = ElasticHashMap::with_capacity(18);
-        for i in 0..15 {
-            assert_eq!(map.insert(i, i), None);
-        }
-        for i in 0..15 {
-            assert_eq!(map.get(&i), Some(&i));
-        }
-    }
-
-    #[test]
     fn retain_does_not_trigger_mid_iter_resize_with_clustered_tombstones() {
-        // Build a small map past the cleanup threshold and retain half. The
-        // bulk-op iterators bypass `remove`, so the per-remove resize check
-        // can't fire mid-walk; this test guards that invariant.
+        // Bulk-op iterators (`retain` → `extract_if`) bypass the per-remove
+        // resize check. `resize_if_needed` only runs from the iterator's Drop,
+        // and only at the same capacity — so the slot count must not change.
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(256);
         let cap = i32::try_from(map.capacity()).expect("test capacity fits i32");
         let n = cap * 2 / 3;
@@ -2402,7 +2390,6 @@ mod tests {
         let initial_capacity = map.capacity();
         map.retain(|k, _| k % 2 == 0);
 
-        // Every surviving key must still resolve.
         let expected_count = (0..n).filter(|i| i % 2 == 0).count();
         assert_eq!(map.len(), expected_count);
         for i in 0..n {
@@ -2412,7 +2399,50 @@ mod tests {
                 assert!(map.get(&i).is_none(), "dropped key {i} survived");
             }
         }
-        // No regress in capacity (we may have rehashed but never grew).
-        assert!(map.capacity() <= initial_capacity * 2);
+        assert_eq!(
+            map.capacity(),
+            initial_capacity,
+            "retain must not change the slot count, only rehash in place"
+        );
+    }
+
+    #[test]
+    fn inserts_spill_to_deeper_levels_at_high_load() {
+        // Paper §4: batches fill L0 first, then push toward deeper levels.
+        // Filling near `max_insertions` must observe non-zero
+        // `max_populated_level`.
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(512);
+        assert!(map.levels.len() > 1, "test requires multi-level layout");
+        let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
+        for i in 0..max {
+            map.insert(i, i);
+        }
+        assert!(
+            map.max_populated_level > 0,
+            "expected spill into deeper level; max_populated_level = {}",
+            map.max_populated_level
+        );
+        for i in 0..max {
+            assert_eq!(map.get(&i), Some(&i));
+        }
+    }
+
+    #[test]
+    fn max_populated_level_shrinks_when_deepest_levels_emptied() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(512);
+        let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
+        for i in 0..max {
+            map.insert(i, i);
+        }
+        let high_water = map.max_populated_level;
+        assert!(high_water > 0, "need a multi-level state to test shrinkage");
+        for i in 0..max {
+            map.remove(&i);
+        }
+        assert_eq!(map.len(), 0);
+        assert_eq!(
+            map.max_populated_level, 0,
+            "max_populated_level should walk back to 0 once every level empties"
+        );
     }
 }

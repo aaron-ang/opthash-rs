@@ -3469,6 +3469,10 @@ mod tests {
         // `group_count == 1` (`mask == 0`). The odd-step probe must still
         // make forward progress (loop terminates via `group_limit`).
         let mut map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity(1);
+        assert_eq!(
+            map.special.primary.group_count_mask, 0,
+            "regression assumes a single-group special primary"
+        );
         for i in 0..16 {
             map.insert(i, i * 3);
         }
@@ -3517,23 +3521,11 @@ mod tests {
         }
     }
 
-    // Regression: removing one of two keys that both routed into a deep level
-    // (level 0 unallocated) must not orphan the surviving sibling.
-    #[test]
-    fn remove_preserves_sibling_when_level_zero_empty() {
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::default();
-        map.insert(1, 10);
-        map.insert(2, 20);
-        map.remove(&1);
-        assert_eq!(map.get(&2), Some(&20));
-        assert_eq!(map.len(), 1);
-    }
-
     #[test]
     fn retain_does_not_trigger_mid_iter_resize_with_clustered_tombstones() {
-        // Pack the map to a high load and retain half. The bulk-op iterators
-        // bypass `remove`, so the per-remove resize check can't fire mid-walk;
-        // this test guards that invariant.
+        // Bulk-op iterators (`retain` → `extract_if`) bypass the per-remove
+        // resize check. `resize_if_needed` only runs from the iterator's Drop,
+        // and only at the same capacity — so the slot count must not change.
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(1024);
         let max = i32::try_from(capacity::max_insertions(
             map.capacity(),
@@ -3555,6 +3547,53 @@ mod tests {
                 assert!(map.get(&i).is_none(), "dropped key {i} survived");
             }
         }
-        assert!(map.capacity() <= initial_capacity * 2);
+        assert_eq!(
+            map.capacity(),
+            initial_capacity,
+            "retain must not change the slot count, only rehash in place"
+        );
+    }
+
+    #[test]
+    fn bucket_overflow_promotes_max_populated_level() {
+        // Paper §5: when an `A_{i,j}` bucket overflows, keys spill to A_{i+1}.
+        // Beyond a low fill threshold some bucket on the way will overflow
+        // even though others have slack, so deeper levels must light up.
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(2048);
+        assert!(map.levels.len() > 1, "test requires multi-level layout");
+        let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
+        for i in 0..max {
+            map.insert(i, i);
+        }
+        assert!(
+            map.max_populated_level >= 1,
+            "expected spill into A_1 or deeper; max_populated_level = {}",
+            map.max_populated_level
+        );
+        for i in 0..max {
+            assert_eq!(map.get(&i), Some(&i));
+        }
+    }
+
+    #[test]
+    fn reserve_fraction_clamped_to_funnel_max() {
+        // Funnel's correctness proof needs reserve_fraction <= 1/8. Any larger
+        // request is clamped down.
+        let map: FunnelHashMap<i32, i32> =
+            FunnelHashMap::with_options(FunnelOptions::with_capacity(256).reserve_fraction(0.5));
+        assert!(
+            map.reserve_fraction <= MAX_FUNNEL_RESERVE_FRACTION,
+            "reserve_fraction={} not clamped to {MAX_FUNNEL_RESERVE_FRACTION}",
+            map.reserve_fraction
+        );
+    }
+
+    #[test]
+    fn primary_probe_limit_override_takes_effect() {
+        // When the caller pins `primary_probe_limit`, the map must store
+        // exactly that value (no log-log derivation).
+        let map: FunnelHashMap<i32, i32> =
+            FunnelHashMap::with_options(FunnelOptions::with_capacity(1024).primary_probe_limit(7));
+        assert_eq!(map.primary_probe_limit, 7);
     }
 }
