@@ -289,7 +289,7 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
 
     bench_populated!(
         group,
-        "delete",
+        "delete_heavy",
         BatchSize::PerIteration,
         &initial_pairs,
         |map| {
@@ -336,7 +336,7 @@ fn bench_resize_heavy_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("resize_heavy_throughput");
     group.throughput(Throughput::Elements(RESIZE_INSERT_COUNT as u64));
 
-    bench_empty!(group, "resize", BatchSize::PerIteration, |map| {
+    bench_empty!(group, "resize_heavy", BatchSize::PerIteration, |map| {
         for &(key, value) in &pairs {
             black_box(map.insert(black_box(key), black_box(value)));
         }
