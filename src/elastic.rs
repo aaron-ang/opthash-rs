@@ -28,9 +28,6 @@ pub struct ElasticOptions {
     /// Fraction of slots kept free as headroom. Lower means higher load
     /// factor but more probing on collisions.
     reserve_fraction: f64,
-    /// Multiplier on per-level probe budgets. Higher means more thorough
-    /// probing within a level before falling through to the next.
-    probe_scale: f64,
 }
 
 impl Default for ElasticOptions {
@@ -38,7 +35,6 @@ impl Default for ElasticOptions {
         Self {
             capacity: 0,
             reserve_fraction: DEFAULT_RESERVE_FRACTION,
-            probe_scale: DEFAULT_PROBE_SCALE,
         }
     }
 }
@@ -61,12 +57,6 @@ impl ElasticOptions {
     #[must_use]
     pub fn reserve_fraction(mut self, reserve_fraction: f64) -> Self {
         self.reserve_fraction = reserve_fraction;
-        self
-    }
-
-    #[must_use]
-    pub fn probe_scale(mut self, probe_scale: f64) -> Self {
-        self.probe_scale = probe_scale;
         self
     }
 }
@@ -281,8 +271,6 @@ pub struct ElasticHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = G
     max_insertions: usize,
     /// Slot reserve fraction per level. See `ElasticOptions`.
     reserve_fraction: f64,
-    /// Probe-budget multiplier. See `ElasticOptions`.
-    probe_scale: f64,
     /// Per-batch insert quota; drives `current_batch_index` advancement.
     batch_plan: Box<[usize]>,
     /// Index into `batch_plan`. Selects which level pair new keys target.
@@ -421,7 +409,6 @@ where
     #[must_use]
     pub fn with_options_and_hasher_in(options: ElasticOptions, hash_builder: S, alloc: A) -> Self {
         let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction);
-        let probe_scale = sanitize_probe_scale(options.probe_scale);
         let capacity = if options.capacity == 0 {
             0
         } else {
@@ -438,7 +425,7 @@ where
                 Level::with_capacity_in(
                     cap,
                     reserve_fraction,
-                    probe_scale,
+                    DEFAULT_PROBE_SCALE,
                     level_idx,
                     alloc.clone(),
                 )
@@ -454,7 +441,6 @@ where
             capacity,
             max_insertions,
             reserve_fraction,
-            probe_scale,
             batch_plan,
             current_batch_index: 0,
             batch_remaining,
@@ -1650,7 +1636,7 @@ where
                 Level::with_capacity_in(
                     cap,
                     self.reserve_fraction,
-                    self.probe_scale,
+                    DEFAULT_PROBE_SCALE,
                     level_idx,
                     self.alloc.clone(),
                 )
@@ -1692,7 +1678,6 @@ where
             ElasticOptions {
                 capacity: new_capacity,
                 reserve_fraction: self.reserve_fraction,
-                probe_scale: self.probe_scale,
             },
             hash_builder,
             self.alloc.clone(),
@@ -1722,7 +1707,6 @@ where
         alloc: A,
     ) -> Result<Self, TryReserveError> {
         let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction);
-        let probe_scale = sanitize_probe_scale(options.probe_scale);
         let capacity = options.capacity;
         let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
@@ -1735,7 +1719,7 @@ where
             levels.push(Level::try_with_capacity_in(
                 cap,
                 reserve_fraction,
-                probe_scale,
+                DEFAULT_PROBE_SCALE,
                 level_idx,
                 alloc.clone(),
             )?);
@@ -1751,7 +1735,6 @@ where
             capacity,
             max_insertions,
             reserve_fraction,
-            probe_scale,
             batch_plan,
             current_batch_index: 0,
             batch_remaining,
@@ -2002,14 +1985,6 @@ fn check_disjoint_aliasing<const N: usize>(locations: &[Option<(usize, usize)>; 
     }
 }
 
-fn sanitize_probe_scale(probe_scale: f64) -> f64 {
-    if probe_scale.is_finite() && probe_scale > 0.0 {
-        probe_scale
-    } else {
-        DEFAULT_PROBE_SCALE
-    }
-}
-
 /// `min(1 + c·log δ⁻¹, group_count)` — paper §2 cap on `f(ε)`.
 #[allow(clippy::cast_precision_loss)]
 fn compute_budget_cap(
@@ -2117,7 +2092,6 @@ where
             capacity: self.capacity,
             max_insertions: self.max_insertions,
             reserve_fraction: self.reserve_fraction,
-            probe_scale: self.probe_scale,
             batch_plan: self.batch_plan.clone(),
             current_batch_index: self.current_batch_index,
             batch_remaining: self.batch_remaining,
@@ -2145,7 +2119,6 @@ where
         self.len = source.len;
         self.max_insertions = source.max_insertions;
         self.reserve_fraction = source.reserve_fraction;
-        self.probe_scale = source.probe_scale;
         self.batch_plan.clone_from(&source.batch_plan);
         self.current_batch_index = source.current_batch_index;
         self.batch_remaining = source.batch_remaining;

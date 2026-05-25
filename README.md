@@ -38,19 +38,15 @@ let mut map = ElasticHashMap::new();
 map.insert("key", 42);
 assert_eq!(map.get("key"), Some(&42));
 
-let mut map = ElasticHashMap::with_options(ElasticOptions {
-    capacity: 1024,
-    reserve_fraction: 0.10,
-    probe_scale: 12.0,
-});
+let mut map = ElasticHashMap::with_options(
+    ElasticOptions::with_capacity(1024).reserve_fraction(0.10),
+);
 map.insert("key", 42);
 assert_eq!(map.get("key"), Some(&42));
 
-let mut map = FunnelHashMap::with_options(FunnelOptions {
-    capacity: 1024,
-    reserve_fraction: 0.10,
-    primary_probe_limit: Some(8),
-});
+let mut map = FunnelHashMap::with_options(
+    FunnelOptions::with_capacity(1024).reserve_fraction(0.10),
+);
 map.insert("key", 42);
 assert_eq!(map.get("key"), Some(&42));
 ```
@@ -69,13 +65,9 @@ m["key"] = 42
 assert m["key"] == 42
 assert "key" in m and len(m) == 1
 
-m = ElasticHashMap.with_options(
-    capacity=1024, reserve_fraction=0.10, probe_scale=12.0
-)
+m = ElasticHashMap.with_options(capacity=1024, reserve_fraction=0.10)
 
-m = FunnelHashMap.with_options(
-    capacity=1024, reserve_fraction=0.10, primary_probe_limit=8
-)
+m = FunnelHashMap.with_options(capacity=1024, reserve_fraction=0.10)
 ```
 
 ## Layout Sketch
@@ -109,8 +101,8 @@ ElasticHashMap
                limited_probe_budgets, salt, group_count_mask
 
   table-wide   len, capacity, max_insertions, reserve_fraction,
-               probe_scale, batch_plan, current_batch_index,
-               batch_remaining, max_populated_level, hash_builder
+               batch_plan, current_batch_index, batch_remaining,
+               max_populated_level, hash_builder
 
 
 FunnelHashMap

@@ -52,7 +52,6 @@ class ElasticHashMap(MutableMapping[K, V]):
         cls,
         capacity: int = 0,
         reserve_fraction: float | None = None,
-        probe_scale: float | None = None,
     ) -> ElasticHashMap[K, V]: ...
     @overload
     @classmethod
@@ -148,7 +147,6 @@ class FunnelHashMap(MutableMapping[K, V]):
         cls,
         capacity: int = 0,
         reserve_fraction: float | None = None,
-        primary_probe_limit: int | None = None,
     ) -> FunnelHashMap[K, V]: ...
     @overload
     @classmethod

@@ -9,7 +9,8 @@ pub(crate) const DEFAULT_RESERVE_FRACTION: f64 = 0.10;
 pub(crate) const MIN_RESERVE_FRACTION: f64 = 1e-6;
 /// Upper clamp for `sanitize_reserve_fraction`.
 pub(crate) const MAX_RESERVE_FRACTION: f64 = 0.999_999;
-/// Default `ElasticOptions::probe_scale`.
+/// Paper §2 probe-budget multiplier `c · GROUP_SIZE` (so
+/// `probe_scale / GROUP_SIZE = 1` → `c = 1` in `f(ε) = c·log²(ε⁻¹)`).
 pub(crate) const DEFAULT_PROBE_SCALE: f64 = 16.0;
 /// Upper bound on `FunnelOptions::reserve_fraction`; level capacities become
 /// unstable beyond this load factor.
