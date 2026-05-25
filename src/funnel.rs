@@ -271,9 +271,8 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for BucketLevel<K, V, A> {
     }
 }
 
-/// Odd-step probe over pow2 group count (paper §5 `SpecialPrimary`). Step is
-/// coprime to `group_count` ⇒ visits every group within `group_count` advances.
-/// Per-key step decorrelates probe paths across keys that share a start group.
+/// Per-key odd-step probe over pow2 group count (paper §5 `SpecialPrimary`).
+/// Step coprime to `group_count` ⇒ permutation over all groups.
 struct ProbeSeq {
     group: usize,
     step: usize,
@@ -1446,10 +1445,8 @@ where
         self.max_populated_level = 0;
     }
 
-    /// Fallible counterpart to [`Self::resize`]. Pre-allocates the new map
-    /// before touching `self`, so the common path leaves `self` intact on
-    /// `Err`. If overflow forces a 2x retry and that allocation fails,
-    /// `self` may be left empty (best-effort shrink).
+    /// Fallible counterpart to [`Self::resize`]. Common path leaves `self`
+    /// intact on `Err`; a failing 2x-retry allocation may empty `self`.
     fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
     where
         S: Clone,
@@ -1563,15 +1560,9 @@ where
         })
     }
 
-    /// Drain all live entries (across levels + special), rebuild levels +
-    /// special in-place at `new_capacity`, reinsert. Also serves as a
-    /// no-grow rehash when called with the current capacity.
-    ///
-    /// Funnel has a structural failure mode: under an adversarial hash
-    /// distribution a key can hit no free slot across every level + the
-    /// special primary's bounded probe budget + both fallback buckets. The
-    /// retry loop doubles `new_capacity` on any such overflow until every
-    /// entry places.
+    /// Rebuild in-place at `new_capacity`. Doubles `new_capacity` on
+    /// insert overflow (funnel's structural failure mode under adversarial
+    /// hashing) until every entry places.
     fn resize(&mut self, mut new_capacity: usize) {
         let mut entries: Vec<(K, V)> = Vec::with_capacity(self.len);
         self.drain_entries_into(&mut entries);
@@ -1594,9 +1585,7 @@ where
         }
     }
 
-    /// Move every live entry out of `self`'s tables into `out`, leaving the
-    /// storage empty but allocated. Shared between in-place [`Self::resize`]
-    /// and its retry loop.
+    /// Move every live entry into `out`; storage stays allocated but empty.
     fn drain_entries_into(&mut self, out: &mut Vec<(K, V)>) {
         for level in &mut self.levels {
             level.table.for_each_occupied_mut(|table, idx| {
@@ -1632,8 +1621,7 @@ where
         self.max_populated_level = 0;
     }
 
-    /// Replace `self`'s tables with fresh empty storage sized for
-    /// `new_capacity`. Caller is responsible for re-inserting drained entries.
+    /// Replace `self`'s tables with empty storage sized for `new_capacity`.
     fn install_fresh_storage(&mut self, new_capacity: usize) {
         let level_count = compute_level_count(self.reserve_fraction);
         let bucket_width = align::round_up_to_group(compute_bucket_width(self.reserve_fraction));
@@ -1771,10 +1759,8 @@ where
         }
     }
 
-    /// Place a known-novel `key`/`value` into the first available slot.
-    /// Returns the pair back on `Err` if every bucket-level / primary-probe /
-    /// fallback-bucket choice is full — the caller (resize loop) reclaims it
-    /// and retries at a larger capacity.
+    /// Place a known-novel `key`/`value`. Returns `Err((key, value))` if no
+    /// slot is available; the resize loop reclaims and retries at 2x.
     #[inline]
     fn try_insert_new_entry_unchecked(&mut self, key: K, value: V) -> Result<(), (K, V)> {
         let key_hash = self.hash_key(&key);
