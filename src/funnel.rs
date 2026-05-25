@@ -1424,7 +1424,7 @@ where
         S: Clone,
     {
         let mut target = new_capacity;
-        let mut new_map = Self::try_with_capacity_and_reserve_fraction_and_hasher_in(
+        let mut new_map = Self::try_with_slots_and_reserve_fraction_and_hasher_in(
             target,
             self.reserve_fraction,
             self.hash_builder.clone(),
@@ -1453,7 +1453,7 @@ where
             target = target
                 .checked_mul(2)
                 .ok_or(TryReserveError::CapacityOverflow)?;
-            new_map = Self::try_with_capacity_and_reserve_fraction_and_hasher_in(
+            new_map = Self::try_with_slots_and_reserve_fraction_and_hasher_in(
                 target,
                 self.reserve_fraction,
                 self.hash_builder.clone(),
@@ -1462,14 +1462,16 @@ where
         }
     }
 
-    /// Fallible counterpart to [`Self::with_capacity_and_reserve_fraction_and_hasher_in`].
-    /// Returns `Err(TryReserveError::AllocError)` if any backing allocation fails.
-    fn try_with_capacity_and_reserve_fraction_and_hasher_in(
-        capacity: usize,
+    /// Internal fallible ctor for `try_resize`. `slots` is raw slot count
+    /// (already inflated by the caller); public ctors take an insertion
+    /// budget and inflate via `capacity_for` — this one skips that.
+    fn try_with_slots_and_reserve_fraction_and_hasher_in(
+        slots: usize,
         reserve_fraction: f64,
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
+        let capacity = slots;
         let reserve_fraction =
             capacity::sanitize_reserve_fraction(reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
         let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
