@@ -6,9 +6,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
 
-use crate::common::config::{
-    DEFAULT_PROBE_SCALE, DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_F64, INITIAL_CAPACITY,
-};
+use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
@@ -78,9 +76,7 @@ struct Level<K, V, A: Allocator + Clone = Global> {
     /// Cached `floor(reserve * cap / 2)` for the
     /// `current_free_slots > threshold` branch in slot selection.
     half_reserve_slot_threshold: usize,
-    /// Paper §2 `c` in `f(ε) = c·log²(ε⁻¹)` — `probe_scale / GROUP_SIZE`.
-    probe_scale_over_group_size: f64,
-    /// Paper §2 cap on `f(ε)` — `min(1 + c·log δ⁻¹, group_count)`.
+    /// Paper §2 cap on `f(ε)` — `min(1 + log δ⁻¹, group_count)` with `c = 1`.
     budget_cap: f64,
 }
 
@@ -88,7 +84,6 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
     fn with_capacity_in(
         capacity: usize,
         reserve_fraction: f64,
-        probe_scale: f64,
         level_idx: usize,
         alloc: A,
     ) -> Self {
@@ -98,9 +93,7 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
             group_count == 0 || group_count.is_power_of_two(),
             "partition_levels must produce pow2 group_count",
         );
-        let probe_scale_over_group_size = probe_scale / GROUP_SIZE_F64;
-        let budget_cap =
-            compute_budget_cap(probe_scale_over_group_size, reserve_fraction, group_count);
+        let budget_cap = compute_budget_cap(reserve_fraction, group_count);
         Self {
             table,
             len: 0,
@@ -111,7 +104,6 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
                 reserve_fraction,
                 capacity,
             ),
-            probe_scale_over_group_size,
             budget_cap,
         }
     }
@@ -120,16 +112,13 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
     fn try_with_capacity_in(
         capacity: usize,
         reserve_fraction: f64,
-        probe_scale: f64,
         level_idx: usize,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
         let table =
             RawTable::try_new_in(capacity, alloc).map_err(|()| TryReserveError::AllocError)?;
         let group_count = table.group_count();
-        let probe_scale_over_group_size = probe_scale / GROUP_SIZE_F64;
-        let budget_cap =
-            compute_budget_cap(probe_scale_over_group_size, reserve_fraction, group_count);
+        let budget_cap = compute_budget_cap(reserve_fraction, group_count);
         Ok(Self {
             table,
             len: 0,
@@ -140,7 +129,6 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
                 reserve_fraction,
                 capacity,
             ),
-            probe_scale_over_group_size,
             budget_cap,
         })
     }
@@ -170,7 +158,7 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
             return 1;
         }
         let log_inv_eps = (capacity as f64 / free_slots as f64).log2();
-        let raw = 1.0 + self.probe_scale_over_group_size * log_inv_eps * log_inv_eps;
+        let raw = 1.0 + log_inv_eps * log_inv_eps;
         raw.min(self.budget_cap) as usize
     }
 
@@ -236,7 +224,6 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for Level<K, V, A> {
             group_count_mask: self.group_count_mask,
             tombstones: self.tombstones,
             half_reserve_slot_threshold: self.half_reserve_slot_threshold,
-            probe_scale_over_group_size: self.probe_scale_over_group_size,
             budget_cap: self.budget_cap,
         }
     }
@@ -248,7 +235,6 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for Level<K, V, A> {
         self.group_count_mask = source.group_count_mask;
         self.tombstones = source.tombstones;
         self.half_reserve_slot_threshold = source.half_reserve_slot_threshold;
-        self.probe_scale_over_group_size = source.probe_scale_over_group_size;
         self.budget_cap = source.budget_cap;
     }
 }
@@ -422,13 +408,7 @@ where
             .iter()
             .enumerate()
             .map(|(level_idx, &cap)| {
-                Level::with_capacity_in(
-                    cap,
-                    reserve_fraction,
-                    DEFAULT_PROBE_SCALE,
-                    level_idx,
-                    alloc.clone(),
-                )
+                Level::with_capacity_in(cap, reserve_fraction, level_idx, alloc.clone())
             })
             .collect();
 
@@ -1633,13 +1613,7 @@ where
             .iter()
             .enumerate()
             .map(|(level_idx, &cap)| {
-                Level::with_capacity_in(
-                    cap,
-                    self.reserve_fraction,
-                    DEFAULT_PROBE_SCALE,
-                    level_idx,
-                    self.alloc.clone(),
-                )
+                Level::with_capacity_in(cap, self.reserve_fraction, level_idx, self.alloc.clone())
             })
             .collect();
         let new_max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
@@ -1719,7 +1693,6 @@ where
             levels.push(Level::try_with_capacity_in(
                 cap,
                 reserve_fraction,
-                DEFAULT_PROBE_SCALE,
                 level_idx,
                 alloc.clone(),
             )?);
@@ -1985,14 +1958,10 @@ fn check_disjoint_aliasing<const N: usize>(locations: &[Option<(usize, usize)>; 
     }
 }
 
-/// `min(1 + c·log δ⁻¹, group_count)` — paper §2 cap on `f(ε)`.
+/// `min(1 + log δ⁻¹, group_count)` — paper §2 cap on `f(ε)` with `c = 1`.
 #[allow(clippy::cast_precision_loss)]
-fn compute_budget_cap(
-    probe_scale_over_group_size: f64,
-    reserve_fraction: f64,
-    group_count: usize,
-) -> f64 {
-    let log_cap = 1.0 + probe_scale_over_group_size * (1.0 / reserve_fraction).log2();
+fn compute_budget_cap(reserve_fraction: f64, group_count: usize) -> f64 {
+    let log_cap = 1.0 + (1.0 / reserve_fraction).log2();
     let max_budget = group_count.max(1) as f64;
     log_cap.min(max_budget).max(1.0)
 }

@@ -1576,9 +1576,10 @@ where
                 )
             })
             .collect();
+        let new_primary_probe_limit = probe::log_log_probe_limit(new_capacity).max(1);
         let new_special = SpecialArray::with_capacity_in(
             special_capacity,
-            self.primary_probe_limit,
+            new_primary_probe_limit,
             self.alloc.clone(),
         );
 
@@ -1587,6 +1588,7 @@ where
         let old_special = std::mem::replace(&mut self.special, new_special);
         self.capacity = new_capacity;
         self.max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
+        self.primary_probe_limit = new_primary_probe_limit;
         self.max_populated_level = 0;
         self.len = 0;
 
