@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/aaron-ang/opthash-rs/compare/v0.8.0...v0.9.0) - 2026-05-25
+
+### Fixed
+
+- *(funnel)* floor special_capacity to keep A_{α+1} non-empty ([#52](https://github.com/aaron-ang/opthash-rs/pull/52))
+
+### Other
+
+- [**breaking**] hide probe_scale + primary_probe_limit from public Options ([#59](https://github.com/aaron-ang/opthash-rs/pull/59))
+- *(probe)* unify elastic on shared TriangularProbe helper ([#58](https://github.com/aaron-ang/opthash-rs/pull/58))
+- remove unnecessary Clone and Copy derives from various structs ([#57](https://github.com/aaron-ang/opthash-rs/pull/57))
+- *(funnel)* extract ProbeSeq + drop resize_if_needed on extract_if drop ([#56](https://github.com/aaron-ang/opthash-rs/pull/56))
+- trim data layout; compute probe budget on demand ([#55](https://github.com/aaron-ang/opthash-rs/pull/55))
+- drop unused metadata + ineffective prefetches; bench tooling ([#53](https://github.com/aaron-ang/opthash-rs/pull/53))
+
 ## [0.8.0](https://github.com/aaron-ang/opthash-rs/compare/v0.7.0...v0.8.0) - 2026-05-24
 
 ### Added
