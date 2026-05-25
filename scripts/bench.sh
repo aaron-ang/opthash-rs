@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Run a Criterion bench with low-noise mitigations applied.
 #
-# Default (no sudo): pins to one core via taskset, disables ASLR via setarch,
-# and (if numactl is present and the host is multi-node) binds memory to the
-# pinned core's NUMA node.
-# Optional (with sudo): also sets the perf governor, disables Intel turbo, and
-# runs at SCHED_FIFO/99. The script gracefully degrades — sudo is not required.
+# No sudo: taskset (core pin), setarch -R (ASLR off), chrt -b 0 (SCHED_BATCH).
+# With sudo: nice -n -20 (max CFS prio), prlimit memlock (no page-out);
+# drops back to invoking user so cargo artifacts stay user-owned.
+# All settings are process-local — die with the bench process.
 #
-# Hybrid-CPU aware: if CORE is unset, claims a free core in the perf cluster
-# (cores at max cpufreq) via flock so concurrent runs don't collide. Falls
-# back to the full cluster CPU list when every core is claimed.
+# Hardware-aware:
+# - CORE unset: claims a free core in the perf cluster (max cpufreq) via
+#   flock. Falls back to the full cluster list when every core is claimed.
+# - Multi-node NUMA: binds memory to the pinned core's node via numactl
+#   --membind so cache misses don't traverse the inter-socket interconnect.
 #
 # Env knobs:
 #   BENCH=all        cargo bench --bench target (default all = speedup + latency)
@@ -116,15 +117,6 @@ command -v cargo >/dev/null 2>&1 || {
 	exit 1
 }
 
-if ((IS_LINUX)) && [[ $EUID -eq 0 ]]; then
-	if command -v cpupower >/dev/null 2>&1; then
-		cpupower frequency-set -g performance >/dev/null
-	fi
-	if [[ -w /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
-		echo 1 >/sys/devices/system/cpu/intel_pstate/no_turbo
-	fi
-fi
-
 if [[ -n "$LOAD" ]]; then
 	criterion_args=(--load-baseline "$LOAD" --baseline "${BASELINE:-ref}")
 elif [[ -n "$BASELINE" ]]; then
@@ -163,12 +155,23 @@ if ((IS_LINUX)) && command -v numactl >/dev/null 2>&1 && [[ -n "${CORE:-}" ]]; t
 	fi
 fi
 
-# sudo: prefix chrt and drop back to invoking user so build artifacts
-# stay user-owned. SCHED_FIFO survives the UID drop (process attribute).
+# sudo path: nice -n -20 (highest priority), prlimit memlock (avoid page-out),
+# then drop back to invoking user so build artifacts stay user-owned.
+# Both attributes survive the UID drop;
+# the dropped user can't raise them further but keeps the boosted values.
+#
+# Non-sudo path: chrt -b 0 (SCHED_BATCH) — kernel skips interactive
+# scheduling heuristics, smaller context-switch overhead.
 launcher=()
-if ((IS_LINUX)) && [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v chrt >/dev/null 2>&1; then
-	launcher=(chrt -f 99 sudo -u "$SUDO_USER"
+if ((IS_LINUX)) && [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v nice >/dev/null 2>&1; then
+	launcher=(nice -n -20)
+	if command -v prlimit >/dev/null 2>&1; then
+		launcher+=(prlimit --memlock=unlimited --)
+	fi
+	launcher+=(sudo -u "$SUDO_USER"
 		--preserve-env=PATH,CARGO_HOME,RUSTUP_HOME --)
+elif ((IS_LINUX)) && command -v chrt >/dev/null 2>&1; then
+	launcher=(chrt -b 0)
 fi
 
 for target in "${bench_targets[@]}"; do
