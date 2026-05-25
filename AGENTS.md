@@ -35,10 +35,10 @@ LOAD=opt1 BASELINE=opt2 scripts/bench.sh    # opt1 vs opt2 (no rerun)
 
 For A/B many optimizations against the same anchor: `SAVE=optN` each variant, then `LOAD=optN` to compare offline. Stored baselines persist in `target/criterion/`.
 
-- Wraps `cargo bench` with `taskset -c $CORE` + `setarch -R` (no privileges). `sudo` adds governor=performance, turbo off, SCHED_FIFO/99; drops back to `$SUDO_USER` for cargo.
+- Wraps `cargo bench` with `taskset -c $CORE` + `setarch -R` (no privileges). `sudo` adds nice -20, prlimit memlock; drops back to invoking user for cargo.
 - `BENCH=all` (default) runs `speedup` then `latency`; set `BENCH=speedup|latency` for single-target.
 - Re-save `ref` when env changes (sudo vs not, core pin) — baselines are wall-clock.
-- Pass through flags: `SAVE=ref scripts/bench.sh -- --measurement-time 10`. Criterion name filter: `scripts/bench.sh -- "get_hit_latency"`.
+- Pass through flags (no leading `--`): `SAVE=ref scripts/bench.sh --measurement-time 10`. Criterion name filter: `scripts/bench.sh "get_hit_latency"`.
 - `latency` bench writes histograms to `target/latency/` and ignores `--baseline`.
 
 **Read results from JSON, not stdout** (stdout truncates + mixes runs):
