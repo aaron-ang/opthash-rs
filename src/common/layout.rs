@@ -489,7 +489,7 @@ impl<T, A: Allocator> RawTable<T, A> {
 
 /// Scan position for [`RawTable::scan_next`]: next group + cached mask of the
 /// in-progress group. Construct a fresh one before switching tables.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct OccupiedCursor {
     next_group_slot: usize,
     current_group_slot: usize,

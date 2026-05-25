@@ -2435,6 +2435,12 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelTables<'a, K, V, A> {
     }
 }
 
+impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelTables<'_, K, V, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FunnelTables").finish_non_exhaustive()
+    }
+}
+
 /// Borrowing iterator over occupied entries. Visits bucket levels → special
 /// primary → special fallback. SIMD-scans one group at a time via
 /// [`OccupiedCursor`], yielding bits from a cached mask before refilling.

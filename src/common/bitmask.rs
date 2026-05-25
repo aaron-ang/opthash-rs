@@ -16,7 +16,7 @@ pub(crate) const BITMASK_STRIDE: u32 = 1;
 ///
 /// `Copy` so callers can snapshot a mask and iterate via the `Iterator` impl
 /// (which consumes bits) without losing the original.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct BitMask(pub(crate) BitMaskWord);
 
 impl BitMask {
