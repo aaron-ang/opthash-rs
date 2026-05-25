@@ -30,7 +30,8 @@
 #   LOAD=attempt-a scripts/bench.sh       # compare attempt-a vs ref (no rerun)
 #   LOAD=attempt-a BASELINE=attempt-b scripts/bench.sh  # a vs b (no rerun)
 #
-# Forwarded args (after `--`) are appended to the Criterion command line
+# Forwarded args are appended to the Criterion command line directly
+# (no leading `--` needed — the script adds its own `--` separator):
 
 set -euo pipefail
 
