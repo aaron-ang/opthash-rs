@@ -509,6 +509,15 @@ enum LookupStep {
     StopSearch,
 }
 
+/// Outcome of the level-walk on a miss.
+enum LevelMiss {
+    /// Probe chain terminated via a clean EMPTY byte — no TOMBSTONE seen,
+    /// so no overflow to special array possible.
+    ChainClean,
+    /// Loop exhausted; key may be in the special array.
+    MayContinue,
+}
+
 /// Candidate-tracking mode for `find_in_*` scans.
 ///
 /// - `Lookup`: pure lookup — skip the free-slot SIMD scan.
@@ -892,7 +901,7 @@ where
         // Scan levels: on match, replace; on miss, retain the first free
         // slot we saw as the insertion candidate.
         let mut candidate: Option<SlotLocation> = None;
-        let (found, chain_clean) = self.find_in_levels(
+        let (found, miss) = self.find_in_levels(
             &key,
             key_hash,
             key_fingerprint,
@@ -903,11 +912,15 @@ where
         }
 
         // Fast path: skip special-array dedup if either:
-        // (1) special is entirely empty, OR
-        // (2) the level chain terminated via a clean EMPTY byte — no
-        //     TOMBSTONE seen, so the key cannot have overflowed to special.
-        // Both require a level-side candidate to place the new entry.
-        if candidate.is_some() && (self.special.total_len == 0 || chain_clean) {
+        // (1) the level chain terminated via a clean EMPTY byte — no
+        //     TOMBSTONE seen, so the key cannot have overflowed to special;
+        // (2) special is entirely empty.
+        // Condition (1) checked first: it's a register value, avoiding the
+        // `total_len` memory load when the chain ended cleanly.
+        // Both cases require a level-side candidate to place the new entry.
+        if candidate.is_some()
+            && (matches!(miss, LevelMiss::ChainClean) || self.special.total_len == 0)
+        {
             return self.insert_at_location_after_resize_check(
                 candidate,
                 key_hash,
@@ -1637,12 +1650,9 @@ where
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
-    /// Paper §5: walk `A_1..A_α` in order, stopping on the first `StopSearch`.
-    /// `Candidate::Track` records the earliest level's free slot so inserts
-    /// spill into deeper bucket levels before reaching the special array.
-    /// Returns `(match, chain_clean)` where `chain_clean = true` means the
-    /// probe chain terminated via a clean EMPTY byte — the key cannot exist
-    /// in the special array.
+    /// Paper §5: walk `A_1..A_α` in order; record the first free slot via
+    /// `Candidate::Track`. Returns the key location if found, plus a
+    /// [`LevelMiss`] indicating whether a special-array scan is needed.
     #[inline]
     fn find_in_levels<Q>(
         &self,
@@ -1650,14 +1660,13 @@ where
         key_hash: u64,
         key_fingerprint: u8,
         candidate: Candidate<'_, SlotLocation>,
-    ) -> (Option<SlotLocation>, bool)
+    ) -> (Option<SlotLocation>, LevelMiss)
     where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
         let wants_free = candidate.wants_free();
         let mut local: Option<SlotLocation> = None;
-        let mut chain_clean = false;
 
         for (level_idx, level) in self.levels.iter().enumerate() {
             // Per-level slot tracking, only while we still want a candidate.
@@ -1681,26 +1690,23 @@ where
                             level_idx,
                             slot_idx,
                         }),
-                        false,
+                        LevelMiss::MayContinue,
                     );
                 }
                 LookupStep::Continue => {}
                 LookupStep::StopSearch => {
-                    chain_clean = true;
-                    break;
+                    candidate.record(local);
+                    return (None, LevelMiss::ChainClean);
                 }
             }
         }
 
         candidate.record(local);
-        (None, chain_clean)
+        (None, LevelMiss::MayContinue)
     }
 
-    /// Scan special primary then fallback for `key`. Updates `candidate` with
-    /// the first free slot seen. Returns `Some(location)` if the key is found.
-    ///
-    /// Marked `#[cold]` + `#[inline(never)]` to keep this out of the hot
-    /// insert path and give the branch predictor a miss-rate hint.
+    /// Probe special primary then fallback for `key`;
+    /// record first free slot in `candidate`.
     #[cold]
     #[inline(never)]
     fn scan_special_for_key<Q>(
