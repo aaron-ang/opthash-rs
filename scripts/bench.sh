@@ -30,8 +30,8 @@
 #   LOAD=attempt-a scripts/bench.sh       # compare attempt-a vs ref (no rerun)
 #   LOAD=attempt-a BASELINE=attempt-b scripts/bench.sh  # a vs b (no rerun)
 #
-# Forwarded args are appended to the Criterion command line directly
-# (no leading `--` needed — the script adds its own `--` separator):
+# Forwarded args are appended to the Criterion command line.
+# The script strips the leading `--` before forwarding.
 
 set -euo pipefail
 
@@ -179,7 +179,13 @@ elif ((IS_LINUX)) && command -v chrt >/dev/null 2>&1; then
 	launcher=(chrt -b 0)
 fi
 
+# Strip a leading '--' from forwarded args so both `-- --flag` and `--flag` work.
+forward_args=("$@")
+if [[ "${#forward_args[@]}" -gt 0 && "${forward_args[0]}" == "--" ]]; then
+	forward_args=("${forward_args[@]:1}")
+fi
+
 for target in "${bench_targets[@]}"; do
-	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" cargo bench --bench "$target" -- "${criterion_args[@]}" "$@")
+	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" cargo bench --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
 	"${launcher[@]}" "${cmd[@]}"
 done

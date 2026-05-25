@@ -38,7 +38,7 @@ For A/B many optimizations against the same anchor: `SAVE=optN` each variant, th
 - Wraps `cargo bench` with `taskset` (core pin), `setarch -R` (ASLR off), `chrt -b` (scheduler batch), and `numactl` (NUMA bind, multi-node only) — no privileges. `sudo` adds `nice -20`, `prlimit` memlock; drops back to invoking user for cargo.
 - `BENCH=all` (default) runs `speedup` then `latency`; set `BENCH=speedup|latency` for single-target.
 - Re-save `ref` when env changes (sudo vs not, core pin) — baselines are wall-clock.
-- Pass through flags (no leading `--`): `SAVE=ref scripts/bench.sh --measurement-time 10`. Criterion name filter: `scripts/bench.sh "get_hit_latency"`.
+- Pass through flags with `--` separator: `SAVE=ref scripts/bench.sh -- --measurement-time 10`. Criterion name filter: `scripts/bench.sh -- "get_hit_latency"`. Both forms accepted (script strips the leading `--`).
 - `latency` bench writes histograms to `target/latency/` and ignores `--baseline`.
 
 **Read results from JSON, not stdout** (stdout truncates + mixes runs):
