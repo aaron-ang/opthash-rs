@@ -32,8 +32,10 @@ def plot_throughput_speedup(assets_dir: Path) -> None:
 
     for workload, label in THROUGHPUT_WORKLOADS:
         try:
+            op = workload[: -len("_throughput")]
             times = {
-                impl: load_criterion_mean_ns(workload, impl) for impl in IMPLEMENTATIONS
+                impl: load_criterion_mean_ns(workload, f"{op}_{impl}")
+                for impl in IMPLEMENTATIONS
             }
         except FileNotFoundError:
             continue

@@ -1,10 +1,11 @@
-use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
+
+use equivalent::Equivalent;
 
 use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
@@ -13,8 +14,8 @@ use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     Values as CommonValues,
 };
-use crate::common::layout::{OccupiedCursor, RawTable, SlotEntry};
 use crate::common::math::{self, align, capacity, probe};
+use crate::common::table::{OccupiedCursor, RawTable, SlotEntry};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
 /// One sub-array `A_i` in paper §4's partition `|A_{i+1}| = |A_i|/2 ± 1`.
@@ -142,8 +143,7 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
     #[inline]
     fn find_by_probe<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> Option<usize>
     where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
         if self.len == 0 {
             return None;
@@ -158,7 +158,7 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
             for relative_idx in match_mask {
                 let slot_idx = probe.pos * GROUP_SIZE + relative_idx;
                 let entry = unsafe { self.table.get_ref(slot_idx) };
-                if entry.key.borrow() == key {
+                if key.equivalent(&entry.key) {
                     return Some(slot_idx);
                 }
             }
@@ -230,7 +230,7 @@ pub struct ElasticHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = G
 impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug
     for ElasticHashMap<K, V, S, A>
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ElasticHashMap")
             .field("len", &self.len)
             .field("capacity", &self.capacity)
@@ -568,8 +568,7 @@ where
 
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control::control_fingerprint(key_hash);
@@ -581,8 +580,7 @@ where
     /// Like [`Self::get`] but returns the stored key alongside its value.
     pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control::control_fingerprint(key_hash);
@@ -594,8 +592,7 @@ where
 
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control::control_fingerprint(key_hash);
@@ -613,8 +610,7 @@ where
     /// If two input keys resolve to the same `(level, slot)` pair.
     pub fn get_disjoint_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> [Option<&mut V>; N]
     where
-        K: Borrow<Q> + Eq,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
         check_disjoint_aliasing(&locations);
@@ -643,8 +639,7 @@ where
         keys: [&Q; N],
     ) -> [Option<(&K, &mut V)>; N]
     where
-        K: Borrow<Q> + Eq,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
         check_disjoint_aliasing(&locations);
@@ -673,8 +668,7 @@ where
         keys: [&Q; N],
     ) -> [Option<&mut V>; N]
     where
-        K: Borrow<Q> + Eq,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
 
@@ -691,8 +685,7 @@ where
     #[inline]
     fn locate_disjoint<Q, const N: usize>(&self, keys: [&Q; N]) -> [Option<(usize, usize)>; N]
     where
-        K: Borrow<Q> + Eq,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         core::array::from_fn(|i| {
             let key = keys[i];
@@ -704,8 +697,7 @@ where
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control::control_fingerprint(key_hash);
@@ -715,8 +707,7 @@ where
 
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         self.remove_inner(key).map(|(_, v)| v)
     }
@@ -724,16 +715,14 @@ where
     /// Like [`Self::remove`] but returns the stored key alongside its value.
     pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         self.remove_inner(key)
     }
 
     fn remove_inner<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control::control_fingerprint(key_hash);
@@ -1189,7 +1178,7 @@ pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global
 }
 
 impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Drain").finish_non_exhaustive()
     }
 }
@@ -1260,7 +1249,7 @@ where
     S: BuildHasher,
     F: FnMut(&K, &mut V) -> bool,
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ExtractIf").finish_non_exhaustive()
     }
 }
@@ -1322,7 +1311,7 @@ pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
 }
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticIter<'_, K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ElasticIter").finish_non_exhaustive()
     }
 }
@@ -1424,7 +1413,7 @@ impl<K, V, A: Allocator + Clone> ExactSizeIterator for ElasticIterMut<'_, K, V, 
 impl<K, V, A: Allocator + Clone> FusedIterator for ElasticIterMut<'_, K, V, A> {}
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticIterMut<'_, K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ElasticIterMut")
             .field("level_idx", &self.level_idx)
             .finish_non_exhaustive()
@@ -1466,7 +1455,7 @@ impl<K, V, A: Allocator + Clone> ExactSizeIterator for ElasticValuesMut<'_, K, V
 impl<K, V, A: Allocator + Clone> FusedIterator for ElasticValuesMut<'_, K, V, A> {}
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticValuesMut<'_, K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ElasticValuesMut")
             .field("level_idx", &self.inner.level_idx)
             .finish_non_exhaustive()
@@ -1517,7 +1506,7 @@ impl<K, V, S, A: Allocator + Clone> Drop for ElasticIntoIter<K, V, S, A> {
 }
 
 impl<K, V, S, A: Allocator + Clone> fmt::Debug for ElasticIntoIter<K, V, S, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ElasticIntoIter")
             .field("level_idx", &self.level_idx)
             .finish_non_exhaustive()
@@ -1809,8 +1798,7 @@ where
         key_fingerprint: u8,
     ) -> Option<(usize, usize)>
     where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
@@ -2102,8 +2090,8 @@ where
 
 impl<K, Q, V, S, A> std::ops::Index<&Q> for ElasticHashMap<K, V, S, A>
 where
-    K: Eq + Hash + Borrow<Q>,
-    Q: Eq + Hash + ?Sized,
+    K: Eq + Hash,
+    Q: Hash + Equivalent<K> + ?Sized,
     S: BuildHasher,
     A: Allocator + Clone,
 {

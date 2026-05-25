@@ -613,7 +613,7 @@ macro_rules! parity_suite {
                     start: T,
                     step: T,
                 ) -> [(T, T); N] {
-                    let mut outs: [(T, T); N] = [(start, start); N];
+                    let mut outs = [(start, start); N];
                     let mut element = step;
                     outs.iter_mut().skip(1).for_each(|(k, v)| {
                         *k += element;

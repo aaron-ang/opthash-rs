@@ -34,8 +34,8 @@ TITLE_COLOR = "darkslategray"
 SUBTITLE_COLOR = "dimgray"
 
 
-def load_criterion_mean_ns(group: str, implementation: str) -> float:
-    path = CRITERION_DIR / group / implementation / "new" / "estimates.json"
+def load_criterion_mean_ns(group: str, variant: str) -> float:
+    path = CRITERION_DIR / group / variant / "new" / "estimates.json"
     if not path.exists():
         raise FileNotFoundError(f"missing Criterion estimates: {path}")
     data = json.loads(path.read_text())

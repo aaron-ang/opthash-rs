@@ -4,10 +4,15 @@ use std::ptr::{self, NonNull};
 use allocator_api2::alloc::{self, Allocator, Global, Layout};
 
 use super::bitmask::BitMask;
-use super::config::{CONTROL_ALIGN, GROUP_SIZE};
+use super::config::GROUP_SIZE;
+
 use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use super::math::align;
 use super::simd;
+
+/// Control-byte region alignment. 64 = cache-line size so the first group is
+/// line-aligned and four groups pack per line without straddling.
+const CONTROL_ALIGN: usize = 64;
 
 pub(crate) struct SlotEntry<K, V> {
     pub(crate) key: K,
@@ -47,7 +52,7 @@ unsafe impl<T: Send, A: Allocator + Send> Send for RawTable<T, A> {}
 unsafe impl<T: Sync, A: Allocator + Sync> Sync for RawTable<T, A> {}
 
 impl<T, A: Allocator> std::fmt::Debug for RawTable<T, A> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("RawTable")
             .field("capacity", &self.capacity)
             .field("group_count", &self.group_count)

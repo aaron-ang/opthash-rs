@@ -11,7 +11,7 @@ pub enum TryReserveError {
 }
 
 impl fmt::Display for TryReserveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::CapacityOverflow => f.write_str("capacity overflow"),
             Self::AllocError => f.write_str("memory allocation failed"),
@@ -48,7 +48,7 @@ where
     E::Key: fmt::Debug,
     V: fmt::Debug,
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("OccupiedError")
             .field("key", self.entry.view_key())
             .field("value", &self.value)
@@ -62,7 +62,7 @@ where
     E::Key: fmt::Debug,
     V: fmt::Debug,
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "tried to insert {:?}, but key {:?} was already present with {:?}",

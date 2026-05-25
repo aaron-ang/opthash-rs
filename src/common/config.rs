@@ -8,9 +8,3 @@ pub(crate) const DEFAULT_RESERVE_FRACTION: f64 = 0.10;
 pub(crate) const MIN_RESERVE_FRACTION: f64 = 1e-6;
 /// Upper clamp for `sanitize_reserve_fraction`.
 pub(crate) const MAX_RESERVE_FRACTION: f64 = 0.999_999;
-/// Upper bound on `FunnelHashMap`'s `reserve_fraction`; level capacities become
-/// unstable beyond this load factor.
-pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
-/// Control-byte region alignment. 64 = cache-line size, so the first group
-/// is line-aligned and groups pack 4-per-line without straddling.
-pub(crate) const CONTROL_ALIGN: usize = 64;

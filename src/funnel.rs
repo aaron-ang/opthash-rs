@@ -1,4 +1,3 @@
-use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::iter::FusedIterator;
@@ -7,17 +6,21 @@ use std::mem;
 use std::ops::{ControlFlow, Range};
 use std::ptr;
 
-use crate::common::config::{
-    DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY, MAX_FUNNEL_RESERVE_FRACTION,
-};
+use equivalent::Equivalent;
+
+use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
+
+/// Upper bound on `reserve_fraction`; level capacities become unstable
+/// beyond this load factor.
+pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     Values as CommonValues,
 };
-use crate::common::layout::{OccupiedCursor, RawTable, SlotEntry};
 use crate::common::math::{self, align, capacity, cast, probe};
+use crate::common::table::{OccupiedCursor, RawTable, SlotEntry};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
 /// One funnel level `A_i` (paper §5). Fixed grid of `β`-sized buckets `A_{i,j}`;
@@ -134,25 +137,32 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
-        candidate: Candidate<'_, usize>,
+        level_idx: usize,
+        free_slot: FreeSlot,
     ) -> LookupStep
     where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
+        let wants_free = matches!(&free_slot, Some(out) if out.is_none());
+
         if self.len == 0 {
             if self.table.capacity() == 0 {
                 return LookupStep::Continue;
             }
-            // Record the chosen bucket's first slot so the insert candidate
-            // isn't lost.
-            if candidate.wants_free() {
+            // Record the chosen bucket's first slot
+            // so the insert candidate isn't lost.
+            if wants_free {
                 let bucket_idx = self.bucket_index(key_hash);
-                let bucket_start = bucket_idx << self.bucket_size_log2;
-                candidate.record(Some(bucket_start));
+                let slot_idx = bucket_idx << self.bucket_size_log2;
+                if let Some(out) = free_slot {
+                    *out = Some(SlotLocation::Level {
+                        level_idx,
+                        slot_idx,
+                    });
+                }
             }
-            // No tombstones ⇒ the cascade never placed a key deeper than this
-            // level, so we can stop probing.
+            // No tombstones ⇒ the cascade never placed a key
+            // deeper than this level, so we can stop probing.
             if self.tombstones == 0 {
                 return LookupStep::StopSearch;
             }
@@ -172,18 +182,23 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
         for relative_idx in self.table.group_match_mask(group_idx, key_fingerprint) {
             let slot_idx = bucket_range.start + relative_idx;
             let entry = unsafe { self.table.get_ref(slot_idx) };
-            if entry.key.borrow() == key {
+            if key.equivalent(&entry.key) {
                 return LookupStep::Found(slot_idx);
             }
         }
 
-        if candidate.wants_free() {
-            let slot = self
+        if wants_free {
+            let slot_idx = self
                 .table
                 .group_free_mask(group_idx)
                 .lowest()
                 .map(|o| bucket_range.start + o);
-            candidate.record(slot);
+            if let (Some(out), Some(slot_idx)) = (free_slot, slot_idx) {
+                *out = Some(SlotLocation::Level {
+                    level_idx,
+                    slot_idx,
+                });
+            }
         }
 
         // StopSearch: bucket has an EMPTY byte → no key ever overflowed past
@@ -498,6 +513,11 @@ enum SlotLocation {
     SpecialFallback { slot_idx: usize },
 }
 
+/// Out-parameter for free-slot tracking during probes.
+/// `None` = lookup-only; `Some(out)` = also record the first free
+/// `SlotLocation` seen. Written once; ignored if `*out` is already `Some`.
+type FreeSlot<'a> = Option<&'a mut Option<SlotLocation>>;
+
 /// Outcome of probing one bucket / group during lookup.
 /// - `Found(slot_idx)`: key matched at slot.
 /// - `Continue`: bucket has tombstones; keep probing for the key elsewhere.
@@ -511,41 +531,10 @@ enum LookupStep {
 
 /// Outcome of the level-walk on a miss.
 enum LevelMiss {
-    /// Probe chain terminated via a clean EMPTY byte — no TOMBSTONE seen,
-    /// so no overflow to special array possible.
+    /// EMPTY byte seen; no overflow to special possible.
     ChainClean,
     /// Loop exhausted; key may be in the special array.
     MayContinue,
-}
-
-/// Candidate-tracking mode for `find_in_*` scans.
-///
-/// - `Lookup`: pure lookup — skip the free-slot SIMD scan.
-/// - `Track(out)`: record the first FREE-or-TOMBSTONE slot into `*out` when
-///   `*out` is `None`; if already `Some`, the scan acts like `Lookup` (caller
-///   has an earlier candidate, no need to find another).
-enum Candidate<'a, T> {
-    Lookup,
-    Track(&'a mut Option<T>),
-}
-
-impl<T> Candidate<'_, T> {
-    /// True when this scan should look for a free slot (caller passed
-    /// `Track` and `*out` is still `None`).
-    #[inline]
-    fn wants_free(&self) -> bool {
-        matches!(self, Candidate::Track(out) if out.is_none())
-    }
-
-    /// Record `slot` into `*out`, only if `Track` and `*out` is `None`.
-    #[inline]
-    fn record(self, slot: Option<T>) {
-        if let Candidate::Track(out) = self
-            && out.is_none()
-        {
-            *out = slot;
-        }
-    }
 }
 
 /// Open-addressed hash map using funnel hashing.
@@ -582,7 +571,7 @@ pub struct FunnelHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Gl
 impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug
     for FunnelHashMap<K, V, S, A>
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelHashMap")
             .field("len", &self.len)
             .field("capacity", &self.capacity)
@@ -901,12 +890,8 @@ where
         // Scan levels: on match, replace; on miss, retain the first free
         // slot we saw as the insertion candidate.
         let mut candidate: Option<SlotLocation> = None;
-        let (found, miss) = self.find_in_levels(
-            &key,
-            key_hash,
-            key_fingerprint,
-            Candidate::Track(&mut candidate),
-        );
+        let (found, miss) =
+            self.find_in_levels(&key, key_hash, key_fingerprint, Some(&mut candidate));
         if let Some(location) = found {
             return Some(self.replace_existing_value(location, value));
         }
@@ -930,8 +915,7 @@ where
             );
         }
 
-        // Cold path: key might be in the special array. Outlined into its
-        // own function to keep insert's hot code compact.
+        // Cold path: key might be in the special array. Outlined to keep insert's hot body compact.
         if let Some(location) =
             self.scan_special_for_key(&key, key_hash, key_fingerprint, &mut candidate)
         {
@@ -943,8 +927,7 @@ where
 
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control::control_fingerprint(key_hash);
@@ -966,8 +949,7 @@ where
     /// Like [`Self::get`] but returns the stored key alongside its value.
     pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control::control_fingerprint(key_hash);
@@ -989,8 +971,7 @@ where
 
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control::control_fingerprint(key_hash);
@@ -1025,8 +1006,7 @@ where
     /// If two input keys resolve to the same slot.
     pub fn get_disjoint_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> [Option<&mut V>; N]
     where
-        K: Borrow<Q> + Eq,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
         check_disjoint_aliasing_funnel(&locations);
@@ -1057,8 +1037,7 @@ where
         keys: [&Q; N],
     ) -> [Option<(&K, &mut V)>; N]
     where
-        K: Borrow<Q> + Eq,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
         check_disjoint_aliasing_funnel(&locations);
@@ -1089,8 +1068,7 @@ where
         keys: [&Q; N],
     ) -> [Option<&mut V>; N]
     where
-        K: Borrow<Q> + Eq,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
 
@@ -1110,8 +1088,7 @@ where
     #[inline]
     fn locate_disjoint<Q, const N: usize>(&self, keys: [&Q; N]) -> [Option<SlotLocation>; N]
     where
-        K: Borrow<Q> + Eq,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         core::array::from_fn(|i| {
             let key = keys[i];
@@ -1123,8 +1100,7 @@ where
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control::control_fingerprint(key_hash);
@@ -1134,8 +1110,7 @@ where
 
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         self.remove_inner(key).map(|(_, v)| v)
     }
@@ -1143,16 +1118,14 @@ where
     /// Like [`Self::remove`] but returns the stored key alongside its value.
     pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         self.remove_inner(key)
     }
 
     fn remove_inner<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control::control_fingerprint(key_hash);
@@ -1248,7 +1221,7 @@ where
             levels_len,
             primary,
             fallback,
-            phase: FunnelIterPhase::Levels,
+            phase: IterPhase::Levels,
             level_idx: 0,
             cursor: OccupiedCursor::new(),
             remaining,
@@ -1354,7 +1327,7 @@ where
     pub fn drain(&mut self) -> Drain<'_, K, V, S, A> {
         Drain {
             map: self,
-            phase: DrainPhase::Levels,
+            phase: IterPhase::Levels,
             level_idx: 0,
             cursor: OccupiedCursor::new(),
         }
@@ -1370,7 +1343,7 @@ where
         ExtractIf {
             map: self,
             pred: f,
-            phase: DrainPhase::Levels,
+            phase: IterPhase::Levels,
             level_idx: 0,
             cursor: OccupiedCursor::new(),
         }
@@ -1650,40 +1623,29 @@ where
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
-    /// Paper §5: walk `A_1..A_α` in order; record the first free slot via
-    /// `Candidate::Track`. Returns the key location if found, plus a
-    /// [`LevelMiss`] indicating whether a special-array scan is needed.
+    /// Walk `A_1..A_α`; record the earliest free slot into `free_slot`.
+    /// Returns the key location if found, plus a [`LevelMiss`].
     #[inline]
     fn find_in_levels<Q>(
         &self,
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
-        candidate: Candidate<'_, SlotLocation>,
+        free_slot: FreeSlot,
     ) -> (Option<SlotLocation>, LevelMiss)
     where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
-        let wants_free = candidate.wants_free();
+        let wants_free = matches!(&free_slot, Some(out) if out.is_none());
         let mut local: Option<SlotLocation> = None;
 
         for (level_idx, level) in self.levels.iter().enumerate() {
-            // Per-level slot tracking, only while we still want a candidate.
-            let mut slot_candidate: Option<usize> = None;
-            let level_mode = if wants_free && local.is_none() {
-                Candidate::Track(&mut slot_candidate)
+            let out = if wants_free && local.is_none() {
+                Some(&mut local)
             } else {
-                Candidate::Lookup
+                None
             };
-            let lookup_step = level.find_in_bucket(key_hash, key_fingerprint, key, level_mode);
-            if let Some(slot_idx) = slot_candidate {
-                local = Some(SlotLocation::Level {
-                    level_idx,
-                    slot_idx,
-                });
-            }
-            match lookup_step {
+            match level.find_in_bucket(key_hash, key_fingerprint, key, level_idx, out) {
                 LookupStep::Found(slot_idx) => {
                     return (
                         Some(SlotLocation::Level {
@@ -1695,18 +1657,22 @@ where
                 }
                 LookupStep::Continue => {}
                 LookupStep::StopSearch => {
-                    candidate.record(local);
+                    if let Some(out) = free_slot {
+                        *out = local;
+                    }
                     return (None, LevelMiss::ChainClean);
                 }
             }
         }
 
-        candidate.record(local);
+        if let Some(out) = free_slot {
+            *out = local;
+        }
         (None, LevelMiss::MayContinue)
     }
 
-    /// Probe special primary then fallback for `key`;
-    /// record first free slot in `candidate`.
+    /// Probe primary then fallback for `key`; record first free slot.
+    /// `#[cold]` keeps insert's hot body compact.
     #[cold]
     #[inline(never)]
     fn scan_special_for_key<Q>(
@@ -1717,26 +1683,17 @@ where
         candidate: &mut Option<SlotLocation>,
     ) -> Option<SlotLocation>
     where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
-        match self.find_in_special_primary(
-            key_hash,
-            key_fingerprint,
-            key,
-            Candidate::Track(candidate),
-        ) {
+        match self.find_in_special_primary(key_hash, key_fingerprint, key, Some(candidate)) {
             LookupStep::Found(slot_idx) => {
                 return Some(SlotLocation::SpecialPrimary { slot_idx });
             }
             LookupStep::StopSearch => {}
             LookupStep::Continue => {
-                if let Some(slot_idx) = self.find_in_special_fallback(
-                    key_hash,
-                    key_fingerprint,
-                    key,
-                    Candidate::Track(candidate),
-                ) {
+                if let Some(slot_idx) =
+                    self.find_in_special_fallback(key_hash, key_fingerprint, key, Some(candidate))
+                {
                     return Some(SlotLocation::SpecialFallback { slot_idx });
                 }
             }
@@ -1906,21 +1863,19 @@ where
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
-        candidate: Candidate<'_, SlotLocation>,
+        free_slot: FreeSlot,
     ) -> LookupStep
     where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
-        let wants_free = candidate.wants_free();
+        let wants_free = matches!(&free_slot, Some(out) if out.is_none());
         let primary = &self.special.primary;
 
         if primary.table.capacity() == 0 || primary.len == 0 {
-            if wants_free {
-                let slot = self
+            if wants_free && let Some(out) = free_slot {
+                *out = self
                     .first_free_in_special_primary(key_hash)
                     .map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx });
-                candidate.record(slot);
             }
             return LookupStep::Continue;
         }
@@ -1951,7 +1906,7 @@ where
                 for relative_idx in primary.table.group_match_mask(probe.group, key_fingerprint) {
                     let slot_idx = probe.group * GROUP_SIZE + relative_idx;
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
-                    if entry.key.borrow() == key {
+                    if key.equivalent(&entry.key) {
                         break 'probe LookupStep::Found(slot_idx);
                     }
                 }
@@ -1971,35 +1926,32 @@ where
             LookupStep::Continue
         };
 
-        if wants_free {
-            candidate.record(local.map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx }));
+        if wants_free && let Some(out) = free_slot {
+            *out = local.map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx });
         }
         outcome
     }
 
     /// Probe special fallback for `key` across its two candidate buckets.
-    /// See [`Candidate`] for tracking modes.
     #[inline]
     fn find_in_special_fallback<Q>(
         &self,
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
-        candidate: Candidate<'_, SlotLocation>,
+        free_slot: FreeSlot,
     ) -> Option<usize>
     where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
-        let wants_free = candidate.wants_free();
+        let wants_free = matches!(&free_slot, Some(out) if out.is_none());
         let fallback = &self.special.fallback;
 
         if fallback.table.capacity() == 0 || fallback.len == 0 {
-            if wants_free {
-                let slot = self
+            if wants_free && let Some(out) = free_slot {
+                *out = self
                     .first_free_in_special_fallback(key_hash)
                     .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx });
-                candidate.record(slot);
             }
             return None;
         }
@@ -2039,7 +1991,7 @@ where
                 ) {
                     let slot_idx = range.start + relative_idx;
                     let entry = unsafe { fallback.table.get_ref(slot_idx) };
-                    if entry.key.borrow() == key {
+                    if key.equivalent(&entry.key) {
                         found = Some(slot_idx);
                         break;
                     }
@@ -2048,8 +2000,8 @@ where
             }
         }
 
-        if wants_free {
-            candidate.record(local.map(|slot_idx| SlotLocation::SpecialFallback { slot_idx }));
+        if wants_free && let Some(out) = free_slot {
+            *out = local.map(|slot_idx| SlotLocation::SpecialFallback { slot_idx });
         }
         found
     }
@@ -2062,10 +2014,9 @@ where
         key_fingerprint: u8,
     ) -> Option<SlotLocation>
     where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
-        match self.levels[0].find_in_bucket(key_hash, key_fingerprint, key, Candidate::Lookup) {
+        match self.levels[0].find_in_bucket(key_hash, key_fingerprint, key, 0, None) {
             LookupStep::Found(slot_idx) => {
                 return Some(SlotLocation::Level {
                     level_idx: 0,
@@ -2101,12 +2052,11 @@ where
         key_fingerprint: u8,
     ) -> ControlFlow<Option<SlotLocation>>
     where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (offset, level) in self.levels[1..search_limit].iter().enumerate() {
-            match level.find_in_bucket(key_hash, key_fingerprint, key, Candidate::Lookup) {
+            match level.find_in_bucket(key_hash, key_fingerprint, key, offset + 1, None) {
                 LookupStep::Found(slot_idx) => {
                     return ControlFlow::Break(Some(SlotLocation::Level {
                         level_idx: offset + 1,
@@ -2129,16 +2079,15 @@ where
         key: &Q,
     ) -> Option<SlotLocation>
     where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
-        match self.find_in_special_primary(key_hash, key_fingerprint, key, Candidate::Lookup) {
+        match self.find_in_special_primary(key_hash, key_fingerprint, key, None) {
             LookupStep::Found(slot_idx) => return Some(SlotLocation::SpecialPrimary { slot_idx }),
             LookupStep::Continue => {}
             LookupStep::StopSearch => return None,
         }
 
-        self.find_in_special_fallback(key_hash, key_fingerprint, key, Candidate::Lookup)
+        self.find_in_special_fallback(key_hash, key_fingerprint, key, None)
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
@@ -2440,10 +2389,10 @@ where
     }
 }
 
-/// Three-phase iterator state: walk all bucket levels, then the special
-/// primary, then the special fallback.
+/// Three-phase iterator state: walk all bucket levels,
+/// then the special primary, then the special fallback.
 #[derive(Debug)]
-enum FunnelIterPhase {
+enum IterPhase {
     Levels,
     Primary,
     Fallback,
@@ -2472,7 +2421,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelTables<'a, K, V, A> {
 }
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelTables<'_, K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelTables").finish_non_exhaustive()
     }
 }
@@ -2489,7 +2438,7 @@ pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
 }
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelIter<'_, K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelIter").finish_non_exhaustive()
     }
 }
@@ -2535,27 +2484,18 @@ where
     }
 }
 
-/// Walk phase shared by `Drain` and `ExtractIf`: levels first, then the
-/// special primary, then the special fallback.
-enum DrainPhase {
-    Levels,
-    Primary,
-    Fallback,
-    Done,
-}
-
 /// Draining iterator. Yields and removes every `(K, V)` entry; the map is
 /// empty once the iterator is consumed or dropped. Returned by
 /// [`FunnelHashMap::drain`].
 pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     map: &'a mut FunnelHashMap<K, V, S, A>,
-    phase: DrainPhase,
+    phase: IterPhase,
     level_idx: usize,
     cursor: OccupiedCursor,
 }
 
 impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Drain").finish_non_exhaustive()
     }
 }
@@ -2569,7 +2509,7 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
         // forward so yielded slots are never re-read.
         loop {
             match self.phase {
-                DrainPhase::Levels => {
+                IterPhase::Levels => {
                     while self.level_idx < self.map.levels.len() {
                         let level = &mut self.map.levels[self.level_idx];
                         if let Some(idx) = level.table.scan_next(&mut self.cursor) {
@@ -2580,29 +2520,29 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
                         self.level_idx += 1;
                         self.cursor = OccupiedCursor::new();
                     }
-                    self.phase = DrainPhase::Primary;
+                    self.phase = IterPhase::Primary;
                     self.cursor = OccupiedCursor::new();
                 }
-                DrainPhase::Primary => {
+                IterPhase::Primary => {
                     let primary = &mut self.map.special.primary;
                     if let Some(idx) = primary.table.scan_next(&mut self.cursor) {
                         let entry = unsafe { primary.table.take(idx) };
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
-                    self.phase = DrainPhase::Fallback;
+                    self.phase = IterPhase::Fallback;
                     self.cursor = OccupiedCursor::new();
                 }
-                DrainPhase::Fallback => {
+                IterPhase::Fallback => {
                     let fallback = &mut self.map.special.fallback;
                     if let Some(idx) = fallback.table.scan_next(&mut self.cursor) {
                         let entry = unsafe { fallback.table.take(idx) };
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
-                    self.phase = DrainPhase::Done;
+                    self.phase = IterPhase::Done;
                 }
-                DrainPhase::Done => return None,
+                IterPhase::Done => return None,
             }
         }
     }
@@ -2648,7 +2588,7 @@ where
 {
     map: &'a mut FunnelHashMap<K, V, S, A>,
     pred: F,
-    phase: DrainPhase,
+    phase: IterPhase,
     level_idx: usize,
     cursor: OccupiedCursor,
 }
@@ -2659,7 +2599,7 @@ where
     S: BuildHasher,
     F: FnMut(&K, &mut V) -> bool,
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ExtractIf").finish_non_exhaustive()
     }
 }
@@ -2675,7 +2615,7 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.phase {
-                DrainPhase::Levels => {
+                IterPhase::Levels => {
                     while self.level_idx < self.map.levels.len() {
                         let level = &mut self.map.levels[self.level_idx];
                         while let Some(idx) = level.table.scan_next(&mut self.cursor) {
@@ -2694,10 +2634,10 @@ where
                         self.level_idx += 1;
                         self.cursor = OccupiedCursor::new();
                     }
-                    self.phase = DrainPhase::Primary;
+                    self.phase = IterPhase::Primary;
                     self.cursor = OccupiedCursor::new();
                 }
-                DrainPhase::Primary => {
+                IterPhase::Primary => {
                     let primary = &mut self.map.special.primary;
                     while let Some(idx) = primary.table.scan_next(&mut self.cursor) {
                         let entry = unsafe { primary.table.get_mut(idx) };
@@ -2712,10 +2652,10 @@ where
                             return Some((removed.key, removed.value));
                         }
                     }
-                    self.phase = DrainPhase::Fallback;
+                    self.phase = IterPhase::Fallback;
                     self.cursor = OccupiedCursor::new();
                 }
-                DrainPhase::Fallback => {
+                IterPhase::Fallback => {
                     let fallback = &mut self.map.special.fallback;
                     while let Some(idx) = fallback.table.scan_next(&mut self.cursor) {
                         let entry = unsafe { fallback.table.get_mut(idx) };
@@ -2730,9 +2670,9 @@ where
                             return Some((removed.key, removed.value));
                         }
                     }
-                    self.phase = DrainPhase::Done;
+                    self.phase = IterPhase::Done;
                 }
-                DrainPhase::Done => return None,
+                IterPhase::Done => return None,
             }
         }
     }
@@ -2770,7 +2710,7 @@ pub struct FunnelIterMut<'a, K, V, A: Allocator + Clone = Global> {
     levels_len: usize,
     primary: *mut SpecialPrimary<K, V, A>,
     fallback: *mut SpecialFallback<K, V, A>,
-    phase: FunnelIterPhase,
+    phase: IterPhase,
     level_idx: usize,
     cursor: OccupiedCursor,
     remaining: usize,
@@ -2788,7 +2728,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.phase {
-                FunnelIterPhase::Levels => {
+                IterPhase::Levels => {
                     while self.level_idx < self.levels_len {
                         // SAFETY: `level_idx < levels_len`, and `self.levels`
                         // points at a slice of `levels_len` initialized
@@ -2808,10 +2748,10 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                         self.level_idx += 1;
                         self.cursor = OccupiedCursor::new();
                     }
-                    self.phase = FunnelIterPhase::Primary;
+                    self.phase = IterPhase::Primary;
                     self.cursor = OccupiedCursor::new();
                 }
-                FunnelIterPhase::Primary => {
+                IterPhase::Primary => {
                     // SAFETY: `self.primary` points at the borrowed map's
                     // `SpecialPrimary` for `'a`.
                     let primary = unsafe { &mut *self.primary };
@@ -2822,10 +2762,10 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                         self.remaining -= 1;
                         return Some((key, val));
                     }
-                    self.phase = FunnelIterPhase::Fallback;
+                    self.phase = IterPhase::Fallback;
                     self.cursor = OccupiedCursor::new();
                 }
-                FunnelIterPhase::Fallback => {
+                IterPhase::Fallback => {
                     // SAFETY: same as the Primary arm, for `self.fallback`.
                     let fallback = unsafe { &mut *self.fallback };
                     if let Some(idx) = fallback.table.scan_next(&mut self.cursor) {
@@ -2835,9 +2775,9 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                         self.remaining -= 1;
                         return Some((key, val));
                     }
-                    self.phase = FunnelIterPhase::Done;
+                    self.phase = IterPhase::Done;
                 }
-                FunnelIterPhase::Done => return None,
+                IterPhase::Done => return None,
             }
         }
     }
@@ -2851,7 +2791,7 @@ impl<K, V, A: Allocator + Clone> ExactSizeIterator for FunnelIterMut<'_, K, V, A
 impl<K, V, A: Allocator + Clone> FusedIterator for FunnelIterMut<'_, K, V, A> {}
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelIterMut<'_, K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelIterMut")
             .field("level_idx", &self.level_idx)
             .finish_non_exhaustive()
@@ -2893,7 +2833,7 @@ impl<K, V, A: Allocator + Clone> ExactSizeIterator for FunnelValuesMut<'_, K, V,
 impl<K, V, A: Allocator + Clone> FusedIterator for FunnelValuesMut<'_, K, V, A> {}
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelValuesMut<'_, K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelValuesMut")
             .field("level_idx", &self.inner.level_idx)
             .finish_non_exhaustive()
@@ -2906,7 +2846,7 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelValuesMut<'_, K, V, A> {
 /// `Drop` never revisits it. `Drop` drains the remainder per std semantics.
 pub struct FunnelIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     map: FunnelHashMap<K, V, S, A>,
-    phase: FunnelIterPhase,
+    phase: IterPhase,
     level_idx: usize,
     cursor: OccupiedCursor,
 }
@@ -2917,7 +2857,7 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.phase {
-                FunnelIterPhase::Levels => {
+                IterPhase::Levels => {
                     while self.level_idx < self.map.levels.len() {
                         let table = &mut self.map.levels[self.level_idx].table;
                         if let Some(idx) = table.scan_next(&mut self.cursor) {
@@ -2931,10 +2871,10 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
                         self.level_idx += 1;
                         self.cursor = OccupiedCursor::new();
                     }
-                    self.phase = FunnelIterPhase::Primary;
+                    self.phase = IterPhase::Primary;
                     self.cursor = OccupiedCursor::new();
                 }
-                FunnelIterPhase::Primary => {
+                IterPhase::Primary => {
                     let table = &mut self.map.special.primary.table;
                     if let Some(idx) = table.scan_next(&mut self.cursor) {
                         let entry = unsafe { table.take(idx) };
@@ -2942,10 +2882,10 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
-                    self.phase = FunnelIterPhase::Fallback;
+                    self.phase = IterPhase::Fallback;
                     self.cursor = OccupiedCursor::new();
                 }
-                FunnelIterPhase::Fallback => {
+                IterPhase::Fallback => {
                     let table = &mut self.map.special.fallback.table;
                     if let Some(idx) = table.scan_next(&mut self.cursor) {
                         let entry = unsafe { table.take(idx) };
@@ -2953,9 +2893,9 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
-                    self.phase = FunnelIterPhase::Done;
+                    self.phase = IterPhase::Done;
                 }
-                FunnelIterPhase::Done => return None,
+                IterPhase::Done => return None,
             }
         }
     }
@@ -2978,7 +2918,7 @@ impl<K, V, S, A: Allocator + Clone> Drop for FunnelIntoIter<K, V, S, A> {
 }
 
 impl<K, V, S, A: Allocator + Clone> fmt::Debug for FunnelIntoIter<K, V, S, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelIntoIter")
             .field("phase", &self.phase)
             .field("level_idx", &self.level_idx)
@@ -2998,7 +2938,7 @@ where
     fn into_iter(self) -> Self::IntoIter {
         FunnelIntoIter {
             map: self,
-            phase: FunnelIterPhase::Levels,
+            phase: IterPhase::Levels,
             level_idx: 0,
             cursor: OccupiedCursor::new(),
         }
@@ -3356,8 +3296,8 @@ where
 
 impl<K, Q, V, S, A> std::ops::Index<&Q> for FunnelHashMap<K, V, S, A>
 where
-    K: Eq + Hash + Borrow<Q>,
-    Q: Eq + Hash + ?Sized,
+    K: Eq + Hash,
+    Q: Hash + Equivalent<K> + ?Sized,
     S: BuildHasher,
     A: Allocator + Clone,
 {

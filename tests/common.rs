@@ -150,7 +150,7 @@ macro_rules! common_suite {
             fn get_disjoint_mut_zero_keys_returns_empty_array() {
                 let mut map: HashMap<i32, i32> = HashMap::with_capacity(16);
                 map.insert(1, 1);
-                let got: [Option<&mut i32>; 0] = map.get_disjoint_mut([]);
+                let got = map.get_disjoint_mut::<i32, 0>([]);
                 assert_eq!(got.len(), 0);
             }
 
