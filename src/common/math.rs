@@ -117,10 +117,9 @@ pub(crate) mod probe {
         hash as usize
     }
 
-    /// Triangular probe over a pow2-sized group count. Group sequence is
-    /// `start, start+1, start+3, start+6, ...` mod `mask+1` — triangular
-    /// numbers visit every residue exactly once when `mask+1` is pow2.
-    /// Same scheme as hashbrown / `SwissTable`.
+    /// Triangular probe over a pow2-sized group count. Visits every group
+    /// exactly once (same scheme as hashbrown / `SwissTable`).
+    #[derive(Debug, Clone, Copy)]
     pub(crate) struct TriangularProbe {
         pub(crate) pos: usize,
         delta: usize,
