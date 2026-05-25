@@ -616,7 +616,7 @@ where
         check_disjoint_aliasing(&locations);
 
         let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
-        core::array::from_fn(|i| {
+        std::array::from_fn(|i| {
             locations[i].map(|(level_idx, slot_idx)| {
                 // SAFETY: locations are unique among Somes (asserted above).
                 // `elastic_slot_value_ptr` projects via raw pointers — no
@@ -645,7 +645,7 @@ where
         check_disjoint_aliasing(&locations);
 
         let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
-        core::array::from_fn(|i| {
+        std::array::from_fn(|i| {
             locations[i].map(|(level_idx, slot_idx)| {
                 // SAFETY: as in `get_disjoint_mut`.
                 let (k_ptr, v_ptr) =
@@ -673,7 +673,7 @@ where
         let locations = self.locate_disjoint(keys);
 
         let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
-        core::array::from_fn(|i| {
+        std::array::from_fn(|i| {
             locations[i].map(|(level_idx, slot_idx)| {
                 // SAFETY: caller guarantees the hits are pairwise distinct.
                 let value_ptr = unsafe { elastic_slot_value_ptr(levels_ptr, level_idx, slot_idx) };
@@ -687,7 +687,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        core::array::from_fn(|i| {
+        std::array::from_fn(|i| {
             let key = keys[i];
             let key_hash = self.hash_key(key);
             let key_fingerprint = control::control_fingerprint(key_hash);

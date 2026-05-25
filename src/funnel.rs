@@ -129,20 +129,21 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
     }
 
     /// Probe one bucket for `key`. SIMD fingerprint scan + key compare.
-    /// `StopSearch` on EMPTY byte: bucket never overflowed, so the key cannot
-    /// be at a deeper level. See [`Candidate`] for the tracking modes.
+    /// `StopSearch` on EMPTY byte: bucket never overflowed,
+    /// so the key cannot be at a deeper level.
+    /// Pass `Some(out)` to record the first free slot index; `None` for lookup-only.
     #[inline]
     fn find_in_bucket<Q>(
         &self,
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
-        free_slot: Option<&mut Option<usize>>,
+        slot_out: Option<&mut Option<usize>>,
     ) -> LookupStep
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let wants_free = matches!(&free_slot, Some(out) if out.is_none());
+        let wants_free = matches!(&slot_out, Some(out) if out.is_none());
 
         if self.len == 0 {
             if self.table.capacity() == 0 {
@@ -153,7 +154,7 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
             if wants_free {
                 let bucket_idx = self.bucket_index(key_hash);
                 let slot_idx = bucket_idx << self.bucket_size_log2;
-                if let Some(out) = free_slot {
+                if let Some(out) = slot_out {
                     *out = Some(slot_idx);
                 }
             }
@@ -189,7 +190,7 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
                 .group_free_mask(group_idx)
                 .lowest()
                 .map(|o| bucket_range.start + o);
-            if let (Some(out), Some(slot_idx)) = (free_slot, slot) {
+            if let (Some(out), Some(slot_idx)) = (slot_out, slot) {
                 *out = Some(slot_idx);
             }
         }
@@ -1007,7 +1008,7 @@ where
         let levels_ptr: *mut BucketLevel<K, V, A> = self.levels.as_mut_ptr();
         let primary_ptr: *mut SpecialPrimary<K, V, A> = &raw mut self.special.primary;
         let fallback_ptr: *mut SpecialFallback<K, V, A> = &raw mut self.special.fallback;
-        core::array::from_fn(|i| {
+        std::array::from_fn(|i| {
             locations[i].map(|loc| {
                 // SAFETY: locations are unique among Somes (asserted above).
                 // Raw-pointer chain — no intermediate `&mut BucketLevel`,
@@ -1038,7 +1039,7 @@ where
         let levels_ptr: *mut BucketLevel<K, V, A> = self.levels.as_mut_ptr();
         let primary_ptr: *mut SpecialPrimary<K, V, A> = &raw mut self.special.primary;
         let fallback_ptr: *mut SpecialFallback<K, V, A> = &raw mut self.special.fallback;
-        core::array::from_fn(|i| {
+        std::array::from_fn(|i| {
             locations[i].map(|loc| {
                 // SAFETY: as in `get_disjoint_mut`.
                 let (k_ptr, v_ptr) =
@@ -1068,7 +1069,7 @@ where
         let levels_ptr: *mut BucketLevel<K, V, A> = self.levels.as_mut_ptr();
         let primary_ptr: *mut SpecialPrimary<K, V, A> = &raw mut self.special.primary;
         let fallback_ptr: *mut SpecialFallback<K, V, A> = &raw mut self.special.fallback;
-        core::array::from_fn(|i| {
+        std::array::from_fn(|i| {
             locations[i].map(|loc| {
                 // SAFETY: caller guarantees the hits are pairwise distinct.
                 let value_ptr: *mut V =
@@ -1083,7 +1084,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        core::array::from_fn(|i| {
+        std::array::from_fn(|i| {
             let key = keys[i];
             let key_hash = self.hash_key(key);
             let key_fingerprint = control::control_fingerprint(key_hash);
@@ -1856,8 +1857,8 @@ where
 
     /// Probe special primary for `key`. Bounded by `primary_probe_limit`
     /// groups; if reached without a match and no tombstones seen, returns
-    /// `StopSearch` so the caller skips fallback. See [`Candidate`] for
-    /// tracking modes.
+    /// `StopSearch` so the caller skips fallback. Pass `Some(out)` to
+    /// record the first free `SlotLocation`; `None` for lookup-only.
     #[inline]
     fn find_in_special_primary<Q>(
         &self,
