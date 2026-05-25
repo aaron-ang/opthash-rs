@@ -2415,6 +2415,7 @@ enum FunnelIterPhase {
 }
 
 /// Iterator over the funnel's tables: each level, then primary, then fallback.
+#[derive(Clone)]
 struct FunnelTables<'a, K, V, A: Allocator + Clone> {
     levels: std::slice::Iter<'a, BucketLevel<K, V, A>>,
     primary: Option<&'a RawTable<SlotEntry<K, V>, A>>,
@@ -2437,6 +2438,7 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelTables<'a, K, V, A> {
 /// Borrowing iterator over occupied entries. Visits bucket levels → special
 /// primary → special fallback. SIMD-scans one group at a time via
 /// [`OccupiedCursor`], yielding bits from a cached mask before refilling.
+#[derive(Clone)]
 pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
     tables: FunnelTables<'a, K, V, A>,
     current: Option<&'a RawTable<SlotEntry<K, V>, A>>,

@@ -1364,6 +1364,7 @@ where
 
 /// Borrowing iterator over occupied entries. Walks levels in order via
 /// [`OccupiedCursor`]; skips FREE and TOMBSTONE.
+#[derive(Clone)]
 pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
     tables: std::slice::Iter<'a, Level<K, V, A>>,
     current: Option<&'a RawTable<SlotEntry<K, V>, A>>,
