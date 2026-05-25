@@ -19,7 +19,7 @@ Both maps share a common core: `RawTable`-backed multi-level layouts, 7-bit fing
 - **`ElasticHashMap<K, V>`** — Flat `RawTable` per level with geometrically halving capacities; insertion uses per-level probe budgets.
 - **`FunnelHashMap<K, V>`** — Bucketed levels plus a split special array: `primary` (group-probed) and `fallback` (two-choice buckets).
 
-Both maps mirror `std::collections::HashMap`'s API and support the same operations. Each map starts with zero allocation (`new()`) and grow dynamically on demand. Advanced tuning is available through `ElasticOptions`, `FunnelOptions`, and `with_options(...)`.
+Both maps mirror `std::collections::HashMap`'s API and support the same operations. Each map starts with zero allocation (`new()`) and grows dynamically on demand. The `reserve_fraction` headroom knob is exposed via dedicated constructors.
 
 ## Usage
 
@@ -30,21 +30,17 @@ cargo add opthash
 ```
 
 ```rust
-use opthash::{ElasticHashMap, ElasticOptions, FunnelHashMap, FunnelOptions};
+use opthash::{ElasticHashMap, FunnelHashMap};
 
 let mut map = ElasticHashMap::new();
 map.insert("key", 42);
 assert_eq!(map.get("key"), Some(&42));
 
-let mut map = ElasticHashMap::with_options(
-    ElasticOptions::with_capacity(1024).reserve_fraction(0.10),
-);
+let mut map = ElasticHashMap::with_capacity_and_reserve_fraction(1024, 0.10);
 map.insert("key", 42);
 assert_eq!(map.get("key"), Some(&42));
 
-let mut map = FunnelHashMap::with_options(
-    FunnelOptions::with_capacity(1024).reserve_fraction(0.10),
-);
+let mut map = FunnelHashMap::with_capacity_and_reserve_fraction(1024, 0.10);
 map.insert("key", 42);
 assert_eq!(map.get("key"), Some(&42));
 ```
@@ -89,24 +85,24 @@ RawTable (shared by both maps)
 ElasticHashMap
 ==============
 
-  levels: Vec<Level>
+  levels: Box<[Level]>
 
     Level 0    RawTable  (largest, ~half of total capacity)
     Level 1    RawTable  (geometrically halved)
     Level 2    ...
 
-    per-level  len, tombstones, half_reserve_slot_threshold,
-               limited_probe_budgets, salt, group_count_mask
+    per-level  table, len, salt, group_count_mask, tombstones,
+               half_reserve_slot_threshold, budget_cap
 
   table-wide   len, capacity, max_insertions, reserve_fraction,
                batch_plan, current_batch_index, batch_remaining,
-               max_populated_level, hash_builder
+               max_populated_level, hash_builder, alloc
 
 
 FunnelHashMap
 =============
 
-  levels: Vec<BucketLevel>
+  levels: Box<[BucketLevel]>
 
     Level 0
       slots:     kv kv __ __ ... kv kv __ __ ... kv ...
@@ -116,19 +112,20 @@ FunnelHashMap
     Level 1    (same layout, smaller buckets)
     ...
 
-    per-level  len, tombstones, bucket_size, salt,
-               bucket_count_mask
+    per-level  table, len, tombstones, salt,
+               bucket_count_mask, bucket_size_log2
 
   special: SpecialArray
 
-    primary    RawTable, group-probed (like elastic)
-    (paper B)  len, group_count_mask, group_summaries, group_tombstones
+    primary    RawTable, group-probed
+    (paper B)  table, len, tombstones, group_count_mask
 
     fallback   RawTable, two-choice bucketed
-    (paper C)  len, tombstones, bucket_size, bucket_count
+    (paper C)  table, len, tombstones, bucket_count, bucket_size_log2
 
   table-wide   len, capacity, max_insertions, reserve_fraction,
-               primary_probe_limit, max_populated_level, hash_builder
+               primary_probe_limit, max_populated_level,
+               hash_builder, alloc
 ```
 
 ## Benchmarks

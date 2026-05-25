@@ -20,48 +20,6 @@ use crate::common::layout::{OccupiedCursor, RawTable, SlotEntry};
 use crate::common::math::{self, align, capacity, cast, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
-/// Construction-time tuning for `FunnelHashMap`.
-#[derive(Debug, Clone, Copy)]
-pub struct FunnelOptions {
-    /// Target initial capacity. Funnel caps load factor at 1/8 by design;
-    /// useful capacity is `capacity * (1 - reserve_fraction)`.
-    capacity: usize,
-    /// Fraction kept free as headroom. Clamped to
-    /// `MAX_FUNNEL_RESERVE_FRACTION` (1/8).
-    reserve_fraction: f64,
-}
-
-impl Default for FunnelOptions {
-    fn default() -> Self {
-        Self {
-            capacity: 0,
-            reserve_fraction: DEFAULT_RESERVE_FRACTION,
-        }
-    }
-}
-
-impl FunnelOptions {
-    #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            capacity,
-            ..Self::default()
-        }
-    }
-
-    #[must_use]
-    pub fn capacity(mut self, capacity: usize) -> Self {
-        self.capacity = capacity;
-        self
-    }
-
-    #[must_use]
-    pub fn reserve_fraction(mut self, reserve_fraction: f64) -> Self {
-        self.reserve_fraction = reserve_fraction;
-        self
-    }
-}
-
 /// One funnel level `A_i` (paper §5). Fixed grid of `β`-sized buckets `A_{i,j}`;
 /// inserts hash to one bucket and probe within it. Overflow spills to `A_{i+1}`
 /// (or the special array `A_{α+1}`).
@@ -600,7 +558,7 @@ pub struct FunnelHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Gl
     capacity: usize,
     /// Insert count that triggers `resize(2x)`.
     max_insertions: usize,
-    /// Slot reserve fraction. See `FunnelOptions`.
+    /// Slot reserve fraction. Set at construction.
     reserve_fraction: f64,
     /// Cap on groups probed in the special primary before fallback.
     primary_probe_limit: usize,
@@ -640,17 +598,27 @@ where
 {
     #[must_use]
     pub fn new() -> Self {
-        Self::with_options(FunnelOptions::default())
+        Self::with_capacity_and_reserve_fraction(0, DEFAULT_RESERVE_FRACTION)
     }
 
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_options(FunnelOptions::with_capacity(capacity))
+        Self::with_capacity_and_reserve_fraction(capacity, DEFAULT_RESERVE_FRACTION)
     }
 
     #[must_use]
-    pub fn with_options(options: FunnelOptions) -> Self {
-        Self::with_options_and_hasher_in(options, DefaultHashBuilder::default(), Global)
+    pub fn with_reserve_fraction(reserve_fraction: f64) -> Self {
+        Self::with_capacity_and_reserve_fraction(0, reserve_fraction)
+    }
+
+    #[must_use]
+    pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self {
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            reserve_fraction,
+            DefaultHashBuilder::default(),
+            Global,
+        )
     }
 }
 
@@ -662,25 +630,50 @@ where
 {
     #[must_use]
     pub fn with_hasher(hash_builder: S) -> Self {
-        Self::with_options_and_hasher_in(FunnelOptions::default(), hash_builder, Global)
-    }
-
-    #[must_use]
-    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
-        Self::with_options_and_hasher_in(
-            FunnelOptions::with_capacity(capacity),
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            0,
+            DEFAULT_RESERVE_FRACTION,
             hash_builder,
             Global,
         )
     }
 
     #[must_use]
-    pub fn with_options_and_hasher(options: FunnelOptions, hash_builder: S) -> Self {
-        Self::with_options_and_hasher_in(options, hash_builder, Global)
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            DEFAULT_RESERVE_FRACTION,
+            hash_builder,
+            Global,
+        )
+    }
+
+    #[must_use]
+    pub fn with_reserve_fraction_and_hasher(reserve_fraction: f64, hash_builder: S) -> Self {
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            0,
+            reserve_fraction,
+            hash_builder,
+            Global,
+        )
+    }
+
+    #[must_use]
+    pub fn with_capacity_and_reserve_fraction_and_hasher(
+        capacity: usize,
+        reserve_fraction: f64,
+        hash_builder: S,
+    ) -> Self {
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            reserve_fraction,
+            hash_builder,
+            Global,
+        )
     }
 }
 
-// Custom allocator + default hasher constructors.
+// Default hasher + custom allocator constructors.
 impl<K, V, A> FunnelHashMap<K, V, DefaultHashBuilder, A>
 where
     K: Eq + Hash,
@@ -688,8 +681,9 @@ where
 {
     #[must_use]
     pub fn new_in(alloc: A) -> Self {
-        Self::with_options_and_hasher_in(
-            FunnelOptions::default(),
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            0,
+            DEFAULT_RESERVE_FRACTION,
             DefaultHashBuilder::default(),
             alloc,
         )
@@ -697,8 +691,9 @@ where
 
     #[must_use]
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        Self::with_options_and_hasher_in(
-            FunnelOptions::with_capacity(capacity),
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            DEFAULT_RESERVE_FRACTION,
             DefaultHashBuilder::default(),
             alloc,
         )
@@ -711,37 +706,27 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
-    #[must_use]
-    pub fn with_hasher_in(hash_builder: S, alloc: A) -> Self {
-        Self::with_options_and_hasher_in(FunnelOptions::default(), hash_builder, alloc)
-    }
-
-    #[must_use]
-    pub fn with_capacity_and_hasher_in(capacity: usize, hash_builder: S, alloc: A) -> Self {
-        Self::with_options_and_hasher_in(
-            FunnelOptions::with_capacity(capacity),
-            hash_builder,
-            alloc,
-        )
-    }
-
     /// Full constructor. `resize` also calls this with the existing
     /// `hash_builder` and allocator so all keys keep the same hash sequence
     /// across grows.
     ///
     /// # Panics
     ///
-    /// Panics if no representable capacity satisfies the requested
-    /// `options.capacity` budget.
+    /// Panics if no representable capacity satisfies the requested budget.
     #[must_use]
-    pub fn with_options_and_hasher_in(options: FunnelOptions, hash_builder: S, alloc: A) -> Self {
+    pub fn with_capacity_and_reserve_fraction_and_hasher_in(
+        capacity: usize,
+        reserve_fraction: f64,
+        hash_builder: S,
+        alloc: A,
+    ) -> Self {
         // Paper §5 precondition: δ ≤ 1/8.
-        let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction)
-            .min(MAX_FUNNEL_RESERVE_FRACTION);
-        let capacity = if options.capacity == 0 {
+        let reserve_fraction =
+            capacity::sanitize_reserve_fraction(reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
+        let capacity = if capacity == 0 {
             0
         } else {
-            capacity::capacity_for(INITIAL_CAPACITY, options.capacity, reserve_fraction)
+            capacity::capacity_for(INITIAL_CAPACITY, capacity, reserve_fraction)
                 .expect("capacity overflow")
         };
         let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
@@ -1439,11 +1424,9 @@ where
         S: Clone,
     {
         let mut target = new_capacity;
-        let mut new_map = Self::try_with_options_and_hasher_in(
-            FunnelOptions {
-                capacity: target,
-                reserve_fraction: self.reserve_fraction,
-            },
+        let mut new_map = Self::try_with_slots_and_reserve_fraction_and_hasher_in(
+            target,
+            self.reserve_fraction,
             self.hash_builder.clone(),
             self.alloc.clone(),
         )?;
@@ -1470,27 +1453,27 @@ where
             target = target
                 .checked_mul(2)
                 .ok_or(TryReserveError::CapacityOverflow)?;
-            new_map = Self::try_with_options_and_hasher_in(
-                FunnelOptions {
-                    capacity: target,
-                    reserve_fraction: self.reserve_fraction,
-                },
+            new_map = Self::try_with_slots_and_reserve_fraction_and_hasher_in(
+                target,
+                self.reserve_fraction,
                 self.hash_builder.clone(),
                 self.alloc.clone(),
             )?;
         }
     }
 
-    /// Fallible counterpart to [`Self::with_options_and_hasher_in`]. Returns
-    /// `Err(TryReserveError::AllocError)` if any backing allocation fails.
-    fn try_with_options_and_hasher_in(
-        options: FunnelOptions,
+    /// Internal fallible ctor for `try_resize`. `slots` is raw slot count
+    /// (already inflated by the caller); public ctors take an insertion
+    /// budget and inflate via `capacity_for` — this one skips that.
+    fn try_with_slots_and_reserve_fraction_and_hasher_in(
+        slots: usize,
+        reserve_fraction: f64,
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction)
-            .min(MAX_FUNNEL_RESERVE_FRACTION);
-        let capacity = options.capacity;
+        let capacity = slots;
+        let reserve_fraction =
+            capacity::sanitize_reserve_fraction(reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
         let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
         let level_count = compute_level_count(reserve_fraction);
@@ -3580,7 +3563,7 @@ mod tests {
     fn reserve_fraction_clamped_to_funnel_max() {
         // Funnel's correctness proof requires reserve_fraction <= 1/8.
         let map: FunnelHashMap<i32, i32> =
-            FunnelHashMap::with_options(FunnelOptions::with_capacity(256).reserve_fraction(0.5));
+            FunnelHashMap::with_capacity_and_reserve_fraction(256, 0.5);
         assert!(
             map.reserve_fraction <= MAX_FUNNEL_RESERVE_FRACTION,
             "reserve_fraction={} not clamped to {MAX_FUNNEL_RESERVE_FRACTION}",

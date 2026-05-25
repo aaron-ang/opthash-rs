@@ -17,48 +17,6 @@ use crate::common::layout::{OccupiedCursor, RawTable, SlotEntry};
 use crate::common::math::{self, align, capacity, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
-/// Construction-time tuning for `ElasticHashMap`.
-#[derive(Debug, Clone, Copy)]
-pub struct ElasticOptions {
-    /// Target initial capacity. The map sizes its level partition so
-    /// `capacity * (1 - reserve_fraction)` inserts fit before the next resize.
-    capacity: usize,
-    /// Fraction of slots kept free as headroom. Lower means higher load
-    /// factor but more probing on collisions.
-    reserve_fraction: f64,
-}
-
-impl Default for ElasticOptions {
-    fn default() -> Self {
-        Self {
-            capacity: 0,
-            reserve_fraction: DEFAULT_RESERVE_FRACTION,
-        }
-    }
-}
-
-impl ElasticOptions {
-    #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            capacity,
-            ..Self::default()
-        }
-    }
-
-    #[must_use]
-    pub fn capacity(mut self, capacity: usize) -> Self {
-        self.capacity = capacity;
-        self
-    }
-
-    #[must_use]
-    pub fn reserve_fraction(mut self, reserve_fraction: f64) -> Self {
-        self.reserve_fraction = reserve_fraction;
-        self
-    }
-}
-
 /// One sub-array `A_i` in paper §4's partition `|A_{i+1}| = |A_i|/2 ± 1`.
 /// Independent open-addressed table with its own probe sequence `h_{i,j}(x)`.
 struct Level<K, V, A: Allocator + Clone = Global> {
@@ -253,7 +211,7 @@ pub struct ElasticHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = G
     capacity: usize,
     /// Insert count that triggers `resize(2x)`.
     max_insertions: usize,
-    /// Slot reserve fraction per level. See `ElasticOptions`.
+    /// Slot reserve fraction per level. Set at construction.
     reserve_fraction: f64,
     /// Per-batch insert quota; drives `current_batch_index` advancement.
     batch_plan: Box<[usize]>,
@@ -297,17 +255,27 @@ where
 {
     #[must_use]
     pub fn new() -> Self {
-        Self::with_options(ElasticOptions::default())
+        Self::with_capacity_and_reserve_fraction(0, DEFAULT_RESERVE_FRACTION)
     }
 
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_options(ElasticOptions::with_capacity(capacity))
+        Self::with_capacity_and_reserve_fraction(capacity, DEFAULT_RESERVE_FRACTION)
     }
 
     #[must_use]
-    pub fn with_options(options: ElasticOptions) -> Self {
-        Self::with_options_and_hasher_in(options, DefaultHashBuilder::default(), Global)
+    pub fn with_reserve_fraction(reserve_fraction: f64) -> Self {
+        Self::with_capacity_and_reserve_fraction(0, reserve_fraction)
+    }
+
+    #[must_use]
+    pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self {
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            reserve_fraction,
+            DefaultHashBuilder::default(),
+            Global,
+        )
     }
 }
 
@@ -319,25 +287,50 @@ where
 {
     #[must_use]
     pub fn with_hasher(hash_builder: S) -> Self {
-        Self::with_options_and_hasher_in(ElasticOptions::default(), hash_builder, Global)
-    }
-
-    #[must_use]
-    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
-        Self::with_options_and_hasher_in(
-            ElasticOptions::with_capacity(capacity),
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            0,
+            DEFAULT_RESERVE_FRACTION,
             hash_builder,
             Global,
         )
     }
 
     #[must_use]
-    pub fn with_options_and_hasher(options: ElasticOptions, hash_builder: S) -> Self {
-        Self::with_options_and_hasher_in(options, hash_builder, Global)
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            DEFAULT_RESERVE_FRACTION,
+            hash_builder,
+            Global,
+        )
+    }
+
+    #[must_use]
+    pub fn with_reserve_fraction_and_hasher(reserve_fraction: f64, hash_builder: S) -> Self {
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            0,
+            reserve_fraction,
+            hash_builder,
+            Global,
+        )
+    }
+
+    #[must_use]
+    pub fn with_capacity_and_reserve_fraction_and_hasher(
+        capacity: usize,
+        reserve_fraction: f64,
+        hash_builder: S,
+    ) -> Self {
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            reserve_fraction,
+            hash_builder,
+            Global,
+        )
     }
 }
 
-// Custom allocator + default hasher constructors.
+// Default hasher + custom allocator constructors.
 impl<K, V, A> ElasticHashMap<K, V, DefaultHashBuilder, A>
 where
     K: Eq + Hash,
@@ -345,8 +338,9 @@ where
 {
     #[must_use]
     pub fn new_in(alloc: A) -> Self {
-        Self::with_options_and_hasher_in(
-            ElasticOptions::default(),
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            0,
+            DEFAULT_RESERVE_FRACTION,
             DefaultHashBuilder::default(),
             alloc,
         )
@@ -354,8 +348,9 @@ where
 
     #[must_use]
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        Self::with_options_and_hasher_in(
-            ElasticOptions::with_capacity(capacity),
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            DEFAULT_RESERVE_FRACTION,
             DefaultHashBuilder::default(),
             alloc,
         )
@@ -368,35 +363,25 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
-    #[must_use]
-    pub fn with_hasher_in(hash_builder: S, alloc: A) -> Self {
-        Self::with_options_and_hasher_in(ElasticOptions::default(), hash_builder, alloc)
-    }
-
-    #[must_use]
-    pub fn with_capacity_and_hasher_in(capacity: usize, hash_builder: S, alloc: A) -> Self {
-        Self::with_options_and_hasher_in(
-            ElasticOptions::with_capacity(capacity),
-            hash_builder,
-            alloc,
-        )
-    }
-
     /// Full constructor. `resize` also calls this with the existing
     /// `hash_builder` and allocator so all keys keep the same hash sequence
     /// across grows.
     ///
     /// # Panics
     ///
-    /// Panics if no representable capacity satisfies the requested
-    /// `options.capacity` budget.
+    /// Panics if no representable capacity satisfies the requested budget.
     #[must_use]
-    pub fn with_options_and_hasher_in(options: ElasticOptions, hash_builder: S, alloc: A) -> Self {
-        let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction);
-        let capacity = if options.capacity == 0 {
+    pub fn with_capacity_and_reserve_fraction_and_hasher_in(
+        capacity: usize,
+        reserve_fraction: f64,
+        hash_builder: S,
+        alloc: A,
+    ) -> Self {
+        let reserve_fraction = capacity::sanitize_reserve_fraction(reserve_fraction);
+        let capacity = if capacity == 0 {
             0
         } else {
-            capacity::capacity_for(INITIAL_CAPACITY, options.capacity, reserve_fraction)
+            capacity::capacity_for(INITIAL_CAPACITY, capacity, reserve_fraction)
                 .expect("capacity overflow")
         };
         let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
@@ -1646,11 +1631,9 @@ where
         S: Clone,
     {
         let hash_builder = self.hash_builder.clone();
-        let mut new_map = Self::try_with_options_and_hasher_in(
-            ElasticOptions {
-                capacity: new_capacity,
-                reserve_fraction: self.reserve_fraction,
-            },
+        let mut new_map = Self::try_with_slots_and_reserve_fraction_and_hasher_in(
+            new_capacity,
+            self.reserve_fraction,
             hash_builder,
             self.alloc.clone(),
         )?;
@@ -1671,15 +1654,17 @@ where
         Ok(())
     }
 
-    /// Fallible counterpart to [`Self::with_options_and_hasher_in`]. Returns
-    /// `Err(TryReserveError::AllocError)` if any backing allocation fails.
-    fn try_with_options_and_hasher_in(
-        options: ElasticOptions,
+    /// Internal fallible ctor for `try_resize`. `slots` is raw slot count
+    /// (already inflated by the caller); public ctors take an insertion
+    /// budget and inflate via `capacity_for` — this one skips that.
+    fn try_with_slots_and_reserve_fraction_and_hasher_in(
+        slots: usize,
+        reserve_fraction: f64,
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction);
-        let capacity = options.capacity;
+        let capacity = slots;
+        let reserve_fraction = capacity::sanitize_reserve_fraction(reserve_fraction);
         let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
         let level_capacities = partition_levels(capacity);

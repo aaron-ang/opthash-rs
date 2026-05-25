@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/aaron-ang/opthash-rs/compare/v0.9.0...v0.10.0) - 2026-05-25
+
+### Other
+
+- [**breaking**] drop ElasticOptions / FunnelOptions in favor of ad-hoc ctors ([#61](https://github.com/aaron-ang/opthash-rs/pull/61))
+- broaden clippy scope; switch release-plz to PAT ([#60](https://github.com/aaron-ang/opthash-rs/pull/60))
+
 ## [0.9.0](https://github.com/aaron-ang/opthash-rs/compare/v0.8.0...v0.9.0) - 2026-05-25
 
 ### Fixed
