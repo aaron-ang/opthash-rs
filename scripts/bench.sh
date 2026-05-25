@@ -155,21 +155,25 @@ if ((IS_LINUX)) && command -v numactl >/dev/null 2>&1 && [[ -n "${CORE:-}" ]]; t
 	fi
 fi
 
-# sudo path: nice -n -20 (highest priority), prlimit memlock (avoid page-out),
-# then drop back to invoking user so build artifacts stay user-owned.
-# Both attributes survive the UID drop;
-# the dropped user can't raise them further but keeps the boosted values.
+# As root: nice -n -20 (max CFS prio) + prlimit memlock (no page-out).
+# Both attributes survive the UID drop, so when SUDO_USER is set we
+# unconditionally hand off to the invoking user — keeps cargo artifacts
+# user-owned even if nice/prlimit are missing.
 #
-# Non-sudo path: chrt -b 0 (SCHED_BATCH) — kernel skips interactive
-# scheduling heuristics, smaller context-switch overhead.
+# Non-root: chrt -b 0 (SCHED_BATCH) — kernel skips interactive scheduling
+# heuristics, smaller context-switch overhead.
 launcher=()
-if ((IS_LINUX)) && [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v nice >/dev/null 2>&1; then
-	launcher=(nice -n -20)
+if ((IS_LINUX)) && [[ $EUID -eq 0 ]]; then
+	if command -v nice >/dev/null 2>&1; then
+		launcher+=(nice -n -20)
+	fi
 	if command -v prlimit >/dev/null 2>&1; then
 		launcher+=(prlimit --memlock=unlimited --)
 	fi
-	launcher+=(sudo -u "$SUDO_USER"
-		--preserve-env=PATH,CARGO_HOME,RUSTUP_HOME --)
+	if [[ -n "${SUDO_USER:-}" ]]; then
+		launcher+=(sudo -u "$SUDO_USER"
+			--preserve-env=PATH,CARGO_HOME,RUSTUP_HOME --)
+	fi
 elif ((IS_LINUX)) && command -v chrt >/dev/null 2>&1; then
 	launcher=(chrt -b 0)
 fi
