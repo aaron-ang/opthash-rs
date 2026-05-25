@@ -1,12 +1,11 @@
 macro_rules! common_suite {
-    ($mod_name:ident, $TestMap:ident, $Entry:ident, $Options:ident) => {
+    ($mod_name:ident, $TestMap:ident, $Entry:ident) => {
         mod $mod_name {
             use std::collections::HashSet;
             use std::sync::Arc;
             use std::sync::atomic::{AtomicUsize, Ordering};
 
             use opthash::$Entry as Entry;
-            use opthash::$Options as Options;
             use opthash::$TestMap as HashMap;
 
             #[test]
@@ -639,9 +638,9 @@ macro_rules! common_suite {
 
             #[test]
             fn options_constructor_fits_requested_capacity() {
-                // `options.capacity` is the insertion budget; the map allocates
+                // `capacity` arg is the insertion budget; the map allocates
                 // at least enough slots so `capacity() >= requested`.
-                let map: HashMap<i32, i32> = HashMap::with_options(Options::with_capacity(320));
+                let map: HashMap<i32, i32> = HashMap::with_capacity(320);
                 assert!(map.capacity() >= 320);
             }
 
@@ -749,5 +748,5 @@ macro_rules! common_suite {
     };
 }
 
-common_suite!(elastic_common, ElasticHashMap, ElasticEntry, ElasticOptions);
-common_suite!(funnel_common, FunnelHashMap, FunnelEntry, FunnelOptions);
+common_suite!(elastic_common, ElasticHashMap, ElasticEntry);
+common_suite!(funnel_common, FunnelHashMap, FunnelEntry);

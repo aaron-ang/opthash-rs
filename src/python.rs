@@ -13,37 +13,32 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySet, PyString, PyTuple, PyType};
 
-use crate::common::config::MAX_FUNNEL_RESERVE_FRACTION;
-use crate::{ElasticHashMap, ElasticOptions, FunnelHashMap, FunnelOptions};
+use crate::common::config::{DEFAULT_RESERVE_FRACTION, MAX_FUNNEL_RESERVE_FRACTION};
+use crate::{ElasticHashMap, FunnelHashMap};
 
-fn build_elastic_options(
-    capacity: usize,
-    reserve_fraction: Option<f64>,
-) -> PyResult<ElasticOptions> {
-    let mut opts = ElasticOptions::with_capacity(capacity);
-    if let Some(rf) = reserve_fraction {
-        if !(rf > 0.0 && rf < 1.0) {
-            return Err(PyValueError::new_err(
-                "reserve_fraction must be in the open interval (0, 1)",
-            ));
-        }
-        opts = opts.reserve_fraction(rf);
+fn validate_elastic_reserve_fraction(reserve_fraction: Option<f64>) -> PyResult<f64> {
+    let Some(rf) = reserve_fraction else {
+        return Ok(DEFAULT_RESERVE_FRACTION);
+    };
+    if !(rf > 0.0 && rf < 1.0) {
+        return Err(PyValueError::new_err(
+            "reserve_fraction must be in the open interval (0, 1)",
+        ));
     }
-    Ok(opts)
+    Ok(rf)
 }
 
-fn build_funnel_options(capacity: usize, reserve_fraction: Option<f64>) -> PyResult<FunnelOptions> {
-    let mut opts = FunnelOptions::with_capacity(capacity);
-    if let Some(rf) = reserve_fraction {
-        if !(rf > 0.0 && rf <= MAX_FUNNEL_RESERVE_FRACTION) {
-            return Err(PyValueError::new_err(format!(
-                "reserve_fraction must be in (0, {MAX_FUNNEL_RESERVE_FRACTION}]; \
-                 FunnelHashMap caps the load factor at 1/8 by design"
-            )));
-        }
-        opts = opts.reserve_fraction(rf);
+fn validate_funnel_reserve_fraction(reserve_fraction: Option<f64>) -> PyResult<f64> {
+    let Some(rf) = reserve_fraction else {
+        return Ok(DEFAULT_RESERVE_FRACTION);
+    };
+    if !(rf > 0.0 && rf <= MAX_FUNNEL_RESERVE_FRACTION) {
+        return Err(PyValueError::new_err(format!(
+            "reserve_fraction must be in (0, {MAX_FUNNEL_RESERVE_FRACTION}]; \
+             FunnelHashMap caps the load factor at 1/8 by design"
+        )));
     }
-    Ok(opts)
+    Ok(rf)
 }
 
 /// Type tag packed into `HashedAny::tagged`'s low bits so `PartialEq` skips
@@ -272,7 +267,7 @@ macro_rules! define_map_classes {
         py_map = $PyMap:ident,
         py_map_name = $py_map_name:literal,
         inner = $Inner:ident,
-        build_options = $build_options:ident,
+        validate_rf = $validate_rf:ident,
         key_iter = $KeyIter:ident,
         key_iter_name = $key_iter_name:literal,
         value_iter = $ValueIter:ident,
@@ -329,9 +324,9 @@ macro_rules! define_map_classes {
                 capacity: usize,
                 reserve_fraction: Option<f64>,
             ) -> PyResult<Self> {
-                let opts = $build_options(capacity, reserve_fraction)?;
+                let rf = $validate_rf(reserve_fraction)?;
                 Ok(Self {
-                    inner: $Inner::with_options(opts),
+                    inner: $Inner::with_capacity_and_reserve_fraction(capacity, rf),
                     generation: 0,
                 })
             }
@@ -1032,7 +1027,7 @@ define_map_classes! {
     py_map = PyElasticHashMap,
     py_map_name = "ElasticHashMap",
     inner = ElasticHashMap,
-    build_options = build_elastic_options,
+    validate_rf = validate_elastic_reserve_fraction,
     key_iter = PyElasticKeyIter,
     key_iter_name = "_ElasticKeyIter",
     value_iter = PyElasticValueIter,
@@ -1051,7 +1046,7 @@ define_map_classes! {
     py_map = PyFunnelHashMap,
     py_map_name = "FunnelHashMap",
     inner = FunnelHashMap,
-    build_options = build_funnel_options,
+    validate_rf = validate_funnel_reserve_fraction,
     key_iter = PyFunnelKeyIter,
     key_iter_name = "_FunnelKeyIter",
     value_iter = PyFunnelValueIter,
