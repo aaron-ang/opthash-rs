@@ -137,8 +137,7 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
-        level_idx: usize,
-        free_slot: FreeSlot,
+        free_slot: Option<&mut Option<usize>>,
     ) -> LookupStep
     where
         Q: Equivalent<K> + ?Sized,
@@ -155,10 +154,7 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
                 let bucket_idx = self.bucket_index(key_hash);
                 let slot_idx = bucket_idx << self.bucket_size_log2;
                 if let Some(out) = free_slot {
-                    *out = Some(SlotLocation::Level {
-                        level_idx,
-                        slot_idx,
-                    });
+                    *out = Some(slot_idx);
                 }
             }
             // No tombstones ⇒ the cascade never placed a key
@@ -188,16 +184,13 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
         }
 
         if wants_free {
-            let slot_idx = self
+            let slot = self
                 .table
                 .group_free_mask(group_idx)
                 .lowest()
                 .map(|o| bucket_range.start + o);
-            if let (Some(out), Some(slot_idx)) = (free_slot, slot_idx) {
-                *out = Some(SlotLocation::Level {
-                    level_idx,
-                    slot_idx,
-                });
+            if let (Some(out), Some(slot_idx)) = (free_slot, slot) {
+                *out = Some(slot_idx);
             }
         }
 
@@ -1640,12 +1633,20 @@ where
         let mut local: Option<SlotLocation> = None;
 
         for (level_idx, level) in self.levels.iter().enumerate() {
+            let mut slot_candidate: Option<usize> = None;
             let out = if wants_free && local.is_none() {
-                Some(&mut local)
+                Some(&mut slot_candidate)
             } else {
                 None
             };
-            match level.find_in_bucket(key_hash, key_fingerprint, key, level_idx, out) {
+            let step = level.find_in_bucket(key_hash, key_fingerprint, key, out);
+            if let Some(slot_idx) = slot_candidate {
+                local = Some(SlotLocation::Level {
+                    level_idx,
+                    slot_idx,
+                });
+            }
+            match step {
                 LookupStep::Found(slot_idx) => {
                     return (
                         Some(SlotLocation::Level {
@@ -1665,7 +1666,7 @@ where
             }
         }
 
-        if let Some(out) = free_slot {
+        if wants_free && let Some(out) = free_slot {
             *out = local;
         }
         (None, LevelMiss::MayContinue)
@@ -2016,7 +2017,7 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        match self.levels[0].find_in_bucket(key_hash, key_fingerprint, key, 0, None) {
+        match self.levels[0].find_in_bucket(key_hash, key_fingerprint, key, None) {
             LookupStep::Found(slot_idx) => {
                 return Some(SlotLocation::Level {
                     level_idx: 0,
@@ -2056,7 +2057,7 @@ where
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (offset, level) in self.levels[1..search_limit].iter().enumerate() {
-            match level.find_in_bucket(key_hash, key_fingerprint, key, offset + 1, None) {
+            match level.find_in_bucket(key_hash, key_fingerprint, key, None) {
                 LookupStep::Found(slot_idx) => {
                     return ControlFlow::Break(Some(SlotLocation::Level {
                         level_idx: offset + 1,
