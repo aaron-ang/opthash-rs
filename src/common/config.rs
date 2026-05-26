@@ -1,5 +1,8 @@
 /// `SwissTable` control-byte group width; SIMD scans operate one group at a time.
-pub(crate) const GROUP_SIZE: usize = 16;
+pub(crate) const GROUP_SIZE_U32: u32 = 16;
+pub(crate) const GROUP_SIZE: usize = GROUP_SIZE_U32 as usize;
+/// Align arena allocations so memset can use cache-line fast paths.
+pub(crate) const CACHE_LINE: usize = 64;
 /// First-allocation slot count when a map grows from empty.
 pub(crate) const INITIAL_CAPACITY: usize = 16;
 /// Default headroom: `max_insertions = capacity * (1 - reserve_fraction)`.

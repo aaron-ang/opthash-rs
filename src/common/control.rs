@@ -31,11 +31,10 @@ impl ControlByte for u8 {
 #[inline]
 #[must_use]
 pub(crate) fn control_fingerprint(hash: u64) -> u8 {
-    // Masking with FINGERPRINT_MASK (0x7F) bounds the value to [0, 127],
-    // so the truncating `as u8` cast is lossless.
-    #[allow(clippy::cast_possible_truncation)]
-    let high = ((hash >> FINGERPRINT_SHIFT) & u64::from(FINGERPRINT_MASK)) as u8;
-    high.max(1)
+    // Masking with FINGERPRINT_MASK (0x7F) bounds the value to [0, 127];
+    // try_from succeeds unconditionally so the unwrap is unreachable.
+    let masked = (hash >> FINGERPRINT_SHIFT) & u64::from(FINGERPRINT_MASK);
+    u8::try_from(masked).unwrap_or(0).max(1)
 }
 
 #[inline]

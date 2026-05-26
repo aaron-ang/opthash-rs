@@ -14,9 +14,9 @@ Both are open-addressing hash maps that achieve optimal expected probe complexit
 
 ## Data Structures
 
-Both maps share a common core: `RawTable`-backed multi-level layouts, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, tombstone accounting, and SwissTable-style triangular probing within every level [^swisstable] [^cppcon2017] [^hashbrown]. Per-level salt re-randomization [^cw1979] decorrelates probe paths across levels. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash) [^foldhash].
+Both maps share a common core: a single-`Arena` allocation per map indexed by per-level descriptors, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, tombstone accounting, and SwissTable-style triangular probing within every level [^swisstable] [^cppcon2017] [^hashbrown]. Per-level salt re-randomization [^cw1979] decorrelates probe paths across levels. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash) [^foldhash].
 
-- **`ElasticHashMap<K, V>`** — Flat `RawTable` per level with geometrically halving capacities; insertion uses per-level probe budgets.
+- **`ElasticHashMap<K, V>`** — Flat group-probed level with geometrically halving capacities; insertion uses per-level probe budgets.
 - **`FunnelHashMap<K, V>`** — Bucketed levels plus a split special array: `primary` (group-probed) and `fallback` (two-choice buckets).
 
 Both maps mirror `std::collections::HashMap`'s API and support the same operations. Each map starts with zero allocation (`new()`) and grows dynamically on demand. The `reserve_fraction` headroom knob is exposed via dedicated constructors.
@@ -67,34 +67,38 @@ m = FunnelHashMap.with_options(capacity=1024, reserve_fraction=0.10)
 ## Layout Sketch
 
 ```text
-RawTable (shared by both maps)
+Arena (one allocation per map)
 ==============================
 
   fp = fingerprint (7-bit control byte)
   kv = key-value entry, __ = empty, xx = tombstone
 
-  Single allocation, slots first, controls at the end:
+  All control bytes pack first, then per-K/V-aligned padding, then all slots:
 
-  data_ptr ► [kv][kv][  ][kv][  ][kv]... [pad] [fp][fp][__][xx][__][fp]...
-             └──── slots (T-aligned) ────┘     └─ controls (16-aligned) ──┘
-                                               ▲ ctrl_ptr
+  arena::ptr ► [fp fp fp ...][fp fp fp ...][fp fp ...][  pad  ][kv kv kv ...][kv ... ]
+               └─ ctrl L0 ──┘└─ ctrl L1 ──┘└── ... ──┘         └─ slots L0 ─┘└─ ... ─┘
+               ▲ each ctrl region starts at u32 offset stamped in its descriptor.
 
-  Occupancy is derived from SIMD scans of the control bytes.
+  Each descriptor is a view of: ctrl_offset, data_offset, capacity,
+  plus per-shape metadata (salt, mask, etc). All slot/ctrl/SIMD ops live on
+  the `ArenaSlots` trait (`src/common/arena.rs`) which implements pointer arithmetic.
 
 
 ElasticHashMap
 ==============
 
-  levels: Box<[Level]>
+  levels: Box<[Level]> (descriptors only)
 
-    Level 0    RawTable  (largest, ~half of total capacity)
-    Level 1    RawTable  (geometrically halved)
+    Level 0    ctrl_offset, data_offset, capacity (~half of total slots)
+    Level 1    geometrically halved
     Level 2    ...
 
-    per-level  table, len, salt, group_count_mask, tombstones,
+    per-level  group_count, group_count_mask, salt, len, tombstones,
                half_reserve_slot_threshold, budget_cap
 
-  table-wide   len, capacity, max_insertions, reserve_fraction,
+  arena:       Arena (the single allocation backing every level above)
+
+  map-wide     len, total_slots, max_insertions, reserve_fraction,
                batch_plan, current_batch_index, batch_remaining,
                max_populated_level, hash_builder, alloc
 
@@ -102,30 +106,29 @@ ElasticHashMap
 FunnelHashMap
 =============
 
-  levels: Box<[BucketLevel]>
+  levels: Box<[BucketLevel]> (descriptors)
 
     Level 0
-      slots:     kv kv __ __ ... kv kv __ __ ... kv ...
-      controls:  fp fp __ __ ... fp fp __ __ ... fp ...
-                 └── bucket 0 ──┘└── bucket 1 ──┘
+      ctrl region   fp fp __ __ ... fp fp __ __ ... fp ...
+      slot region   kv kv __ __ ... kv kv __ __ ... kv ...
+                    └── bucket 0 ──┘└── bucket 1 ──┘
 
     Level 1    (same layout, smaller buckets)
-    ...
 
-    per-level  table, len, tombstones, salt,
-               bucket_count_mask, bucket_size_log2
+    per-level  bucket_count_mask, bucket_size_log2, salt, len, tombstones
 
   special: SpecialArray
 
-    primary    RawTable, group-probed
-    (paper B)  table, len, tombstones, group_count_mask
+    primary    group-probed (paper B)
+               group_count_mask, len, tombstones
 
-    fallback   RawTable, two-choice bucketed
-    (paper C)  table, len, tombstones, bucket_count, bucket_size_log2
+    fallback   two-choice bucketed (paper C)
+               bucket_count, bucket_size_log2, len, tombstones
 
-  table-wide   len, capacity, max_insertions, reserve_fraction,
-               primary_probe_limit, max_populated_level,
-               hash_builder, alloc
+  arena:       Arena (covers every level + both special regions)
+
+  map-wide     len, total_slots, max_insertions, reserve_fraction,
+               primary_probe_limit, max_populated_level, hash_builder, alloc
 ```
 
 ## Benchmarks
@@ -138,7 +141,7 @@ See [benches/README.md](benches/README.md) for bench target layout, charts, CLI 
 
 [^cw1979]: J. Lawrence Carter, Mark N. Wegman. _Universal Classes of Hash Functions_ (STOC 1977 / JCSS 1979). DOI: <https://doi.org/10.1016/0022-0000(79)90044-8>. Foundational hash-based probing model the FKK bounds rely on; the per-level `salt` re-randomization in `Level`/`BucketLevel` (see `level_salt` in [`src/common/math.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/math.rs)) follows the universal-hashing assumption.
 
-[^swisstable]: Abseil. _SwissTable design notes_. <https://abseil.io/about/design/swisstables>. Source of the 7-bit fingerprint control-byte layout + SIMD group scans used by `RawTable` (see [`src/common/control.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/control.rs), [`src/common/simd.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/simd.rs)) and the triangular `(idx + delta) & mask` probe sequence used in `ElasticHashMap::triangular_group_start` and `FunnelHashMap::special_primary_triangular_start`.
+[^swisstable]: Abseil. _SwissTable design notes_. <https://abseil.io/about/design/swisstables>. Source of the 7-bit fingerprint control-byte layout + SIMD group scans used by the shared `ArenaSlots` trait (see [`src/common/arena.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/arena.rs), [`src/common/control.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/control.rs), [`src/common/simd.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/simd.rs)) and the triangular `(idx + delta) & mask` probe sequence used in `Level::triangular_group_start`.
 
 [^cppcon2017]: Matt Kulukundis. _Designing a Fast, Efficient, Cache-friendly Hash Table, Step by Step_ (CppCon 2017). <https://www.youtube.com/watch?v=ncHmEUmJZf4>. Talk introducing the SwissTable design referenced above.
 

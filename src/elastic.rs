@@ -5,9 +5,13 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
 
+use allocator_api2::alloc::Layout;
 use equivalent::Equivalent;
 
-use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
+use crate::common::arena::{Arena, ArenaSlots, OccupiedCursor, SlotEntry};
+use crate::common::config::{
+    CACHE_LINE, DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY,
+};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
@@ -15,95 +19,101 @@ use crate::common::iter::{
     Values as CommonValues,
 };
 use crate::common::math::{self, align, capacity, probe};
-use crate::common::table::{OccupiedCursor, RawTable, SlotEntry};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
-/// One sub-array `A_i` in paper §4's partition `|A_{i+1}| = |A_i|/2 ± 1`.
-/// Independent open-addressed table with its own probe sequence `h_{i,j}(x)`.
-struct Level<K, V, A: Allocator + Clone = Global> {
-    /// `SoA` control bytes + entries.
-    table: RawTable<SlotEntry<K, V>, A>,
+/// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
+/// into the map-level arena; owns no allocation. The actual ctrl bytes and
+/// [`SlotEntry`] data live contiguously in [`ElasticHashMap::arena`].
+struct Level<K, V> {
+    /// Cached `arena.as_ptr() + ctrl_offset`, stamped at construction.
+    ctrl_ptr: *mut u8,
+    /// Cached `arena.as_ptr() + data_offset`, stamped at construction.
+    data_ptr: *mut SlotEntry<K, V>,
+    /// Slot capacity (= `group_count` * `GROUP_SIZE`). Bounded by `capacity`
+    /// via the arena layout, so `len`/`tombstones` fit in `u32` too.
+    capacity: u32,
+    /// Number of SIMD groups.
+    group_count: u32,
+    /// `group_count - 1`; pow2 so probe wrap is `& mask`.
+    group_count_mask: u32,
     /// Live entry count.
-    len: usize,
-    /// Per-level salt mixed into key hashes. Hot — read every lookup.
-    salt: u64,
-    /// `group_count - 1`. `group_count` is pow2 by construction (see
-    /// `partition_levels`), so `(idx + delta) & mask` wraps in one op.
-    group_count_mask: usize,
+    len: u32,
     /// Deleted-slot count.
-    tombstones: usize,
-    /// Cached `floor(reserve * cap / 2)` for the
-    /// `current_free_slots > threshold` branch in slot selection.
-    half_reserve_slot_threshold: usize,
-    /// Paper §2 cap on `f(ε)` — `min(1 + log δ⁻¹, group_count)` with `c = 1`.
+    tombstones: u32,
+    /// Cached `floor(reserve * cap / 2)`.
+    half_reserve_slot_threshold: u32,
+    /// Per-level salt mixed into key hashes.
+    salt: u64,
+    /// Paper §2 cap on `f(ε)`.
     budget_cap: f64,
+    _marker: PhantomData<*mut SlotEntry<K, V>>,
 }
 
-impl<K, V, A: Allocator + Clone> Level<K, V, A> {
-    fn with_capacity_in(
-        capacity: usize,
-        reserve_fraction: f64,
+unsafe impl<K: Send, V: Send> Send for Level<K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for Level<K, V> {}
+
+impl<K, V> ArenaSlots<K, V> for Level<K, V> {
+    #[inline]
+    fn ctrl_ptr(&self) -> *mut u8 {
+        self.ctrl_ptr
+    }
+    #[inline]
+    fn data_ptr(&self) -> *mut SlotEntry<K, V> {
+        self.data_ptr
+    }
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.capacity as usize
+    }
+}
+
+impl<K, V> Level<K, V> {
+    /// Stamps a fresh descriptor at the given arena ptrs.
+    /// Caller advances the offset cursor.
+    fn new_at(
         level_idx: usize,
-        alloc: A,
+        cap_u32: u32,
+        reserve_fraction: f64,
+        ctrl_ptr: *mut u8,
+        data_ptr: *mut SlotEntry<K, V>,
     ) -> Self {
-        let table = RawTable::new_in(capacity, alloc);
-        let group_count = table.group_count();
-        debug_assert!(
-            group_count == 0 || group_count.is_power_of_two(),
-            "partition_levels must produce pow2 group_count",
-        );
-        let budget_cap = compute_budget_cap(reserve_fraction, group_count);
+        let cap = cap_u32 as usize;
+        let gc = cap_u32 / GROUP_SIZE_U32;
         Self {
-            table,
-            len: 0,
+            ctrl_ptr,
+            data_ptr,
+            capacity: cap_u32,
+            group_count: gc,
+            group_count_mask: gc.wrapping_sub(1),
             salt: math::level_salt(level_idx),
-            group_count_mask: group_count.wrapping_sub(1),
+            len: 0,
             tombstones: 0,
-            half_reserve_slot_threshold: capacity::floor_half_reserve_slots(
+            half_reserve_slot_threshold: u32::try_from(capacity::floor_half_reserve_slots(
                 reserve_fraction,
-                capacity,
-            ),
-            budget_cap,
+                cap,
+            ))
+            .unwrap_or(u32::MAX),
+            budget_cap: compute_budget_cap(reserve_fraction, gc as usize),
+            _marker: PhantomData,
         }
     }
 
-    /// Fallible counterpart to [`Level::with_capacity_in`].
-    fn try_with_capacity_in(
-        capacity: usize,
-        reserve_fraction: f64,
-        level_idx: usize,
-        alloc: A,
-    ) -> Result<Self, TryReserveError> {
-        let table =
-            RawTable::try_new_in(capacity, alloc).map_err(|()| TryReserveError::AllocError)?;
-        let group_count = table.group_count();
-        let budget_cap = compute_budget_cap(reserve_fraction, group_count);
-        Ok(Self {
-            table,
-            len: 0,
-            salt: math::level_salt(level_idx),
-            group_count_mask: group_count.wrapping_sub(1),
-            tombstones: 0,
-            half_reserve_slot_threshold: capacity::floor_half_reserve_slots(
-                reserve_fraction,
-                capacity,
-            ),
-            budget_cap,
-        })
-    }
-
     #[inline]
-    fn capacity(&self) -> usize {
-        self.table.capacity()
+    fn group_count(&self) -> usize {
+        self.group_count as usize
     }
 
-    /// Slots minus live entries. Includes tombstones (reusable on insert).
+    // ---------------------------------------------------------------- //
+    // Probe helpers                                                      //
+    // ---------------------------------------------------------------- //
+
+    /// Slots minus live entries (includes tombstones, reusable on insert).
     #[inline]
     fn free_slots(&self) -> usize {
-        self.capacity().saturating_sub(self.len)
+        self.capacity.saturating_sub(self.len) as usize
     }
 
-    /// Paper §2 `f(ε) = c·min(log² ε⁻¹, log δ⁻¹)` with `ε = free_slots/capacity`.
+    /// Paper §2 `f(ε)` probe budget.
     #[inline]
     #[allow(
         clippy::cast_sign_loss,
@@ -111,87 +121,60 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
         clippy::cast_possible_truncation
     )]
     fn limited_group_budget(&self) -> usize {
-        let capacity = self.capacity();
-        let free_slots = self.free_slots();
-        if capacity == 0 || free_slots == 0 {
+        let cap = self.capacity as usize;
+        let free = self.free_slots();
+        if cap == 0 || free == 0 {
             return 1;
         }
-        let log_inv_eps = (capacity as f64 / free_slots as f64).log2();
+        let log_inv_eps = (cap as f64 / free as f64).log2();
         let raw = 1.0 + log_inv_eps * log_inv_eps;
         raw.min(self.budget_cap) as usize
     }
 
-    /// Triggers a no-grow rehash on remove when tombstones outnumber half
-    /// the slots. Keeps probe sequences from degrading after delete-heavy
-    /// workloads.
     #[inline]
     fn needs_cleanup(&self) -> bool {
-        self.tombstones > self.capacity() / 2
+        self.tombstones > self.capacity / 2
     }
 
-    /// Triangular-probing starting group: `(key_hash ^ salt) & (group_count - 1)`.
-    /// `group_count` is pow2 by `partition_levels` construction.
     #[inline]
     fn triangular_group_start(&self, key_hash: u64) -> usize {
         let mixed = key_hash ^ self.salt;
-        probe::hash_to_usize(mixed) & self.group_count_mask
+        probe::hash_to_usize(mixed) & self.group_count_mask as usize
     }
 
-    /// Paper §4 search in this `A_i`: triangular probe of groups, SIMD
-    /// fingerprint match, key compare. Stops on FREE byte (probe chain
-    /// terminated naturally; key cannot be deeper in this level).
+    /// Triangular probe: fingerprint scan + key compare. Returns slot index on
+    /// hit, `None` on miss (stops at first EMPTY byte in the group sequence).
     #[inline]
-    fn find_by_probe<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> Option<usize>
+    fn find_by_probe<Q>(
+        &self,
+        arena: &Arena,
+        key_hash: u64,
+        key_fingerprint: u8,
+        key: &Q,
+    ) -> Option<usize>
     where
         Q: Equivalent<K> + ?Sized,
     {
         if self.len == 0 {
             return None;
         }
-
-        let group_count = self.table.group_count();
-        let mask = self.group_count_mask;
+        let mask = self.group_count_mask as usize;
         let mut probe = probe::TriangularProbe::new(self.triangular_group_start(key_hash));
-
-        for _ in 0..group_count {
-            let match_mask = self.table.group_match_mask(probe.pos, key_fingerprint);
+        for _ in 0..self.group_count {
+            let match_mask = self.group_match_mask(arena, probe.pos, key_fingerprint);
             for relative_idx in match_mask {
                 let slot_idx = probe.pos * GROUP_SIZE + relative_idx;
-                let entry = unsafe { self.table.get_ref(slot_idx) };
+                let entry = unsafe { self.get_ref(arena, slot_idx) };
                 if key.equivalent(&entry.key) {
                     return Some(slot_idx);
                 }
             }
-            if self.table.group_match_mask(probe.pos, CTRL_EMPTY).any() {
+            if self.group_match_mask(arena, probe.pos, CTRL_EMPTY).any() {
                 return None;
             }
             probe.advance(mask);
         }
         None
-    }
-}
-
-impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for Level<K, V, A> {
-    fn clone(&self) -> Self {
-        Self {
-            table: self.table.clone(),
-            len: self.len,
-            salt: self.salt,
-            group_count_mask: self.group_count_mask,
-            tombstones: self.tombstones,
-            half_reserve_slot_threshold: self.half_reserve_slot_threshold,
-            budget_cap: self.budget_cap,
-        }
-    }
-
-    fn clone_from(&mut self, source: &Self) {
-        self.table.clone_from(&source.table);
-        self.len = source.len;
-        self.salt = source.salt;
-        self.group_count_mask = source.group_count_mask;
-        self.tombstones = source.tombstones;
-        self.half_reserve_slot_threshold = source.half_reserve_slot_threshold;
-        self.budget_cap = source.budget_cap;
     }
 }
 
@@ -202,13 +185,18 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for Level<K, V, A> {
 /// batches push toward deeper levels. Lookups probe every level whose
 /// `len > 0`. Unlike standard open addressing, expected probe count stays
 /// low even at high load.
+///
+/// **Probe sequence**: paper §2 assumes uniform random probes per level;
+/// we use triangular probing with a per-level salt instead. Same
+/// simplification as `SwissTable` / hashbrown — preserves coverage with
+/// far better cache behavior than recomputing random positions.
 pub struct ElasticHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     /// Geometrically shrinking partition of capacity; length fixed at ctor.
-    levels: Box<[Level<K, V, A>]>,
+    levels: Box<[Level<K, V>]>,
     /// Total live entries.
     len: usize,
     /// Total slot count across all levels.
-    capacity: usize,
+    total_slots: usize,
     /// Insert count that triggers `resize(2x)`.
     max_insertions: usize,
     /// Slot reserve fraction per level. Set at construction.
@@ -223,19 +211,42 @@ pub struct ElasticHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = G
     max_populated_level: usize,
     /// Hash builder. Cloned across resizes to preserve probe sequences.
     hash_builder: S,
-    /// Allocator used for all per-capacity allocations (tables, probe budgets).
+    /// Allocator used for all per-capacity allocations.
     alloc: A,
+    /// One allocation holding all levels' ctrl bytes then all slot arrays.
+    /// Layout: [`ctrl_L0` | `ctrl_L1` | ...] [pad] [`slots_L0` | `slots_L1` | ...]
+    arena: Arena,
 }
 
-impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug
+unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
     for ElasticHashMap<K, V, S, A>
 {
+}
+unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
+    for ElasticHashMap<K, V, S, A>
+{
+}
+
+impl<K, V, S, A: Allocator + Clone> Drop for ElasticHashMap<K, V, S, A> {
+    fn drop(&mut self) {
+        let arena_ptr = &self.arena;
+        for level in &self.levels {
+            level.drop_values(arena_ptr);
+        }
+        let arena = mem::replace(&mut self.arena, Arena::empty());
+        arena.deallocate(&self.alloc);
+    }
+}
+
+impl<K, V, S, A> fmt::Debug for ElasticHashMap<K, V, S, A>
+where
+    K: fmt::Debug + Eq + Hash,
+    V: fmt::Debug,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("ElasticHashMap")
-            .field("len", &self.len)
-            .field("capacity", &self.capacity)
-            .field("max_populated_level", &self.max_populated_level)
-            .finish_non_exhaustive()
+        f.debug_map().entries(self.iter()).finish()
     }
 }
 
@@ -357,6 +368,125 @@ where
     }
 }
 
+/// Computes the combined ctrl+data layout for an arena whose ctrl section
+/// holds `total_ctrl` bytes and data section holds `total_ctrl` slots. Returns
+/// `(arena_layout, data_base_off)` — the offset where slot data begins within
+/// the allocation, accounting for `K, V` alignment padding.
+fn arena_layout_for<K, V>(total_ctrl: usize) -> Result<(Layout, usize), TryReserveError> {
+    let ctrl_layout = Layout::from_size_align(total_ctrl.max(1), CACHE_LINE)
+        .map_err(|_| TryReserveError::AllocError)?;
+    let data_layout = Layout::array::<SlotEntry<K, V>>(total_ctrl.max(1))
+        .map_err(|_| TryReserveError::AllocError)?;
+    let (arena_layout, data_base_off) = ctrl_layout
+        .extend(data_layout)
+        .map_err(|_| TryReserveError::AllocError)?;
+    Ok((arena_layout.pad_to_align(), data_base_off))
+}
+
+type ElasticArenaBuild<K, V> = (Arena, Box<[Level<K, V>]>);
+
+/// Stamps level descriptors with arena-relative `(ctrl_ptr, data_ptr)`.
+/// Split out so the alloc-then-deallocate-on-error wrapper stays shallow.
+fn build_elastic_levels<K, V>(
+    arena_base: *mut u8,
+    data_base_off: usize,
+    level_capacities: &[usize],
+    reserve_fraction: f64,
+) -> Result<Box<[Level<K, V>]>, TryReserveError> {
+    let slot_size = u32::try_from(mem::size_of::<SlotEntry<K, V>>())
+        .map_err(|_| TryReserveError::CapacityOverflow)?;
+    let mut ctrl_off: u32 = 0;
+    let mut data_off: u32 =
+        u32::try_from(data_base_off).map_err(|_| TryReserveError::CapacityOverflow)?;
+    let mut levels: Vec<Level<K, V>> = Vec::new();
+    levels
+        .try_reserve_exact(level_capacities.len())
+        .map_err(|_| TryReserveError::AllocError)?;
+    for (level_idx, &cap) in level_capacities.iter().enumerate() {
+        let cap_u32 = u32::try_from(cap).map_err(|_| TryReserveError::CapacityOverflow)?;
+        let ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
+        let data_ptr = unsafe { arena_base.add(data_off as usize).cast::<SlotEntry<K, V>>() };
+        levels.push(Level::new_at(
+            level_idx,
+            cap_u32,
+            reserve_fraction,
+            ctrl_ptr,
+            data_ptr,
+        ));
+        ctrl_off += cap_u32;
+        data_off += cap_u32 * slot_size;
+    }
+    Ok(levels.into_boxed_slice())
+}
+
+fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
+    level_capacities: &[usize],
+    reserve_fraction: f64,
+    alloc: &A,
+) -> Result<ElasticArenaBuild<K, V>, TryReserveError> {
+    let total_ctrl: usize = level_capacities.iter().sum();
+    let (arena_layout, data_base_off) = arena_layout_for::<K, V>(total_ctrl)?;
+    let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout, total_ctrl, alloc)?;
+
+    // `Arena` has no `Drop`, so a bare `?` would leak the allocation if
+    // level construction fails. Deallocate explicitly on `Err`.
+    match build_elastic_levels::<K, V>(
+        arena.as_ptr(),
+        data_base_off,
+        level_capacities,
+        reserve_fraction,
+    ) {
+        Ok(levels) => Ok((arena, levels)),
+        Err(e) => {
+            arena.deallocate(alloc);
+            Err(e)
+        }
+    }
+}
+
+fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
+    level_capacities: &[usize],
+    reserve_fraction: f64,
+    alloc: &A,
+) -> ElasticArenaBuild<K, V> {
+    try_alloc_elastic_arena(level_capacities, reserve_fraction, alloc).unwrap_or_else(|_| {
+        let total_ctrl: usize = level_capacities.iter().sum();
+        let layout = match arena_layout_for::<K, V>(total_ctrl) {
+            Ok((l, _)) => l,
+            Err(_) => Layout::from_size_align(1, 1).unwrap(),
+        };
+        allocator_api2::alloc::handle_alloc_error(layout)
+    })
+}
+
+/// Drops values + deallocates an `Arena` if dropped before `arena.take()`.
+/// Lets `resize`/`Clone` panic-safely roll back — `Arena` has no `Drop`,
+/// so a bare unwind would leak.
+///
+/// `levels_ptr + len` instead of `&[Level]` so the guard doesn't conflict
+/// with mutable iteration during clone.
+struct ArenaDropGuard<K, V, A: Allocator + Clone> {
+    arena: Option<Arena>,
+    levels_ptr: *const Level<K, V>,
+    levels_len: usize,
+    alloc: A,
+}
+
+impl<K, V, A: Allocator + Clone> Drop for ArenaDropGuard<K, V, A> {
+    fn drop(&mut self) {
+        if let Some(arena) = self.arena.take() {
+            let arena_ref = &arena;
+            // SAFETY: caller ensures `levels_ptr`/`levels_len` describe a
+            // live `[Level<K, V>]` slice for the guard's lifetime.
+            let levels = unsafe { std::slice::from_raw_parts(self.levels_ptr, self.levels_len) };
+            for level in levels {
+                level.drop_values(arena_ref);
+            }
+            arena.deallocate(&self.alloc);
+        }
+    }
+}
+
 impl<K, V, S, A> ElasticHashMap<K, V, S, A>
 where
     K: Eq + Hash,
@@ -378,30 +508,23 @@ where
         alloc: A,
     ) -> Self {
         let reserve_fraction = capacity::sanitize_reserve_fraction(reserve_fraction);
-        let capacity = if capacity == 0 {
+        let total_slots = if capacity == 0 {
             0
         } else {
             capacity::capacity_for(INITIAL_CAPACITY, capacity, reserve_fraction)
                 .expect("capacity overflow")
         };
-        let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
+        let max_insertions = capacity::max_insertions(total_slots, reserve_fraction);
 
-        let level_capacities = partition_levels(capacity);
-        let levels: Box<[Level<K, V, A>]> = level_capacities
-            .iter()
-            .enumerate()
-            .map(|(level_idx, &cap)| {
-                Level::with_capacity_in(cap, reserve_fraction, level_idx, alloc.clone())
-            })
-            .collect();
-
+        let level_capacities = partition_levels(total_slots);
+        let (arena, levels) = alloc_elastic_arena(&level_capacities, reserve_fraction, &alloc);
         let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
         let batch_remaining = batch_plan.first().copied().unwrap_or(0);
 
         Self {
             levels,
             len: 0,
-            capacity,
+            total_slots,
             max_insertions,
             reserve_fraction,
             batch_plan,
@@ -410,6 +533,7 @@ where
             max_populated_level: 0,
             hash_builder,
             alloc,
+            arena,
         }
     }
 
@@ -430,10 +554,9 @@ where
     }
 
     /// Maximum number of inserts the map can absorb before the next resize.
-    /// Mirrors [`std::collections::HashMap::capacity`]. Returns
-    /// `max_insertions` (the budget), not the raw slot count.
+    /// Mirrors [`std::collections::HashMap::capacity`] — returns the insert
+    /// budget, not the raw slot count (see [`Self::total_slots`] field).
     #[must_use]
-    #[allow(clippy::misnamed_getters)]
     pub fn capacity(&self) -> usize {
         self.max_insertions
     }
@@ -484,7 +607,7 @@ where
     }
 
     /// Shrinks the capacity with a lower bound. The table won't shrink below
-    /// the larger of `min_capacity` and `self.len`. Mirrors
+    /// the larger of `min_capacity` and [`Self::len`]. Mirrors
     /// [`std::collections::HashMap::shrink_to`].
     ///
     /// # Panics
@@ -493,7 +616,7 @@ where
     /// `capacity::max_insertions(cap) >= min_capacity`.
     pub fn shrink_to(&mut self, min_capacity: usize) {
         if self.len == 0 && min_capacity == 0 {
-            if self.capacity > 0 {
+            if self.total_slots > 0 {
                 self.resize(0);
             }
             return;
@@ -501,7 +624,7 @@ where
         let lower = self.len.max(min_capacity).max(INITIAL_CAPACITY);
         let new_capacity = capacity::capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction)
             .expect("capacity overflow");
-        if new_capacity >= self.capacity {
+        if new_capacity >= self.total_slots {
             return;
         }
         self.resize(new_capacity);
@@ -512,7 +635,7 @@ where
     /// suffices. Used by `reserve` / `try_reserve`.
     fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
         capacity::capacity_for(
-            self.capacity.max(INITIAL_CAPACITY),
+            self.total_slots.max(INITIAL_CAPACITY),
             needed,
             self.reserve_fraction,
         )
@@ -528,16 +651,16 @@ where
         if let Some((level_idx, slot_idx)) =
             self.find_slot_indices_with_hash(&key, key_hash, key_fingerprint)
         {
-            let entry = unsafe { self.levels[level_idx].table.get_mut(slot_idx) };
+            let entry = unsafe { self.levels[level_idx].get_mut(&self.arena, slot_idx) };
             let old = mem::replace(&mut entry.value, value);
             return Some(old);
         }
 
         if self.len >= self.max_insertions {
-            let new_capacity = if self.capacity == 0 {
+            let new_capacity = if self.total_slots == 0 {
                 INITIAL_CAPACITY
             } else {
-                self.capacity.saturating_mul(2)
+                self.total_slots.saturating_mul(2)
             };
             self.resize(new_capacity);
         }
@@ -547,11 +670,10 @@ where
             .choose_slot_for_new_key(key_hash)
             .expect("no free slot found after resize");
 
+        let arena = &self.arena;
         let level = &mut self.levels[level_idx];
-        let prev_ctrl = level.table.control_at(slot_idx);
-        level
-            .table
-            .write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        let prev_ctrl = level.control_at(arena, slot_idx);
+        level.write_with_control(arena, slot_idx, SlotEntry { key, value }, key_fingerprint);
         level.len += 1;
         if prev_ctrl == CTRL_TOMBSTONE {
             level.tombstones -= 1;
@@ -574,7 +696,7 @@ where
         let key_fingerprint = control::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
-        Some(unsafe { &self.levels[level_idx].table.get_ref(slot_idx).value })
+        Some(unsafe { &self.levels[level_idx].get_ref(&self.arena, slot_idx).value })
     }
 
     /// Like [`Self::get`] but returns the stored key alongside its value.
@@ -586,7 +708,7 @@ where
         let key_fingerprint = control::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
-        let entry = unsafe { self.levels[level_idx].table.get_ref(slot_idx) };
+        let entry = unsafe { self.levels[level_idx].get_ref(&self.arena, slot_idx) };
         Some((&entry.key, &entry.value))
     }
 
@@ -598,7 +720,7 @@ where
         let key_fingerprint = control::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
-        Some(unsafe { &mut self.levels[level_idx].table.get_mut(slot_idx).value })
+        Some(unsafe { &mut self.levels[level_idx].get_mut(&self.arena, slot_idx).value })
     }
 
     /// Returns `N` disjoint mutable references, mirroring
@@ -615,14 +737,15 @@ where
         let locations = self.locate_disjoint(keys);
         check_disjoint_aliasing(&locations);
 
-        let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
+        let levels_ptr: *const Level<K, V> = self.levels.as_ptr();
         std::array::from_fn(|i| {
             locations[i].map(|(level_idx, slot_idx)| {
                 // SAFETY: locations are unique among Somes (asserted above).
                 // `elastic_slot_value_ptr` projects via raw pointers — no
                 // intermediate `&mut Level` / `&mut RawTable`, so two keys
                 // hitting the same level can't alias under Stacked Borrows.
-                let value_ptr = unsafe { elastic_slot_value_ptr(levels_ptr, level_idx, slot_idx) };
+                let value_ptr =
+                    unsafe { elastic_slot_value_ptr(&self.arena, levels_ptr, level_idx, slot_idx) };
                 unsafe { &mut *value_ptr }
             })
         })
@@ -644,12 +767,12 @@ where
         let locations = self.locate_disjoint(keys);
         check_disjoint_aliasing(&locations);
 
-        let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
+        let levels_ptr: *const Level<K, V> = self.levels.as_ptr();
         std::array::from_fn(|i| {
             locations[i].map(|(level_idx, slot_idx)| {
                 // SAFETY: as in `get_disjoint_mut`.
                 let (k_ptr, v_ptr) =
-                    unsafe { elastic_slot_kv_ptrs(levels_ptr, level_idx, slot_idx) };
+                    unsafe { elastic_slot_kv_ptrs(&self.arena, levels_ptr, level_idx, slot_idx) };
                 (unsafe { &*k_ptr }, unsafe { &mut *v_ptr })
             })
         })
@@ -672,11 +795,12 @@ where
     {
         let locations = self.locate_disjoint(keys);
 
-        let levels_ptr: *mut Level<K, V, A> = self.levels.as_mut_ptr();
+        let levels_ptr: *const Level<K, V> = self.levels.as_ptr();
         std::array::from_fn(|i| {
             locations[i].map(|(level_idx, slot_idx)| {
                 // SAFETY: caller guarantees the hits are pairwise distinct.
-                let value_ptr = unsafe { elastic_slot_value_ptr(levels_ptr, level_idx, slot_idx) };
+                let value_ptr =
+                    unsafe { elastic_slot_value_ptr(&self.arena, levels_ptr, level_idx, slot_idx) };
                 unsafe { &mut *value_ptr }
             })
         })
@@ -731,8 +855,9 @@ where
 
         let removed_entry = {
             let level = &mut self.levels[level_idx];
-            let removed = unsafe { level.table.take(slot_idx) };
-            level.table.mark_tombstone(slot_idx);
+            let arena = &self.arena;
+            let removed = unsafe { level.take(arena, slot_idx) };
+            level.mark_tombstone(arena, slot_idx);
             level.len -= 1;
             level.tombstones += 1;
             removed
@@ -742,19 +867,16 @@ where
         let needs_resize = self.levels[level_idx].needs_cleanup();
         self.shrink_max_populated_level();
         if needs_resize {
-            self.resize(self.capacity);
+            self.resize(self.total_slots);
         }
         Some((removed_entry.key, removed_entry.value))
     }
 
     pub fn clear(&mut self) {
+        let arena = &self.arena;
         for level in &mut self.levels {
-            for idx in 0..level.table.capacity() {
-                if level.table.control_at(idx).is_occupied() {
-                    unsafe { level.table.drop_in_place(idx) };
-                }
-            }
-            level.table.clear_all_controls();
+            level.drop_values(arena);
+            level.clear_all_controls(arena);
             level.len = 0;
             level.tombstones = 0;
         }
@@ -767,10 +889,12 @@ where
     #[must_use]
     pub fn iter(&self) -> ElasticIter<'_, K, V, A> {
         ElasticIter {
-            tables: self.levels.iter(),
-            current: None,
+            arena: &self.arena,
+            levels: self.levels.iter(),
+            current_level: None,
             cursor: OccupiedCursor::new(),
             remaining: self.len,
+            _alloc: PhantomData,
         }
     }
 
@@ -798,12 +922,14 @@ where
         let levels = self.levels.as_mut_ptr();
         let remaining = self.len;
         ElasticIterMut {
+            arena: &self.arena,
             levels,
             levels_len,
             level_idx: 0,
             cursor: OccupiedCursor::new(),
             remaining,
             _marker: PhantomData,
+            _alloc: PhantomData,
         }
     }
 
@@ -871,10 +997,10 @@ where
         let key_fingerprint = control::control_fingerprint(key_hash);
 
         if self.len >= self.max_insertions {
-            let new_capacity = if self.capacity == 0 {
+            let new_capacity = if self.total_slots == 0 {
                 INITIAL_CAPACITY
             } else {
-                self.capacity.saturating_mul(2)
+                self.total_slots.saturating_mul(2)
             };
             self.resize(new_capacity);
         }
@@ -884,11 +1010,10 @@ where
             .choose_slot_for_new_key(key_hash)
             .expect("no free slot found after resize");
 
+        let arena = &self.arena;
         let level = &mut self.levels[level_idx];
-        let prev_ctrl = level.table.control_at(slot_idx);
-        level
-            .table
-            .write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        let prev_ctrl = level.control_at(arena, slot_idx);
+        level.write_with_control(arena, slot_idx, SlotEntry { key, value }, key_fingerprint);
         level.len += 1;
         if prev_ctrl == CTRL_TOMBSTONE {
             level.tombstones -= 1;
@@ -963,50 +1088,30 @@ where
     /// Returns a reference to the entry's key.
     #[must_use]
     pub fn key(&self) -> &K {
-        unsafe {
-            &self.map.levels[self.level_idx]
-                .table
-                .get_ref(self.slot_idx)
-                .key
-        }
+        unsafe { &self.map.slot_ref(self.level_idx, self.slot_idx).key }
     }
 
     /// Returns a reference to the entry's value.
     #[must_use]
     pub fn get(&self) -> &V {
-        unsafe {
-            &self.map.levels[self.level_idx]
-                .table
-                .get_ref(self.slot_idx)
-                .value
-        }
+        unsafe { &self.map.slot_ref(self.level_idx, self.slot_idx).value }
     }
 
     /// Returns `&mut V`. Borrow is tied to `self`; for the map's lifetime
     /// use [`OccupiedEntry::into_mut`].
     pub fn get_mut(&mut self) -> &mut V {
-        unsafe {
-            &mut self.map.levels[self.level_idx]
-                .table
-                .get_mut(self.slot_idx)
-                .value
-        }
+        unsafe { &mut self.map.slot_mut(self.level_idx, self.slot_idx).value }
     }
 
     /// Consumes the entry and returns `&mut V` borrowed from the map.
     #[must_use]
     pub fn into_mut(self) -> &'a mut V {
-        unsafe {
-            &mut self.map.levels[self.level_idx]
-                .table
-                .get_mut(self.slot_idx)
-                .value
-        }
+        unsafe { &mut self.map.slot_mut(self.level_idx, self.slot_idx).value }
     }
 
     /// Replaces the entry's value and returns the old one.
     pub fn insert(&mut self, value: V) -> V {
-        let entry = unsafe { self.map.levels[self.level_idx].table.get_mut(self.slot_idx) };
+        let entry = unsafe { self.map.slot_mut(self.level_idx, self.slot_idx) };
         mem::replace(&mut entry.value, value)
     }
 
@@ -1021,10 +1126,11 @@ where
     pub fn remove_entry(self) -> (K, V) {
         let level_idx = self.level_idx;
         let slot_idx = self.slot_idx;
+        let arena = &self.map.arena;
         let removed = {
             let level = &mut self.map.levels[level_idx];
-            let removed = unsafe { level.table.take(slot_idx) };
-            level.table.mark_tombstone(slot_idx);
+            let removed = unsafe { level.take(arena, slot_idx) };
+            level.mark_tombstone(arena, slot_idx);
             level.len -= 1;
             level.tombstones += 1;
             removed
@@ -1034,8 +1140,7 @@ where
         let needs_resize = self.map.levels[level_idx].needs_cleanup();
         self.map.shrink_max_populated_level();
         if needs_resize {
-            let capacity = self.map.capacity;
-            self.map.resize(capacity);
+            self.map.resize(self.map.total_slots);
         }
         (removed.key, removed.value)
     }
@@ -1070,7 +1175,7 @@ where
         let (level_idx, slot_idx) =
             self.map
                 .insert_for_vacant_entry(self.key, value, self.key_hash);
-        unsafe { &mut self.map.levels[level_idx].table.get_mut(slot_idx).value }
+        unsafe { &mut self.map.slot_mut(level_idx, slot_idx).value }
     }
 }
 
@@ -1177,9 +1282,12 @@ pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global
     cursor: OccupiedCursor,
 }
 
-impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
+impl<K, V, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Drain").finish_non_exhaustive()
+        f.debug_struct("Drain")
+            .field("level_idx", &self.level_idx)
+            .field("remaining", &self.map.len)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1191,9 +1299,10 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
         // via `clear_all_controls` regardless, and the scan only advances
         // forward so yielded slots are never re-read.
         while self.level_idx < self.map.levels.len() {
+            let arena = &self.map.arena;
             let level = &mut self.map.levels[self.level_idx];
-            if let Some(idx) = level.table.scan_next(&mut self.cursor) {
-                let entry = unsafe { level.table.take(idx) };
+            if let Some(idx) = level.scan_next(arena, &mut self.cursor) {
+                let entry = unsafe { level.take(arena, idx) };
                 self.map.len -= 1;
                 return Some((entry.key, entry.value));
             }
@@ -1217,7 +1326,7 @@ impl<K, V, S, A: Allocator + Clone> Drop for Drain<'_, K, V, S, A> {
         for _ in &mut *self {}
         // All entries moved out via `next()`; wipe ctrl bytes + counters en bloc.
         for level in &mut self.map.levels {
-            level.table.clear_all_controls();
+            level.clear_all_controls(&self.map.arena);
             level.len = 0;
             level.tombstones = 0;
         }
@@ -1250,7 +1359,10 @@ where
     F: FnMut(&K, &mut V) -> bool,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("ExtractIf").finish_non_exhaustive()
+        f.debug_struct("ExtractIf")
+            .field("level_idx", &self.level_idx)
+            .field("remaining", &self.map.len)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1265,12 +1377,13 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         while self.level_idx < self.map.levels.len() {
             let level = &mut self.map.levels[self.level_idx];
-            while let Some(idx) = level.table.scan_next(&mut self.cursor) {
+            let arena = &self.map.arena;
+            while let Some(idx) = level.scan_next(arena, &mut self.cursor) {
                 // In-place borrow so predicate mutations stick on kept entries.
-                let entry = unsafe { level.table.get_mut(idx) };
+                let entry = unsafe { level.get_mut(arena, idx) };
                 if (self.pred)(&entry.key, &mut entry.value) {
-                    let removed = unsafe { level.table.take(idx) };
-                    level.table.mark_tombstone(idx);
+                    let removed = unsafe { level.take(&self.map.arena, idx) };
+                    level.mark_tombstone(arena, idx);
                     level.len -= 1;
                     level.tombstones += 1;
                     self.map.len -= 1;
@@ -1300,19 +1413,32 @@ where
     }
 }
 
-/// Borrowing iterator over occupied entries. Walks levels in order via
-/// [`OccupiedCursor`]; skips FREE and TOMBSTONE.
-#[derive(Clone)]
+/// Borrowing iterator over occupied entries.
 pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
-    tables: std::slice::Iter<'a, Level<K, V, A>>,
-    current: Option<&'a RawTable<SlotEntry<K, V>, A>>,
+    arena: &'a Arena,
+    levels: std::slice::Iter<'a, Level<K, V>>,
+    current_level: Option<&'a Level<K, V>>,
     cursor: OccupiedCursor,
     remaining: usize,
+    _alloc: PhantomData<&'a A>,
 }
 
-impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticIter<'_, K, V, A> {
+impl<K, V, A: Allocator + Clone> Clone for ElasticIter<'_, K, V, A> {
+    fn clone(&self) -> Self {
+        Self {
+            arena: self.arena,
+            levels: self.levels.clone(),
+            current_level: self.current_level,
+            cursor: self.cursor.clone(),
+            remaining: self.remaining,
+            _alloc: PhantomData,
+        }
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug, A: Allocator + Clone> fmt::Debug for ElasticIter<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("ElasticIter").finish_non_exhaustive()
+        f.debug_list().entries(self.clone()).finish()
     }
 }
 
@@ -1320,18 +1446,19 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIter<'a, K, V, A> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
+        let arena = self.arena;
         loop {
-            let Some(table) = self.current else {
-                self.current = Some(&self.tables.next()?.table);
+            let Some(level) = self.current_level else {
+                self.current_level = Some(self.levels.next()?);
                 self.cursor = OccupiedCursor::new();
                 continue;
             };
-            if let Some(slot_idx) = table.scan_next(&mut self.cursor) {
-                let entry = unsafe { table.get_ref(slot_idx) };
+            if let Some(slot_idx) = level.scan_next(arena, &mut self.cursor) {
+                let entry = unsafe { level.get_ref(arena, slot_idx) };
                 self.remaining -= 1;
                 return Some((&entry.key, &entry.value));
             }
-            self.current = None;
+            self.current_level = None;
         }
     }
 
@@ -1365,19 +1492,21 @@ pub type Values<'a, K, V, A = Global> = CommonValues<ElasticIter<'a, K, V, A>>;
 /// `(&K, &mut V)` iterator. Walks levels in storage order, skipping FREE
 /// and TOMBSTONE slots.
 ///
-/// SAFETY: raw pointer + `PhantomData<&'a mut [Level<K, V, A>]>` ties the
+/// SAFETY: raw pointer + `PhantomData<&'a mut [Level<K, V>]>` ties the
 /// iterator to the exclusive borrow of the map. Each `next()` returns a
 /// borrow of a strictly newer slot, so produced references are disjoint.
 pub struct ElasticIterMut<'a, K, V, A: Allocator + Clone = Global> {
-    levels: *mut Level<K, V, A>,
+    arena: &'a Arena,
+    levels: *mut Level<K, V>,
     levels_len: usize,
     level_idx: usize,
     cursor: OccupiedCursor,
     remaining: usize,
-    _marker: PhantomData<&'a mut [Level<K, V, A>]>,
+    _marker: PhantomData<&'a mut [Level<K, V>]>,
+    _alloc: PhantomData<A>,
 }
 
-// SAFETY: behaves as `&mut [Level<K, V, A>]` for its lifetime.
+// SAFETY: behaves as `&mut [Level<K, V>]` for its lifetime.
 unsafe impl<K: Send, V: Send, A: Allocator + Clone + Send> Send for ElasticIterMut<'_, K, V, A> {}
 unsafe impl<K: Sync, V: Sync, A: Allocator + Clone + Sync> Sync for ElasticIterMut<'_, K, V, A> {}
 
@@ -1386,13 +1515,14 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIterMut<'a, K, V, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.level_idx < self.levels_len {
+            let arena = self.arena;
             // SAFETY: `level_idx < levels_len`; `self.levels` points at an
             // owned slice of initialized `Level`s. Fresh `&mut` each iter.
             let level = unsafe { &mut *self.levels.add(self.level_idx) };
-            if let Some(idx) = level.table.scan_next(&mut self.cursor) {
+            if let Some(idx) = level.scan_next(arena, &mut self.cursor) {
                 // SAFETY: scan only yields occupied slots; reborrow through
                 // raw ptr so refs outlive the per-iter `level` reborrow.
-                let entry = unsafe { level.table.get_mut(idx) };
+                let entry = unsafe { level.get_mut(arena, idx) };
                 let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                 let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
                 self.remaining -= 1;
@@ -1416,6 +1546,7 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticIterMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ElasticIterMut")
             .field("level_idx", &self.level_idx)
+            .field("remaining", &self.remaining)
             .finish_non_exhaustive()
     }
 }
@@ -1458,6 +1589,7 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticValuesMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ElasticValuesMut")
             .field("level_idx", &self.inner.level_idx)
+            .field("remaining", &self.inner.remaining)
             .finish_non_exhaustive()
     }
 }
@@ -1474,12 +1606,13 @@ impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.level_idx < self.map.levels.len() {
-            let table = &mut self.map.levels[self.level_idx].table;
-            if let Some(idx) = table.scan_next(&mut self.cursor) {
+            let arena = &self.map.arena;
+            let level = &mut self.map.levels[self.level_idx];
+            if let Some(idx) = level.scan_next(arena, &mut self.cursor) {
                 // SAFETY: scan only yields occupied slots. Tombstone-mark
                 // prevents map's Drop and future next() from revisiting.
-                let entry = unsafe { table.take(idx) };
-                table.mark_tombstone(idx);
+                let entry = unsafe { level.take(arena, idx) };
+                level.mark_tombstone(arena, idx);
                 self.map.len -= 1;
                 return Some((entry.key, entry.value));
             }
@@ -1509,6 +1642,7 @@ impl<K, V, S, A: Allocator + Clone> fmt::Debug for ElasticIntoIter<K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ElasticIntoIter")
             .field("level_idx", &self.level_idx)
+            .field("remaining", &self.map.len)
             .finish_non_exhaustive()
     }
 }
@@ -1562,10 +1696,9 @@ where
             .choose_slot_for_new_key(key_hash)
             .expect("no free slot found in freshly-allocated map");
 
+        let arena = &self.arena;
         let level = &mut self.levels[level_idx];
-        level
-            .table
-            .write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        level.write_with_control(arena, slot_idx, SlotEntry { key, value }, key_fingerprint);
         level.len += 1;
         if level_idx > self.max_populated_level {
             self.max_populated_level = level_idx;
@@ -1581,21 +1714,18 @@ where
     /// performs a no-grow rehash that flushes accumulated tombstones.
     fn resize(&mut self, new_capacity: usize) {
         let level_capacities = partition_levels(new_capacity);
-        let new_levels: Box<[Level<K, V, A>]> = level_capacities
-            .iter()
-            .enumerate()
-            .map(|(level_idx, &cap)| {
-                Level::with_capacity_in(cap, self.reserve_fraction, level_idx, self.alloc.clone())
-            })
-            .collect();
         let new_max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
         let new_batch_plan =
             build_batch_plan(&level_capacities, self.reserve_fraction, new_max_insertions);
         let new_batch_remaining = new_batch_plan.first().copied().unwrap_or(0);
 
-        // Swap new levels in; old move local for draining.
-        let old_levels = std::mem::replace(&mut self.levels, new_levels);
-        self.capacity = new_capacity;
+        let (new_arena, new_levels) =
+            alloc_elastic_arena(&level_capacities, self.reserve_fraction, &self.alloc);
+
+        // Swap in fresh arena; keep old one alive until drain completes.
+        let old_arena = mem::replace(&mut self.arena, new_arena);
+        let old_levels = mem::replace(&mut self.levels, new_levels);
+        self.total_slots = new_capacity;
         self.max_insertions = new_max_insertions;
         self.batch_plan = new_batch_plan;
         self.current_batch_index = 0;
@@ -1603,14 +1733,31 @@ where
         self.max_populated_level = 0;
         self.len = 0;
 
-        // `take` leaves ctrl stale; clear so Drop doesn't double-drop.
-        for mut level in old_levels {
-            level.table.for_each_occupied_mut(|table, idx| {
-                let entry = unsafe { table.take(idx) };
+        // Move every live entry from old arena into the new levels.
+        //
+        // Panic safety: clear each source ctrl right after `read` so the
+        // guard's drop walks only un-moved slots (no double-drop with
+        // entries already in the new arena). If `insert_unique` panics
+        // the guard unwinds: drops any survivors then deallocates
+        // `old_arena` — `Arena` has no `Drop`, so without the guard the
+        // backing allocation would leak.
+        let guard = ArenaDropGuard {
+            arena: Some(old_arena),
+            levels_ptr: old_levels.as_ptr(),
+            levels_len: old_levels.len(),
+            alloc: self.alloc.clone(),
+        };
+        let old_ptr = guard.arena.as_ref().unwrap();
+        for level in &old_levels {
+            for idx in level.occupied(old_ptr) {
+                let entry = unsafe { level.take(old_ptr, idx) };
+                level.set_control(old_ptr, idx, CTRL_EMPTY);
                 self.insert_unique(entry.key, entry.value);
-            });
-            level.table.clear_all_controls();
+            }
         }
+        // guard drops at end of scope, deallocating old_arena. All slots
+        // are CTRL_EMPTY so `drop_values` is a no-op on success.
+        drop(guard);
     }
 
     /// Fallible counterpart to [`Self::resize`]. Allocates the new backing
@@ -1627,16 +1774,19 @@ where
             self.alloc.clone(),
         )?;
 
-        for level in &mut self.levels {
-            level.table.for_each_occupied_mut(|table, idx| {
-                let entry = unsafe { table.take(idx) };
+        // Clear each source ctrl immediately after `take`. If `insert_unique`
+        // panics (e.g. via a user-provided `Hash` impl), the un-iterated slots
+        // remain OCCUPIED on `self` and the already-moved ones are EMPTY, so
+        // both `self.drop_values` and `new_map.drop_values` are sound on
+        // unwind (no double-drop).
+        let old_ptr = &self.arena;
+        for level in &self.levels {
+            for idx in level.occupied(old_ptr) {
+                let entry = unsafe { level.take(old_ptr, idx) };
+                level.set_control(old_ptr, idx, CTRL_EMPTY);
                 new_map.insert_unique(entry.key, entry.value);
-            });
-            level.table.clear_all_controls();
-            level.len = 0;
-            level.tombstones = 0;
+            }
         }
-
         self.len = 0;
         self.max_populated_level = 0;
         *self = new_map;
@@ -1652,32 +1802,19 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let capacity = slots;
+        let total_slots = slots;
         let reserve_fraction = capacity::sanitize_reserve_fraction(reserve_fraction);
-        let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
+        let max_insertions = capacity::max_insertions(total_slots, reserve_fraction);
 
-        let level_capacities = partition_levels(capacity);
-        let mut levels: Vec<Level<K, V, A>> = Vec::new();
-        levels
-            .try_reserve_exact(level_capacities.len())
-            .map_err(|_| TryReserveError::AllocError)?;
-        for (level_idx, &cap) in level_capacities.iter().enumerate() {
-            levels.push(Level::try_with_capacity_in(
-                cap,
-                reserve_fraction,
-                level_idx,
-                alloc.clone(),
-            )?);
-        }
-        let levels = levels.into_boxed_slice();
-
+        let level_capacities = partition_levels(total_slots);
+        let (arena, levels) = try_alloc_elastic_arena(&level_capacities, reserve_fraction, &alloc)?;
         let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
         let batch_remaining = batch_plan.first().copied().unwrap_or(0);
 
         Ok(Self {
             levels,
             len: 0,
-            capacity,
+            total_slots,
             max_insertions,
             reserve_fraction,
             batch_plan,
@@ -1686,6 +1823,7 @@ where
             max_populated_level: 0,
             hash_builder,
             alloc,
+            arena,
         })
     }
 
@@ -1756,7 +1894,7 @@ where
         let current_free_slots = current_level.free_slots();
         let next_free_slots = next_level.free_slots();
 
-        if current_free_slots > current_level.half_reserve_slot_threshold
+        if current_free_slots > current_level.half_reserve_slot_threshold as usize
             && next_free_slots.saturating_mul(4) > next_level.capacity()
         {
             let limited_budget = current_level.limited_group_budget();
@@ -1771,7 +1909,7 @@ where
                 .map(|slot_idx| (level_idx, slot_idx));
         }
 
-        if current_free_slots <= current_level.half_reserve_slot_threshold {
+        if current_free_slots <= current_level.half_reserve_slot_threshold as usize {
             if let Some(slot_idx) = self.first_free_uniform(key_hash, level_idx + 1) {
                 return Some((level_idx + 1, slot_idx));
             }
@@ -1785,6 +1923,19 @@ where
         }
         self.first_free_uniform(key_hash, level_idx + 1)
             .map(|slot_idx| (level_idx + 1, slot_idx))
+    }
+
+    /// SAFETY: `level_idx` < `self.levels.len()` and `slot_idx` references an
+    /// occupied slot in that level.
+    #[inline]
+    unsafe fn slot_ref(&self, level_idx: usize, slot_idx: usize) -> &SlotEntry<K, V> {
+        unsafe { self.levels[level_idx].get_ref(&self.arena, slot_idx) }
+    }
+
+    /// SAFETY: same as [`Self::slot_ref`] plus caller holds exclusive access.
+    #[inline]
+    unsafe fn slot_mut(&mut self, level_idx: usize, slot_idx: usize) -> &mut SlotEntry<K, V> {
+        unsafe { self.levels[level_idx].get_mut(&self.arena, slot_idx) }
     }
 
     /// Paper §4 lookup: walk levels `A_1`, `A_2`, … in order using each
@@ -1801,8 +1952,9 @@ where
         Q: Equivalent<K> + ?Sized,
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
+        let arena = &self.arena;
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            if let Some(slot_idx) = level.find_by_probe(key_hash, key_fingerprint, key) {
+            if let Some(slot_idx) = level.find_by_probe(arena, key_hash, key_fingerprint, key) {
                 return Some((level_idx, slot_idx));
             }
         }
@@ -1820,16 +1972,16 @@ where
         max_groups: usize,
     ) -> Option<usize> {
         let level = &self.levels[level_idx];
-        if level.len >= level.capacity() {
+        if level.len as usize >= level.capacity() {
             return None;
         }
-
-        let group_count = level.table.group_count();
+        let arena = &self.arena;
+        let group_count = level.group_count();
         let max_groups = max_groups.min(group_count.max(1));
-        let mask = level.group_count_mask;
+        let mask = level.group_count_mask as usize;
         let mut probe = probe::TriangularProbe::new(level.triangular_group_start(key_hash));
         for _ in 0..max_groups {
-            if let Some(slot_idx) = level.table.first_free_in_group(probe.pos) {
+            if let Some(slot_idx) = level.first_free_in_group(arena, probe.pos) {
                 return Some(slot_idx);
             }
             probe.advance(mask);
@@ -1842,15 +1994,15 @@ where
     #[inline]
     fn first_free_uniform(&self, key_hash: u64, level_idx: usize) -> Option<usize> {
         let level = &self.levels[level_idx];
-        if level.len >= level.capacity() {
+        if level.len as usize >= level.capacity() {
             return None;
         }
-
-        let group_count = level.table.group_count();
-        let mask = level.group_count_mask;
+        let arena = &self.arena;
+        let group_count = level.group_count();
+        let mask = level.group_count_mask as usize;
         let mut probe = probe::TriangularProbe::new(level.triangular_group_start(key_hash));
         for _ in 0..group_count {
-            if let Some(slot_idx) = level.table.first_free_in_group(probe.pos) {
+            if let Some(slot_idx) = level.first_free_in_group(arena, probe.pos) {
                 return Some(slot_idx);
             }
             probe.advance(mask);
@@ -1873,41 +2025,37 @@ where
     }
 }
 
-/// Raw-pointer projection from `(level_idx, slot_idx)` to `*mut V`, without
-/// forming an intermediate `&mut Level` / `&mut RawTable`. Used by
-/// `get_disjoint_mut*` to hand out disjoint `&mut V` even when multiple keys
-/// live in the same level.
+/// Raw-pointer projection from `(level_idx, slot_idx)` to `*mut V`.
+/// Used by `get_disjoint_mut*` to hand out disjoint `&mut V` from multiple
+/// slots without going through `&mut ElasticHashMap`.
 ///
 /// # Safety
 ///
-/// - `levels_ptr` must point to a live `[Level<K, V, A>]` whose `level_idx`
-///   slot exists.
-/// - `slot_idx` must reference an occupied slot in that level's table.
+/// - `arena` must point to the map's live arena.
+/// - `levels_ptr` must point to the map's live `[Level<K, V>]`.
+/// - `slot_idx` must be an occupied slot in that level.
 #[inline]
-unsafe fn elastic_slot_value_ptr<K, V, A: Allocator + Clone>(
-    levels_ptr: *mut Level<K, V, A>,
+unsafe fn elastic_slot_value_ptr<K, V>(
+    arena: &Arena,
+    levels_ptr: *const Level<K, V>,
     level_idx: usize,
     slot_idx: usize,
 ) -> *mut V {
-    let lvl_ptr = unsafe { levels_ptr.add(level_idx) };
-    let table_ptr: *mut RawTable<SlotEntry<K, V>, A> = unsafe { &raw mut (*lvl_ptr).table };
-    let entry_ptr: *mut SlotEntry<K, V> = unsafe { RawTable::slot_ptr_raw(table_ptr, slot_idx) };
-    unsafe { &raw mut (*entry_ptr).value }
+    let level = unsafe { &*levels_ptr.add(level_idx) };
+    unsafe { &raw mut (*level.slots(arena).add(slot_idx)).value }
 }
 
 /// As [`elastic_slot_value_ptr`] but returns key + value pointers together.
 #[inline]
-unsafe fn elastic_slot_kv_ptrs<K, V, A: Allocator + Clone>(
-    levels_ptr: *mut Level<K, V, A>,
+unsafe fn elastic_slot_kv_ptrs<K, V>(
+    arena: &Arena,
+    levels_ptr: *const Level<K, V>,
     level_idx: usize,
     slot_idx: usize,
 ) -> (*const K, *mut V) {
-    let lvl_ptr = unsafe { levels_ptr.add(level_idx) };
-    let table_ptr: *mut RawTable<SlotEntry<K, V>, A> = unsafe { &raw mut (*lvl_ptr).table };
-    let entry_ptr: *mut SlotEntry<K, V> = unsafe { RawTable::slot_ptr_raw(table_ptr, slot_idx) };
-    let k_ptr: *const K = unsafe { &raw const (*entry_ptr).key };
-    let v_ptr: *mut V = unsafe { &raw mut (*entry_ptr).value };
-    (k_ptr, v_ptr)
+    let level = unsafe { &*levels_ptr.add(level_idx) };
+    let entry = unsafe { &mut *level.slots(arena).add(slot_idx) };
+    (ptr::addr_of!(entry.key), ptr::addr_of_mut!(entry.value))
 }
 
 /// O(N^2) alias check shared by `get_disjoint_mut` and
@@ -1926,10 +2074,9 @@ fn check_disjoint_aliasing<const N: usize>(locations: &[Option<(usize, usize)>; 
 }
 
 /// `min(1 + log δ⁻¹, group_count)` — paper §2 cap on `f(ε)` with `c = 1`.
-#[allow(clippy::cast_precision_loss)]
 fn compute_budget_cap(reserve_fraction: f64, group_count: usize) -> f64 {
     let log_cap = 1.0 + (1.0 / reserve_fraction).log2();
-    let max_budget = group_count.max(1) as f64;
+    let max_budget = math::cast::usize_to_f64(group_count.max(1));
     log_cap.min(max_budget).max(1.0)
 }
 
@@ -2022,10 +2169,57 @@ where
     A: Allocator + Clone,
 {
     fn clone(&self) -> Self {
+        let level_capacities: Vec<usize> =
+            self.levels.iter().map(|l| l.capacity as usize).collect();
+        let (arena, mut levels) =
+            alloc_elastic_arena(&level_capacities, self.reserve_fraction, &self.alloc);
+
+        // Drop guard for the half-built clone: if any user `K::clone` /
+        // `V::clone` panics, drop the already-cloned values (OCCUPIED on
+        // `dst_arena`) and deallocate the partially-filled arena. `Arena`
+        // has no `Drop`, so without this the whole allocation would leak.
+        let mut guard = ArenaDropGuard {
+            arena: Some(arena),
+            levels_ptr: levels.as_ptr(),
+            levels_len: levels.len(),
+            alloc: self.alloc.clone(),
+        };
+
+        let src_arena = &self.arena;
+        let dst_arena = guard.arena.as_ref().unwrap();
+        // Panic-safe order: clone value, write slot, then write ctrl byte.
+        // If a clone panics, only OCCUPIED slots reflect initialized memory —
+        // the guard's `drop_values` walks exactly those.
+        for (dst, src_lvl) in levels.iter_mut().zip(self.levels.iter()) {
+            for idx in 0..src_lvl.capacity as usize {
+                let ctrl = src_lvl.control_at(src_arena, idx);
+                if ctrl.is_occupied() {
+                    let cloned = unsafe { src_lvl.get_ref(src_arena, idx) }.clone();
+                    unsafe { dst.slots(dst_arena).add(idx).write(cloned) };
+                    dst.set_control(dst_arena, idx, ctrl);
+                }
+            }
+            // Copy TOMBSTONE bytes only after all clones succeed — they hold
+            // no payload, so it's safe to set them in a second pass.
+            for idx in 0..src_lvl.capacity as usize {
+                let ctrl = src_lvl.control_at(src_arena, idx);
+                if ctrl == CTRL_TOMBSTONE {
+                    dst.set_control(dst_arena, idx, CTRL_TOMBSTONE);
+                }
+            }
+            dst.len = src_lvl.len;
+            dst.tombstones = src_lvl.tombstones;
+        }
+
+        // Success: take the arena out of the guard so its Drop becomes a
+        // no-op. The arena now lives in `Self` below.
+        let arena = guard.arena.take().unwrap();
+        drop(guard);
+
         Self {
-            levels: self.levels.clone(),
+            levels,
             len: self.len,
-            capacity: self.capacity,
+            total_slots: self.total_slots,
             max_insertions: self.max_insertions,
             reserve_fraction: self.reserve_fraction,
             batch_plan: self.batch_plan.clone(),
@@ -2034,32 +2228,15 @@ where
             max_populated_level: self.max_populated_level,
             hash_builder: self.hash_builder.clone(),
             alloc: self.alloc.clone(),
+            arena,
         }
     }
 
     fn clone_from(&mut self, source: &Self) {
-        // Fast path: reuse every per-level allocation when shapes match.
-        let shape_matches = self.capacity == source.capacity
-            && self
-                .levels
-                .iter()
-                .zip(source.levels.iter())
-                .all(|(a, b)| a.table.capacity() == b.table.capacity());
-        if !shape_matches {
-            *self = source.clone();
-            return;
-        }
-        for (dst, src) in self.levels.iter_mut().zip(source.levels.iter()) {
-            dst.clone_from(src);
-        }
-        self.len = source.len;
-        self.max_insertions = source.max_insertions;
-        self.reserve_fraction = source.reserve_fraction;
-        self.batch_plan.clone_from(&source.batch_plan);
-        self.current_batch_index = source.current_batch_index;
-        self.batch_remaining = source.batch_remaining;
-        self.max_populated_level = source.max_populated_level;
-        self.hash_builder.clone_from(&source.hash_builder);
+        // Descriptors are pure offsets — `Level::clone_from` would only copy
+        // them, not the data they index into the arena. Delegate to full
+        // clone + move-assign so K/V are actually cloned.
+        *self = source.clone();
     }
 }
 
