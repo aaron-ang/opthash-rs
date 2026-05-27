@@ -856,32 +856,28 @@ fn alloc_funnel_arena<K, V, A: Allocator + Clone>(
 }
 
 /// Drops occupied slots + deallocates the arena if dropped before
-/// `arena.take()`. Lets `Clone` panic-safely roll back when user
-/// `K::clone` / `V::clone` unwinds — `Arena` has no `Drop`.
-///
-/// Raw ptr + len for levels/special so the guard doesn't conflict with
-/// mutable iteration during clone.
+/// extraction. Lets `Clone` panic-safely roll back when user `K::clone` /
+/// `V::clone` unwinds — `Arena` has no `Drop`. Owns levels + special so
+/// mut-iteration borrows from the guard.
 struct ArenaDropGuard<K, V, A: Allocator + Clone> {
     arena: Option<Arena>,
-    levels_ptr: *const BucketLevel<K, V>,
-    levels_len: usize,
-    special: *const SpecialArray<K, V>,
+    levels: Option<Box<[BucketLevel<K, V>]>>,
+    special: Option<SpecialArray<K, V>>,
     alloc: A,
 }
 
 impl<K, V, A: Allocator + Clone> Drop for ArenaDropGuard<K, V, A> {
     fn drop(&mut self) {
         if let Some(arena) = self.arena.take() {
-            let arena_ref = &arena;
-            // SAFETY: caller ensures the raw pointers describe live slices /
-            // a live `SpecialArray` for the guard's lifetime.
-            let levels = unsafe { std::slice::from_raw_parts(self.levels_ptr, self.levels_len) };
-            for level in levels {
-                level.drop_values(arena_ref);
+            if let Some(levels) = self.levels.take() {
+                for level in &levels {
+                    level.drop_values(&arena);
+                }
             }
-            let special = unsafe { &*self.special };
-            special.primary.drop_values(arena_ref);
-            special.fallback.drop_values(arena_ref);
+            if let Some(special) = self.special.take() {
+                special.primary.drop_values(&arena);
+                special.fallback.drop_values(&arena);
+            }
             arena.deallocate(&self.alloc);
         }
     }
@@ -3448,7 +3444,7 @@ where
             .collect();
         let fallback_bucket_size = (self.primary_probe_limit.saturating_mul(2)).max(2);
 
-        let (arena, mut levels, mut special) = alloc_funnel_arena(
+        let (arena, levels, special) = alloc_funnel_arena(
             &level_bucket_counts,
             bucket_width,
             primary_ctrl,
@@ -3464,15 +3460,20 @@ where
         // allocation would leak on unwind.
         let mut guard = ArenaDropGuard::<K, V, A> {
             arena: Some(arena),
-            levels_ptr: levels.as_ptr(),
-            levels_len: levels.len(),
-            special: ptr::from_ref(&special),
+            levels: Some(levels),
+            special: Some(special),
             alloc: self.alloc.clone(),
         };
         // Panic-safe order: clone value, write slot, then ctrl byte. If a
         // clone panics, only initialized slots carry OCCUPIED ctrls — the
         // guard's `drop_values` walks exactly those.
-        for (dst, src_lvl) in levels.iter_mut().zip(self.levels.iter()) {
+        for (dst, src_lvl) in guard
+            .levels
+            .as_deref_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(self.levels.iter())
+        {
             arena::clone_region_panic_safe::<K, V>(
                 src_lvl.ctrl_ptr,
                 dst.ctrl_ptr,
@@ -3484,9 +3485,10 @@ where
             dst.tombstones = src_lvl.tombstones;
         }
 
+        let special_mut = guard.special.as_mut().unwrap();
         {
             let s = &self.special.primary;
-            let d = &mut special.primary;
+            let d = &mut special_mut.primary;
             arena::clone_region_panic_safe::<K, V>(
                 s.ctrl_ptr,
                 d.ctrl_ptr,
@@ -3500,7 +3502,7 @@ where
 
         {
             let s = &self.special.fallback;
-            let d = &mut special.fallback;
+            let d = &mut special_mut.fallback;
             arena::clone_region_panic_safe::<K, V>(
                 s.ctrl_ptr,
                 d.ctrl_ptr,
@@ -3512,10 +3514,12 @@ where
             d.tombstones = s.tombstones;
         }
 
-        special.total_len = self.special.total_len;
+        special_mut.total_len = self.special.total_len;
 
-        // Success: take the arena out of the guard so its Drop is a no-op.
+        // Success: extract from guard so its Drop is a no-op.
         let arena = guard.arena.take().unwrap();
+        let levels = guard.levels.take().unwrap();
+        let special = guard.special.take().unwrap();
         drop(guard);
 
         Self {

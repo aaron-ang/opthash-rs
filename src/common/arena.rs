@@ -83,12 +83,9 @@ impl<K: Clone, V: Clone> Clone for SlotEntry<K, V> {
     }
 }
 
-/// Clone occupied + tombstone slots from one arena region into another in
-/// panic-safe order: each src value is cloned, written into `dst`, then
-/// its OCCUPIED ctrl byte is stamped. A panicking clone leaves `dst` with
-/// every initialized slot already covered by OCCUPIED, so partial drop
-/// only touches initialized memory. TOMBSTONE bytes are copied in a
-/// second pass once all clones succeed.
+/// Clone one arena region's slots in panic-safe order: clone → write →
+/// stamp OCCUPIED ctrl. A panic mid-loop leaves `dst` with OCCUPIED only
+/// on fully-written slots. TOMBSTONE bytes copied in a second pass.
 pub(crate) fn clone_region_panic_safe<K: Clone, V: Clone>(
     src_ctrl: *const u8,
     dst_ctrl: *mut u8,
@@ -283,10 +280,9 @@ pub(crate) trait ArenaSlots<K, V> {
         }
     }
 
-    /// Drop every K,V and reset all ctrl bytes to FREE in one panic-safe
-    /// pass: each slot's ctrl is cleared *before* its value is dropped, so a
-    /// panicking `Drop` impl leaves no OCCUPIED ctrl behind for the caller's
-    /// own `Drop` to double-drop. Tombstones are cleared too.
+    /// Drop every K,V + reset all ctrls to FREE in one pass. Clears each
+    /// ctrl *before* the drop so a panicking `Drop` leaves no OCCUPIED
+    /// behind to double-drop. Tombstones cleared too.
     fn drop_values_and_clear(&self, arena: &Arena) {
         if self.capacity() == 0 {
             return;

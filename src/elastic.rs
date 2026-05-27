@@ -459,28 +459,22 @@ fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
     })
 }
 
-/// Drops values + deallocates an `Arena` if dropped before `arena.take()`.
-/// Lets `resize`/`Clone` panic-safely roll back — `Arena` has no `Drop`,
-/// so a bare unwind would leak.
-///
-/// `levels_ptr + len` instead of `&[Level]` so the guard doesn't conflict
-/// with mutable iteration during clone.
+/// Drops values + deallocates an `Arena` if dropped before extraction.
+/// Lets `resize`/`Clone` panic-safely roll back — `Arena` has no `Drop`.
+/// Owns the level slice so mut-iteration borrows from `guard.levels`.
 struct ArenaDropGuard<K, V, A: Allocator + Clone> {
     arena: Option<Arena>,
-    levels_ptr: *const Level<K, V>,
-    levels_len: usize,
+    levels: Option<Box<[Level<K, V>]>>,
     alloc: A,
 }
 
 impl<K, V, A: Allocator + Clone> Drop for ArenaDropGuard<K, V, A> {
     fn drop(&mut self) {
         if let Some(arena) = self.arena.take() {
-            let arena_ref = &arena;
-            // SAFETY: caller ensures `levels_ptr`/`levels_len` describe a
-            // live `[Level<K, V>]` slice for the guard's lifetime.
-            let levels = unsafe { std::slice::from_raw_parts(self.levels_ptr, self.levels_len) };
-            for level in levels {
-                level.drop_values(arena_ref);
+            if let Some(levels) = self.levels.take() {
+                for level in &levels {
+                    level.drop_values(&arena);
+                }
             }
             arena.deallocate(&self.alloc);
         }
@@ -1743,12 +1737,11 @@ where
         // backing allocation would leak.
         let guard = ArenaDropGuard {
             arena: Some(old_arena),
-            levels_ptr: old_levels.as_ptr(),
-            levels_len: old_levels.len(),
+            levels: Some(old_levels),
             alloc: self.alloc.clone(),
         };
         let old_ptr = guard.arena.as_ref().unwrap();
-        for level in &old_levels {
+        for level in guard.levels.as_deref().unwrap() {
             for idx in level.occupied(old_ptr) {
                 let entry = unsafe { level.take(old_ptr, idx) };
                 level.set_control(old_ptr, idx, CTRL_EMPTY);
@@ -2171,7 +2164,7 @@ where
     fn clone(&self) -> Self {
         let level_capacities: Vec<usize> =
             self.levels.iter().map(|l| l.capacity as usize).collect();
-        let (arena, mut levels) =
+        let (arena, levels) =
             alloc_elastic_arena(&level_capacities, self.reserve_fraction, &self.alloc);
 
         // Drop guard for the half-built clone: if any user `K::clone` /
@@ -2180,12 +2173,17 @@ where
         // has no `Drop`, so without this the whole allocation would leak.
         let mut guard = ArenaDropGuard {
             arena: Some(arena),
-            levels_ptr: levels.as_ptr(),
-            levels_len: levels.len(),
+            levels: Some(levels),
             alloc: self.alloc.clone(),
         };
 
-        for (dst, src_lvl) in levels.iter_mut().zip(self.levels.iter()) {
+        for (dst, src_lvl) in guard
+            .levels
+            .as_deref_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(self.levels.iter())
+        {
             arena::clone_region_panic_safe::<K, V>(
                 src_lvl.ctrl_ptr,
                 dst.ctrl_ptr,
@@ -2197,9 +2195,10 @@ where
             dst.tombstones = src_lvl.tombstones;
         }
 
-        // Success: take the arena out of the guard so its Drop becomes a
-        // no-op. The arena now lives in `Self` below.
+        // Success: extract arena + levels from the guard so its Drop becomes
+        // a no-op. Both fields now live in `Self` below.
         let arena = guard.arena.take().unwrap();
+        let levels = guard.levels.take().unwrap();
         drop(guard);
 
         Self {
