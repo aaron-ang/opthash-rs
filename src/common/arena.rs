@@ -67,6 +67,36 @@ impl Arena {
     }
 }
 
+/// Drop-guard wrapper: deallocates the arena on drop. Used by map `Drop`
+/// impls so `V::drop` panics don't unwind past `arena.deallocate`.
+pub(crate) struct DeallocGuard<'a, A: Allocator> {
+    arena: Option<Arena>,
+    alloc: &'a A,
+}
+
+impl<'a, A: Allocator> DeallocGuard<'a, A> {
+    #[inline]
+    pub(crate) fn new(arena: Arena, alloc: &'a A) -> Self {
+        Self {
+            arena: Some(arena),
+            alloc,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn arena(&self) -> &Arena {
+        self.arena.as_ref().expect("guard already disarmed")
+    }
+}
+
+impl<A: Allocator> Drop for DeallocGuard<'_, A> {
+    fn drop(&mut self) {
+        if let Some(arena) = self.arena.take() {
+            arena.deallocate(self.alloc);
+        }
+    }
+}
+
 /// One stored entry in the arena's data section. K and V live next to each
 /// other so a `read` / `drop_in_place` touches both in one shot.
 pub(crate) struct SlotEntry<K, V> {
