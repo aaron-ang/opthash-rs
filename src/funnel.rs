@@ -401,11 +401,15 @@ impl<K, V> SpecialArray<K, V> {
     }
 
     /// Drain primary + fallback in occupied order, calling `f` on each entry.
+    /// Clears each slot's ctrl byte *before* moving the entry out, so an `f`
+    /// panic leaves no OCCUPIED slots for the map's drop to double-drop.
     fn for_each_occupied<F: FnMut(SlotEntry<K, V>)>(&self, mut f: F) {
         for idx in self.primary.occupied() {
+            self.primary.set_control(idx, CTRL_EMPTY);
             f(unsafe { self.primary.take(idx) });
         }
         for idx in self.fallback.occupied() {
+            self.fallback.set_control(idx, CTRL_EMPTY);
             f(unsafe { self.fallback.take(idx) });
         }
     }
@@ -1648,10 +1652,12 @@ where
     }
 
     /// Move every live entry into `out`; ctrl bytes cleared so `install_fresh_storage`
-    /// can free the old arena safely.
+    /// can free the old arena safely. Each ctrl is cleared *before* the move so
+    /// a `Vec::push` realloc panic leaves no OCCUPIED slot behind to double-drop.
     fn drain_entries_into(&mut self, out: &mut Vec<(K, V)>) {
         for level in &self.levels {
             for idx in level.occupied() {
+                level.set_control(idx, CTRL_EMPTY);
                 let entry = unsafe { level.take(idx) };
                 out.push((entry.key, entry.value));
             }
