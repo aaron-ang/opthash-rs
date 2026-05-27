@@ -10,7 +10,7 @@ use allocator_api2::alloc::Layout;
 use equivalent::Equivalent;
 
 use crate::common::arena::{self, Arena, ArenaSlots, OccupiedCursor, SlotEntry};
-use crate::common::config::{CACHE_LINE, DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
+use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
@@ -37,7 +37,6 @@ struct BucketLevel<K, V> {
     salt: u64,
     len: u32,
     tombstones: u32,
-    _marker: PhantomData<*mut SlotEntry<K, V>>,
 }
 
 unsafe impl<K: Send, V: Send> Send for BucketLevel<K, V> {}
@@ -78,7 +77,6 @@ impl<K, V> BucketLevel<K, V> {
             salt: math::level_salt(level_idx),
             len: 0,
             tombstones: 0,
-            _marker: PhantomData,
         }
     }
 
@@ -97,7 +95,7 @@ impl<K, V> BucketLevel<K, V> {
 
     /// Paper §5 attempted insertion: hash `key_hash` to one bucket `A_{i,j}`,
     /// return the first empty slot in that bucket (or `None` if full).
-    fn first_free_in_bucket(&self, arena: &Arena, key_hash: u64) -> Option<usize> {
+    fn first_free_in_bucket(&self, key_hash: u64) -> Option<usize> {
         if self.len >= self.capacity {
             return None;
         }
@@ -108,7 +106,7 @@ impl<K, V> BucketLevel<K, V> {
             unsafe { std::hint::unreachable_unchecked() };
         }
         let group_idx = bucket_range.start / GROUP_SIZE;
-        let group_ptr = unsafe { self.ctrl(arena).add(group_idx * GROUP_SIZE) };
+        let group_ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         unsafe { simd::free_mask_16(group_ptr) }
             .lowest()
             .map(|offset| bucket_range.start + offset)
@@ -121,7 +119,6 @@ impl<K, V> BucketLevel<K, V> {
     #[inline]
     fn find_in_bucket<Q>(
         &self,
-        arena: &Arena,
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
@@ -158,11 +155,11 @@ impl<K, V> BucketLevel<K, V> {
             unsafe { std::hint::unreachable_unchecked() };
         }
         let group_idx = bucket_range.start / GROUP_SIZE;
-        let group_ptr = unsafe { self.ctrl(arena).add(group_idx * GROUP_SIZE) };
+        let group_ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         let match_mask = unsafe { simd::eq_mask_16(group_ptr, key_fingerprint) };
         for relative_idx in match_mask {
             let slot_idx = bucket_range.start + relative_idx;
-            let entry = unsafe { &*self.slots(arena).add(slot_idx) };
+            let entry = unsafe { &*self.data_ptr().add(slot_idx) };
             if key.equivalent(&entry.key) {
                 return LookupStep::Found(slot_idx);
             }
@@ -189,14 +186,14 @@ impl<K, V> BucketLevel<K, V> {
     /// (probe chain terminates here), else `CTRL_TOMBSTONE`.
     /// Returns whether a tombstone was written.
     #[inline]
-    fn erase(&self, arena: &Arena, idx: usize) -> bool {
+    fn erase(&self, idx: usize) -> bool {
         let group_idx = idx / GROUP_SIZE;
-        let gp = unsafe { self.ctrl(arena).add(group_idx * GROUP_SIZE) };
+        let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
-            self.set_control(arena, idx, CTRL_EMPTY);
+            self.set_control(idx, CTRL_EMPTY);
             false
         } else {
-            self.set_control(arena, idx, CTRL_TOMBSTONE);
+            self.set_control(idx, CTRL_TOMBSTONE);
             true
         }
     }
@@ -232,7 +229,6 @@ struct SpecialPrimary<K, V> {
     group_count_mask: u32,
     len: u32,
     tombstones: u32,
-    _marker: PhantomData<*mut SlotEntry<K, V>>,
 }
 
 unsafe impl<K: Send, V: Send> Send for SpecialPrimary<K, V> {}
@@ -269,7 +265,6 @@ impl<K, V> SpecialPrimary<K, V> {
             group_count_mask,
             len: 0,
             tombstones: 0,
-            _marker: PhantomData,
         }
     }
 
@@ -295,14 +290,14 @@ impl<K, V> SpecialPrimary<K, V> {
 
     /// Erase slot: drop tombstone unless the group has free space.
     #[inline]
-    fn erase(&self, arena: &Arena, idx: usize) -> bool {
+    fn erase(&self, idx: usize) -> bool {
         let group_idx = idx / GROUP_SIZE;
-        let gp = unsafe { self.ctrl(arena).add(group_idx * GROUP_SIZE) };
+        let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
-            self.set_control(arena, idx, CTRL_EMPTY);
+            self.set_control(idx, CTRL_EMPTY);
             false
         } else {
-            self.set_control(arena, idx, CTRL_TOMBSTONE);
+            self.set_control(idx, CTRL_TOMBSTONE);
             true
         }
     }
@@ -319,7 +314,6 @@ struct SpecialFallback<K, V> {
     bucket_size_log2: u32,
     len: u32,
     tombstones: u32,
-    _marker: PhantomData<*mut SlotEntry<K, V>>,
 }
 
 unsafe impl<K: Send, V: Send> Send for SpecialFallback<K, V> {}
@@ -357,7 +351,6 @@ impl<K, V> SpecialFallback<K, V> {
             bucket_size_log2,
             len: 0,
             tombstones: 0,
-            _marker: PhantomData,
         }
     }
 
@@ -379,14 +372,14 @@ impl<K, V> SpecialFallback<K, V> {
 
     /// Erase slot: drop tombstone unless the group has free space.
     #[inline]
-    fn erase(&self, arena: &Arena, idx: usize) -> bool {
+    fn erase(&self, idx: usize) -> bool {
         let group_idx = idx / GROUP_SIZE;
-        let gp = unsafe { self.ctrl(arena).add(group_idx * GROUP_SIZE) };
+        let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
-            self.set_control(arena, idx, CTRL_EMPTY);
+            self.set_control(idx, CTRL_EMPTY);
             false
         } else {
-            self.set_control(arena, idx, CTRL_TOMBSTONE);
+            self.set_control(idx, CTRL_TOMBSTONE);
             true
         }
     }
@@ -402,9 +395,19 @@ struct SpecialArray<K, V> {
 }
 
 impl<K, V> SpecialArray<K, V> {
-    fn drop_values(&self, arena: &Arena) {
-        self.primary.drop_values(arena);
-        self.fallback.drop_values(arena);
+    fn drop_values(&self) {
+        self.primary.drop_values();
+        self.fallback.drop_values();
+    }
+
+    /// Drain primary + fallback in occupied order, calling `f` on each entry.
+    fn for_each_occupied<F: FnMut(SlotEntry<K, V>)>(&self, mut f: F) {
+        for idx in self.primary.occupied() {
+            f(unsafe { self.primary.take(idx) });
+        }
+        for idx in self.fallback.occupied() {
+            f(unsafe { self.fallback.take(idx) });
+        }
     }
 }
 
@@ -490,9 +493,9 @@ impl<K, V, S, A: Allocator + Clone> Drop for FunnelHashMap<K, V, S, A> {
         let arena = mem::replace(&mut self.arena, Arena::empty());
         let guard = arena::DeallocGuard::new(arena, &self.alloc);
         for level in &self.levels {
-            level.drop_values(guard.arena());
+            level.drop_values();
         }
-        self.special.drop_values(guard.arena());
+        self.special.drop_values();
         drop(guard);
     }
 }
@@ -625,33 +628,6 @@ where
             alloc,
         )
     }
-}
-
-/// Compute the funnel arena layout and allocate everything in one block.
-/// `bucket_width` = pow2 multiple of `GROUP_SIZE`; already rounded at call site.
-fn for_each_special_occupied<K, V, F>(arena: &Arena, special: &SpecialArray<K, V>, mut f: F)
-where
-    F: FnMut(SlotEntry<K, V>),
-{
-    for idx in special.primary.occupied(arena) {
-        f(unsafe { special.primary.take(arena, idx) });
-    }
-    for idx in special.fallback.occupied(arena) {
-        f(unsafe { special.fallback.take(arena, idx) });
-    }
-}
-
-/// Computes the combined ctrl+data layout for an arena whose ctrl section
-/// holds `total_ctrl` bytes and data section holds `total_ctrl` slots.
-fn arena_layout_for<K, V>(total_ctrl: usize) -> Result<(Layout, usize), TryReserveError> {
-    let ctrl_layout = Layout::from_size_align(total_ctrl.max(1), CACHE_LINE)
-        .map_err(|_| TryReserveError::AllocError)?;
-    let data_layout = Layout::array::<SlotEntry<K, V>>(total_ctrl.max(1))
-        .map_err(|_| TryReserveError::AllocError)?;
-    let (arena_layout, data_base_off) = ctrl_layout
-        .extend(data_layout)
-        .map_err(|_| TryReserveError::AllocError)?;
-    Ok((arena_layout.pad_to_align(), data_base_off))
 }
 
 /// Total ctrl bytes for a funnel layout. Each level rounds bucket count up
@@ -796,7 +772,7 @@ fn try_alloc_funnel_arena<K, V, A: Allocator + Clone>(
         primary_ctrl,
         fallback_ctrl,
     );
-    let (arena_layout, data_base_off) = arena_layout_for::<K, V>(total_ctrl)?;
+    let (arena_layout, data_base_off) = arena::layout_for::<K, V>(total_ctrl)?;
     let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout, total_ctrl, alloc)?;
 
     let Ok(bw32) = u32::try_from(bw) else {
@@ -847,7 +823,7 @@ fn alloc_funnel_arena<K, V, A: Allocator + Clone>(
             primary_ctrl,
             fallback_ctrl,
         );
-        let layout = match arena_layout_for::<K, V>(total_ctrl) {
+        let layout = match arena::layout_for::<K, V>(total_ctrl) {
             Ok((l, _)) => l,
             Err(_) => Layout::from_size_align(1, 1).unwrap(),
         };
@@ -871,12 +847,12 @@ impl<K, V, A: Allocator + Clone> Drop for ArenaDropGuard<K, V, A> {
         if let Some(arena) = self.arena.take() {
             if let Some(levels) = self.levels.take() {
                 for level in &levels {
-                    level.drop_values(&arena);
+                    level.drop_values();
                 }
             }
             if let Some(special) = self.special.take() {
-                special.primary.drop_values(&arena);
-                special.fallback.drop_values(&arena);
+                special.primary.drop_values();
+                special.fallback.drop_values();
             }
             arena.deallocate(&self.alloc);
         }
@@ -1100,7 +1076,7 @@ where
 
         // Cold path: key might be in the special array. Outlined to keep insert's hot body compact.
         if let Some(location) =
-            self.scan_special_for_key(&key, key_hash, key_fingerprint, &mut candidate)
+            self.find_in_special(&key, key_hash, key_fingerprint, Some(&mut candidate))
         {
             return Some(self.replace_existing_value(location, value));
         }
@@ -1162,9 +1138,8 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
-        check_disjoint_aliasing_funnel(&locations);
+        arena::check_disjoint_aliasing(&locations);
 
-        let arena = &self.arena;
         let levels_ptr = self.levels.as_ptr().cast_mut();
         let primary_ptr = &raw mut self.special.primary;
         let fallback_ptr = &raw mut self.special.fallback;
@@ -1173,9 +1148,8 @@ where
                 // SAFETY: locations are unique among Somes (asserted above).
                 // Raw-pointer chain — no intermediate `&mut BucketLevel`,
                 // `&mut SpecialPrimary`, or `&mut SpecialFallback`.
-                let value_ptr: *mut V = unsafe {
-                    funnel_slot_value_ptr(arena, levels_ptr, primary_ptr, fallback_ptr, loc)
-                };
+                let value_ptr: *mut V =
+                    unsafe { funnel_slot_value_ptr(levels_ptr, primary_ptr, fallback_ptr, loc) };
                 unsafe { &mut *value_ptr }
             })
         })
@@ -1195,18 +1169,16 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
-        check_disjoint_aliasing_funnel(&locations);
+        arena::check_disjoint_aliasing(&locations);
 
-        let arena = &self.arena;
         let levels_ptr = self.levels.as_ptr().cast_mut();
         let primary_ptr = &raw mut self.special.primary;
         let fallback_ptr = &raw mut self.special.fallback;
         std::array::from_fn(|i| {
             locations[i].map(|loc| {
                 // SAFETY: as in `get_disjoint_mut`.
-                let (k_ptr, v_ptr) = unsafe {
-                    funnel_slot_kv_ptrs(arena, levels_ptr, primary_ptr, fallback_ptr, loc)
-                };
+                let (k_ptr, v_ptr) =
+                    unsafe { funnel_slot_kv_ptrs(levels_ptr, primary_ptr, fallback_ptr, loc) };
                 (unsafe { &*k_ptr }, unsafe { &mut *v_ptr })
             })
         })
@@ -1229,16 +1201,14 @@ where
     {
         let locations = self.locate_disjoint(keys);
 
-        let arena = &self.arena;
         let levels_ptr = self.levels.as_ptr().cast_mut();
         let primary_ptr = &raw mut self.special.primary;
         let fallback_ptr = &raw mut self.special.fallback;
         std::array::from_fn(|i| {
             locations[i].map(|loc| {
                 // SAFETY: caller guarantees the hits are pairwise distinct.
-                let value_ptr: *mut V = unsafe {
-                    funnel_slot_value_ptr(arena, levels_ptr, primary_ptr, fallback_ptr, loc)
-                };
+                let value_ptr: *mut V =
+                    unsafe { funnel_slot_value_ptr(levels_ptr, primary_ptr, fallback_ptr, loc) };
                 unsafe { &mut *value_ptr }
             })
         })
@@ -1296,8 +1266,8 @@ where
                 slot_idx,
             } => {
                 let level = &mut self.levels[level_idx];
-                let removed = unsafe { level.take(&self.arena, slot_idx) };
-                if level.erase(&self.arena, slot_idx) {
+                let removed = unsafe { level.take(slot_idx) };
+                if level.erase(slot_idx) {
                     level.tombstones += 1;
                 }
                 level.len -= 1;
@@ -1306,8 +1276,8 @@ where
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
                 let primary = &mut self.special.primary;
-                let removed = unsafe { primary.take(&self.arena, slot_idx) };
-                if primary.erase(&self.arena, slot_idx) {
+                let removed = unsafe { primary.take(slot_idx) };
+                if primary.erase(slot_idx) {
                     primary.tombstones += 1;
                 }
                 primary.len -= 1;
@@ -1317,8 +1287,8 @@ where
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let fallback = &mut self.special.fallback;
-                let removed = unsafe { fallback.take(&self.arena, slot_idx) };
-                if fallback.erase(&self.arena, slot_idx) {
+                let removed = unsafe { fallback.take(slot_idx) };
+                if fallback.erase(slot_idx) {
                     fallback.tombstones += 1;
                 }
                 fallback.len -= 1;
@@ -1359,7 +1329,6 @@ where
         let mut levels_iter = self.levels.iter();
         let first_level = levels_iter.next();
         FunnelIter {
-            arena: &self.arena,
             levels: levels_iter,
             current_level: first_level,
             phase: IterPhase::Levels,
@@ -1379,7 +1348,6 @@ where
         let fallback = ptr::from_mut(&mut self.special.fallback);
         let remaining = self.len;
         FunnelIterMut {
-            arena: &self.arena,
             levels,
             levels_len,
             primary,
@@ -1515,37 +1483,36 @@ where
     }
 
     pub fn clear(&mut self) {
-        let arena = &self.arena;
         for level in &mut self.levels {
             for idx in 0..level.capacity() {
-                if level.control_at(arena, idx).is_occupied() {
-                    unsafe { ptr::drop_in_place(level.slots(arena).add(idx)) };
+                if level.control_at(idx).is_occupied() {
+                    unsafe { ptr::drop_in_place(level.data_ptr().add(idx)) };
                 }
             }
-            level.clear_all_controls(arena);
+            level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
         }
 
         for idx in 0..self.special.primary.capacity() {
-            if self.special.primary.control_at(arena, idx).is_occupied() {
+            if self.special.primary.control_at(idx).is_occupied() {
                 unsafe {
-                    ptr::drop_in_place(self.special.primary.slots(arena).add(idx));
+                    ptr::drop_in_place(self.special.primary.data_ptr().add(idx));
                 };
             }
         }
-        self.special.primary.clear_all_controls(arena);
+        self.special.primary.clear_all_controls();
         self.special.primary.len = 0;
         self.special.primary.tombstones = 0;
 
         for idx in 0..self.special.fallback.capacity() {
-            if self.special.fallback.control_at(arena, idx).is_occupied() {
+            if self.special.fallback.control_at(idx).is_occupied() {
                 unsafe {
-                    ptr::drop_in_place(self.special.fallback.slots(arena).add(idx));
+                    ptr::drop_in_place(self.special.fallback.data_ptr().add(idx));
                 };
             }
         }
-        self.special.fallback.clear_all_controls(arena);
+        self.special.fallback.clear_all_controls();
         self.special.fallback.len = 0;
         self.special.fallback.tombstones = 0;
         self.special.total_len = 0;
@@ -1683,19 +1650,18 @@ where
     /// Move every live entry into `out`; ctrl bytes cleared so `install_fresh_storage`
     /// can free the old arena safely.
     fn drain_entries_into(&mut self, out: &mut Vec<(K, V)>) {
-        let arena = &self.arena;
         for level in &self.levels {
-            for idx in level.occupied(arena) {
-                let entry = unsafe { level.take(arena, idx) };
+            for idx in level.occupied() {
+                let entry = unsafe { level.take(idx) };
                 out.push((entry.key, entry.value));
             }
-            level.clear_all_controls(arena);
+            level.clear_all_controls();
         }
-        for_each_special_occupied(arena, &self.special, |entry| {
+        self.special.for_each_occupied(|entry| {
             out.push((entry.key, entry.value));
         });
-        self.special.primary.clear_all_controls(arena);
-        self.special.fallback.clear_all_controls(arena);
+        self.special.primary.clear_all_controls();
+        self.special.fallback.clear_all_controls();
         for level in &mut self.levels {
             level.len = 0;
             level.tombstones = 0;
@@ -1766,9 +1732,8 @@ where
     /// spill to `A_{α+1}`.
     #[inline]
     fn choose_slot_for_new_key(&self, key_hash: u64) -> Option<SlotLocation> {
-        let arena = &self.arena;
         for (level_idx, level) in self.levels.iter().enumerate() {
-            if let Some(slot_idx) = level.first_free_in_bucket(arena, key_hash) {
+            if let Some(slot_idx) = level.first_free_in_bucket(key_hash) {
                 return Some(SlotLocation::Level {
                     level_idx,
                     slot_idx,
@@ -1797,7 +1762,6 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let arena = &self.arena;
         let wants_free = matches!(&free_slot, Some(out) if out.is_none());
         let mut local: Option<SlotLocation> = None;
 
@@ -1808,7 +1772,7 @@ where
             } else {
                 None
             };
-            let step = level.find_in_bucket(arena, key_hash, key_fingerprint, key, out);
+            let step = level.find_in_bucket(key_hash, key_fingerprint, key, out);
             if let Some(slot_idx) = slot_candidate {
                 local = Some(SlotLocation::Level {
                     level_idx,
@@ -1841,52 +1805,48 @@ where
         (None, LevelMiss::MayContinue)
     }
 
-    /// Probe primary then fallback for `key`; record first free slot.
+    /// Probe primary then fallback for `key`. Pass `Some(candidate)` to also
+    /// record the first free slot seen (for insert); `None` for lookup-only.
     #[cold]
     #[inline(never)]
-    fn scan_special_for_key<Q>(
+    fn find_in_special<Q>(
         &self,
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
-        candidate: &mut Option<SlotLocation>,
+        mut candidate: FreeSlot,
     ) -> Option<SlotLocation>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        match self.find_in_special_primary(key_hash, key_fingerprint, key, Some(candidate)) {
+        match self.find_in_special_primary(key_hash, key_fingerprint, key, candidate.as_deref_mut())
+        {
             LookupStep::Found(slot_idx) => {
                 return Some(SlotLocation::SpecialPrimary { slot_idx });
             }
-            LookupStep::StopSearch => {}
-            LookupStep::Continue => {
-                if let Some(slot_idx) =
-                    self.find_in_special_fallback(key_hash, key_fingerprint, key, Some(candidate))
-                {
-                    return Some(SlotLocation::SpecialFallback { slot_idx });
-                }
-            }
+            LookupStep::StopSearch => return None,
+            LookupStep::Continue => {}
         }
-        None
+        self.find_in_special_fallback(key_hash, key_fingerprint, key, candidate)
+            .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
     #[inline]
     fn replace_existing_value(&mut self, location: SlotLocation, value: V) -> V {
-        let arena = &self.arena;
         match location {
             SlotLocation::Level {
                 level_idx,
                 slot_idx,
             } => {
-                let entry = unsafe { self.levels[level_idx].get_mut(arena, slot_idx) };
+                let entry = unsafe { self.levels[level_idx].get_mut(slot_idx) };
                 mem::replace(&mut entry.value, value)
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
-                let entry = unsafe { self.special.primary.get_mut(arena, slot_idx) };
+                let entry = unsafe { self.special.primary.get_mut(slot_idx) };
                 mem::replace(&mut entry.value, value)
             }
             SlotLocation::SpecialFallback { slot_idx } => {
-                let entry = unsafe { self.special.fallback.get_mut(arena, slot_idx) };
+                let entry = unsafe { self.special.fallback.get_mut(slot_idx) };
                 mem::replace(&mut entry.value, value)
             }
         }
@@ -1939,19 +1899,13 @@ where
 
     #[inline]
     fn place_new_entry(&mut self, location: SlotLocation, key: K, value: V, key_fingerprint: u8) {
-        let arena = &self.arena;
         match location {
             SlotLocation::Level {
                 level_idx,
                 slot_idx,
             } => {
                 let level = &mut self.levels[level_idx];
-                level.write_with_control(
-                    arena,
-                    slot_idx,
-                    SlotEntry { key, value },
-                    key_fingerprint,
-                );
+                level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
                 level.len += 1;
                 if level_idx > self.max_populated_level {
                     self.max_populated_level = level_idx;
@@ -1961,13 +1915,8 @@ where
                 let primary = &mut self.special.primary;
                 // Reusing a tombstone slot must decrement the counter;
                 // otherwise resize triggers on stale-since-resize counts.
-                let was_tombstone = primary.control_at(arena, slot_idx) == CTRL_TOMBSTONE;
-                primary.write_with_control(
-                    arena,
-                    slot_idx,
-                    SlotEntry { key, value },
-                    key_fingerprint,
-                );
+                let was_tombstone = primary.control_at(slot_idx) == CTRL_TOMBSTONE;
+                primary.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
                 primary.len += 1;
                 if was_tombstone {
                     primary.tombstones -= 1;
@@ -1976,12 +1925,7 @@ where
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let fallback = &mut self.special.fallback;
-                fallback.write_with_control(
-                    arena,
-                    slot_idx,
-                    SlotEntry { key, value },
-                    key_fingerprint,
-                );
+                fallback.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
                 fallback.len += 1;
                 self.special.total_len += 1;
             }
@@ -1990,7 +1934,6 @@ where
     }
 
     fn first_free_in_special_primary(&self, key_hash: u64) -> Option<usize> {
-        let arena = &self.arena;
         let primary = &self.special.primary;
         if primary.len as usize >= primary.capacity() {
             return None;
@@ -2001,7 +1944,7 @@ where
         let mask = primary.group_count_mask as usize;
         let mut probe = ProbeSeq::new(primary.group_start(key_hash), primary.group_step(key_hash));
         for _ in 0..group_limit {
-            if let Some(slot_idx) = primary.first_free_in_group(arena, probe.group) {
+            if let Some(slot_idx) = primary.first_free_in_group(probe.group) {
                 return Some(slot_idx);
             }
             probe.advance(mask);
@@ -2010,7 +1953,6 @@ where
     }
 
     fn first_free_in_special_fallback(&self, key_hash: u64) -> Option<usize> {
-        let arena = &self.arena;
         let fallback = &self.special.fallback;
         if fallback.len as usize >= fallback.capacity() {
             return None;
@@ -2022,7 +1964,7 @@ where
         for &bucket_idx in &[bucket_a, bucket_b] {
             let range = fallback.bucket_range(bucket_idx);
             for slot_idx in range {
-                if fallback.control_at(arena, slot_idx).is_free() {
+                if fallback.control_at(slot_idx).is_free() {
                     return Some(slot_idx);
                 }
             }
@@ -2046,7 +1988,6 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let arena = &self.arena;
         let wants_free = matches!(&free_slot, Some(out) if out.is_none());
         let primary = &self.special.primary;
 
@@ -2071,19 +2012,17 @@ where
                 // one. `first_free_in_group` doubles as the "any free?" check;
                 // when not tracking we use the cheaper EMPTY-only mask.
                 let has_free = if wants_free && local.is_none() {
-                    let slot = primary.first_free_in_group(arena, probe.group);
+                    let slot = primary.first_free_in_group(probe.group);
                     if let Some(s) = slot {
                         local = Some(s);
                     }
                     slot.is_some()
                 } else {
-                    primary
-                        .group_match_mask(arena, probe.group, CTRL_EMPTY)
-                        .any()
+                    primary.group_match_mask(probe.group, CTRL_EMPTY).any()
                 };
-                for relative_idx in primary.group_match_mask(arena, probe.group, key_fingerprint) {
+                for relative_idx in primary.group_match_mask(probe.group, key_fingerprint) {
                     let slot_idx = probe.group * GROUP_SIZE + relative_idx;
-                    let entry = unsafe { primary.get_ref(arena, slot_idx) };
+                    let entry = unsafe { primary.get_ref(slot_idx) };
                     if key.equivalent(&entry.key) {
                         break 'probe LookupStep::Found(slot_idx);
                     }
@@ -2091,11 +2030,7 @@ where
                 // StopSearch: probe chain terminated naturally — an EMPTY
                 // slot in the group, with no TOMBSTONE that might be hiding
                 // an overflow we'd need to chase.
-                if has_free
-                    && !primary
-                        .group_match_mask(arena, probe.group, CTRL_TOMBSTONE)
-                        .any()
-                {
+                if has_free && !primary.group_match_mask(probe.group, CTRL_TOMBSTONE).any() {
                     break 'probe LookupStep::StopSearch;
                 }
                 probe.advance(mask);
@@ -2121,7 +2056,6 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let arena = &self.arena;
         let wants_free = matches!(&free_slot, Some(out) if out.is_none());
         let fallback = &self.special.fallback;
 
@@ -2148,7 +2082,7 @@ where
             let range = fallback.bucket_range(bucket_idx);
             if need_candidate {
                 for slot_idx in range.clone() {
-                    if fallback.control_at(arena, slot_idx).is_free() {
+                    if fallback.control_at(slot_idx).is_free() {
                         local = Some(slot_idx);
                         break;
                     }
@@ -2156,7 +2090,7 @@ where
             }
             if need_match {
                 let controls = unsafe {
-                    std::slice::from_raw_parts(fallback.ctrl(arena).add(range.start), range.len())
+                    std::slice::from_raw_parts(fallback.ctrl_ptr().add(range.start), range.len())
                 };
                 let mut match_offset = 0;
                 while let Some(relative_idx) = control::find_next_fingerprint_in_controls(
@@ -2165,7 +2099,7 @@ where
                     match_offset,
                 ) {
                     let slot_idx = range.start + relative_idx;
-                    let entry = unsafe { fallback.get_ref(arena, slot_idx) };
+                    let entry = unsafe { fallback.get_ref(slot_idx) };
                     if key.equivalent(&entry.key) {
                         found = Some(slot_idx);
                         break;
@@ -2185,17 +2119,16 @@ where
     /// to the slot. SAFETY: `loc` must reference an occupied slot.
     #[inline]
     unsafe fn slot_ref(&self, loc: SlotLocation) -> &SlotEntry<K, V> {
-        let arena = &self.arena;
         match loc {
             SlotLocation::Level {
                 level_idx,
                 slot_idx,
-            } => unsafe { self.levels[level_idx].get_ref(arena, slot_idx) },
+            } => unsafe { self.levels[level_idx].get_ref(slot_idx) },
             SlotLocation::SpecialPrimary { slot_idx } => unsafe {
-                self.special.primary.get_ref(arena, slot_idx)
+                self.special.primary.get_ref(slot_idx)
             },
             SlotLocation::SpecialFallback { slot_idx } => unsafe {
-                self.special.fallback.get_ref(arena, slot_idx)
+                self.special.fallback.get_ref(slot_idx)
             },
         }
     }
@@ -2208,12 +2141,12 @@ where
             SlotLocation::Level {
                 level_idx,
                 slot_idx,
-            } => unsafe { self.levels[level_idx].get_mut(&self.arena, slot_idx) },
+            } => unsafe { self.levels[level_idx].get_mut(slot_idx) },
             SlotLocation::SpecialPrimary { slot_idx } => unsafe {
-                self.special.primary.get_mut(&self.arena, slot_idx)
+                self.special.primary.get_mut(slot_idx)
             },
             SlotLocation::SpecialFallback { slot_idx } => unsafe {
-                self.special.fallback.get_mut(&self.arena, slot_idx)
+                self.special.fallback.get_mut(slot_idx)
             },
         }
     }
@@ -2228,8 +2161,7 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let arena = &self.arena;
-        match self.levels[0].find_in_bucket(arena, key_hash, key_fingerprint, key, None) {
+        match self.levels[0].find_in_bucket(key_hash, key_fingerprint, key, None) {
             LookupStep::Found(slot_idx) => {
                 return Some(SlotLocation::Level {
                     level_idx: 0,
@@ -2253,7 +2185,7 @@ where
             return None;
         }
 
-        self.find_in_special_outline(key_hash, key_fingerprint, key)
+        self.find_in_special(key, key_hash, key_fingerprint, None)
     }
 
     #[cold]
@@ -2269,8 +2201,7 @@ where
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (offset, level) in self.levels[1..search_limit].iter().enumerate() {
-            let arena = &self.arena;
-            match level.find_in_bucket(arena, key_hash, key_fingerprint, key, None) {
+            match level.find_in_bucket(key_hash, key_fingerprint, key, None) {
                 LookupStep::Found(slot_idx) => {
                     return ControlFlow::Break(Some(SlotLocation::Level {
                         level_idx: offset + 1,
@@ -2282,27 +2213,6 @@ where
             }
         }
         ControlFlow::Continue(())
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn find_in_special_outline<Q>(
-        &self,
-        key_hash: u64,
-        key_fingerprint: u8,
-        key: &Q,
-    ) -> Option<SlotLocation>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        match self.find_in_special_primary(key_hash, key_fingerprint, key, None) {
-            LookupStep::Found(slot_idx) => return Some(SlotLocation::SpecialPrimary { slot_idx }),
-            LookupStep::Continue => {}
-            LookupStep::StopSearch => return None,
-        }
-
-        self.find_in_special_fallback(key_hash, key_fingerprint, key, None)
-            .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
     fn shrink_max_populated_level(&mut self) {
@@ -2371,15 +2281,14 @@ where
     /// Removes the entry and returns the `(key, value)` pair.
     #[must_use]
     pub fn remove_entry(self) -> (K, V) {
-        let arena = &self.map.arena;
         let (removed_entry, needs_resize) = match self.location {
             SlotLocation::Level {
                 level_idx,
                 slot_idx,
             } => {
                 let level = &mut self.map.levels[level_idx];
-                let removed = unsafe { level.take(arena, slot_idx) };
-                if level.erase(arena, slot_idx) {
+                let removed = unsafe { level.take(slot_idx) };
+                if level.erase(slot_idx) {
                     level.tombstones += 1;
                 }
                 level.len -= 1;
@@ -2389,8 +2298,8 @@ where
             SlotLocation::SpecialPrimary { slot_idx } => {
                 let special = &mut self.map.special;
                 let primary = &mut special.primary;
-                let removed = unsafe { primary.take(arena, slot_idx) };
-                if primary.erase(arena, slot_idx) {
+                let removed = unsafe { primary.take(slot_idx) };
+                if primary.erase(slot_idx) {
                     primary.tombstones += 1;
                 }
                 primary.len -= 1;
@@ -2401,8 +2310,8 @@ where
             SlotLocation::SpecialFallback { slot_idx } => {
                 let special = &mut self.map.special;
                 let fallback = &mut special.fallback;
-                let removed = unsafe { fallback.take(arena, slot_idx) };
-                if fallback.erase(arena, slot_idx) {
+                let removed = unsafe { fallback.take(slot_idx) };
+                if fallback.erase(slot_idx) {
                     fallback.tombstones += 1;
                 }
                 fallback.len -= 1;
@@ -2560,7 +2469,6 @@ enum IterPhase {
 
 /// Borrowing iterator over occupied entries.
 pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
-    arena: &'a Arena,
     levels: std::slice::Iter<'a, BucketLevel<K, V>>,
     current_level: Option<&'a BucketLevel<K, V>>,
     phase: IterPhase,
@@ -2574,7 +2482,6 @@ pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
 impl<K, V, A: Allocator + Clone> Clone for FunnelIter<'_, K, V, A> {
     fn clone(&self) -> Self {
         Self {
-            arena: self.arena,
             levels: self.levels.clone(),
             current_level: self.current_level,
             phase: self.phase,
@@ -2597,13 +2504,12 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let arena = self.arena;
         loop {
             match self.phase {
                 IterPhase::Levels => {
                     if let Some(level) = self.current_level {
-                        if let Some(idx) = level.scan_next(arena, &mut self.cursor) {
-                            let entry = unsafe { level.get_ref(arena, idx) };
+                        if let Some(idx) = level.scan_next(&mut self.cursor) {
+                            let entry = unsafe { level.get_ref(idx) };
                             self.remaining -= 1;
                             return Some((&entry.key, &entry.value));
                         }
@@ -2614,8 +2520,8 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
                     self.cursor = OccupiedCursor::new();
                 }
                 IterPhase::Primary => {
-                    if let Some(idx) = self.primary.scan_next(arena, &mut self.cursor) {
-                        let entry = unsafe { self.primary.get_ref(arena, idx) };
+                    if let Some(idx) = self.primary.scan_next(&mut self.cursor) {
+                        let entry = unsafe { self.primary.get_ref(idx) };
                         self.remaining -= 1;
                         return Some((&entry.key, &entry.value));
                     }
@@ -2623,8 +2529,8 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
                     self.cursor = OccupiedCursor::new();
                 }
                 IterPhase::Fallback => {
-                    if let Some(idx) = self.fallback.scan_next(arena, &mut self.cursor) {
-                        let entry = unsafe { self.fallback.get_ref(arena, idx) };
+                    if let Some(idx) = self.fallback.scan_next(&mut self.cursor) {
+                        let entry = unsafe { self.fallback.get_ref(idx) };
                         self.remaining -= 1;
                         return Some((&entry.key, &entry.value));
                     }
@@ -2684,14 +2590,13 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
         // Per-yield ctrl byte update is skipped: Drain::drop wipes all ctrls
         // via `clear_all_controls` regardless, and the scan only advances
         // forward so yielded slots are never re-read.
-        let arena = &self.map.arena;
         loop {
             match self.phase {
                 IterPhase::Levels => {
                     while self.level_idx < self.map.levels.len() {
                         let level = &mut self.map.levels[self.level_idx];
-                        if let Some(idx) = level.scan_next(arena, &mut self.cursor) {
-                            let entry = unsafe { level.take(arena, idx) };
+                        if let Some(idx) = level.scan_next(&mut self.cursor) {
+                            let entry = unsafe { level.take(idx) };
                             self.map.len -= 1;
                             return Some((entry.key, entry.value));
                         }
@@ -2703,8 +2608,8 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
                 }
                 IterPhase::Primary => {
                     let primary = &mut self.map.special.primary;
-                    if let Some(idx) = primary.scan_next(arena, &mut self.cursor) {
-                        let entry = unsafe { primary.take(arena, idx) };
+                    if let Some(idx) = primary.scan_next(&mut self.cursor) {
+                        let entry = unsafe { primary.take(idx) };
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
@@ -2713,8 +2618,8 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
                 }
                 IterPhase::Fallback => {
                     let fallback = &mut self.map.special.fallback;
-                    if let Some(idx) = fallback.scan_next(arena, &mut self.cursor) {
-                        let entry = unsafe { fallback.take(arena, idx) };
+                    if let Some(idx) = fallback.scan_next(&mut self.cursor) {
+                        let entry = unsafe { fallback.take(idx) };
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
@@ -2738,16 +2643,15 @@ impl<K, V, S, A: Allocator + Clone> Drop for Drain<'_, K, V, S, A> {
         // Drain any unyielded entries so values run their `Drop`.
         for _ in &mut *self {}
         // All entries moved out via `next()`; wipe ctrl bytes + counters en bloc.
-        let arena = &self.map.arena;
         for level in &mut self.map.levels {
-            level.clear_all_controls(arena);
+            level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
         }
-        self.map.special.primary.clear_all_controls(arena);
+        self.map.special.primary.clear_all_controls();
         self.map.special.primary.len = 0;
         self.map.special.primary.tombstones = 0;
-        self.map.special.fallback.clear_all_controls(arena);
+        self.map.special.fallback.clear_all_controls();
         self.map.special.fallback.len = 0;
         self.map.special.fallback.tombstones = 0;
         self.map.special.total_len = 0;
@@ -2796,18 +2700,17 @@ where
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let arena = &self.map.arena;
         loop {
             match self.phase {
                 IterPhase::Levels => {
                     while self.level_idx < self.map.levels.len() {
                         let level = &mut self.map.levels[self.level_idx];
-                        while let Some(idx) = level.scan_next(arena, &mut self.cursor) {
+                        while let Some(idx) = level.scan_next(&mut self.cursor) {
                             // SAFETY: scan only yields occupied slots.
-                            let entry = unsafe { level.get_mut(arena, idx) };
+                            let entry = unsafe { level.get_mut(idx) };
                             if (self.pred)(&entry.key, &mut entry.value) {
-                                let removed = unsafe { level.take(arena, idx) };
-                                if level.erase(arena, idx) {
+                                let removed = unsafe { level.take(idx) };
+                                if level.erase(idx) {
                                     level.tombstones += 1;
                                 }
                                 level.len -= 1;
@@ -2823,11 +2726,11 @@ where
                 }
                 IterPhase::Primary => {
                     let primary = &mut self.map.special.primary;
-                    while let Some(idx) = primary.scan_next(arena, &mut self.cursor) {
-                        let entry = unsafe { primary.get_mut(arena, idx) };
+                    while let Some(idx) = primary.scan_next(&mut self.cursor) {
+                        let entry = unsafe { primary.get_mut(idx) };
                         if (self.pred)(&entry.key, &mut entry.value) {
-                            let removed = unsafe { primary.take(arena, idx) };
-                            if primary.erase(arena, idx) {
+                            let removed = unsafe { primary.take(idx) };
+                            if primary.erase(idx) {
                                 primary.tombstones += 1;
                             }
                             primary.len -= 1;
@@ -2841,11 +2744,11 @@ where
                 }
                 IterPhase::Fallback => {
                     let fallback = &mut self.map.special.fallback;
-                    while let Some(idx) = fallback.scan_next(arena, &mut self.cursor) {
-                        let entry = unsafe { fallback.get_mut(arena, idx) };
+                    while let Some(idx) = fallback.scan_next(&mut self.cursor) {
+                        let entry = unsafe { fallback.get_mut(idx) };
                         if (self.pred)(&entry.key, &mut entry.value) {
-                            let removed = unsafe { fallback.take(arena, idx) };
-                            if fallback.erase(arena, idx) {
+                            let removed = unsafe { fallback.take(idx) };
+                            if fallback.erase(idx) {
                                 fallback.tombstones += 1;
                             }
                             fallback.len -= 1;
@@ -2890,7 +2793,6 @@ pub type Values<'a, K, V, A = Global> = CommonValues<FunnelIter<'a, K, V, A>>;
 /// tie the iterator to the map's exclusive borrow. Each `next()` returns a
 /// borrow of a strictly newer slot ⇒ disjoint.
 pub struct FunnelIterMut<'a, K, V, A: Allocator + Clone = Global> {
-    arena: &'a Arena,
     levels: *mut BucketLevel<K, V>,
     levels_len: usize,
     primary: *mut SpecialPrimary<K, V>,
@@ -2912,7 +2814,6 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
     type Item = (&'a K, &'a mut V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let arena = self.arena;
         loop {
             match self.phase {
                 IterPhase::Levels => {
@@ -2922,11 +2823,11 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                         // `BucketLevel`s owned by the borrowed map. We hold
                         // an exclusive borrow for `'a` (via PhantomData).
                         let level = unsafe { &mut *self.levels.add(self.level_idx) };
-                        if let Some(idx) = level.scan_next(arena, &mut self.cursor) {
+                        if let Some(idx) = level.scan_next(&mut self.cursor) {
                             // SAFETY: scan only yields occupied slots; each
                             // call yields a strictly newer slot, so borrows
                             // returned across calls are disjoint.
-                            let entry = unsafe { level.get_mut(arena, idx) };
+                            let entry = unsafe { level.get_mut(idx) };
                             let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                             let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
                             self.remaining -= 1;
@@ -2942,8 +2843,8 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                     // SAFETY: `self.primary` points at the borrowed map's
                     // `SpecialPrimary` for `'a`.
                     let primary = unsafe { &mut *self.primary };
-                    if let Some(idx) = primary.scan_next(arena, &mut self.cursor) {
-                        let entry = unsafe { primary.get_mut(arena, idx) };
+                    if let Some(idx) = primary.scan_next(&mut self.cursor) {
+                        let entry = unsafe { primary.get_mut(idx) };
                         let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                         let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
                         self.remaining -= 1;
@@ -2955,8 +2856,8 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
                 IterPhase::Fallback => {
                     // SAFETY: same as the Primary arm, for `self.fallback`.
                     let fallback = unsafe { &mut *self.fallback };
-                    if let Some(idx) = fallback.scan_next(arena, &mut self.cursor) {
-                        let entry = unsafe { fallback.get_mut(arena, idx) };
+                    if let Some(idx) = fallback.scan_next(&mut self.cursor) {
+                        let entry = unsafe { fallback.get_mut(idx) };
                         let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                         let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
                         self.remaining -= 1;
@@ -3047,17 +2948,16 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let arena = &self.map.arena;
         loop {
             match self.phase {
                 IterPhase::Levels => {
                     while self.level_idx < self.map.levels.len() {
                         let level = &mut self.map.levels[self.level_idx];
-                        if let Some(idx) = level.scan_next(arena, &mut self.cursor) {
+                        if let Some(idx) = level.scan_next(&mut self.cursor) {
                             // SAFETY: scan only yields occupied indices.
                             // Tombstone-mark so the map's `Drop` skips it.
-                            let entry = unsafe { level.take(arena, idx) };
-                            level.mark_tombstone(arena, idx);
+                            let entry = unsafe { level.take(idx) };
+                            level.mark_tombstone(idx);
                             self.map.len -= 1;
                             return Some((entry.key, entry.value));
                         }
@@ -3069,9 +2969,9 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
                 }
                 IterPhase::Primary => {
                     let primary = &mut self.map.special.primary;
-                    if let Some(idx) = primary.scan_next(arena, &mut self.cursor) {
-                        let entry = unsafe { primary.take(arena, idx) };
-                        primary.mark_tombstone(arena, idx);
+                    if let Some(idx) = primary.scan_next(&mut self.cursor) {
+                        let entry = unsafe { primary.take(idx) };
+                        primary.mark_tombstone(idx);
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
@@ -3080,9 +2980,9 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
                 }
                 IterPhase::Fallback => {
                     let fallback = &mut self.map.special.fallback;
-                    if let Some(idx) = fallback.scan_next(arena, &mut self.cursor) {
-                        let entry = unsafe { fallback.take(arena, idx) };
-                        fallback.mark_tombstone(arena, idx);
+                    if let Some(idx) = fallback.scan_next(&mut self.cursor) {
+                        let entry = unsafe { fallback.take(idx) };
+                        fallback.mark_tombstone(idx);
                         self.map.len -= 1;
                         return Some((entry.key, entry.value));
                     }
@@ -3158,7 +3058,6 @@ pub type FunnelIntoValues<K, V, S = DefaultHashBuilder, A = Global> =
 /// - The `slot_idx` carried by `loc` must reference an occupied slot.
 #[inline]
 unsafe fn funnel_slot_value_ptr<K, V>(
-    arena: &Arena,
     levels_ptr: *const BucketLevel<K, V>,
     primary_ptr: *const SpecialPrimary<K, V>,
     fallback_ptr: *const SpecialFallback<K, V>,
@@ -3170,13 +3069,13 @@ unsafe fn funnel_slot_value_ptr<K, V>(
             slot_idx,
         } => unsafe {
             let lvl = &*levels_ptr.add(level_idx);
-            lvl.slots(arena).add(slot_idx)
+            lvl.data_ptr().add(slot_idx)
         },
         SlotLocation::SpecialPrimary { slot_idx } => unsafe {
-            (*primary_ptr).slots(arena).add(slot_idx)
+            (*primary_ptr).data_ptr().add(slot_idx)
         },
         SlotLocation::SpecialFallback { slot_idx } => unsafe {
-            (*fallback_ptr).slots(arena).add(slot_idx)
+            (*fallback_ptr).data_ptr().add(slot_idx)
         },
     };
     unsafe { &raw mut (*entry).value }
@@ -3185,7 +3084,6 @@ unsafe fn funnel_slot_value_ptr<K, V>(
 /// As [`funnel_slot_value_ptr`] but returns key + value pointers together.
 #[inline]
 unsafe fn funnel_slot_kv_ptrs<K, V>(
-    arena: &Arena,
     levels_ptr: *const BucketLevel<K, V>,
     primary_ptr: *const SpecialPrimary<K, V>,
     fallback_ptr: *const SpecialFallback<K, V>,
@@ -3197,33 +3095,18 @@ unsafe fn funnel_slot_kv_ptrs<K, V>(
             slot_idx,
         } => unsafe {
             let lvl = &*levels_ptr.add(level_idx);
-            lvl.slots(arena).add(slot_idx)
+            lvl.data_ptr().add(slot_idx)
         },
         SlotLocation::SpecialPrimary { slot_idx } => unsafe {
-            (*primary_ptr).slots(arena).add(slot_idx)
+            (*primary_ptr).data_ptr().add(slot_idx)
         },
         SlotLocation::SpecialFallback { slot_idx } => unsafe {
-            (*fallback_ptr).slots(arena).add(slot_idx)
+            (*fallback_ptr).data_ptr().add(slot_idx)
         },
     };
     let k_ptr = unsafe { &raw const (*entry).key };
     let v_ptr = unsafe { &raw mut (*entry).value };
     (k_ptr, v_ptr)
-}
-
-/// O(N^2) alias check shared by `get_disjoint_mut` and
-/// `get_disjoint_key_value_mut`. Panics if two `Some` locations collide.
-#[inline]
-fn check_disjoint_aliasing_funnel<const N: usize>(locations: &[Option<SlotLocation>; N]) {
-    for (i, li) in locations.iter().enumerate() {
-        let Some(li) = li else { continue };
-        for other in &locations[i + 1..] {
-            assert!(
-                other.as_ref() != Some(li),
-                "get_disjoint_mut: duplicate keys resolve to the same entry",
-            );
-        }
-    }
 }
 
 /// Paper §5: `α = ⌈4 log δ⁻¹ + 10⌉` levels (excluding the special array).
@@ -3556,12 +3439,11 @@ where
             return;
         }
 
-        let self_arena = &self.arena;
         for level in &self.levels {
-            level.drop_values_and_clear(self_arena);
+            level.drop_values_and_clear();
         }
-        self.special.primary.drop_values_and_clear(self_arena);
-        self.special.fallback.drop_values_and_clear(self_arena);
+        self.special.primary.drop_values_and_clear();
+        self.special.fallback.drop_values_and_clear();
 
         for (dst, src_lvl) in self.levels.iter_mut().zip(source.levels.iter()) {
             arena::clone_region_panic_safe::<K, V>(

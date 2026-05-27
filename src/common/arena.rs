@@ -4,7 +4,7 @@ use std::ptr;
 use allocator_api2::alloc::Layout;
 
 use super::bitmask::BitMask;
-use super::config::GROUP_SIZE;
+use super::config::{CACHE_LINE, GROUP_SIZE};
 use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use super::simd;
 use super::{Allocator, TryReserveError};
@@ -67,6 +67,37 @@ impl Arena {
     }
 }
 
+/// Combined ctrl+data layout for an arena whose ctrl section holds
+/// `total_ctrl` bytes and data section holds `total_ctrl` slots.
+/// Returns `(layout, data_offset_within_arena)`.
+pub(crate) fn layout_for<K, V>(total_ctrl: usize) -> Result<(Layout, usize), TryReserveError> {
+    let total_ctrl = total_ctrl.max(1);
+    let ctrl_layout =
+        Layout::from_size_align(total_ctrl, CACHE_LINE).map_err(|_| TryReserveError::AllocError)?;
+    let data_layout =
+        Layout::array::<SlotEntry<K, V>>(total_ctrl).map_err(|_| TryReserveError::AllocError)?;
+    let (arena_layout, data_base_off) = ctrl_layout
+        .extend(data_layout)
+        .map_err(|_| TryReserveError::AllocError)?;
+    Ok((arena_layout.pad_to_align(), data_base_off))
+}
+
+/// O(N²) alias check for [`get_disjoint_mut`]-style APIs: panics if two
+/// `Some` locations collide. `T: PartialEq` so it works for both raw
+/// `(level_idx, slot_idx)` tuples and richer `SlotLocation` enums.
+#[inline]
+pub(crate) fn check_disjoint_aliasing<T: PartialEq, const N: usize>(locations: &[Option<T>; N]) {
+    for (i, li) in locations.iter().enumerate() {
+        let Some(li) = li else { continue };
+        for other in &locations[i + 1..] {
+            assert!(
+                other.as_ref() != Some(li),
+                "get_disjoint_mut: duplicate keys resolve to the same entry",
+            );
+        }
+    }
+}
+
 /// Drop-guard wrapper: deallocates the arena on drop. Used by map `Drop`
 /// impls so `V::drop` panics don't unwind past `arena.deallocate`.
 pub(crate) struct DeallocGuard<'a, A: Allocator> {
@@ -81,11 +112,6 @@ impl<'a, A: Allocator> DeallocGuard<'a, A> {
             arena: Some(arena),
             alloc,
         }
-    }
-
-    #[inline]
-    pub(crate) fn arena(&self) -> &Arena {
-        self.arena.as_ref().expect("guard already disarmed")
     }
 }
 
@@ -160,62 +186,52 @@ impl OccupiedCursor {
 }
 
 /// Per-region view of a map's arena.
-/// `&Arena` args are borrow-proof only; LLVM elides them.
+/// The arena owns the allocation; descriptors borrow into it.
 pub(crate) trait ArenaSlots<K, V> {
     fn ctrl_ptr(&self) -> *mut u8;
     fn data_ptr(&self) -> *mut SlotEntry<K, V>;
     fn capacity(&self) -> usize;
 
     #[inline]
-    fn ctrl(&self, _arena: &Arena) -> *mut u8 {
-        self.ctrl_ptr()
+    fn group_ctrl(&self, group_idx: usize) -> *const u8 {
+        unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) }
     }
 
     #[inline]
-    fn slots(&self, _arena: &Arena) -> *mut SlotEntry<K, V> {
-        self.data_ptr()
+    fn control_at(&self, idx: usize) -> u8 {
+        unsafe { *self.ctrl_ptr().add(idx) }
     }
 
     #[inline]
-    fn group_ctrl(&self, arena: &Arena, group_idx: usize) -> *const u8 {
-        unsafe { self.ctrl(arena).add(group_idx * GROUP_SIZE) }
+    fn set_control(&self, idx: usize, ctrl: u8) {
+        unsafe { *self.ctrl_ptr().add(idx) = ctrl }
     }
 
     #[inline]
-    fn control_at(&self, arena: &Arena, idx: usize) -> u8 {
-        unsafe { *self.ctrl(arena).add(idx) }
-    }
-
-    #[inline]
-    fn set_control(&self, arena: &Arena, idx: usize, ctrl: u8) {
-        unsafe { *self.ctrl(arena).add(idx) = ctrl }
-    }
-
-    #[inline]
-    fn mark_tombstone(&self, arena: &Arena, idx: usize) {
-        self.set_control(arena, idx, CTRL_TOMBSTONE);
+    fn mark_tombstone(&self, idx: usize) {
+        self.set_control(idx, CTRL_TOMBSTONE);
     }
 
     /// Wipe every ctrl byte in this region to FREE.
     /// Caller is responsible for having dropped occupied values first.
     #[inline]
-    fn clear_all_controls(&self, arena: &Arena) {
+    fn clear_all_controls(&self) {
         if self.capacity() == 0 {
             return;
         }
-        unsafe { ptr::write_bytes(self.ctrl(arena), 0, self.capacity()) }
+        unsafe { ptr::write_bytes(self.ctrl_ptr(), 0, self.capacity()) }
     }
 
     #[inline]
-    fn write_with_control(&self, arena: &Arena, idx: usize, entry: SlotEntry<K, V>, ctrl: u8) {
-        unsafe { self.slots(arena).add(idx).write(entry) }
-        self.set_control(arena, idx, ctrl);
+    fn write_with_control(&self, idx: usize, entry: SlotEntry<K, V>, ctrl: u8) {
+        unsafe { self.data_ptr().add(idx).write(entry) }
+        self.set_control(idx, ctrl);
     }
 
     /// SAFETY: caller ensures `idx` is in-bounds and the slot is initialized.
     #[inline]
-    unsafe fn get_ref(&self, arena: &Arena, idx: usize) -> &SlotEntry<K, V> {
-        unsafe { &*self.slots(arena).add(idx) }
+    unsafe fn get_ref(&self, idx: usize) -> &SlotEntry<K, V> {
+        unsafe { &*self.data_ptr().add(idx) }
     }
 
     /// Takes `&mut self` as a type-level proof of exclusive access — the
@@ -224,30 +240,30 @@ pub(crate) trait ArenaSlots<K, V> {
     ///
     /// SAFETY: caller ensures `idx` is in-bounds and the slot is initialized.
     #[inline]
-    unsafe fn get_mut(&mut self, arena: &Arena, idx: usize) -> &mut SlotEntry<K, V> {
-        unsafe { &mut *self.slots(arena).add(idx) }
+    unsafe fn get_mut(&mut self, idx: usize) -> &mut SlotEntry<K, V> {
+        unsafe { &mut *self.data_ptr().add(idx) }
     }
 
     /// SAFETY: caller ensures `idx` is in-bounds and the slot is initialized.
     /// The slot must not be read again before being re-written.
     #[inline]
-    unsafe fn take(&self, arena: &Arena, idx: usize) -> SlotEntry<K, V> {
-        unsafe { self.slots(arena).add(idx).read() }
+    unsafe fn take(&self, idx: usize) -> SlotEntry<K, V> {
+        unsafe { self.data_ptr().add(idx).read() }
     }
 
     #[inline]
-    fn group_match_mask(&self, arena: &Arena, group_idx: usize, target: u8) -> BitMask {
-        unsafe { simd::eq_mask_16(self.group_ctrl(arena, group_idx), target) }
+    fn group_match_mask(&self, group_idx: usize, target: u8) -> BitMask {
+        unsafe { simd::eq_mask_16(self.group_ctrl(group_idx), target) }
     }
 
     #[inline]
-    fn group_free_mask(&self, arena: &Arena, group_idx: usize) -> BitMask {
-        unsafe { simd::free_mask_16(self.group_ctrl(arena, group_idx)) }
+    fn group_free_mask(&self, group_idx: usize) -> BitMask {
+        unsafe { simd::free_mask_16(self.group_ctrl(group_idx)) }
     }
 
     #[inline]
-    fn first_free_in_group(&self, arena: &Arena, group_idx: usize) -> Option<usize> {
-        let offset = self.group_free_mask(arena, group_idx).lowest()?;
+    fn first_free_in_group(&self, group_idx: usize) -> Option<usize> {
+        let offset = self.group_free_mask(group_idx).lowest()?;
         let slot_idx = group_idx * GROUP_SIZE + offset;
         if slot_idx < self.capacity() {
             Some(slot_idx)
@@ -259,7 +275,8 @@ pub(crate) trait ArenaSlots<K, V> {
     /// Yields the next occupied slot index, advancing `cursor`. Use directly
     /// when one cursor must persist across region transitions; otherwise
     /// prefer [`Self::occupied`] which owns its cursor.
-    fn scan_next(&self, arena: &Arena, cursor: &mut OccupiedCursor) -> Option<usize> {
+    #[inline]
+    fn scan_next(&self, cursor: &mut OccupiedCursor) -> Option<usize> {
         loop {
             if let Some(bit) = cursor.current_mask.next() {
                 return Some(cursor.current_group_slot + bit);
@@ -268,7 +285,7 @@ pub(crate) trait ArenaSlots<K, V> {
                 return None;
             }
             let group_idx = cursor.next_group_slot / GROUP_SIZE;
-            let group_ptr = self.group_ctrl(arena, group_idx);
+            let group_ptr = self.group_ctrl(group_idx);
             let mut mask = unsafe { simd::occupied_mask_16(group_ptr) };
             let group_end = cursor.next_group_slot + GROUP_SIZE;
             if group_end > self.capacity() {
@@ -283,13 +300,13 @@ pub(crate) trait ArenaSlots<K, V> {
     /// Returns an iterator over occupied slot indices in this region, with
     /// the scan cursor owned internally. Callers that scan one region in
     /// one shot should use this instead of plumbing an [`OccupiedCursor`].
-    fn occupied<'a>(&'a self, arena: &'a Arena) -> OccupiedIter<'a, K, V, Self>
+    #[inline]
+    fn occupied(&self) -> OccupiedIter<'_, K, V, Self>
     where
         Self: Sized,
     {
         OccupiedIter {
             descriptor: self,
-            arena,
             cursor: OccupiedCursor::new(),
             _marker: PhantomData,
         }
@@ -297,12 +314,12 @@ pub(crate) trait ArenaSlots<K, V> {
 
     /// Drop every K,V stored in occupied slots.
     /// Caller must call this before [`Arena::deallocate`] to avoid leaks.
-    fn drop_values(&self, arena: &Arena) {
+    fn drop_values(&self) {
         if self.capacity() == 0 {
             return;
         }
-        let ctrl = self.ctrl(arena);
-        let slots = self.slots(arena);
+        let ctrl = self.ctrl_ptr();
+        let slots = self.data_ptr();
         for idx in 0..self.capacity() {
             if unsafe { (*ctrl.add(idx)).is_occupied() } {
                 unsafe { ptr::drop_in_place(slots.add(idx)) }
@@ -313,12 +330,12 @@ pub(crate) trait ArenaSlots<K, V> {
     /// Drop every K,V + reset all ctrls to FREE in one pass. Clears each
     /// ctrl *before* the drop so a panicking `Drop` leaves no OCCUPIED
     /// behind to double-drop. Tombstones cleared too.
-    fn drop_values_and_clear(&self, arena: &Arena) {
+    fn drop_values_and_clear(&self) {
         if self.capacity() == 0 {
             return;
         }
-        let ctrl = self.ctrl(arena);
-        let slots = self.slots(arena);
+        let ctrl = self.ctrl_ptr();
+        let slots = self.data_ptr();
         for idx in 0..self.capacity() {
             unsafe {
                 let prev = *ctrl.add(idx);
@@ -335,7 +352,6 @@ pub(crate) trait ArenaSlots<K, V> {
 /// [`OccupiedCursor`] so callers don't have to plumb one through.
 pub(crate) struct OccupiedIter<'a, K, V, D: ArenaSlots<K, V> + ?Sized> {
     descriptor: &'a D,
-    arena: &'a Arena,
     cursor: OccupiedCursor,
     _marker: PhantomData<*const (K, V)>,
 }
@@ -345,6 +361,6 @@ impl<K, V, D: ArenaSlots<K, V> + ?Sized> Iterator for OccupiedIter<'_, K, V, D> 
 
     #[inline]
     fn next(&mut self) -> Option<usize> {
-        self.descriptor.scan_next(self.arena, &mut self.cursor)
+        self.descriptor.scan_next(&mut self.cursor)
     }
 }

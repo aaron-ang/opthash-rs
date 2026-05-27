@@ -10,7 +10,7 @@ use equivalent::Equivalent;
 
 use crate::common::arena::{self, Arena, ArenaSlots, OccupiedCursor, SlotEntry};
 use crate::common::config::{
-    CACHE_LINE, DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY,
+    DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY,
 };
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
@@ -46,7 +46,6 @@ struct Level<K, V> {
     salt: u64,
     /// Paper §2 cap on `f(ε)`.
     budget_cap: f64,
-    _marker: PhantomData<*mut SlotEntry<K, V>>,
 }
 
 unsafe impl<K: Send, V: Send> Send for Level<K, V> {}
@@ -94,7 +93,6 @@ impl<K, V> Level<K, V> {
             ))
             .unwrap_or(u32::MAX),
             budget_cap: compute_budget_cap(reserve_fraction, gc as usize),
-            _marker: PhantomData,
         }
     }
 
@@ -145,13 +143,7 @@ impl<K, V> Level<K, V> {
     /// Triangular probe: fingerprint scan + key compare. Returns slot index on
     /// hit, `None` on miss (stops at first EMPTY byte in the group sequence).
     #[inline]
-    fn find_by_probe<Q>(
-        &self,
-        arena: &Arena,
-        key_hash: u64,
-        key_fingerprint: u8,
-        key: &Q,
-    ) -> Option<usize>
+    fn find_by_probe<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> Option<usize>
     where
         Q: Equivalent<K> + ?Sized,
     {
@@ -161,15 +153,15 @@ impl<K, V> Level<K, V> {
         let mask = self.group_count_mask as usize;
         let mut probe = probe::TriangularProbe::new(self.triangular_group_start(key_hash));
         for _ in 0..self.group_count {
-            let match_mask = self.group_match_mask(arena, probe.pos, key_fingerprint);
+            let match_mask = self.group_match_mask(probe.pos, key_fingerprint);
             for relative_idx in match_mask {
                 let slot_idx = probe.pos * GROUP_SIZE + relative_idx;
-                let entry = unsafe { self.get_ref(arena, slot_idx) };
+                let entry = unsafe { self.get_ref(slot_idx) };
                 if key.equivalent(&entry.key) {
                     return Some(slot_idx);
                 }
             }
-            if self.group_match_mask(arena, probe.pos, CTRL_EMPTY).any() {
+            if self.group_match_mask(probe.pos, CTRL_EMPTY).any() {
                 return None;
             }
             probe.advance(mask);
@@ -232,7 +224,7 @@ impl<K, V, S, A: Allocator + Clone> Drop for ElasticHashMap<K, V, S, A> {
         let arena = mem::replace(&mut self.arena, Arena::empty());
         let guard = arena::DeallocGuard::new(arena, &self.alloc);
         for level in &self.levels {
-            level.drop_values(guard.arena());
+            level.drop_values();
         }
         drop(guard);
     }
@@ -368,21 +360,6 @@ where
     }
 }
 
-/// Computes the combined ctrl+data layout for an arena whose ctrl section
-/// holds `total_ctrl` bytes and data section holds `total_ctrl` slots. Returns
-/// `(arena_layout, data_base_off)` — the offset where slot data begins within
-/// the allocation, accounting for `K, V` alignment padding.
-fn arena_layout_for<K, V>(total_ctrl: usize) -> Result<(Layout, usize), TryReserveError> {
-    let ctrl_layout = Layout::from_size_align(total_ctrl.max(1), CACHE_LINE)
-        .map_err(|_| TryReserveError::AllocError)?;
-    let data_layout = Layout::array::<SlotEntry<K, V>>(total_ctrl.max(1))
-        .map_err(|_| TryReserveError::AllocError)?;
-    let (arena_layout, data_base_off) = ctrl_layout
-        .extend(data_layout)
-        .map_err(|_| TryReserveError::AllocError)?;
-    Ok((arena_layout.pad_to_align(), data_base_off))
-}
-
 type ElasticArenaBuild<K, V> = (Arena, Box<[Level<K, V>]>);
 
 /// Stamps level descriptors with arena-relative `(ctrl_ptr, data_ptr)`.
@@ -425,7 +402,7 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     alloc: &A,
 ) -> Result<ElasticArenaBuild<K, V>, TryReserveError> {
     let total_ctrl: usize = level_capacities.iter().sum();
-    let (arena_layout, data_base_off) = arena_layout_for::<K, V>(total_ctrl)?;
+    let (arena_layout, data_base_off) = arena::layout_for::<K, V>(total_ctrl)?;
     let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout, total_ctrl, alloc)?;
 
     // `Arena` has no `Drop`, so a bare `?` would leak the allocation if
@@ -451,7 +428,7 @@ fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
 ) -> ElasticArenaBuild<K, V> {
     try_alloc_elastic_arena(level_capacities, reserve_fraction, alloc).unwrap_or_else(|_| {
         let total_ctrl: usize = level_capacities.iter().sum();
-        let layout = match arena_layout_for::<K, V>(total_ctrl) {
+        let layout = match arena::layout_for::<K, V>(total_ctrl) {
             Ok((l, _)) => l,
             Err(_) => Layout::from_size_align(1, 1).unwrap(),
         };
@@ -473,7 +450,7 @@ impl<K, V, A: Allocator + Clone> Drop for ArenaDropGuard<K, V, A> {
         if let Some(arena) = self.arena.take() {
             if let Some(levels) = self.levels.take() {
                 for level in &levels {
-                    level.drop_values(&arena);
+                    level.drop_values();
                 }
             }
             arena.deallocate(&self.alloc);
@@ -645,7 +622,7 @@ where
         if let Some((level_idx, slot_idx)) =
             self.find_slot_indices_with_hash(&key, key_hash, key_fingerprint)
         {
-            let entry = unsafe { self.levels[level_idx].get_mut(&self.arena, slot_idx) };
+            let entry = unsafe { self.levels[level_idx].get_mut(slot_idx) };
             let old = mem::replace(&mut entry.value, value);
             return Some(old);
         }
@@ -664,10 +641,9 @@ where
             .choose_slot_for_new_key(key_hash)
             .expect("no free slot found after resize");
 
-        let arena = &self.arena;
         let level = &mut self.levels[level_idx];
-        let prev_ctrl = level.control_at(arena, slot_idx);
-        level.write_with_control(arena, slot_idx, SlotEntry { key, value }, key_fingerprint);
+        let prev_ctrl = level.control_at(slot_idx);
+        level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
         level.len += 1;
         if prev_ctrl == CTRL_TOMBSTONE {
             level.tombstones -= 1;
@@ -690,7 +666,7 @@ where
         let key_fingerprint = control::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
-        Some(unsafe { &self.levels[level_idx].get_ref(&self.arena, slot_idx).value })
+        Some(unsafe { &self.levels[level_idx].get_ref(slot_idx).value })
     }
 
     /// Like [`Self::get`] but returns the stored key alongside its value.
@@ -702,7 +678,7 @@ where
         let key_fingerprint = control::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
-        let entry = unsafe { self.levels[level_idx].get_ref(&self.arena, slot_idx) };
+        let entry = unsafe { self.levels[level_idx].get_ref(slot_idx) };
         Some((&entry.key, &entry.value))
     }
 
@@ -714,7 +690,7 @@ where
         let key_fingerprint = control::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
-        Some(unsafe { &mut self.levels[level_idx].get_mut(&self.arena, slot_idx).value })
+        Some(unsafe { &mut self.levels[level_idx].get_mut(slot_idx).value })
     }
 
     /// Returns `N` disjoint mutable references, mirroring
@@ -729,7 +705,7 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
-        check_disjoint_aliasing(&locations);
+        arena::check_disjoint_aliasing(&locations);
 
         let levels_ptr: *const Level<K, V> = self.levels.as_ptr();
         std::array::from_fn(|i| {
@@ -738,8 +714,7 @@ where
                 // `elastic_slot_value_ptr` projects via raw pointers — no
                 // intermediate `&mut Level` / `&mut RawTable`, so two keys
                 // hitting the same level can't alias under Stacked Borrows.
-                let value_ptr =
-                    unsafe { elastic_slot_value_ptr(&self.arena, levels_ptr, level_idx, slot_idx) };
+                let value_ptr = unsafe { elastic_slot_value_ptr(levels_ptr, level_idx, slot_idx) };
                 unsafe { &mut *value_ptr }
             })
         })
@@ -759,14 +734,14 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
-        check_disjoint_aliasing(&locations);
+        arena::check_disjoint_aliasing(&locations);
 
         let levels_ptr: *const Level<K, V> = self.levels.as_ptr();
         std::array::from_fn(|i| {
             locations[i].map(|(level_idx, slot_idx)| {
                 // SAFETY: as in `get_disjoint_mut`.
                 let (k_ptr, v_ptr) =
-                    unsafe { elastic_slot_kv_ptrs(&self.arena, levels_ptr, level_idx, slot_idx) };
+                    unsafe { elastic_slot_kv_ptrs(levels_ptr, level_idx, slot_idx) };
                 (unsafe { &*k_ptr }, unsafe { &mut *v_ptr })
             })
         })
@@ -793,8 +768,7 @@ where
         std::array::from_fn(|i| {
             locations[i].map(|(level_idx, slot_idx)| {
                 // SAFETY: caller guarantees the hits are pairwise distinct.
-                let value_ptr =
-                    unsafe { elastic_slot_value_ptr(&self.arena, levels_ptr, level_idx, slot_idx) };
+                let value_ptr = unsafe { elastic_slot_value_ptr(levels_ptr, level_idx, slot_idx) };
                 unsafe { &mut *value_ptr }
             })
         })
@@ -849,9 +823,8 @@ where
 
         let removed_entry = {
             let level = &mut self.levels[level_idx];
-            let arena = &self.arena;
-            let removed = unsafe { level.take(arena, slot_idx) };
-            level.mark_tombstone(arena, slot_idx);
+            let removed = unsafe { level.take(slot_idx) };
+            level.mark_tombstone(slot_idx);
             level.len -= 1;
             level.tombstones += 1;
             removed
@@ -867,10 +840,9 @@ where
     }
 
     pub fn clear(&mut self) {
-        let arena = &self.arena;
         for level in &mut self.levels {
-            level.drop_values(arena);
-            level.clear_all_controls(arena);
+            level.drop_values();
+            level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
         }
@@ -883,7 +855,6 @@ where
     #[must_use]
     pub fn iter(&self) -> ElasticIter<'_, K, V, A> {
         ElasticIter {
-            arena: &self.arena,
             levels: self.levels.iter(),
             current_level: None,
             cursor: OccupiedCursor::new(),
@@ -916,7 +887,6 @@ where
         let levels = self.levels.as_mut_ptr();
         let remaining = self.len;
         ElasticIterMut {
-            arena: &self.arena,
             levels,
             levels_len,
             level_idx: 0,
@@ -1004,10 +974,9 @@ where
             .choose_slot_for_new_key(key_hash)
             .expect("no free slot found after resize");
 
-        let arena = &self.arena;
         let level = &mut self.levels[level_idx];
-        let prev_ctrl = level.control_at(arena, slot_idx);
-        level.write_with_control(arena, slot_idx, SlotEntry { key, value }, key_fingerprint);
+        let prev_ctrl = level.control_at(slot_idx);
+        level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
         level.len += 1;
         if prev_ctrl == CTRL_TOMBSTONE {
             level.tombstones -= 1;
@@ -1120,11 +1089,10 @@ where
     pub fn remove_entry(self) -> (K, V) {
         let level_idx = self.level_idx;
         let slot_idx = self.slot_idx;
-        let arena = &self.map.arena;
         let removed = {
             let level = &mut self.map.levels[level_idx];
-            let removed = unsafe { level.take(arena, slot_idx) };
-            level.mark_tombstone(arena, slot_idx);
+            let removed = unsafe { level.take(slot_idx) };
+            level.mark_tombstone(slot_idx);
             level.len -= 1;
             level.tombstones += 1;
             removed
@@ -1293,10 +1261,9 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
         // via `clear_all_controls` regardless, and the scan only advances
         // forward so yielded slots are never re-read.
         while self.level_idx < self.map.levels.len() {
-            let arena = &self.map.arena;
             let level = &mut self.map.levels[self.level_idx];
-            if let Some(idx) = level.scan_next(arena, &mut self.cursor) {
-                let entry = unsafe { level.take(arena, idx) };
+            if let Some(idx) = level.scan_next(&mut self.cursor) {
+                let entry = unsafe { level.take(idx) };
                 self.map.len -= 1;
                 return Some((entry.key, entry.value));
             }
@@ -1320,7 +1287,7 @@ impl<K, V, S, A: Allocator + Clone> Drop for Drain<'_, K, V, S, A> {
         for _ in &mut *self {}
         // All entries moved out via `next()`; wipe ctrl bytes + counters en bloc.
         for level in &mut self.map.levels {
-            level.clear_all_controls(&self.map.arena);
+            level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
         }
@@ -1371,13 +1338,12 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         while self.level_idx < self.map.levels.len() {
             let level = &mut self.map.levels[self.level_idx];
-            let arena = &self.map.arena;
-            while let Some(idx) = level.scan_next(arena, &mut self.cursor) {
+            while let Some(idx) = level.scan_next(&mut self.cursor) {
                 // In-place borrow so predicate mutations stick on kept entries.
-                let entry = unsafe { level.get_mut(arena, idx) };
+                let entry = unsafe { level.get_mut(idx) };
                 if (self.pred)(&entry.key, &mut entry.value) {
-                    let removed = unsafe { level.take(&self.map.arena, idx) };
-                    level.mark_tombstone(arena, idx);
+                    let removed = unsafe { level.take(idx) };
+                    level.mark_tombstone(idx);
                     level.len -= 1;
                     level.tombstones += 1;
                     self.map.len -= 1;
@@ -1409,7 +1375,6 @@ where
 
 /// Borrowing iterator over occupied entries.
 pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
-    arena: &'a Arena,
     levels: std::slice::Iter<'a, Level<K, V>>,
     current_level: Option<&'a Level<K, V>>,
     cursor: OccupiedCursor,
@@ -1420,7 +1385,6 @@ pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
 impl<K, V, A: Allocator + Clone> Clone for ElasticIter<'_, K, V, A> {
     fn clone(&self) -> Self {
         Self {
-            arena: self.arena,
             levels: self.levels.clone(),
             current_level: self.current_level,
             cursor: self.cursor.clone(),
@@ -1440,15 +1404,14 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIter<'a, K, V, A> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let arena = self.arena;
         loop {
             let Some(level) = self.current_level else {
                 self.current_level = Some(self.levels.next()?);
                 self.cursor = OccupiedCursor::new();
                 continue;
             };
-            if let Some(slot_idx) = level.scan_next(arena, &mut self.cursor) {
-                let entry = unsafe { level.get_ref(arena, slot_idx) };
+            if let Some(slot_idx) = level.scan_next(&mut self.cursor) {
+                let entry = unsafe { level.get_ref(slot_idx) };
                 self.remaining -= 1;
                 return Some((&entry.key, &entry.value));
             }
@@ -1490,7 +1453,6 @@ pub type Values<'a, K, V, A = Global> = CommonValues<ElasticIter<'a, K, V, A>>;
 /// iterator to the exclusive borrow of the map. Each `next()` returns a
 /// borrow of a strictly newer slot, so produced references are disjoint.
 pub struct ElasticIterMut<'a, K, V, A: Allocator + Clone = Global> {
-    arena: &'a Arena,
     levels: *mut Level<K, V>,
     levels_len: usize,
     level_idx: usize,
@@ -1509,14 +1471,13 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIterMut<'a, K, V, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.level_idx < self.levels_len {
-            let arena = self.arena;
             // SAFETY: `level_idx < levels_len`; `self.levels` points at an
             // owned slice of initialized `Level`s. Fresh `&mut` each iter.
             let level = unsafe { &mut *self.levels.add(self.level_idx) };
-            if let Some(idx) = level.scan_next(arena, &mut self.cursor) {
+            if let Some(idx) = level.scan_next(&mut self.cursor) {
                 // SAFETY: scan only yields occupied slots; reborrow through
                 // raw ptr so refs outlive the per-iter `level` reborrow.
-                let entry = unsafe { level.get_mut(arena, idx) };
+                let entry = unsafe { level.get_mut(idx) };
                 let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
                 let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
                 self.remaining -= 1;
@@ -1600,13 +1561,12 @@ impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.level_idx < self.map.levels.len() {
-            let arena = &self.map.arena;
             let level = &mut self.map.levels[self.level_idx];
-            if let Some(idx) = level.scan_next(arena, &mut self.cursor) {
+            if let Some(idx) = level.scan_next(&mut self.cursor) {
                 // SAFETY: scan only yields occupied slots. Tombstone-mark
                 // prevents map's Drop and future next() from revisiting.
-                let entry = unsafe { level.take(arena, idx) };
-                level.mark_tombstone(arena, idx);
+                let entry = unsafe { level.take(idx) };
+                level.mark_tombstone(idx);
                 self.map.len -= 1;
                 return Some((entry.key, entry.value));
             }
@@ -1690,9 +1650,8 @@ where
             .choose_slot_for_new_key(key_hash)
             .expect("no free slot found in freshly-allocated map");
 
-        let arena = &self.arena;
         let level = &mut self.levels[level_idx];
-        level.write_with_control(arena, slot_idx, SlotEntry { key, value }, key_fingerprint);
+        level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
         level.len += 1;
         if level_idx > self.max_populated_level {
             self.max_populated_level = level_idx;
@@ -1740,11 +1699,10 @@ where
             levels: Some(old_levels),
             alloc: self.alloc.clone(),
         };
-        let old_ptr = guard.arena.as_ref().unwrap();
         for level in guard.levels.as_deref().unwrap() {
-            for idx in level.occupied(old_ptr) {
-                let entry = unsafe { level.take(old_ptr, idx) };
-                level.set_control(old_ptr, idx, CTRL_EMPTY);
+            for idx in level.occupied() {
+                let entry = unsafe { level.take(idx) };
+                level.set_control(idx, CTRL_EMPTY);
                 self.insert_unique(entry.key, entry.value);
             }
         }
@@ -1772,11 +1730,10 @@ where
         // remain OCCUPIED on `self` and the already-moved ones are EMPTY, so
         // both `self.drop_values` and `new_map.drop_values` are sound on
         // unwind (no double-drop).
-        let old_ptr = &self.arena;
         for level in &self.levels {
-            for idx in level.occupied(old_ptr) {
-                let entry = unsafe { level.take(old_ptr, idx) };
-                level.set_control(old_ptr, idx, CTRL_EMPTY);
+            for idx in level.occupied() {
+                let entry = unsafe { level.take(idx) };
+                level.set_control(idx, CTRL_EMPTY);
                 new_map.insert_unique(entry.key, entry.value);
             }
         }
@@ -1922,13 +1879,13 @@ where
     /// occupied slot in that level.
     #[inline]
     unsafe fn slot_ref(&self, level_idx: usize, slot_idx: usize) -> &SlotEntry<K, V> {
-        unsafe { self.levels[level_idx].get_ref(&self.arena, slot_idx) }
+        unsafe { self.levels[level_idx].get_ref(slot_idx) }
     }
 
     /// SAFETY: same as [`Self::slot_ref`] plus caller holds exclusive access.
     #[inline]
     unsafe fn slot_mut(&mut self, level_idx: usize, slot_idx: usize) -> &mut SlotEntry<K, V> {
-        unsafe { self.levels[level_idx].get_mut(&self.arena, slot_idx) }
+        unsafe { self.levels[level_idx].get_mut(slot_idx) }
     }
 
     /// Paper §4 lookup: walk levels `A_1`, `A_2`, … in order using each
@@ -1945,9 +1902,8 @@ where
         Q: Equivalent<K> + ?Sized,
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
-        let arena = &self.arena;
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            if let Some(slot_idx) = level.find_by_probe(arena, key_hash, key_fingerprint, key) {
+            if let Some(slot_idx) = level.find_by_probe(key_hash, key_fingerprint, key) {
                 return Some((level_idx, slot_idx));
             }
         }
@@ -1968,13 +1924,12 @@ where
         if level.len as usize >= level.capacity() {
             return None;
         }
-        let arena = &self.arena;
         let group_count = level.group_count();
         let max_groups = max_groups.min(group_count.max(1));
         let mask = level.group_count_mask as usize;
         let mut probe = probe::TriangularProbe::new(level.triangular_group_start(key_hash));
         for _ in 0..max_groups {
-            if let Some(slot_idx) = level.first_free_in_group(arena, probe.pos) {
+            if let Some(slot_idx) = level.first_free_in_group(probe.pos) {
                 return Some(slot_idx);
             }
             probe.advance(mask);
@@ -1990,12 +1945,11 @@ where
         if level.len as usize >= level.capacity() {
             return None;
         }
-        let arena = &self.arena;
         let group_count = level.group_count();
         let mask = level.group_count_mask as usize;
         let mut probe = probe::TriangularProbe::new(level.triangular_group_start(key_hash));
         for _ in 0..group_count {
-            if let Some(slot_idx) = level.first_free_in_group(arena, probe.pos) {
+            if let Some(slot_idx) = level.first_free_in_group(probe.pos) {
                 return Some(slot_idx);
             }
             probe.advance(mask);
@@ -2024,46 +1978,28 @@ where
 ///
 /// # Safety
 ///
-/// - `arena` must point to the map's live arena.
 /// - `levels_ptr` must point to the map's live `[Level<K, V>]`.
 /// - `slot_idx` must be an occupied slot in that level.
 #[inline]
 unsafe fn elastic_slot_value_ptr<K, V>(
-    arena: &Arena,
     levels_ptr: *const Level<K, V>,
     level_idx: usize,
     slot_idx: usize,
 ) -> *mut V {
     let level = unsafe { &*levels_ptr.add(level_idx) };
-    unsafe { &raw mut (*level.slots(arena).add(slot_idx)).value }
+    unsafe { &raw mut (*level.data_ptr().add(slot_idx)).value }
 }
 
 /// As [`elastic_slot_value_ptr`] but returns key + value pointers together.
 #[inline]
 unsafe fn elastic_slot_kv_ptrs<K, V>(
-    arena: &Arena,
     levels_ptr: *const Level<K, V>,
     level_idx: usize,
     slot_idx: usize,
 ) -> (*const K, *mut V) {
     let level = unsafe { &*levels_ptr.add(level_idx) };
-    let entry = unsafe { &mut *level.slots(arena).add(slot_idx) };
+    let entry = unsafe { &mut *level.data_ptr().add(slot_idx) };
     (ptr::addr_of!(entry.key), ptr::addr_of_mut!(entry.value))
-}
-
-/// O(N^2) alias check shared by `get_disjoint_mut` and
-/// `get_disjoint_key_value_mut`. Panics if two `Some` locations collide.
-#[inline]
-fn check_disjoint_aliasing<const N: usize>(locations: &[Option<(usize, usize)>; N]) {
-    for (i, li) in locations.iter().enumerate() {
-        let Some(li) = li else { continue };
-        for other in &locations[i + 1..] {
-            assert!(
-                other.as_ref() != Some(li),
-                "get_disjoint_mut: duplicate keys resolve to the same entry",
-            );
-        }
-    }
 }
 
 /// `min(1 + log δ⁻¹, group_count)` — paper §2 cap on `f(ε)` with `c = 1`.
@@ -2232,9 +2168,8 @@ where
             return;
         }
 
-        let self_arena = &self.arena;
         for level in &self.levels {
-            level.drop_values_and_clear(self_arena);
+            level.drop_values_and_clear();
         }
 
         // Panic-safe: `K::clone` / `V::clone` unwinding leaves `self`'s arena
