@@ -9,7 +9,7 @@ use std::ptr;
 use allocator_api2::alloc::Layout;
 use equivalent::Equivalent;
 
-use crate::common::arena::{Arena, ArenaSlots, OccupiedCursor, SlotEntry};
+use crate::common::arena::{self, Arena, ArenaSlots, OccupiedCursor, SlotEntry};
 use crate::common::config::{CACHE_LINE, DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
@@ -638,36 +638,6 @@ where
     }
     for idx in special.fallback.occupied(arena) {
         f(unsafe { special.fallback.take(arena, idx) });
-    }
-}
-
-/// Clone occupied + tombstone slots from one arena region into another in
-/// panic-safe order: each src value is cloned, written into `dst` slot, then
-/// its OCCUPIED ctrl byte is stamped.
-///
-/// A panicking clone leaves `dst` with every initialized slot already covered by an OCCUPIED ctrl,
-/// so partial drop only touches initialized memory.
-/// TOMBSTONE bytes are copied in a second pass once all clones succeed.
-fn clone_region_panic_safe<K: Clone, V: Clone>(
-    src_ctrl: *const u8,
-    dst_ctrl: *mut u8,
-    src_slots: *const SlotEntry<K, V>,
-    dst_slots: *mut SlotEntry<K, V>,
-    capacity: usize,
-) {
-    for idx in 0..capacity {
-        let ctrl = unsafe { *src_ctrl.add(idx) };
-        if ctrl.is_occupied() {
-            let cloned = unsafe { (*src_slots.add(idx)).clone() };
-            unsafe { dst_slots.add(idx).write(cloned) };
-            unsafe { *dst_ctrl.add(idx) = ctrl };
-        }
-    }
-    for idx in 0..capacity {
-        let ctrl = unsafe { *src_ctrl.add(idx) };
-        if ctrl == CTRL_TOMBSTONE {
-            unsafe { *dst_ctrl.add(idx) = CTRL_TOMBSTONE };
-        }
     }
 }
 
@@ -3503,7 +3473,7 @@ where
         // clone panics, only initialized slots carry OCCUPIED ctrls — the
         // guard's `drop_values` walks exactly those.
         for (dst, src_lvl) in levels.iter_mut().zip(self.levels.iter()) {
-            clone_region_panic_safe::<K, V>(
+            arena::clone_region_panic_safe::<K, V>(
                 src_lvl.ctrl_ptr,
                 dst.ctrl_ptr,
                 src_lvl.data_ptr,
@@ -3517,7 +3487,7 @@ where
         {
             let s = &self.special.primary;
             let d = &mut special.primary;
-            clone_region_panic_safe::<K, V>(
+            arena::clone_region_panic_safe::<K, V>(
                 s.ctrl_ptr,
                 d.ctrl_ptr,
                 s.data_ptr,
@@ -3531,7 +3501,7 @@ where
         {
             let s = &self.special.fallback;
             let d = &mut special.fallback;
-            clone_region_panic_safe::<K, V>(
+            arena::clone_region_panic_safe::<K, V>(
                 s.ctrl_ptr,
                 d.ctrl_ptr,
                 s.data_ptr,
@@ -3584,16 +3554,13 @@ where
 
         let self_arena = &self.arena;
         for level in &self.levels {
-            level.drop_values(self_arena);
-            level.clear_all_controls(self_arena);
+            level.drop_values_and_clear(self_arena);
         }
-        self.special.primary.drop_values(self_arena);
-        self.special.primary.clear_all_controls(self_arena);
-        self.special.fallback.drop_values(self_arena);
-        self.special.fallback.clear_all_controls(self_arena);
+        self.special.primary.drop_values_and_clear(self_arena);
+        self.special.fallback.drop_values_and_clear(self_arena);
 
         for (dst, src_lvl) in self.levels.iter_mut().zip(source.levels.iter()) {
-            clone_region_panic_safe::<K, V>(
+            arena::clone_region_panic_safe::<K, V>(
                 src_lvl.ctrl_ptr,
                 dst.ctrl_ptr,
                 src_lvl.data_ptr,
@@ -3606,7 +3573,7 @@ where
         {
             let s = &source.special.primary;
             let d = &mut self.special.primary;
-            clone_region_panic_safe::<K, V>(
+            arena::clone_region_panic_safe::<K, V>(
                 s.ctrl_ptr,
                 d.ctrl_ptr,
                 s.data_ptr,
@@ -3619,7 +3586,7 @@ where
         {
             let s = &source.special.fallback;
             let d = &mut self.special.fallback;
-            clone_region_panic_safe::<K, V>(
+            arena::clone_region_panic_safe::<K, V>(
                 s.ctrl_ptr,
                 d.ctrl_ptr,
                 s.data_ptr,

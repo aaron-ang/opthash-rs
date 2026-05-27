@@ -5,7 +5,7 @@ use allocator_api2::alloc::Layout;
 
 use super::bitmask::BitMask;
 use super::config::GROUP_SIZE;
-use super::control::{CTRL_TOMBSTONE, ControlByte};
+use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use super::simd;
 use super::{Allocator, TryReserveError};
 
@@ -79,6 +79,35 @@ impl<K: Clone, V: Clone> Clone for SlotEntry<K, V> {
         Self {
             key: self.key.clone(),
             value: self.value.clone(),
+        }
+    }
+}
+
+/// Clone occupied + tombstone slots from one arena region into another in
+/// panic-safe order: each src value is cloned, written into `dst`, then
+/// its OCCUPIED ctrl byte is stamped. A panicking clone leaves `dst` with
+/// every initialized slot already covered by OCCUPIED, so partial drop
+/// only touches initialized memory. TOMBSTONE bytes are copied in a
+/// second pass once all clones succeed.
+pub(crate) fn clone_region_panic_safe<K: Clone, V: Clone>(
+    src_ctrl: *const u8,
+    dst_ctrl: *mut u8,
+    src_slots: *const SlotEntry<K, V>,
+    dst_slots: *mut SlotEntry<K, V>,
+    capacity: usize,
+) {
+    for idx in 0..capacity {
+        let ctrl = unsafe { *src_ctrl.add(idx) };
+        if ctrl.is_occupied() {
+            let cloned = unsafe { (*src_slots.add(idx)).clone() };
+            unsafe { dst_slots.add(idx).write(cloned) };
+            unsafe { *dst_ctrl.add(idx) = ctrl };
+        }
+    }
+    for idx in 0..capacity {
+        let ctrl = unsafe { *src_ctrl.add(idx) };
+        if ctrl == CTRL_TOMBSTONE {
+            unsafe { *dst_ctrl.add(idx) = CTRL_TOMBSTONE };
         }
     }
 }
@@ -250,6 +279,27 @@ pub(crate) trait ArenaSlots<K, V> {
         for idx in 0..self.capacity() {
             if unsafe { (*ctrl.add(idx)).is_occupied() } {
                 unsafe { ptr::drop_in_place(slots.add(idx)) }
+            }
+        }
+    }
+
+    /// Drop every K,V and reset all ctrl bytes to FREE in one panic-safe
+    /// pass: each slot's ctrl is cleared *before* its value is dropped, so a
+    /// panicking `Drop` impl leaves no OCCUPIED ctrl behind for the caller's
+    /// own `Drop` to double-drop. Tombstones are cleared too.
+    fn drop_values_and_clear(&self, arena: &Arena) {
+        if self.capacity() == 0 {
+            return;
+        }
+        let ctrl = self.ctrl(arena);
+        let slots = self.slots(arena);
+        for idx in 0..self.capacity() {
+            unsafe {
+                let prev = *ctrl.add(idx);
+                *ctrl.add(idx) = CTRL_EMPTY;
+                if prev.is_occupied() {
+                    ptr::drop_in_place(slots.add(idx));
+                }
             }
         }
     }

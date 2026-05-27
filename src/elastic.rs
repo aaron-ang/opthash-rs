@@ -8,11 +8,11 @@ use std::ptr;
 use allocator_api2::alloc::Layout;
 use equivalent::Equivalent;
 
-use crate::common::arena::{Arena, ArenaSlots, OccupiedCursor, SlotEntry};
+use crate::common::arena::{self, Arena, ArenaSlots, OccupiedCursor, SlotEntry};
 use crate::common::config::{
     CACHE_LINE, DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY,
 };
-use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
+use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
@@ -2185,28 +2185,14 @@ where
             alloc: self.alloc.clone(),
         };
 
-        let src_arena = &self.arena;
-        let dst_arena = guard.arena.as_ref().unwrap();
-        // Panic-safe order: clone value, write slot, then write ctrl byte.
-        // If a clone panics, only OCCUPIED slots reflect initialized memory —
-        // the guard's `drop_values` walks exactly those.
         for (dst, src_lvl) in levels.iter_mut().zip(self.levels.iter()) {
-            for idx in 0..src_lvl.capacity as usize {
-                let ctrl = src_lvl.control_at(src_arena, idx);
-                if ctrl.is_occupied() {
-                    let cloned = unsafe { src_lvl.get_ref(src_arena, idx) }.clone();
-                    unsafe { dst.slots(dst_arena).add(idx).write(cloned) };
-                    dst.set_control(dst_arena, idx, ctrl);
-                }
-            }
-            // Copy TOMBSTONE bytes only after all clones succeed — they hold
-            // no payload, so it's safe to set them in a second pass.
-            for idx in 0..src_lvl.capacity as usize {
-                let ctrl = src_lvl.control_at(src_arena, idx);
-                if ctrl == CTRL_TOMBSTONE {
-                    dst.set_control(dst_arena, idx, CTRL_TOMBSTONE);
-                }
-            }
+            arena::clone_region_panic_safe::<K, V>(
+                src_lvl.ctrl_ptr,
+                dst.ctrl_ptr,
+                src_lvl.data_ptr,
+                dst.data_ptr,
+                src_lvl.capacity as usize,
+            );
             dst.len = src_lvl.len;
             dst.tombstones = src_lvl.tombstones;
         }
@@ -2249,30 +2235,20 @@ where
 
         let self_arena = &self.arena;
         for level in &self.levels {
-            level.drop_values(self_arena);
-            level.clear_all_controls(self_arena);
+            level.drop_values_and_clear(self_arena);
         }
 
-        // Panic-safe order per slot: clone, write, set ctrl. If `K::clone` /
-        // `V::clone` unwinds, `self`'s `Drop` walks OCCUPIED ctrls and drops
-        // exactly the slots that were already written.
-        let src_arena = &source.arena;
-        let dst_arena = &self.arena;
+        // Panic-safe: `K::clone` / `V::clone` unwinding leaves `self`'s arena
+        // with OCCUPIED ctrls only on slots that were fully written. `Drop`
+        // walks ctrls, so the partial state cleans up correctly.
         for (dst, src_lvl) in self.levels.iter_mut().zip(source.levels.iter()) {
-            for idx in 0..src_lvl.capacity as usize {
-                let ctrl = src_lvl.control_at(src_arena, idx);
-                if ctrl.is_occupied() {
-                    let cloned = unsafe { src_lvl.get_ref(src_arena, idx) }.clone();
-                    unsafe { dst.slots(dst_arena).add(idx).write(cloned) };
-                    dst.set_control(dst_arena, idx, ctrl);
-                }
-            }
-            for idx in 0..src_lvl.capacity as usize {
-                let ctrl = src_lvl.control_at(src_arena, idx);
-                if ctrl == CTRL_TOMBSTONE {
-                    dst.set_control(dst_arena, idx, CTRL_TOMBSTONE);
-                }
-            }
+            arena::clone_region_panic_safe::<K, V>(
+                src_lvl.ctrl_ptr,
+                dst.ctrl_ptr,
+                src_lvl.data_ptr,
+                dst.data_ptr,
+                src_lvl.capacity as usize,
+            );
             dst.len = src_lvl.len;
             dst.tombstones = src_lvl.tombstones;
         }
