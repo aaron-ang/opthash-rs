@@ -7,7 +7,9 @@ mod common;
 use std::collections::HashMap as StdHashMap;
 use std::hint::black_box;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(codspeed))]
+use std::time::Instant;
 
 use criterion::{
     BatchSize, Criterion, Throughput, criterion_group, criterion_main, profiler::Profiler,
@@ -174,10 +176,14 @@ macro_rules! bench_insert_reuse {
     }};
 }
 
-/// One impl variant of [`bench_insert_reuse`]. Times only the insert loop;
-/// `clear()` excluded via manual `Instant::now()`.
+/// One impl variant of [`bench_insert_reuse`]. Native: `iter_custom` so
+/// only the insert loop is timed (no per-iter alloc pollution). Under
+/// `cfg(codspeed)` falls back to `iter_batched_ref` (codspeed-criterion-
+/// compat skips `iter_custom`); accept the realloc cost — instruction
+/// counts under callgrind are insensitive to cache state anyway.
 macro_rules! bench_insert_reuse_one {
     ($group:expr, $name:expr, $setup:expr, $pairs:expr $(,)?) => {{
+        #[cfg(not(codspeed))]
         $group.bench_function($name, |b| {
             let mut map = $setup;
             b.iter_custom(|iters| {
@@ -193,6 +199,19 @@ macro_rules! bench_insert_reuse_one {
                 }
                 total
             });
+        });
+        #[cfg(codspeed)]
+        $group.bench_function($name, |b| {
+            b.iter_batched_ref(
+                || $setup,
+                |map| {
+                    for &(key, value) in $pairs {
+                        map.insert(black_box(key), black_box(value));
+                    }
+                    black_box(map.len())
+                },
+                BatchSize::PerIteration,
+            );
         });
     }};
 }
