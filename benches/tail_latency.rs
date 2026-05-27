@@ -14,10 +14,6 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use common::{
-    GOLDEN_RATIO_U64, build_elastic_map, build_funnel_map, build_hashbrown_map, build_std_map,
-    make_pairs,
-};
 use hdrhistogram::Histogram;
 use serde::Serialize;
 
@@ -81,7 +77,7 @@ fn new_hist() -> Histogram<u64> {
 
 fn scatter(i: usize, n: usize) -> usize {
     #[allow(clippy::cast_possible_truncation)]
-    let mixed = (i as u64).wrapping_mul(GOLDEN_RATIO_U64) as usize;
+    let mixed = (i as u64).wrapping_mul(common::GOLDEN_RATIO_U64) as usize;
     mixed % n
 }
 
@@ -104,7 +100,7 @@ where
 }
 
 fn run_get_hit(map: &str, size: usize, samples: usize, warmup: usize) -> Histogram<u64> {
-    let pairs = make_pairs(size);
+    let pairs = common::make_pairs(size);
     let keys: Vec<u64> = pairs.iter().map(|&(k, _)| k).collect();
     let n = keys.len();
 
@@ -118,10 +114,10 @@ fn run_get_hit(map: &str, size: usize, samples: usize, warmup: usize) -> Histogr
     }
 
     match map {
-        "std" => run!(build_std_map),
-        "hashbrown" => run!(build_hashbrown_map),
-        "elastic" => run!(build_elastic_map),
-        "funnel" => run!(build_funnel_map),
+        "std" => run!(common::build_std_map),
+        "hashbrown" => run!(common::build_hashbrown_map),
+        "elastic" => run!(common::build_elastic_map),
+        "funnel" => run!(common::build_funnel_map),
         _ => unreachable!(),
     }
 }

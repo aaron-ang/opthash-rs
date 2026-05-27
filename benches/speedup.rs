@@ -9,12 +9,6 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{
-    VALUE_XOR_MIX_ALT, build_elastic_big_map, build_elastic_drop_map, build_elastic_map,
-    build_funnel_big_map, build_funnel_drop_map, build_funnel_map, build_hashbrown_big_map,
-    build_hashbrown_drop_map, build_hashbrown_map, build_std_big_map, build_std_drop_map,
-    build_std_map, drop_sink_value, key_at, make_big_pairs, make_pairs,
-};
 use criterion::{
     BatchSize, Criterion, Throughput, criterion_group, criterion_main, profiler::Profiler,
 };
@@ -84,18 +78,17 @@ macro_rules! bench_all_impls {
     }};
 }
 
-/// `bench_all_impls!` with the four `build_*_map($pairs)`
-/// setup closures filled in.
+/// [`bench_all_impls!`] with `build_*_map($pairs)` for each impl.
 macro_rules! bench_populated {
     ($group:expr, $op:literal, $batch:expr, $pairs:expr, $body:expr $(,)?) => {
         bench_all_impls!(
             $group,
             $op,
             $batch,
-            || build_std_map($pairs),
-            || build_hashbrown_map($pairs),
-            || build_elastic_map($pairs),
-            || build_funnel_map($pairs),
+            || common::build_std_map($pairs),
+            || common::build_hashbrown_map($pairs),
+            || common::build_elastic_map($pairs),
+            || common::build_funnel_map($pairs),
             $body,
         )
     };
@@ -108,16 +101,16 @@ macro_rules! bench_populated_big {
             $group,
             $op,
             $batch,
-            || build_std_big_map($pairs),
-            || build_hashbrown_big_map($pairs),
-            || build_elastic_big_map($pairs),
-            || build_funnel_big_map($pairs),
+            || common::build_std_big_map($pairs),
+            || common::build_hashbrown_big_map($pairs),
+            || common::build_elastic_big_map($pairs),
+            || common::build_funnel_big_map($pairs),
             $body,
         )
     };
 }
 
-/// `bench_all_impls!` with empty-map constructors. For growth / extend.
+/// [`bench_all_impls!`] with empty-map constructors. For growth / extend.
 macro_rules! bench_empty {
     ($group:expr, $op:literal, $batch:expr, $body:expr $(,)?) => {
         bench_all_impls!(
@@ -133,7 +126,7 @@ macro_rules! bench_empty {
     };
 }
 
-/// `bench_all_impls!` with `with_capacity($cap)` constructors.
+/// [`bench_all_impls!`] with `with_capacity($cap)` constructors.
 macro_rules! bench_with_cap {
     ($group:expr, $op:literal, $batch:expr, $cap:expr, $body:expr $(,)?) => {
         bench_all_impls!(
@@ -150,7 +143,7 @@ macro_rules! bench_with_cap {
 }
 
 fn bench_insert_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(OP_COUNT);
+    let pairs = common::make_pairs(OP_COUNT);
     let mut group = c.benchmark_group("insert_throughput");
     group.throughput(Throughput::Elements(OP_COUNT as u64));
 
@@ -215,15 +208,15 @@ fn bench_one_lookup_group(
 }
 
 fn bench_lookups(c: &mut Criterion) {
-    let pairs = make_pairs(MAP_SIZE);
-    let std_map = build_std_map(&pairs);
-    let hb_map = build_hashbrown_map(&pairs);
-    let el_map = build_elastic_map(&pairs);
-    let fn_map = build_funnel_map(&pairs);
+    let pairs = common::make_pairs(MAP_SIZE);
+    let std_map = common::build_std_map(&pairs);
+    let hb_map = common::build_hashbrown_map(&pairs);
+    let el_map = common::build_elastic_map(&pairs);
+    let fn_map = common::build_funnel_map(&pairs);
 
     let hit_keys: Vec<u64> = (0..OP_COUNT).map(|idx| pairs[idx % MAP_SIZE].0).collect();
     let miss_keys: Vec<u64> = (0..OP_COUNT)
-        .map(|idx| key_at(idx + MAP_SIZE + 10_000_000))
+        .map(|idx| common::key_at(idx + MAP_SIZE + 10_000_000))
         .collect();
 
     bench_one_lookup_group(
@@ -249,20 +242,20 @@ fn bench_lookups(c: &mut Criterion) {
 }
 
 fn bench_tiny_lookup_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(TINY_MAP_SIZE);
+    let pairs = common::make_pairs(TINY_MAP_SIZE);
     let query_keys: Vec<u64> = (0..TINY_OP_COUNT)
         .map(|idx| {
             if idx % 2 == 0 {
                 pairs[idx % TINY_MAP_SIZE].0
             } else {
-                key_at(idx + 5_000_000)
+                common::key_at(idx + 5_000_000)
             }
         })
         .collect();
-    let std_map = build_std_map(&pairs);
-    let hb_map = build_hashbrown_map(&pairs);
-    let el_map = build_elastic_map(&pairs);
-    let fn_map = build_funnel_map(&pairs);
+    let std_map = common::build_std_map(&pairs);
+    let hb_map = common::build_hashbrown_map(&pairs);
+    let el_map = common::build_elastic_map(&pairs);
+    let fn_map = common::build_funnel_map(&pairs);
     bench_one_lookup_group(
         c,
         "tiny_lookup_throughput",
@@ -276,11 +269,11 @@ fn bench_tiny_lookup_throughput(c: &mut Criterion) {
 }
 
 fn bench_delete_heavy_throughput(c: &mut Criterion) {
-    let initial_pairs = make_pairs(MAP_SIZE);
+    let initial_pairs = common::make_pairs(MAP_SIZE);
     let replacement_pairs: Vec<(u64, u64)> = (0..OP_COUNT)
         .map(|idx| {
-            let key = key_at(idx + 20_000_000);
-            (key, key ^ VALUE_XOR_MIX_ALT)
+            let key = common::key_at(idx + 20_000_000);
+            (key, key ^ common::VALUE_XOR_MIX_ALT)
         })
         .collect();
 
@@ -305,7 +298,7 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
 }
 
 fn bench_mixed_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(MAP_SIZE);
+    let pairs = common::make_pairs(MAP_SIZE);
     let ops: Vec<(usize, bool)> = (0..OP_COUNT)
         .map(|i| {
             let mixed = u32::try_from(i).unwrap().wrapping_mul(2_654_435_761);
@@ -332,7 +325,7 @@ fn bench_mixed_throughput(c: &mut Criterion) {
 }
 
 fn bench_resize_heavy_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(RESIZE_INSERT_COUNT);
+    let pairs = common::make_pairs(RESIZE_INSERT_COUNT);
     let mut group = c.benchmark_group("resize_heavy_throughput");
     group.throughput(Throughput::Elements(RESIZE_INSERT_COUNT as u64));
 
@@ -347,7 +340,7 @@ fn bench_resize_heavy_throughput(c: &mut Criterion) {
 }
 
 fn bench_iter_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(MAP_SIZE);
+    let pairs = common::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("iter_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -361,7 +354,7 @@ fn bench_iter_throughput(c: &mut Criterion) {
 }
 
 fn bench_iter_mut_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(MAP_SIZE);
+    let pairs = common::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("iter_mut_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -375,7 +368,7 @@ fn bench_iter_mut_throughput(c: &mut Criterion) {
 }
 
 fn bench_drain_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(MAP_SIZE);
+    let pairs = common::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("drain_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -389,7 +382,7 @@ fn bench_drain_throughput(c: &mut Criterion) {
 }
 
 fn bench_extract_if_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(MAP_SIZE);
+    let pairs = common::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("extract_if_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -418,21 +411,21 @@ fn bench_clear_drop_throughput(c: &mut Criterion) {
         group,
         "clear",
         BatchSize::PerIteration,
-        || build_std_drop_map(MAP_SIZE),
-        || build_hashbrown_drop_map(MAP_SIZE),
-        || build_elastic_drop_map(MAP_SIZE),
-        || build_funnel_drop_map(MAP_SIZE),
+        || common::build_std_drop_map(MAP_SIZE),
+        || common::build_hashbrown_drop_map(MAP_SIZE),
+        || common::build_elastic_drop_map(MAP_SIZE),
+        || common::build_funnel_drop_map(MAP_SIZE),
         |map| map.clear(),
     );
     // Touch the sink so the drop side-effects can't be optimized out at
     // module scope.
-    black_box(drop_sink_value());
+    black_box(common::drop_sink_value());
 
     group.finish();
 }
 
 fn bench_entry_or_insert_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(MAP_SIZE);
+    let pairs = common::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("entry_or_insert_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -447,7 +440,7 @@ fn bench_entry_or_insert_throughput(c: &mut Criterion) {
 }
 
 fn bench_grow_insert_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(MAP_SIZE);
+    let pairs = common::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("grow_insert_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -465,7 +458,7 @@ fn bench_grow_insert_throughput(c: &mut Criterion) {
 /// Sweep `get_hit` at 50/75/90% load — exercises Elastic's near-capacity behavior.
 fn bench_get_hit_load_factor(c: &mut Criterion) {
     const LOAD_PCTS: &[u32] = &[50, 75, 90];
-    let pairs = make_pairs(MAP_SIZE);
+    let pairs = common::make_pairs(MAP_SIZE);
     let hit_keys: Vec<u64> = (0..OP_COUNT).map(|idx| pairs[idx % MAP_SIZE].0).collect();
 
     for &load_pct in LOAD_PCTS {
@@ -496,7 +489,7 @@ fn bench_get_hit_load_factor(c: &mut Criterion) {
 // 32-byte `BigVal` payload — memcpy axis. Pair with `(u64, u64)` to attribute deltas.
 
 fn bench_insert_big_throughput(c: &mut Criterion) {
-    let pairs = make_big_pairs(OP_COUNT);
+    let pairs = common::make_big_pairs(OP_COUNT);
     let mut group = c.benchmark_group("insert_big_throughput");
     group.throughput(Throughput::Elements(OP_COUNT as u64));
 
@@ -517,7 +510,7 @@ fn bench_insert_big_throughput(c: &mut Criterion) {
 }
 
 fn bench_get_hit_big_throughput(c: &mut Criterion) {
-    let pairs = make_big_pairs(MAP_SIZE);
+    let pairs = common::make_big_pairs(MAP_SIZE);
     let hit_keys: Vec<u64> = (0..OP_COUNT).map(|idx| pairs[idx % MAP_SIZE].0).collect();
 
     let mut group = c.benchmark_group("get_hit_big_throughput");
@@ -533,7 +526,7 @@ fn bench_get_hit_big_throughput(c: &mut Criterion) {
 }
 
 fn bench_drain_big_throughput(c: &mut Criterion) {
-    let pairs = make_big_pairs(MAP_SIZE);
+    let pairs = common::make_big_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("drain_big_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -559,7 +552,7 @@ macro_rules! sparse_setup {
 }
 
 fn bench_shrink_to_fit_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(MAP_SIZE);
+    let pairs = common::make_pairs(MAP_SIZE);
     let keep: usize = MAP_SIZE / 10;
     let mut group = c.benchmark_group("shrink_to_fit_throughput");
     group.throughput(Throughput::Elements(keep as u64));
@@ -568,10 +561,10 @@ fn bench_shrink_to_fit_throughput(c: &mut Criterion) {
         group,
         "shrink_to_fit",
         BatchSize::PerIteration,
-        sparse_setup!(build_std_map, &pairs, keep),
-        sparse_setup!(build_hashbrown_map, &pairs, keep),
-        sparse_setup!(build_elastic_map, &pairs, keep),
-        sparse_setup!(build_funnel_map, &pairs, keep),
+        sparse_setup!(common::build_std_map, &pairs, keep),
+        sparse_setup!(common::build_hashbrown_map, &pairs, keep),
+        sparse_setup!(common::build_elastic_map, &pairs, keep),
+        sparse_setup!(common::build_funnel_map, &pairs, keep),
         |map| {
             map.shrink_to_fit();
             black_box(map.capacity())
@@ -585,7 +578,7 @@ fn bench_shrink_to_fit_throughput(c: &mut Criterion) {
 /// in `insert` codegen, distinct from the vacant-slot path covered by
 /// `insert_throughput`.
 fn bench_replace_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(MAP_SIZE);
+    let pairs = common::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("replace_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -600,7 +593,7 @@ fn bench_replace_throughput(c: &mut Criterion) {
 }
 
 fn bench_extend_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(MAP_SIZE);
+    let pairs = common::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("extend_throughput");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
