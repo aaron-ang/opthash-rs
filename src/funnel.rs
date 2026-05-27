@@ -3564,7 +3564,80 @@ where
     }
 
     fn clone_from(&mut self, source: &Self) {
-        *self = source.clone();
+        // Reuse `self.arena` when every region's layout matches — same
+        // capacities ⇒ same arena offsets, so we save one alloc + dealloc
+        // per assignment. Falls back to full clone otherwise.
+        let layouts_match = self.levels.len() == source.levels.len()
+            && self
+                .levels
+                .iter()
+                .zip(source.levels.iter())
+                .all(|(a, b)| a.capacity == b.capacity)
+            && self.special.primary.capacity == source.special.primary.capacity
+            && self.special.fallback.capacity == source.special.fallback.capacity
+            && self.special.fallback.bucket_count == source.special.fallback.bucket_count
+            && self.special.fallback.bucket_size_log2 == source.special.fallback.bucket_size_log2;
+        if !layouts_match {
+            *self = source.clone();
+            return;
+        }
+
+        let self_arena = &self.arena;
+        for level in &self.levels {
+            level.drop_values(self_arena);
+            level.clear_all_controls(self_arena);
+        }
+        self.special.primary.drop_values(self_arena);
+        self.special.primary.clear_all_controls(self_arena);
+        self.special.fallback.drop_values(self_arena);
+        self.special.fallback.clear_all_controls(self_arena);
+
+        for (dst, src_lvl) in self.levels.iter_mut().zip(source.levels.iter()) {
+            clone_region_panic_safe::<K, V>(
+                src_lvl.ctrl_ptr,
+                dst.ctrl_ptr,
+                src_lvl.data_ptr,
+                dst.data_ptr,
+                src_lvl.capacity as usize,
+            );
+            dst.len = src_lvl.len;
+            dst.tombstones = src_lvl.tombstones;
+        }
+        {
+            let s = &source.special.primary;
+            let d = &mut self.special.primary;
+            clone_region_panic_safe::<K, V>(
+                s.ctrl_ptr,
+                d.ctrl_ptr,
+                s.data_ptr,
+                d.data_ptr,
+                s.capacity as usize,
+            );
+            d.len = s.len;
+            d.tombstones = s.tombstones;
+        }
+        {
+            let s = &source.special.fallback;
+            let d = &mut self.special.fallback;
+            clone_region_panic_safe::<K, V>(
+                s.ctrl_ptr,
+                d.ctrl_ptr,
+                s.data_ptr,
+                d.data_ptr,
+                s.capacity as usize,
+            );
+            d.len = s.len;
+            d.tombstones = s.tombstones;
+        }
+        self.special.total_len = source.special.total_len;
+
+        self.len = source.len;
+        self.total_slots = source.total_slots;
+        self.max_insertions = source.max_insertions;
+        self.reserve_fraction = source.reserve_fraction;
+        self.primary_probe_limit = source.primary_probe_limit;
+        self.max_populated_level = source.max_populated_level;
+        self.hash_builder.clone_from(&source.hash_builder);
     }
 }
 

@@ -2233,10 +2233,59 @@ where
     }
 
     fn clone_from(&mut self, source: &Self) {
-        // Descriptors are pure offsets — `Level::clone_from` would only copy
-        // them, not the data they index into the arena. Delegate to full
-        // clone + move-assign so K/V are actually cloned.
-        *self = source.clone();
+        // Reuse `self.arena` when the per-level layout matches — capacities
+        // fully determine descriptor offsets, so we save one alloc + dealloc
+        // per assignment. Falls back to full clone otherwise.
+        let layouts_match = self.levels.len() == source.levels.len()
+            && self
+                .levels
+                .iter()
+                .zip(source.levels.iter())
+                .all(|(a, b)| a.capacity == b.capacity);
+        if !layouts_match {
+            *self = source.clone();
+            return;
+        }
+
+        let self_arena = &self.arena;
+        for level in &self.levels {
+            level.drop_values(self_arena);
+            level.clear_all_controls(self_arena);
+        }
+
+        // Panic-safe order per slot: clone, write, set ctrl. If `K::clone` /
+        // `V::clone` unwinds, `self`'s `Drop` walks OCCUPIED ctrls and drops
+        // exactly the slots that were already written.
+        let src_arena = &source.arena;
+        let dst_arena = &self.arena;
+        for (dst, src_lvl) in self.levels.iter_mut().zip(source.levels.iter()) {
+            for idx in 0..src_lvl.capacity as usize {
+                let ctrl = src_lvl.control_at(src_arena, idx);
+                if ctrl.is_occupied() {
+                    let cloned = unsafe { src_lvl.get_ref(src_arena, idx) }.clone();
+                    unsafe { dst.slots(dst_arena).add(idx).write(cloned) };
+                    dst.set_control(dst_arena, idx, ctrl);
+                }
+            }
+            for idx in 0..src_lvl.capacity as usize {
+                let ctrl = src_lvl.control_at(src_arena, idx);
+                if ctrl == CTRL_TOMBSTONE {
+                    dst.set_control(dst_arena, idx, CTRL_TOMBSTONE);
+                }
+            }
+            dst.len = src_lvl.len;
+            dst.tombstones = src_lvl.tombstones;
+        }
+
+        self.len = source.len;
+        self.total_slots = source.total_slots;
+        self.max_insertions = source.max_insertions;
+        self.reserve_fraction = source.reserve_fraction;
+        self.batch_plan.clone_from(&source.batch_plan);
+        self.current_batch_index = source.current_batch_index;
+        self.batch_remaining = source.batch_remaining;
+        self.max_populated_level = source.max_populated_level;
+        self.hash_builder.clone_from(&source.hash_builder);
     }
 }
 
