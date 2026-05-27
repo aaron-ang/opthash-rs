@@ -487,13 +487,31 @@ unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
 
 impl<K, V, S, A: Allocator + Clone> Drop for FunnelHashMap<K, V, S, A> {
     fn drop(&mut self) {
-        let arena_ptr = &self.arena;
-        for level in &self.levels {
-            level.drop_values(arena_ptr);
+        // Take arena out + wrap in a guard so `arena.deallocate` runs even
+        // if `V::drop` panics mid-loop. `Arena` has no `Drop`, so without
+        // this an unwinding destructor would leak the backing allocation.
+        struct DeallocGuard<'a, A: Allocator> {
+            arena: Option<Arena>,
+            alloc: &'a A,
         }
-        self.special.drop_values(arena_ptr);
+        impl<A: Allocator> Drop for DeallocGuard<'_, A> {
+            fn drop(&mut self) {
+                if let Some(arena) = self.arena.take() {
+                    arena.deallocate(self.alloc);
+                }
+            }
+        }
         let arena = mem::replace(&mut self.arena, Arena::empty());
-        arena.deallocate(&self.alloc);
+        let guard = DeallocGuard {
+            arena: Some(arena),
+            alloc: &self.alloc,
+        };
+        let arena_ref = guard.arena.as_ref().unwrap();
+        for level in &self.levels {
+            level.drop_values(arena_ref);
+        }
+        self.special.drop_values(arena_ref);
+        drop(guard);
     }
 }
 
