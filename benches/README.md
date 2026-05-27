@@ -1,6 +1,6 @@
 # Benchmarks
 
-Methodology + commands in [AGENTS.md](../AGENTS.md). Per-file details at top of each `.rs`.
+Methodology + commands in [AGENTS.md](../AGENTS.md), and at the top of each benchmark file.
 
 ## Throughput (Rust, vs `std::HashMap`)
 

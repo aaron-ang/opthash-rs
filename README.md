@@ -71,17 +71,18 @@ Arena (one allocation per map)
 ==============================
 
   fp = fingerprint (7-bit control byte)
-  kv = key-value entry, __ = empty, xx = tombstone
+  kv = key-value entry, __ = empty (CTRL_EMPTY = 0x00), xx = tombstone (CTRL_TOMBSTONE = 0x80)
 
-  All control bytes pack first, then per-K/V-aligned padding, then all slots:
+  All control bytes pack first, then alignment padding so the slot region
+  starts at `align_of::<SlotEntry<K, V>>()`, then all slots:
 
-  arena::ptr ► [fp fp fp ...][fp fp fp ...][fp fp ...][  pad  ][kv kv kv ...][kv ... ]
-               └─ ctrl L0 ──┘└─ ctrl L1 ──┘└── ... ──┘         └─ slots L0 ─┘└─ ... ─┘
-               ▲ each ctrl region starts at u32 offset stamped in its descriptor.
+  arena::ptr ► [fp fp xx __ ... ][fp xx fp __ ...][fp fp ...][  pad  ][kv kv kv ...][kv ... ]
+               └─── ctrl L0 ────┘└─── ctrl L1 ───┘└── ... ──┘         └─ slots L0 ─┘└─ ... ─┘
+               ▲ each descriptor caches `ctrl_ptr` + `data_ptr` into the arena.
 
-  Each descriptor is a view of: ctrl_offset, data_offset, capacity,
-  plus per-shape metadata (salt, mask, etc). All slot/ctrl/SIMD ops live on
-  the `ArenaSlots` trait (`src/common/arena.rs`) which implements pointer arithmetic.
+  Each descriptor stores cached `ctrl_ptr`, `data_ptr`, capacity, plus
+  per-shape metadata (salt, mask, etc). All slot/ctrl/SIMD ops live on
+  the `ArenaSlots` trait (`src/common/arena.rs`).
 
 
 ElasticHashMap
@@ -89,7 +90,7 @@ ElasticHashMap
 
   levels: Box<[Level]> (descriptors only)
 
-    Level 0    ctrl_offset, data_offset, capacity (~half of total slots)
+    Level 0    ctrl_ptr, data_ptr, capacity (~half of total slots)
     Level 1    geometrically halved
     Level 2    ...
 
@@ -109,9 +110,11 @@ FunnelHashMap
   levels: Box<[BucketLevel]> (descriptors)
 
     Level 0
-      ctrl region   fp fp __ __ ... fp fp __ __ ... fp ...
-      slot region   kv kv __ __ ... kv kv __ __ ... kv ...
+      ctrl region   fp xx fp __ ... fp fp xx __ ... fp ...
+      slot region   kv kv kv __ ... kv kv kv __ ... kv ...
                     └── bucket 0 ──┘└── bucket 1 ──┘
+      (xx in ctrl marks a removed slot; the slot bytes may still hold
+       the stale kv physically, but are logically uninit — never read.)
 
     Level 1    (same layout, smaller buckets)
 
@@ -133,7 +136,7 @@ FunnelHashMap
 
 ## Benchmarks
 
-See [benches/README.md](benches/README.md) for bench target layout, charts, CLI flags, chart regeneration, and flamegraph profiling.
+See [benches/README.md](benches/README.md) for comparison charts.
 
 ## References
 
