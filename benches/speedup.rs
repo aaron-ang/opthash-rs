@@ -7,7 +7,7 @@ mod common;
 use std::collections::HashMap as StdHashMap;
 use std::hint::black_box;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{
     BatchSize, Criterion, Throughput, criterion_group, criterion_main, profiler::Profiler,
@@ -142,24 +142,68 @@ macro_rules! bench_with_cap {
     };
 }
 
+/// Per-impl insert bench using `iter_custom` + map reuse via `clear()`.
+/// Timed region excludes setup so allocation-induced cache pollution
+/// doesn't bleed into the measurement (unlike [`bench_with_cap!`]).
+macro_rules! bench_insert_reuse {
+    ($group:expr, $op:literal, $cap:expr, $pairs:expr $(,)?) => {{
+        bench_insert_reuse_one!(
+            $group,
+            concat!($op, "_std"),
+            StdHashMap::with_capacity($cap),
+            $pairs
+        );
+        bench_insert_reuse_one!(
+            $group,
+            concat!($op, "_hashbrown"),
+            HashbrownMap::with_capacity($cap),
+            $pairs
+        );
+        bench_insert_reuse_one!(
+            $group,
+            concat!($op, "_elastic"),
+            ElasticHashMap::with_capacity($cap),
+            $pairs
+        );
+        bench_insert_reuse_one!(
+            $group,
+            concat!($op, "_funnel"),
+            FunnelHashMap::with_capacity($cap),
+            $pairs
+        );
+    }};
+}
+
+/// One impl variant of [`bench_insert_reuse`]. Times only the insert loop;
+/// `clear()` excluded via manual `Instant::now()`.
+macro_rules! bench_insert_reuse_one {
+    ($group:expr, $name:expr, $setup:expr, $pairs:expr $(,)?) => {{
+        $group.bench_function($name, |b| {
+            let mut map = $setup;
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    map.clear();
+                    let t0 = Instant::now();
+                    for &(key, value) in $pairs {
+                        map.insert(black_box(key), black_box(value));
+                    }
+                    total += t0.elapsed();
+                    black_box(map.len());
+                }
+                total
+            });
+        });
+    }};
+}
+
+/// Steady-state insert into a reused map (cap = `2 * OP_COUNT`).
+/// Reflects what a long-lived map pays per insert; excludes allocation cost.
 fn bench_insert_throughput(c: &mut Criterion) {
     let pairs = common::make_pairs(OP_COUNT);
     let mut group = c.benchmark_group("insert_throughput");
     group.throughput(Throughput::Elements(OP_COUNT as u64));
-
-    bench_with_cap!(
-        group,
-        "insert",
-        BatchSize::PerIteration,
-        OP_COUNT * 2,
-        |map| {
-            for &(key, value) in &pairs {
-                map.insert(black_box(key), black_box(value));
-            }
-            black_box(map.len())
-        },
-    );
-
+    bench_insert_reuse!(group, "insert", OP_COUNT * 2, &pairs);
     group.finish();
 }
 
@@ -488,24 +532,13 @@ fn bench_get_hit_load_factor(c: &mut Criterion) {
 
 // 32-byte `BigVal` payload — memcpy axis. Pair with `(u64, u64)` to attribute deltas.
 
+/// [`bench_insert_throughput`] with `BigVal` payload (32B) — exercises
+/// the memcpy axis.
 fn bench_insert_big_throughput(c: &mut Criterion) {
     let pairs = common::make_big_pairs(OP_COUNT);
     let mut group = c.benchmark_group("insert_big_throughput");
     group.throughput(Throughput::Elements(OP_COUNT as u64));
-
-    bench_with_cap!(
-        group,
-        "insert_big",
-        BatchSize::PerIteration,
-        OP_COUNT,
-        |map| {
-            for &(key, value) in &pairs {
-                map.insert(black_box(key), black_box(value));
-            }
-            black_box(map.len())
-        },
-    );
-
+    bench_insert_reuse!(group, "insert_big", OP_COUNT, &pairs);
     group.finish();
 }
 
