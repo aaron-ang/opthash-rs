@@ -2,14 +2,16 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
-use std::mem;
-use std::ops::{ControlFlow, Range};
+use std::mem::{self, ManuallyDrop};
+use std::ops::{ControlFlow, Index, Range};
 use std::ptr;
+use std::slice;
 
 use allocator_api2::alloc::Layout;
 use equivalent::Equivalent;
 
-use crate::common::arena::{self, Arena, ArenaSlots, OccupiedCursor, SlotEntry};
+use crate::common::arena::{self, Arena, ArenaSlots, IterRange, SlotEntry};
+use crate::common::bitmask::BitMask;
 use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
@@ -28,9 +30,9 @@ pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
 /// One funnel level `A_i` (paper §5). Fixed grid of `β`-sized buckets `A_{i,j}`;
 /// inserts hash to one bucket and probe within it. Overflow spills to `A_{i+1}`
 /// (or the special array `A_{α+1}`).
-struct BucketLevel<K, V> {
+struct BucketLevel<T> {
     ctrl_ptr: *mut u8,
-    data_ptr: *mut SlotEntry<K, V>,
+    data_ptr: *mut T,
     capacity: u32,
     bucket_count_mask: u32,
     bucket_size_log2: u32,
@@ -39,16 +41,16 @@ struct BucketLevel<K, V> {
     tombstones: u32,
 }
 
-unsafe impl<K: Send, V: Send> Send for BucketLevel<K, V> {}
-unsafe impl<K: Sync, V: Sync> Sync for BucketLevel<K, V> {}
+unsafe impl<T: Send> Send for BucketLevel<T> {}
+unsafe impl<T: Sync> Sync for BucketLevel<T> {}
 
-impl<K, V> ArenaSlots<K, V> for BucketLevel<K, V> {
+impl<T> ArenaSlots<T> for BucketLevel<T> {
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
         self.ctrl_ptr
     }
     #[inline]
-    fn data_ptr(&self) -> *mut SlotEntry<K, V> {
+    fn data_ptr(&self) -> *mut T {
         self.data_ptr
     }
     #[inline]
@@ -57,7 +59,7 @@ impl<K, V> ArenaSlots<K, V> for BucketLevel<K, V> {
     }
 }
 
-impl<K, V> BucketLevel<K, V> {
+impl<T> BucketLevel<T> {
     /// Stamps a fresh descriptor at the given arena ptrs.
     /// Caller advances the offset cursor.
     fn new_at(
@@ -65,7 +67,7 @@ impl<K, V> BucketLevel<K, V> {
         bucket_count: u32,
         bucket_width: u32,
         ctrl_ptr: *mut u8,
-        data_ptr: *mut SlotEntry<K, V>,
+        data_ptr: *mut T,
     ) -> Self {
         let cap = bucket_count.saturating_mul(bucket_width);
         Self {
@@ -112,28 +114,40 @@ impl<K, V> BucketLevel<K, V> {
             .map(|offset| bucket_range.start + offset)
     }
 
-    /// Probe one bucket for `key`. SIMD fingerprint scan + key compare.
-    /// `StopSearch` on EMPTY byte: bucket never overflowed,
-    /// so the key cannot be at a deeper level.
-    /// Pass `Some(out)` to record the first free slot index; `None` for lookup-only.
+    /// Erase slot: become `CTRL_EMPTY` if the bucket has any EMPTY byte
+    /// (probe chain terminates here), else `CTRL_TOMBSTONE`.
+    /// Returns whether a tombstone was written.
     #[inline]
-    fn find_in_bucket<Q>(
+    fn erase(&self, idx: usize) -> bool {
+        let group_idx = idx / GROUP_SIZE;
+        let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
+        if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
+            self.set_control(idx, CTRL_EMPTY);
+            false
+        } else {
+            self.set_control(idx, CTRL_TOMBSTONE);
+            true
+        }
+    }
+
+    /// Probe one bucket for `key` with caller-provided equality.
+    /// `StopSearch` on EMPTY byte: bucket never overflowed, so the key
+    /// cannot be at a deeper level. Pass `Some(out)` to record the first
+    /// free slot index; `None` for lookup-only. Closure-driven so
+    /// `BucketLevel<T>` stays K, V-free at the type level.
+    #[inline]
+    fn find_in_bucket<F: FnMut(&T) -> bool>(
         &self,
         key_hash: u64,
         key_fingerprint: u8,
-        key: &Q,
+        mut eq: F,
         slot_out: Option<&mut Option<usize>>,
-    ) -> LookupStep
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
+    ) -> LookupStep {
         let wants_free = matches!(&slot_out, Some(out) if out.is_none());
         if self.len == 0 {
             if self.capacity == 0 {
                 return LookupStep::Continue;
             }
-            // Record the chosen bucket's first slot
-            // so the insert candidate isn't lost.
             if wants_free {
                 let bucket_idx = self.bucket_index(key_hash);
                 let slot_idx = bucket_idx << self.bucket_size_log2;
@@ -141,8 +155,6 @@ impl<K, V> BucketLevel<K, V> {
                     *out = Some(slot_idx);
                 }
             }
-            // No tombstones ⇒ the cascade never placed a key
-            // deeper than this level, so we can stop probing.
             if self.tombstones == 0 {
                 return LookupStep::StopSearch;
             }
@@ -160,7 +172,7 @@ impl<K, V> BucketLevel<K, V> {
         for relative_idx in match_mask {
             let slot_idx = bucket_range.start + relative_idx;
             let entry = unsafe { &*self.data_ptr().add(slot_idx) };
-            if key.equivalent(&entry.key) {
+            if eq(entry) {
                 return LookupStep::Found(slot_idx);
             }
         }
@@ -172,29 +184,10 @@ impl<K, V> BucketLevel<K, V> {
                 *out = Some(bucket_range.start + o);
             }
         }
-        // StopSearch: bucket has an EMPTY byte → no key ever overflowed past here.
-        // Tombstones don't disable termination since the empty byte
-        // still proves the probe chain terminated naturally.
         if unsafe { simd::eq_mask_16(group_ptr, CTRL_EMPTY).any() } {
             LookupStep::StopSearch
         } else {
             LookupStep::Continue
-        }
-    }
-
-    /// Erase slot: become `CTRL_EMPTY` if the bucket has any EMPTY byte
-    /// (probe chain terminates here), else `CTRL_TOMBSTONE`.
-    /// Returns whether a tombstone was written.
-    #[inline]
-    fn erase(&self, idx: usize) -> bool {
-        let group_idx = idx / GROUP_SIZE;
-        let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
-            self.set_control(idx, CTRL_EMPTY);
-            false
-        } else {
-            self.set_control(idx, CTRL_TOMBSTONE);
-            true
         }
     }
 }
@@ -222,25 +215,25 @@ impl ProbeSeq {
 /// uniform-probing table capped at `primary_probe_limit` ≈ log log n probes.
 /// SIMD-group open addressing with per-key odd-step probing over pow2 `group_count`
 /// (step coprime to `group_count` ⇒ permutation over all groups).
-struct SpecialPrimary<K, V> {
+struct SpecialPrimary<T> {
     ctrl_ptr: *mut u8,
-    data_ptr: *mut SlotEntry<K, V>,
+    data_ptr: *mut T,
     capacity: u32,
     group_count_mask: u32,
     len: u32,
     tombstones: u32,
 }
 
-unsafe impl<K: Send, V: Send> Send for SpecialPrimary<K, V> {}
-unsafe impl<K: Sync, V: Sync> Sync for SpecialPrimary<K, V> {}
+unsafe impl<T: Send> Send for SpecialPrimary<T> {}
+unsafe impl<T: Sync> Sync for SpecialPrimary<T> {}
 
-impl<K, V> ArenaSlots<K, V> for SpecialPrimary<K, V> {
+impl<T> ArenaSlots<T> for SpecialPrimary<T> {
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
         self.ctrl_ptr
     }
     #[inline]
-    fn data_ptr(&self) -> *mut SlotEntry<K, V> {
+    fn data_ptr(&self) -> *mut T {
         self.data_ptr
     }
     #[inline]
@@ -249,15 +242,10 @@ impl<K, V> ArenaSlots<K, V> for SpecialPrimary<K, V> {
     }
 }
 
-impl<K, V> SpecialPrimary<K, V> {
+impl<T> SpecialPrimary<T> {
     /// Stamps a fresh primary descriptor.
     /// `group_count_mask` = `group_count - 1` (pow2-1) so probes wrap `& mask`.
-    fn new_at(
-        cap: u32,
-        group_count_mask: u32,
-        ctrl_ptr: *mut u8,
-        data_ptr: *mut SlotEntry<K, V>,
-    ) -> Self {
+    fn new_at(cap: u32, group_count_mask: u32, ctrl_ptr: *mut u8, data_ptr: *mut T) -> Self {
         Self {
             ctrl_ptr,
             data_ptr,
@@ -306,9 +294,9 @@ impl<K, V> SpecialPrimary<K, V> {
 /// Half `C` of the special array `A_{α+1}` (paper §5):
 /// two-choice table with buckets of size `2 * primary_probe_limit` ≈ 2 log log n.
 /// Reached only when a key exhausts the primary's probe budget.
-struct SpecialFallback<K, V> {
+struct SpecialFallback<T> {
     ctrl_ptr: *mut u8,
-    data_ptr: *mut SlotEntry<K, V>,
+    data_ptr: *mut T,
     capacity: u32,
     bucket_count: u32,
     bucket_size_log2: u32,
@@ -316,16 +304,16 @@ struct SpecialFallback<K, V> {
     tombstones: u32,
 }
 
-unsafe impl<K: Send, V: Send> Send for SpecialFallback<K, V> {}
-unsafe impl<K: Sync, V: Sync> Sync for SpecialFallback<K, V> {}
+unsafe impl<T: Send> Send for SpecialFallback<T> {}
+unsafe impl<T: Sync> Sync for SpecialFallback<T> {}
 
-impl<K, V> ArenaSlots<K, V> for SpecialFallback<K, V> {
+impl<T> ArenaSlots<T> for SpecialFallback<T> {
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
         self.ctrl_ptr
     }
     #[inline]
-    fn data_ptr(&self) -> *mut SlotEntry<K, V> {
+    fn data_ptr(&self) -> *mut T {
         self.data_ptr
     }
     #[inline]
@@ -334,14 +322,14 @@ impl<K, V> ArenaSlots<K, V> for SpecialFallback<K, V> {
     }
 }
 
-impl<K, V> SpecialFallback<K, V> {
+impl<T> SpecialFallback<T> {
     /// Stamps a fresh fallback descriptor with two-choice bucket geometry.
     fn new_at(
         cap: u32,
         bucket_count: u32,
         bucket_size_log2: u32,
         ctrl_ptr: *mut u8,
-        data_ptr: *mut SlotEntry<K, V>,
+        data_ptr: *mut T,
     ) -> Self {
         Self {
             ctrl_ptr,
@@ -355,7 +343,7 @@ impl<K, V> SpecialFallback<K, V> {
     }
 
     #[inline]
-    fn bucket_range(&self, bucket_idx: usize) -> std::ops::Range<usize> {
+    fn bucket_range(&self, bucket_idx: usize) -> Range<usize> {
         let start = bucket_idx << self.bucket_size_log2;
         let size = 1usize << self.bucket_size_log2;
         let end = (start + size).min(self.capacity as usize);
@@ -388,22 +376,17 @@ impl<K, V> SpecialFallback<K, V> {
 /// Combines the special primary (probed first) and the special fallback
 /// (when primary hits its probe limit). Together they catch keys that
 /// overflowed every bucket level.
-struct SpecialArray<K, V> {
-    primary: SpecialPrimary<K, V>,
-    fallback: SpecialFallback<K, V>,
+struct SpecialArray<T> {
+    primary: SpecialPrimary<T>,
+    fallback: SpecialFallback<T>,
     total_len: usize,
 }
 
-impl<K, V> SpecialArray<K, V> {
-    fn drop_values(&self) {
-        self.primary.drop_values();
-        self.fallback.drop_values();
-    }
-
-    /// Drain primary + fallback in occupied order, calling `f` on each entry.
-    /// Clears each slot's ctrl byte *before* moving the entry out, so an `f`
-    /// panic leaves no OCCUPIED slots for the map's drop to double-drop.
-    fn for_each_occupied<F: FnMut(SlotEntry<K, V>)>(&self, mut f: F) {
+impl<T> SpecialArray<T> {
+    /// Drain primary + fallback, calling `f` on each entry. Each slot's
+    /// ctrl is cleared *before* the move so an `f` panic leaves no
+    /// OCCUPIED ctrl for the map's drop to double-drop.
+    fn for_each_occupied<F: FnMut(T)>(&self, mut f: F) {
         for idx in self.primary.occupied() {
             self.primary.set_control(idx, CTRL_EMPTY);
             f(unsafe { self.primary.take(idx) });
@@ -462,9 +445,9 @@ enum LevelMiss {
 /// this asymptotically — no constant-factor rewrite can do better.
 pub struct FunnelHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     /// Level descriptors (bucket-grouped).
-    levels: Box<[BucketLevel<K, V>]>,
+    levels: BucketLevelSlice<K, V>,
     /// Special array descriptor.
-    special: SpecialArray<K, V>,
+    special: SpecialArray<SlotEntry<K, V>>,
     /// Total live entries.
     len: usize,
     /// Total slot count across all levels + special arrays.
@@ -499,7 +482,8 @@ impl<K, V, S, A: Allocator + Clone> Drop for FunnelHashMap<K, V, S, A> {
         for level in &self.levels {
             level.drop_values();
         }
-        self.special.drop_values();
+        self.special.primary.drop_values();
+        self.special.fallback.drop_values();
         drop(guard);
     }
 }
@@ -661,12 +645,14 @@ fn funnel_total_ctrl(
 /// the level + special descriptors with offsets stamped into a single
 /// contiguous allocation:
 /// `[ctrls_L0|ctrls_L1|...|sp_ctrl|sf_ctrl][pad][slots_L0|...|sf_slots]`.
-type FunnelArenaBuild<K, V> = (Arena, Box<[BucketLevel<K, V>]>, SpecialArray<K, V>);
+type BucketLevelSlice<K, V> = Box<[BucketLevel<SlotEntry<K, V>>]>;
+
+type FunnelArenaBuild<K, V> = (Arena, BucketLevelSlice<K, V>, SpecialArray<SlotEntry<K, V>>);
 
 /// Subset of [`FunnelArenaBuild`] minus the arena — built by the inner
 /// closure of `try_alloc_funnel_arena` so a failure deallocates the arena
 /// before returning.
-type FunnelArenaInner<K, V> = (Box<[BucketLevel<K, V>]>, SpecialArray<K, V>);
+type FunnelArenaInner<K, V> = (BucketLevelSlice<K, V>, SpecialArray<SlotEntry<K, V>>);
 
 /// Layout inputs for [`build_funnel_regions`]: levels + special arrays
 /// with their pre-rounded sizes. Split out to keep the builder shallow.
@@ -691,7 +677,7 @@ fn build_funnel_regions<K, V>(
     let mut data_off: u32 =
         u32::try_from(data_base_off).map_err(|_| TryReserveError::CapacityOverflow)?;
 
-    let mut levels: Vec<BucketLevel<K, V>> = Vec::new();
+    let mut levels: Vec<BucketLevel<SlotEntry<K, V>>> = Vec::new();
     levels
         .try_reserve_exact(geom.level_bucket_counts.len())
         .map_err(|_| TryReserveError::AllocError)?;
@@ -841,8 +827,8 @@ fn alloc_funnel_arena<K, V, A: Allocator + Clone>(
 /// mut-iteration borrows from the guard.
 struct ArenaDropGuard<K, V, A: Allocator + Clone> {
     arena: Option<Arena>,
-    levels: Option<Box<[BucketLevel<K, V>]>>,
-    special: Option<SpecialArray<K, V>>,
+    levels: Option<BucketLevelSlice<K, V>>,
+    special: Option<SpecialArray<SlotEntry<K, V>>>,
     alloc: A,
 }
 
@@ -1330,15 +1316,11 @@ where
 
     #[must_use]
     pub fn iter(&self) -> FunnelIter<'_, K, V, A> {
-        let mut levels_iter = self.levels.iter();
-        let first_level = levels_iter.next();
         FunnelIter {
-            levels: levels_iter,
-            current_level: first_level,
+            levels: IterRange::new_shared(&self.levels),
+            primary: self.special.primary.occupied(),
+            fallback: self.special.fallback.occupied(),
             phase: IterPhase::Levels,
-            primary: &self.special.primary,
-            fallback: &self.special.fallback,
-            cursor: OccupiedCursor::new(),
             remaining: self.len,
             _alloc: PhantomData,
         }
@@ -1346,21 +1328,16 @@ where
 
     /// Mutable iterator yielding `(&K, &mut V)`. Mirrors `HashMap::iter_mut`.
     pub fn iter_mut(&mut self) -> FunnelIterMut<'_, K, V, A> {
-        let levels_len = self.levels.len();
-        let levels = self.levels.as_mut_ptr();
-        let primary = ptr::from_mut(&mut self.special.primary);
-        let fallback = ptr::from_mut(&mut self.special.fallback);
         let remaining = self.len;
+        let levels = IterRange::new_mut(&mut self.levels);
+        let primary = IterRange::new_mut(std::slice::from_mut(&mut self.special.primary));
+        let fallback = IterRange::new_mut(std::slice::from_mut(&mut self.special.fallback));
         FunnelIterMut {
             levels,
-            levels_len,
             primary,
             fallback,
             phase: IterPhase::Levels,
-            level_idx: 0,
-            cursor: OccupiedCursor::new(),
             remaining,
-            _marker: PhantomData,
             _alloc: PhantomData,
         }
     }
@@ -1462,11 +1439,21 @@ where
     /// Returns a draining iterator that empties the map. Mirrors
     /// [`std::collections::HashMap::drain`].
     pub fn drain(&mut self) -> Drain<'_, K, V, S, A> {
+        let map_ptr = ptr::from_mut(self);
+        // SAFETY: `&mut self` lets us split into disjoint mut borrows of
+        // `self.levels`, `self.special.primary`, `self.special.fallback`
+        // for the scanners; `map_ptr` is for accessing `self.len` etc.
+        // via raw deref (no overlapping live borrows per step).
+        let levels = IterRange::new_mut(&mut self.levels);
+        let primary = IterRange::new_mut(std::slice::from_mut(&mut self.special.primary));
+        let fallback = IterRange::new_mut(std::slice::from_mut(&mut self.special.fallback));
         Drain {
-            map: self,
+            levels,
+            primary,
+            fallback,
+            map_ptr,
             phase: IterPhase::Levels,
-            level_idx: 0,
-            cursor: OccupiedCursor::new(),
+            _marker: PhantomData,
         }
     }
 
@@ -1477,12 +1464,19 @@ where
     where
         F: FnMut(&K, &mut V) -> bool,
     {
+        let map_ptr = ptr::from_mut(self);
+        // SAFETY: see [`ExtractIf`].
+        let levels = IterRange::new_mut(&mut self.levels);
+        let primary = IterRange::new_mut(std::slice::from_mut(&mut self.special.primary));
+        let fallback = IterRange::new_mut(std::slice::from_mut(&mut self.special.fallback));
         ExtractIf {
-            map: self,
+            levels,
+            primary,
+            fallback,
+            map_ptr,
             pred: f,
             phase: IterPhase::Levels,
-            level_idx: 0,
-            cursor: OccupiedCursor::new(),
+            _marker: PhantomData,
         }
     }
 
@@ -1778,7 +1772,12 @@ where
             } else {
                 None
             };
-            let step = level.find_in_bucket(key_hash, key_fingerprint, key, out);
+            let step = level.find_in_bucket(
+                key_hash,
+                key_fingerprint,
+                |entry| key.equivalent(&entry.key),
+                out,
+            );
             if let Some(slot_idx) = slot_candidate {
                 local = Some(SlotLocation::Level {
                     level_idx,
@@ -2096,7 +2095,7 @@ where
             }
             if need_match {
                 let controls = unsafe {
-                    std::slice::from_raw_parts(fallback.ctrl_ptr().add(range.start), range.len())
+                    slice::from_raw_parts(fallback.ctrl_ptr().add(range.start), range.len())
                 };
                 let mut match_offset = 0;
                 while let Some(relative_idx) = control::find_next_fingerprint_in_controls(
@@ -2167,7 +2166,12 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        match self.levels[0].find_in_bucket(key_hash, key_fingerprint, key, None) {
+        match self.levels[0].find_in_bucket(
+            key_hash,
+            key_fingerprint,
+            |entry| key.equivalent(&entry.key),
+            None,
+        ) {
             LookupStep::Found(slot_idx) => {
                 return Some(SlotLocation::Level {
                     level_idx: 0,
@@ -2207,7 +2211,12 @@ where
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (offset, level) in self.levels[1..search_limit].iter().enumerate() {
-            match level.find_in_bucket(key_hash, key_fingerprint, key, None) {
+            match level.find_in_bucket(
+                key_hash,
+                key_fingerprint,
+                |entry| key.equivalent(&entry.key),
+                None,
+            ) {
                 LookupStep::Found(slot_idx) => {
                     return ControlFlow::Break(Some(SlotLocation::Level {
                         level_idx: offset + 1,
@@ -2473,14 +2482,14 @@ enum IterPhase {
     Done,
 }
 
-/// Borrowing iterator over occupied entries.
+/// Borrowing iterator over occupied entries. Walks bucket levels, then
+/// special primary, then special fallback — each phase owns its own
+/// [`IterRange`], no shared cursor.
 pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
-    levels: std::slice::Iter<'a, BucketLevel<K, V>>,
-    current_level: Option<&'a BucketLevel<K, V>>,
+    levels: IterRange<'a, SlotEntry<K, V>, BucketLevel<SlotEntry<K, V>>>,
+    primary: IterRange<'a, SlotEntry<K, V>, SpecialPrimary<SlotEntry<K, V>>>,
+    fallback: IterRange<'a, SlotEntry<K, V>, SpecialFallback<SlotEntry<K, V>>>,
     phase: IterPhase,
-    primary: &'a SpecialPrimary<K, V>,
-    fallback: &'a SpecialFallback<K, V>,
-    cursor: OccupiedCursor,
     remaining: usize,
     _alloc: PhantomData<&'a A>,
 }
@@ -2489,11 +2498,9 @@ impl<K, V, A: Allocator + Clone> Clone for FunnelIter<'_, K, V, A> {
     fn clone(&self) -> Self {
         Self {
             levels: self.levels.clone(),
-            current_level: self.current_level,
+            primary: self.primary.clone(),
+            fallback: self.fallback.clone(),
             phase: self.phase,
-            primary: self.primary,
-            fallback: self.fallback,
-            cursor: self.cursor.clone(),
             remaining: self.remaining,
             _alloc: PhantomData,
         }
@@ -2511,39 +2518,23 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            match self.phase {
-                IterPhase::Levels => {
-                    if let Some(level) = self.current_level {
-                        if let Some(idx) = level.scan_next(&mut self.cursor) {
-                            let entry = unsafe { level.get_ref(idx) };
-                            self.remaining -= 1;
-                            return Some((&entry.key, &entry.value));
-                        }
-                        self.current_level = self.levels.next();
-                    } else {
-                        self.phase = IterPhase::Primary;
-                    }
-                    self.cursor = OccupiedCursor::new();
-                }
-                IterPhase::Primary => {
-                    if let Some(idx) = self.primary.scan_next(&mut self.cursor) {
-                        let entry = unsafe { self.primary.get_ref(idx) };
-                        self.remaining -= 1;
-                        return Some((&entry.key, &entry.value));
-                    }
-                    self.phase = IterPhase::Fallback;
-                    self.cursor = OccupiedCursor::new();
-                }
-                IterPhase::Fallback => {
-                    if let Some(idx) = self.fallback.scan_next(&mut self.cursor) {
-                        let entry = unsafe { self.fallback.get_ref(idx) };
-                        self.remaining -= 1;
-                        return Some((&entry.key, &entry.value));
-                    }
-                    return None;
-                }
+            // SAFETY: FunnelIter is constructed from a shared borrow; each
+            // `next_handle` yields a handle on which only `as_ref` is sound.
+            let handle_entry = match self.phase {
+                IterPhase::Levels => self.levels.next_handle().map(|h| unsafe { h.as_ref() }),
+                IterPhase::Primary => self.primary.next_handle().map(|h| unsafe { h.as_ref() }),
+                IterPhase::Fallback => self.fallback.next_handle().map(|h| unsafe { h.as_ref() }),
                 IterPhase::Done => return None,
+            };
+            if let Some(entry) = handle_entry {
+                self.remaining -= 1;
+                return Some((&entry.key, &entry.value));
             }
+            self.phase = match self.phase {
+                IterPhase::Levels => IterPhase::Primary,
+                IterPhase::Primary => IterPhase::Fallback,
+                IterPhase::Fallback | IterPhase::Done => return None,
+            };
         }
     }
 
@@ -2572,19 +2563,22 @@ where
 /// Draining iterator. Yields and removes every `(K, V)` entry; the map is
 /// empty once the iterator is consumed or dropped. Returned by
 /// [`FunnelHashMap::drain`].
+/// SAFETY: `scanner` + `map_ptr` alias the map's allocation; each step uses
+/// fresh temporary `&mut`s only, so no two live borrows overlap.
 pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    map: &'a mut FunnelHashMap<K, V, S, A>,
+    levels: IterRange<'a, SlotEntry<K, V>, BucketLevel<SlotEntry<K, V>>>,
+    primary: IterRange<'a, SlotEntry<K, V>, SpecialPrimary<SlotEntry<K, V>>>,
+    fallback: IterRange<'a, SlotEntry<K, V>, SpecialFallback<SlotEntry<K, V>>>,
+    map_ptr: *mut FunnelHashMap<K, V, S, A>,
     phase: IterPhase,
-    level_idx: usize,
-    cursor: OccupiedCursor,
+    _marker: PhantomData<&'a mut FunnelHashMap<K, V, S, A>>,
 }
 
 impl<K, V, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Drain")
             .field("phase", &self.phase)
-            .field("level_idx", &self.level_idx)
-            .field("remaining", &self.map.len)
+            .field("remaining", &unsafe { (*self.map_ptr).len })
             .finish_non_exhaustive()
     }
 }
@@ -2597,47 +2591,27 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
         // via `clear_all_controls` regardless, and the scan only advances
         // forward so yielded slots are never re-read.
         loop {
-            match self.phase {
-                IterPhase::Levels => {
-                    while self.level_idx < self.map.levels.len() {
-                        let level = &mut self.map.levels[self.level_idx];
-                        if let Some(idx) = level.scan_next(&mut self.cursor) {
-                            let entry = unsafe { level.take(idx) };
-                            self.map.len -= 1;
-                            return Some((entry.key, entry.value));
-                        }
-                        self.level_idx += 1;
-                        self.cursor = OccupiedCursor::new();
-                    }
-                    self.phase = IterPhase::Primary;
-                    self.cursor = OccupiedCursor::new();
-                }
-                IterPhase::Primary => {
-                    let primary = &mut self.map.special.primary;
-                    if let Some(idx) = primary.scan_next(&mut self.cursor) {
-                        let entry = unsafe { primary.take(idx) };
-                        self.map.len -= 1;
-                        return Some((entry.key, entry.value));
-                    }
-                    self.phase = IterPhase::Fallback;
-                    self.cursor = OccupiedCursor::new();
-                }
-                IterPhase::Fallback => {
-                    let fallback = &mut self.map.special.fallback;
-                    if let Some(idx) = fallback.scan_next(&mut self.cursor) {
-                        let entry = unsafe { fallback.take(idx) };
-                        self.map.len -= 1;
-                        return Some((entry.key, entry.value));
-                    }
-                    self.phase = IterPhase::Done;
-                }
+            let handle_read = match self.phase {
+                IterPhase::Levels => self.levels.next_handle().map(|h| unsafe { h.read() }),
+                IterPhase::Primary => self.primary.next_handle().map(|h| unsafe { h.read() }),
+                IterPhase::Fallback => self.fallback.next_handle().map(|h| unsafe { h.read() }),
                 IterPhase::Done => return None,
+            };
+            if let Some(entry) = handle_read {
+                unsafe { (*self.map_ptr).len -= 1 };
+                return Some((entry.key, entry.value));
             }
+            self.phase = match self.phase {
+                IterPhase::Levels => IterPhase::Primary,
+                IterPhase::Primary => IterPhase::Fallback,
+                IterPhase::Fallback | IterPhase::Done => return None,
+            };
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.map.len, Some(self.map.len))
+        let len = unsafe { (*self.map_ptr).len };
+        (len, Some(len))
     }
 }
 
@@ -2648,38 +2622,41 @@ impl<K, V, S, A: Allocator + Clone> Drop for Drain<'_, K, V, S, A> {
     fn drop(&mut self) {
         // Drain any unyielded entries so values run their `Drop`.
         for _ in &mut *self {}
-        // All entries moved out via `next()`; wipe ctrl bytes + counters en bloc.
-        for level in &mut self.map.levels {
+        let map = unsafe { &mut *self.map_ptr };
+        for level in &mut map.levels {
             level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
         }
-        self.map.special.primary.clear_all_controls();
-        self.map.special.primary.len = 0;
-        self.map.special.primary.tombstones = 0;
-        self.map.special.fallback.clear_all_controls();
-        self.map.special.fallback.len = 0;
-        self.map.special.fallback.tombstones = 0;
-        self.map.special.total_len = 0;
-        self.map.len = 0;
-        self.map.max_populated_level = 0;
+        map.special.primary.clear_all_controls();
+        map.special.primary.len = 0;
+        map.special.primary.tombstones = 0;
+        map.special.fallback.clear_all_controls();
+        map.special.fallback.len = 0;
+        map.special.fallback.tombstones = 0;
+        map.special.total_len = 0;
+        map.len = 0;
+        map.max_populated_level = 0;
     }
 }
 
 /// Filtering drain. Yields and removes entries for which the predicate
 /// returns `true`; the rest stay in the map. Returned by
 /// [`FunnelHashMap::extract_if`].
+/// SAFETY: as [`Drain`] — scanners + `map_ptr` alias; fresh temp `&mut`s only.
 pub struct ExtractIf<'a, K, V, F, S = DefaultHashBuilder, A: Allocator + Clone = Global>
 where
     K: Eq + Hash,
     S: BuildHasher,
     F: FnMut(&K, &mut V) -> bool,
 {
-    map: &'a mut FunnelHashMap<K, V, S, A>,
+    levels: IterRange<'a, SlotEntry<K, V>, BucketLevel<SlotEntry<K, V>>>,
+    primary: IterRange<'a, SlotEntry<K, V>, SpecialPrimary<SlotEntry<K, V>>>,
+    fallback: IterRange<'a, SlotEntry<K, V>, SpecialFallback<SlotEntry<K, V>>>,
+    map_ptr: *mut FunnelHashMap<K, V, S, A>,
     pred: F,
     phase: IterPhase,
-    level_idx: usize,
-    cursor: OccupiedCursor,
+    _marker: PhantomData<&'a mut FunnelHashMap<K, V, S, A>>,
 }
 
 impl<K, V, F, S, A: Allocator + Clone> fmt::Debug for ExtractIf<'_, K, V, F, S, A>
@@ -2691,8 +2668,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ExtractIf")
             .field("phase", &self.phase)
-            .field("level_idx", &self.level_idx)
-            .field("remaining", &self.map.len)
+            .field("remaining", &unsafe { (*self.map_ptr).len })
             .finish_non_exhaustive()
     }
 }
@@ -2709,57 +2685,58 @@ where
         loop {
             match self.phase {
                 IterPhase::Levels => {
-                    while self.level_idx < self.map.levels.len() {
-                        let level = &mut self.map.levels[self.level_idx];
-                        while let Some(idx) = level.scan_next(&mut self.cursor) {
-                            // SAFETY: scan only yields occupied slots.
-                            let entry = unsafe { level.get_mut(idx) };
-                            if (self.pred)(&entry.key, &mut entry.value) {
-                                let removed = unsafe { level.take(idx) };
-                                if level.erase(idx) {
-                                    level.tombstones += 1;
+                    while let Some(mut handle) = self.levels.next_handle() {
+                        let entry = unsafe { handle.as_mut() };
+                        if (self.pred)(&entry.key, &mut entry.value) {
+                            let level_ptr = handle.descriptor_ptr();
+                            unsafe {
+                                // Clear ctrl first (panic-safety), then
+                                // counters, then read.
+                                if (*level_ptr).erase(handle.idx()) {
+                                    (*level_ptr).tombstones += 1;
                                 }
-                                level.len -= 1;
-                                self.map.len -= 1;
-                                return Some((removed.key, removed.value));
+                                (*level_ptr).len -= 1;
+                                (*self.map_ptr).len -= 1;
                             }
+                            let removed = unsafe { handle.read() };
+                            return Some((removed.key, removed.value));
                         }
-                        self.level_idx += 1;
-                        self.cursor = OccupiedCursor::new();
                     }
                     self.phase = IterPhase::Primary;
-                    self.cursor = OccupiedCursor::new();
                 }
                 IterPhase::Primary => {
-                    let primary = &mut self.map.special.primary;
-                    while let Some(idx) = primary.scan_next(&mut self.cursor) {
-                        let entry = unsafe { primary.get_mut(idx) };
+                    while let Some(mut handle) = self.primary.next_handle() {
+                        let entry = unsafe { handle.as_mut() };
                         if (self.pred)(&entry.key, &mut entry.value) {
-                            let removed = unsafe { primary.take(idx) };
-                            if primary.erase(idx) {
-                                primary.tombstones += 1;
+                            let primary_ptr = handle.descriptor_ptr();
+                            unsafe {
+                                if (*primary_ptr).erase(handle.idx()) {
+                                    (*primary_ptr).tombstones += 1;
+                                }
+                                (*primary_ptr).len -= 1;
+                                (*self.map_ptr).special.total_len -= 1;
+                                (*self.map_ptr).len -= 1;
                             }
-                            primary.len -= 1;
-                            self.map.special.total_len -= 1;
-                            self.map.len -= 1;
+                            let removed = unsafe { handle.read() };
                             return Some((removed.key, removed.value));
                         }
                     }
                     self.phase = IterPhase::Fallback;
-                    self.cursor = OccupiedCursor::new();
                 }
                 IterPhase::Fallback => {
-                    let fallback = &mut self.map.special.fallback;
-                    while let Some(idx) = fallback.scan_next(&mut self.cursor) {
-                        let entry = unsafe { fallback.get_mut(idx) };
+                    while let Some(mut handle) = self.fallback.next_handle() {
+                        let entry = unsafe { handle.as_mut() };
                         if (self.pred)(&entry.key, &mut entry.value) {
-                            let removed = unsafe { fallback.take(idx) };
-                            if fallback.erase(idx) {
-                                fallback.tombstones += 1;
+                            let fallback_ptr = handle.descriptor_ptr();
+                            unsafe {
+                                if (*fallback_ptr).erase(handle.idx()) {
+                                    (*fallback_ptr).tombstones += 1;
+                                }
+                                (*fallback_ptr).len -= 1;
+                                (*self.map_ptr).special.total_len -= 1;
+                                (*self.map_ptr).len -= 1;
                             }
-                            fallback.len -= 1;
-                            self.map.special.total_len -= 1;
-                            self.map.len -= 1;
+                            let removed = unsafe { handle.read() };
                             return Some((removed.key, removed.value));
                         }
                     }
@@ -2771,7 +2748,7 @@ where
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.map.len))
+        (0, Some(unsafe { (*self.map_ptr).len }))
     }
 }
 
@@ -2795,84 +2772,49 @@ pub type Values<'a, K, V, A = Global> = CommonValues<FunnelIter<'a, K, V, A>>;
 /// `(&K, &mut V)` iterator. Visits bucket levels → special primary →
 /// special fallback. Skips FREE / TOMBSTONE.
 ///
-/// SAFETY: raw pointers to each region + `PhantomData<&'a mut FunnelHashMap>`
-/// tie the iterator to the map's exclusive borrow. Each `next()` returns a
-/// borrow of a strictly newer slot ⇒ disjoint.
+/// SAFETY: scanners hold exclusive borrows of disjoint map fields; each
+/// `next()` yields a handle on a strictly newer slot ⇒ disjoint refs.
 pub struct FunnelIterMut<'a, K, V, A: Allocator + Clone = Global> {
-    levels: *mut BucketLevel<K, V>,
-    levels_len: usize,
-    primary: *mut SpecialPrimary<K, V>,
-    fallback: *mut SpecialFallback<K, V>,
+    levels: IterRange<'a, SlotEntry<K, V>, BucketLevel<SlotEntry<K, V>>>,
+    primary: IterRange<'a, SlotEntry<K, V>, SpecialPrimary<SlotEntry<K, V>>>,
+    fallback: IterRange<'a, SlotEntry<K, V>, SpecialFallback<SlotEntry<K, V>>>,
     phase: IterPhase,
-    level_idx: usize,
-    cursor: OccupiedCursor,
     remaining: usize,
-    _marker: PhantomData<&'a mut SpecialArray<K, V>>,
     _alloc: PhantomData<A>,
 }
-
-// SAFETY: `FunnelIterMut` acts as an exclusive borrow of the underlying
-// map regions for its lifetime, matching `&mut FunnelHashMap<K, V, S, A>`.
-unsafe impl<K: Send, V: Send, A: Allocator + Clone + Send> Send for FunnelIterMut<'_, K, V, A> {}
-unsafe impl<K: Sync, V: Sync, A: Allocator + Clone + Sync> Sync for FunnelIterMut<'_, K, V, A> {}
 
 impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
     type Item = (&'a K, &'a mut V);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            match self.phase {
-                IterPhase::Levels => {
-                    while self.level_idx < self.levels_len {
-                        // SAFETY: `level_idx < levels_len`, and `self.levels`
-                        // points at a slice of `levels_len` initialized
-                        // `BucketLevel`s owned by the borrowed map. We hold
-                        // an exclusive borrow for `'a` (via PhantomData).
-                        let level = unsafe { &mut *self.levels.add(self.level_idx) };
-                        if let Some(idx) = level.scan_next(&mut self.cursor) {
-                            // SAFETY: scan only yields occupied slots; each
-                            // call yields a strictly newer slot, so borrows
-                            // returned across calls are disjoint.
-                            let entry = unsafe { level.get_mut(idx) };
-                            let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
-                            let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
-                            self.remaining -= 1;
-                            return Some((key, val));
-                        }
-                        self.level_idx += 1;
-                        self.cursor = OccupiedCursor::new();
-                    }
-                    self.phase = IterPhase::Primary;
-                    self.cursor = OccupiedCursor::new();
-                }
-                IterPhase::Primary => {
-                    // SAFETY: `self.primary` points at the borrowed map's
-                    // `SpecialPrimary` for `'a`.
-                    let primary = unsafe { &mut *self.primary };
-                    if let Some(idx) = primary.scan_next(&mut self.cursor) {
-                        let entry = unsafe { primary.get_mut(idx) };
-                        let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
-                        let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
-                        self.remaining -= 1;
-                        return Some((key, val));
-                    }
-                    self.phase = IterPhase::Fallback;
-                    self.cursor = OccupiedCursor::new();
-                }
-                IterPhase::Fallback => {
-                    // SAFETY: same as the Primary arm, for `self.fallback`.
-                    let fallback = unsafe { &mut *self.fallback };
-                    if let Some(idx) = fallback.scan_next(&mut self.cursor) {
-                        let entry = unsafe { fallback.get_mut(idx) };
-                        let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
-                        let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
-                        self.remaining -= 1;
-                        return Some((key, val));
-                    }
-                    self.phase = IterPhase::Done;
-                }
+            // SAFETY: forge `&'a mut` via raw ptr — scanner yields disjoint
+            // slots so refs across iter calls don't alias.
+            let entry_ptr: Option<*mut SlotEntry<K, V>> = match self.phase {
+                IterPhase::Levels => self
+                    .levels
+                    .next_handle()
+                    .map(|mut h| unsafe { ptr::from_mut(h.as_mut()) }),
+                IterPhase::Primary => self
+                    .primary
+                    .next_handle()
+                    .map(|mut h| unsafe { ptr::from_mut(h.as_mut()) }),
+                IterPhase::Fallback => self
+                    .fallback
+                    .next_handle()
+                    .map(|mut h| unsafe { ptr::from_mut(h.as_mut()) }),
                 IterPhase::Done => return None,
+            };
+            if let Some(entry_ptr) = entry_ptr {
+                let entry: &'a mut SlotEntry<K, V> = unsafe { &mut *entry_ptr };
+                self.remaining -= 1;
+                return Some((&entry.key, &mut entry.value));
             }
+            self.phase = match self.phase {
+                IterPhase::Levels => IterPhase::Primary,
+                IterPhase::Primary => IterPhase::Fallback,
+                IterPhase::Fallback | IterPhase::Done => return None,
+            };
         }
     }
 
@@ -2888,7 +2830,6 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelIterMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelIterMut")
             .field("phase", &self.phase)
-            .field("level_idx", &self.level_idx)
             .field("remaining", &self.remaining)
             .finish_non_exhaustive()
     }
@@ -2911,7 +2852,7 @@ where
 /// `&mut V` iterator returned by [`FunnelHashMap::values_mut`].
 pub struct FunnelValuesMut<'a, K, V, A: Allocator + Clone = Global> {
     inner: FunnelIterMut<'a, K, V, A>,
-    _alloc: std::marker::PhantomData<A>,
+    _alloc: PhantomData<A>,
 }
 
 impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelValuesMut<'a, K, V, A> {
@@ -2933,21 +2874,50 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelValuesMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelValuesMut")
             .field("phase", &self.inner.phase)
-            .field("level_idx", &self.inner.level_idx)
             .field("remaining", &self.inner.remaining)
             .finish_non_exhaustive()
     }
 }
 
 /// Owned `(K, V)` iterator returned by `FunnelHashMap::into_iter`.
-///
-/// SAFETY: each yielded slot is immediately tombstoned, so the map's
-/// `Drop` never revisits it. `Drop` drains the remainder per std semantics.
+/// Holds levels + special + arena via `ManuallyDrop` so the inline scan
+/// ptr stays valid without a self-borrow. `Drop` drains, then frees.
 pub struct FunnelIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    map: FunnelHashMap<K, V, S, A>,
-    phase: IterPhase,
+    levels_ptr: *mut BucketLevel<SlotEntry<K, V>>,
+    levels_len: usize,
     level_idx: usize,
-    cursor: OccupiedCursor,
+    next_group_slot: usize,
+    current_group_slot: usize,
+    current_mask: BitMask,
+    /// Owns the levels box so `levels_ptr` stays valid.
+    levels: ManuallyDrop<BucketLevelSlice<K, V>>,
+    /// Special arrays are accessed directly via `self.special.primary` etc.
+    /// inside `next()`; kept alive here.
+    special: ManuallyDrop<SpecialArray<SlotEntry<K, V>>>,
+    arena: ManuallyDrop<Arena>,
+    alloc: A,
+    phase: IterPhase,
+    remaining: usize,
+    _marker: PhantomData<S>,
+}
+
+// SAFETY: raw pointers into owned `levels` / `arena`; Send/Sync match map.
+unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
+    for FunnelIntoIter<K, V, S, A>
+{
+}
+unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
+    for FunnelIntoIter<K, V, S, A>
+{
+}
+
+impl<K, V, S, A: Allocator + Clone> FunnelIntoIter<K, V, S, A> {
+    #[inline]
+    fn reset_cursor(&mut self) {
+        self.next_group_slot = 0;
+        self.current_group_slot = 0;
+        self.current_mask = BitMask(0);
+    }
 }
 
 impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
@@ -2957,39 +2927,51 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
         loop {
             match self.phase {
                 IterPhase::Levels => {
-                    while self.level_idx < self.map.levels.len() {
-                        let level = &mut self.map.levels[self.level_idx];
-                        if let Some(idx) = level.scan_next(&mut self.cursor) {
-                            // SAFETY: scan only yields occupied indices.
-                            // Tombstone-mark so the map's `Drop` skips it.
+                    while self.level_idx < self.levels_len {
+                        // SAFETY: `level_idx < levels_len`; `levels_ptr`
+                        // points into `self.levels` (alive via ManuallyDrop).
+                        let level = unsafe { &mut *self.levels_ptr.add(self.level_idx) };
+                        if let Some(idx) = level.scan_next(
+                            &mut self.next_group_slot,
+                            &mut self.current_group_slot,
+                            &mut self.current_mask,
+                        ) {
                             let entry = unsafe { level.take(idx) };
                             level.mark_tombstone(idx);
-                            self.map.len -= 1;
+                            self.remaining -= 1;
                             return Some((entry.key, entry.value));
                         }
                         self.level_idx += 1;
-                        self.cursor = OccupiedCursor::new();
+                        self.reset_cursor();
                     }
                     self.phase = IterPhase::Primary;
-                    self.cursor = OccupiedCursor::new();
+                    self.reset_cursor();
                 }
                 IterPhase::Primary => {
-                    let primary = &mut self.map.special.primary;
-                    if let Some(idx) = primary.scan_next(&mut self.cursor) {
+                    let primary = &mut self.special.primary;
+                    if let Some(idx) = primary.scan_next(
+                        &mut self.next_group_slot,
+                        &mut self.current_group_slot,
+                        &mut self.current_mask,
+                    ) {
                         let entry = unsafe { primary.take(idx) };
                         primary.mark_tombstone(idx);
-                        self.map.len -= 1;
+                        self.remaining -= 1;
                         return Some((entry.key, entry.value));
                     }
                     self.phase = IterPhase::Fallback;
-                    self.cursor = OccupiedCursor::new();
+                    self.reset_cursor();
                 }
                 IterPhase::Fallback => {
-                    let fallback = &mut self.map.special.fallback;
-                    if let Some(idx) = fallback.scan_next(&mut self.cursor) {
+                    let fallback = &mut self.special.fallback;
+                    if let Some(idx) = fallback.scan_next(
+                        &mut self.next_group_slot,
+                        &mut self.current_group_slot,
+                        &mut self.current_mask,
+                    ) {
                         let entry = unsafe { fallback.take(idx) };
                         fallback.mark_tombstone(idx);
-                        self.map.len -= 1;
+                        self.remaining -= 1;
                         return Some((entry.key, entry.value));
                     }
                     self.phase = IterPhase::Done;
@@ -3000,7 +2982,7 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.map.len, Some(self.map.len))
+        (self.remaining, Some(self.remaining))
     }
 }
 
@@ -3009,10 +2991,14 @@ impl<K, V, S, A: Allocator + Clone> FusedIterator for FunnelIntoIter<K, V, S, A>
 
 impl<K, V, S, A: Allocator + Clone> Drop for FunnelIntoIter<K, V, S, A> {
     fn drop(&mut self) {
-        // Drain the remainder so each owned `(K, V)` runs its `Drop`. After
-        // this, the map's own `Drop` finds only tombstones and is a no-op
-        // over the entries.
         for _ in self.by_ref() {}
+        // SAFETY: scan state is no longer used past this point.
+        unsafe {
+            ManuallyDrop::drop(&mut self.levels);
+            ManuallyDrop::drop(&mut self.special);
+            let arena = ManuallyDrop::take(&mut self.arena);
+            arena.deallocate(&self.alloc);
+        }
     }
 }
 
@@ -3020,8 +3006,7 @@ impl<K, V, S, A: Allocator + Clone> fmt::Debug for FunnelIntoIter<K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelIntoIter")
             .field("phase", &self.phase)
-            .field("level_idx", &self.level_idx)
-            .field("remaining", &self.map.len)
+            .field("remaining", &self.remaining)
             .finish_non_exhaustive()
     }
 }
@@ -3035,12 +3020,37 @@ where
     type Item = (K, V);
     type IntoIter = FunnelIntoIter<K, V, S, A>;
 
-    fn into_iter(self) -> Self::IntoIter {
+    fn into_iter(mut self) -> Self::IntoIter {
+        let mut levels = mem::take(&mut self.levels);
+        let special = mem::replace(
+            &mut self.special,
+            SpecialArray {
+                primary: SpecialPrimary::new_at(0, 0, ptr::null_mut(), ptr::null_mut()),
+                fallback: SpecialFallback::new_at(0, 0, 0, ptr::null_mut(), ptr::null_mut()),
+                total_len: 0,
+            },
+        );
+        let arena = mem::replace(&mut self.arena, Arena::empty());
+        let alloc = self.alloc.clone();
+        let remaining = self.len;
+        let levels_ptr = levels.as_mut_ptr();
+        let levels_len = levels.len();
+        // `self` drops below: empty levels / empty special / empty arena —
+        // all no-ops; hash_builder / etc. drop normally.
         FunnelIntoIter {
-            map: self,
-            phase: IterPhase::Levels,
+            levels_ptr,
+            levels_len,
             level_idx: 0,
-            cursor: OccupiedCursor::new(),
+            next_group_slot: 0,
+            current_group_slot: 0,
+            current_mask: BitMask(0),
+            levels: ManuallyDrop::new(levels),
+            special: ManuallyDrop::new(special),
+            arena: ManuallyDrop::new(arena),
+            alloc,
+            phase: IterPhase::Levels,
+            remaining,
+            _marker: PhantomData,
         }
     }
 }
@@ -3059,14 +3069,14 @@ pub type FunnelIntoValues<K, V, S = DefaultHashBuilder, A = Global> =
 ///
 /// # Safety
 ///
-/// - `levels_ptr` must point to a live `[BucketLevel<K, V>]` whose `level_idx`
+/// - `levels_ptr` must point to a live `[BucketLevel<SlotEntry<K, V>>]` whose `level_idx`
 ///   slot exists; same for `primary_ptr` / `fallback_ptr`.
 /// - The `slot_idx` carried by `loc` must reference an occupied slot.
 #[inline]
 unsafe fn funnel_slot_value_ptr<K, V>(
-    levels_ptr: *const BucketLevel<K, V>,
-    primary_ptr: *const SpecialPrimary<K, V>,
-    fallback_ptr: *const SpecialFallback<K, V>,
+    levels_ptr: *const BucketLevel<SlotEntry<K, V>>,
+    primary_ptr: *const SpecialPrimary<SlotEntry<K, V>>,
+    fallback_ptr: *const SpecialFallback<SlotEntry<K, V>>,
     loc: SlotLocation,
 ) -> *mut V {
     let entry = match loc {
@@ -3090,9 +3100,9 @@ unsafe fn funnel_slot_value_ptr<K, V>(
 /// As [`funnel_slot_value_ptr`] but returns key + value pointers together.
 #[inline]
 unsafe fn funnel_slot_kv_ptrs<K, V>(
-    levels_ptr: *const BucketLevel<K, V>,
-    primary_ptr: *const SpecialPrimary<K, V>,
-    fallback_ptr: *const SpecialFallback<K, V>,
+    levels_ptr: *const BucketLevel<SlotEntry<K, V>>,
+    primary_ptr: *const SpecialPrimary<SlotEntry<K, V>>,
+    fallback_ptr: *const SpecialFallback<SlotEntry<K, V>>,
     loc: SlotLocation,
 ) -> (*const K, *mut V) {
     let entry = match loc {
@@ -3525,7 +3535,7 @@ where
 {
 }
 
-impl<K, Q, V, S, A> std::ops::Index<&Q> for FunnelHashMap<K, V, S, A>
+impl<K, Q, V, S, A> Index<&Q> for FunnelHashMap<K, V, S, A>
 where
     K: Eq + Hash,
     Q: Hash + Equivalent<K> + ?Sized,
@@ -3599,6 +3609,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::hash::{BuildHasher, Hasher};
 
     #[test]
     fn funnel_layout_covers_capacity() {
@@ -3737,14 +3749,14 @@ mod tests {
         // Paper §5: A_{i,j} overflow must spill into A_{i+1}, not skip to the
         // special array. Constant hasher pins every key to the same L0 bucket.
         struct ConstHasher;
-        impl std::hash::Hasher for ConstHasher {
+        impl Hasher for ConstHasher {
             fn finish(&self) -> u64 {
                 0
             }
             fn write(&mut self, _: &[u8]) {}
         }
         struct ConstHashBuilder;
-        impl std::hash::BuildHasher for ConstHashBuilder {
+        impl BuildHasher for ConstHashBuilder {
             type Hasher = ConstHasher;
             fn build_hasher(&self) -> Self::Hasher {
                 ConstHasher

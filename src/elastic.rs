@@ -2,13 +2,15 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
-use std::mem;
+use std::mem::{self, ManuallyDrop};
+use std::ops::Index;
 use std::ptr;
 
 use allocator_api2::alloc::Layout;
 use equivalent::Equivalent;
 
-use crate::common::arena::{self, Arena, ArenaSlots, OccupiedCursor, SlotEntry};
+use crate::common::arena::{self, Arena, ArenaSlots, IterRange, SlotEntry};
+use crate::common::bitmask::BitMask;
 use crate::common::config::{
     DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY,
 };
@@ -24,11 +26,11 @@ use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
 /// [`SlotEntry`] data live contiguously in [`ElasticHashMap::arena`].
-struct Level<K, V> {
+struct Level<T> {
     /// Cached `arena.as_ptr() + ctrl_offset`, stamped at construction.
     ctrl_ptr: *mut u8,
     /// Cached `arena.as_ptr() + data_offset`, stamped at construction.
-    data_ptr: *mut SlotEntry<K, V>,
+    data_ptr: *mut T,
     /// Slot capacity (= `group_count` * `GROUP_SIZE`). Bounded by `capacity`
     /// via the arena layout, so `len`/`tombstones` fit in `u32` too.
     capacity: u32,
@@ -48,16 +50,16 @@ struct Level<K, V> {
     budget_cap: f64,
 }
 
-unsafe impl<K: Send, V: Send> Send for Level<K, V> {}
-unsafe impl<K: Sync, V: Sync> Sync for Level<K, V> {}
+unsafe impl<T: Send> Send for Level<T> {}
+unsafe impl<T: Sync> Sync for Level<T> {}
 
-impl<K, V> ArenaSlots<K, V> for Level<K, V> {
+impl<T> ArenaSlots<T> for Level<T> {
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
         self.ctrl_ptr
     }
     #[inline]
-    fn data_ptr(&self) -> *mut SlotEntry<K, V> {
+    fn data_ptr(&self) -> *mut T {
         self.data_ptr
     }
     #[inline]
@@ -66,7 +68,7 @@ impl<K, V> ArenaSlots<K, V> for Level<K, V> {
     }
 }
 
-impl<K, V> Level<K, V> {
+impl<T> Level<T> {
     /// Stamps a fresh descriptor at the given arena ptrs.
     /// Caller advances the offset cursor.
     fn new_at(
@@ -74,7 +76,7 @@ impl<K, V> Level<K, V> {
         cap_u32: u32,
         reserve_fraction: f64,
         ctrl_ptr: *mut u8,
-        data_ptr: *mut SlotEntry<K, V>,
+        data_ptr: *mut T,
     ) -> Self {
         let cap = cap_u32 as usize;
         let gc = cap_u32 / GROUP_SIZE_U32;
@@ -140,13 +142,18 @@ impl<K, V> Level<K, V> {
         probe::hash_to_usize(mixed) & self.group_count_mask as usize
     }
 
-    /// Triangular probe: fingerprint scan + key compare. Returns slot index on
-    /// hit, `None` on miss (stops at first EMPTY byte in the group sequence).
+    /// Triangular probe: fingerprint scan + caller-provided equality test.
+    /// Returns slot index on hit, `None` on miss (stops at first EMPTY byte
+    /// in the group sequence). Closure-driven so `Level<T>` stays K, V-free
+    /// at the type level — caller binds `|entry| key.equivalent(&entry.key)`
+    /// or set-style `|entry| key.equivalent(entry)`.
     #[inline]
-    fn find_by_probe<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> Option<usize>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
+    fn find_by_probe<F: FnMut(&T) -> bool>(
+        &self,
+        key_hash: u64,
+        key_fingerprint: u8,
+        mut eq: F,
+    ) -> Option<usize> {
         if self.len == 0 {
             return None;
         }
@@ -157,7 +164,7 @@ impl<K, V> Level<K, V> {
             for relative_idx in match_mask {
                 let slot_idx = probe.pos * GROUP_SIZE + relative_idx;
                 let entry = unsafe { self.get_ref(slot_idx) };
-                if key.equivalent(&entry.key) {
+                if eq(entry) {
                     return Some(slot_idx);
                 }
             }
@@ -184,7 +191,7 @@ impl<K, V> Level<K, V> {
 /// far better cache behavior than recomputing random positions.
 pub struct ElasticHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     /// Geometrically shrinking partition of capacity; length fixed at ctor.
-    levels: Box<[Level<K, V>]>,
+    levels: LevelSlice<K, V>,
     /// Total live entries.
     len: usize,
     /// Total slot count across all levels.
@@ -360,7 +367,9 @@ where
     }
 }
 
-type ElasticArenaBuild<K, V> = (Arena, Box<[Level<K, V>]>);
+/// Boxed slice of levels for one `(K, V)` parameterization.
+type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
+type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>);
 
 /// Stamps level descriptors with arena-relative `(ctrl_ptr, data_ptr)`.
 /// Split out so the alloc-then-deallocate-on-error wrapper stays shallow.
@@ -369,13 +378,13 @@ fn build_elastic_levels<K, V>(
     data_base_off: usize,
     level_capacities: &[usize],
     reserve_fraction: f64,
-) -> Result<Box<[Level<K, V>]>, TryReserveError> {
+) -> Result<LevelSlice<K, V>, TryReserveError> {
     let slot_size = u32::try_from(mem::size_of::<SlotEntry<K, V>>())
         .map_err(|_| TryReserveError::CapacityOverflow)?;
     let mut ctrl_off: u32 = 0;
     let mut data_off: u32 =
         u32::try_from(data_base_off).map_err(|_| TryReserveError::CapacityOverflow)?;
-    let mut levels: Vec<Level<K, V>> = Vec::new();
+    let mut levels: Vec<Level<SlotEntry<K, V>>> = Vec::new();
     levels
         .try_reserve_exact(level_capacities.len())
         .map_err(|_| TryReserveError::AllocError)?;
@@ -441,7 +450,7 @@ fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
 /// Owns the level slice so mut-iteration borrows from `guard.levels`.
 struct ArenaDropGuard<K, V, A: Allocator + Clone> {
     arena: Option<Arena>,
-    levels: Option<Box<[Level<K, V>]>>,
+    levels: Option<LevelSlice<K, V>>,
     alloc: A,
 }
 
@@ -707,7 +716,7 @@ where
         let locations = self.locate_disjoint(keys);
         arena::check_disjoint_aliasing(&locations);
 
-        let levels_ptr: *const Level<K, V> = self.levels.as_ptr();
+        let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
         std::array::from_fn(|i| {
             locations[i].map(|(level_idx, slot_idx)| {
                 // SAFETY: locations are unique among Somes (asserted above).
@@ -736,7 +745,7 @@ where
         let locations = self.locate_disjoint(keys);
         arena::check_disjoint_aliasing(&locations);
 
-        let levels_ptr: *const Level<K, V> = self.levels.as_ptr();
+        let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
         std::array::from_fn(|i| {
             locations[i].map(|(level_idx, slot_idx)| {
                 // SAFETY: as in `get_disjoint_mut`.
@@ -764,7 +773,7 @@ where
     {
         let locations = self.locate_disjoint(keys);
 
-        let levels_ptr: *const Level<K, V> = self.levels.as_ptr();
+        let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
         std::array::from_fn(|i| {
             locations[i].map(|(level_idx, slot_idx)| {
                 // SAFETY: caller guarantees the hits are pairwise distinct.
@@ -855,9 +864,7 @@ where
     #[must_use]
     pub fn iter(&self) -> ElasticIter<'_, K, V, A> {
         ElasticIter {
-            levels: self.levels.iter(),
-            current_level: None,
-            cursor: OccupiedCursor::new(),
+            iter: IterRange::new_shared(&self.levels),
             remaining: self.len,
             _alloc: PhantomData,
         }
@@ -883,16 +890,11 @@ where
 
     /// `(&K, &mut V)` iterator. Mirrors `HashMap::iter_mut`.
     pub fn iter_mut(&mut self) -> ElasticIterMut<'_, K, V, A> {
-        let levels_len = self.levels.len();
-        let levels = self.levels.as_mut_ptr();
         let remaining = self.len;
+        let iter = IterRange::new_mut(&mut self.levels);
         ElasticIterMut {
-            levels,
-            levels_len,
-            level_idx: 0,
-            cursor: OccupiedCursor::new(),
+            iter,
             remaining,
-            _marker: PhantomData,
             _alloc: PhantomData,
         }
     }
@@ -1003,10 +1005,12 @@ where
     /// Returns a draining iterator that empties the map. Mirrors
     /// [`std::collections::HashMap::drain`].
     pub fn drain(&mut self) -> Drain<'_, K, V, S, A> {
+        let map_ptr = ptr::from_mut(self);
+        let iter = IterRange::new_mut(&mut self.levels);
         Drain {
-            map: self,
-            level_idx: 0,
-            cursor: OccupiedCursor::new(),
+            iter,
+            map_ptr,
+            _marker: PhantomData,
         }
     }
 
@@ -1017,11 +1021,13 @@ where
     where
         F: FnMut(&K, &mut V) -> bool,
     {
+        let map_ptr = ptr::from_mut(self);
+        let iter = IterRange::new_mut(&mut self.levels);
         ExtractIf {
-            map: self,
+            iter,
+            map_ptr,
             pred: f,
-            level_idx: 0,
-            cursor: OccupiedCursor::new(),
+            _marker: PhantomData,
         }
     }
 }
@@ -1238,17 +1244,19 @@ where
 /// Draining iterator. Yields and removes every `(K, V)` entry; the map is
 /// empty once the iterator is consumed or dropped. Returned by
 /// [`ElasticHashMap::drain`].
+///
+/// SAFETY: `iter` + `map_ptr` alias the same allocation, but each step
+/// uses fresh temp `&mut`s only; `PhantomData` brands the `'a` borrow.
 pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    map: &'a mut ElasticHashMap<K, V, S, A>,
-    level_idx: usize,
-    cursor: OccupiedCursor,
+    iter: IterRange<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
+    map_ptr: *mut ElasticHashMap<K, V, S, A>,
+    _marker: PhantomData<&'a mut ElasticHashMap<K, V, S, A>>,
 }
 
 impl<K, V, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Drain")
-            .field("level_idx", &self.level_idx)
-            .field("remaining", &self.map.len)
+            .field("remaining", &unsafe { (*self.map_ptr).len })
             .finish_non_exhaustive()
     }
 }
@@ -1260,21 +1268,15 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
         // Per-yield ctrl byte update is skipped: Drain::drop wipes all ctrls
         // via `clear_all_controls` regardless, and the scan only advances
         // forward so yielded slots are never re-read.
-        while self.level_idx < self.map.levels.len() {
-            let level = &mut self.map.levels[self.level_idx];
-            if let Some(idx) = level.scan_next(&mut self.cursor) {
-                let entry = unsafe { level.take(idx) };
-                self.map.len -= 1;
-                return Some((entry.key, entry.value));
-            }
-            self.level_idx += 1;
-            self.cursor = OccupiedCursor::new();
-        }
-        None
+        let handle = self.iter.next_handle()?;
+        let entry = unsafe { handle.read() };
+        unsafe { (*self.map_ptr).len -= 1 };
+        Some((entry.key, entry.value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.map.len, Some(self.map.len))
+        let len = unsafe { (*self.map_ptr).len };
+        (len, Some(len))
     }
 }
 
@@ -1286,31 +1288,35 @@ impl<K, V, S, A: Allocator + Clone> Drop for Drain<'_, K, V, S, A> {
         // Drain any unyielded entries so values run their `Drop`.
         for _ in &mut *self {}
         // All entries moved out via `next()`; wipe ctrl bytes + counters en bloc.
-        for level in &mut self.map.levels {
+        let map = unsafe { &mut *self.map_ptr };
+        for level in &mut map.levels {
             level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
         }
-        self.map.len = 0;
-        self.map.max_populated_level = 0;
-        self.map.current_batch_index = 0;
-        self.map.batch_remaining = self.map.batch_plan.first().copied().unwrap_or(0);
+        map.len = 0;
+        map.max_populated_level = 0;
+        map.current_batch_index = 0;
+        map.batch_remaining = map.batch_plan.first().copied().unwrap_or(0);
     }
 }
 
 /// Filtering drain. Yields and removes entries for which the predicate
 /// returns `true`; the rest stay in the map. Returned by
 /// [`ElasticHashMap::extract_if`].
+///
+/// SAFETY: as [`Drain`] — `scanner` + `map_ptr` alias the same allocation;
+/// each step uses fresh temporary `&mut`s only.
 pub struct ExtractIf<'a, K, V, F, S = DefaultHashBuilder, A: Allocator + Clone = Global>
 where
     K: Eq + Hash,
     S: BuildHasher,
     F: FnMut(&K, &mut V) -> bool,
 {
-    map: &'a mut ElasticHashMap<K, V, S, A>,
+    iter: IterRange<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
+    map_ptr: *mut ElasticHashMap<K, V, S, A>,
     pred: F,
-    level_idx: usize,
-    cursor: OccupiedCursor,
+    _marker: PhantomData<&'a mut ElasticHashMap<K, V, S, A>>,
 }
 
 impl<K, V, F, S, A: Allocator + Clone> fmt::Debug for ExtractIf<'_, K, V, F, S, A>
@@ -1321,8 +1327,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ExtractIf")
-            .field("level_idx", &self.level_idx)
-            .field("remaining", &self.map.len)
+            .field("remaining", &unsafe { (*self.map_ptr).len })
             .finish_non_exhaustive()
     }
 }
@@ -1336,28 +1341,28 @@ where
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.level_idx < self.map.levels.len() {
-            let level = &mut self.map.levels[self.level_idx];
-            while let Some(idx) = level.scan_next(&mut self.cursor) {
-                // In-place borrow so predicate mutations stick on kept entries.
-                let entry = unsafe { level.get_mut(idx) };
-                if (self.pred)(&entry.key, &mut entry.value) {
-                    let removed = unsafe { level.take(idx) };
-                    level.mark_tombstone(idx);
-                    level.len -= 1;
-                    level.tombstones += 1;
-                    self.map.len -= 1;
-                    return Some((removed.key, removed.value));
+        while let Some(mut handle) = self.iter.next_handle() {
+            // In-place borrow so predicate mutations stick on kept entries.
+            let entry = unsafe { handle.as_mut() };
+            if (self.pred)(&entry.key, &mut entry.value) {
+                let level_ptr = handle.descriptor_ptr();
+                // Tombstone before read so a panic between (none expected
+                // here, but defensively) leaves no OCCUPIED to double-drop.
+                unsafe {
+                    handle.tombstone();
+                    (*level_ptr).len -= 1;
+                    (*level_ptr).tombstones += 1;
+                    (*self.map_ptr).len -= 1;
                 }
+                let removed = unsafe { handle.read() };
+                return Some((removed.key, removed.value));
             }
-            self.level_idx += 1;
-            self.cursor = OccupiedCursor::new();
         }
         None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.map.len))
+        (0, Some(unsafe { (*self.map_ptr).len }))
     }
 }
 
@@ -1375,9 +1380,7 @@ where
 
 /// Borrowing iterator over occupied entries.
 pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
-    levels: std::slice::Iter<'a, Level<K, V>>,
-    current_level: Option<&'a Level<K, V>>,
-    cursor: OccupiedCursor,
+    iter: IterRange<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
     remaining: usize,
     _alloc: PhantomData<&'a A>,
 }
@@ -1385,9 +1388,7 @@ pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
 impl<K, V, A: Allocator + Clone> Clone for ElasticIter<'_, K, V, A> {
     fn clone(&self) -> Self {
         Self {
-            levels: self.levels.clone(),
-            current_level: self.current_level,
-            cursor: self.cursor.clone(),
+            iter: self.iter.clone(),
             remaining: self.remaining,
             _alloc: PhantomData,
         }
@@ -1404,19 +1405,12 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIter<'a, K, V, A> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let Some(level) = self.current_level else {
-                self.current_level = Some(self.levels.next()?);
-                self.cursor = OccupiedCursor::new();
-                continue;
-            };
-            if let Some(slot_idx) = level.scan_next(&mut self.cursor) {
-                let entry = unsafe { level.get_ref(slot_idx) };
-                self.remaining -= 1;
-                return Some((&entry.key, &entry.value));
-            }
-            self.current_level = None;
-        }
+        let handle = self.iter.next_handle()?;
+        // SAFETY: ElasticIter holds a shared borrow of the levels; only
+        // `as_ref` is called on the handle.
+        let entry = unsafe { handle.as_ref() };
+        self.remaining -= 1;
+        Some((&entry.key, &entry.value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1447,46 +1441,26 @@ pub type Keys<'a, K, V, A = Global> = CommonKeys<ElasticIter<'a, K, V, A>>;
 pub type Values<'a, K, V, A = Global> = CommonValues<ElasticIter<'a, K, V, A>>;
 
 /// `(&K, &mut V)` iterator. Walks levels in storage order, skipping FREE
-/// and TOMBSTONE slots.
-///
-/// SAFETY: raw pointer + `PhantomData<&'a mut [Level<K, V>]>` ties the
-/// iterator to the exclusive borrow of the map. Each `next()` returns a
-/// borrow of a strictly newer slot, so produced references are disjoint.
+/// and TOMBSTONE slots. Each `next()` yields a strictly newer slot ⇒
+/// returned `&mut V`s are disjoint.
 pub struct ElasticIterMut<'a, K, V, A: Allocator + Clone = Global> {
-    levels: *mut Level<K, V>,
-    levels_len: usize,
-    level_idx: usize,
-    cursor: OccupiedCursor,
+    iter: IterRange<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
     remaining: usize,
-    _marker: PhantomData<&'a mut [Level<K, V>]>,
     _alloc: PhantomData<A>,
 }
-
-// SAFETY: behaves as `&mut [Level<K, V>]` for its lifetime.
-unsafe impl<K: Send, V: Send, A: Allocator + Clone + Send> Send for ElasticIterMut<'_, K, V, A> {}
-unsafe impl<K: Sync, V: Sync, A: Allocator + Clone + Sync> Sync for ElasticIterMut<'_, K, V, A> {}
 
 impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIterMut<'a, K, V, A> {
     type Item = (&'a K, &'a mut V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.level_idx < self.levels_len {
-            // SAFETY: `level_idx < levels_len`; `self.levels` points at an
-            // owned slice of initialized `Level`s. Fresh `&mut` each iter.
-            let level = unsafe { &mut *self.levels.add(self.level_idx) };
-            if let Some(idx) = level.scan_next(&mut self.cursor) {
-                // SAFETY: scan only yields occupied slots; reborrow through
-                // raw ptr so refs outlive the per-iter `level` reborrow.
-                let entry = unsafe { level.get_mut(idx) };
-                let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
-                let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
-                self.remaining -= 1;
-                return Some((key, val));
-            }
-            self.level_idx += 1;
-            self.cursor = OccupiedCursor::new();
-        }
-        None
+        let mut handle = self.iter.next_handle()?;
+        // SAFETY: scanner yielded a fresh handle; reborrow through raw
+        // ptrs so refs outlive the handle's `&mut Level` borrow.
+        let entry = unsafe { handle.as_mut() };
+        let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
+        let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
+        self.remaining -= 1;
+        Some((key, val))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1500,7 +1474,6 @@ impl<K, V, A: Allocator + Clone> FusedIterator for ElasticIterMut<'_, K, V, A> {
 impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticIterMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ElasticIterMut")
-            .field("level_idx", &self.level_idx)
             .field("remaining", &self.remaining)
             .finish_non_exhaustive()
     }
@@ -1543,41 +1516,70 @@ impl<K, V, A: Allocator + Clone> FusedIterator for ElasticValuesMut<'_, K, V, A>
 impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticValuesMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ElasticValuesMut")
-            .field("level_idx", &self.inner.level_idx)
             .field("remaining", &self.inner.remaining)
             .finish_non_exhaustive()
     }
 }
 
 /// Consuming `(K, V)` iterator returned by `ElasticHashMap::into_iter`.
+/// Holds levels + arena via `ManuallyDrop` so the inline scan ptr stays
+/// valid without a self-borrow. `Drop` drains, then frees.
 pub struct ElasticIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    map: ElasticHashMap<K, V, S, A>,
+    /// Raw walker over `*self.levels`. Cursor state inline; no lifetime tie
+    /// needed — the box is kept alive here via `ManuallyDrop`.
+    levels_ptr: *mut Level<SlotEntry<K, V>>,
+    levels_len: usize,
     level_idx: usize,
-    cursor: OccupiedCursor,
+    next_group_slot: usize,
+    current_group_slot: usize,
+    current_mask: BitMask,
+    levels: ManuallyDrop<LevelSlice<K, V>>,
+    arena: ManuallyDrop<Arena>,
+    alloc: A,
+    remaining: usize,
+    _marker: PhantomData<S>,
+}
+
+// SAFETY: raw pointers into owned `levels` / `arena`; Send/Sync match map.
+unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
+    for ElasticIntoIter<K, V, S, A>
+{
+}
+unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
+    for ElasticIntoIter<K, V, S, A>
+{
 }
 
 impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.level_idx < self.map.levels.len() {
-            let level = &mut self.map.levels[self.level_idx];
-            if let Some(idx) = level.scan_next(&mut self.cursor) {
+        while self.level_idx < self.levels_len {
+            // SAFETY: `level_idx < levels_len`; `levels_ptr` points at the
+            // box's data, kept alive by `self.levels: ManuallyDrop`.
+            let level = unsafe { &mut *self.levels_ptr.add(self.level_idx) };
+            if let Some(idx) = level.scan_next(
+                &mut self.next_group_slot,
+                &mut self.current_group_slot,
+                &mut self.current_mask,
+            ) {
                 // SAFETY: scan only yields occupied slots. Tombstone-mark
-                // prevents map's Drop and future next() from revisiting.
+                // prevents future revisits if `Drop` runs mid-iteration.
                 let entry = unsafe { level.take(idx) };
                 level.mark_tombstone(idx);
-                self.map.len -= 1;
+                self.remaining -= 1;
                 return Some((entry.key, entry.value));
             }
             self.level_idx += 1;
-            self.cursor = OccupiedCursor::new();
+            self.next_group_slot = 0;
+            self.current_group_slot = 0;
+            self.current_mask = BitMask(0);
         }
         None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.map.len, Some(self.map.len))
+        (self.remaining, Some(self.remaining))
     }
 }
 
@@ -1586,17 +1588,23 @@ impl<K, V, S, A: Allocator + Clone> FusedIterator for ElasticIntoIter<K, V, S, A
 
 impl<K, V, S, A: Allocator + Clone> Drop for ElasticIntoIter<K, V, S, A> {
     fn drop(&mut self) {
-        // Drain remaining entries so each runs its Drop; map's Drop then
-        // sees only tombstones.
+        // Drain any unyielded entries so values run their Drop.
         for _ in self.by_ref() {}
+        // SAFETY: scanner is no longer used past this point. Drop the
+        // levels box (descriptors only, no remaining values), then free
+        // the arena.
+        unsafe {
+            ManuallyDrop::drop(&mut self.levels);
+            let arena = ManuallyDrop::take(&mut self.arena);
+            arena.deallocate(&self.alloc);
+        }
     }
 }
 
 impl<K, V, S, A: Allocator + Clone> fmt::Debug for ElasticIntoIter<K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ElasticIntoIter")
-            .field("level_idx", &self.level_idx)
-            .field("remaining", &self.map.len)
+            .field("remaining", &self.remaining)
             .finish_non_exhaustive()
     }
 }
@@ -1610,11 +1618,27 @@ where
     type Item = (K, V);
     type IntoIter = ElasticIntoIter<K, V, S, A>;
 
-    fn into_iter(self) -> Self::IntoIter {
+    fn into_iter(mut self) -> Self::IntoIter {
+        let mut levels = mem::take(&mut self.levels);
+        let arena = mem::replace(&mut self.arena, Arena::empty());
+        let alloc = self.alloc.clone();
+        let remaining = self.len;
+        let levels_ptr = levels.as_mut_ptr();
+        let levels_len = levels.len();
+        // `self` drops below: empty levels + empty arena = no-op on the
+        // arena/data side; hash_builder / batch_plan / etc. drop normally.
         ElasticIntoIter {
-            map: self,
+            levels_ptr,
+            levels_len,
             level_idx: 0,
-            cursor: OccupiedCursor::new(),
+            next_group_slot: 0,
+            current_group_slot: 0,
+            current_mask: BitMask(0),
+            levels: ManuallyDrop::new(levels),
+            arena: ManuallyDrop::new(arena),
+            alloc,
+            remaining,
+            _marker: PhantomData,
         }
     }
 }
@@ -1903,7 +1927,9 @@ where
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            if let Some(slot_idx) = level.find_by_probe(key_hash, key_fingerprint, key) {
+            if let Some(slot_idx) = level.find_by_probe(key_hash, key_fingerprint, |entry| {
+                key.equivalent(&entry.key)
+            }) {
                 return Some((level_idx, slot_idx));
             }
         }
@@ -1978,11 +2004,11 @@ where
 ///
 /// # Safety
 ///
-/// - `levels_ptr` must point to the map's live `[Level<K, V>]`.
+/// - `levels_ptr` must point to the map's live `[Level<SlotEntry<K, V>>]`.
 /// - `slot_idx` must be an occupied slot in that level.
 #[inline]
 unsafe fn elastic_slot_value_ptr<K, V>(
-    levels_ptr: *const Level<K, V>,
+    levels_ptr: *const Level<SlotEntry<K, V>>,
     level_idx: usize,
     slot_idx: usize,
 ) -> *mut V {
@@ -1993,7 +2019,7 @@ unsafe fn elastic_slot_value_ptr<K, V>(
 /// As [`elastic_slot_value_ptr`] but returns key + value pointers together.
 #[inline]
 unsafe fn elastic_slot_kv_ptrs<K, V>(
-    levels_ptr: *const Level<K, V>,
+    levels_ptr: *const Level<SlotEntry<K, V>>,
     level_idx: usize,
     slot_idx: usize,
 ) -> (*const K, *mut V) {
@@ -2224,7 +2250,7 @@ where
 {
 }
 
-impl<K, Q, V, S, A> std::ops::Index<&Q> for ElasticHashMap<K, V, S, A>
+impl<K, Q, V, S, A> Index<&Q> for ElasticHashMap<K, V, S, A>
 where
     K: Eq + Hash,
     Q: Hash + Equivalent<K> + ?Sized,
