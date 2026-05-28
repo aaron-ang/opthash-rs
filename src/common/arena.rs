@@ -255,7 +255,7 @@ pub(crate) trait ArenaSlots<T> {
     where
         Self: Sized,
     {
-        IterRange::new_shared(std::slice::from_ref(self))
+        IterRange::new(std::slice::from_ref(self))
     }
 
     /// Drop every slot value in occupied slots.
@@ -294,85 +294,47 @@ pub(crate) trait ArenaSlots<T> {
     }
 }
 
-/// Scanner over a slice of `D` descriptors (1 or more). Pointer-walking
-/// internals (hashbrown-style): `next_ctrl` advances by `GROUP_SIZE` per
-/// group, `end_ctrl` is the per-region bound. Returns [`SlotHandle`]s via
-/// `next_handle()` or raw indices via `Iterator<Item = usize>`.
-///
-/// `new_shared(&[D])` constructs read-only; mutating handle methods
-/// (`as_mut`/`read`/`tombstone`) are UB. `new_mut(&mut [D])` allows all.
-pub(crate) struct IterRange<'a, T, D: ArenaSlots<T>> {
-    levels: *mut D,
-    levels_len: usize,
-    level_idx: usize,
-    /// Ptr to the next group's first ctrl byte (or `end_ctrl` if exhausted).
-    next_ctrl: *const u8,
-    /// One-past-end of the current region's ctrl bytes.
-    end_ctrl: *const u8,
-    /// Slot offset of the currently-loaded group. Initialized to wrap so
-    /// the first load lands at 0 after `wrapping_add(GROUP_SIZE)`.
-    current_group_slot: usize,
-    current_mask: BitMask,
-    _marker: PhantomData<(&'a mut [D], *mut T)>,
-}
-
 /// Initial slot offset that becomes `0` after the first
 /// `wrapping_add(GROUP_SIZE)` on group load.
 pub(crate) const CURRENT_SLOT_INIT: usize = 0_usize.wrapping_sub(GROUP_SIZE);
 
-// SAFETY: behaves as `&mut [D]` for its lifetime.
-unsafe impl<T: Send, D: ArenaSlots<T> + Send> Send for IterRange<'_, T, D> {}
-unsafe impl<T: Sync, D: ArenaSlots<T> + Sync> Sync for IterRange<'_, T, D> {}
+/// Pointer-walk cursor over one region. Shared scan logic between
+/// [`IterRange`] / [`IterRangeMut`] and inline holders that need a phase
+/// machine (e.g. funnel iters spanning levels + special arrays).
+pub(crate) struct ScanCursor {
+    /// Ptr to the next group's first ctrl byte (or `end_ctrl` if done).
+    next_ctrl: *const u8,
+    /// One-past-end of the current region's ctrl bytes.
+    end_ctrl: *const u8,
+    /// Slot offset of the currently-loaded group. See [`CURRENT_SLOT_INIT`].
+    current_group_slot: usize,
+    current_mask: BitMask,
+}
 
-impl<'a, T, D: ArenaSlots<T>> IterRange<'a, T, D> {
-    /// Read-only scanner. Caller must restrict yielded handles to
-    /// [`SlotHandle::as_ref`] — calling `as_mut` / `read` / `tombstone` is
-    /// UB (aliases the shared borrow).
+impl ScanCursor {
     #[inline]
-    pub(crate) fn new_shared(slice: &'a [D]) -> Self {
-        Self::new_raw(slice.as_ptr().cast_mut(), slice.len())
-    }
-
-    /// Mut scanner. All [`SlotHandle`] methods are usable.
-    #[inline]
-    pub(crate) fn new_mut(slice: &'a mut [D]) -> Self {
-        Self::new_raw(slice.as_mut_ptr(), slice.len())
-    }
-
-    #[inline]
-    fn new_raw(levels: *mut D, levels_len: usize) -> Self {
-        let mut me = Self {
-            levels,
-            levels_len,
-            level_idx: 0,
+    pub(crate) fn empty() -> Self {
+        Self {
             next_ctrl: ptr::null(),
             end_ctrl: ptr::null(),
             current_group_slot: CURRENT_SLOT_INIT,
             current_mask: BitMask(0),
-            _marker: PhantomData,
-        };
-        if levels_len > 0 {
-            me.init_region();
         }
-        me
     }
 
-    /// Set the ctrl pointer pair for the current level.
+    /// Set ctrl pointers + reset state for a new region.
     #[inline]
-    fn init_region(&mut self) {
-        // SAFETY: caller (only `new_raw`/`Iterator::next`/`next_handle`)
-        // guards `level_idx < levels_len`.
-        let level = unsafe { &*self.levels.add(self.level_idx) };
-        self.next_ctrl = level.ctrl_ptr();
-        self.end_ctrl = unsafe { level.ctrl_ptr().add(level.capacity()) };
+    pub(crate) fn set_region<T, D: ArenaSlots<T> + ?Sized>(&mut self, region: &D) {
+        self.next_ctrl = region.ctrl_ptr();
+        // SAFETY: `ctrl_ptr() + capacity()` is one-past-end of the ctrl bytes.
+        self.end_ctrl = unsafe { region.ctrl_ptr().add(region.capacity()) };
         self.current_group_slot = CURRENT_SLOT_INIT;
         self.current_mask = BitMask(0);
     }
 
-    /// Advance the scan one step, returning the next occupied slot index
-    /// in the current region. Returns `None` when the region is exhausted.
+    /// Advance one step in the current region.
     #[inline]
-    fn scan_step(&mut self) -> Option<usize> {
+    pub(crate) fn step(&mut self) -> Option<usize> {
         loop {
             if let Some(bit) = self.current_mask.next() {
                 return Some(self.current_group_slot.wrapping_add(bit));
@@ -386,13 +348,145 @@ impl<'a, T, D: ArenaSlots<T>> IterRange<'a, T, D> {
             self.next_ctrl = unsafe { self.next_ctrl.add(GROUP_SIZE) };
         }
     }
+}
 
-    /// Yields a [`SlotHandle`] over the next occupied slot. Caller picks
-    /// `as_ref` / `as_mut` / `read` / `tombstone` per its semantics.
+impl Clone for ScanCursor {
+    fn clone(&self) -> Self {
+        Self {
+            next_ctrl: self.next_ctrl,
+            end_ctrl: self.end_ctrl,
+            current_group_slot: self.current_group_slot,
+            current_mask: self.current_mask.clone(),
+        }
+    }
+}
+
+/// Shared scanner over a slice of `D` descriptors. Pointer-walking
+/// internals: `next_ctrl` advances by `GROUP_SIZE` per group; `end_ctrl`
+/// bounds the current region.
+///
+/// Read-only — yielded [`SlotHandle`]s are sound to call `as_ref` on
+/// only. For mutating scans use [`IterRangeMut`].
+pub(crate) struct IterRange<'a, T, D: ArenaSlots<T>> {
+    levels: *const D,
+    levels_len: usize,
+    level_idx: usize,
+    cursor: ScanCursor,
+    _marker: PhantomData<(&'a [D], *const T)>,
+}
+
+// SAFETY: shared borrow of `[D]` is `Send` iff `D: Sync`; same here.
+unsafe impl<T: Sync, D: ArenaSlots<T> + Sync> Send for IterRange<'_, T, D> {}
+unsafe impl<T: Sync, D: ArenaSlots<T> + Sync> Sync for IterRange<'_, T, D> {}
+
+impl<'a, T, D: ArenaSlots<T>> IterRange<'a, T, D> {
+    #[inline]
+    pub(crate) fn new(slice: &'a [D]) -> Self {
+        let mut me = Self {
+            levels: slice.as_ptr(),
+            levels_len: slice.len(),
+            level_idx: 0,
+            cursor: ScanCursor::empty(),
+            _marker: PhantomData,
+        };
+        if me.levels_len > 0 {
+            // SAFETY: levels_len > 0.
+            me.cursor.set_region(unsafe { &*me.levels });
+        }
+        me
+    }
+
     #[inline]
     pub(crate) fn next_handle(&mut self) -> Option<SlotHandle<'a, T, D>> {
         loop {
-            if let Some(idx) = self.scan_step() {
+            if let Some(idx) = self.cursor.step() {
+                // SAFETY: `level_idx < levels_len` (cursor.step returned).
+                let level_ptr = unsafe { self.levels.add(self.level_idx) }.cast_mut();
+                return Some(SlotHandle {
+                    descriptor: level_ptr,
+                    idx,
+                    _marker: PhantomData,
+                });
+            }
+            self.level_idx += 1;
+            if self.level_idx >= self.levels_len {
+                return None;
+            }
+            // SAFETY: level_idx < levels_len.
+            self.cursor
+                .set_region(unsafe { &*self.levels.add(self.level_idx) });
+        }
+    }
+}
+
+impl<T, D: ArenaSlots<T>> Clone for IterRange<'_, T, D> {
+    fn clone(&self) -> Self {
+        Self {
+            levels: self.levels,
+            levels_len: self.levels_len,
+            level_idx: self.level_idx,
+            cursor: self.cursor.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T, D: ArenaSlots<T>> Iterator for IterRange<'_, T, D> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            if let Some(idx) = self.cursor.step() {
+                return Some(idx);
+            }
+            self.level_idx += 1;
+            if self.level_idx >= self.levels_len {
+                return None;
+            }
+            self.cursor
+                .set_region(unsafe { &*self.levels.add(self.level_idx) });
+        }
+    }
+}
+
+/// Mut sibling of [`IterRange`]. Holds exclusive ptrs into `[D]`; yielded
+/// [`SlotHandle`]s permit `as_mut` / `read` / `tombstone`. Not `Clone` —
+/// would alias `&mut`.
+pub(crate) struct IterRangeMut<'a, T, D: ArenaSlots<T>> {
+    levels: *mut D,
+    levels_len: usize,
+    level_idx: usize,
+    cursor: ScanCursor,
+    _marker: PhantomData<(&'a mut [D], *mut T)>,
+}
+
+// SAFETY: exclusive borrow of `[D]` is `Send` iff `D: Send`.
+unsafe impl<T: Send, D: ArenaSlots<T> + Send> Send for IterRangeMut<'_, T, D> {}
+unsafe impl<T: Sync, D: ArenaSlots<T> + Sync> Sync for IterRangeMut<'_, T, D> {}
+
+impl<'a, T, D: ArenaSlots<T>> IterRangeMut<'a, T, D> {
+    #[inline]
+    pub(crate) fn new(slice: &'a mut [D]) -> Self {
+        let mut me = Self {
+            levels: slice.as_mut_ptr(),
+            levels_len: slice.len(),
+            level_idx: 0,
+            cursor: ScanCursor::empty(),
+            _marker: PhantomData,
+        };
+        if me.levels_len > 0 {
+            // SAFETY: levels_len > 0.
+            me.cursor.set_region(unsafe { &*me.levels });
+        }
+        me
+    }
+
+    #[inline]
+    pub(crate) fn next_handle(&mut self) -> Option<SlotHandle<'a, T, D>> {
+        loop {
+            if let Some(idx) = self.cursor.step() {
+                // SAFETY: `level_idx < levels_len` (cursor.step returned).
                 let level_ptr = unsafe { self.levels.add(self.level_idx) };
                 return Some(SlotHandle {
                     descriptor: level_ptr,
@@ -404,42 +498,9 @@ impl<'a, T, D: ArenaSlots<T>> IterRange<'a, T, D> {
             if self.level_idx >= self.levels_len {
                 return None;
             }
-            self.init_region();
-        }
-    }
-}
-
-impl<T, D: ArenaSlots<T>> Clone for IterRange<'_, T, D> {
-    fn clone(&self) -> Self {
-        Self {
-            levels: self.levels,
-            levels_len: self.levels_len,
-            level_idx: self.level_idx,
-            next_ctrl: self.next_ctrl,
-            end_ctrl: self.end_ctrl,
-            current_group_slot: self.current_group_slot,
-            current_mask: self.current_mask.clone(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-/// Plain `usize` walker — for drop loops / simple scans that don't need
-/// [`SlotHandle`].
-impl<T, D: ArenaSlots<T>> Iterator for IterRange<'_, T, D> {
-    type Item = usize;
-
-    #[inline]
-    fn next(&mut self) -> Option<usize> {
-        loop {
-            if let Some(idx) = self.scan_step() {
-                return Some(idx);
-            }
-            self.level_idx += 1;
-            if self.level_idx >= self.levels_len {
-                return None;
-            }
-            self.init_region();
+            // SAFETY: level_idx < levels_len.
+            self.cursor
+                .set_region(unsafe { &*self.levels.add(self.level_idx) });
         }
     }
 }
@@ -455,11 +516,6 @@ pub(crate) struct SlotHandle<'a, T, D: ArenaSlots<T>> {
 }
 
 impl<'a, T, D: ArenaSlots<T>> SlotHandle<'a, T, D> {
-    #[inline]
-    pub(crate) fn idx(&self) -> usize {
-        self.idx
-    }
-
     /// Raw descriptor pointer. Caller uses it to mutate per-region state
     /// (e.g. `level.len -= 1`) without going through the handle.
     #[inline]

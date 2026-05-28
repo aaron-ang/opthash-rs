@@ -9,7 +9,9 @@ use std::ptr;
 use allocator_api2::alloc::Layout;
 use equivalent::Equivalent;
 
-use crate::common::arena::{self, Arena, ArenaSlots, CURRENT_SLOT_INIT, IterRange, SlotEntry};
+use crate::common::arena::{
+    self, Arena, ArenaSlots, CURRENT_SLOT_INIT, IterRange, IterRangeMut, SlotEntry,
+};
 use crate::common::bitmask::BitMask;
 use crate::common::config::{
     DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY,
@@ -865,7 +867,7 @@ where
     #[must_use]
     pub fn iter(&self) -> ElasticIter<'_, K, V, A> {
         ElasticIter {
-            iter: IterRange::new_shared(&self.levels),
+            iter: IterRange::new(&self.levels),
             remaining: self.len,
             _alloc: PhantomData,
         }
@@ -892,7 +894,7 @@ where
     /// `(&K, &mut V)` iterator. Mirrors `HashMap::iter_mut`.
     pub fn iter_mut(&mut self) -> ElasticIterMut<'_, K, V, A> {
         let remaining = self.len;
-        let iter = IterRange::new_mut(&mut self.levels);
+        let iter = IterRangeMut::new(&mut self.levels);
         ElasticIterMut {
             iter,
             remaining,
@@ -1007,7 +1009,7 @@ where
     /// [`std::collections::HashMap::drain`].
     pub fn drain(&mut self) -> Drain<'_, K, V, S, A> {
         let map_ptr = ptr::from_mut(self);
-        let iter = IterRange::new_mut(&mut self.levels);
+        let iter = IterRangeMut::new(&mut self.levels);
         Drain {
             iter,
             map_ptr,
@@ -1023,7 +1025,7 @@ where
         F: FnMut(&K, &mut V) -> bool,
     {
         let map_ptr = ptr::from_mut(self);
-        let iter = IterRange::new_mut(&mut self.levels);
+        let iter = IterRangeMut::new(&mut self.levels);
         ExtractIf {
             iter,
             map_ptr,
@@ -1249,7 +1251,7 @@ where
 /// SAFETY: `iter` + `map_ptr` alias the same allocation, but each step
 /// uses fresh temp `&mut`s only; `PhantomData` brands the `'a` borrow.
 pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    iter: IterRange<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
+    iter: IterRangeMut<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
     map_ptr: *mut ElasticHashMap<K, V, S, A>,
     _marker: PhantomData<&'a mut ElasticHashMap<K, V, S, A>>,
 }
@@ -1314,7 +1316,7 @@ where
     S: BuildHasher,
     F: FnMut(&K, &mut V) -> bool,
 {
-    iter: IterRange<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
+    iter: IterRangeMut<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
     map_ptr: *mut ElasticHashMap<K, V, S, A>,
     pred: F,
     _marker: PhantomData<&'a mut ElasticHashMap<K, V, S, A>>,
@@ -1445,7 +1447,7 @@ pub type Values<'a, K, V, A = Global> = CommonValues<ElasticIter<'a, K, V, A>>;
 /// and TOMBSTONE slots. Each `next()` yields a strictly newer slot ⇒
 /// returned `&mut V`s are disjoint.
 pub struct ElasticIterMut<'a, K, V, A: Allocator + Clone = Global> {
-    iter: IterRange<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
+    iter: IterRangeMut<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
     remaining: usize,
     _alloc: PhantomData<A>,
 }
