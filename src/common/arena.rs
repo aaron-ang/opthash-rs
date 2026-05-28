@@ -248,35 +248,6 @@ pub(crate) trait ArenaSlots<T> {
         }
     }
 
-    /// Advance one step of an occupied-slot scan. Cursor state is passed
-    /// inline so scanners can hold the fields directly.
-    #[inline]
-    fn scan_next(
-        &self,
-        next_group_slot: &mut usize,
-        current_group_slot: &mut usize,
-        current_mask: &mut BitMask,
-    ) -> Option<usize> {
-        loop {
-            if let Some(bit) = current_mask.next() {
-                return Some(*current_group_slot + bit);
-            }
-            if *next_group_slot >= self.capacity() {
-                return None;
-            }
-            let group_idx = *next_group_slot / GROUP_SIZE;
-            let group_ptr = self.group_ctrl(group_idx);
-            let mut mask = unsafe { simd::occupied_mask_16(group_ptr) };
-            let group_end = *next_group_slot + GROUP_SIZE;
-            if group_end > self.capacity() {
-                mask = mask.truncate_to(self.capacity() - *next_group_slot);
-            }
-            *current_mask = mask;
-            *current_group_slot = *next_group_slot;
-            *next_group_slot = group_end;
-        }
-    }
-
     /// Scanner over occupied slots in this single region. `Iterator<usize>`
     /// for simple walks; `next_handle()` for richer access.
     #[inline]
@@ -323,10 +294,10 @@ pub(crate) trait ArenaSlots<T> {
     }
 }
 
-/// Scanner over a slice of `D` descriptors (1 or more). Yields
-/// [`SlotHandle`]s via `next_handle()`, or raw slot indices via the
-/// `Iterator<Item = usize>` impl. Cursor reset on region transition is
-/// handled internally.
+/// Scanner over a slice of `D` descriptors (1 or more). Pointer-walking
+/// internals (hashbrown-style): `next_ctrl` advances by `GROUP_SIZE` per
+/// group, `end_ctrl` is the per-region bound. Returns [`SlotHandle`]s via
+/// `next_handle()` or raw indices via `Iterator<Item = usize>`.
 ///
 /// `new_shared(&[D])` constructs read-only; mutating handle methods
 /// (`as_mut`/`read`/`tombstone`) are UB. `new_mut(&mut [D])` allows all.
@@ -334,11 +305,20 @@ pub(crate) struct IterRange<'a, T, D: ArenaSlots<T>> {
     levels: *mut D,
     levels_len: usize,
     level_idx: usize,
-    next_group_slot: usize,
+    /// Ptr to the next group's first ctrl byte (or `end_ctrl` if exhausted).
+    next_ctrl: *const u8,
+    /// One-past-end of the current region's ctrl bytes.
+    end_ctrl: *const u8,
+    /// Slot offset of the currently-loaded group. Initialized to wrap so
+    /// the first load lands at 0 after `wrapping_add(GROUP_SIZE)`.
     current_group_slot: usize,
     current_mask: BitMask,
     _marker: PhantomData<(&'a mut [D], *mut T)>,
 }
+
+/// Initial slot offset that becomes `0` after the first
+/// `wrapping_add(GROUP_SIZE)` on group load.
+pub(crate) const CURRENT_SLOT_INIT: usize = 0_usize.wrapping_sub(GROUP_SIZE);
 
 // SAFETY: behaves as `&mut [D]` for its lifetime.
 unsafe impl<T: Send, D: ArenaSlots<T> + Send> Send for IterRange<'_, T, D> {}
@@ -350,28 +330,60 @@ impl<'a, T, D: ArenaSlots<T>> IterRange<'a, T, D> {
     /// UB (aliases the shared borrow).
     #[inline]
     pub(crate) fn new_shared(slice: &'a [D]) -> Self {
-        Self {
-            levels: slice.as_ptr().cast_mut(),
-            levels_len: slice.len(),
-            level_idx: 0,
-            next_group_slot: 0,
-            current_group_slot: 0,
-            current_mask: BitMask(0),
-            _marker: PhantomData,
-        }
+        Self::new_raw(slice.as_ptr().cast_mut(), slice.len())
     }
 
     /// Mut scanner. All [`SlotHandle`] methods are usable.
     #[inline]
     pub(crate) fn new_mut(slice: &'a mut [D]) -> Self {
-        Self {
-            levels: slice.as_mut_ptr(),
-            levels_len: slice.len(),
+        Self::new_raw(slice.as_mut_ptr(), slice.len())
+    }
+
+    #[inline]
+    fn new_raw(levels: *mut D, levels_len: usize) -> Self {
+        let mut me = Self {
+            levels,
+            levels_len,
             level_idx: 0,
-            next_group_slot: 0,
-            current_group_slot: 0,
+            next_ctrl: ptr::null(),
+            end_ctrl: ptr::null(),
+            current_group_slot: CURRENT_SLOT_INIT,
             current_mask: BitMask(0),
             _marker: PhantomData,
+        };
+        if levels_len > 0 {
+            me.init_region();
+        }
+        me
+    }
+
+    /// Set the ctrl pointer pair for the current level.
+    #[inline]
+    fn init_region(&mut self) {
+        // SAFETY: caller (only `new_raw`/`Iterator::next`/`next_handle`)
+        // guards `level_idx < levels_len`.
+        let level = unsafe { &*self.levels.add(self.level_idx) };
+        self.next_ctrl = level.ctrl_ptr();
+        self.end_ctrl = unsafe { level.ctrl_ptr().add(level.capacity()) };
+        self.current_group_slot = CURRENT_SLOT_INIT;
+        self.current_mask = BitMask(0);
+    }
+
+    /// Advance the scan one step, returning the next occupied slot index
+    /// in the current region. Returns `None` when the region is exhausted.
+    #[inline]
+    fn scan_step(&mut self) -> Option<usize> {
+        loop {
+            if let Some(bit) = self.current_mask.next() {
+                return Some(self.current_group_slot.wrapping_add(bit));
+            }
+            if self.next_ctrl >= self.end_ctrl {
+                return None;
+            }
+            self.current_group_slot = self.current_group_slot.wrapping_add(GROUP_SIZE);
+            // SAFETY: `next_ctrl < end_ctrl` ⇒ within the region's ctrl bytes.
+            self.current_mask = unsafe { simd::occupied_mask_16(self.next_ctrl) };
+            self.next_ctrl = unsafe { self.next_ctrl.add(GROUP_SIZE) };
         }
     }
 
@@ -379,15 +391,9 @@ impl<'a, T, D: ArenaSlots<T>> IterRange<'a, T, D> {
     /// `as_ref` / `as_mut` / `read` / `tombstone` per its semantics.
     #[inline]
     pub(crate) fn next_handle(&mut self) -> Option<SlotHandle<'a, T, D>> {
-        while self.level_idx < self.levels_len {
-            // SAFETY: `level_idx < levels_len`; constructor invariant.
-            let level_ptr = unsafe { self.levels.add(self.level_idx) };
-            let level = unsafe { &*level_ptr };
-            if let Some(idx) = level.scan_next(
-                &mut self.next_group_slot,
-                &mut self.current_group_slot,
-                &mut self.current_mask,
-            ) {
+        loop {
+            if let Some(idx) = self.scan_step() {
+                let level_ptr = unsafe { self.levels.add(self.level_idx) };
                 return Some(SlotHandle {
                     descriptor: level_ptr,
                     idx,
@@ -395,11 +401,11 @@ impl<'a, T, D: ArenaSlots<T>> IterRange<'a, T, D> {
                 });
             }
             self.level_idx += 1;
-            self.next_group_slot = 0;
-            self.current_group_slot = 0;
-            self.current_mask = BitMask(0);
+            if self.level_idx >= self.levels_len {
+                return None;
+            }
+            self.init_region();
         }
-        None
     }
 }
 
@@ -409,7 +415,8 @@ impl<T, D: ArenaSlots<T>> Clone for IterRange<'_, T, D> {
             levels: self.levels,
             levels_len: self.levels_len,
             level_idx: self.level_idx,
-            next_group_slot: self.next_group_slot,
+            next_ctrl: self.next_ctrl,
+            end_ctrl: self.end_ctrl,
             current_group_slot: self.current_group_slot,
             current_mask: self.current_mask.clone(),
             _marker: PhantomData,
@@ -424,22 +431,16 @@ impl<T, D: ArenaSlots<T>> Iterator for IterRange<'_, T, D> {
 
     #[inline]
     fn next(&mut self) -> Option<usize> {
-        while self.level_idx < self.levels_len {
-            // SAFETY: `level_idx < levels_len`; constructor invariant.
-            let level = unsafe { &*self.levels.add(self.level_idx) };
-            if let Some(idx) = level.scan_next(
-                &mut self.next_group_slot,
-                &mut self.current_group_slot,
-                &mut self.current_mask,
-            ) {
+        loop {
+            if let Some(idx) = self.scan_step() {
                 return Some(idx);
             }
             self.level_idx += 1;
-            self.next_group_slot = 0;
-            self.current_group_slot = 0;
-            self.current_mask = BitMask(0);
+            if self.level_idx >= self.levels_len {
+                return None;
+            }
+            self.init_region();
         }
-        None
     }
 }
 

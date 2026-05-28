@@ -10,7 +10,7 @@ use std::slice;
 use allocator_api2::alloc::Layout;
 use equivalent::Equivalent;
 
-use crate::common::arena::{self, Arena, ArenaSlots, IterRange, SlotEntry};
+use crate::common::arena::{self, Arena, ArenaSlots, CURRENT_SLOT_INIT, IterRange, SlotEntry};
 use crate::common::bitmask::BitMask;
 use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
@@ -2883,16 +2883,18 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelValuesMut<'_, K, V, A> {
 /// Holds levels + special + arena via `ManuallyDrop` so the inline scan
 /// ptr stays valid without a self-borrow. `Drop` drains, then frees.
 pub struct FunnelIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
+    /// Hashbrown-style ptr-walk over the current region. Re-init'd on
+    /// phase transitions.
+    next_ctrl: *const u8,
+    end_ctrl: *const u8,
+    current_group_slot: usize,
+    current_mask: BitMask,
     levels_ptr: *mut BucketLevel<SlotEntry<K, V>>,
     levels_len: usize,
     level_idx: usize,
-    next_group_slot: usize,
-    current_group_slot: usize,
-    current_mask: BitMask,
     /// Owns the levels box so `levels_ptr` stays valid.
     levels: ManuallyDrop<BucketLevelSlice<K, V>>,
-    /// Special arrays are accessed directly via `self.special.primary` etc.
-    /// inside `next()`; kept alive here.
+    /// Special arrays accessed directly via `self.special.primary` etc.
     special: ManuallyDrop<SpecialArray<SlotEntry<K, V>>>,
     arena: ManuallyDrop<Arena>,
     alloc: A,
@@ -2912,11 +2914,28 @@ unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
 }
 
 impl<K, V, S, A: Allocator + Clone> FunnelIntoIter<K, V, S, A> {
+    /// Set ctrl pointers for an arbitrary region.
     #[inline]
-    fn reset_cursor(&mut self) {
-        self.next_group_slot = 0;
-        self.current_group_slot = 0;
+    fn set_region<D: ArenaSlots<SlotEntry<K, V>>>(&mut self, region: &D) {
+        self.next_ctrl = region.ctrl_ptr();
+        self.end_ctrl = unsafe { region.ctrl_ptr().add(region.capacity()) };
+        self.current_group_slot = CURRENT_SLOT_INIT;
         self.current_mask = BitMask(0);
+    }
+
+    #[inline]
+    fn scan_step(&mut self) -> Option<usize> {
+        loop {
+            if let Some(bit) = self.current_mask.next() {
+                return Some(self.current_group_slot.wrapping_add(bit));
+            }
+            if self.next_ctrl >= self.end_ctrl {
+                return None;
+            }
+            self.current_group_slot = self.current_group_slot.wrapping_add(GROUP_SIZE);
+            self.current_mask = unsafe { simd::occupied_mask_16(self.next_ctrl) };
+            self.next_ctrl = unsafe { self.next_ctrl.add(GROUP_SIZE) };
+        }
     }
 }
 
@@ -2927,48 +2946,41 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
         loop {
             match self.phase {
                 IterPhase::Levels => {
-                    while self.level_idx < self.levels_len {
-                        // SAFETY: `level_idx < levels_len`; `levels_ptr`
-                        // points into `self.levels` (alive via ManuallyDrop).
+                    if let Some(idx) = self.scan_step() {
+                        // SAFETY: `level_idx < levels_len`; alive via ManuallyDrop.
                         let level = unsafe { &mut *self.levels_ptr.add(self.level_idx) };
-                        if let Some(idx) = level.scan_next(
-                            &mut self.next_group_slot,
-                            &mut self.current_group_slot,
-                            &mut self.current_mask,
-                        ) {
-                            let entry = unsafe { level.take(idx) };
-                            level.mark_tombstone(idx);
-                            self.remaining -= 1;
-                            return Some((entry.key, entry.value));
-                        }
-                        self.level_idx += 1;
-                        self.reset_cursor();
+                        let entry = unsafe { level.take(idx) };
+                        level.mark_tombstone(idx);
+                        self.remaining -= 1;
+                        return Some((entry.key, entry.value));
                     }
-                    self.phase = IterPhase::Primary;
-                    self.reset_cursor();
+                    self.level_idx += 1;
+                    if self.level_idx < self.levels_len {
+                        let level = unsafe { &*self.levels_ptr.add(self.level_idx) };
+                        self.set_region(level);
+                    } else {
+                        self.phase = IterPhase::Primary;
+                        let primary = ptr::from_ref(&self.special.primary);
+                        // SAFETY: ptr came from `&self.special.primary` above.
+                        self.set_region(unsafe { &*primary });
+                    }
                 }
                 IterPhase::Primary => {
-                    let primary = &mut self.special.primary;
-                    if let Some(idx) = primary.scan_next(
-                        &mut self.next_group_slot,
-                        &mut self.current_group_slot,
-                        &mut self.current_mask,
-                    ) {
+                    if let Some(idx) = self.scan_step() {
+                        let primary = &mut self.special.primary;
                         let entry = unsafe { primary.take(idx) };
                         primary.mark_tombstone(idx);
                         self.remaining -= 1;
                         return Some((entry.key, entry.value));
                     }
                     self.phase = IterPhase::Fallback;
-                    self.reset_cursor();
+                    let fallback = ptr::from_ref(&self.special.fallback);
+                    // SAFETY: ptr came from `&self.special.fallback` above.
+                    self.set_region(unsafe { &*fallback });
                 }
                 IterPhase::Fallback => {
-                    let fallback = &mut self.special.fallback;
-                    if let Some(idx) = fallback.scan_next(
-                        &mut self.next_group_slot,
-                        &mut self.current_group_slot,
-                        &mut self.current_mask,
-                    ) {
+                    if let Some(idx) = self.scan_step() {
+                        let fallback = &mut self.special.fallback;
                         let entry = unsafe { fallback.take(idx) };
                         fallback.mark_tombstone(idx);
                         self.remaining -= 1;
@@ -3037,13 +3049,14 @@ where
         let levels_len = levels.len();
         // `self` drops below: empty levels / empty special / empty arena —
         // all no-ops; hash_builder / etc. drop normally.
-        FunnelIntoIter {
+        let mut iter = FunnelIntoIter {
+            next_ctrl: ptr::null(),
+            end_ctrl: ptr::null(),
+            current_group_slot: CURRENT_SLOT_INIT,
+            current_mask: BitMask(0),
             levels_ptr,
             levels_len,
             level_idx: 0,
-            next_group_slot: 0,
-            current_group_slot: 0,
-            current_mask: BitMask(0),
             levels: ManuallyDrop::new(levels),
             special: ManuallyDrop::new(special),
             arena: ManuallyDrop::new(arena),
@@ -3051,7 +3064,19 @@ where
             phase: IterPhase::Levels,
             remaining,
             _marker: PhantomData,
+        };
+        // Prime the scan to the first non-empty region (or skip through
+        // empty levels into Primary/Fallback).
+        if iter.levels_len > 0 {
+            let level = unsafe { &*iter.levels_ptr };
+            iter.set_region(level);
+        } else {
+            iter.phase = IterPhase::Primary;
+            let primary = ptr::from_ref(&iter.special.primary);
+            // SAFETY: ptr came from `&iter.special.primary` above.
+            iter.set_region(unsafe { &*primary });
         }
+        iter
     }
 }
 

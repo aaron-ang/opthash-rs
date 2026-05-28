@@ -9,7 +9,7 @@ use std::ptr;
 use allocator_api2::alloc::Layout;
 use equivalent::Equivalent;
 
-use crate::common::arena::{self, Arena, ArenaSlots, IterRange, SlotEntry};
+use crate::common::arena::{self, Arena, ArenaSlots, CURRENT_SLOT_INIT, IterRange, SlotEntry};
 use crate::common::bitmask::BitMask;
 use crate::common::config::{
     DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY,
@@ -21,6 +21,7 @@ use crate::common::iter::{
     Values as CommonValues,
 };
 use crate::common::math::{self, align, capacity, probe};
+use crate::common::simd;
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
@@ -1527,10 +1528,13 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticValuesMut<'_, K, V, A> {
 pub struct ElasticIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     /// Raw walker over `*self.levels`. Cursor state inline; no lifetime tie
     /// needed — the box is kept alive here via `ManuallyDrop`.
+    /// Hashbrown-style ptr-walk: `next_ctrl` advances by `GROUP_SIZE` per
+    /// group, `end_ctrl` is the per-region bound.
     levels_ptr: *mut Level<SlotEntry<K, V>>,
     levels_len: usize,
     level_idx: usize,
-    next_group_slot: usize,
+    next_ctrl: *const u8,
+    end_ctrl: *const u8,
     current_group_slot: usize,
     current_mask: BitMask,
     levels: ManuallyDrop<LevelSlice<K, V>>,
@@ -1550,32 +1554,55 @@ unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
 {
 }
 
+impl<K, V, S, A: Allocator + Clone> ElasticIntoIter<K, V, S, A> {
+    /// Set ctrl pointers for the current level.
+    #[inline]
+    fn init_region(&mut self) {
+        // SAFETY: caller guards `level_idx < levels_len`.
+        let level = unsafe { &*self.levels_ptr.add(self.level_idx) };
+        self.next_ctrl = level.ctrl_ptr();
+        self.end_ctrl = unsafe { level.ctrl_ptr().add(level.capacity()) };
+        self.current_group_slot = CURRENT_SLOT_INIT;
+        self.current_mask = BitMask(0);
+    }
+
+    /// Advance the scan one step within the current region.
+    #[inline]
+    fn scan_step(&mut self) -> Option<usize> {
+        loop {
+            if let Some(bit) = self.current_mask.next() {
+                return Some(self.current_group_slot.wrapping_add(bit));
+            }
+            if self.next_ctrl >= self.end_ctrl {
+                return None;
+            }
+            self.current_group_slot = self.current_group_slot.wrapping_add(GROUP_SIZE);
+            self.current_mask = unsafe { simd::occupied_mask_16(self.next_ctrl) };
+            self.next_ctrl = unsafe { self.next_ctrl.add(GROUP_SIZE) };
+        }
+    }
+}
+
 impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.level_idx < self.levels_len {
-            // SAFETY: `level_idx < levels_len`; `levels_ptr` points at the
-            // box's data, kept alive by `self.levels: ManuallyDrop`.
-            let level = unsafe { &mut *self.levels_ptr.add(self.level_idx) };
-            if let Some(idx) = level.scan_next(
-                &mut self.next_group_slot,
-                &mut self.current_group_slot,
-                &mut self.current_mask,
-            ) {
-                // SAFETY: scan only yields occupied slots. Tombstone-mark
+        loop {
+            if let Some(idx) = self.scan_step() {
+                // SAFETY: scanner yielded an occupied slot; tombstone-mark
                 // prevents future revisits if `Drop` runs mid-iteration.
+                let level = unsafe { &mut *self.levels_ptr.add(self.level_idx) };
                 let entry = unsafe { level.take(idx) };
                 level.mark_tombstone(idx);
                 self.remaining -= 1;
                 return Some((entry.key, entry.value));
             }
             self.level_idx += 1;
-            self.next_group_slot = 0;
-            self.current_group_slot = 0;
-            self.current_mask = BitMask(0);
+            if self.level_idx >= self.levels_len {
+                return None;
+            }
+            self.init_region();
         }
-        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1627,19 +1654,24 @@ where
         let levels_len = levels.len();
         // `self` drops below: empty levels + empty arena = no-op on the
         // arena/data side; hash_builder / batch_plan / etc. drop normally.
-        ElasticIntoIter {
+        let mut iter = ElasticIntoIter {
             levels_ptr,
             levels_len,
             level_idx: 0,
-            next_group_slot: 0,
-            current_group_slot: 0,
+            next_ctrl: ptr::null(),
+            end_ctrl: ptr::null(),
+            current_group_slot: CURRENT_SLOT_INIT,
             current_mask: BitMask(0),
             levels: ManuallyDrop::new(levels),
             arena: ManuallyDrop::new(arena),
             alloc,
             remaining,
             _marker: PhantomData,
+        };
+        if levels_len > 0 {
+            iter.init_region();
         }
+        iter
     }
 }
 

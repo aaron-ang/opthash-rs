@@ -1,5 +1,3 @@
-use crate::common::config::GROUP_SIZE;
-
 #[cfg(target_arch = "aarch64")]
 pub(crate) type BitMaskWord = u64;
 #[cfg(not(target_arch = "aarch64"))]
@@ -31,19 +29,6 @@ impl BitMask {
         } else {
             Some((self.0.trailing_zeros() / BITMASK_STRIDE) as usize)
         }
-    }
-
-    /// Restrict the mask to the first `n` slots. Slots `>= n` are cleared.
-    #[inline]
-    pub(crate) fn truncate_to(self, n: usize) -> Self {
-        // A full group is GROUP_SIZE=16 slots. If n >= GROUP_SIZE, no truncation.
-        if n >= GROUP_SIZE {
-            return self;
-        }
-        // n < GROUP_SIZE = 16 fits trivially in u32.
-        let bits = u32::try_from(n).unwrap_or(0) * BITMASK_STRIDE;
-        let mask = (1 as BitMaskWord).wrapping_shl(bits).wrapping_sub(1);
-        Self(self.0 & mask)
     }
 }
 
