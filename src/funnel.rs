@@ -129,11 +129,9 @@ impl<T> BucketLevel<T> {
         }
     }
 
-    /// Probe one bucket for `key` with caller-provided equality.
-    /// `StopSearch` on EMPTY byte: bucket never overflowed, so the key
-    /// cannot be at a deeper level. Pass `Some(out)` to record the first
-    /// free slot index; `None` for lookup-only. Closure-driven so
-    /// `BucketLevel<T>` stays K, V-free at the type level.
+    /// Probe one bucket with caller-provided equality. `StopSearch` on
+    /// EMPTY: bucket never overflowed, so the key isn't at a deeper level.
+    /// Pass `Some(out)` to record the first free slot; `None` for lookup.
     #[inline]
     fn find_in_bucket<F: FnMut(&T) -> bool>(
         &self,
@@ -1341,18 +1339,27 @@ where
     /// Mutable iterator yielding `(&K, &mut V)`. Mirrors `HashMap::iter_mut`.
     pub fn iter_mut(&mut self) -> FunnelIterMut<'_, K, V, A> {
         let remaining = self.len;
-        let levels_len = self.levels.len();
+        let map_ptr = ptr::from_mut(self);
+        // Derive sub-ptrs through `map_ptr` so they share its borrow tag.
+        let (levels_ptr, levels_len, primary, fallback) = unsafe {
+            let levels = &mut (*map_ptr).levels;
+            (
+                levels.as_mut_ptr(),
+                levels.len(),
+                ptr::addr_of_mut!((*map_ptr).special.primary),
+                ptr::addr_of_mut!((*map_ptr).special.fallback),
+            )
+        };
         let mut cursor = ScanCursor::empty();
         let mut phase = IterPhase::Levels;
         if levels_len > 0 {
-            cursor.set_region(&self.levels[0]);
+            // SAFETY: levels_len > 0.
+            cursor.set_region(unsafe { &*levels_ptr });
         } else {
             phase = IterPhase::Primary;
-            cursor.set_region(&self.special.primary);
+            // SAFETY: `primary` from `map_ptr`.
+            cursor.set_region(unsafe { &*primary });
         }
-        let levels_ptr = self.levels.as_mut_ptr();
-        let primary = ptr::from_mut(&mut self.special.primary);
-        let fallback = ptr::from_mut(&mut self.special.fallback);
         FunnelIterMut {
             levels: levels_ptr,
             levels_len,
@@ -1464,19 +1471,25 @@ where
     /// Returns a draining iterator that empties the map. Mirrors
     /// [`std::collections::HashMap::drain`].
     pub fn drain(&mut self) -> Drain<'_, K, V, S, A> {
-        let levels_len = self.levels.len();
+        let map_ptr = ptr::from_mut(self);
+        // Derive sub-ptrs through `map_ptr` so they share its borrow tag.
+        let (levels_ptr, levels_len, primary, fallback) = unsafe {
+            let levels = &mut (*map_ptr).levels;
+            (
+                levels.as_mut_ptr(),
+                levels.len(),
+                ptr::addr_of_mut!((*map_ptr).special.primary),
+                ptr::addr_of_mut!((*map_ptr).special.fallback),
+            )
+        };
         let mut cursor = ScanCursor::empty();
         let mut phase = IterPhase::Levels;
         if levels_len > 0 {
-            cursor.set_region(&self.levels[0]);
+            cursor.set_region(unsafe { &*levels_ptr });
         } else {
             phase = IterPhase::Primary;
-            cursor.set_region(&self.special.primary);
+            cursor.set_region(unsafe { &*primary });
         }
-        let levels_ptr = self.levels.as_mut_ptr();
-        let primary = ptr::from_mut(&mut self.special.primary);
-        let fallback = ptr::from_mut(&mut self.special.fallback);
-        let map_ptr = ptr::from_mut(self);
         Drain {
             levels: levels_ptr,
             levels_len,
@@ -1497,19 +1510,24 @@ where
     where
         F: FnMut(&K, &mut V) -> bool,
     {
-        let levels_len = self.levels.len();
+        let map_ptr = ptr::from_mut(self);
+        let (levels_ptr, levels_len, primary, fallback) = unsafe {
+            let levels = &mut (*map_ptr).levels;
+            (
+                levels.as_mut_ptr(),
+                levels.len(),
+                ptr::addr_of_mut!((*map_ptr).special.primary),
+                ptr::addr_of_mut!((*map_ptr).special.fallback),
+            )
+        };
         let mut cursor = ScanCursor::empty();
         let mut phase = IterPhase::Levels;
         if levels_len > 0 {
-            cursor.set_region(&self.levels[0]);
+            cursor.set_region(unsafe { &*levels_ptr });
         } else {
             phase = IterPhase::Primary;
-            cursor.set_region(&self.special.primary);
+            cursor.set_region(unsafe { &*primary });
         }
-        let levels_ptr = self.levels.as_mut_ptr();
-        let primary = ptr::from_mut(&mut self.special.primary);
-        let fallback = ptr::from_mut(&mut self.special.fallback);
-        let map_ptr = ptr::from_mut(self);
         ExtractIf {
             levels: levels_ptr,
             levels_len,
@@ -2643,8 +2661,7 @@ where
 }
 
 /// Draining iterator. Yields and removes every `(K, V)`; the map is empty
-/// once consumed or dropped. SAFETY: `map_ptr` aliases the map; per-step
-/// access uses fresh temp `&mut`s only.
+/// once consumed or dropped.
 pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     levels: *mut BucketLevel<SlotEntry<K, V>>,
     levels_len: usize,
@@ -2747,7 +2764,6 @@ impl<K, V, S, A: Allocator + Clone> Drop for Drain<'_, K, V, S, A> {
 }
 
 /// Filtering drain. Yields and removes entries where `pred` returns `true`.
-/// SAFETY: `map_ptr` aliases the map; per-step `&mut` is fresh.
 pub struct ExtractIf<'a, K, V, F, S = DefaultHashBuilder, A: Allocator + Clone = Global>
 where
     K: Eq + Hash,
@@ -3034,8 +3050,6 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelValuesMut<'_, K, V, A> {
 }
 
 /// Owned `(K, V)` iterator returned by `FunnelHashMap::into_iter`.
-/// Holds levels + special + arena via `ManuallyDrop` so the scan ptr
-/// stays valid without a self-borrow. `Drop` drains, then frees.
 pub struct FunnelIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     cursor: ScanCursor,
     levels_ptr: *mut BucketLevel<SlotEntry<K, V>>,
@@ -3163,7 +3177,7 @@ where
     type IntoIter = FunnelIntoIter<K, V, S, A>;
 
     fn into_iter(mut self) -> Self::IntoIter {
-        let mut levels = mem::take(&mut self.levels);
+        let levels = mem::take(&mut self.levels);
         let special = mem::replace(
             &mut self.special,
             SpecialArray {
@@ -3175,29 +3189,30 @@ where
         let arena = mem::replace(&mut self.arena, Arena::empty());
         let alloc = self.alloc.clone();
         let remaining = self.len;
-        let levels_ptr = levels.as_mut_ptr();
         let levels_len = levels.len();
-        let mut cursor = ScanCursor::empty();
-        let mut phase = IterPhase::Levels;
-        if levels_len > 0 {
-            cursor.set_region(&levels[0]);
-        } else {
-            phase = IterPhase::Primary;
-            cursor.set_region(&special.primary);
-        }
-        FunnelIntoIter {
-            cursor,
-            levels_ptr,
+        let mut iter = FunnelIntoIter {
+            cursor: ScanCursor::empty(),
+            levels_ptr: ptr::null_mut(),
             levels_len,
             level_idx: 0,
             levels: ManuallyDrop::new(levels),
             special: ManuallyDrop::new(special),
             arena: ManuallyDrop::new(arena),
             alloc,
-            phase,
+            phase: IterPhase::Levels,
             remaining,
             _marker: PhantomData,
+        };
+        // Derive raw ptrs / cursor post-move so the Vec/SpecialArray moves
+        // into `ManuallyDrop` don't invalidate the borrow tags.
+        iter.levels_ptr = iter.levels.as_mut_ptr();
+        if levels_len > 0 {
+            iter.cursor.set_region(&iter.levels[0]);
+        } else {
+            iter.phase = IterPhase::Primary;
+            iter.cursor.set_region(&iter.special.primary);
         }
+        iter
     }
 }
 
