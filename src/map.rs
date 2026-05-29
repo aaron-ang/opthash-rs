@@ -103,9 +103,8 @@ pub trait RawTable<K, V>: Sized {
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> Self::Location;
 
     /// Inserts `key`→`value`, returning the previous value if present. The
-    /// default probes once to find, then again for a vacant slot; backends that
-    /// record an insertion candidate during the find probe override this to do
-    /// a single pass.
+    /// default probes twice (find, then a vacant slot); a backend that records a
+    /// candidate during the find probe overrides this for a single pass.
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
     where
         K: Hash + Eq,
@@ -281,11 +280,10 @@ where
         Some((&entry.key, &entry.value))
     }
 
-    /// Returns the stored key equal to `key`, inserting `f(key)` paired with
-    /// `value` if absent. One probe on the hit path: the `Copy` location from
-    /// [`RawTable::find`] releases the borrow before the key reference is
-    /// re-derived (stable borrowck rejects the naive `get`-then-insert form).
-    /// Backs the sets' `get_or_insert_with`, where `value` is always `()`.
+    /// Returns the stored key equal to `key`, inserting `f(key)` (with `value`)
+    /// if absent, in one hit-path probe. The `Copy` location from
+    /// [`RawTable::find`] frees the borrow before the key ref is re-derived —
+    /// the naive `get`-then-insert needs Polonius. Backs set `get_or_insert_with`.
     pub(crate) fn get_or_insert_key_with<Q, F>(&mut self, key: &Q, value: V, f: F) -> &K
     where
         Q: Hash + Equivalent<K> + ?Sized,

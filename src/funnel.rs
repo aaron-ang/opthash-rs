@@ -1297,10 +1297,9 @@ where
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
-    /// Single-pass level probe: returns the match (if any) and, with
-    /// `Some(free_slot)`, records the first free `SlotLocation` seen so an
-    /// insert can place there without re-probing. The [`LevelMiss`] tells the
-    /// caller whether the chain ended clean (no special overflow possible).
+    /// Single-pass level probe. Returns the match if any; with `Some(free_slot)`
+    /// records the first free slot so an insert places there without re-probing.
+    /// The [`LevelMiss`] reports whether the chain ended clean (no special overflow).
     fn find_in_levels<Q>(
         &self,
         key: &Q,
