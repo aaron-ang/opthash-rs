@@ -432,6 +432,11 @@ impl<T, D: ArenaSlots<T>> Iterator for IterRange<'_, T, D> {
 
     #[inline]
     fn next(&mut self) -> Option<usize> {
+        // Plain `usize` collapses level identity; valid only for single-region scans.
+        debug_assert!(
+            self.levels_len <= 1,
+            "IterRange::next yields ambiguous indices across multiple regions; use next_handle"
+        );
         loop {
             if let Some(idx) = self.cursor.step() {
                 return Some(idx);

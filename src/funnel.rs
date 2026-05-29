@@ -3137,14 +3137,24 @@ impl<K, V, S, A: Allocator + Clone> FusedIterator for FunnelIntoIter<K, V, S, A>
 
 impl<K, V, S, A: Allocator + Clone> Drop for FunnelIntoIter<K, V, S, A> {
     fn drop(&mut self) {
-        for _ in self.by_ref() {}
-        // SAFETY: scan state is no longer used past this point.
-        unsafe {
-            ManuallyDrop::drop(&mut self.levels);
-            ManuallyDrop::drop(&mut self.special);
-            let arena = ManuallyDrop::take(&mut self.arena);
-            arena.deallocate(&self.alloc);
+        // Guard ensures `levels` / `special` / `arena` are freed even if
+        // a `V::drop` panic unwinds out of the drain loop below.
+        struct DropGuard<'a, K, V, S, A: Allocator + Clone> {
+            iter: &'a mut FunnelIntoIter<K, V, S, A>,
         }
+        impl<K, V, S, A: Allocator + Clone> Drop for DropGuard<'_, K, V, S, A> {
+            #[inline]
+            fn drop(&mut self) {
+                unsafe {
+                    ManuallyDrop::drop(&mut self.iter.levels);
+                    ManuallyDrop::drop(&mut self.iter.special);
+                    let arena = ManuallyDrop::take(&mut self.iter.arena);
+                    arena.deallocate(&self.iter.alloc);
+                }
+            }
+        }
+        let guard = DropGuard { iter: self };
+        for _ in guard.iter.by_ref() {}
     }
 }
 

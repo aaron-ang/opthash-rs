@@ -1641,16 +1641,23 @@ impl<K, V, S, A: Allocator + Clone> FusedIterator for ElasticIntoIter<K, V, S, A
 
 impl<K, V, S, A: Allocator + Clone> Drop for ElasticIntoIter<K, V, S, A> {
     fn drop(&mut self) {
-        // Drain any unyielded entries so values run their Drop.
-        for _ in self.by_ref() {}
-        // SAFETY: scanner is no longer used past this point. Drop the
-        // levels box (descriptors only, no remaining values), then free
-        // the arena.
-        unsafe {
-            ManuallyDrop::drop(&mut self.levels);
-            let arena = ManuallyDrop::take(&mut self.arena);
-            arena.deallocate(&self.alloc);
+        // Guard ensures `levels` + `arena` are freed even if a `V::drop`
+        // panic unwinds out of the drain loop below.
+        struct DropGuard<'a, K, V, S, A: Allocator + Clone> {
+            iter: &'a mut ElasticIntoIter<K, V, S, A>,
         }
+        impl<K, V, S, A: Allocator + Clone> Drop for DropGuard<'_, K, V, S, A> {
+            #[inline]
+            fn drop(&mut self) {
+                unsafe {
+                    ManuallyDrop::drop(&mut self.iter.levels);
+                    let arena = ManuallyDrop::take(&mut self.iter.arena);
+                    arena.deallocate(&self.iter.alloc);
+                }
+            }
+        }
+        let guard = DropGuard { iter: self };
+        for _ in guard.iter.by_ref() {}
     }
 }
 
