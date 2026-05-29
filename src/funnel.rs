@@ -1601,6 +1601,63 @@ where
     }
 }
 
+impl<K, V, S, A> FunnelTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    /// Cold path of [`RawTable::scan_next`]: first-call region prime and region
+    /// crossings (levels → special primary → fallback). Kept out of line so the
+    /// per-element hot path inlines.
+    #[cold]
+    fn scan_advance(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, SlotLocation)> {
+        if !scan.started {
+            scan.started = true;
+            // Prime the cursor on the first region. With no levels, jump
+            // straight to the special primary.
+            if self.levels.is_empty() {
+                scan.phase = ScanPhase::Primary;
+                scan.cursor.set_region(&self.special.primary);
+                scan.cur_data = self.special.primary.data_ptr().cast();
+            } else {
+                scan.cursor.set_region(&self.levels[0]);
+                scan.cur_data = self.levels[0].data_ptr().cast();
+            }
+        }
+        loop {
+            if let Some(slot_idx) = scan.cursor.step() {
+                return Some(scan.yield_at::<K, V>(slot_idx));
+            }
+            // Current region exhausted: advance, re-deriving the region pointer
+            // + cached data ptr from `&self`.
+            match scan.phase {
+                ScanPhase::Levels => {
+                    scan.level_idx += 1;
+                    if scan.level_idx < self.levels.len() {
+                        scan.cursor.set_region(&self.levels[scan.level_idx]);
+                        scan.cur_data = self.levels[scan.level_idx].data_ptr().cast();
+                    } else {
+                        scan.phase = ScanPhase::Primary;
+                        scan.cursor.set_region(&self.special.primary);
+                        scan.cur_data = self.special.primary.data_ptr().cast();
+                    }
+                }
+                ScanPhase::Primary => {
+                    scan.phase = ScanPhase::Fallback;
+                    scan.cursor.set_region(&self.special.fallback);
+                    scan.cur_data = self.special.fallback.data_ptr().cast();
+                }
+                ScanPhase::Fallback => {
+                    scan.phase = ScanPhase::Done;
+                    return None;
+                }
+                ScanPhase::Done => return None,
+            }
+        }
+    }
+}
+
 // `SlotEntry` is `pub(crate)`; the `RawTable` trait (in the private `map`
 // module) exposes it in `slot_ref`/`slot_ptr`, so the impl mirrors the trait's
 // private-interface lint exemption.
@@ -1735,6 +1792,7 @@ where
         kv
     }
 
+    #[inline]
     fn tombstone_slot(&mut self, location: SlotLocation) {
         match location {
             SlotLocation::Level {
@@ -1752,6 +1810,7 @@ where
         }
     }
 
+    #[inline]
     fn extract_finish(&mut self, location: SlotLocation) {
         match location {
             SlotLocation::Level {
@@ -1795,65 +1854,15 @@ where
         }
     }
 
+    #[inline]
     fn scan_next(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, SlotLocation)> {
-        if !scan.started {
-            scan.started = true;
-            // Prime the cursor on the first region. With no levels, jump
-            // straight to the special primary.
-            if self.levels.is_empty() {
-                scan.phase = ScanPhase::Primary;
-                scan.cursor.set_region(&self.special.primary);
-                scan.cur_data = self.special.primary.data_ptr().cast();
-            } else {
-                // SAFETY: levels non-empty ⇒ index 0 in bounds.
-                scan.cursor.set_region(&self.levels[0]);
-                scan.cur_data = self.levels[0].data_ptr().cast();
-            }
+        // Hot path: another occupied slot in the region the cursor already holds.
+        if scan.started
+            && let Some(slot_idx) = scan.cursor.step()
+        {
+            return Some(scan.yield_at::<K, V>(slot_idx));
         }
-        loop {
-            if let Some(slot_idx) = scan.cursor.step() {
-                let loc = match scan.phase {
-                    ScanPhase::Levels => SlotLocation::Level {
-                        level_idx: scan.level_idx,
-                        slot_idx,
-                    },
-                    ScanPhase::Primary => SlotLocation::SpecialPrimary { slot_idx },
-                    ScanPhase::Fallback => SlotLocation::SpecialFallback { slot_idx },
-                    // `step` returns `None` on an empty region, so the cursor
-                    // never yields once the phase machine reaches `Done`.
-                    ScanPhase::Done => unreachable!("cursor empty in Done phase"),
-                };
-                // SAFETY: `cur_data` is the current region's slot array; `slot_idx`
-                // is in-bounds for it (`step` yields only valid slots).
-                let ptr = unsafe { scan.cur_data.cast::<SlotEntry<K, V>>().add(slot_idx) };
-                return Some((ptr, loc));
-            }
-            // Current region exhausted: advance to the next, re-deriving the
-            // region pointer + cached data ptr from `&self`.
-            match scan.phase {
-                ScanPhase::Levels => {
-                    scan.level_idx += 1;
-                    if scan.level_idx < self.levels.len() {
-                        scan.cursor.set_region(&self.levels[scan.level_idx]);
-                        scan.cur_data = self.levels[scan.level_idx].data_ptr().cast();
-                    } else {
-                        scan.phase = ScanPhase::Primary;
-                        scan.cursor.set_region(&self.special.primary);
-                        scan.cur_data = self.special.primary.data_ptr().cast();
-                    }
-                }
-                ScanPhase::Primary => {
-                    scan.phase = ScanPhase::Fallback;
-                    scan.cursor.set_region(&self.special.fallback);
-                    scan.cur_data = self.special.fallback.data_ptr().cast();
-                }
-                ScanPhase::Fallback => {
-                    scan.phase = ScanPhase::Done;
-                    return None;
-                }
-                ScanPhase::Done => return None,
-            }
-        }
+        self.scan_advance(scan)
     }
 
     fn wipe_all(&mut self) {
@@ -1906,6 +1915,29 @@ impl Clone for FunnelScan {
             cur_data: self.cur_data,
             started: self.started,
         }
+    }
+}
+
+impl FunnelScan {
+    /// Builds the `(slot ptr, location)` pair for `slot_idx` in the cursor's
+    /// current region. Shared by the hot and cold `scan_next` paths.
+    #[inline]
+    fn yield_at<K, V>(&self, slot_idx: usize) -> (*mut SlotEntry<K, V>, SlotLocation) {
+        let loc = match self.phase {
+            ScanPhase::Levels => SlotLocation::Level {
+                level_idx: self.level_idx,
+                slot_idx,
+            },
+            ScanPhase::Primary => SlotLocation::SpecialPrimary { slot_idx },
+            ScanPhase::Fallback => SlotLocation::SpecialFallback { slot_idx },
+            // `step` returns `None` on an empty region, so the cursor never
+            // yields once the phase machine reaches `Done`.
+            ScanPhase::Done => unreachable!("cursor empty in Done phase"),
+        };
+        // SAFETY: `cur_data` is the current region's slot array; `slot_idx` is
+        // in-bounds for it (`step` yields only valid slots).
+        let ptr = unsafe { self.cur_data.cast::<SlotEntry<K, V>>().add(slot_idx) };
+        (ptr, loc)
     }
 }
 

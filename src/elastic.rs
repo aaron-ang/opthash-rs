@@ -13,6 +13,10 @@ use crate::common::iter::OccupiedSlots;
 use crate::common::math::{self, align, capacity, probe};
 use crate::map::{self, RawTable};
 
+/// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
+/// by iterators, the `(level, slot)` location backs removal.
+type ElasticScanItem<K, V> = (*mut SlotEntry<K, V>, (usize, usize));
+
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
 /// [`SlotEntry`] data live contiguously in [`ElasticTable::arena`].
@@ -517,6 +521,36 @@ where
         self.len -= 1;
         (removed.key, removed.value)
     }
+
+    /// Cold path of [`RawTable::scan_next`]: first-call region prime and level
+    /// crossings. Kept out of line so the per-element hot path inlines.
+    #[cold]
+    fn scan_advance(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
+        if !scan.started {
+            if self.levels.is_empty() {
+                return None;
+            }
+            scan.started = true;
+            let level = &self.levels[0];
+            scan.cursor.set_region(level);
+            scan.cur_data = level.data_ptr().cast();
+        }
+        loop {
+            if let Some(slot_idx) = scan.cursor.step() {
+                // SAFETY: `cur_data` is the current level's slot array; `slot_idx`
+                // is in-bounds for it (`step` yields only valid slots).
+                let ptr = unsafe { scan.cur_data.cast::<SlotEntry<K, V>>().add(slot_idx) };
+                return Some((ptr, (scan.level_idx, slot_idx)));
+            }
+            scan.level_idx += 1;
+            if scan.level_idx >= self.levels.len() {
+                return None;
+            }
+            let level = &self.levels[scan.level_idx];
+            scan.cursor.set_region(level);
+            scan.cur_data = level.data_ptr().cast();
+        }
+    }
 }
 
 // `SlotEntry` is `pub(crate)`; the `RawTable` trait (in the private `map`
@@ -660,6 +694,7 @@ where
         self.levels[level_idx].mark_tombstone(slot_idx);
     }
 
+    #[inline]
     fn extract_finish(&mut self, (level_idx, slot_idx): (usize, usize)) {
         let level = &mut self.levels[level_idx];
         level.mark_tombstone(slot_idx);
@@ -678,32 +713,18 @@ where
         }
     }
 
-    fn scan_next(&self, scan: &mut ElasticScan) -> Option<(*mut SlotEntry<K, V>, (usize, usize))> {
-        if self.levels.is_empty() {
-            return None;
+    #[inline]
+    fn scan_next(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
+        // Hot path: another occupied slot in the level the cursor already holds.
+        if scan.started
+            && let Some(slot_idx) = scan.cursor.step()
+        {
+            // SAFETY: `cur_data` is the current level's slot array; `slot_idx`
+            // is in-bounds for it (`step` yields only valid slots).
+            let ptr = unsafe { scan.cur_data.cast::<SlotEntry<K, V>>().add(slot_idx) };
+            return Some((ptr, (scan.level_idx, slot_idx)));
         }
-        if !scan.started {
-            scan.started = true;
-            // SAFETY: levels non-empty ⇒ index 0 in bounds.
-            let level = &self.levels[0];
-            scan.cursor.set_region(level);
-            scan.cur_data = level.data_ptr().cast();
-        }
-        loop {
-            if let Some(slot_idx) = scan.cursor.step() {
-                // SAFETY: `cur_data` is the current level's slot array; `slot_idx`
-                // is in-bounds for it (`step` yields only valid slots).
-                let ptr = unsafe { scan.cur_data.cast::<SlotEntry<K, V>>().add(slot_idx) };
-                return Some((ptr, (scan.level_idx, slot_idx)));
-            }
-            scan.level_idx += 1;
-            if scan.level_idx >= self.levels.len() {
-                return None;
-            }
-            let level = &self.levels[scan.level_idx];
-            scan.cursor.set_region(level);
-            scan.cur_data = level.data_ptr().cast();
-        }
+        self.scan_advance(scan)
     }
 
     fn wipe_all(&mut self) {
