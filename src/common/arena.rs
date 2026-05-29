@@ -248,8 +248,7 @@ pub(crate) trait ArenaSlots<T> {
         }
     }
 
-    /// Scanner over occupied slots in this single region. `Iterator<usize>`
-    /// for simple walks; `next_handle()` for richer access.
+    /// `Iterator<usize>` over occupied slot indices in this single region.
     #[inline]
     fn occupied(&self) -> RegionIter<'_, T, Self>
     where

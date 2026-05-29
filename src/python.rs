@@ -11,11 +11,11 @@ use pyo3::Borrowed;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PySet, PyString, PyTuple, PyType};
+use pyo3::types::{PyDict, PyFrozenSet, PySet, PyString, PyTuple, PyType};
 
 use crate::common::config::DEFAULT_RESERVE_FRACTION;
 use crate::funnel::MAX_FUNNEL_RESERVE_FRACTION;
-use crate::{ElasticHashMap, FunnelHashMap};
+use crate::{ElasticHashMap, ElasticHashSet, FunnelHashMap, FunnelHashSet};
 
 fn validate_elastic_reserve_fraction(reserve_fraction: Option<f64>) -> PyResult<f64> {
     let Some(rf) = reserve_fraction else {
@@ -1020,6 +1020,485 @@ macro_rules! define_iter {
     };
 }
 
+/// `true` if `other` is set-like (builtin `set`/`frozenset`, an opthash set,
+/// or anything registered with `collections.abc.Set`). Used by `__eq__` so a
+/// set never compares equal to a non-set (e.g. a list with the same elements).
+fn is_set_like(other: &Bound<PyAny>) -> PyResult<bool> {
+    if other.is_instance_of::<PySet>() || other.is_instance_of::<PyFrozenSet>() {
+        return Ok(true);
+    }
+    let set_abc = other.py().import("collections.abc")?.getattr("Set")?;
+    other.is_instance(&set_abc)
+}
+
+/// Emits one Python-facing set surface (class + element iterator) per backend.
+/// Mirrors `define_map_classes!`: invoked once each for `Elastic` and `Funnel`.
+macro_rules! define_set_classes {
+    (
+        py_set = $PySet:ident,
+        py_set_name = $py_set_name:literal,
+        inner = $Inner:ident,
+        validate_rf = $validate_rf:ident,
+        key_iter = $KeyIter:ident,
+        key_iter_name = $key_iter_name:literal,
+    ) => {
+        /// `PyO3` wrapper around the Rust hash set.
+        #[pyclass(name = $py_set_name, module = "opthash")]
+        struct $PySet {
+            inner: $Inner<HashedAny>,
+            /// Mutation counter snapshotted by iterators; mismatch on
+            /// `__next__` raises `RuntimeError`.
+            generation: u64,
+        }
+
+        impl $PySet {
+            /// Invalidate active iterator snapshots. Call after every mutation.
+            #[inline]
+            fn bump(&mut self) {
+                self.generation = self.generation.wrapping_add(1);
+            }
+
+            /// Inserts every element of `other` (an opthash set or any iterable).
+            /// Returns whether the set changed.
+            fn add_all(&mut self, other: &Bound<PyAny>) -> PyResult<bool> {
+                let before = self.inner.len();
+                if let Ok(other_set) = other.cast::<Self>() {
+                    let py = other.py();
+                    let borrowed = other_set.borrow();
+                    self.inner.reserve(borrowed.inner.len());
+                    for value in borrowed.inner.iter() {
+                        self.inner.insert(value.clone_with_py(py));
+                    }
+                } else {
+                    if let Ok(hint) = other.len() {
+                        self.inner.reserve(hint);
+                    }
+                    for item in other.try_iter()? {
+                        let item = item?;
+                        self.inner.insert(HashedAny::from_bound(&item)?);
+                    }
+                }
+                Ok(self.inner.len() != before)
+            }
+
+            /// Removes every element of `other` from the set. Returns whether
+            /// the set changed.
+            fn remove_all(&mut self, other: &Bound<PyAny>) -> PyResult<bool> {
+                let before = self.inner.len();
+                if let Ok(other_set) = other.cast::<Self>() {
+                    let borrowed = other_set.borrow();
+                    for value in borrowed.inner.iter() {
+                        self.inner.remove(value);
+                    }
+                } else {
+                    for item in other.try_iter()? {
+                        let item = item?;
+                        // SAFETY: `item` outlives `probe`.
+                        let probe = unsafe { ProbeKey::from_bound(&item) }?;
+                        self.inner.remove(probe.as_key());
+                    }
+                }
+                Ok(self.inner.len() != before)
+            }
+
+            /// Retains only the elements also present in `other`. Returns
+            /// whether the set changed.
+            fn retain_in(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                let other_set = PySet::empty(py)?;
+                for item in other.try_iter()? {
+                    other_set.add(item?)?;
+                }
+                let before = self.inner.len();
+                self.inner
+                    .retain(|value| other_set.contains(value.obj_borrowed(py)).unwrap_or(false));
+                Ok(self.inner.len() != before)
+            }
+
+            /// In-place symmetric difference with `other`.
+            fn symmetric_difference_with(&mut self, other: &Bound<PyAny>) -> PyResult<bool> {
+                let mut touched = false;
+                for item in other.try_iter()? {
+                    let item = item?;
+                    // SAFETY: `item` outlives `probe`.
+                    let probe = unsafe { ProbeKey::from_bound(&item) }?;
+                    if self.inner.remove(probe.as_key()) {
+                        touched = true;
+                    } else {
+                        self.inner.insert(HashedAny::from_bound(&item)?);
+                        touched = true;
+                    }
+                }
+                Ok(touched)
+            }
+        }
+
+        #[pymethods]
+        impl $PySet {
+            #[new]
+            #[pyo3(signature = (iterable = None, *, capacity = 0))]
+            fn new(iterable: Option<&Bound<PyAny>>, capacity: usize) -> PyResult<Self> {
+                let mut me = Self {
+                    inner: $Inner::with_capacity(capacity),
+                    generation: 0,
+                };
+                if let Some(iterable) = iterable {
+                    me.add_all(iterable)?;
+                }
+                Ok(me)
+            }
+
+            #[classmethod]
+            #[pyo3(signature = (capacity = 0, reserve_fraction = None))]
+            fn with_options(
+                _cls: &Bound<PyType>,
+                capacity: usize,
+                reserve_fraction: Option<f64>,
+            ) -> PyResult<Self> {
+                let rf = $validate_rf(reserve_fraction)?;
+                Ok(Self {
+                    inner: $Inner::with_capacity_and_reserve_fraction(capacity, rf),
+                    generation: 0,
+                })
+            }
+
+            /// Runtime support for `Cls[T]` via `types.GenericAlias`.
+            #[classmethod]
+            fn __class_getitem__<'py>(
+                cls: &Bound<'py, PyType>,
+                item: &Bound<'py, PyAny>,
+                py: Python<'py>,
+            ) -> PyResult<Bound<'py, PyAny>> {
+                py.import("types")?
+                    .getattr("GenericAlias")?
+                    .call1((cls, item))
+            }
+
+            fn __len__(&self) -> usize {
+                self.inner.len()
+            }
+
+            #[getter]
+            fn capacity(&self) -> usize {
+                self.inner.capacity()
+            }
+
+            fn __contains__(&self, value: &Bound<PyAny>) -> PyResult<bool> {
+                // SAFETY: `value` outlives `probe`.
+                let probe = unsafe { ProbeKey::from_bound(value) }?;
+                Ok(self.inner.contains(probe.as_key()))
+            }
+
+            fn __iter__(slf: Bound<Self>) -> $KeyIter {
+                let py = slf.py();
+                let m = slf.borrow();
+                let snapshot = m.inner.iter().map(|k| Some(k.obj_clone_ref(py))).collect();
+                let expected_gen = m.generation;
+                drop(m);
+                $KeyIter {
+                    map: slf.unbind(),
+                    snapshot,
+                    expected_gen,
+                    pos: 0,
+                }
+            }
+
+            fn __repr__(&self) -> String {
+                format!(
+                    concat!($py_set_name, "(len={}, capacity={})"),
+                    self.inner.len(),
+                    self.inner.capacity()
+                )
+            }
+
+            fn copy(&self, py: Python) -> Self {
+                let mut new = $Inner::with_capacity(self.inner.len());
+                for value in self.inner.iter() {
+                    new.insert(value.clone_with_py(py));
+                }
+                Self {
+                    inner: new,
+                    generation: 0,
+                }
+            }
+
+            fn add(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
+                let key = HashedAny::from_bound(value)?;
+                if self.inner.insert(key) {
+                    self.bump();
+                }
+                Ok(())
+            }
+
+            fn discard(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
+                // SAFETY: `value` outlives `probe`.
+                let probe = unsafe { ProbeKey::from_bound(value) }?;
+                if self.inner.remove(probe.as_key()) {
+                    self.bump();
+                }
+                Ok(())
+            }
+
+            fn remove(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
+                // SAFETY: `value` outlives `probe`.
+                let probe = unsafe { ProbeKey::from_bound(value) }?;
+                if self.inner.remove(probe.as_key()) {
+                    self.bump();
+                    Ok(())
+                } else {
+                    Err(PyKeyError::new_err(value.clone().unbind()))
+                }
+            }
+
+            fn pop(&mut self, py: Python) -> PyResult<Py<PyAny>> {
+                if self.inner.is_empty() {
+                    return Err(PyKeyError::new_err("pop from an empty set"));
+                }
+                // `extract_if` removes only the elements it yields (its `Drop` is
+                // a no-op), so taking one leaves the rest intact.
+                let value = self.inner.extract_if(|_| true).next().expect("len > 0");
+                let obj = value.obj_clone_ref(py);
+                self.bump();
+                Ok(obj)
+            }
+
+            fn clear(&mut self) {
+                Python::attach(|_py| self.inner.clear());
+                self.bump();
+            }
+
+            fn isdisjoint(&self, other: &Bound<PyAny>) -> PyResult<bool> {
+                for item in other.try_iter()? {
+                    let item = item?;
+                    // SAFETY: `item` outlives `probe`.
+                    let probe = unsafe { ProbeKey::from_bound(&item) }?;
+                    if self.inner.contains(probe.as_key()) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+
+            fn issubset(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                let other_set = PySet::empty(py)?;
+                for item in other.try_iter()? {
+                    other_set.add(item?)?;
+                }
+                for value in self.inner.iter() {
+                    if !other_set.contains(value.obj_borrowed(py))? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+
+            fn issuperset(&self, other: &Bound<PyAny>) -> PyResult<bool> {
+                for item in other.try_iter()? {
+                    let item = item?;
+                    // SAFETY: `item` outlives `probe`.
+                    let probe = unsafe { ProbeKey::from_bound(&item) }?;
+                    if !self.inner.contains(probe.as_key()) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+
+            #[pyo3(signature = (*others))]
+            fn union(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
+                let mut new = self.copy(py);
+                for other in others.try_iter()? {
+                    new.add_all(&other?)?;
+                }
+                Ok(new)
+            }
+
+            #[pyo3(signature = (*others))]
+            fn intersection(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
+                let mut new = self.copy(py);
+                for other in others.try_iter()? {
+                    new.retain_in(&other?, py)?;
+                }
+                Ok(new)
+            }
+
+            #[pyo3(signature = (*others))]
+            fn difference(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
+                let mut new = self.copy(py);
+                for other in others.try_iter()? {
+                    new.remove_all(&other?)?;
+                }
+                Ok(new)
+            }
+
+            fn symmetric_difference(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
+                let mut new = self.copy(py);
+                new.symmetric_difference_with(other)?;
+                Ok(new)
+            }
+
+            #[pyo3(signature = (*others))]
+            fn update(&mut self, others: &Bound<PyTuple>) -> PyResult<()> {
+                let mut touched = false;
+                for other in others.try_iter()? {
+                    touched |= self.add_all(&other?)?;
+                }
+                if touched {
+                    self.bump();
+                }
+                Ok(())
+            }
+
+            #[pyo3(signature = (*others))]
+            fn intersection_update(&mut self, others: &Bound<PyTuple>, py: Python) -> PyResult<()> {
+                let mut touched = false;
+                for other in others.try_iter()? {
+                    touched |= self.retain_in(&other?, py)?;
+                }
+                if touched {
+                    self.bump();
+                }
+                Ok(())
+            }
+
+            #[pyo3(signature = (*others))]
+            fn difference_update(&mut self, others: &Bound<PyTuple>) -> PyResult<()> {
+                let mut touched = false;
+                for other in others.try_iter()? {
+                    touched |= self.remove_all(&other?)?;
+                }
+                if touched {
+                    self.bump();
+                }
+                Ok(())
+            }
+
+            fn symmetric_difference_update(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
+                if self.symmetric_difference_with(other)? {
+                    self.bump();
+                }
+                Ok(())
+            }
+
+            fn __eq__(&self, other: &Bound<PyAny>) -> PyResult<bool> {
+                if !is_set_like(other)? {
+                    return Ok(false);
+                }
+                let Ok(other_len) = other.len() else {
+                    return Ok(false);
+                };
+                if other_len != self.inner.len() {
+                    return Ok(false);
+                }
+                for item in other.try_iter()? {
+                    let item = item?;
+                    // SAFETY: `item` outlives `probe`.
+                    let probe = unsafe { ProbeKey::from_bound(&item) }?;
+                    if !self.inner.contains(probe.as_key()) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+
+            fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
+                let mut new = self.copy(py);
+                new.add_all(other)?;
+                Ok(new)
+            }
+
+            fn __ror__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
+                // Union is commutative for membership; result keeps this backend.
+                self.__or__(other, py)
+            }
+
+            fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
+                let mut new = self.copy(py);
+                new.retain_in(other, py)?;
+                Ok(new)
+            }
+
+            fn __rand__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
+                self.__and__(other, py)
+            }
+
+            fn __sub__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
+                let mut new = self.copy(py);
+                new.remove_all(other)?;
+                Ok(new)
+            }
+
+            fn __rsub__(&self, other: &Bound<PyAny>) -> PyResult<Self> {
+                // `other - self`: start from `other`, drop everything in `self`.
+                let mut new = Self {
+                    inner: $Inner::new(),
+                    generation: 0,
+                };
+                new.add_all(other)?;
+                for value in self.inner.iter() {
+                    new.inner.remove(value);
+                }
+                Ok(new)
+            }
+
+            fn __xor__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
+                self.symmetric_difference(other, py)
+            }
+
+            fn __rxor__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
+                self.symmetric_difference(other, py)
+            }
+
+            fn __ior__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
+                if self.add_all(other)? {
+                    self.bump();
+                }
+                Ok(())
+            }
+
+            fn __iand__(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<()> {
+                if self.retain_in(other, py)? {
+                    self.bump();
+                }
+                Ok(())
+            }
+
+            fn __isub__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
+                if self.remove_all(other)? {
+                    self.bump();
+                }
+                Ok(())
+            }
+
+            fn __ixor__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
+                if self.symmetric_difference_with(other)? {
+                    self.bump();
+                }
+                Ok(())
+            }
+        }
+
+        define_iter!($KeyIter, $key_iter_name, $PySet);
+    };
+}
+
+define_set_classes! {
+    py_set = PyElasticHashSet,
+    py_set_name = "ElasticHashSet",
+    inner = ElasticHashSet,
+    validate_rf = validate_elastic_reserve_fraction,
+    key_iter = PyElasticSetIter,
+    key_iter_name = "_ElasticSetIter",
+}
+
+define_set_classes! {
+    py_set = PyFunnelHashSet,
+    py_set_name = "FunnelHashSet",
+    inner = FunnelHashSet,
+    validate_rf = validate_funnel_reserve_fraction,
+    key_iter = PyFunnelSetIter,
+    key_iter_name = "_FunnelSetIter",
+}
+
 define_map_classes! {
     py_map = PyElasticHashMap,
     py_map_name = "ElasticHashMap",
@@ -1062,6 +1541,8 @@ define_map_classes! {
 fn opthash(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PyElasticHashMap>()?;
     m.add_class::<PyFunnelHashMap>()?;
+    m.add_class::<PyElasticHashSet>()?;
+    m.add_class::<PyFunnelHashSet>()?;
     m.add_class::<PyElasticKeysView>()?;
     m.add_class::<PyElasticValuesView>()?;
     m.add_class::<PyElasticItemsView>()?;

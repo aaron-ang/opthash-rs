@@ -1,30 +1,21 @@
-use std::fmt;
 use std::hash::{BuildHasher, Hash};
-use std::iter::FusedIterator;
-use std::marker::PhantomData;
-use std::mem::{self, ManuallyDrop};
-use std::ops::Index;
-use std::ptr;
+use std::mem;
 
 use allocator_api2::alloc::{Allocator, Global, Layout};
 use equivalent::Equivalent;
 
 use crate::common::DefaultHashBuilder;
 use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
-use crate::common::config::{
-    DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY,
-};
+use crate::common::config::{GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
-use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError, TryReserveError};
-use crate::common::iter::{
-    IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys, OccupiedSlots,
-    RegionIter, RegionIterMut, Values as CommonValues,
-};
+use crate::common::error::TryReserveError;
+use crate::common::iter::OccupiedSlots;
 use crate::common::math::{self, align, capacity, probe};
+use crate::map::{self, RawTable};
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
-/// [`SlotEntry`] data live contiguously in [`ElasticHashMap::arena`].
+/// [`SlotEntry`] data live contiguously in [`ElasticTable::arena`].
 struct Level<T> {
     /// Cached `arena.as_ptr() + ctrl_offset`, stamped at construction.
     ctrl_ptr: *mut u8,
@@ -173,7 +164,8 @@ impl<K, V> Level<SlotEntry<K, V>> {
     }
 }
 
-/// Open-addressed hash map using elastic hashing.
+/// Open-addressed elastic-hashing backend for the generic [`map::HashMap`]
+/// shell. See [`ElasticHashMap`] for the public map type.
 ///
 /// Splits capacity across geometrically shrinking `levels` and routes inserts
 /// through a `batch_plan`: early batches concentrate on level 0; later
@@ -185,7 +177,7 @@ impl<K, V> Level<SlotEntry<K, V>> {
 /// we use triangular probing with a per-level salt instead. Same
 /// simplification as `SwissTable` / hashbrown — preserves coverage with
 /// far better cache behavior than recomputing random positions.
-pub struct ElasticHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
+pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     /// Geometrically shrinking partition of capacity; length fixed at ctor.
     levels: LevelSlice<K, V>,
     /// Total live entries.
@@ -214,15 +206,15 @@ pub struct ElasticHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = G
 }
 
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
-    for ElasticHashMap<K, V, S, A>
+    for ElasticTable<K, V, S, A>
 {
 }
 unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
-    for ElasticHashMap<K, V, S, A>
+    for ElasticTable<K, V, S, A>
 {
 }
 
-impl<K, V, S, A: Allocator + Clone> Drop for ElasticHashMap<K, V, S, A> {
+impl<K, V, S, A: Allocator + Clone> Drop for ElasticTable<K, V, S, A> {
     fn drop(&mut self) {
         let arena = mem::replace(&mut self.arena, Arena::empty());
         let guard = arena::DeallocGuard::new(arena, &self.alloc);
@@ -233,135 +225,58 @@ impl<K, V, S, A: Allocator + Clone> Drop for ElasticHashMap<K, V, S, A> {
     }
 }
 
-impl<K, V, S, A> fmt::Debug for ElasticHashMap<K, V, S, A>
-where
-    K: fmt::Debug + Eq + Hash,
-    V: fmt::Debug,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_map().entries(self.iter()).finish()
-    }
-}
+// ---------------------------------------------------------------------------
+// Public type aliases. The generic [`map::HashMap`] shell supplies the public
+// API; these names keep `ElasticHashMap` and its iterator/entry types
+// nameable (and re-exportable from `lib.rs` / `set.rs`).
+// ---------------------------------------------------------------------------
 
-impl<K, V> Default for ElasticHashMap<K, V, DefaultHashBuilder, Global>
-where
-    K: Eq + Hash,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Open-addressed hash map using elastic hashing.
+pub type ElasticHashMap<K, V, S = DefaultHashBuilder, A = Global> =
+    map::HashMap<K, V, ElasticTable<K, V, S, A>>;
 
-// Global allocator + default hasher constructors.
-impl<K, V> ElasticHashMap<K, V, DefaultHashBuilder, Global>
-where
-    K: Eq + Hash,
-{
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_capacity_and_reserve_fraction(0, DEFAULT_RESERVE_FRACTION)
-    }
-
-    #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_and_reserve_fraction(capacity, DEFAULT_RESERVE_FRACTION)
-    }
-
-    #[must_use]
-    pub fn with_reserve_fraction(reserve_fraction: f64) -> Self {
-        Self::with_capacity_and_reserve_fraction(0, reserve_fraction)
-    }
-
-    #[must_use]
-    pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
-            capacity,
-            reserve_fraction,
-            DefaultHashBuilder::default(),
-            Global,
-        )
-    }
-}
-
-// Global allocator + custom hasher constructors.
-impl<K, V, S> ElasticHashMap<K, V, S, Global>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-{
-    #[must_use]
-    pub fn with_hasher(hash_builder: S) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
-            0,
-            DEFAULT_RESERVE_FRACTION,
-            hash_builder,
-            Global,
-        )
-    }
-
-    #[must_use]
-    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
-            capacity,
-            DEFAULT_RESERVE_FRACTION,
-            hash_builder,
-            Global,
-        )
-    }
-
-    #[must_use]
-    pub fn with_reserve_fraction_and_hasher(reserve_fraction: f64, hash_builder: S) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
-            0,
-            reserve_fraction,
-            hash_builder,
-            Global,
-        )
-    }
-
-    #[must_use]
-    pub fn with_capacity_and_reserve_fraction_and_hasher(
-        capacity: usize,
-        reserve_fraction: f64,
-        hash_builder: S,
-    ) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
-            capacity,
-            reserve_fraction,
-            hash_builder,
-            Global,
-        )
-    }
-}
-
-// Default hasher + custom allocator constructors.
-impl<K, V, A> ElasticHashMap<K, V, DefaultHashBuilder, A>
-where
-    K: Eq + Hash,
-    A: Allocator + Clone,
-{
-    #[must_use]
-    pub fn new_in(alloc: A) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
-            0,
-            DEFAULT_RESERVE_FRACTION,
-            DefaultHashBuilder::default(),
-            alloc,
-        )
-    }
-
-    #[must_use]
-    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
-            capacity,
-            DEFAULT_RESERVE_FRACTION,
-            DefaultHashBuilder::default(),
-            alloc,
-        )
-    }
-}
+/// A view into a single entry, occupied or vacant.
+pub type Entry<'a, K, V, S = DefaultHashBuilder, A = Global> =
+    map::Entry<'a, K, V, ElasticTable<K, V, S, A>>;
+/// View of an occupied entry.
+pub type OccupiedEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
+    map::OccupiedEntry<'a, K, V, ElasticTable<K, V, S, A>>;
+/// View of a vacant entry.
+pub type VacantEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
+    map::VacantEntry<'a, K, V, ElasticTable<K, V, S, A>>;
+/// Error returned by `try_insert` on key collision.
+pub type OccupiedError<'a, K, V, S = DefaultHashBuilder, A = Global> =
+    map::OccupiedError<'a, K, V, ElasticTable<K, V, S, A>>;
+/// Borrowing iterator over `(&K, &V)`.
+pub type ElasticIter<'a, K, V, S = DefaultHashBuilder, A = Global> =
+    map::Iter<'a, K, V, ElasticTable<K, V, S, A>>;
+/// Borrowing iterator over `(&K, &mut V)`.
+pub type ElasticIterMut<'a, K, V, S = DefaultHashBuilder, A = Global> =
+    map::IterMut<'a, K, V, ElasticTable<K, V, S, A>>;
+/// Consuming iterator over owned `(K, V)`.
+pub type ElasticIntoIter<K, V, S = DefaultHashBuilder, A = Global> =
+    map::IntoIter<K, V, ElasticTable<K, V, S, A>>;
+/// `&K` iterator.
+pub type Keys<'a, K, V, S = DefaultHashBuilder, A = Global> =
+    map::Keys<'a, K, V, ElasticTable<K, V, S, A>>;
+/// `&V` iterator.
+pub type Values<'a, K, V, S = DefaultHashBuilder, A = Global> =
+    map::Values<'a, K, V, ElasticTable<K, V, S, A>>;
+/// `&mut V` iterator.
+pub type ElasticValuesMut<'a, K, V, S = DefaultHashBuilder, A = Global> =
+    map::ValuesMut<'a, K, V, ElasticTable<K, V, S, A>>;
+/// Owned `K` iterator.
+pub type ElasticIntoKeys<K, V, S = DefaultHashBuilder, A = Global> =
+    map::IntoKeys<K, V, ElasticTable<K, V, S, A>>;
+/// Owned `V` iterator.
+pub type ElasticIntoValues<K, V, S = DefaultHashBuilder, A = Global> =
+    map::IntoValues<K, V, ElasticTable<K, V, S, A>>;
+/// Draining iterator that empties the map.
+pub type Drain<'a, K, V, S = DefaultHashBuilder, A = Global> =
+    map::Drain<'a, K, V, ElasticTable<K, V, S, A>>;
+/// Iterator yielding entries removed by `extract_if`.
+pub type ExtractIf<'a, K, V, F, S = DefaultHashBuilder, A = Global> =
+    map::ExtractIf<'a, K, V, ElasticTable<K, V, S, A>, F>;
 
 /// Boxed slice of levels for one `(K, V)` parameterization.
 type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
@@ -463,7 +378,7 @@ impl<K, V, A: Allocator + Clone> Drop for ArenaDropGuard<K, V, A> {
     }
 }
 
-impl<K, V, S, A> ElasticHashMap<K, V, S, A>
+impl<K, V, S, A> ElasticTable<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
@@ -513,99 +428,6 @@ where
         }
     }
 
-    /// Reference to the map's allocator.
-    #[must_use]
-    pub fn allocator(&self) -> &A {
-        &self.alloc
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Maximum number of inserts the map can absorb before the next resize.
-    /// Mirrors [`std::collections::HashMap::capacity`] — returns the insert
-    /// budget, not the raw slot count (see [`Self::total_slots`] field).
-    #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.max_insertions
-    }
-
-    /// Grow capacity so at least `additional` more inserts fit without
-    /// triggering an internal resize. No-op if already large enough.
-    ///
-    /// # Panics
-    ///
-    /// Panics on capacity overflow. Use [`Self::try_reserve`] for fallible
-    /// growth.
-    pub fn reserve(&mut self, additional: usize) {
-        let needed = self.len.saturating_add(additional);
-        if needed <= self.max_insertions {
-            return;
-        }
-        let new_capacity = self.grow_capacity_for(needed).expect("capacity overflow");
-        self.resize(new_capacity);
-    }
-
-    /// Fallible counterpart to [`Self::reserve`].
-    ///
-    /// # Errors
-    ///
-    /// [`TryReserveError::CapacityOverflow`] if `self.len + additional`
-    /// overflows; [`TryReserveError::AllocError`] on allocator failure.
-    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
-    where
-        S: Clone,
-    {
-        let needed = self
-            .len
-            .checked_add(additional)
-            .ok_or(TryReserveError::CapacityOverflow)?;
-        if needed <= self.max_insertions {
-            return Ok(());
-        }
-        let new_capacity = self
-            .grow_capacity_for(needed)
-            .ok_or(TryReserveError::CapacityOverflow)?;
-        self.try_resize(new_capacity)
-    }
-
-    /// Shrinks the capacity as much as possible while preserving all live
-    /// entries. Mirrors [`std::collections::HashMap::shrink_to_fit`].
-    pub fn shrink_to_fit(&mut self) {
-        self.shrink_to(0);
-    }
-
-    /// Shrinks the capacity with a lower bound. The table won't shrink below
-    /// the larger of `min_capacity` and [`Self::len`]. Mirrors
-    /// [`std::collections::HashMap::shrink_to`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if no representable capacity satisfies
-    /// `capacity::max_insertions(cap) >= min_capacity`.
-    pub fn shrink_to(&mut self, min_capacity: usize) {
-        if self.len == 0 && min_capacity == 0 {
-            if self.total_slots > 0 {
-                self.resize(0);
-            }
-            return;
-        }
-        let lower = self.len.max(min_capacity).max(INITIAL_CAPACITY);
-        let new_capacity = capacity::capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction)
-            .expect("capacity overflow");
-        if new_capacity >= self.total_slots {
-            return;
-        }
-        self.resize(new_capacity);
-    }
-
     /// Round up to the smallest capacity whose `max_insertions` accommodates
     /// `needed` live entries. Returns `None` if no representable capacity
     /// suffices. Used by `reserve` / `try_reserve`.
@@ -617,234 +439,8 @@ where
         )
     }
 
-    /// # Panics
-    ///
-    /// Panics if a resize succeeds but no free slot can be found for the new key.
-    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        let key_hash = self.hash_key(&key);
-        let key_fingerprint = control::control_fingerprint(key_hash);
-
-        if let Some((level_idx, slot_idx)) =
-            self.find_slot_indices_with_hash(&key, key_hash, key_fingerprint)
-        {
-            let entry = unsafe { self.levels[level_idx].get_mut(slot_idx) };
-            let old = mem::replace(&mut entry.value, value);
-            return Some(old);
-        }
-
-        if self.len >= self.max_insertions {
-            let new_capacity = if self.total_slots == 0 {
-                INITIAL_CAPACITY
-            } else {
-                self.total_slots.saturating_mul(2)
-            };
-            self.resize(new_capacity);
-        }
-
-        self.advance_batch_window();
-        let (level_idx, slot_idx) = self
-            .choose_slot_for_new_key(key_hash)
-            .expect("no free slot found after resize");
-
-        let level = &mut self.levels[level_idx];
-        let prev_ctrl = level.control_at(slot_idx);
-        level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
-        level.len += 1;
-        if prev_ctrl == CTRL_TOMBSTONE {
-            level.tombstones -= 1;
-        }
-        if level_idx > self.max_populated_level {
-            self.max_populated_level = level_idx;
-        }
-        self.len += 1;
-        if self.batch_remaining > 0 {
-            self.batch_remaining -= 1;
-        }
-        None
-    }
-
-    pub fn get<Q>(&self, key: &Q) -> Option<&V>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let key_hash = self.hash_key(key);
-        let key_fingerprint = control::control_fingerprint(key_hash);
-        let (level_idx, slot_idx) =
-            self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
-        Some(unsafe { &self.levels[level_idx].get_ref(slot_idx).value })
-    }
-
-    /// Like [`Self::get`] but returns the stored key alongside its value.
-    pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let key_hash = self.hash_key(key);
-        let key_fingerprint = control::control_fingerprint(key_hash);
-        let (level_idx, slot_idx) =
-            self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
-        let entry = unsafe { self.levels[level_idx].get_ref(slot_idx) };
-        Some((&entry.key, &entry.value))
-    }
-
-    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let key_hash = self.hash_key(key);
-        let key_fingerprint = control::control_fingerprint(key_hash);
-        let (level_idx, slot_idx) =
-            self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
-        Some(unsafe { &mut self.levels[level_idx].get_mut(slot_idx).value })
-    }
-
-    /// Returns `N` disjoint mutable references, mirroring
-    /// [`std::collections::HashMap::get_disjoint_mut`]: per-key `Option` for
-    /// each lookup, panic on aliasing among the hits.
-    ///
-    /// # Panics
-    ///
-    /// If two input keys resolve to the same `(level, slot)` pair.
-    pub fn get_disjoint_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> [Option<&mut V>; N]
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let locations = self.locate_disjoint(keys);
-        arena::check_disjoint_aliasing(&locations);
-
-        let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
-        std::array::from_fn(|i| {
-            locations[i].map(|(level_idx, slot_idx)| {
-                // SAFETY: locations are unique among Somes (asserted above).
-                // `elastic_slot_value_ptr` projects via raw pointers — no
-                // intermediate `&mut Level` / `&mut RawTable`, so two keys
-                // hitting the same level can't alias under Stacked Borrows.
-                let value_ptr = unsafe { elastic_slot_value_ptr(levels_ptr, level_idx, slot_idx) };
-                unsafe { &mut *value_ptr }
-            })
-        })
-    }
-
-    /// Like [`Self::get_disjoint_mut`] but each yielded element is
-    /// `(&K, &mut V)`. Mirrors `std`'s `get_disjoint_key_value_mut`.
-    ///
-    /// # Panics
-    ///
-    /// If two input keys resolve to the same `(level, slot)` pair.
-    pub fn get_disjoint_key_value_mut<Q, const N: usize>(
-        &mut self,
-        keys: [&Q; N],
-    ) -> [Option<(&K, &mut V)>; N]
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let locations = self.locate_disjoint(keys);
-        arena::check_disjoint_aliasing(&locations);
-
-        let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
-        std::array::from_fn(|i| {
-            locations[i].map(|(level_idx, slot_idx)| {
-                // SAFETY: as in `get_disjoint_mut`.
-                let (k_ptr, v_ptr) =
-                    unsafe { elastic_slot_kv_ptrs(levels_ptr, level_idx, slot_idx) };
-                (unsafe { &*k_ptr }, unsafe { &mut *v_ptr })
-            })
-        })
-    }
-
-    /// Unsafe variant of [`Self::get_disjoint_mut`] that skips the
-    /// alias check. Mirrors [`std::collections::HashMap::get_disjoint_unchecked_mut`].
-    ///
-    /// # Safety
-    ///
-    /// Among the keys that resolve to occupied slots, all must reference
-    /// distinct entries; otherwise the returned references alias and
-    /// behavior is undefined.
-    pub unsafe fn get_disjoint_unchecked_mut<Q, const N: usize>(
-        &mut self,
-        keys: [&Q; N],
-    ) -> [Option<&mut V>; N]
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let locations = self.locate_disjoint(keys);
-
-        let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
-        std::array::from_fn(|i| {
-            locations[i].map(|(level_idx, slot_idx)| {
-                // SAFETY: caller guarantees the hits are pairwise distinct.
-                let value_ptr = unsafe { elastic_slot_value_ptr(levels_ptr, level_idx, slot_idx) };
-                unsafe { &mut *value_ptr }
-            })
-        })
-    }
-
-    #[inline]
-    fn locate_disjoint<Q, const N: usize>(&self, keys: [&Q; N]) -> [Option<(usize, usize)>; N]
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        std::array::from_fn(|i| {
-            let key = keys[i];
-            let key_hash = self.hash_key(key);
-            let key_fingerprint = control::control_fingerprint(key_hash);
-            self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)
-        })
-    }
-
-    pub fn contains_key<Q>(&self, key: &Q) -> bool
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let key_hash = self.hash_key(key);
-        let key_fingerprint = control::control_fingerprint(key_hash);
-        self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)
-            .is_some()
-    }
-
-    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        self.remove_inner(key).map(|(_, v)| v)
-    }
-
-    /// Like [`Self::remove`] but returns the stored key alongside its value.
-    pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        self.remove_inner(key)
-    }
-
-    fn remove_inner<Q>(&mut self, key: &Q) -> Option<(K, V)>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let key_hash = self.hash_key(key);
-        let key_fingerprint = control::control_fingerprint(key_hash);
-        let (level_idx, slot_idx) =
-            self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
-
-        let removed_entry = {
-            let level = &mut self.levels[level_idx];
-            let removed = unsafe { level.take(slot_idx) };
-            level.mark_tombstone(slot_idx);
-            level.len -= 1;
-            level.tombstones += 1;
-            removed
-        };
-
-        self.len -= 1;
-        let needs_resize = self.levels[level_idx].needs_cleanup();
-        self.shrink_max_populated_level();
-        if needs_resize {
-            self.resize(self.total_slots);
-        }
-        Some((removed_entry.key, removed_entry.value))
-    }
-
-    pub fn clear(&mut self) {
+    /// Removes all entries, keeping allocated capacity.
+    fn clear(&mut self) {
         for level in &mut self.levels {
             level.drop_values();
             level.clear_all_controls();
@@ -855,102 +451,6 @@ where
         self.current_batch_index = 0;
         self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
         self.max_populated_level = 0;
-    }
-
-    #[must_use]
-    pub fn iter(&self) -> ElasticIter<'_, K, V, A> {
-        ElasticIter {
-            iter: RegionIter::new(&self.levels),
-            remaining: self.len,
-            _alloc: PhantomData,
-        }
-    }
-
-    /// `&K` iterator. Order matches [`Self::iter`].
-    #[must_use]
-    pub fn keys(&self) -> Keys<'_, K, V, A> {
-        Keys::new(self.iter())
-    }
-
-    /// `&V` iterator. Order matches [`Self::iter`].
-    #[must_use]
-    pub fn values(&self) -> Values<'_, K, V, A> {
-        Values::new(self.iter())
-    }
-
-    /// Reference to the map's [`BuildHasher`].
-    #[must_use]
-    pub fn hasher(&self) -> &S {
-        &self.hash_builder
-    }
-
-    /// `(&K, &mut V)` iterator. Mirrors `HashMap::iter_mut`.
-    pub fn iter_mut(&mut self) -> ElasticIterMut<'_, K, V, A> {
-        let remaining = self.len;
-        let iter = RegionIterMut::new(&mut self.levels);
-        ElasticIterMut {
-            iter,
-            remaining,
-            _alloc: PhantomData,
-        }
-    }
-
-    /// `&mut V` iterator. Mirrors `HashMap::values_mut`.
-    pub fn values_mut(&mut self) -> ElasticValuesMut<'_, K, V, A> {
-        ElasticValuesMut {
-            inner: self.iter_mut(),
-        }
-    }
-
-    /// Consuming iterator over owned keys. Mirrors `HashMap::into_keys`.
-    #[must_use]
-    pub fn into_keys(self) -> ElasticIntoKeys<K, V, S, A> {
-        ElasticIntoKeys::new(self.into_iter())
-    }
-
-    /// Consuming iterator over owned values. Mirrors `HashMap::into_values`.
-    #[must_use]
-    pub fn into_values(self) -> ElasticIntoValues<K, V, S, A> {
-        ElasticIntoValues::new(self.into_iter())
-    }
-
-    /// Returns an [`Entry`] for in-place manipulation of `key`'s slot.
-    /// Mirrors [`std::collections::HashMap::entry`].
-    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, S, A> {
-        let key_hash = self.hash_key(&key);
-        let key_fingerprint = control::control_fingerprint(key_hash);
-        if let Some((level_idx, slot_idx)) =
-            self.find_slot_indices_with_hash(&key, key_hash, key_fingerprint)
-        {
-            Entry::Occupied(OccupiedEntry {
-                map: self,
-                level_idx,
-                slot_idx,
-            })
-        } else {
-            Entry::Vacant(VacantEntry {
-                map: self,
-                key,
-                key_hash,
-            })
-        }
-    }
-
-    /// Inserts `key`/`value` if absent. Mirrors the unstable
-    /// [`std::collections::HashMap::try_insert`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`OccupiedError`] if `key` was already present.
-    pub fn try_insert(
-        &mut self,
-        key: K,
-        value: V,
-    ) -> Result<&mut V, OccupiedError<'_, K, V, S, A>> {
-        match self.entry(key) {
-            Entry::Occupied(entry) => Err(OccupiedError { entry, value }),
-            Entry::Vacant(entry) => Ok(entry.insert(value)),
-        }
     }
 
     /// Post-lookup insert for a key known to be absent. Returns the chosen
@@ -989,706 +489,304 @@ where
         (level_idx, slot_idx)
     }
 
-    /// Drops every entry for which `f(&K, &mut V)` returns `false`.
-    /// Mirrors [`std::collections::HashMap::retain`].
-    pub fn retain<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&K, &mut V) -> bool,
-    {
-        self.extract_if(|k, v| !f(k, v)).for_each(drop);
+    /// Raw pointer to the whole slot at `(level_idx, slot_idx)`. Projects
+    /// through raw pointers from `&self.levels`, forming no intermediate
+    /// `&mut Level`, so distinct locations yield non-aliasing `*mut`.
+    ///
+    /// # Safety
+    /// `level_idx` < `self.levels.len()` and `slot_idx` is a live slot there.
+    #[inline]
+    unsafe fn slot_ptr_at(&self, level_idx: usize, slot_idx: usize) -> *mut SlotEntry<K, V> {
+        let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
+        // SAFETY: shared `&Level` only — never `&mut` — so no aliasing tag.
+        let level = unsafe { &*levels_ptr.add(level_idx) };
+        unsafe { level.data_ptr().add(slot_idx) }
     }
 
-    /// Returns a draining iterator that empties the map. Mirrors
-    /// [`std::collections::HashMap::drain`].
-    pub fn drain(&mut self) -> Drain<'_, K, V, S, A> {
-        let map_ptr = ptr::from_mut(self);
-        let (levels_ptr, levels_len) = unsafe {
-            let levels = &mut (*map_ptr).levels;
-            (levels.as_mut_ptr(), levels.len())
-        };
-        let mut cursor = OccupiedSlots::empty();
-        if levels_len > 0 {
-            cursor.set_region(unsafe { &*levels_ptr });
-        }
-        Drain {
-            map_ptr,
-            levels_ptr,
-            levels_len,
-            cursor,
-            level_idx: 0,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Yields and removes `(K, V)` pairs where `f` returned `true`; kept
-    /// entries remain in the map. Mirrors
-    /// [`std::collections::HashMap::extract_if`].
-    pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, K, V, F, S, A>
-    where
-        F: FnMut(&K, &mut V) -> bool,
-    {
-        let map_ptr = ptr::from_mut(self);
-        let (levels_ptr, levels_len) = unsafe {
-            let levels = &mut (*map_ptr).levels;
-            (levels.as_mut_ptr(), levels.len())
-        };
-        let mut cursor = OccupiedSlots::empty();
-        if levels_len > 0 {
-            cursor.set_region(unsafe { &*levels_ptr });
-        }
-        ExtractIf {
-            map_ptr,
-            levels_ptr,
-            levels_len,
-            cursor,
-            level_idx: 0,
-            pred: f,
-            _marker: PhantomData,
-        }
-    }
-}
-
-/// A view into a single entry in an [`ElasticHashMap`], which may be either
-/// vacant or occupied. Constructed via [`ElasticHashMap::entry`].
-pub enum Entry<'a, K: 'a, V: 'a, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    /// Slot is occupied; key already lives in the map.
-    Occupied(OccupiedEntry<'a, K, V, S, A>),
-    /// Slot is vacant; the supplied key does not exist in the map yet.
-    Vacant(VacantEntry<'a, K, V, S, A>),
-}
-
-/// View of an occupied entry in an [`ElasticHashMap`].
-pub struct OccupiedEntry<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    map: &'a mut ElasticHashMap<K, V, S, A>,
-    level_idx: usize,
-    slot_idx: usize,
-}
-
-impl<'a, K, V, S, A> OccupiedEntry<'a, K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    /// Returns a reference to the entry's key.
-    #[must_use]
-    pub fn key(&self) -> &K {
-        unsafe { &self.map.slot_ref(self.level_idx, self.slot_idx).key }
-    }
-
-    /// Returns a reference to the entry's value.
-    #[must_use]
-    pub fn get(&self) -> &V {
-        unsafe { &self.map.slot_ref(self.level_idx, self.slot_idx).value }
-    }
-
-    /// Returns `&mut V`. Borrow is tied to `self`; for the map's lifetime
-    /// use [`OccupiedEntry::into_mut`].
-    pub fn get_mut(&mut self) -> &mut V {
-        unsafe { &mut self.map.slot_mut(self.level_idx, self.slot_idx).value }
-    }
-
-    /// Consumes the entry and returns `&mut V` borrowed from the map.
-    #[must_use]
-    pub fn into_mut(self) -> &'a mut V {
-        unsafe { &mut self.map.slot_mut(self.level_idx, self.slot_idx).value }
-    }
-
-    /// Replaces the entry's value and returns the old one.
-    pub fn insert(&mut self, value: V) -> V {
-        let entry = unsafe { self.map.slot_mut(self.level_idx, self.slot_idx) };
-        mem::replace(&mut entry.value, value)
-    }
-
-    /// Removes the entry and returns its value.
-    #[must_use]
-    pub fn remove(self) -> V {
-        self.remove_entry().1
-    }
-
-    /// Removes the entry and returns the `(key, value)` pair.
-    #[must_use]
-    pub fn remove_entry(self) -> (K, V) {
-        let level_idx = self.level_idx;
-        let slot_idx = self.slot_idx;
+    /// Take + tombstone + decrement counters for the slot at `loc`. Shared
+    /// by [`RawTable::remove`] and [`RawTable::extract_at`]; the former adds a
+    /// resize pass, the latter consolidates tombstones lazily.
+    fn take_and_tombstone(&mut self, level_idx: usize, slot_idx: usize) -> (K, V) {
         let removed = {
-            let level = &mut self.map.levels[level_idx];
+            let level = &mut self.levels[level_idx];
             let removed = unsafe { level.take(slot_idx) };
             level.mark_tombstone(slot_idx);
             level.len -= 1;
             level.tombstones += 1;
             removed
         };
-
-        self.map.len -= 1;
-        let needs_resize = self.map.levels[level_idx].needs_cleanup();
-        self.map.shrink_max_populated_level();
-        if needs_resize {
-            self.map.resize(self.map.total_slots);
-        }
+        self.len -= 1;
         (removed.key, removed.value)
     }
 }
 
-/// View of a vacant entry in an [`ElasticHashMap`].
-pub struct VacantEntry<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    map: &'a mut ElasticHashMap<K, V, S, A>,
-    key: K,
-    key_hash: u64,
-}
-
-impl<'a, K, V, S, A> VacantEntry<'a, K, V, S, A>
+// `SlotEntry` is `pub(crate)`; the `RawTable` trait (in the private `map`
+// module) exposes it in `slot_ref`/`slot_ptr`, so the impl mirrors the trait's
+// private-interface lint exemption.
+#[allow(private_interfaces)]
+impl<K, V, S, A> RawTable<K, V> for ElasticTable<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
     A: Allocator + Clone,
 {
-    /// Returns a reference to the key that would be inserted.
-    pub fn key(&self) -> &K {
-        &self.key
+    type Location = (usize, usize);
+    type Hasher = S;
+    type Alloc = A;
+    type Scan = ElasticScan;
+
+    #[inline]
+    fn with_capacity_and_reserve_fraction_and_hasher_in(
+        capacity: usize,
+        reserve_fraction: f64,
+        hash_builder: S,
+        alloc: A,
+    ) -> Self {
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            reserve_fraction,
+            hash_builder,
+            alloc,
+        )
     }
 
-    /// Consumes the entry and returns the key without inserting.
-    #[must_use]
-    pub fn into_key(self) -> K {
-        self.key
+    #[inline]
+    fn hasher(&self) -> &S {
+        &self.hash_builder
     }
 
-    /// Inserts `value` for the entry's key, returning `&mut V`.
-    pub fn insert(self, value: V) -> &'a mut V {
-        let (level_idx, slot_idx) =
-            self.map
-                .insert_for_vacant_entry(self.key, value, self.key_hash);
-        unsafe { &mut self.map.slot_mut(level_idx, slot_idx).value }
+    #[inline]
+    fn allocator(&self) -> &A {
+        &self.alloc
     }
-}
 
-impl<'a, K, V, S, A> Entry<'a, K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    /// Returns a mutable reference to the entry's value, inserting `default`
-    /// first if vacant.
-    pub fn or_insert(self, default: V) -> &'a mut V {
-        match self {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(default),
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.max_insertions
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        let needed = self.len.saturating_add(additional);
+        if needed <= self.max_insertions {
+            return;
         }
+        let new_capacity = self.grow_capacity_for(needed).expect("capacity overflow");
+        self.resize(new_capacity);
     }
 
-    /// Like [`Entry::or_insert`] but the default is computed lazily.
-    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V {
-        match self {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(default()),
+    fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
+    where
+        S: Clone,
+    {
+        let needed = self
+            .len
+            .checked_add(additional)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        if needed <= self.max_insertions {
+            return Ok(());
         }
+        let new_capacity = self
+            .grow_capacity_for(needed)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        self.try_resize(new_capacity)
     }
 
-    /// Like [`Entry::or_insert_with`] but the default closure receives a
-    /// reference to the key.
-    pub fn or_insert_with_key<F: FnOnce(&K) -> V>(self, default: F) -> &'a mut V {
-        match self {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let value = default(entry.key());
-                entry.insert(value)
+    fn shrink_to(&mut self, min_capacity: usize) {
+        if self.len == 0 && min_capacity == 0 {
+            if self.total_slots > 0 {
+                self.resize(0);
             }
+            return;
+        }
+        let lower = self.len.max(min_capacity).max(INITIAL_CAPACITY);
+        let new_capacity = capacity::capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction)
+            .expect("capacity overflow");
+        if new_capacity >= self.total_slots {
+            return;
+        }
+        self.resize(new_capacity);
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.clear();
+    }
+
+    #[inline]
+    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<(usize, usize)>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.find_slot_indices_with_hash(key, hash, fingerprint)
+    }
+
+    #[inline]
+    unsafe fn slot_ref(&self, (level_idx, slot_idx): (usize, usize)) -> &SlotEntry<K, V> {
+        unsafe { self.slot_ref(level_idx, slot_idx) }
+    }
+
+    #[inline]
+    unsafe fn slot_ptr(&self, (level_idx, slot_idx): (usize, usize)) -> *mut SlotEntry<K, V> {
+        unsafe { self.slot_ptr_at(level_idx, slot_idx) }
+    }
+
+    #[inline]
+    fn replace_value(&mut self, (level_idx, slot_idx): (usize, usize), value: V) -> V {
+        let slot = unsafe { self.slot_mut(level_idx, slot_idx) };
+        mem::replace(&mut slot.value, value)
+    }
+
+    #[inline]
+    fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> (usize, usize) {
+        self.insert_for_vacant_entry(key, value, hash)
+    }
+
+    fn remove(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
+        let kv = self.take_and_tombstone(level_idx, slot_idx);
+        let needs_resize = self.levels[level_idx].needs_cleanup();
+        self.shrink_max_populated_level();
+        if needs_resize {
+            self.resize(self.total_slots);
+        }
+        kv
+    }
+
+    #[inline]
+    fn extract_at(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
+        self.take_and_tombstone(level_idx, slot_idx)
+    }
+
+    #[inline]
+    fn scan(&self) -> ElasticScan {
+        ElasticScan {
+            level_idx: 0,
+            cursor: OccupiedSlots::empty(),
+            started: false,
         }
     }
 
-    /// Returns a reference to this entry's key.
-    pub fn key(&self) -> &K {
-        match self {
-            Entry::Occupied(entry) => entry.key(),
-            Entry::Vacant(entry) => entry.key(),
+    fn scan_next(&self, scan: &mut ElasticScan) -> Option<(usize, usize)> {
+        if self.levels.is_empty() {
+            return None;
         }
-    }
-
-    /// Runs `f` against the value if the entry is occupied, then returns
-    /// the entry for further chaining.
-    #[must_use]
-    pub fn and_modify<F: FnOnce(&mut V)>(self, f: F) -> Self {
-        match self {
-            Entry::Occupied(mut entry) => {
-                f(entry.get_mut());
-                Entry::Occupied(entry)
-            }
-            Entry::Vacant(entry) => Entry::Vacant(entry),
+        if !scan.started {
+            scan.started = true;
+            // SAFETY: levels non-empty ⇒ index 0 in bounds.
+            scan.cursor.set_region(&self.levels[0]);
         }
-    }
-}
-
-impl<'a, K, V, S, A> Entry<'a, K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-    V: Default,
-{
-    /// Returns a mutable reference to the value, inserting `V::default()`
-    /// first if vacant.
-    pub fn or_default(self) -> &'a mut V {
-        match self {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(V::default()),
-        }
-    }
-}
-
-/// Error returned by [`ElasticHashMap::try_insert`] on key collision.
-pub type OccupiedError<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    CommonOccupiedError<OccupiedEntry<'a, K, V, S, A>, V>;
-
-impl<K, V, S, A> EntryView for OccupiedEntry<'_, K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    type Key = K;
-    type Value = V;
-    fn view_key(&self) -> &K {
-        self.key()
-    }
-    fn view_value(&self) -> &V {
-        self.get()
-    }
-}
-
-/// Draining iterator. Yields and removes every `(K, V)`; map is empty
-/// once consumed or dropped.
-pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    map_ptr: *mut ElasticHashMap<K, V, S, A>,
-    levels_ptr: *mut Level<SlotEntry<K, V>>,
-    levels_len: usize,
-    level_idx: usize,
-    cursor: OccupiedSlots,
-    _marker: PhantomData<&'a mut ElasticHashMap<K, V, S, A>>,
-}
-
-impl<K, V, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Drain")
-            .field("remaining", &unsafe { (*self.map_ptr).len })
-            .finish_non_exhaustive()
-    }
-}
-
-impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
-    type Item = (K, V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Per-yield ctrl byte update skipped: `Drain::drop` wipes all ctrls.
         loop {
-            if let Some(idx) = self.cursor.next() {
-                // SAFETY: scan only yields occupied slots in the current level.
-                let entry = unsafe {
-                    let level = &mut *self.levels_ptr.add(self.level_idx);
-                    level.take(idx)
-                };
-                unsafe { (*self.map_ptr).len -= 1 };
-                return Some((entry.key, entry.value));
+            if let Some(slot_idx) = scan.cursor.step() {
+                return Some((scan.level_idx, slot_idx));
             }
-            self.level_idx += 1;
-            if self.level_idx >= self.levels_len {
+            scan.level_idx += 1;
+            if scan.level_idx >= self.levels.len() {
                 return None;
             }
-            self.cursor
-                .set_region(unsafe { &*self.levels_ptr.add(self.level_idx) });
+            scan.cursor.set_region(&self.levels[scan.level_idx]);
         }
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = unsafe { (*self.map_ptr).len };
-        (len, Some(len))
-    }
-}
-
-impl<K, V, S, A: Allocator + Clone> ExactSizeIterator for Drain<'_, K, V, S, A> {}
-impl<K, V, S, A: Allocator + Clone> FusedIterator for Drain<'_, K, V, S, A> {}
-
-impl<K, V, S, A: Allocator + Clone> Drop for Drain<'_, K, V, S, A> {
-    fn drop(&mut self) {
-        // Drain any unyielded entries so values run their `Drop`.
-        for _ in &mut *self {}
-        // All entries moved out via `next()`; wipe ctrl bytes + counters en bloc.
-        let map = unsafe { &mut *self.map_ptr };
-        for level in &mut map.levels {
+    fn wipe_all(&mut self) {
+        for level in &mut self.levels {
             level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
         }
-        map.len = 0;
-        map.max_populated_level = 0;
-        map.current_batch_index = 0;
-        map.batch_remaining = map.batch_plan.first().copied().unwrap_or(0);
+        self.len = 0;
+        self.max_populated_level = 0;
+        self.current_batch_index = 0;
+        self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
     }
-}
 
-/// Filtering drain. Yields and removes entries where `pred` returns `true`.
-pub struct ExtractIf<'a, K, V, F, S = DefaultHashBuilder, A: Allocator + Clone = Global>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    F: FnMut(&K, &mut V) -> bool,
-{
-    map_ptr: *mut ElasticHashMap<K, V, S, A>,
-    levels_ptr: *mut Level<SlotEntry<K, V>>,
-    levels_len: usize,
-    level_idx: usize,
-    cursor: OccupiedSlots,
-    pred: F,
-    _marker: PhantomData<&'a mut ElasticHashMap<K, V, S, A>>,
-}
+    fn clone_table(&self) -> Self
+    where
+        K: Clone,
+        V: Clone,
+        S: Clone,
+    {
+        let level_capacities: Vec<usize> =
+            self.levels.iter().map(|l| l.capacity as usize).collect();
+        let (arena, levels) =
+            alloc_elastic_arena(&level_capacities, self.reserve_fraction, &self.alloc);
 
-impl<K, V, F, S, A: Allocator + Clone> fmt::Debug for ExtractIf<'_, K, V, F, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    F: FnMut(&K, &mut V) -> bool,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("ExtractIf")
-            .field("remaining", &unsafe { (*self.map_ptr).len })
-            .finish_non_exhaustive()
-    }
-}
+        // Drop guard for the half-built clone: if any user `K::clone` /
+        // `V::clone` panics, drop the already-cloned values (OCCUPIED on
+        // `dst_arena`) and deallocate the partially-filled arena. `Arena`
+        // has no `Drop`, so without this the whole allocation would leak.
+        let mut guard = ArenaDropGuard {
+            arena: Some(arena),
+            levels: Some(levels),
+            alloc: self.alloc.clone(),
+        };
 
-impl<K, V, F, S, A: Allocator + Clone> Iterator for ExtractIf<'_, K, V, F, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    F: FnMut(&K, &mut V) -> bool,
-{
-    type Item = (K, V);
+        for (dst, src_lvl) in guard
+            .levels
+            .as_deref_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(self.levels.iter())
+        {
+            arena::clone_region_panic_safe::<K, V>(
+                src_lvl.ctrl_ptr,
+                dst.ctrl_ptr,
+                src_lvl.data_ptr,
+                dst.data_ptr,
+                src_lvl.capacity as usize,
+            );
+            dst.len = src_lvl.len;
+            dst.tombstones = src_lvl.tombstones;
+        }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            for idx in self.cursor.by_ref() {
-                // SAFETY: scan only yields occupied slots.
-                let level = unsafe { &mut *self.levels_ptr.add(self.level_idx) };
-                let entry = unsafe { level.get_mut(idx) };
-                if (self.pred)(&entry.key, &mut entry.value) {
-                    // Tombstone before take so a panic mid-op leaves no
-                    // OCCUPIED to double-drop.
-                    level.mark_tombstone(idx);
-                    level.len -= 1;
-                    level.tombstones += 1;
-                    unsafe { (*self.map_ptr).len -= 1 };
-                    let removed = unsafe { level.take(idx) };
-                    return Some((removed.key, removed.value));
-                }
-            }
-            self.level_idx += 1;
-            if self.level_idx >= self.levels_len {
-                return None;
-            }
-            self.cursor
-                .set_region(unsafe { &*self.levels_ptr.add(self.level_idx) });
+        // Success: extract arena + levels from the guard so its Drop becomes
+        // a no-op. Both fields now live in `Self` below.
+        let arena = guard.arena.take().unwrap();
+        let levels = guard.levels.take().unwrap();
+        drop(guard);
+
+        Self {
+            levels,
+            len: self.len,
+            total_slots: self.total_slots,
+            max_insertions: self.max_insertions,
+            reserve_fraction: self.reserve_fraction,
+            batch_plan: self.batch_plan.clone(),
+            current_batch_index: self.current_batch_index,
+            batch_remaining: self.batch_remaining,
+            max_populated_level: self.max_populated_level,
+            hash_builder: self.hash_builder.clone(),
+            alloc: self.alloc.clone(),
+            arena,
         }
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(unsafe { (*self.map_ptr).len }))
-    }
 }
 
-impl<K, V, F, S, A: Allocator + Clone> Drop for ExtractIf<'_, K, V, F, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    F: FnMut(&K, &mut V) -> bool,
-{
-    fn drop(&mut self) {
-        // Tombstones from extracted entries are left in place; subsequent
-        // `remove` calls trigger consolidation when their threshold is crossed.
-    }
+/// Pointerless multi-level scan cursor for [`RawTable::scan`]. Holds only the
+/// current level index + an in-region [`OccupiedSlots`]; the owning iterator can
+/// move the table because no pointer into it is stored across calls.
+pub struct ElasticScan {
+    level_idx: usize,
+    cursor: OccupiedSlots,
+    /// `false` until the first [`RawTable::scan_next`] lazily sets the cursor
+    /// region from `&self.levels[0]`, keeping `scan()` pointerless.
+    started: bool,
 }
 
-/// Borrowing iterator over occupied entries.
-pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
-    iter: RegionIter<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
-    remaining: usize,
-    _alloc: PhantomData<&'a A>,
-}
-
-impl<K, V, A: Allocator + Clone> Clone for ElasticIter<'_, K, V, A> {
+impl Clone for ElasticScan {
     fn clone(&self) -> Self {
         Self {
-            iter: self.iter.clone(),
-            remaining: self.remaining,
-            _alloc: PhantomData,
+            level_idx: self.level_idx,
+            cursor: self.cursor.clone(),
+            started: self.started,
         }
     }
 }
 
-impl<K: fmt::Debug, V: fmt::Debug, A: Allocator + Clone> fmt::Debug for ElasticIter<'_, K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_list().entries(self.clone()).finish()
-    }
-}
-
-impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIter<'a, K, V, A> {
-    type Item = (&'a K, &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let handle = self.iter.next_handle()?;
-        // SAFETY: ElasticIter holds a shared borrow of the levels; only
-        // `as_ref` is called on the handle.
-        let entry = unsafe { handle.as_ref() };
-        self.remaining -= 1;
-        Some((&entry.key, &entry.value))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl<K, V, A: Allocator + Clone> ExactSizeIterator for ElasticIter<'_, K, V, A> {}
-impl<K, V, A: Allocator + Clone> FusedIterator for ElasticIter<'_, K, V, A> {}
-
-impl<'a, K, V, S, A> IntoIterator for &'a ElasticHashMap<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    type Item = (&'a K, &'a V);
-    type IntoIter = ElasticIter<'a, K, V, A>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-/// `&K` iterator returned by [`ElasticHashMap::keys`].
-pub type Keys<'a, K, V, A = Global> = CommonKeys<ElasticIter<'a, K, V, A>>;
-/// `&V` iterator returned by [`ElasticHashMap::values`].
-pub type Values<'a, K, V, A = Global> = CommonValues<ElasticIter<'a, K, V, A>>;
-
-/// `(&K, &mut V)` iterator. Walks levels in storage order, skipping FREE
-/// and TOMBSTONE slots. Each `next()` yields a strictly newer slot ⇒
-/// returned `&mut V`s are disjoint.
-pub struct ElasticIterMut<'a, K, V, A: Allocator + Clone = Global> {
-    iter: RegionIterMut<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
-    remaining: usize,
-    _alloc: PhantomData<A>,
-}
-
-impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIterMut<'a, K, V, A> {
-    type Item = (&'a K, &'a mut V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut handle = self.iter.next_handle()?;
-        // SAFETY: scanner yielded a fresh handle; reborrow through raw
-        // ptrs so refs outlive the handle's `&mut Level` borrow.
-        let entry = unsafe { handle.as_mut() };
-        let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
-        let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
-        self.remaining -= 1;
-        Some((key, val))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl<K, V, A: Allocator + Clone> ExactSizeIterator for ElasticIterMut<'_, K, V, A> {}
-impl<K, V, A: Allocator + Clone> FusedIterator for ElasticIterMut<'_, K, V, A> {}
-
-impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticIterMut<'_, K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("ElasticIterMut")
-            .field("remaining", &self.remaining)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<'a, K, V, S, A> IntoIterator for &'a mut ElasticHashMap<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    type Item = (&'a K, &'a mut V);
-    type IntoIter = ElasticIterMut<'a, K, V, A>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter_mut()
-    }
-}
-
-/// `&mut V` iterator returned by [`ElasticHashMap::values_mut`].
-pub struct ElasticValuesMut<'a, K, V, A: Allocator + Clone = Global> {
-    inner: ElasticIterMut<'a, K, V, A>,
-}
-
-impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticValuesMut<'a, K, V, A> {
-    type Item = &'a mut V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-
-impl<K, V, A: Allocator + Clone> ExactSizeIterator for ElasticValuesMut<'_, K, V, A> {}
-impl<K, V, A: Allocator + Clone> FusedIterator for ElasticValuesMut<'_, K, V, A> {}
-
-impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticValuesMut<'_, K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("ElasticValuesMut")
-            .field("remaining", &self.inner.remaining)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Consuming `(K, V)` iterator returned by `ElasticHashMap::into_iter`.
-pub struct ElasticIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    levels_ptr: *mut Level<SlotEntry<K, V>>,
-    levels_len: usize,
-    level_idx: usize,
-    cursor: OccupiedSlots,
-    levels: ManuallyDrop<LevelSlice<K, V>>,
-    arena: ManuallyDrop<Arena>,
-    alloc: A,
-    remaining: usize,
-    _marker: PhantomData<S>,
-}
-
-// SAFETY: raw pointers into owned `levels` / `arena`; Send/Sync match map.
-unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
-    for ElasticIntoIter<K, V, S, A>
-{
-}
-unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
-    for ElasticIntoIter<K, V, S, A>
-{
-}
-
-impl<K, V, S, A: Allocator + Clone> ElasticIntoIter<K, V, S, A> {
-    /// Set ctrl pointers for the current level.
-    #[inline]
-    fn init_region(&mut self) {
-        // SAFETY: caller guards `level_idx < levels_len`.
-        let level = unsafe { &*self.levels_ptr.add(self.level_idx) };
-        self.cursor.set_region(level);
-    }
-}
-
-impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
-    type Item = (K, V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(idx) = self.cursor.next() {
-                // SAFETY: scanner yielded an occupied slot; tombstone-mark
-                // prevents future revisits if `Drop` runs mid-iteration.
-                let level = unsafe { &mut *self.levels_ptr.add(self.level_idx) };
-                let entry = unsafe { level.take(idx) };
-                level.mark_tombstone(idx);
-                self.remaining -= 1;
-                return Some((entry.key, entry.value));
-            }
-            self.level_idx += 1;
-            if self.level_idx >= self.levels_len {
-                return None;
-            }
-            self.init_region();
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl<K, V, S, A: Allocator + Clone> ExactSizeIterator for ElasticIntoIter<K, V, S, A> {}
-impl<K, V, S, A: Allocator + Clone> FusedIterator for ElasticIntoIter<K, V, S, A> {}
-
-impl<K, V, S, A: Allocator + Clone> Drop for ElasticIntoIter<K, V, S, A> {
-    fn drop(&mut self) {
-        // Guard ensures `levels` + `arena` are freed even if a `V::drop`
-        // panic unwinds out of the drain loop below.
-        struct DropGuard<'a, K, V, S, A: Allocator + Clone> {
-            iter: &'a mut ElasticIntoIter<K, V, S, A>,
-        }
-        impl<K, V, S, A: Allocator + Clone> Drop for DropGuard<'_, K, V, S, A> {
-            #[inline]
-            fn drop(&mut self) {
-                unsafe {
-                    ManuallyDrop::drop(&mut self.iter.levels);
-                    let arena = ManuallyDrop::take(&mut self.iter.arena);
-                    arena.deallocate(&self.iter.alloc);
-                }
-            }
-        }
-        let guard = DropGuard { iter: self };
-        for _ in guard.iter.by_ref() {}
-    }
-}
-
-impl<K, V, S, A: Allocator + Clone> fmt::Debug for ElasticIntoIter<K, V, S, A> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("ElasticIntoIter")
-            .field("remaining", &self.remaining)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<K, V, S, A> IntoIterator for ElasticHashMap<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    type Item = (K, V);
-    type IntoIter = ElasticIntoIter<K, V, S, A>;
-
-    fn into_iter(mut self) -> Self::IntoIter {
-        let levels = mem::take(&mut self.levels);
-        let arena = mem::replace(&mut self.arena, Arena::empty());
-        let alloc = self.alloc.clone();
-        let remaining = self.len;
-        let levels_len = levels.len();
-        // `self` drops below: empty levels + empty arena = no-op on the
-        // arena/data side; hash_builder / batch_plan / etc. drop normally.
-        let mut iter = ElasticIntoIter {
-            levels_ptr: ptr::null_mut(),
-            levels_len,
-            level_idx: 0,
-            cursor: OccupiedSlots::empty(),
-            levels: ManuallyDrop::new(levels),
-            arena: ManuallyDrop::new(arena),
-            alloc,
-            remaining,
-            _marker: PhantomData,
-        };
-        // Derive `levels_ptr` post-move so the Vec move into `ManuallyDrop`
-        // doesn't invalidate the buffer's borrow tag.
-        iter.levels_ptr = iter.levels.as_mut_ptr();
-        if levels_len > 0 {
-            iter.init_region();
-        }
-        iter
-    }
-}
-
-/// Owned `K` iterator returned by [`ElasticHashMap::into_keys`].
-pub type ElasticIntoKeys<K, V, S = DefaultHashBuilder, A = Global> =
-    CommonIntoKeys<ElasticIntoIter<K, V, S, A>>;
-/// Owned `V` iterator returned by [`ElasticHashMap::into_values`].
-pub type ElasticIntoValues<K, V, S = DefaultHashBuilder, A = Global> =
-    CommonIntoValues<ElasticIntoIter<K, V, S, A>>;
-
-impl<K, V, S, A> ElasticHashMap<K, V, S, A>
+impl<K, V, S, A> ElasticTable<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
@@ -2034,36 +1132,6 @@ where
     }
 }
 
-/// Raw-pointer projection from `(level_idx, slot_idx)` to `*mut V`.
-/// Used by `get_disjoint_mut*` to hand out disjoint `&mut V` from multiple
-/// slots without going through `&mut ElasticHashMap`.
-///
-/// # Safety
-///
-/// - `levels_ptr` must point to the map's live `[Level<SlotEntry<K, V>>]`.
-/// - `slot_idx` must be an occupied slot in that level.
-#[inline]
-unsafe fn elastic_slot_value_ptr<K, V>(
-    levels_ptr: *const Level<SlotEntry<K, V>>,
-    level_idx: usize,
-    slot_idx: usize,
-) -> *mut V {
-    let level = unsafe { &*levels_ptr.add(level_idx) };
-    unsafe { &raw mut (*level.data_ptr().add(slot_idx)).value }
-}
-
-/// As [`elastic_slot_value_ptr`] but returns key + value pointers together.
-#[inline]
-unsafe fn elastic_slot_kv_ptrs<K, V>(
-    levels_ptr: *const Level<SlotEntry<K, V>>,
-    level_idx: usize,
-    slot_idx: usize,
-) -> (*const K, *mut V) {
-    let level = unsafe { &*levels_ptr.add(level_idx) };
-    let entry = unsafe { &mut *level.data_ptr().add(slot_idx) };
-    (ptr::addr_of!(entry.key), ptr::addr_of_mut!(entry.value))
-}
-
 /// `min(1 + log δ⁻¹, group_count)` — paper §2 cap on `f(ε)` with `c = 1`.
 fn compute_budget_cap(reserve_fraction: f64, group_count: usize) -> f64 {
     let log_cap = 1.0 + (1.0 / reserve_fraction).log2();
@@ -2152,208 +1220,45 @@ fn build_batch_plan(
     plan.into_boxed_slice()
 }
 
-impl<K, V, S, A> Clone for ElasticHashMap<K, V, S, A>
-where
-    K: Clone,
-    V: Clone,
-    S: Clone,
-    A: Allocator + Clone,
-{
-    fn clone(&self) -> Self {
-        let level_capacities: Vec<usize> =
-            self.levels.iter().map(|l| l.capacity as usize).collect();
-        let (arena, levels) =
-            alloc_elastic_arena(&level_capacities, self.reserve_fraction, &self.alloc);
-
-        // Drop guard for the half-built clone: if any user `K::clone` /
-        // `V::clone` panics, drop the already-cloned values (OCCUPIED on
-        // `dst_arena`) and deallocate the partially-filled arena. `Arena`
-        // has no `Drop`, so without this the whole allocation would leak.
-        let mut guard = ArenaDropGuard {
-            arena: Some(arena),
-            levels: Some(levels),
-            alloc: self.alloc.clone(),
-        };
-
-        for (dst, src_lvl) in guard
-            .levels
-            .as_deref_mut()
-            .unwrap()
-            .iter_mut()
-            .zip(self.levels.iter())
-        {
-            arena::clone_region_panic_safe::<K, V>(
-                src_lvl.ctrl_ptr,
-                dst.ctrl_ptr,
-                src_lvl.data_ptr,
-                dst.data_ptr,
-                src_lvl.capacity as usize,
-            );
-            dst.len = src_lvl.len;
-            dst.tombstones = src_lvl.tombstones;
-        }
-
-        // Success: extract arena + levels from the guard so its Drop becomes
-        // a no-op. Both fields now live in `Self` below.
-        let arena = guard.arena.take().unwrap();
-        let levels = guard.levels.take().unwrap();
-        drop(guard);
-
-        Self {
-            levels,
-            len: self.len,
-            total_slots: self.total_slots,
-            max_insertions: self.max_insertions,
-            reserve_fraction: self.reserve_fraction,
-            batch_plan: self.batch_plan.clone(),
-            current_batch_index: self.current_batch_index,
-            batch_remaining: self.batch_remaining,
-            max_populated_level: self.max_populated_level,
-            hash_builder: self.hash_builder.clone(),
-            alloc: self.alloc.clone(),
-            arena,
-        }
-    }
-
-    fn clone_from(&mut self, source: &Self) {
-        // Reuse `self.arena` when the per-level layout matches — capacities
-        // fully determine descriptor offsets, so we save one alloc + dealloc
-        // per assignment. Falls back to full clone otherwise.
-        let layouts_match = self.levels.len() == source.levels.len()
-            && self
-                .levels
-                .iter()
-                .zip(source.levels.iter())
-                .all(|(a, b)| a.capacity == b.capacity);
-        if !layouts_match {
-            *self = source.clone();
-            return;
-        }
-
-        for level in &self.levels {
-            level.drop_values_and_clear();
-        }
-
-        // Panic-safe: `K::clone` / `V::clone` unwinding leaves `self`'s arena
-        // with OCCUPIED ctrls only on slots that were fully written. `Drop`
-        // walks ctrls, so the partial state cleans up correctly.
-        for (dst, src_lvl) in self.levels.iter_mut().zip(source.levels.iter()) {
-            arena::clone_region_panic_safe::<K, V>(
-                src_lvl.ctrl_ptr,
-                dst.ctrl_ptr,
-                src_lvl.data_ptr,
-                dst.data_ptr,
-                src_lvl.capacity as usize,
-            );
-            dst.len = src_lvl.len;
-            dst.tombstones = src_lvl.tombstones;
-        }
-
-        self.len = source.len;
-        self.total_slots = source.total_slots;
-        self.max_insertions = source.max_insertions;
-        self.reserve_fraction = source.reserve_fraction;
-        self.batch_plan.clone_from(&source.batch_plan);
-        self.current_batch_index = source.current_batch_index;
-        self.batch_remaining = source.batch_remaining;
-        self.max_populated_level = source.max_populated_level;
-        self.hash_builder.clone_from(&source.hash_builder);
-    }
-}
-
-impl<K, V, S, A> PartialEq for ElasticHashMap<K, V, S, A>
-where
-    K: Eq + Hash,
-    V: PartialEq,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    fn eq(&self, other: &Self) -> bool {
-        if self.len() != other.len() {
-            return false;
-        }
-        self.iter()
-            .all(|(k, v)| other.get(k).is_some_and(|ov| *v == *ov))
-    }
-}
-
-impl<K, V, S, A> Eq for ElasticHashMap<K, V, S, A>
-where
-    K: Eq + Hash,
-    V: Eq,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-}
-
-impl<K, Q, V, S, A> Index<&Q> for ElasticHashMap<K, V, S, A>
-where
-    K: Eq + Hash,
-    Q: Hash + Equivalent<K> + ?Sized,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    type Output = V;
-
-    #[inline]
-    fn index(&self, key: &Q) -> &V {
-        self.get(key).expect("no entry found for key")
-    }
-}
-
-impl<K, V, S, A> Extend<(K, V)> for ElasticHashMap<K, V, S, A>
+/// Test-only direct drivers for [`ElasticTable`] internals. The public
+/// insert/get/remove API now lives on the [`map::HashMap`] shell, but the
+/// unit tests below inspect backend-private fields (`levels`,
+/// `max_populated_level`), so they operate on the table directly.
+#[cfg(test)]
+impl<K, V, S, A> ElasticTable<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
     A: Allocator + Clone,
 {
-    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
-        let iter = iter.into_iter();
-        let (lo, _) = iter.size_hint();
-        if lo > 0 {
-            self.reserve(lo);
+    fn test_insert(&mut self, key: K, value: V) -> Option<V> {
+        let hash = self.hash_key(&key);
+        let fp = control::control_fingerprint(hash);
+        if let Some(loc) = self.find_slot_indices_with_hash(&key, hash, fp) {
+            return Some(self.replace_value(loc, value));
         }
-        for (k, v) in iter {
-            self.insert(k, v);
-        }
+        self.insert_for_vacant_entry(key, value, hash);
+        None
     }
-}
 
-impl<'a, K, V, S, A> Extend<(&'a K, &'a V)> for ElasticHashMap<K, V, S, A>
-where
-    K: Eq + Hash + Copy,
-    V: Copy,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    fn extend<I: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: I) {
-        self.extend(iter.into_iter().map(|(k, v)| (*k, *v)));
+    fn test_get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let hash = self.hash_key(key);
+        let fp = control::control_fingerprint(hash);
+        let (l, s) = self.find_slot_indices_with_hash(key, hash, fp)?;
+        Some(unsafe { &self.slot_ref(l, s).value })
     }
-}
 
-impl<'a, K, V, S, A> Extend<&'a (K, V)> for ElasticHashMap<K, V, S, A>
-where
-    K: Eq + Hash + Copy,
-    V: Copy,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    fn extend<I: IntoIterator<Item = &'a (K, V)>>(&mut self, iter: I) {
-        self.extend(iter.into_iter().copied());
-    }
-}
-
-impl<K, V, S> FromIterator<(K, V)> for ElasticHashMap<K, V, S, Global>
-where
-    K: Eq + Hash,
-    S: BuildHasher + Default,
-{
-    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
-        let iter = iter.into_iter();
-        let (lo, _) = iter.size_hint();
-        let mut map = Self::with_capacity_and_hasher(lo, S::default());
-        map.extend(iter);
-        map
+    fn test_remove<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let hash = self.hash_key(key);
+        let fp = control::control_fingerprint(hash);
+        let loc = self.find_slot_indices_with_hash(key, hash, fp)?;
+        Some(RawTable::remove(self, loc))
     }
 }
 
@@ -2420,37 +1325,49 @@ mod tests {
     #[test]
     fn inserts_spill_to_deeper_levels_at_high_load() {
         // Paper §4: batches push later inserts into deeper levels.
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(512);
-        assert!(map.levels.len() > 1, "test requires multi-level layout");
-        let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
+        let mut table: ElasticTable<i32, i32> =
+            ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
+                512,
+                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DefaultHashBuilder::default(),
+                Global,
+            );
+        assert!(table.levels.len() > 1, "test requires multi-level layout");
+        let max = i32::try_from(table.max_insertions).expect("test capacity fits i32");
         for i in 0..max {
-            map.insert(i, i);
+            table.test_insert(i, i);
         }
         assert!(
-            map.max_populated_level > 0,
+            table.max_populated_level > 0,
             "expected spill into deeper level; max_populated_level = {}",
-            map.max_populated_level
+            table.max_populated_level
         );
         for i in 0..max {
-            assert_eq!(map.get(&i), Some(&i));
+            assert_eq!(table.test_get(&i), Some(&i));
         }
     }
 
     #[test]
     fn max_populated_level_shrinks_when_deepest_levels_emptied() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(512);
-        let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
+        let mut table: ElasticTable<i32, i32> =
+            ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
+                512,
+                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DefaultHashBuilder::default(),
+                Global,
+            );
+        let max = i32::try_from(table.max_insertions).expect("test capacity fits i32");
         for i in 0..max {
-            map.insert(i, i);
+            table.test_insert(i, i);
         }
-        let high_water = map.max_populated_level;
+        let high_water = table.max_populated_level;
         assert!(high_water > 0, "need a multi-level state to test shrinkage");
         for i in 0..max {
-            map.remove(&i);
+            table.test_remove(&i);
         }
-        assert_eq!(map.len(), 0);
+        assert_eq!(table.len, 0);
         assert_eq!(
-            map.max_populated_level, 0,
+            table.max_populated_level, 0,
             "max_populated_level should walk back to 0 once every level empties"
         );
     }

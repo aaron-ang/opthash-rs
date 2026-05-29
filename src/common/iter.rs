@@ -271,9 +271,9 @@ impl Clone for OccupiedSlots {
     }
 }
 
-/// Shared scanner over a slice of `D` descriptors. Yielded
-/// [`SlotHandle`]s permit `as_ref` only. For mutating scans use
-/// [`RegionIterMut`].
+/// Shared single-region scanner over a slice of `D` descriptors, yielding
+/// occupied slot indices. Multi-region scans drive [`OccupiedSlots`] directly
+/// with explicit region tracking (see the backend `Scan` cursors).
 pub(crate) struct RegionIter<'a, T, D: ArenaSlots<T>> {
     regions: *const D,
     regions_len: usize,
@@ -301,28 +301,6 @@ impl<'a, T, D: ArenaSlots<T>> RegionIter<'a, T, D> {
             me.slots.set_region(unsafe { &*me.regions });
         }
         me
-    }
-
-    #[inline]
-    pub(crate) fn next_handle(&mut self) -> Option<SlotHandle<'a, T, D>> {
-        loop {
-            if let Some(idx) = self.slots.step() {
-                // SAFETY: `region_idx < regions_len` (`slots.step` returned).
-                let descriptor = unsafe { self.regions.add(self.region_idx) }.cast_mut();
-                return Some(SlotHandle {
-                    descriptor,
-                    idx,
-                    _marker: PhantomData,
-                });
-            }
-            self.region_idx += 1;
-            if self.region_idx >= self.regions_len {
-                return None;
-            }
-            // SAFETY: region_idx < regions_len.
-            self.slots
-                .set_region(unsafe { &*self.regions.add(self.region_idx) });
-        }
     }
 }
 
@@ -359,84 +337,5 @@ impl<T, D: ArenaSlots<T>> Iterator for RegionIter<'_, T, D> {
             self.slots
                 .set_region(unsafe { &*self.regions.add(self.region_idx) });
         }
-    }
-}
-
-/// Mut sibling of [`RegionIter`]. Yielded [`SlotHandle`]s permit `as_mut`.
-/// Not `Clone` — would alias `&mut`.
-pub(crate) struct RegionIterMut<'a, T, D: ArenaSlots<T>> {
-    regions: *mut D,
-    regions_len: usize,
-    region_idx: usize,
-    slots: OccupiedSlots,
-    _marker: PhantomData<(&'a mut [D], *mut T)>,
-}
-
-// SAFETY: exclusive borrow of `[D]` is `Send` iff `D: Send`.
-unsafe impl<T: Send, D: ArenaSlots<T> + Send> Send for RegionIterMut<'_, T, D> {}
-unsafe impl<T: Sync, D: ArenaSlots<T> + Sync> Sync for RegionIterMut<'_, T, D> {}
-
-impl<'a, T, D: ArenaSlots<T>> RegionIterMut<'a, T, D> {
-    #[inline]
-    pub(crate) fn new(slice: &'a mut [D]) -> Self {
-        let mut me = Self {
-            regions: slice.as_mut_ptr(),
-            regions_len: slice.len(),
-            region_idx: 0,
-            slots: OccupiedSlots::empty(),
-            _marker: PhantomData,
-        };
-        if me.regions_len > 0 {
-            // SAFETY: regions_len > 0.
-            me.slots.set_region(unsafe { &*me.regions });
-        }
-        me
-    }
-
-    #[inline]
-    pub(crate) fn next_handle(&mut self) -> Option<SlotHandle<'a, T, D>> {
-        loop {
-            if let Some(idx) = self.slots.step() {
-                // SAFETY: `region_idx < regions_len` (`slots.step` returned).
-                let descriptor = unsafe { self.regions.add(self.region_idx) };
-                return Some(SlotHandle {
-                    descriptor,
-                    idx,
-                    _marker: PhantomData,
-                });
-            }
-            self.region_idx += 1;
-            if self.region_idx >= self.regions_len {
-                return None;
-            }
-            // SAFETY: region_idx < regions_len.
-            self.slots
-                .set_region(unsafe { &*self.regions.add(self.region_idx) });
-        }
-    }
-}
-
-/// Handle to one occupied slot (descriptor pointer + index). Only safe
-/// to construct via a scanner over a confirmed-occupied slot.
-pub(crate) struct SlotHandle<'a, T, D: ArenaSlots<T>> {
-    descriptor: *mut D,
-    idx: usize,
-    _marker: PhantomData<(&'a mut D, *mut T)>,
-}
-
-impl<'a, T, D: ArenaSlots<T>> SlotHandle<'a, T, D> {
-    /// Returns a reference with the scanner's lifetime `'a`, not the
-    /// handle's borrow — yielded refs can outlive the handle.
-    ///
-    /// SAFETY: caller ensures no `&mut` to this slot is live.
-    #[inline]
-    pub(crate) unsafe fn as_ref(&self) -> &'a T {
-        unsafe { &*(*self.descriptor).data_ptr().add(self.idx) }
-    }
-
-    /// SAFETY: caller ensures no other reference to this slot is live.
-    #[inline]
-    pub(crate) unsafe fn as_mut(&mut self) -> &mut T {
-        unsafe { (*self.descriptor).get_mut(self.idx) }
     }
 }
