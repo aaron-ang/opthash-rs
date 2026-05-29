@@ -1006,14 +1006,22 @@ where
     /// Returns a draining iterator that empties the map. Mirrors
     /// [`std::collections::HashMap::drain`].
     pub fn drain(&mut self) -> Drain<'_, K, V, S, A> {
+        let map_ptr = ptr::from_mut(self);
+        let (levels_ptr, levels_len) = unsafe {
+            let levels = &mut (*map_ptr).levels;
+            (levels.as_mut_ptr(), levels.len())
+        };
         let mut cursor = ScanCursor::empty();
-        if !self.levels.is_empty() {
-            cursor.set_region(&self.levels[0]);
+        if levels_len > 0 {
+            cursor.set_region(unsafe { &*levels_ptr });
         }
         Drain {
-            map: self,
+            map_ptr,
+            levels_ptr,
+            levels_len,
             cursor,
             level_idx: 0,
+            _marker: PhantomData,
         }
     }
 
@@ -1024,15 +1032,23 @@ where
     where
         F: FnMut(&K, &mut V) -> bool,
     {
+        let map_ptr = ptr::from_mut(self);
+        let (levels_ptr, levels_len) = unsafe {
+            let levels = &mut (*map_ptr).levels;
+            (levels.as_mut_ptr(), levels.len())
+        };
         let mut cursor = ScanCursor::empty();
-        if !self.levels.is_empty() {
-            cursor.set_region(&self.levels[0]);
+        if levels_len > 0 {
+            cursor.set_region(unsafe { &*levels_ptr });
         }
         ExtractIf {
-            map: self,
+            map_ptr,
+            levels_ptr,
+            levels_len,
             cursor,
             level_idx: 0,
             pred: f,
+            _marker: PhantomData,
         }
     }
 }
@@ -1249,15 +1265,18 @@ where
 /// Draining iterator. Yields and removes every `(K, V)`; map is empty
 /// once consumed or dropped.
 pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    map: &'a mut ElasticHashMap<K, V, S, A>,
-    cursor: ScanCursor,
+    map_ptr: *mut ElasticHashMap<K, V, S, A>,
+    levels_ptr: *mut Level<SlotEntry<K, V>>,
+    levels_len: usize,
     level_idx: usize,
+    cursor: ScanCursor,
+    _marker: PhantomData<&'a mut ElasticHashMap<K, V, S, A>>,
 }
 
 impl<K, V, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Drain")
-            .field("remaining", &self.map.len)
+            .field("remaining", &unsafe { (*self.map_ptr).len })
             .finish_non_exhaustive()
     }
 }
@@ -1269,22 +1288,26 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
         // Per-yield ctrl byte update skipped: `Drain::drop` wipes all ctrls.
         loop {
             if let Some(idx) = self.cursor.step() {
-                let level = &mut self.map.levels[self.level_idx];
-                // SAFETY: scan only yields occupied slots.
-                let entry = unsafe { level.take(idx) };
-                self.map.len -= 1;
+                // SAFETY: scan only yields occupied slots in the current level.
+                let entry = unsafe {
+                    let level = &mut *self.levels_ptr.add(self.level_idx);
+                    level.take(idx)
+                };
+                unsafe { (*self.map_ptr).len -= 1 };
                 return Some((entry.key, entry.value));
             }
             self.level_idx += 1;
-            if self.level_idx >= self.map.levels.len() {
+            if self.level_idx >= self.levels_len {
                 return None;
             }
-            self.cursor.set_region(&self.map.levels[self.level_idx]);
+            self.cursor
+                .set_region(unsafe { &*self.levels_ptr.add(self.level_idx) });
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.map.len, Some(self.map.len))
+        let len = unsafe { (*self.map_ptr).len };
+        (len, Some(len))
     }
 }
 
@@ -1296,15 +1319,16 @@ impl<K, V, S, A: Allocator + Clone> Drop for Drain<'_, K, V, S, A> {
         // Drain any unyielded entries so values run their `Drop`.
         for _ in &mut *self {}
         // All entries moved out via `next()`; wipe ctrl bytes + counters en bloc.
-        for level in &mut self.map.levels {
+        let map = unsafe { &mut *self.map_ptr };
+        for level in &mut map.levels {
             level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
         }
-        self.map.len = 0;
-        self.map.max_populated_level = 0;
-        self.map.current_batch_index = 0;
-        self.map.batch_remaining = self.map.batch_plan.first().copied().unwrap_or(0);
+        map.len = 0;
+        map.max_populated_level = 0;
+        map.current_batch_index = 0;
+        map.batch_remaining = map.batch_plan.first().copied().unwrap_or(0);
     }
 }
 
@@ -1315,10 +1339,13 @@ where
     S: BuildHasher,
     F: FnMut(&K, &mut V) -> bool,
 {
-    map: &'a mut ElasticHashMap<K, V, S, A>,
-    cursor: ScanCursor,
+    map_ptr: *mut ElasticHashMap<K, V, S, A>,
+    levels_ptr: *mut Level<SlotEntry<K, V>>,
+    levels_len: usize,
     level_idx: usize,
+    cursor: ScanCursor,
     pred: F,
+    _marker: PhantomData<&'a mut ElasticHashMap<K, V, S, A>>,
 }
 
 impl<K, V, F, S, A: Allocator + Clone> fmt::Debug for ExtractIf<'_, K, V, F, S, A>
@@ -1329,7 +1356,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ExtractIf")
-            .field("remaining", &self.map.len)
+            .field("remaining", &unsafe { (*self.map_ptr).len })
             .finish_non_exhaustive()
     }
 }
@@ -1345,8 +1372,8 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             while let Some(idx) = self.cursor.step() {
-                let level = &mut self.map.levels[self.level_idx];
                 // SAFETY: scan only yields occupied slots.
+                let level = unsafe { &mut *self.levels_ptr.add(self.level_idx) };
                 let entry = unsafe { level.get_mut(idx) };
                 if (self.pred)(&entry.key, &mut entry.value) {
                     // Tombstone before take so a panic mid-op leaves no
@@ -1354,21 +1381,22 @@ where
                     level.mark_tombstone(idx);
                     level.len -= 1;
                     level.tombstones += 1;
-                    self.map.len -= 1;
-                    let removed = unsafe { self.map.levels[self.level_idx].take(idx) };
+                    unsafe { (*self.map_ptr).len -= 1 };
+                    let removed = unsafe { level.take(idx) };
                     return Some((removed.key, removed.value));
                 }
             }
             self.level_idx += 1;
-            if self.level_idx >= self.map.levels.len() {
+            if self.level_idx >= self.levels_len {
                 return None;
             }
-            self.cursor.set_region(&self.map.levels[self.level_idx]);
+            self.cursor
+                .set_region(unsafe { &*self.levels_ptr.add(self.level_idx) });
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.map.len))
+        (0, Some(unsafe { (*self.map_ptr).len }))
     }
 }
 
