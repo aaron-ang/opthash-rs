@@ -144,17 +144,16 @@ impl<T> Level<T> {
         let mixed = key_hash ^ self.salt;
         probe::hash_to_usize(mixed) & self.group_count_mask as usize
     }
+}
 
-    /// Triangular probe: fingerprint scan + caller-provided equality.
-    /// Returns slot index on hit, `None` on miss (stops at first EMPTY byte).
-    /// Closure-driven so `Level<T>` stays slot-type-agnostic.
+impl<K, V> Level<SlotEntry<K, V>> {
+    /// Triangular probe: fingerprint scan + key compare. Returns slot
+    /// index on hit, `None` on miss (stops at first EMPTY byte).
     #[inline]
-    fn find_by_probe<F: FnMut(&T) -> bool>(
-        &self,
-        key_hash: u64,
-        key_fingerprint: u8,
-        mut eq: F,
-    ) -> Option<usize> {
+    fn find_by_probe<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> Option<usize>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
         if self.len == 0 {
             return None;
         }
@@ -165,7 +164,7 @@ impl<T> Level<T> {
             for relative_idx in match_mask {
                 let slot_idx = probe.pos * GROUP_SIZE + relative_idx;
                 let entry = unsafe { self.get_ref(slot_idx) };
-                if eq(entry) {
+                if key.equivalent(&entry.key) {
                     return Some(slot_idx);
                 }
             }
@@ -1988,9 +1987,7 @@ where
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            if let Some(slot_idx) = level.find_by_probe(key_hash, key_fingerprint, |entry| {
-                key.equivalent(&entry.key)
-            }) {
+            if let Some(slot_idx) = level.find_by_probe(key_hash, key_fingerprint, key) {
                 return Some((level_idx, slot_idx));
             }
         }

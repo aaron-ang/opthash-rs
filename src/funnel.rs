@@ -128,18 +128,23 @@ impl<T> BucketLevel<T> {
             true
         }
     }
+}
 
-    /// Probe one bucket with caller-provided equality. `StopSearch` on
-    /// EMPTY: bucket never overflowed, so the key isn't at a deeper level.
-    /// Pass `Some(out)` to record the first free slot; `None` for lookup.
+impl<K, V> BucketLevel<SlotEntry<K, V>> {
+    /// Probe one bucket for `key`. `StopSearch` on EMPTY: bucket never
+    /// overflowed, so the key isn't at a deeper level. Pass `Some(out)`
+    /// to record the first free slot; `None` for lookup.
     #[inline]
-    fn find_in_bucket<F: FnMut(&T) -> bool>(
+    fn find_in_bucket<Q>(
         &self,
         key_hash: u64,
         key_fingerprint: u8,
-        mut eq: F,
+        key: &Q,
         slot_out: Option<&mut Option<usize>>,
-    ) -> LookupStep {
+    ) -> LookupStep
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
         let wants_free = matches!(&slot_out, Some(out) if out.is_none());
         if self.len == 0 {
             if self.capacity == 0 {
@@ -169,7 +174,7 @@ impl<T> BucketLevel<T> {
         for relative_idx in match_mask {
             let slot_idx = bucket_range.start + relative_idx;
             let entry = unsafe { &*self.data_ptr().add(slot_idx) };
-            if eq(entry) {
+            if key.equivalent(&entry.key) {
                 return LookupStep::Found(slot_idx);
             }
         }
@@ -1834,12 +1839,7 @@ where
             } else {
                 None
             };
-            let step = level.find_in_bucket(
-                key_hash,
-                key_fingerprint,
-                |entry| key.equivalent(&entry.key),
-                out,
-            );
+            let step = level.find_in_bucket(key_hash, key_fingerprint, key, out);
             if let Some(slot_idx) = slot_candidate {
                 local = Some(SlotLocation::Level {
                     level_idx,
@@ -1881,12 +1881,12 @@ where
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
-        mut candidate: FreeSlot,
+        mut free_slot: FreeSlot,
     ) -> Option<SlotLocation>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        match self.find_in_special_primary(key_hash, key_fingerprint, key, candidate.as_deref_mut())
+        match self.find_in_special_primary(key_hash, key_fingerprint, key, free_slot.as_deref_mut())
         {
             LookupStep::Found(slot_idx) => {
                 return Some(SlotLocation::SpecialPrimary { slot_idx });
@@ -1894,7 +1894,7 @@ where
             LookupStep::StopSearch => return None,
             LookupStep::Continue => {}
         }
-        self.find_in_special_fallback(key_hash, key_fingerprint, key, candidate)
+        self.find_in_special_fallback(key_hash, key_fingerprint, key, free_slot)
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
@@ -2228,12 +2228,7 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        match self.levels[0].find_in_bucket(
-            key_hash,
-            key_fingerprint,
-            |entry| key.equivalent(&entry.key),
-            None,
-        ) {
+        match self.levels[0].find_in_bucket(key_hash, key_fingerprint, key, None) {
             LookupStep::Found(slot_idx) => {
                 return Some(SlotLocation::Level {
                     level_idx: 0,
@@ -2273,12 +2268,7 @@ where
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (offset, level) in self.levels[1..search_limit].iter().enumerate() {
-            match level.find_in_bucket(
-                key_hash,
-                key_fingerprint,
-                |entry| key.equivalent(&entry.key),
-                None,
-            ) {
+            match level.find_in_bucket(key_hash, key_fingerprint, key, None) {
                 LookupStep::Found(slot_idx) => {
                     return ControlFlow::Break(Some(SlotLocation::Level {
                         level_idx: offset + 1,
