@@ -10,7 +10,6 @@
 mod common;
 
 use std::hint::black_box;
-use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -43,9 +42,7 @@ fn bench_get_hit_latency(c: &mut Criterion) {
 
 criterion_group!(
     name = benches;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(2));
+    config = Criterion::default();
     targets = bench_get_hit_latency
 );
 criterion_main!(benches);

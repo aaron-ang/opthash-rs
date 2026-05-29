@@ -34,41 +34,48 @@ pub fn make_pairs(count: usize) -> Vec<(u64, u64)> {
         .collect()
 }
 
-#[must_use]
-pub fn build_std_map(pairs: &[(u64, u64)]) -> StdHashMap<u64, u64> {
-    let mut map = StdHashMap::with_capacity(pairs.len());
-    for &(key, value) in pairs {
-        map.insert(key, value);
-    }
-    map
+/// Emits `pub fn $fn(pairs: &[(u64, $val)]) -> $Map<u64, $val>` for each
+/// `$fn => $Map`, each a `with_capacity` + insert loop. Covers the map and
+/// big-value builder families.
+macro_rules! pairs_builders {
+    ($val:ty; $($fn:ident => $Map:ident),+ $(,)?) => {
+        $(
+            #[must_use]
+            pub fn $fn(pairs: &[(u64, $val)]) -> $Map<u64, $val> {
+                let mut map = $Map::with_capacity(pairs.len());
+                for &(key, value) in pairs {
+                    map.insert(key, value);
+                }
+                map
+            }
+        )+
+    };
 }
 
-#[must_use]
-pub fn build_elastic_map(pairs: &[(u64, u64)]) -> ElasticHashMap<u64, u64> {
-    let mut map = ElasticHashMap::with_capacity(pairs.len());
-    for &(key, value) in pairs {
-        map.insert(key, value);
-    }
-    map
+/// Emits `pub fn $fn(n: usize) -> $Map<DropU64, DropU64>` for each
+/// `$fn => $Map`, inserting `n` observable-drop entries.
+macro_rules! drop_builders {
+    ($($fn:ident => $Map:ident),+ $(,)?) => {
+        $(
+            #[must_use]
+            pub fn $fn(n: usize) -> $Map<DropU64, DropU64> {
+                let mut map = $Map::with_capacity(n);
+                for idx in 0..n {
+                    let key = key_at(idx);
+                    map.insert(DropU64(key), DropU64(key ^ VALUE_XOR_MIX));
+                }
+                map
+            }
+        )+
+    };
 }
 
-#[must_use]
-pub fn build_funnel_map(pairs: &[(u64, u64)]) -> FunnelHashMap<u64, u64> {
-    let mut map = FunnelHashMap::with_capacity(pairs.len());
-    for &(key, value) in pairs {
-        map.insert(key, value);
-    }
-    map
-}
-
-#[must_use]
-pub fn build_hashbrown_map(pairs: &[(u64, u64)]) -> HashbrownMap<u64, u64> {
-    let mut map = HashbrownMap::with_capacity(pairs.len());
-    for &(key, value) in pairs {
-        map.insert(key, value);
-    }
-    map
-}
+pairs_builders!(u64;
+    build_std_map => StdHashMap,
+    build_hashbrown_map => HashbrownMap,
+    build_elastic_map => ElasticHashMap,
+    build_funnel_map => FunnelHashMap,
+);
 
 /// Side-effect sink for [`DropU64::drop`]; defeats LLVM elision of drop loops.
 pub static DROP_SINK: AtomicU64 = AtomicU64::new(0);
@@ -90,45 +97,12 @@ pub fn drop_sink_value() -> u64 {
     DROP_SINK.load(Ordering::Relaxed)
 }
 
-#[must_use]
-pub fn build_std_drop_map(n: usize) -> StdHashMap<DropU64, DropU64> {
-    let mut map = StdHashMap::with_capacity(n);
-    for idx in 0..n {
-        let key = key_at(idx);
-        map.insert(DropU64(key), DropU64(key ^ VALUE_XOR_MIX));
-    }
-    map
-}
-
-#[must_use]
-pub fn build_hashbrown_drop_map(n: usize) -> HashbrownMap<DropU64, DropU64> {
-    let mut map = HashbrownMap::with_capacity(n);
-    for idx in 0..n {
-        let key = key_at(idx);
-        map.insert(DropU64(key), DropU64(key ^ VALUE_XOR_MIX));
-    }
-    map
-}
-
-#[must_use]
-pub fn build_elastic_drop_map(n: usize) -> ElasticHashMap<DropU64, DropU64> {
-    let mut map = ElasticHashMap::with_capacity(n);
-    for idx in 0..n {
-        let key = key_at(idx);
-        map.insert(DropU64(key), DropU64(key ^ VALUE_XOR_MIX));
-    }
-    map
-}
-
-#[must_use]
-pub fn build_funnel_drop_map(n: usize) -> FunnelHashMap<DropU64, DropU64> {
-    let mut map = FunnelHashMap::with_capacity(n);
-    for idx in 0..n {
-        let key = key_at(idx);
-        map.insert(DropU64(key), DropU64(key ^ VALUE_XOR_MIX));
-    }
-    map
-}
+drop_builders!(
+    build_std_drop_map => StdHashMap,
+    build_hashbrown_drop_map => HashbrownMap,
+    build_elastic_drop_map => ElasticHashMap,
+    build_funnel_drop_map => FunnelHashMap,
+);
 
 /// 32-byte Copy value for memcpy-cost benches
 /// (insert rehash, drain move-out, get cache footprint).
@@ -151,41 +125,12 @@ pub fn make_big_pairs(count: usize) -> Vec<(u64, BigVal)> {
         .collect()
 }
 
-#[must_use]
-pub fn build_std_big_map(pairs: &[(u64, BigVal)]) -> StdHashMap<u64, BigVal> {
-    let mut map = StdHashMap::with_capacity(pairs.len());
-    for &(key, value) in pairs {
-        map.insert(key, value);
-    }
-    map
-}
-
-#[must_use]
-pub fn build_hashbrown_big_map(pairs: &[(u64, BigVal)]) -> HashbrownMap<u64, BigVal> {
-    let mut map = HashbrownMap::with_capacity(pairs.len());
-    for &(key, value) in pairs {
-        map.insert(key, value);
-    }
-    map
-}
-
-#[must_use]
-pub fn build_elastic_big_map(pairs: &[(u64, BigVal)]) -> ElasticHashMap<u64, BigVal> {
-    let mut map = ElasticHashMap::with_capacity(pairs.len());
-    for &(key, value) in pairs {
-        map.insert(key, value);
-    }
-    map
-}
-
-#[must_use]
-pub fn build_funnel_big_map(pairs: &[(u64, BigVal)]) -> FunnelHashMap<u64, BigVal> {
-    let mut map = FunnelHashMap::with_capacity(pairs.len());
-    for &(key, value) in pairs {
-        map.insert(key, value);
-    }
-    map
-}
+pairs_builders!(BigVal;
+    build_std_big_map => StdHashMap,
+    build_hashbrown_big_map => HashbrownMap,
+    build_elastic_big_map => ElasticHashMap,
+    build_funnel_big_map => FunnelHashMap,
+);
 
 #[must_use]
 pub fn size_label(size: usize) -> String {
