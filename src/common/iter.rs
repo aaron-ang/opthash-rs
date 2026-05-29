@@ -233,13 +233,9 @@ impl OccupiedSlots {
         self.current_group_slot = GROUP_SLOT_INIT;
         self.current_mask = BitMask(0);
     }
-}
-
-impl Iterator for OccupiedSlots {
-    type Item = usize;
 
     #[inline]
-    fn next(&mut self) -> Option<usize> {
+    pub(crate) fn step(&mut self) -> Option<usize> {
         loop {
             if let Some(bit) = self.current_mask.next() {
                 return Some(self.current_group_slot.wrapping_add(bit));
@@ -252,6 +248,15 @@ impl Iterator for OccupiedSlots {
             self.current_mask = unsafe { simd::occupied_mask_16(self.next_ctrl) };
             self.next_ctrl = unsafe { self.next_ctrl.add(GROUP_SIZE) };
         }
+    }
+}
+
+impl Iterator for OccupiedSlots {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        self.step()
     }
 }
 
@@ -301,8 +306,8 @@ impl<'a, T, D: ArenaSlots<T>> RegionIter<'a, T, D> {
     #[inline]
     pub(crate) fn next_handle(&mut self) -> Option<SlotHandle<'a, T, D>> {
         loop {
-            if let Some(idx) = self.slots.next() {
-                // SAFETY: `region_idx < regions_len` (`slots.next` returned).
+            if let Some(idx) = self.slots.step() {
+                // SAFETY: `region_idx < regions_len` (`slots.step` returned).
                 let descriptor = unsafe { self.regions.add(self.region_idx) }.cast_mut();
                 return Some(SlotHandle {
                     descriptor,
@@ -344,7 +349,7 @@ impl<T, D: ArenaSlots<T>> Iterator for RegionIter<'_, T, D> {
             "RegionIter::next yields ambiguous indices across multiple regions; use next_handle"
         );
         loop {
-            if let Some(idx) = self.slots.next() {
+            if let Some(idx) = self.slots.step() {
                 return Some(idx);
             }
             self.region_idx += 1;
@@ -391,8 +396,8 @@ impl<'a, T, D: ArenaSlots<T>> RegionIterMut<'a, T, D> {
     #[inline]
     pub(crate) fn next_handle(&mut self) -> Option<SlotHandle<'a, T, D>> {
         loop {
-            if let Some(idx) = self.slots.next() {
-                // SAFETY: `region_idx < regions_len` (`slots.next` returned).
+            if let Some(idx) = self.slots.step() {
+                // SAFETY: `region_idx < regions_len` (`slots.step` returned).
                 let descriptor = unsafe { self.regions.add(self.region_idx) };
                 return Some(SlotHandle {
                     descriptor,

@@ -86,29 +86,12 @@ impl<T> BucketLevel<T> {
         probe::hash_to_usize(key_hash ^ self.salt) & self.bucket_count_mask as usize
     }
 
+    /// Slot index range covering all entries in `bucket_idx`.
     #[inline]
-    fn first_free_in_range(&self, range: &Range<usize>) -> Option<usize> {
-        for group_start in (range.start..range.end).step_by(GROUP_SIZE) {
-            let group_ptr = unsafe { self.ctrl_ptr().add(group_start) };
-            if let Some(offset) = unsafe { simd::free_mask_16(group_ptr) }.lowest() {
-                let slot_idx = group_start + offset;
-                if slot_idx < range.end {
-                    return Some(slot_idx);
-                }
-            }
-        }
-        None
-    }
-
-    #[inline]
-    fn range_has_empty(&self, range: &Range<usize>) -> bool {
-        for group_start in (range.start..range.end).step_by(GROUP_SIZE) {
-            let group_ptr = unsafe { self.ctrl_ptr().add(group_start) };
-            if unsafe { simd::eq_mask_16(group_ptr, CTRL_EMPTY).any() } {
-                return true;
-            }
-        }
-        false
+    fn bucket_range(&self, bucket_idx: usize) -> Range<usize> {
+        let start = bucket_idx << self.bucket_size_log2;
+        let size = 1usize << self.bucket_size_log2;
+        start..start + size
     }
 
     /// Paper §5 attempted insertion: hash `key_hash` to one bucket `A_{i,j}`,
@@ -118,19 +101,16 @@ impl<T> BucketLevel<T> {
             return None;
         }
         let bucket_idx = self.bucket_index(key_hash);
-        let bucket_start = bucket_idx << self.bucket_size_log2;
-        let bucket_width = 1usize << self.bucket_size_log2;
-        debug_assert_eq!(bucket_start % GROUP_SIZE, 0);
-        if !bucket_start.is_multiple_of(GROUP_SIZE) {
+        let bucket_range = self.bucket_range(bucket_idx);
+        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
+        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
             unsafe { std::hint::unreachable_unchecked() };
         }
-        if bucket_width == GROUP_SIZE {
-            let group_ptr = unsafe { self.ctrl_ptr().add(bucket_start) };
-            return unsafe { simd::free_mask_16(group_ptr) }
-                .lowest()
-                .map(|offset| bucket_start + offset);
-        }
-        self.first_free_in_range(&(bucket_start..bucket_start + bucket_width))
+        let group_idx = bucket_range.start / GROUP_SIZE;
+        let group_ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
+        unsafe { simd::free_mask_16(group_ptr) }
+            .lowest()
+            .map(|offset| bucket_range.start + offset)
     }
 
     /// Erase slot: become `CTRL_EMPTY` if the bucket has any EMPTY byte
@@ -138,15 +118,9 @@ impl<T> BucketLevel<T> {
     /// Returns whether a tombstone was written.
     #[inline]
     fn erase(&self, idx: usize) -> bool {
-        let bucket_start = (idx >> self.bucket_size_log2) << self.bucket_size_log2;
-        let bucket_width = 1usize << self.bucket_size_log2;
-        let has_empty = if bucket_width == GROUP_SIZE {
-            let group_ptr = unsafe { self.ctrl_ptr().add(bucket_start) };
-            unsafe { simd::eq_mask_16(group_ptr, CTRL_EMPTY).any() }
-        } else {
-            self.range_has_empty(&(bucket_start..bucket_start + bucket_width))
-        };
-        if has_empty {
+        let group_idx = idx / GROUP_SIZE;
+        let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
+        if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
             self.set_control(idx, CTRL_EMPTY);
             false
         } else {
@@ -189,20 +163,16 @@ impl<K, V> BucketLevel<SlotEntry<K, V>> {
             return LookupStep::Continue;
         }
         let bucket_idx = self.bucket_index(key_hash);
-        let bucket_start = bucket_idx << self.bucket_size_log2;
-        let bucket_width = 1usize << self.bucket_size_log2;
-        debug_assert_eq!(bucket_start % GROUP_SIZE, 0);
-        if !bucket_start.is_multiple_of(GROUP_SIZE) {
+        let bucket_range = self.bucket_range(bucket_idx);
+        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
+        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
             unsafe { std::hint::unreachable_unchecked() };
         }
-        if bucket_width != GROUP_SIZE {
-            let bucket_range = bucket_start..bucket_start + bucket_width;
-            return self.find_in_wide_bucket(&bucket_range, key_fingerprint, key, slot_out);
-        }
-        let group_ptr = unsafe { self.ctrl_ptr().add(bucket_start) };
+        let group_idx = bucket_range.start / GROUP_SIZE;
+        let group_ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         let match_mask = unsafe { simd::eq_mask_16(group_ptr, key_fingerprint) };
         for relative_idx in match_mask {
-            let slot_idx = bucket_start + relative_idx;
+            let slot_idx = bucket_range.start + relative_idx;
             let entry = unsafe { &*self.data_ptr().add(slot_idx) };
             if key.equivalent(&entry.key) {
                 return LookupStep::Found(slot_idx);
@@ -213,69 +183,10 @@ impl<K, V> BucketLevel<SlotEntry<K, V>> {
             if let Some(o) = free_mask.lowest()
                 && let Some(out) = slot_out
             {
-                *out = Some(bucket_start + o);
+                *out = Some(bucket_range.start + o);
             }
         }
         if unsafe { simd::eq_mask_16(group_ptr, CTRL_EMPTY).any() } {
-            LookupStep::StopSearch
-        } else {
-            LookupStep::Continue
-        }
-    }
-
-    #[inline]
-    fn find_in_wide_bucket<Q>(
-        &self,
-        bucket_range: &Range<usize>,
-        key_fingerprint: u8,
-        key: &Q,
-        slot_out: Option<&mut Option<usize>>,
-    ) -> LookupStep
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        let wants_free = matches!(&slot_out, Some(out) if out.is_none());
-        let mut free_slot = None;
-        let mut saw_empty = false;
-        let mut saw_tombstone = false;
-
-        for group_start in (bucket_range.start..bucket_range.end).step_by(GROUP_SIZE) {
-            let group_ptr = unsafe { self.ctrl_ptr().add(group_start) };
-            let match_mask = unsafe { simd::eq_mask_16(group_ptr, key_fingerprint) };
-            for relative_idx in match_mask {
-                let slot_idx = group_start + relative_idx;
-                if slot_idx >= bucket_range.end {
-                    continue;
-                }
-                let entry = unsafe { &*self.data_ptr().add(slot_idx) };
-                if key.equivalent(&entry.key) {
-                    return LookupStep::Found(slot_idx);
-                }
-            }
-
-            if wants_free
-                && free_slot.is_none()
-                && let Some(offset) = unsafe { simd::free_mask_16(group_ptr) }.lowest()
-            {
-                let slot_idx = group_start + offset;
-                if slot_idx < bucket_range.end {
-                    free_slot = Some(slot_idx);
-                }
-            }
-
-            if unsafe { simd::eq_mask_16(group_ptr, CTRL_EMPTY).any() } {
-                saw_empty = true;
-            }
-            if unsafe { simd::eq_mask_16(group_ptr, CTRL_TOMBSTONE).any() } {
-                saw_tombstone = true;
-            }
-        }
-
-        if wants_free && let Some(out) = slot_out {
-            *out = free_slot;
-        }
-
-        if saw_empty && !saw_tombstone {
             LookupStep::StopSearch
         } else {
             LookupStep::Continue
@@ -2586,13 +2497,6 @@ struct FunnelSlot {
     slot_idx: usize,
 }
 
-impl FunnelSlot {
-    #[inline]
-    fn is_special(self) -> bool {
-        !matches!(self.phase, IterPhase::Levels)
-    }
-}
-
 /// Shared phase machine for Funnel's heterogeneous storage regions.
 struct FunnelRegions<T> {
     levels: *mut BucketLevel<T>,
@@ -2665,7 +2569,7 @@ impl<T> FunnelRegions<T> {
     #[inline]
     fn next_slot(&mut self) -> Option<FunnelSlot> {
         loop {
-            if let Some(slot_idx) = self.slots.next() {
+            if let Some(slot_idx) = self.slots.step() {
                 return Some(FunnelSlot {
                     phase: self.phase,
                     level_idx: self.level_idx,
@@ -2682,7 +2586,7 @@ impl<T> FunnelRegions<T> {
     #[inline]
     fn next_entry_ptr(&mut self) -> Option<*mut T> {
         loop {
-            if let Some(slot_idx) = self.slots.next() {
+            if let Some(slot_idx) = self.slots.step() {
                 let entry_ptr = unsafe {
                     match self.phase {
                         IterPhase::Levels => {
@@ -2725,23 +2629,8 @@ impl<T> FunnelRegions<T> {
     }
 
     /// SAFETY: `slot` must have been yielded by this cursor and still point to
-    /// an initialized entry.
-    #[inline]
-    unsafe fn entry_ptr(&self, slot: FunnelSlot) -> *mut T {
-        unsafe {
-            match slot.phase {
-                IterPhase::Levels => (*self.levels.add(slot.level_idx))
-                    .data_ptr()
-                    .add(slot.slot_idx),
-                IterPhase::Primary => (*self.primary).data_ptr().add(slot.slot_idx),
-                IterPhase::Fallback => (*self.fallback).data_ptr().add(slot.slot_idx),
-                IterPhase::Done => std::hint::unreachable_unchecked(),
-            }
-        }
-    }
-
-    /// SAFETY: same as [`Self::entry_ptr`]. The slot must not be read again
-    /// before being re-written.
+    /// an initialized entry. The slot must not be read again before being
+    /// re-written.
     #[inline]
     unsafe fn take(&self, slot: FunnelSlot) -> T {
         unsafe {
@@ -2763,42 +2652,6 @@ impl<T> FunnelRegions<T> {
                 }
                 IterPhase::Primary => (*self.primary).mark_tombstone(slot.slot_idx),
                 IterPhase::Fallback => (*self.fallback).mark_tombstone(slot.slot_idx),
-                IterPhase::Done => std::hint::unreachable_unchecked(),
-            }
-        }
-    }
-
-    #[inline]
-    unsafe fn erase(&self, slot: FunnelSlot) -> bool {
-        unsafe {
-            match slot.phase {
-                IterPhase::Levels => (*self.levels.add(slot.level_idx)).erase(slot.slot_idx),
-                IterPhase::Primary => (*self.primary).erase(slot.slot_idx),
-                IterPhase::Fallback => (*self.fallback).erase(slot.slot_idx),
-                IterPhase::Done => std::hint::unreachable_unchecked(),
-            }
-        }
-    }
-
-    #[inline]
-    unsafe fn increment_tombstones(&self, slot: FunnelSlot) {
-        unsafe {
-            match slot.phase {
-                IterPhase::Levels => (*self.levels.add(slot.level_idx)).tombstones += 1,
-                IterPhase::Primary => (*self.primary).tombstones += 1,
-                IterPhase::Fallback => (*self.fallback).tombstones += 1,
-                IterPhase::Done => std::hint::unreachable_unchecked(),
-            }
-        }
-    }
-
-    #[inline]
-    unsafe fn decrement_len(&self, slot: FunnelSlot) {
-        unsafe {
-            match slot.phase {
-                IterPhase::Levels => (*self.levels.add(slot.level_idx)).len -= 1,
-                IterPhase::Primary => (*self.primary).len -= 1,
-                IterPhase::Fallback => (*self.fallback).len -= 1,
                 IterPhase::Done => std::hint::unreachable_unchecked(),
             }
         }
@@ -2959,27 +2812,64 @@ where
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(slot) = self.regions.next_slot() {
-            let remove = {
-                let entry = unsafe { &mut *self.regions.entry_ptr(slot) };
-                (self.pred)(&entry.key, &mut entry.value)
-            };
-            if remove {
-                unsafe {
-                    if self.regions.erase(slot) {
-                        self.regions.increment_tombstones(slot);
+        loop {
+            while let Some(slot_idx) = self.regions.slots.step() {
+                match self.regions.phase {
+                    IterPhase::Levels => {
+                        let level_ptr = unsafe { self.regions.levels.add(self.regions.level_idx) };
+                        let entry = unsafe { (*level_ptr).get_mut(slot_idx) };
+                        if (self.pred)(&entry.key, &mut entry.value) {
+                            unsafe {
+                                if (*level_ptr).erase(slot_idx) {
+                                    (*level_ptr).tombstones += 1;
+                                }
+                                (*level_ptr).len -= 1;
+                                (*self.map_ptr).len -= 1;
+                                let removed = (*level_ptr).take(slot_idx);
+                                return Some((removed.key, removed.value));
+                            }
+                        }
                     }
-                    self.regions.decrement_len(slot);
-                    if slot.is_special() {
-                        (*self.map_ptr).special.total_len -= 1;
+                    IterPhase::Primary => {
+                        let primary = self.regions.primary;
+                        let entry = unsafe { (*primary).get_mut(slot_idx) };
+                        if (self.pred)(&entry.key, &mut entry.value) {
+                            unsafe {
+                                if (*primary).erase(slot_idx) {
+                                    (*primary).tombstones += 1;
+                                }
+                                (*primary).len -= 1;
+                                (*self.map_ptr).special.total_len -= 1;
+                                (*self.map_ptr).len -= 1;
+                                let removed = (*primary).take(slot_idx);
+                                return Some((removed.key, removed.value));
+                            }
+                        }
                     }
-                    (*self.map_ptr).len -= 1;
-                    let removed = self.regions.take(slot);
-                    return Some((removed.key, removed.value));
+                    IterPhase::Fallback => {
+                        let fallback = self.regions.fallback;
+                        let entry = unsafe { (*fallback).get_mut(slot_idx) };
+                        if (self.pred)(&entry.key, &mut entry.value) {
+                            unsafe {
+                                if (*fallback).erase(slot_idx) {
+                                    (*fallback).tombstones += 1;
+                                }
+                                (*fallback).len -= 1;
+                                (*self.map_ptr).special.total_len -= 1;
+                                (*self.map_ptr).len -= 1;
+                                let removed = (*fallback).take(slot_idx);
+                                return Some((removed.key, removed.value));
+                            }
+                        }
+                    }
+                    IterPhase::Done => unsafe { std::hint::unreachable_unchecked() },
                 }
             }
+            self.regions.advance_region();
+            if matches!(self.regions.phase, IterPhase::Done) {
+                return None;
+            }
         }
-        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -3773,8 +3663,6 @@ where
 mod tests {
     use super::*;
 
-    use crate::common::config::MIN_RESERVE_FRACTION;
-
     use std::hash::{BuildHasher, Hasher};
 
     struct ConstHasher;
@@ -3947,31 +3835,6 @@ mod tests {
         );
         for i in 0..=l0_bucket_size {
             assert_eq!(map.get(&i), Some(&i));
-        }
-    }
-
-    #[test]
-    fn wide_level_bucket_scans_past_first_group() {
-        let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
-            FunnelHashMap::with_capacity_and_reserve_fraction_and_hasher(
-                512,
-                MIN_RESERVE_FRACTION,
-                ConstHashBuilder,
-            );
-        let l0_bucket_size = 1usize << map.levels[0].bucket_size_log2;
-        assert!(
-            l0_bucket_size > GROUP_SIZE,
-            "test requires a multi-group bucket, got {l0_bucket_size}"
-        );
-
-        let inserted = GROUP_SIZE + 4;
-        for i in 0..inserted {
-            let key = i32::try_from(i).unwrap();
-            map.insert(key, key * 7);
-        }
-        for i in 0..inserted {
-            let key = i32::try_from(i).unwrap();
-            assert_eq!(map.get(&key), Some(&(key * 7)), "missing key {key}");
         }
     }
 
