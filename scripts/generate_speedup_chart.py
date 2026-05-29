@@ -14,13 +14,13 @@ from _plot_common import (
 
 
 THROUGHPUT_WORKLOADS = (
-    ("insert_throughput", "Insert"),
-    ("get_hit_throughput", "Get Hit"),
-    ("get_miss_throughput", "Get Miss"),
-    ("tiny_lookup_throughput", "Tiny"),
-    ("mixed_throughput", "Mixed"),
-    ("delete_heavy_throughput", "Delete"),
-    ("resize_heavy_throughput", "Resize"),
+    ("insert", "Insert"),
+    ("get_hit", "Get Hit"),
+    ("get_miss", "Get Miss"),
+    ("tiny_lookup", "Tiny"),
+    ("mixed", "Mixed"),
+    ("delete_heavy", "Delete"),
+    ("resize_heavy", "Resize"),
 )
 
 
@@ -30,11 +30,11 @@ def plot_throughput_speedup(assets_dir: Path):
     elastic_speedups = []
     funnel_speedups = []
 
+    # Group name is the workload; bench id is `<workload>_<impl>`.
     for workload, label in THROUGHPUT_WORKLOADS:
         try:
-            op = workload[: -len("_throughput")]
             times = {
-                impl: load_criterion_mean_ns(workload, f"{op}_{impl}")
+                impl: load_criterion_mean_ns(workload, f"{workload}_{impl}")
                 for impl in IMPLEMENTATIONS
             }
         except FileNotFoundError:

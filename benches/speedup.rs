@@ -60,7 +60,7 @@ const OP_COUNT: usize = 100_000;
 const TINY_MAP_SIZE: usize = 32;
 ///  Tiny map bench lookups per iteration.
 const TINY_OP_COUNT: usize = 500_000;
-/// Inserts per iteration of `resize_heavy_throughput`; triggers multiple resizes.
+/// Inserts per iteration of `resize_heavy`; triggers multiple resizes.
 const RESIZE_INSERT_COUNT: usize = 8_000;
 
 /// Emits per-impl `bench_function` blocks for a given op.
@@ -220,9 +220,9 @@ macro_rules! bench_insert_reuse_one {
 
 /// Steady-state insert into a reused map (cap = `2 * OP_COUNT`).
 /// Reflects what a long-lived map pays per insert; excludes allocation cost.
-fn bench_insert_throughput(c: &mut Criterion) {
+fn bench_insert(c: &mut Criterion) {
     let pairs = common::make_pairs(OP_COUNT);
-    let mut group = c.benchmark_group("insert_throughput");
+    let mut group = c.benchmark_group("insert");
     group.throughput(Throughput::Elements(OP_COUNT as u64));
     bench_insert_reuse!(group, "insert", OP_COUNT * 2, &pairs);
     group.finish();
@@ -285,28 +285,14 @@ fn bench_lookups(c: &mut Criterion) {
         .collect();
 
     bench_one_lookup_group(
-        c,
-        "get_hit_throughput",
-        "get_hit",
-        &hit_keys,
-        &std_map,
-        &hb_map,
-        &el_map,
-        &fn_map,
+        c, "get_hit", "get_hit", &hit_keys, &std_map, &hb_map, &el_map, &fn_map,
     );
     bench_one_lookup_group(
-        c,
-        "get_miss_throughput",
-        "get_miss",
-        &miss_keys,
-        &std_map,
-        &hb_map,
-        &el_map,
-        &fn_map,
+        c, "get_miss", "get_miss", &miss_keys, &std_map, &hb_map, &el_map, &fn_map,
     );
 }
 
-fn bench_tiny_lookup_throughput(c: &mut Criterion) {
+fn bench_tiny_lookup(c: &mut Criterion) {
     let pairs = common::make_pairs(TINY_MAP_SIZE);
     let query_keys: Vec<u64> = (0..TINY_OP_COUNT)
         .map(|idx| {
@@ -323,7 +309,7 @@ fn bench_tiny_lookup_throughput(c: &mut Criterion) {
     let fn_map = common::build_funnel_map(&pairs);
     bench_one_lookup_group(
         c,
-        "tiny_lookup_throughput",
+        "tiny_lookup",
         "tiny_lookup",
         &query_keys,
         &std_map,
@@ -333,7 +319,7 @@ fn bench_tiny_lookup_throughput(c: &mut Criterion) {
     );
 }
 
-fn bench_delete_heavy_throughput(c: &mut Criterion) {
+fn bench_delete_heavy(c: &mut Criterion) {
     let initial_pairs = common::make_pairs(MAP_SIZE);
     let replacement_pairs: Vec<(u64, u64)> = (0..OP_COUNT)
         .map(|idx| {
@@ -342,7 +328,7 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("delete_heavy_throughput");
+    let mut group = c.benchmark_group("delete_heavy");
     group.throughput(Throughput::Elements((OP_COUNT * 2) as u64));
 
     bench_populated!(
@@ -362,7 +348,7 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_mixed_throughput(c: &mut Criterion) {
+fn bench_mixed(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
     let ops: Vec<(usize, bool)> = (0..OP_COUNT)
         .map(|i| {
@@ -372,7 +358,7 @@ fn bench_mixed_throughput(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("mixed_throughput");
+    let mut group = c.benchmark_group("mixed");
     group.throughput(Throughput::Elements(OP_COUNT as u64));
 
     bench_populated!(group, "mixed", BatchSize::LargeInput, &pairs, |map| {
@@ -389,9 +375,9 @@ fn bench_mixed_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_resize_heavy_throughput(c: &mut Criterion) {
+fn bench_resize_heavy(c: &mut Criterion) {
     let pairs = common::make_pairs(RESIZE_INSERT_COUNT);
-    let mut group = c.benchmark_group("resize_heavy_throughput");
+    let mut group = c.benchmark_group("resize_heavy");
     group.throughput(Throughput::Elements(RESIZE_INSERT_COUNT as u64));
 
     bench_empty!(group, "resize_heavy", BatchSize::PerIteration, |map| {
@@ -404,9 +390,9 @@ fn bench_resize_heavy_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_iter_throughput(c: &mut Criterion) {
+fn bench_iter(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
-    let mut group = c.benchmark_group("iter_throughput");
+    let mut group = c.benchmark_group("iter");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
     // xor-fold the yielded pairs so LLVM can't elide the walk; `.count()`
@@ -418,9 +404,9 @@ fn bench_iter_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_iter_mut_throughput(c: &mut Criterion) {
+fn bench_iter_mut(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
-    let mut group = c.benchmark_group("iter_mut_throughput");
+    let mut group = c.benchmark_group("iter_mut");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
     bench_populated!(group, "iter_mut", BatchSize::LargeInput, &pairs, |map| {
@@ -432,9 +418,9 @@ fn bench_iter_mut_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_drain_throughput(c: &mut Criterion) {
+fn bench_drain(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
-    let mut group = c.benchmark_group("drain_throughput");
+    let mut group = c.benchmark_group("drain");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
     // xor-fold pulls every yielded `(K, V)` out — defeats `.count()` elision
@@ -446,9 +432,9 @@ fn bench_drain_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_extract_if_throughput(c: &mut Criterion) {
+fn bench_extract_if(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
-    let mut group = c.benchmark_group("extract_if_throughput");
+    let mut group = c.benchmark_group("extract_if");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
     bench_populated!(
@@ -468,8 +454,8 @@ fn bench_extract_if_throughput(c: &mut Criterion) {
 }
 
 #[allow(clippy::redundant_closure_for_method_calls)]
-fn bench_clear_drop_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("clear_drop_throughput");
+fn bench_clear_drop(c: &mut Criterion) {
+    let mut group = c.benchmark_group("clear_drop");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
     bench_all_impls!(
@@ -489,9 +475,9 @@ fn bench_clear_drop_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_entry_or_insert_throughput(c: &mut Criterion) {
+fn bench_entry_or_insert(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
-    let mut group = c.benchmark_group("entry_or_insert_throughput");
+    let mut group = c.benchmark_group("entry_or_insert");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
     bench_with_cap!(group, "entry", BatchSize::PerIteration, MAP_SIZE, |map| {
@@ -504,9 +490,9 @@ fn bench_entry_or_insert_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_grow_insert_throughput(c: &mut Criterion) {
+fn bench_grow_insert(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
-    let mut group = c.benchmark_group("grow_insert_throughput");
+    let mut group = c.benchmark_group("grow_insert");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
     // No `with_capacity` hint — each impl pays growth-through-rehash.
@@ -538,36 +524,30 @@ fn bench_get_hit_load_factor(c: &mut Criterion) {
             el_map.insert(key, value);
             fn_map.insert(key, value);
         }
+        let group = format!("get_hit_load_{load_pct}");
         bench_one_lookup_group(
-            c,
-            &format!("get_hit_load_{load_pct}"),
-            "get_hit",
-            &hit_keys,
-            &std_map,
-            &hb_map,
-            &el_map,
-            &fn_map,
+            c, &group, &group, &hit_keys, &std_map, &hb_map, &el_map, &fn_map,
         );
     }
 }
 
 // 32-byte `BigVal` payload — memcpy axis. Pair with `(u64, u64)` to attribute deltas.
 
-/// [`bench_insert_throughput`] with `BigVal` payload (32B) — exercises
+/// [`bench_insert`] with `BigVal` payload (32B) — exercises
 /// the memcpy axis.
-fn bench_insert_big_throughput(c: &mut Criterion) {
+fn bench_insert_big(c: &mut Criterion) {
     let pairs = common::make_big_pairs(OP_COUNT);
-    let mut group = c.benchmark_group("insert_big_throughput");
+    let mut group = c.benchmark_group("insert_big");
     group.throughput(Throughput::Elements(OP_COUNT as u64));
     bench_insert_reuse!(group, "insert_big", OP_COUNT, &pairs);
     group.finish();
 }
 
-fn bench_get_hit_big_throughput(c: &mut Criterion) {
+fn bench_get_hit_big(c: &mut Criterion) {
     let pairs = common::make_big_pairs(MAP_SIZE);
     let hit_keys: Vec<u64> = (0..OP_COUNT).map(|idx| pairs[idx % MAP_SIZE].0).collect();
 
-    let mut group = c.benchmark_group("get_hit_big_throughput");
+    let mut group = c.benchmark_group("get_hit_big");
     group.throughput(Throughput::Elements(hit_keys.len() as u64));
 
     bench_populated_big!(group, "get_hit_big", BatchSize::LargeInput, &pairs, |map| {
@@ -579,9 +559,9 @@ fn bench_get_hit_big_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_drain_big_throughput(c: &mut Criterion) {
+fn bench_drain_big(c: &mut Criterion) {
     let pairs = common::make_big_pairs(MAP_SIZE);
-    let mut group = c.benchmark_group("drain_big_throughput");
+    let mut group = c.benchmark_group("drain_big");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
     bench_populated_big!(group, "drain_big", BatchSize::PerIteration, &pairs, |map| {
@@ -605,10 +585,10 @@ macro_rules! sparse_setup {
     };
 }
 
-fn bench_shrink_to_fit_throughput(c: &mut Criterion) {
+fn bench_shrink_to_fit(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
     let keep: usize = MAP_SIZE / 10;
-    let mut group = c.benchmark_group("shrink_to_fit_throughput");
+    let mut group = c.benchmark_group("shrink_to_fit");
     group.throughput(Throughput::Elements(keep as u64));
 
     bench_all_impls!(
@@ -630,10 +610,10 @@ fn bench_shrink_to_fit_throughput(c: &mut Criterion) {
 
 /// Re-insert all keys with new values — hits the update-existing branch
 /// in `insert` codegen, distinct from the vacant-slot path covered by
-/// `insert_throughput`.
-fn bench_replace_throughput(c: &mut Criterion) {
+/// `insert`.
+fn bench_replace(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
-    let mut group = c.benchmark_group("replace_throughput");
+    let mut group = c.benchmark_group("replace");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
     bench_populated!(group, "replace", BatchSize::LargeInput, &pairs, |map| {
@@ -646,9 +626,9 @@ fn bench_replace_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_extend_throughput(c: &mut Criterion) {
+fn bench_extend(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
-    let mut group = c.benchmark_group("extend_throughput");
+    let mut group = c.benchmark_group("extend");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
     bench_empty!(group, "extend", BatchSize::PerIteration, |map| {
@@ -688,7 +668,7 @@ macro_rules! build_set {
 /// boxed-predicate path on the opthash sets. xor-fold defeats elision.
 fn bench_set_extract_if(c: &mut Criterion) {
     let ks = set_keys(SET_SIZE, 0);
-    let mut group = c.benchmark_group("set_extract_if_throughput");
+    let mut group = c.benchmark_group("set_extract_if");
     group.throughput(Throughput::Elements(SET_SIZE as u64));
 
     macro_rules! one {
@@ -727,7 +707,7 @@ macro_rules! algebra_group {
         let fa = build_set!(FunnelHashSet<u64>, &ka);
         let fb = build_set!(FunnelHashSet<u64>, &kb);
 
-        let mut group = $c.benchmark_group(concat!($tag, "_throughput"));
+        let mut group = $c.benchmark_group($tag);
         group.throughput(Throughput::Elements(SET_SIZE as u64));
         group.bench_function(concat!($tag, "_std"), |b| {
             b.iter(|| black_box(sa.$method(&sb).fold(0u64, |a, &x| a ^ x)));
@@ -756,26 +736,26 @@ criterion_group!(
     name = benches;
     config = Criterion::default().with_profiler(FlamegraphProfiler::new());
     targets =
-        bench_insert_throughput,
-        bench_grow_insert_throughput,
+        bench_insert,
+        bench_grow_insert,
         bench_lookups,
         bench_get_hit_load_factor,
-        bench_tiny_lookup_throughput,
-        bench_mixed_throughput,
-        bench_delete_heavy_throughput,
-        bench_resize_heavy_throughput,
-        bench_iter_throughput,
-        bench_iter_mut_throughput,
-        bench_drain_throughput,
-        bench_extract_if_throughput,
-        bench_clear_drop_throughput,
-        bench_entry_or_insert_throughput,
-        bench_replace_throughput,
-        bench_extend_throughput,
-        bench_shrink_to_fit_throughput,
-        bench_insert_big_throughput,
-        bench_get_hit_big_throughput,
-        bench_drain_big_throughput,
+        bench_tiny_lookup,
+        bench_mixed,
+        bench_delete_heavy,
+        bench_resize_heavy,
+        bench_iter,
+        bench_iter_mut,
+        bench_drain,
+        bench_extract_if,
+        bench_clear_drop,
+        bench_entry_or_insert,
+        bench_replace,
+        bench_extend,
+        bench_shrink_to_fit,
+        bench_insert_big,
+        bench_get_hit_big,
+        bench_drain_big,
         bench_set_extract_if,
         bench_set_algebra
 );
