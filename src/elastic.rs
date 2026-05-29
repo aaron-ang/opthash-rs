@@ -503,9 +503,8 @@ where
         unsafe { level.data_ptr().add(slot_idx) }
     }
 
-    /// Take + tombstone + decrement counters for the slot at `loc`. Shared
-    /// by [`RawTable::remove`] and [`RawTable::extract_at`]; the former adds a
-    /// resize pass, the latter consolidates tombstones lazily.
+    /// Take + tombstone + decrement counters for the slot at `loc`. Backs
+    /// [`RawTable::remove`], which adds a resize pass.
     fn take_and_tombstone(&mut self, level_idx: usize, slot_idx: usize) -> (K, V) {
         let removed = {
             let level = &mut self.levels[level_idx];
@@ -657,8 +656,16 @@ where
     }
 
     #[inline]
-    fn extract_at(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
-        self.take_and_tombstone(level_idx, slot_idx)
+    fn tombstone_slot(&mut self, (level_idx, slot_idx): (usize, usize)) {
+        self.levels[level_idx].mark_tombstone(slot_idx);
+    }
+
+    fn extract_finish(&mut self, (level_idx, slot_idx): (usize, usize)) {
+        let level = &mut self.levels[level_idx];
+        level.mark_tombstone(slot_idx);
+        level.len -= 1;
+        level.tombstones += 1;
+        self.len -= 1;
     }
 
     #[inline]
@@ -666,28 +673,36 @@ where
         ElasticScan {
             level_idx: 0,
             cursor: OccupiedSlots::empty(),
+            cur_data: std::ptr::null_mut(),
             started: false,
         }
     }
 
-    fn scan_next(&self, scan: &mut ElasticScan) -> Option<(usize, usize)> {
+    fn scan_next(&self, scan: &mut ElasticScan) -> Option<(*mut SlotEntry<K, V>, (usize, usize))> {
         if self.levels.is_empty() {
             return None;
         }
         if !scan.started {
             scan.started = true;
             // SAFETY: levels non-empty ⇒ index 0 in bounds.
-            scan.cursor.set_region(&self.levels[0]);
+            let level = &self.levels[0];
+            scan.cursor.set_region(level);
+            scan.cur_data = level.data_ptr().cast();
         }
         loop {
             if let Some(slot_idx) = scan.cursor.step() {
-                return Some((scan.level_idx, slot_idx));
+                // SAFETY: `cur_data` is the current level's slot array; `slot_idx`
+                // is in-bounds for it (`step` yields only valid slots).
+                let ptr = unsafe { scan.cur_data.cast::<SlotEntry<K, V>>().add(slot_idx) };
+                return Some((ptr, (scan.level_idx, slot_idx)));
             }
             scan.level_idx += 1;
             if scan.level_idx >= self.levels.len() {
                 return None;
             }
-            scan.cursor.set_region(&self.levels[scan.level_idx]);
+            let level = &self.levels[scan.level_idx];
+            scan.cursor.set_region(level);
+            scan.cur_data = level.data_ptr().cast();
         }
     }
 
@@ -765,14 +780,19 @@ where
     }
 }
 
-/// Pointerless multi-level scan cursor for [`RawTable::scan`]. Holds only the
-/// current level index + an in-region [`OccupiedSlots`]; the owning iterator can
-/// move the table because no pointer into it is stored across calls.
+/// Multi-level scan cursor for [`RawTable::scan`]. Holds the current level
+/// index, an in-region [`OccupiedSlots`], and the current level's cached slot
+/// pointer. `scan()` leaves it pointer-free (`started == false`); the cache is
+/// populated only on the first `scan_next`, so a consumed table can be moved
+/// before iteration begins.
 pub struct ElasticScan {
     level_idx: usize,
     cursor: OccupiedSlots,
+    /// Cached `data_ptr()` of the current level (as bytes), refreshed on each
+    /// region cross so `scan_next` yields a slot pointer with one offset.
+    cur_data: *mut u8,
     /// `false` until the first [`RawTable::scan_next`] lazily sets the cursor
-    /// region from `&self.levels[0]`, keeping `scan()` pointerless.
+    /// + `cur_data` from `&self.levels[0]`.
     started: bool,
 }
 
@@ -781,6 +801,7 @@ impl Clone for ElasticScan {
         Self {
             level_idx: self.level_idx,
             cursor: self.cursor.clone(),
+            cur_data: self.cur_data,
             started: self.started,
         }
     }

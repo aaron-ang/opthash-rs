@@ -1735,9 +1735,53 @@ where
         kv
     }
 
-    #[inline]
-    fn extract_at(&mut self, loc: SlotLocation) -> (K, V) {
-        self.take_and_tombstone(loc)
+    fn tombstone_slot(&mut self, location: SlotLocation) {
+        match location {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => {
+                self.levels[level_idx].erase(slot_idx);
+            }
+            SlotLocation::SpecialPrimary { slot_idx } => {
+                self.special.primary.erase(slot_idx);
+            }
+            SlotLocation::SpecialFallback { slot_idx } => {
+                self.special.fallback.erase(slot_idx);
+            }
+        }
+    }
+
+    fn extract_finish(&mut self, location: SlotLocation) {
+        match location {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => {
+                let level = &mut self.levels[level_idx];
+                if level.erase(slot_idx) {
+                    level.tombstones += 1;
+                }
+                level.len -= 1;
+            }
+            SlotLocation::SpecialPrimary { slot_idx } => {
+                let primary = &mut self.special.primary;
+                if primary.erase(slot_idx) {
+                    primary.tombstones += 1;
+                }
+                primary.len -= 1;
+                self.special.total_len -= 1;
+            }
+            SlotLocation::SpecialFallback { slot_idx } => {
+                let fallback = &mut self.special.fallback;
+                if fallback.erase(slot_idx) {
+                    fallback.tombstones += 1;
+                }
+                fallback.len -= 1;
+                self.special.total_len -= 1;
+            }
+        }
+        self.len -= 1;
     }
 
     #[inline]
@@ -1746,11 +1790,12 @@ where
             phase: ScanPhase::Levels,
             level_idx: 0,
             cursor: OccupiedSlots::empty(),
+            cur_data: std::ptr::null_mut(),
             started: false,
         }
     }
 
-    fn scan_next(&self, scan: &mut FunnelScan) -> Option<SlotLocation> {
+    fn scan_next(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, SlotLocation)> {
         if !scan.started {
             scan.started = true;
             // Prime the cursor on the first region. With no levels, jump
@@ -1758,14 +1803,16 @@ where
             if self.levels.is_empty() {
                 scan.phase = ScanPhase::Primary;
                 scan.cursor.set_region(&self.special.primary);
+                scan.cur_data = self.special.primary.data_ptr().cast();
             } else {
                 // SAFETY: levels non-empty ⇒ index 0 in bounds.
                 scan.cursor.set_region(&self.levels[0]);
+                scan.cur_data = self.levels[0].data_ptr().cast();
             }
         }
         loop {
             if let Some(slot_idx) = scan.cursor.step() {
-                return Some(match scan.phase {
+                let loc = match scan.phase {
                     ScanPhase::Levels => SlotLocation::Level {
                         level_idx: scan.level_idx,
                         slot_idx,
@@ -1775,23 +1822,30 @@ where
                     // `step` returns `None` on an empty region, so the cursor
                     // never yields once the phase machine reaches `Done`.
                     ScanPhase::Done => unreachable!("cursor empty in Done phase"),
-                });
+                };
+                // SAFETY: `cur_data` is the current region's slot array; `slot_idx`
+                // is in-bounds for it (`step` yields only valid slots).
+                let ptr = unsafe { scan.cur_data.cast::<SlotEntry<K, V>>().add(slot_idx) };
+                return Some((ptr, loc));
             }
             // Current region exhausted: advance to the next, re-deriving the
-            // region pointer from `&self` so `FunnelScan` stays pointerless.
+            // region pointer + cached data ptr from `&self`.
             match scan.phase {
                 ScanPhase::Levels => {
                     scan.level_idx += 1;
                     if scan.level_idx < self.levels.len() {
                         scan.cursor.set_region(&self.levels[scan.level_idx]);
+                        scan.cur_data = self.levels[scan.level_idx].data_ptr().cast();
                     } else {
                         scan.phase = ScanPhase::Primary;
                         scan.cursor.set_region(&self.special.primary);
+                        scan.cur_data = self.special.primary.data_ptr().cast();
                     }
                 }
                 ScanPhase::Primary => {
                     scan.phase = ScanPhase::Fallback;
                     scan.cursor.set_region(&self.special.fallback);
+                    scan.cur_data = self.special.fallback.data_ptr().cast();
                 }
                 ScanPhase::Fallback => {
                     scan.phase = ScanPhase::Done;
@@ -1835,8 +1889,11 @@ pub struct FunnelScan {
     phase: ScanPhase,
     level_idx: usize,
     cursor: OccupiedSlots,
+    /// Cached `data_ptr()` of the current region (as bytes), refreshed on each
+    /// region cross so `scan_next` yields a slot pointer with one offset.
+    cur_data: *mut u8,
     /// `false` until the first [`RawTable::scan_next`] lazily sets the cursor
-    /// region from `&self`, keeping `scan()` pointerless.
+    /// + `cur_data` from `&self`, keeping `scan()` pointer-free.
     started: bool,
 }
 
@@ -1846,6 +1903,7 @@ impl Clone for FunnelScan {
             phase: self.phase,
             level_idx: self.level_idx,
             cursor: self.cursor.clone(),
+            cur_data: self.cur_data,
             started: self.started,
         }
     }

@@ -1,12 +1,3 @@
-//! Generic hash-map shell shared by the [`ElasticHashMap`](crate::ElasticHashMap)
-//! and [`FunnelHashMap`](crate::FunnelHashMap) backends.
-//!
-//! [`HashMap`] is a thin wrapper that owns a [`RawTable`] implementation and
-//! layers the public map API — lookup/insert/remove, the entry API, iterators,
-//! and trait impls — on top of a small set of backend primitives. The backends
-//! ([`crate::elastic`], [`crate::funnel`]) own all storage, hashing, and the
-//! probing algorithm; this module owns everything that is identical between them.
-
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::iter::FusedIterator;
@@ -114,16 +105,27 @@ pub trait RawTable<K, V>: Sized {
     /// Removes the entry at `loc` (tombstone + bookkeeping + maybe resize).
     fn remove(&mut self, loc: Self::Location) -> (K, V);
 
-    /// Removes the entry at `loc` without triggering a resize. Used by
-    /// draining iterators that consolidate tombstones lazily.
-    fn extract_at(&mut self, loc: Self::Location) -> (K, V);
+    /// Marks the slot at `loc` as a tombstone without touching live/tombstone
+    /// counters. For draining iterators whose value was already read out and
+    /// whose counters are reset wholesale ([`Drain`] via [`wipe_all`](RawTable::wipe_all))
+    /// or irrelevant (a consumed [`IntoIter`]); the mark stops the table's
+    /// `Drop` from re-dropping the moved-out slot.
+    fn tombstone_slot(&mut self, loc: Self::Location);
+
+    /// Finalizes removal of the slot at `loc` whose value was already read out:
+    /// marks a tombstone and updates counters, but does not resize. For
+    /// [`ExtractIf`], where the map keeps being used afterward.
+    fn extract_finish(&mut self, loc: Self::Location);
 
     /// Fresh cursor positioned before the first occupied slot.
     fn scan(&self) -> Self::Scan;
 
-    /// Advances `scan`, returning the next occupied location in storage order.
-    /// Re-derives storage pointers from `&self` so `scan` stays pointerless.
-    fn scan_next(&self, scan: &mut Self::Scan) -> Option<Self::Location>;
+    /// Advances `scan`, returning the next occupied slot's pointer and location
+    /// in storage order. Iterators read through the pointer directly; the
+    /// location backs removal. `scan` caches the current region so the pointer
+    /// is one offset, not a per-element region lookup. `scan` itself holds no
+    /// pointer until the first call, so a consumed table may be moved first.
+    fn scan_next(&self, scan: &mut Self::Scan) -> Option<(*mut SlotEntry<K, V>, Self::Location)>;
 
     /// Bulk-clears all control bytes and zeroes counters. Called by
     /// [`Drain::drop`] after the slots' values have been taken.
@@ -852,11 +854,11 @@ pub struct Iter<'a, K, V, R: RawTable<K, V>> {
 impl<'a, K, V, R: RawTable<K, V>> Iterator for Iter<'a, K, V, R> {
     type Item = (&'a K, &'a V);
     fn next(&mut self) -> Option<(&'a K, &'a V)> {
-        let loc = self.table.scan_next(&mut self.scan)?;
+        let (ptr, _loc) = self.table.scan_next(&mut self.scan)?;
         self.remaining -= 1;
-        // SAFETY: `loc` came from this table's scan; the `&'a R` borrow keeps
-        // the slot alive for `'a`.
-        let slot: &'a SlotEntry<K, V> = unsafe { &*self.table.slot_ptr(loc) };
+        // SAFETY: `ptr` is a live slot from this table's scan; the `&'a R`
+        // borrow keeps it alive for `'a`.
+        let slot: &'a SlotEntry<K, V> = unsafe { &*ptr };
         Some((&slot.key, &slot.value))
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -910,9 +912,9 @@ impl<'a, K, V, R: RawTable<K, V>> Iterator for IterMut<'a, K, V, R> {
         // SAFETY: `table` points to the borrowed map; `scan_next` yields each
         // location at most once, so the `&'a mut` references are disjoint.
         let table = unsafe { &*self.table };
-        let loc = table.scan_next(&mut self.scan)?;
+        let (ptr, _loc) = table.scan_next(&mut self.scan)?;
         self.remaining -= 1;
-        let slot: &'a mut SlotEntry<K, V> = unsafe { &mut *table.slot_ptr(loc) };
+        let slot: &'a mut SlotEntry<K, V> = unsafe { &mut *ptr };
         Some((&slot.key, &mut slot.value))
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -937,9 +939,13 @@ pub struct IntoIter<K, V, R: RawTable<K, V>> {
 impl<K, V, R: RawTable<K, V>> Iterator for IntoIter<K, V, R> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
-        let loc = self.table.scan_next(&mut self.scan)?;
+        let (ptr, loc) = self.table.scan_next(&mut self.scan)?;
         self.remaining -= 1;
-        Some(self.table.extract_at(loc))
+        // SAFETY: `ptr` is a live slot; read the entry out, then tombstone so
+        // the consumed table's `Drop` won't re-drop the moved-out slot.
+        let entry = unsafe { std::ptr::read(ptr) };
+        self.table.tombstone_slot(loc);
+        Some((entry.key, entry.value))
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.remaining, Some(self.remaining))
@@ -965,9 +971,13 @@ impl<K, V, R: RawTable<K, V>> Iterator for Drain<'_, K, V, R> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
         // SAFETY: `table` points to the borrowed map for the drain's lifetime.
-        let loc = unsafe { (*self.table).scan_next(&mut self.scan) }?;
+        let (ptr, loc) = unsafe { (*self.table).scan_next(&mut self.scan) }?;
         self.remaining -= 1;
-        Some(unsafe { (*self.table).extract_at(loc) })
+        // SAFETY: live slot; read the entry out and mark a tombstone (counters
+        // are reset wholesale by `wipe_all` on drop).
+        let entry = unsafe { std::ptr::read(ptr) };
+        unsafe { (*self.table).tombstone_slot(loc) };
+        Some((entry.key, entry.value))
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.remaining, Some(self.remaining))
@@ -1007,10 +1017,15 @@ where
     fn next(&mut self) -> Option<(K, V)> {
         loop {
             // SAFETY: `table` points to the borrowed map for the iterator's life.
-            let loc = unsafe { (*self.table).scan_next(&mut self.scan) }?;
-            let slot = unsafe { &mut *(*self.table).slot_ptr(loc) };
+            let (ptr, loc) = unsafe { (*self.table).scan_next(&mut self.scan) }?;
+            // SAFETY: live slot; exclusive via the `&mut` map borrow.
+            let slot = unsafe { &mut *ptr };
             if (self.pred)(&slot.key, &mut slot.value) {
-                return Some(unsafe { (*self.table).extract_at(loc) });
+                // SAFETY: matched — read the entry out, then finalize removal
+                // (tombstone + counters; the map keeps being used).
+                let entry = unsafe { std::ptr::read(ptr) };
+                unsafe { (*self.table).extract_finish(loc) };
+                return Some((entry.key, entry.value));
             }
         }
     }
