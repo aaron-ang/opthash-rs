@@ -3004,8 +3004,9 @@ impl<K, V, S, A: Allocator + Clone> FunnelIntoIter<K, V, S, A> {
     #[inline]
     fn refresh_region_ptrs(&mut self) {
         self.regions.levels = self.levels.as_mut_ptr();
-        // Project sibling fields from one raw parent pointer; separate
-        // projections through `self.special` retag the parent under Miri.
+        // Keep both special-region pointers as sibling projections from the
+        // same raw parent pointer; each is used only for its non-overlapping
+        // field.
         let special = ptr::addr_of_mut!(*self.special);
         self.regions.primary = unsafe { ptr::addr_of_mut!((*special).primary) };
         self.regions.fallback = unsafe { ptr::addr_of_mut!((*special).fallback) };
@@ -3100,9 +3101,9 @@ where
             _marker: PhantomData,
         };
         // Derive raw ptrs post-move so moving the Vec/SpecialArray into
-        // `ManuallyDrop` does not invalidate the borrow tags. Use one raw
-        // parent pointer for both special fields so sibling projections do not
-        // retag each other.
+        // `ManuallyDrop` does not invalidate them. The primary/fallback
+        // pointers are sibling projections from one raw parent pointer and
+        // are used only for their respective non-overlapping fields.
         let special = ptr::addr_of_mut!(*iter.special);
         iter.regions = FunnelRegions::new(
             iter.levels.as_mut_ptr(),
