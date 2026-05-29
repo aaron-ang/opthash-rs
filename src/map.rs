@@ -102,6 +102,22 @@ pub trait RawTable<K, V>: Sized {
     /// Inserts a known-absent key, resizing as needed. Returns its location.
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> Self::Location;
 
+    /// Inserts `key`→`value`, returning the previous value if present. The
+    /// default probes once to find, then again for a vacant slot; backends that
+    /// record an insertion candidate during the find probe override this to do
+    /// a single pass.
+    fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
+    where
+        K: Hash + Eq,
+    {
+        let fp = fingerprint(hash);
+        if let Some(loc) = self.find(&key, hash, fp) {
+            return Some(self.replace_value(loc, value));
+        }
+        self.insert_for_vacant(key, value, hash);
+        None
+    }
+
     /// Removes the entry at `loc` (tombstone + bookkeeping + maybe resize).
     fn remove(&mut self, loc: Self::Location) -> (K, V);
 
@@ -241,12 +257,7 @@ where
     /// Inserts `key`/`value`. Returns the previous value for `key`, if any.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let hash = self.table.hash(&key);
-        let fp = fingerprint(hash);
-        if let Some(loc) = self.table.find(&key, hash, fp) {
-            return Some(self.table.replace_value(loc, value));
-        }
-        self.table.insert_for_vacant(key, value, hash);
-        None
+        self.table.insert(key, value, hash)
     }
 
     /// Returns a reference to the value for `key`.
@@ -268,6 +279,24 @@ where
         let loc = self.table.find(key, hash, fingerprint(hash))?;
         let entry = unsafe { self.table.slot_ref(loc) };
         Some((&entry.key, &entry.value))
+    }
+
+    /// Returns the stored key equal to `key`, inserting `f(key)` paired with
+    /// `value` if absent. One probe on the hit path: the `Copy` location from
+    /// [`RawTable::find`] releases the borrow before the key reference is
+    /// re-derived (stable borrowck rejects the naive `get`-then-insert form).
+    /// Backs the sets' `get_or_insert_with`, where `value` is always `()`.
+    pub(crate) fn get_or_insert_key_with<Q, F>(&mut self, key: &Q, value: V, f: F) -> &K
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+        F: FnOnce(&Q) -> K,
+    {
+        let hash = self.table.hash(key);
+        if let Some(loc) = self.table.find(key, hash, fingerprint(hash)) {
+            return unsafe { &self.table.slot_ref(loc).key };
+        }
+        let loc = self.table.insert_for_vacant(f(key), value, hash);
+        unsafe { &self.table.slot_ref(loc).key }
     }
 
     /// Returns a mutable reference to the value for `key`.

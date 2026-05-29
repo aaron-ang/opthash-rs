@@ -1104,11 +1104,16 @@ macro_rules! define_set_classes {
             /// Retains only the elements also present in `other`. Returns
             /// whether the set changed.
             fn retain_in(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                let before = self.inner.len();
+                if let Ok(other_set) = other.cast::<Self>() {
+                    let borrowed = other_set.borrow();
+                    self.inner.retain(|value| borrowed.inner.contains(value));
+                    return Ok(self.inner.len() != before);
+                }
                 let other_set = PySet::empty(py)?;
                 for item in other.try_iter()? {
                     other_set.add(item?)?;
                 }
-                let before = self.inner.len();
                 self.inner
                     .retain(|value| other_set.contains(value.obj_borrowed(py)).unwrap_or(false));
                 Ok(self.inner.len() != before)
@@ -1116,6 +1121,18 @@ macro_rules! define_set_classes {
 
             /// In-place symmetric difference with `other`.
             fn symmetric_difference_with(&mut self, other: &Bound<PyAny>) -> PyResult<bool> {
+                if let Ok(other_set) = other.cast::<Self>() {
+                    let py = other.py();
+                    let borrowed = other_set.borrow();
+                    let mut touched = false;
+                    for value in borrowed.inner.iter() {
+                        if !self.inner.remove(value) {
+                            self.inner.insert(value.clone_with_py(py));
+                        }
+                        touched = true;
+                    }
+                    return Ok(touched);
+                }
                 let mut touched = false;
                 for item in other.try_iter()? {
                     let item = item?;
@@ -1267,6 +1284,20 @@ macro_rules! define_set_classes {
             }
 
             fn isdisjoint(&self, other: &Bound<PyAny>) -> PyResult<bool> {
+                if let Ok(other_set) = other.cast::<Self>() {
+                    let borrowed = other_set.borrow();
+                    let (smaller, larger) = if self.inner.len() <= borrowed.inner.len() {
+                        (&self.inner, &borrowed.inner)
+                    } else {
+                        (&borrowed.inner, &self.inner)
+                    };
+                    for value in smaller.iter() {
+                        if larger.contains(value) {
+                            return Ok(false);
+                        }
+                    }
+                    return Ok(true);
+                }
                 for item in other.try_iter()? {
                     let item = item?;
                     // SAFETY: `item` outlives `probe`.
@@ -1279,6 +1310,18 @@ macro_rules! define_set_classes {
             }
 
             fn issubset(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                if let Ok(other_set) = other.cast::<Self>() {
+                    let borrowed = other_set.borrow();
+                    if self.inner.len() > borrowed.inner.len() {
+                        return Ok(false);
+                    }
+                    for value in self.inner.iter() {
+                        if !borrowed.inner.contains(value) {
+                            return Ok(false);
+                        }
+                    }
+                    return Ok(true);
+                }
                 let other_set = PySet::empty(py)?;
                 for item in other.try_iter()? {
                     other_set.add(item?)?;
@@ -1292,6 +1335,18 @@ macro_rules! define_set_classes {
             }
 
             fn issuperset(&self, other: &Bound<PyAny>) -> PyResult<bool> {
+                if let Ok(other_set) = other.cast::<Self>() {
+                    let borrowed = other_set.borrow();
+                    if self.inner.len() < borrowed.inner.len() {
+                        return Ok(false);
+                    }
+                    for value in borrowed.inner.iter() {
+                        if !self.inner.contains(value) {
+                            return Ok(false);
+                        }
+                    }
+                    return Ok(true);
+                }
                 for item in other.try_iter()? {
                     let item = item?;
                     // SAFETY: `item` outlives `probe`.
@@ -1380,6 +1435,18 @@ macro_rules! define_set_classes {
             }
 
             fn __eq__(&self, other: &Bound<PyAny>) -> PyResult<bool> {
+                if let Ok(other_set) = other.cast::<Self>() {
+                    let borrowed = other_set.borrow();
+                    if self.inner.len() != borrowed.inner.len() {
+                        return Ok(false);
+                    }
+                    for value in self.inner.iter() {
+                        if !borrowed.inner.contains(value) {
+                            return Ok(false);
+                        }
+                    }
+                    return Ok(true);
+                }
                 if !is_set_like(other)? {
                     return Ok(false);
                 }

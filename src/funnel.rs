@@ -419,6 +419,15 @@ enum LookupStep {
     StopSearch,
 }
 
+/// Why a single-pass level probe missed, deciding whether overflow to the
+/// special array is possible.
+enum LevelMiss {
+    /// An EMPTY byte ended the chain; no overflow to special possible.
+    ChainClean,
+    /// Levels exhausted without a clean stop; key may be in the special array.
+    MayContinue,
+}
+
 /// Open-addressed funnel-hashing backend for the generic [`map::HashMap`]
 /// shell. See [`FunnelHashMap`] for the public map type.
 ///
@@ -876,6 +885,34 @@ where
         final_location
     }
 
+    /// Places a known-novel entry at `location`, resizing first if the table is
+    /// full or no candidate was found. Single-pass insert's placement tail.
+    fn insert_at_location_after_resize_check(
+        &mut self,
+        location: Option<SlotLocation>,
+        key_hash: u64,
+        key: K,
+        value: V,
+        key_fingerprint: u8,
+    ) -> Option<V> {
+        let final_location = match location {
+            Some(loc) if self.len < self.max_insertions => loc,
+            _ => {
+                let new_capacity = if self.total_slots == 0 {
+                    INITIAL_CAPACITY
+                } else {
+                    self.total_slots.saturating_mul(2)
+                };
+                self.resize(new_capacity);
+                self.choose_slot_for_new_key(key_hash)
+                    .expect("no free slot found after resize")
+            }
+        };
+
+        self.place_new_entry(final_location, key, value, key_fingerprint);
+        None
+    }
+
     /// Raw pointer to the whole slot at `loc`. Projects through raw pointers
     /// from shared `&Region` (level / special primary / special fallback),
     /// forming no intermediate `&mut`, so distinct locations yield
@@ -1258,6 +1295,63 @@ where
         }
         self.find_in_special_fallback(key_hash, key_fingerprint, key, free_slot)
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
+    }
+
+    /// Single-pass level probe: returns the match (if any) and, with
+    /// `Some(free_slot)`, records the first free `SlotLocation` seen so an
+    /// insert can place there without re-probing. The [`LevelMiss`] tells the
+    /// caller whether the chain ended clean (no special overflow possible).
+    fn find_in_levels<Q>(
+        &self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+        free_slot: FreeSlot,
+    ) -> (Option<SlotLocation>, LevelMiss)
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let wants_free = matches!(&free_slot, Some(out) if out.is_none());
+        let mut local: Option<SlotLocation> = None;
+
+        for (level_idx, level) in self.levels.iter().enumerate() {
+            let mut slot_candidate: Option<usize> = None;
+            let out = if wants_free && local.is_none() {
+                Some(&mut slot_candidate)
+            } else {
+                None
+            };
+            let step = level.find_in_bucket(key_hash, key_fingerprint, key, out);
+            if let Some(slot_idx) = slot_candidate {
+                local = Some(SlotLocation::Level {
+                    level_idx,
+                    slot_idx,
+                });
+            }
+            match step {
+                LookupStep::Found(slot_idx) => {
+                    return (
+                        Some(SlotLocation::Level {
+                            level_idx,
+                            slot_idx,
+                        }),
+                        LevelMiss::MayContinue,
+                    );
+                }
+                LookupStep::Continue => {}
+                LookupStep::StopSearch => {
+                    if let Some(out) = free_slot {
+                        *out = local;
+                    }
+                    return (None, LevelMiss::ChainClean);
+                }
+            }
+        }
+
+        if wants_free && let Some(out) = free_slot {
+            *out = local;
+        }
+        (None, LevelMiss::MayContinue)
     }
 
     #[inline]
@@ -1781,6 +1875,45 @@ where
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> SlotLocation {
         self.insert_for_vacant_entry(key, value, hash)
+    }
+
+    fn insert(&mut self, key: K, value: V, key_hash: u64) -> Option<V>
+    where
+        K: Hash + Eq,
+    {
+        let key_fingerprint = control::control_fingerprint(key_hash);
+
+        // One pass over levels: on match replace; on miss keep the first free
+        // slot as the insertion candidate.
+        let mut candidate: Option<SlotLocation> = None;
+        let (found, miss) =
+            self.find_in_levels(&key, key_hash, key_fingerprint, Some(&mut candidate));
+        if let Some(location) = found {
+            return Some(self.replace_existing_value(location, value));
+        }
+
+        // Skip the special-array dedup when the chain ended clean (no overflow
+        // possible) or special is empty — place at the level candidate.
+        if candidate.is_some()
+            && (matches!(miss, LevelMiss::ChainClean) || self.special.total_len == 0)
+        {
+            return self.insert_at_location_after_resize_check(
+                candidate,
+                key_hash,
+                key,
+                value,
+                key_fingerprint,
+            );
+        }
+
+        // Cold: key may have overflowed to special; probe it for a match.
+        if let Some(location) =
+            self.find_in_special(&key, key_hash, key_fingerprint, Some(&mut candidate))
+        {
+            return Some(self.replace_existing_value(location, value));
+        }
+
+        self.insert_at_location_after_resize_check(candidate, key_hash, key, value, key_fingerprint)
     }
 
     fn remove(&mut self, loc: SlotLocation) -> (K, V) {

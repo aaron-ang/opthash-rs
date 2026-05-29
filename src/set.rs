@@ -283,13 +283,7 @@ macro_rules! define_hash_set {
                 Q: Hash + Equivalent<T> + ?Sized,
                 F: FnOnce(&Q) -> T,
             {
-                if self.map.contains_key(value) {
-                    return self.map.get_key_value(value).expect("value is present").0;
-                }
-                match self.map.entry(f(value)) {
-                    $MapEntry::Occupied(entry) => entry.into_key(),
-                    $MapEntry::Vacant(entry) => entry.insert_entry(()).into_key(),
-                }
+                self.map.get_or_insert_key_with(value, (), f)
             }
 
             /// Inserts `value`. Returns `true` if it was newly added.
@@ -395,9 +389,16 @@ macro_rules! define_hash_set {
 
             /// Visits the values present in both `self` and `other`.
             pub fn intersection<'a>(&'a self, other: &'a Self) -> $Intersection<'a, T, S, A> {
+                // Iterate the smaller set and probe the larger, minimizing
+                // membership lookups when sizes differ.
+                let (smaller, larger) = if self.len() <= other.len() {
+                    (self, other)
+                } else {
+                    (other, self)
+                };
                 $Intersection {
-                    iter: self.iter(),
-                    other,
+                    iter: smaller.iter(),
+                    other: larger,
                 }
             }
 

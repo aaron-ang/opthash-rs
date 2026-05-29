@@ -232,7 +232,6 @@ fn bench_insert(c: &mut Criterion) {
 fn bench_one_lookup_group(
     c: &mut Criterion,
     group_name: &str,
-    op_tag: &str,
     query_keys: &[u64],
     std_map: &StdHashMap<u64, u64>,
     hb_map: &HashbrownMap<u64, u64>,
@@ -241,28 +240,28 @@ fn bench_one_lookup_group(
 ) {
     let mut group = c.benchmark_group(group_name);
     group.throughput(Throughput::Elements(query_keys.len() as u64));
-    group.bench_function(format!("{op_tag}_std"), |b| {
+    group.bench_function(format!("{group_name}_std"), |b| {
         b.iter(|| {
             for key in query_keys {
                 black_box(std_map.get(black_box(key)));
             }
         });
     });
-    group.bench_function(format!("{op_tag}_hashbrown"), |b| {
+    group.bench_function(format!("{group_name}_hashbrown"), |b| {
         b.iter(|| {
             for key in query_keys {
                 black_box(hb_map.get(black_box(key)));
             }
         });
     });
-    group.bench_function(format!("{op_tag}_elastic"), |b| {
+    group.bench_function(format!("{group_name}_elastic"), |b| {
         b.iter(|| {
             for key in query_keys {
                 black_box(el_map.get(black_box(key)));
             }
         });
     });
-    group.bench_function(format!("{op_tag}_funnel"), |b| {
+    group.bench_function(format!("{group_name}_funnel"), |b| {
         b.iter(|| {
             for key in query_keys {
                 black_box(fn_map.get(black_box(key)));
@@ -284,11 +283,9 @@ fn bench_lookups(c: &mut Criterion) {
         .map(|idx| common::key_at(idx + MAP_SIZE + 10_000_000))
         .collect();
 
+    bench_one_lookup_group(c, "get_hit", &hit_keys, &std_map, &hb_map, &el_map, &fn_map);
     bench_one_lookup_group(
-        c, "get_hit", "get_hit", &hit_keys, &std_map, &hb_map, &el_map, &fn_map,
-    );
-    bench_one_lookup_group(
-        c, "get_miss", "get_miss", &miss_keys, &std_map, &hb_map, &el_map, &fn_map,
+        c, "get_miss", &miss_keys, &std_map, &hb_map, &el_map, &fn_map,
     );
 }
 
@@ -309,7 +306,6 @@ fn bench_tiny_lookup(c: &mut Criterion) {
     let fn_map = common::build_funnel_map(&pairs);
     bench_one_lookup_group(
         c,
-        "tiny_lookup",
         "tiny_lookup",
         &query_keys,
         &std_map,
@@ -525,9 +521,7 @@ fn bench_get_hit_load_factor(c: &mut Criterion) {
             fn_map.insert(key, value);
         }
         let group = format!("get_hit_load_{load_pct}");
-        bench_one_lookup_group(
-            c, &group, &group, &hit_keys, &std_map, &hb_map, &el_map, &fn_map,
-        );
+        bench_one_lookup_group(c, &group, &hit_keys, &std_map, &hb_map, &el_map, &fn_map);
     }
 }
 
