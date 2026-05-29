@@ -31,9 +31,11 @@ def plot_mean_latency_by_size(assets_dir: Path):
 
     for size_label in LATENCY_SIZES:
         group = f"get_hit_latency_{size_label}"
+        # Bench id is `<group>_<impl>` (see benches/README.md).
         try:
             row = {
-                impl: load_criterion_mean_ns(group, impl) for impl in IMPLEMENTATIONS
+                impl: load_criterion_mean_ns(group, f"{group}_{impl}")
+                for impl in IMPLEMENTATIONS
             }
         except FileNotFoundError:
             continue
@@ -94,13 +96,13 @@ def _tail_x(q):
 
 
 def plot_tail_cdf(assets_dir: Path):
-    """Percentile-vs-latency tail plot for get-hit @ TAIL_SIZE, one line per impl."""
+    """Percentile-vs-latency tail plot for get_hit @ TAIL_SIZE, one line per impl."""
     fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
     max_x = _tail_x(TAIL_TICK_QS[-1])
 
     any_data = False
     for impl in IMPLEMENTATIONS:
-        doc = load_latency_json(impl, TAIL_SIZE, "get-hit")
+        doc = load_latency_json(impl, TAIL_SIZE, "get_hit")
         if doc is None:
             continue
         buckets = doc.get("histogram", [])
@@ -122,7 +124,7 @@ def plot_tail_cdf(assets_dir: Path):
 
     if not any_data:
         plt.close(fig)
-        print(f"no latency data for get-hit @ {TAIL_SIZE}, skipping tail plot")
+        print(f"no latency data for get_hit @ {TAIL_SIZE}, skipping tail plot")
         return
 
     tick_positions = [_tail_x(q) for q in TAIL_TICK_QS]
@@ -144,7 +146,7 @@ def plot_tail_cdf(assets_dir: Path):
     )
     ax.legend(fontsize=12, loc="upper left")
 
-    save_svg(fig, assets_dir / "latency-tail-10M-get-hit.svg")
+    save_svg(fig, assets_dir / "latency-tail-10M-get_hit.svg")
 
 
 def main():

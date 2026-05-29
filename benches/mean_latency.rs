@@ -19,11 +19,13 @@ fn bench_get_hit_latency(c: &mut Criterion) {
         let query_keys: Vec<u64> = (0..size).map(|idx| pairs[idx].0).collect();
 
         let label = common::size_label(size);
-        let mut group = c.benchmark_group(format!("get_hit_latency_{label}"));
+        let workload = format!("get_hit_latency_{label}");
+        let mut group = c.benchmark_group(&workload);
 
+        // Bench id `<workload>_<impl>`, matching speedup.rs (see benches/README.md).
         macro_rules! latency_arm {
-            ($name:literal, $build:expr) => {
-                group.bench_function($name, |b| {
+            ($impl:literal, $build:expr) => {
+                group.bench_function(format!("{workload}_{}", $impl), |b| {
                     let map = $build(&pairs);
                     let mut keys = query_keys.iter().cycle();
                     b.iter(|| black_box(map.get(black_box(keys.next().unwrap()))));

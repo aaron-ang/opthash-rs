@@ -53,8 +53,8 @@ Run shape and options:
 
 ### Latency-chart harnesses
 
-- `BENCH=mean_latency scripts/bench.sh` — Criterion sweep of `get_hit` over `LATENCY_SIZES` (1K → 10M); feeds the cache-cliff line chart. Output: `target/criterion/get_hit_latency_<size>/<impl>/`.
-- `BENCH=tail_latency scripts/bench.sh` — HDR get-hit distribution at SIZE=10M (1M samples × 4 maps × 10K warmup). Output: `target/latency/<map>/<size>/<op>.json` (serde_json) — percentiles + histogram buckets + `clock_overhead_ns`. This harness writes JSON directly and does not use Criterion baselines.
+- `BENCH=mean_latency scripts/bench.sh` — Criterion sweep of `get_hit` over `LATENCY_SIZES` (1K → 10M); feeds the cache-cliff line chart. Output: `target/criterion/get_hit_latency_<size>/get_hit_latency_<size>_<impl>/`.
+- `BENCH=tail_latency scripts/bench.sh` — HDR get_hit distribution at SIZE=10M (1M samples × 4 maps × 10K warmup). Output: `target/latency/<map>/<size>/<op>.json` (serde_json) — percentiles + histogram buckets + `clock_overhead_ns`. This harness writes JSON directly and does not use Criterion baselines.
 
 ### Python-side benchmarks
 
@@ -78,7 +78,7 @@ uv run scripts/generate_python_chart.py
 ### Charts
 
 - `uv run scripts/generate_speedup_chart.py` — throughput speedup bar chart
-- `uv run scripts/generate_latency_chart.py` — Criterion mean-latency line (`target/criterion/get_hit_latency_<size>`; sizes from `LATENCY_SIZES` in `benches/common.rs`) + HDR get-hit tail CDF @ 10M (`target/latency/`).
+- `uv run scripts/generate_latency_chart.py` — Criterion mean-latency line (`target/criterion/get_hit_latency_<size>`; sizes from `LATENCY_SIZES` in `benches/common.rs`) + HDR get_hit tail CDF @ 10M (`target/latency/`).
 - `uv run scripts/generate_all_charts.py` — regenerate everything
 - `uv run scripts/generate_python_chart.py` — Python-side dict-vs-opthash speedup (reads `.benchmarks/python.json`)
 

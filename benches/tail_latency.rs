@@ -1,4 +1,4 @@
-//! HDR tail-latency histograms for get-hit at SIZE=10M. Writes
+//! HDR tail-latency histograms for `get_hit` at SIZE=10M. Writes
 //! percentiles + bucket counts to `target/latency/<map>/<size>/<op>.json`,
 //! consumed by `scripts/generate_latency_chart.py` for the tail CDF.
 //!
@@ -21,8 +21,8 @@ use serde::Serialize;
 const MAPS: &[&str] = &["std", "hashbrown", "elastic", "funnel"];
 /// Items inserted into the map before sampling.
 const SIZE: usize = 10_000_000;
-/// Operation label written into the output JSON.
-const OP: &str = "get-hit";
+/// Operation label written into the output JSON (matches speedup's `get_hit`).
+const OP: &str = "get_hit";
 /// Latency samples recorded per (map, op).
 const SAMPLES: usize = 1_000_000;
 /// Pre-sample warmup iterations to stabilize caches + branch predictor.
