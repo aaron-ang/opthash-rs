@@ -1,10 +1,3 @@
-//! Hash sets layered over the map backends.
-//!
-//! [`ElasticHashSet`] and [`FunnelHashSet`] are thin wrappers around
-//! `ElasticHashMap<T, ()>` and `FunnelHashMap<T, ()>`, mirroring
-//! `hashbrown::HashSet`. Both share one implementation via [`define_hash_set`];
-//! invoked once per backend so the two stay in sync.
-
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::iter::{Chain, FusedIterator};
