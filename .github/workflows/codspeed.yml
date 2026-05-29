@@ -27,7 +27,7 @@ jobs:
           tool: cargo-codspeed
       - uses: Swatinem/rust-cache@v2
       - name: Build benchmarks
-        run: cargo codspeed build --bench speedup
+        run: cargo codspeed build --bench speedup --bench set_ops
       - uses: CodSpeedHQ/action@v4
         with:
           mode: simulation
