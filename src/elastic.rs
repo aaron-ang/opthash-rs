@@ -6,25 +6,21 @@ use std::mem::{self, ManuallyDrop};
 use std::ops::Index;
 use std::ptr;
 
-use allocator_api2::alloc::Layout;
+use allocator_api2::alloc::{Allocator, Global, Layout};
 use equivalent::Equivalent;
 
-use crate::common::arena::{
-    self, Arena, ArenaSlots, CURRENT_SLOT_INIT, IterRange, IterRangeMut, ScanCursor, SlotEntry,
-};
-use crate::common::bitmask::BitMask;
+use crate::common::DefaultHashBuilder;
+use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::{
     DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY,
 };
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
-use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
+use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError, TryReserveError};
 use crate::common::iter::{
-    IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
-    Values as CommonValues,
+    IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys, OccupiedSlots,
+    RegionIter, RegionIterMut, Values as CommonValues,
 };
 use crate::common::math::{self, align, capacity, probe};
-use crate::common::simd;
-use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
@@ -864,7 +860,7 @@ where
     #[must_use]
     pub fn iter(&self) -> ElasticIter<'_, K, V, A> {
         ElasticIter {
-            iter: IterRange::new(&self.levels),
+            iter: RegionIter::new(&self.levels),
             remaining: self.len,
             _alloc: PhantomData,
         }
@@ -891,7 +887,7 @@ where
     /// `(&K, &mut V)` iterator. Mirrors `HashMap::iter_mut`.
     pub fn iter_mut(&mut self) -> ElasticIterMut<'_, K, V, A> {
         let remaining = self.len;
-        let iter = IterRangeMut::new(&mut self.levels);
+        let iter = RegionIterMut::new(&mut self.levels);
         ElasticIterMut {
             iter,
             remaining,
@@ -1010,7 +1006,7 @@ where
             let levels = &mut (*map_ptr).levels;
             (levels.as_mut_ptr(), levels.len())
         };
-        let mut cursor = ScanCursor::empty();
+        let mut cursor = OccupiedSlots::empty();
         if levels_len > 0 {
             cursor.set_region(unsafe { &*levels_ptr });
         }
@@ -1036,7 +1032,7 @@ where
             let levels = &mut (*map_ptr).levels;
             (levels.as_mut_ptr(), levels.len())
         };
-        let mut cursor = ScanCursor::empty();
+        let mut cursor = OccupiedSlots::empty();
         if levels_len > 0 {
             cursor.set_region(unsafe { &*levels_ptr });
         }
@@ -1268,7 +1264,7 @@ pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global
     levels_ptr: *mut Level<SlotEntry<K, V>>,
     levels_len: usize,
     level_idx: usize,
-    cursor: ScanCursor,
+    cursor: OccupiedSlots,
     _marker: PhantomData<&'a mut ElasticHashMap<K, V, S, A>>,
 }
 
@@ -1286,7 +1282,7 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
     fn next(&mut self) -> Option<Self::Item> {
         // Per-yield ctrl byte update skipped: `Drain::drop` wipes all ctrls.
         loop {
-            if let Some(idx) = self.cursor.step() {
+            if let Some(idx) = self.cursor.next() {
                 // SAFETY: scan only yields occupied slots in the current level.
                 let entry = unsafe {
                     let level = &mut *self.levels_ptr.add(self.level_idx);
@@ -1342,7 +1338,7 @@ where
     levels_ptr: *mut Level<SlotEntry<K, V>>,
     levels_len: usize,
     level_idx: usize,
-    cursor: ScanCursor,
+    cursor: OccupiedSlots,
     pred: F,
     _marker: PhantomData<&'a mut ElasticHashMap<K, V, S, A>>,
 }
@@ -1370,7 +1366,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            while let Some(idx) = self.cursor.step() {
+            for idx in self.cursor.by_ref() {
                 // SAFETY: scan only yields occupied slots.
                 let level = unsafe { &mut *self.levels_ptr.add(self.level_idx) };
                 let entry = unsafe { level.get_mut(idx) };
@@ -1413,7 +1409,7 @@ where
 
 /// Borrowing iterator over occupied entries.
 pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
-    iter: IterRange<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
+    iter: RegionIter<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
     remaining: usize,
     _alloc: PhantomData<&'a A>,
 }
@@ -1477,7 +1473,7 @@ pub type Values<'a, K, V, A = Global> = CommonValues<ElasticIter<'a, K, V, A>>;
 /// and TOMBSTONE slots. Each `next()` yields a strictly newer slot ⇒
 /// returned `&mut V`s are disjoint.
 pub struct ElasticIterMut<'a, K, V, A: Allocator + Clone = Global> {
-    iter: IterRangeMut<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
+    iter: RegionIterMut<'a, SlotEntry<K, V>, Level<SlotEntry<K, V>>>,
     remaining: usize,
     _alloc: PhantomData<A>,
 }
@@ -1559,10 +1555,7 @@ pub struct ElasticIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = 
     levels_ptr: *mut Level<SlotEntry<K, V>>,
     levels_len: usize,
     level_idx: usize,
-    next_ctrl: *const u8,
-    end_ctrl: *const u8,
-    current_group_slot: usize,
-    current_mask: BitMask,
+    cursor: OccupiedSlots,
     levels: ManuallyDrop<LevelSlice<K, V>>,
     arena: ManuallyDrop<Arena>,
     alloc: A,
@@ -1586,26 +1579,7 @@ impl<K, V, S, A: Allocator + Clone> ElasticIntoIter<K, V, S, A> {
     fn init_region(&mut self) {
         // SAFETY: caller guards `level_idx < levels_len`.
         let level = unsafe { &*self.levels_ptr.add(self.level_idx) };
-        self.next_ctrl = level.ctrl_ptr();
-        self.end_ctrl = unsafe { level.ctrl_ptr().add(level.capacity()) };
-        self.current_group_slot = CURRENT_SLOT_INIT;
-        self.current_mask = BitMask(0);
-    }
-
-    /// Advance the scan one step within the current region.
-    #[inline]
-    fn scan_step(&mut self) -> Option<usize> {
-        loop {
-            if let Some(bit) = self.current_mask.next() {
-                return Some(self.current_group_slot.wrapping_add(bit));
-            }
-            if self.next_ctrl >= self.end_ctrl {
-                return None;
-            }
-            self.current_group_slot = self.current_group_slot.wrapping_add(GROUP_SIZE);
-            self.current_mask = unsafe { simd::occupied_mask_16(self.next_ctrl) };
-            self.next_ctrl = unsafe { self.next_ctrl.add(GROUP_SIZE) };
-        }
+        self.cursor.set_region(level);
     }
 }
 
@@ -1614,7 +1588,7 @@ impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(idx) = self.scan_step() {
+            if let Some(idx) = self.cursor.next() {
                 // SAFETY: scanner yielded an occupied slot; tombstone-mark
                 // prevents future revisits if `Drop` runs mid-iteration.
                 let level = unsafe { &mut *self.levels_ptr.add(self.level_idx) };
@@ -1690,10 +1664,7 @@ where
             levels_ptr: ptr::null_mut(),
             levels_len,
             level_idx: 0,
-            next_ctrl: ptr::null(),
-            end_ctrl: ptr::null(),
-            current_group_slot: CURRENT_SLOT_INIT,
-            current_mask: BitMask(0),
+            cursor: OccupiedSlots::empty(),
             levels: ManuallyDrop::new(levels),
             arena: ManuallyDrop::new(arena),
             alloc,

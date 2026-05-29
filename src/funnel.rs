@@ -7,20 +7,20 @@ use std::ops::{ControlFlow, Index, Range};
 use std::ptr;
 use std::slice;
 
-use allocator_api2::alloc::Layout;
+use allocator_api2::alloc::{Allocator, Global, Layout};
 use equivalent::Equivalent;
 
-use crate::common::arena::{self, Arena, ArenaSlots, ScanCursor, SlotEntry};
+use crate::common::DefaultHashBuilder;
+use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
-use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
+use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError, TryReserveError};
 use crate::common::iter::{
-    IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
+    IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys, OccupiedSlots,
     Values as CommonValues,
 };
 use crate::common::math::{self, align, capacity, cast, probe};
 use crate::common::simd;
-use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
 /// Upper bound on `reserve_fraction`;
 /// level capacities become unstable beyond this load factor.
@@ -86,12 +86,29 @@ impl<T> BucketLevel<T> {
         probe::hash_to_usize(key_hash ^ self.salt) & self.bucket_count_mask as usize
     }
 
-    /// Slot index range covering all entries in `bucket_idx`.
     #[inline]
-    fn bucket_range(&self, bucket_idx: usize) -> Range<usize> {
-        let start = bucket_idx << self.bucket_size_log2;
-        let size = 1usize << self.bucket_size_log2;
-        start..start + size
+    fn first_free_in_range(&self, range: &Range<usize>) -> Option<usize> {
+        for group_start in (range.start..range.end).step_by(GROUP_SIZE) {
+            let group_ptr = unsafe { self.ctrl_ptr().add(group_start) };
+            if let Some(offset) = unsafe { simd::free_mask_16(group_ptr) }.lowest() {
+                let slot_idx = group_start + offset;
+                if slot_idx < range.end {
+                    return Some(slot_idx);
+                }
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn range_has_empty(&self, range: &Range<usize>) -> bool {
+        for group_start in (range.start..range.end).step_by(GROUP_SIZE) {
+            let group_ptr = unsafe { self.ctrl_ptr().add(group_start) };
+            if unsafe { simd::eq_mask_16(group_ptr, CTRL_EMPTY).any() } {
+                return true;
+            }
+        }
+        false
     }
 
     /// Paper §5 attempted insertion: hash `key_hash` to one bucket `A_{i,j}`,
@@ -101,16 +118,19 @@ impl<T> BucketLevel<T> {
             return None;
         }
         let bucket_idx = self.bucket_index(key_hash);
-        let bucket_range = self.bucket_range(bucket_idx);
-        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
-        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
+        let bucket_start = bucket_idx << self.bucket_size_log2;
+        let bucket_width = 1usize << self.bucket_size_log2;
+        debug_assert_eq!(bucket_start % GROUP_SIZE, 0);
+        if !bucket_start.is_multiple_of(GROUP_SIZE) {
             unsafe { std::hint::unreachable_unchecked() };
         }
-        let group_idx = bucket_range.start / GROUP_SIZE;
-        let group_ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        unsafe { simd::free_mask_16(group_ptr) }
-            .lowest()
-            .map(|offset| bucket_range.start + offset)
+        if bucket_width == GROUP_SIZE {
+            let group_ptr = unsafe { self.ctrl_ptr().add(bucket_start) };
+            return unsafe { simd::free_mask_16(group_ptr) }
+                .lowest()
+                .map(|offset| bucket_start + offset);
+        }
+        self.first_free_in_range(&(bucket_start..bucket_start + bucket_width))
     }
 
     /// Erase slot: become `CTRL_EMPTY` if the bucket has any EMPTY byte
@@ -118,9 +138,15 @@ impl<T> BucketLevel<T> {
     /// Returns whether a tombstone was written.
     #[inline]
     fn erase(&self, idx: usize) -> bool {
-        let group_idx = idx / GROUP_SIZE;
-        let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
+        let bucket_start = (idx >> self.bucket_size_log2) << self.bucket_size_log2;
+        let bucket_width = 1usize << self.bucket_size_log2;
+        let has_empty = if bucket_width == GROUP_SIZE {
+            let group_ptr = unsafe { self.ctrl_ptr().add(bucket_start) };
+            unsafe { simd::eq_mask_16(group_ptr, CTRL_EMPTY).any() }
+        } else {
+            self.range_has_empty(&(bucket_start..bucket_start + bucket_width))
+        };
+        if has_empty {
             self.set_control(idx, CTRL_EMPTY);
             false
         } else {
@@ -163,16 +189,20 @@ impl<K, V> BucketLevel<SlotEntry<K, V>> {
             return LookupStep::Continue;
         }
         let bucket_idx = self.bucket_index(key_hash);
-        let bucket_range = self.bucket_range(bucket_idx);
-        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
-        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
+        let bucket_start = bucket_idx << self.bucket_size_log2;
+        let bucket_width = 1usize << self.bucket_size_log2;
+        debug_assert_eq!(bucket_start % GROUP_SIZE, 0);
+        if !bucket_start.is_multiple_of(GROUP_SIZE) {
             unsafe { std::hint::unreachable_unchecked() };
         }
-        let group_idx = bucket_range.start / GROUP_SIZE;
-        let group_ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
+        if bucket_width != GROUP_SIZE {
+            let bucket_range = bucket_start..bucket_start + bucket_width;
+            return self.find_in_wide_bucket(&bucket_range, key_fingerprint, key, slot_out);
+        }
+        let group_ptr = unsafe { self.ctrl_ptr().add(bucket_start) };
         let match_mask = unsafe { simd::eq_mask_16(group_ptr, key_fingerprint) };
         for relative_idx in match_mask {
-            let slot_idx = bucket_range.start + relative_idx;
+            let slot_idx = bucket_start + relative_idx;
             let entry = unsafe { &*self.data_ptr().add(slot_idx) };
             if key.equivalent(&entry.key) {
                 return LookupStep::Found(slot_idx);
@@ -183,10 +213,69 @@ impl<K, V> BucketLevel<SlotEntry<K, V>> {
             if let Some(o) = free_mask.lowest()
                 && let Some(out) = slot_out
             {
-                *out = Some(bucket_range.start + o);
+                *out = Some(bucket_start + o);
             }
         }
         if unsafe { simd::eq_mask_16(group_ptr, CTRL_EMPTY).any() } {
+            LookupStep::StopSearch
+        } else {
+            LookupStep::Continue
+        }
+    }
+
+    #[inline]
+    fn find_in_wide_bucket<Q>(
+        &self,
+        bucket_range: &Range<usize>,
+        key_fingerprint: u8,
+        key: &Q,
+        slot_out: Option<&mut Option<usize>>,
+    ) -> LookupStep
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let wants_free = matches!(&slot_out, Some(out) if out.is_none());
+        let mut free_slot = None;
+        let mut saw_empty = false;
+        let mut saw_tombstone = false;
+
+        for group_start in (bucket_range.start..bucket_range.end).step_by(GROUP_SIZE) {
+            let group_ptr = unsafe { self.ctrl_ptr().add(group_start) };
+            let match_mask = unsafe { simd::eq_mask_16(group_ptr, key_fingerprint) };
+            for relative_idx in match_mask {
+                let slot_idx = group_start + relative_idx;
+                if slot_idx >= bucket_range.end {
+                    continue;
+                }
+                let entry = unsafe { &*self.data_ptr().add(slot_idx) };
+                if key.equivalent(&entry.key) {
+                    return LookupStep::Found(slot_idx);
+                }
+            }
+
+            if wants_free
+                && free_slot.is_none()
+                && let Some(offset) = unsafe { simd::free_mask_16(group_ptr) }.lowest()
+            {
+                let slot_idx = group_start + offset;
+                if slot_idx < bucket_range.end {
+                    free_slot = Some(slot_idx);
+                }
+            }
+
+            if unsafe { simd::eq_mask_16(group_ptr, CTRL_EMPTY).any() } {
+                saw_empty = true;
+            }
+            if unsafe { simd::eq_mask_16(group_ptr, CTRL_TOMBSTONE).any() } {
+                saw_tombstone = true;
+            }
+        }
+
+        if wants_free && let Some(out) = slot_out {
+            *out = free_slot;
+        }
+
+        if saw_empty && !saw_tombstone {
             LookupStep::StopSearch
         } else {
             LookupStep::Continue
@@ -1318,24 +1407,13 @@ where
 
     #[must_use]
     pub fn iter(&self) -> FunnelIter<'_, K, V, A> {
-        let levels_len = self.levels.len();
-        let mut cursor = ScanCursor::empty();
-        let mut phase = IterPhase::Levels;
-        // Prime cursor: first non-empty level, else jump to primary.
-        if levels_len > 0 {
-            cursor.set_region(&self.levels[0]);
-        } else {
-            phase = IterPhase::Primary;
-            cursor.set_region(&self.special.primary);
-        }
         FunnelIter {
-            levels: self.levels.as_ptr(),
-            levels_len,
-            level_idx: 0,
-            primary: ptr::from_ref(&self.special.primary),
-            fallback: ptr::from_ref(&self.special.fallback),
-            cursor,
-            phase,
+            regions: FunnelRegions::new(
+                self.levels.as_ptr().cast_mut(),
+                self.levels.len(),
+                ptr::from_ref(&self.special.primary).cast_mut(),
+                ptr::from_ref(&self.special.fallback).cast_mut(),
+            ),
             remaining: self.len,
             _marker: PhantomData,
         }
@@ -1355,24 +1433,8 @@ where
                 ptr::addr_of_mut!((*map_ptr).special.fallback),
             )
         };
-        let mut cursor = ScanCursor::empty();
-        let mut phase = IterPhase::Levels;
-        if levels_len > 0 {
-            // SAFETY: levels_len > 0.
-            cursor.set_region(unsafe { &*levels_ptr });
-        } else {
-            phase = IterPhase::Primary;
-            // SAFETY: `primary` from `map_ptr`.
-            cursor.set_region(unsafe { &*primary });
-        }
         FunnelIterMut {
-            levels: levels_ptr,
-            levels_len,
-            level_idx: 0,
-            primary,
-            fallback,
-            cursor,
-            phase,
+            regions: FunnelRegions::new(levels_ptr, levels_len, primary, fallback),
             remaining,
             _marker: PhantomData,
             _alloc: PhantomData,
@@ -1487,23 +1549,9 @@ where
                 ptr::addr_of_mut!((*map_ptr).special.fallback),
             )
         };
-        let mut cursor = ScanCursor::empty();
-        let mut phase = IterPhase::Levels;
-        if levels_len > 0 {
-            cursor.set_region(unsafe { &*levels_ptr });
-        } else {
-            phase = IterPhase::Primary;
-            cursor.set_region(unsafe { &*primary });
-        }
         Drain {
-            levels: levels_ptr,
-            levels_len,
-            level_idx: 0,
-            primary,
-            fallback,
-            cursor,
+            regions: FunnelRegions::new(levels_ptr, levels_len, primary, fallback),
             map_ptr,
-            phase,
             _marker: PhantomData,
         }
     }
@@ -1525,24 +1573,10 @@ where
                 ptr::addr_of_mut!((*map_ptr).special.fallback),
             )
         };
-        let mut cursor = ScanCursor::empty();
-        let mut phase = IterPhase::Levels;
-        if levels_len > 0 {
-            cursor.set_region(unsafe { &*levels_ptr });
-        } else {
-            phase = IterPhase::Primary;
-            cursor.set_region(unsafe { &*primary });
-        }
         ExtractIf {
-            levels: levels_ptr,
-            levels_len,
-            level_idx: 0,
-            primary,
-            fallback,
-            cursor,
+            regions: FunnelRegions::new(levels_ptr, levels_len, primary, fallback),
             map_ptr,
             pred: f,
-            phase,
             _marker: PhantomData,
         }
     }
@@ -1972,8 +2006,13 @@ where
                 slot_idx,
             } => {
                 let level = &mut self.levels[level_idx];
+                let was_tombstone =
+                    level.tombstones != 0 && level.control_at(slot_idx) == CTRL_TOMBSTONE;
                 level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
                 level.len += 1;
+                if was_tombstone {
+                    level.tombstones -= 1;
+                }
                 if level_idx > self.max_populated_level {
                     self.max_populated_level = level_idx;
                 }
@@ -1982,7 +2021,8 @@ where
                 let primary = &mut self.special.primary;
                 // Reusing a tombstone slot must decrement the counter;
                 // otherwise resize triggers on stale-since-resize counts.
-                let was_tombstone = primary.control_at(slot_idx) == CTRL_TOMBSTONE;
+                let was_tombstone =
+                    primary.tombstones != 0 && primary.control_at(slot_idx) == CTRL_TOMBSTONE;
                 primary.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
                 primary.len += 1;
                 if was_tombstone {
@@ -1992,8 +2032,13 @@ where
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let fallback = &mut self.special.fallback;
+                let was_tombstone =
+                    fallback.tombstones != 0 && fallback.control_at(slot_idx) == CTRL_TOMBSTONE;
                 fallback.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
                 fallback.len += 1;
+                if was_tombstone {
+                    fallback.tombstones -= 1;
+                }
                 self.special.total_len += 1;
             }
         }
@@ -2534,16 +2579,236 @@ enum IterPhase {
     Done,
 }
 
-/// Borrowing iterator over occupied entries. Single [`ScanCursor`] +
-/// phase machine across bucket levels → primary → fallback.
-pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
-    levels: *const BucketLevel<SlotEntry<K, V>>,
+#[derive(Clone, Copy)]
+struct FunnelSlot {
+    phase: IterPhase,
+    level_idx: usize,
+    slot_idx: usize,
+}
+
+impl FunnelSlot {
+    #[inline]
+    fn is_special(self) -> bool {
+        !matches!(self.phase, IterPhase::Levels)
+    }
+}
+
+/// Shared phase machine for Funnel's heterogeneous storage regions.
+struct FunnelRegions<T> {
+    levels: *mut BucketLevel<T>,
     levels_len: usize,
     level_idx: usize,
-    primary: *const SpecialPrimary<SlotEntry<K, V>>,
-    fallback: *const SpecialFallback<SlotEntry<K, V>>,
-    cursor: ScanCursor,
+    primary: *mut SpecialPrimary<T>,
+    fallback: *mut SpecialFallback<T>,
+    slots: OccupiedSlots,
     phase: IterPhase,
+}
+
+impl<T> Clone for FunnelRegions<T> {
+    fn clone(&self) -> Self {
+        Self {
+            levels: self.levels,
+            levels_len: self.levels_len,
+            level_idx: self.level_idx,
+            primary: self.primary,
+            fallback: self.fallback,
+            slots: self.slots.clone(),
+            phase: self.phase,
+        }
+    }
+}
+
+impl<T> FunnelRegions<T> {
+    #[inline]
+    fn empty() -> Self {
+        Self {
+            levels: ptr::null_mut(),
+            levels_len: 0,
+            level_idx: 0,
+            primary: ptr::null_mut(),
+            fallback: ptr::null_mut(),
+            slots: OccupiedSlots::empty(),
+            phase: IterPhase::Done,
+        }
+    }
+
+    #[inline]
+    fn new(
+        levels: *mut BucketLevel<T>,
+        levels_len: usize,
+        primary: *mut SpecialPrimary<T>,
+        fallback: *mut SpecialFallback<T>,
+    ) -> Self {
+        let mut me = Self {
+            levels,
+            levels_len,
+            level_idx: 0,
+            primary,
+            fallback,
+            slots: OccupiedSlots::empty(),
+            phase: IterPhase::Levels,
+        };
+        if levels_len > 0 {
+            me.slots.set_region(unsafe { &*levels });
+        } else {
+            me.phase = IterPhase::Primary;
+            me.slots.set_region(unsafe { &*primary });
+        }
+        me
+    }
+
+    #[inline]
+    fn phase(&self) -> IterPhase {
+        self.phase
+    }
+
+    #[inline]
+    fn next_slot(&mut self) -> Option<FunnelSlot> {
+        loop {
+            if let Some(slot_idx) = self.slots.next() {
+                return Some(FunnelSlot {
+                    phase: self.phase,
+                    level_idx: self.level_idx,
+                    slot_idx,
+                });
+            }
+            self.advance_region();
+            if matches!(self.phase, IterPhase::Done) {
+                return None;
+            }
+        }
+    }
+
+    #[inline]
+    fn next_entry_ptr(&mut self) -> Option<*mut T> {
+        loop {
+            if let Some(slot_idx) = self.slots.next() {
+                let entry_ptr = unsafe {
+                    match self.phase {
+                        IterPhase::Levels => {
+                            (*self.levels.add(self.level_idx)).data_ptr().add(slot_idx)
+                        }
+                        IterPhase::Primary => (*self.primary).data_ptr().add(slot_idx),
+                        IterPhase::Fallback => (*self.fallback).data_ptr().add(slot_idx),
+                        IterPhase::Done => std::hint::unreachable_unchecked(),
+                    }
+                };
+                return Some(entry_ptr);
+            }
+            self.advance_region();
+            if matches!(self.phase, IterPhase::Done) {
+                return None;
+            }
+        }
+    }
+
+    #[inline]
+    fn advance_region(&mut self) {
+        match self.phase {
+            IterPhase::Levels => {
+                self.level_idx += 1;
+                if self.level_idx < self.levels_len {
+                    self.slots
+                        .set_region(unsafe { &*self.levels.add(self.level_idx) });
+                } else {
+                    self.phase = IterPhase::Primary;
+                    self.slots.set_region(unsafe { &*self.primary });
+                }
+            }
+            IterPhase::Primary => {
+                self.phase = IterPhase::Fallback;
+                self.slots.set_region(unsafe { &*self.fallback });
+            }
+            IterPhase::Fallback => self.phase = IterPhase::Done,
+            IterPhase::Done => {}
+        }
+    }
+
+    /// SAFETY: `slot` must have been yielded by this cursor and still point to
+    /// an initialized entry.
+    #[inline]
+    unsafe fn entry_ptr(&self, slot: FunnelSlot) -> *mut T {
+        unsafe {
+            match slot.phase {
+                IterPhase::Levels => (*self.levels.add(slot.level_idx))
+                    .data_ptr()
+                    .add(slot.slot_idx),
+                IterPhase::Primary => (*self.primary).data_ptr().add(slot.slot_idx),
+                IterPhase::Fallback => (*self.fallback).data_ptr().add(slot.slot_idx),
+                IterPhase::Done => std::hint::unreachable_unchecked(),
+            }
+        }
+    }
+
+    /// SAFETY: same as [`Self::entry_ptr`]. The slot must not be read again
+    /// before being re-written.
+    #[inline]
+    unsafe fn take(&self, slot: FunnelSlot) -> T {
+        unsafe {
+            match slot.phase {
+                IterPhase::Levels => (*self.levels.add(slot.level_idx)).take(slot.slot_idx),
+                IterPhase::Primary => (*self.primary).take(slot.slot_idx),
+                IterPhase::Fallback => (*self.fallback).take(slot.slot_idx),
+                IterPhase::Done => std::hint::unreachable_unchecked(),
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn mark_tombstone(&self, slot: FunnelSlot) {
+        unsafe {
+            match slot.phase {
+                IterPhase::Levels => {
+                    (*self.levels.add(slot.level_idx)).mark_tombstone(slot.slot_idx);
+                }
+                IterPhase::Primary => (*self.primary).mark_tombstone(slot.slot_idx),
+                IterPhase::Fallback => (*self.fallback).mark_tombstone(slot.slot_idx),
+                IterPhase::Done => std::hint::unreachable_unchecked(),
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn erase(&self, slot: FunnelSlot) -> bool {
+        unsafe {
+            match slot.phase {
+                IterPhase::Levels => (*self.levels.add(slot.level_idx)).erase(slot.slot_idx),
+                IterPhase::Primary => (*self.primary).erase(slot.slot_idx),
+                IterPhase::Fallback => (*self.fallback).erase(slot.slot_idx),
+                IterPhase::Done => std::hint::unreachable_unchecked(),
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn increment_tombstones(&self, slot: FunnelSlot) {
+        unsafe {
+            match slot.phase {
+                IterPhase::Levels => (*self.levels.add(slot.level_idx)).tombstones += 1,
+                IterPhase::Primary => (*self.primary).tombstones += 1,
+                IterPhase::Fallback => (*self.fallback).tombstones += 1,
+                IterPhase::Done => std::hint::unreachable_unchecked(),
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn decrement_len(&self, slot: FunnelSlot) {
+        unsafe {
+            match slot.phase {
+                IterPhase::Levels => (*self.levels.add(slot.level_idx)).len -= 1,
+                IterPhase::Primary => (*self.primary).len -= 1,
+                IterPhase::Fallback => (*self.fallback).len -= 1,
+                IterPhase::Done => std::hint::unreachable_unchecked(),
+            }
+        }
+    }
+}
+
+/// Borrowing iterator over occupied entries. Uses [`FunnelRegions`] to walk
+/// bucket levels → primary → fallback.
+pub struct FunnelIter<'a, K, V, A: Allocator + Clone = Global> {
+    regions: FunnelRegions<SlotEntry<K, V>>,
     remaining: usize,
     _marker: PhantomData<&'a A>,
 }
@@ -2555,13 +2820,7 @@ unsafe impl<K: Sync, V: Sync, A: Allocator + Clone + Sync> Sync for FunnelIter<'
 impl<K, V, A: Allocator + Clone> Clone for FunnelIter<'_, K, V, A> {
     fn clone(&self) -> Self {
         Self {
-            levels: self.levels,
-            levels_len: self.levels_len,
-            level_idx: self.level_idx,
-            primary: self.primary,
-            fallback: self.fallback,
-            cursor: self.cursor.clone(),
-            phase: self.phase,
+            regions: self.regions.clone(),
             remaining: self.remaining,
             _marker: PhantomData,
         }
@@ -2574,58 +2833,13 @@ impl<K: fmt::Debug, V: fmt::Debug, A: Allocator + Clone> fmt::Debug for FunnelIt
     }
 }
 
-impl<K, V, A: Allocator + Clone> FunnelIter<'_, K, V, A> {
-    /// Advance past the just-exhausted region: next level, or transition
-    /// to primary → fallback → done.
-    #[inline]
-    fn advance_region(&mut self) {
-        match self.phase {
-            IterPhase::Levels => {
-                self.level_idx += 1;
-                if self.level_idx < self.levels_len {
-                    // SAFETY: bounded above.
-                    self.cursor
-                        .set_region(unsafe { &*self.levels.add(self.level_idx) });
-                } else {
-                    self.phase = IterPhase::Primary;
-                    self.cursor.set_region(unsafe { &*self.primary });
-                }
-            }
-            IterPhase::Primary => {
-                self.phase = IterPhase::Fallback;
-                self.cursor.set_region(unsafe { &*self.fallback });
-            }
-            IterPhase::Fallback => self.phase = IterPhase::Done,
-            IterPhase::Done => {}
-        }
-    }
-}
-
 impl<'a, K: 'a, V: 'a, A: Allocator + Clone> Iterator for FunnelIter<'a, K, V, A> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(idx) = self.cursor.step() {
-                // SAFETY: cursor over current phase's region; only as-ref reads.
-                let entry: &'a SlotEntry<K, V> = unsafe {
-                    match self.phase {
-                        IterPhase::Levels => {
-                            &*(*self.levels.add(self.level_idx)).data_ptr().add(idx)
-                        }
-                        IterPhase::Primary => &*(*self.primary).data_ptr().add(idx),
-                        IterPhase::Fallback => &*(*self.fallback).data_ptr().add(idx),
-                        IterPhase::Done => std::hint::unreachable_unchecked(),
-                    }
-                };
-                self.remaining -= 1;
-                return Some((&entry.key, &entry.value));
-            }
-            self.advance_region();
-            if matches!(self.phase, IterPhase::Done) {
-                return None;
-            }
-        }
+        let entry: &'a SlotEntry<K, V> = unsafe { &*self.regions.next_entry_ptr()? };
+        self.remaining -= 1;
+        Some((&entry.key, &entry.value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -2653,45 +2867,15 @@ where
 /// Draining iterator. Yields and removes every `(K, V)`; the map is empty
 /// once consumed or dropped.
 pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    levels: *mut BucketLevel<SlotEntry<K, V>>,
-    levels_len: usize,
-    level_idx: usize,
-    primary: *mut SpecialPrimary<SlotEntry<K, V>>,
-    fallback: *mut SpecialFallback<SlotEntry<K, V>>,
-    cursor: ScanCursor,
+    regions: FunnelRegions<SlotEntry<K, V>>,
     map_ptr: *mut FunnelHashMap<K, V, S, A>,
-    phase: IterPhase,
     _marker: PhantomData<&'a mut FunnelHashMap<K, V, S, A>>,
-}
-
-impl<K, V, S, A: Allocator + Clone> Drain<'_, K, V, S, A> {
-    #[inline]
-    fn advance_region(&mut self) {
-        match self.phase {
-            IterPhase::Levels => {
-                self.level_idx += 1;
-                if self.level_idx < self.levels_len {
-                    self.cursor
-                        .set_region(unsafe { &*self.levels.add(self.level_idx) });
-                } else {
-                    self.phase = IterPhase::Primary;
-                    self.cursor.set_region(unsafe { &*self.primary });
-                }
-            }
-            IterPhase::Primary => {
-                self.phase = IterPhase::Fallback;
-                self.cursor.set_region(unsafe { &*self.fallback });
-            }
-            IterPhase::Fallback => self.phase = IterPhase::Done,
-            IterPhase::Done => {}
-        }
-    }
 }
 
 impl<K, V, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Drain")
-            .field("phase", &self.phase)
+            .field("phase", &self.regions.phase())
             .field("remaining", &unsafe { (*self.map_ptr).len })
             .finish_non_exhaustive()
     }
@@ -2702,24 +2886,10 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Per-yield ctrl byte update is skipped: Drain::drop wipes all ctrls.
-        loop {
-            if let Some(idx) = self.cursor.step() {
-                let entry = unsafe {
-                    match self.phase {
-                        IterPhase::Levels => (*self.levels.add(self.level_idx)).take(idx),
-                        IterPhase::Primary => (*self.primary).take(idx),
-                        IterPhase::Fallback => (*self.fallback).take(idx),
-                        IterPhase::Done => std::hint::unreachable_unchecked(),
-                    }
-                };
-                unsafe { (*self.map_ptr).len -= 1 };
-                return Some((entry.key, entry.value));
-            }
-            self.advance_region();
-            if matches!(self.phase, IterPhase::Done) {
-                return None;
-            }
-        }
+        let slot = self.regions.next_slot()?;
+        let entry = unsafe { self.regions.take(slot) };
+        unsafe { (*self.map_ptr).len -= 1 };
+        Some((entry.key, entry.value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -2760,45 +2930,10 @@ where
     S: BuildHasher,
     F: FnMut(&K, &mut V) -> bool,
 {
-    levels: *mut BucketLevel<SlotEntry<K, V>>,
-    levels_len: usize,
-    level_idx: usize,
-    primary: *mut SpecialPrimary<SlotEntry<K, V>>,
-    fallback: *mut SpecialFallback<SlotEntry<K, V>>,
-    cursor: ScanCursor,
+    regions: FunnelRegions<SlotEntry<K, V>>,
     map_ptr: *mut FunnelHashMap<K, V, S, A>,
     pred: F,
-    phase: IterPhase,
     _marker: PhantomData<&'a mut FunnelHashMap<K, V, S, A>>,
-}
-
-impl<K, V, F, S, A: Allocator + Clone> ExtractIf<'_, K, V, F, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    F: FnMut(&K, &mut V) -> bool,
-{
-    #[inline]
-    fn advance_region(&mut self) {
-        match self.phase {
-            IterPhase::Levels => {
-                self.level_idx += 1;
-                if self.level_idx < self.levels_len {
-                    self.cursor
-                        .set_region(unsafe { &*self.levels.add(self.level_idx) });
-                } else {
-                    self.phase = IterPhase::Primary;
-                    self.cursor.set_region(unsafe { &*self.primary });
-                }
-            }
-            IterPhase::Primary => {
-                self.phase = IterPhase::Fallback;
-                self.cursor.set_region(unsafe { &*self.fallback });
-            }
-            IterPhase::Fallback => self.phase = IterPhase::Done,
-            IterPhase::Done => {}
-        }
-    }
 }
 
 impl<K, V, F, S, A: Allocator + Clone> fmt::Debug for ExtractIf<'_, K, V, F, S, A>
@@ -2809,7 +2944,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ExtractIf")
-            .field("phase", &self.phase)
+            .field("phase", &self.regions.phase())
             .field("remaining", &unsafe { (*self.map_ptr).len })
             .finish_non_exhaustive()
     }
@@ -2824,66 +2959,27 @@ where
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            while let Some(idx) = self.cursor.step() {
-                // SAFETY: cursor is over current phase's region; we mutate
-                // only that region + map.len via fresh temp `&mut`s.
-                match self.phase {
-                    IterPhase::Levels => {
-                        let level_ptr = unsafe { self.levels.add(self.level_idx) };
-                        let entry = unsafe { (*level_ptr).get_mut(idx) };
-                        if (self.pred)(&entry.key, &mut entry.value) {
-                            unsafe {
-                                if (*level_ptr).erase(idx) {
-                                    (*level_ptr).tombstones += 1;
-                                }
-                                (*level_ptr).len -= 1;
-                                (*self.map_ptr).len -= 1;
-                                let removed = (*level_ptr).take(idx);
-                                return Some((removed.key, removed.value));
-                            }
-                        }
+        while let Some(slot) = self.regions.next_slot() {
+            let remove = {
+                let entry = unsafe { &mut *self.regions.entry_ptr(slot) };
+                (self.pred)(&entry.key, &mut entry.value)
+            };
+            if remove {
+                unsafe {
+                    if self.regions.erase(slot) {
+                        self.regions.increment_tombstones(slot);
                     }
-                    IterPhase::Primary => {
-                        let primary = self.primary;
-                        let entry = unsafe { (*primary).get_mut(idx) };
-                        if (self.pred)(&entry.key, &mut entry.value) {
-                            unsafe {
-                                if (*primary).erase(idx) {
-                                    (*primary).tombstones += 1;
-                                }
-                                (*primary).len -= 1;
-                                (*self.map_ptr).special.total_len -= 1;
-                                (*self.map_ptr).len -= 1;
-                                let removed = (*primary).take(idx);
-                                return Some((removed.key, removed.value));
-                            }
-                        }
+                    self.regions.decrement_len(slot);
+                    if slot.is_special() {
+                        (*self.map_ptr).special.total_len -= 1;
                     }
-                    IterPhase::Fallback => {
-                        let fallback = self.fallback;
-                        let entry = unsafe { (*fallback).get_mut(idx) };
-                        if (self.pred)(&entry.key, &mut entry.value) {
-                            unsafe {
-                                if (*fallback).erase(idx) {
-                                    (*fallback).tombstones += 1;
-                                }
-                                (*fallback).len -= 1;
-                                (*self.map_ptr).special.total_len -= 1;
-                                (*self.map_ptr).len -= 1;
-                                let removed = (*fallback).take(idx);
-                                return Some((removed.key, removed.value));
-                            }
-                        }
-                    }
-                    IterPhase::Done => unsafe { std::hint::unreachable_unchecked() },
+                    (*self.map_ptr).len -= 1;
+                    let removed = self.regions.take(slot);
+                    return Some((removed.key, removed.value));
                 }
             }
-            self.advance_region();
-            if matches!(self.phase, IterPhase::Done) {
-                return None;
-            }
         }
+        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -2911,13 +3007,7 @@ pub type Values<'a, K, V, A = Global> = CommonValues<FunnelIter<'a, K, V, A>>;
 /// `(&K, &mut V)` iterator over levels → primary → fallback. Each
 /// `next()` yields a strictly newer slot ⇒ refs are disjoint.
 pub struct FunnelIterMut<'a, K, V, A: Allocator + Clone = Global> {
-    levels: *mut BucketLevel<SlotEntry<K, V>>,
-    levels_len: usize,
-    level_idx: usize,
-    primary: *mut SpecialPrimary<SlotEntry<K, V>>,
-    fallback: *mut SpecialFallback<SlotEntry<K, V>>,
-    cursor: ScanCursor,
-    phase: IterPhase,
+    regions: FunnelRegions<SlotEntry<K, V>>,
     remaining: usize,
     _marker: PhantomData<&'a mut SpecialArray<SlotEntry<K, V>>>,
     _alloc: PhantomData<A>,
@@ -2927,55 +3017,15 @@ pub struct FunnelIterMut<'a, K, V, A: Allocator + Clone = Global> {
 unsafe impl<K: Send, V: Send, A: Allocator + Clone + Send> Send for FunnelIterMut<'_, K, V, A> {}
 unsafe impl<K: Sync, V: Sync, A: Allocator + Clone + Sync> Sync for FunnelIterMut<'_, K, V, A> {}
 
-impl<K, V, A: Allocator + Clone> FunnelIterMut<'_, K, V, A> {
-    #[inline]
-    fn advance_region(&mut self) {
-        match self.phase {
-            IterPhase::Levels => {
-                self.level_idx += 1;
-                if self.level_idx < self.levels_len {
-                    self.cursor
-                        .set_region(unsafe { &*self.levels.add(self.level_idx) });
-                } else {
-                    self.phase = IterPhase::Primary;
-                    self.cursor.set_region(unsafe { &*self.primary });
-                }
-            }
-            IterPhase::Primary => {
-                self.phase = IterPhase::Fallback;
-                self.cursor.set_region(unsafe { &*self.fallback });
-            }
-            IterPhase::Fallback => self.phase = IterPhase::Done,
-            IterPhase::Done => {}
-        }
-    }
-}
-
 impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelIterMut<'a, K, V, A> {
     type Item = (&'a K, &'a mut V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(idx) = self.cursor.step() {
-                // SAFETY: scanner yields a strictly newer slot each call ⇒
-                // forged `&'a mut` refs don't alias across iterations.
-                let entry_ptr: *mut SlotEntry<K, V> = unsafe {
-                    match self.phase {
-                        IterPhase::Levels => (*self.levels.add(self.level_idx)).data_ptr().add(idx),
-                        IterPhase::Primary => (*self.primary).data_ptr().add(idx),
-                        IterPhase::Fallback => (*self.fallback).data_ptr().add(idx),
-                        IterPhase::Done => std::hint::unreachable_unchecked(),
-                    }
-                };
-                let entry: &'a mut SlotEntry<K, V> = unsafe { &mut *entry_ptr };
-                self.remaining -= 1;
-                return Some((&entry.key, &mut entry.value));
-            }
-            self.advance_region();
-            if matches!(self.phase, IterPhase::Done) {
-                return None;
-            }
-        }
+        // SAFETY: scanner yields a strictly newer slot each call, so forged
+        // `&'a mut` refs don't alias across iterations.
+        let entry: &'a mut SlotEntry<K, V> = unsafe { &mut *self.regions.next_entry_ptr()? };
+        self.remaining -= 1;
+        Some((&entry.key, &mut entry.value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -2989,7 +3039,7 @@ impl<K, V, A: Allocator + Clone> FusedIterator for FunnelIterMut<'_, K, V, A> {}
 impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelIterMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelIterMut")
-            .field("phase", &self.phase)
+            .field("phase", &self.regions.phase())
             .field("remaining", &self.remaining)
             .finish_non_exhaustive()
     }
@@ -3033,7 +3083,7 @@ impl<K, V, A: Allocator + Clone> FusedIterator for FunnelValuesMut<'_, K, V, A> 
 impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelValuesMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelValuesMut")
-            .field("phase", &self.inner.phase)
+            .field("phase", &self.inner.regions.phase())
             .field("remaining", &self.inner.remaining)
             .finish_non_exhaustive()
     }
@@ -3041,15 +3091,11 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelValuesMut<'_, K, V, A> {
 
 /// Owned `(K, V)` iterator returned by `FunnelHashMap::into_iter`.
 pub struct FunnelIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    cursor: ScanCursor,
-    levels_ptr: *mut BucketLevel<SlotEntry<K, V>>,
-    levels_len: usize,
-    level_idx: usize,
+    regions: FunnelRegions<SlotEntry<K, V>>,
     levels: ManuallyDrop<BucketLevelSlice<K, V>>,
     special: ManuallyDrop<SpecialArray<SlotEntry<K, V>>>,
     arena: ManuallyDrop<Arena>,
     alloc: A,
-    phase: IterPhase,
     remaining: usize,
     _marker: PhantomData<S>,
 }
@@ -3066,25 +3112,10 @@ unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
 
 impl<K, V, S, A: Allocator + Clone> FunnelIntoIter<K, V, S, A> {
     #[inline]
-    fn advance_region(&mut self) {
-        match self.phase {
-            IterPhase::Levels => {
-                self.level_idx += 1;
-                if self.level_idx < self.levels_len {
-                    self.cursor
-                        .set_region(unsafe { &*self.levels_ptr.add(self.level_idx) });
-                } else {
-                    self.phase = IterPhase::Primary;
-                    self.cursor.set_region(&self.special.primary);
-                }
-            }
-            IterPhase::Primary => {
-                self.phase = IterPhase::Fallback;
-                self.cursor.set_region(&self.special.fallback);
-            }
-            IterPhase::Fallback => self.phase = IterPhase::Done,
-            IterPhase::Done => {}
-        }
+    fn refresh_region_ptrs(&mut self) {
+        self.regions.levels = self.levels.as_mut_ptr();
+        self.regions.primary = ptr::addr_of_mut!(self.special.primary);
+        self.regions.fallback = ptr::addr_of_mut!(self.special.fallback);
     }
 }
 
@@ -3092,39 +3123,15 @@ impl<K, V, S, A: Allocator + Clone> Iterator for FunnelIntoIter<K, V, S, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(idx) = self.cursor.step() {
-                let entry = unsafe {
-                    match self.phase {
-                        IterPhase::Levels => {
-                            let level = &mut *self.levels_ptr.add(self.level_idx);
-                            let e = level.take(idx);
-                            level.mark_tombstone(idx);
-                            e
-                        }
-                        IterPhase::Primary => {
-                            let p = &mut self.special.primary;
-                            let e = p.take(idx);
-                            p.mark_tombstone(idx);
-                            e
-                        }
-                        IterPhase::Fallback => {
-                            let f = &mut self.special.fallback;
-                            let e = f.take(idx);
-                            f.mark_tombstone(idx);
-                            e
-                        }
-                        IterPhase::Done => std::hint::unreachable_unchecked(),
-                    }
-                };
-                self.remaining -= 1;
-                return Some((entry.key, entry.value));
-            }
-            self.advance_region();
-            if matches!(self.phase, IterPhase::Done) {
-                return None;
-            }
-        }
+        self.refresh_region_ptrs();
+        let slot = self.regions.next_slot()?;
+        let entry = unsafe {
+            let entry = self.regions.take(slot);
+            self.regions.mark_tombstone(slot);
+            entry
+        };
+        self.remaining -= 1;
+        Some((entry.key, entry.value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -3161,7 +3168,7 @@ impl<K, V, S, A: Allocator + Clone> Drop for FunnelIntoIter<K, V, S, A> {
 impl<K, V, S, A: Allocator + Clone> fmt::Debug for FunnelIntoIter<K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FunnelIntoIter")
-            .field("phase", &self.phase)
+            .field("phase", &self.regions.phase())
             .field("remaining", &self.remaining)
             .finish_non_exhaustive()
     }
@@ -3191,27 +3198,22 @@ where
         let remaining = self.len;
         let levels_len = levels.len();
         let mut iter = FunnelIntoIter {
-            cursor: ScanCursor::empty(),
-            levels_ptr: ptr::null_mut(),
-            levels_len,
-            level_idx: 0,
+            regions: FunnelRegions::empty(),
             levels: ManuallyDrop::new(levels),
             special: ManuallyDrop::new(special),
             arena: ManuallyDrop::new(arena),
             alloc,
-            phase: IterPhase::Levels,
             remaining,
             _marker: PhantomData,
         };
-        // Derive raw ptrs / cursor post-move so the Vec/SpecialArray moves
-        // into `ManuallyDrop` don't invalidate the borrow tags.
-        iter.levels_ptr = iter.levels.as_mut_ptr();
-        if levels_len > 0 {
-            iter.cursor.set_region(&iter.levels[0]);
-        } else {
-            iter.phase = IterPhase::Primary;
-            iter.cursor.set_region(&iter.special.primary);
-        }
+        // Derive raw ptrs post-move so moving the Vec/SpecialArray into
+        // `ManuallyDrop` does not invalidate the borrow tags.
+        iter.regions = FunnelRegions::new(
+            iter.levels.as_mut_ptr(),
+            levels_len,
+            ptr::addr_of_mut!(iter.special.primary),
+            ptr::addr_of_mut!(iter.special.fallback),
+        );
         iter
     }
 }
@@ -3771,7 +3773,29 @@ where
 mod tests {
     use super::*;
 
+    use crate::common::config::MIN_RESERVE_FRACTION;
+
     use std::hash::{BuildHasher, Hasher};
+
+    struct ConstHasher;
+
+    impl Hasher for ConstHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, _: &[u8]) {}
+    }
+
+    struct ConstHashBuilder;
+
+    impl BuildHasher for ConstHashBuilder {
+        type Hasher = ConstHasher;
+
+        fn build_hasher(&self) -> Self::Hasher {
+            ConstHasher
+        }
+    }
 
     #[test]
     fn funnel_layout_covers_capacity() {
@@ -3909,21 +3933,6 @@ mod tests {
     fn bucket_overflow_promotes_max_populated_level() {
         // Paper §5: A_{i,j} overflow must spill into A_{i+1}, not skip to the
         // special array. Constant hasher pins every key to the same L0 bucket.
-        struct ConstHasher;
-        impl Hasher for ConstHasher {
-            fn finish(&self) -> u64 {
-                0
-            }
-            fn write(&mut self, _: &[u8]) {}
-        }
-        struct ConstHashBuilder;
-        impl BuildHasher for ConstHashBuilder {
-            type Hasher = ConstHasher;
-            fn build_hasher(&self) -> Self::Hasher {
-                ConstHasher
-            }
-        }
-
         let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
             FunnelHashMap::with_capacity_and_hasher(2048, ConstHashBuilder);
         assert!(map.levels.len() > 1, "test requires multi-level layout");
@@ -3939,6 +3948,50 @@ mod tests {
         for i in 0..=l0_bucket_size {
             assert_eq!(map.get(&i), Some(&i));
         }
+    }
+
+    #[test]
+    fn wide_level_bucket_scans_past_first_group() {
+        let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
+            FunnelHashMap::with_capacity_and_reserve_fraction_and_hasher(
+                512,
+                MIN_RESERVE_FRACTION,
+                ConstHashBuilder,
+            );
+        let l0_bucket_size = 1usize << map.levels[0].bucket_size_log2;
+        assert!(
+            l0_bucket_size > GROUP_SIZE,
+            "test requires a multi-group bucket, got {l0_bucket_size}"
+        );
+
+        let inserted = GROUP_SIZE + 4;
+        for i in 0..inserted {
+            let key = i32::try_from(i).unwrap();
+            map.insert(key, key * 7);
+        }
+        for i in 0..inserted {
+            let key = i32::try_from(i).unwrap();
+            assert_eq!(map.get(&key), Some(&(key * 7)), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn reusing_level_tombstone_decrements_counter() {
+        let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
+            FunnelHashMap::with_capacity_and_hasher(2048, ConstHashBuilder);
+        let l0_bucket_size = 1usize << map.levels[0].bucket_size_log2;
+        for i in 0..l0_bucket_size {
+            let key = i32::try_from(i).unwrap();
+            map.insert(key, key);
+        }
+
+        assert_eq!(map.levels[0].tombstones, 0);
+        assert_eq!(map.remove(&0), Some(0));
+        assert_eq!(map.levels[0].tombstones, 1);
+
+        map.insert(10_000, 10_000);
+        assert_eq!(map.levels[0].tombstones, 0);
+        assert_eq!(map.get(&10_000), Some(&10_000));
     }
 
     #[test]

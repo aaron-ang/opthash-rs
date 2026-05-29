@@ -9,7 +9,8 @@ mod python;
 
 pub use equivalent::Equivalent;
 
-pub use common::{DefaultHashBuilder, TryReserveError};
+pub use common::DefaultHashBuilder;
+pub use common::error::TryReserveError;
 pub use elastic::{
     Drain as ElasticDrain, ElasticHashMap, ElasticIntoIter, ElasticIntoKeys, ElasticIntoValues,
     ElasticIter, ElasticIterMut, ElasticValuesMut, Entry as ElasticEntry,
