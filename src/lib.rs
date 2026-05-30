@@ -17,25 +17,18 @@ pub use common::error::TryReserveError;
 pub use elastic::{
     Drain as ElasticDrain, ElasticDifference, ElasticHashMap, ElasticHashSet, ElasticIntersection,
     ElasticIntoIter, ElasticIntoKeys, ElasticIntoValues, ElasticIter, ElasticIterMut,
-    ElasticSetDrain, ElasticSetExtractIf, ElasticSetIntoIter, ElasticSetIter,
-    ElasticSymmetricDifference, ElasticUnion, ElasticValuesMut, ExtractIf as ElasticExtractIf,
-    Keys as ElasticKeys, OccupiedError as ElasticOccupiedError, Values as ElasticValues,
+    ElasticSetDrain, ElasticSetEntry, ElasticSetExtractIf, ElasticSetIntoIter, ElasticSetIter,
+    ElasticSetOccupiedEntry, ElasticSetVacantEntry, ElasticSymmetricDifference, ElasticUnion,
+    ElasticValuesMut, Entry as ElasticEntry, ExtractIf as ElasticExtractIf, Keys as ElasticKeys,
+    OccupiedEntry as ElasticOccupiedEntry, OccupiedError as ElasticOccupiedError,
+    VacantEntry as ElasticVacantEntry, Values as ElasticValues,
 };
 pub use funnel::{
-    Drain as FunnelDrain, ExtractIf as FunnelExtractIf, FunnelDifference, FunnelHashMap,
-    FunnelHashSet, FunnelIntersection, FunnelIntoIter, FunnelIntoKeys, FunnelIntoValues,
-    FunnelIter, FunnelIterMut, FunnelSetDrain, FunnelSetExtractIf, FunnelSetIntoIter,
-    FunnelSetIter, FunnelSymmetricDifference, FunnelUnion, FunnelValuesMut, Keys as FunnelKeys,
-    OccupiedError as FunnelOccupiedError, Values as FunnelValues,
-};
-
-pub use map::{
-    Entry as ElasticEntry, Entry as FunnelEntry, OccupiedEntry as ElasticOccupiedEntry,
-    OccupiedEntry as FunnelOccupiedEntry, VacantEntry as ElasticVacantEntry,
-    VacantEntry as FunnelVacantEntry,
-};
-pub use set::{
-    Entry as ElasticSetEntry, Entry as FunnelSetEntry, OccupiedEntry as ElasticSetOccupiedEntry,
-    OccupiedEntry as FunnelSetOccupiedEntry, VacantEntry as ElasticSetVacantEntry,
-    VacantEntry as FunnelSetVacantEntry,
+    Drain as FunnelDrain, Entry as FunnelEntry, ExtractIf as FunnelExtractIf, FunnelDifference,
+    FunnelHashMap, FunnelHashSet, FunnelIntersection, FunnelIntoIter, FunnelIntoKeys,
+    FunnelIntoValues, FunnelIter, FunnelIterMut, FunnelSetDrain, FunnelSetEntry,
+    FunnelSetExtractIf, FunnelSetIntoIter, FunnelSetIter, FunnelSetOccupiedEntry,
+    FunnelSetVacantEntry, FunnelSymmetricDifference, FunnelUnion, FunnelValuesMut,
+    Keys as FunnelKeys, OccupiedEntry as FunnelOccupiedEntry, OccupiedError as FunnelOccupiedError,
+    VacantEntry as FunnelVacantEntry, Values as FunnelValues,
 };

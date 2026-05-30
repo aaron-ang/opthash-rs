@@ -17,7 +17,7 @@ macro_rules! parity_suite {
             )]
 
             use core::cell::RefCell;
-            use opthash::$Entry::{Occupied, Vacant};
+            use opthash::$Entry as Entry;
             use opthash::{DefaultHashBuilder, $TestMap as HashMap};
 
             thread_local! {
@@ -234,8 +234,8 @@ macro_rules! parity_suite {
             fn test_empty_entry() {
                 let mut m: HashMap<i32, bool> = HashMap::new();
                 match m.entry(0) {
-                    Occupied(_) => panic!(),
-                    Vacant(_) => {}
+                    Entry::Occupied(_) => panic!(),
+                    Entry::Vacant(_) => {}
                 }
                 assert!(*m.entry(0).or_insert(true));
                 assert_eq!(m.len(), 1);
@@ -545,8 +545,8 @@ macro_rules! parity_suite {
 
                 // Existing key (insert)
                 match map.entry(1) {
-                    Vacant(_) => unreachable!(),
-                    Occupied(mut view) => {
+                    Entry::Vacant(_) => unreachable!(),
+                    Entry::Occupied(mut view) => {
                         assert_eq!(view.get(), &10);
                         assert_eq!(view.insert(100), 10);
                     }
@@ -556,8 +556,8 @@ macro_rules! parity_suite {
 
                 // Existing key (update)
                 match map.entry(2) {
-                    Vacant(_) => unreachable!(),
-                    Occupied(mut view) => {
+                    Entry::Vacant(_) => unreachable!(),
+                    Entry::Occupied(mut view) => {
                         let v = view.get_mut();
                         let new_v = (*v) * 10;
                         *v = new_v;
@@ -568,8 +568,8 @@ macro_rules! parity_suite {
 
                 // Existing key (take)
                 match map.entry(3) {
-                    Vacant(_) => unreachable!(),
-                    Occupied(view) => {
+                    Entry::Vacant(_) => unreachable!(),
+                    Entry::Occupied(view) => {
                         assert_eq!(view.remove(), 30);
                     }
                 }
@@ -578,8 +578,8 @@ macro_rules! parity_suite {
 
                 // Inexistent key (insert)
                 match map.entry(10) {
-                    Occupied(_) => unreachable!(),
-                    Vacant(view) => {
+                    Entry::Occupied(_) => unreachable!(),
+                    Entry::Vacant(view) => {
                         assert_eq!(*view.insert(1000), 1000);
                     }
                 }
@@ -665,8 +665,8 @@ macro_rules! parity_suite {
                 assert_eq!(a[key], value);
 
                 match a.entry(key) {
-                    Vacant(_) => panic!(),
-                    Occupied(e) => assert_eq!(key, *e.key()),
+                    Entry::Vacant(_) => panic!(),
+                    Entry::Occupied(e) => assert_eq!(key, *e.key()),
                 }
                 assert_eq!(a.len(), 1);
                 assert_eq!(a[key], value);
@@ -680,8 +680,8 @@ macro_rules! parity_suite {
 
                 assert!(a.is_empty());
                 match a.entry(key) {
-                    Occupied(_) => panic!(),
-                    Vacant(e) => {
+                    Entry::Occupied(_) => panic!(),
+                    Entry::Vacant(e) => {
                         assert_eq!(key, *e.key());
                         e.insert(value);
                     }

@@ -8,7 +8,7 @@
 macro_rules! set_suite {
     ($mod_name:ident, $TestSet:ident, $Entry:ident) => {
         mod $mod_name {
-            use opthash::$Entry::{Occupied, Vacant};
+            use opthash::$Entry as Entry;
             use opthash::{DefaultHashBuilder, $TestSet as HashSet};
 
             #[test]
@@ -460,8 +460,8 @@ macro_rules! set_suite {
                 // via its map; cover the set wrapper directly here.
                 let mut set: HashSet<&str> = HashSet::new();
                 match set.entry("a") {
-                    Occupied(_) => unreachable!(),
-                    Vacant(v) => {
+                    Entry::Occupied(_) => unreachable!(),
+                    Entry::Vacant(v) => {
                         assert_eq!(v.get(), &"a");
                         v.insert();
                     }
@@ -469,15 +469,15 @@ macro_rules! set_suite {
                 assert!(set.contains("a"));
 
                 match set.entry("a") {
-                    Vacant(_) => unreachable!(),
-                    Occupied(o) => {
+                    Entry::Vacant(_) => unreachable!(),
+                    Entry::Occupied(o) => {
                         assert_eq!(o.get(), &"a");
                         assert_eq!(o.remove(), "a");
                     }
                 }
                 assert!(!set.contains("a"));
 
-                if let Vacant(v) = set.entry("b") {
+                if let Entry::Vacant(v) = set.entry("b") {
                     assert_eq!(v.into_value(), "b");
                 }
                 assert!(set.is_empty());

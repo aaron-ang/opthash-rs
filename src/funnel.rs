@@ -498,15 +498,12 @@ pub type FunnelHashMap<K, V, S = DefaultHashBuilder, A = Global> =
     map::HashMap<K, V, FunnelTable<K, V, S, A>>;
 
 /// A view into a single entry, occupied or vacant.
-#[allow(dead_code)]
 pub type Entry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::Entry<'a, K, V, FunnelTable<K, V, S, A>>;
 /// View of an occupied entry.
-#[allow(dead_code)]
 pub type OccupiedEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::OccupiedEntry<'a, K, V, FunnelTable<K, V, S, A>>;
 /// View of a vacant entry.
-#[allow(dead_code)]
 pub type VacantEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::VacantEntry<'a, K, V, FunnelTable<K, V, S, A>>;
 /// Error returned by `try_insert` on key collision.
@@ -571,15 +568,12 @@ pub type FunnelSymmetricDifference<'a, T, S = DefaultHashBuilder, A = Global> =
 pub type FunnelUnion<'a, T, S = DefaultHashBuilder, A = Global> =
     set::Union<'a, T, FunnelTable<T, (), S, A>>;
 /// A view into a single set entry.
-#[allow(dead_code)]
 pub type FunnelSetEntry<'a, T, S = DefaultHashBuilder, A = Global> =
     set::Entry<'a, T, FunnelTable<T, (), S, A>>;
 /// View of an occupied set entry.
-#[allow(dead_code)]
 pub type FunnelSetOccupiedEntry<'a, T, S = DefaultHashBuilder, A = Global> =
     set::OccupiedEntry<'a, T, FunnelTable<T, (), S, A>>;
 /// View of a vacant set entry.
-#[allow(dead_code)]
 pub type FunnelSetVacantEntry<'a, T, S = DefaultHashBuilder, A = Global> =
     set::VacantEntry<'a, T, FunnelTable<T, (), S, A>>;
 
