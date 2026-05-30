@@ -15,14 +15,18 @@ pub use common::DefaultHashBuilder;
 pub use common::error::TryReserveError;
 
 pub use elastic::{
-    Drain as ElasticDrain, ElasticHashMap, ElasticIntoIter, ElasticIntoKeys, ElasticIntoValues,
-    ElasticIter, ElasticIterMut, ElasticValuesMut, ExtractIf as ElasticExtractIf,
+    Drain as ElasticDrain, ElasticDifference, ElasticHashMap, ElasticHashSet, ElasticIntersection,
+    ElasticIntoIter, ElasticIntoKeys, ElasticIntoValues, ElasticIter, ElasticIterMut,
+    ElasticSetDrain, ElasticSetExtractIf, ElasticSetIntoIter, ElasticSetIter,
+    ElasticSymmetricDifference, ElasticUnion, ElasticValuesMut, ExtractIf as ElasticExtractIf,
     Keys as ElasticKeys, OccupiedError as ElasticOccupiedError, Values as ElasticValues,
 };
 pub use funnel::{
-    Drain as FunnelDrain, ExtractIf as FunnelExtractIf, FunnelHashMap, FunnelIntoIter,
-    FunnelIntoKeys, FunnelIntoValues, FunnelIter, FunnelIterMut, FunnelValuesMut,
-    Keys as FunnelKeys, OccupiedError as FunnelOccupiedError, Values as FunnelValues,
+    Drain as FunnelDrain, ExtractIf as FunnelExtractIf, FunnelDifference, FunnelHashMap,
+    FunnelHashSet, FunnelIntersection, FunnelIntoIter, FunnelIntoKeys, FunnelIntoValues,
+    FunnelIter, FunnelIterMut, FunnelSetDrain, FunnelSetExtractIf, FunnelSetIntoIter,
+    FunnelSetIter, FunnelSymmetricDifference, FunnelUnion, FunnelValuesMut, Keys as FunnelKeys,
+    OccupiedError as FunnelOccupiedError, Values as FunnelValues,
 };
 
 pub use map::{
@@ -31,10 +35,7 @@ pub use map::{
     VacantEntry as FunnelVacantEntry,
 };
 pub use set::{
-    ElasticDifference, ElasticHashSet, ElasticIntersection, ElasticSetDrain, ElasticSetEntry,
-    ElasticSetExtractIf, ElasticSetIntoIter, ElasticSetIter, ElasticSetOccupiedEntry,
-    ElasticSetVacantEntry, ElasticSymmetricDifference, ElasticUnion, FunnelDifference,
-    FunnelHashSet, FunnelIntersection, FunnelSetDrain, FunnelSetEntry, FunnelSetExtractIf,
-    FunnelSetIntoIter, FunnelSetIter, FunnelSetOccupiedEntry, FunnelSetVacantEntry,
-    FunnelSymmetricDifference, FunnelUnion,
+    Entry as ElasticSetEntry, Entry as FunnelSetEntry, OccupiedEntry as ElasticSetOccupiedEntry,
+    OccupiedEntry as FunnelSetOccupiedEntry, VacantEntry as ElasticSetVacantEntry,
+    VacantEntry as FunnelSetVacantEntry,
 };

@@ -15,6 +15,7 @@ use crate::common::iter::OccupiedSlots;
 use crate::common::math::{self, align, capacity, cast, probe};
 use crate::common::simd;
 use crate::map::{self, RawTable};
+use crate::set;
 
 /// Upper bound on `reserve_fraction`;
 /// level capacities become unstable beyond this load factor.
@@ -497,12 +498,15 @@ pub type FunnelHashMap<K, V, S = DefaultHashBuilder, A = Global> =
     map::HashMap<K, V, FunnelTable<K, V, S, A>>;
 
 /// A view into a single entry, occupied or vacant.
+#[allow(dead_code)]
 pub type Entry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::Entry<'a, K, V, FunnelTable<K, V, S, A>>;
 /// View of an occupied entry.
+#[allow(dead_code)]
 pub type OccupiedEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::OccupiedEntry<'a, K, V, FunnelTable<K, V, S, A>>;
 /// View of a vacant entry.
+#[allow(dead_code)]
 pub type VacantEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::VacantEntry<'a, K, V, FunnelTable<K, V, S, A>>;
 /// Error returned by `try_insert` on key collision.
@@ -538,6 +542,46 @@ pub type Drain<'a, K, V, S = DefaultHashBuilder, A = Global> =
 /// Iterator yielding entries removed by `extract_if`.
 pub type ExtractIf<'a, K, V, F, S = DefaultHashBuilder, A = Global> =
     map::ExtractIf<'a, K, V, FunnelTable<K, V, S, A>, F>;
+
+/// Hash set using funnel hashing.
+pub type FunnelHashSet<T, S = DefaultHashBuilder, A = Global> =
+    set::HashSet<T, FunnelTable<T, (), S, A>>;
+/// Borrowing iterator over set values.
+pub type FunnelSetIter<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Iter<'a, T, FunnelTable<T, (), S, A>>;
+/// Consuming iterator over set values.
+pub type FunnelSetIntoIter<T, S = DefaultHashBuilder, A = Global> =
+    set::IntoIter<T, FunnelTable<T, (), S, A>>;
+/// Draining iterator that empties the set.
+pub type FunnelSetDrain<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Drain<'a, T, FunnelTable<T, (), S, A>>;
+/// Iterator yielding values removed by set `extract_if`.
+pub type FunnelSetExtractIf<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::ExtractIf<'a, T, FunnelTable<T, (), S, A>>;
+/// Iterator over values present only in the first set.
+pub type FunnelDifference<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Difference<'a, T, FunnelTable<T, (), S, A>>;
+/// Iterator over values present in both sets.
+pub type FunnelIntersection<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Intersection<'a, T, FunnelTable<T, (), S, A>>;
+/// Iterator over values present in exactly one set.
+pub type FunnelSymmetricDifference<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::SymmetricDifference<'a, T, FunnelTable<T, (), S, A>>;
+/// Iterator over values present in either set.
+pub type FunnelUnion<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Union<'a, T, FunnelTable<T, (), S, A>>;
+/// A view into a single set entry.
+#[allow(dead_code)]
+pub type FunnelSetEntry<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Entry<'a, T, FunnelTable<T, (), S, A>>;
+/// View of an occupied set entry.
+#[allow(dead_code)]
+pub type FunnelSetOccupiedEntry<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::OccupiedEntry<'a, T, FunnelTable<T, (), S, A>>;
+/// View of a vacant set entry.
+#[allow(dead_code)]
+pub type FunnelSetVacantEntry<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::VacantEntry<'a, T, FunnelTable<T, (), S, A>>;
 
 /// Total ctrl bytes for a funnel layout. Each level rounds bucket count up
 /// to pow2 then multiplies by `bw`; special arrays are pre-rounded.

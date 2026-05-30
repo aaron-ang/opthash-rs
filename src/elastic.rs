@@ -12,6 +12,7 @@ use crate::common::error::TryReserveError;
 use crate::common::iter::OccupiedSlots;
 use crate::common::math::{self, align, capacity, probe};
 use crate::map::{self, RawTable};
+use crate::set;
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -240,12 +241,15 @@ pub type ElasticHashMap<K, V, S = DefaultHashBuilder, A = Global> =
     map::HashMap<K, V, ElasticTable<K, V, S, A>>;
 
 /// A view into a single entry, occupied or vacant.
+#[allow(dead_code)]
 pub type Entry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::Entry<'a, K, V, ElasticTable<K, V, S, A>>;
 /// View of an occupied entry.
+#[allow(dead_code)]
 pub type OccupiedEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::OccupiedEntry<'a, K, V, ElasticTable<K, V, S, A>>;
 /// View of a vacant entry.
+#[allow(dead_code)]
 pub type VacantEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::VacantEntry<'a, K, V, ElasticTable<K, V, S, A>>;
 /// Error returned by `try_insert` on key collision.
@@ -281,6 +285,46 @@ pub type Drain<'a, K, V, S = DefaultHashBuilder, A = Global> =
 /// Iterator yielding entries removed by `extract_if`.
 pub type ExtractIf<'a, K, V, F, S = DefaultHashBuilder, A = Global> =
     map::ExtractIf<'a, K, V, ElasticTable<K, V, S, A>, F>;
+
+/// Hash set using elastic hashing.
+pub type ElasticHashSet<T, S = DefaultHashBuilder, A = Global> =
+    set::HashSet<T, ElasticTable<T, (), S, A>>;
+/// Borrowing iterator over set values.
+pub type ElasticSetIter<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Iter<'a, T, ElasticTable<T, (), S, A>>;
+/// Consuming iterator over set values.
+pub type ElasticSetIntoIter<T, S = DefaultHashBuilder, A = Global> =
+    set::IntoIter<T, ElasticTable<T, (), S, A>>;
+/// Draining iterator that empties the set.
+pub type ElasticSetDrain<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Drain<'a, T, ElasticTable<T, (), S, A>>;
+/// Iterator yielding values removed by set `extract_if`.
+pub type ElasticSetExtractIf<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::ExtractIf<'a, T, ElasticTable<T, (), S, A>>;
+/// Iterator over values present only in the first set.
+pub type ElasticDifference<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Difference<'a, T, ElasticTable<T, (), S, A>>;
+/// Iterator over values present in both sets.
+pub type ElasticIntersection<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Intersection<'a, T, ElasticTable<T, (), S, A>>;
+/// Iterator over values present in exactly one set.
+pub type ElasticSymmetricDifference<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::SymmetricDifference<'a, T, ElasticTable<T, (), S, A>>;
+/// Iterator over values present in either set.
+pub type ElasticUnion<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Union<'a, T, ElasticTable<T, (), S, A>>;
+/// A view into a single set entry.
+#[allow(dead_code)]
+pub type ElasticSetEntry<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::Entry<'a, T, ElasticTable<T, (), S, A>>;
+/// View of an occupied set entry.
+#[allow(dead_code)]
+pub type ElasticSetOccupiedEntry<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::OccupiedEntry<'a, T, ElasticTable<T, (), S, A>>;
+/// View of a vacant set entry.
+#[allow(dead_code)]
+pub type ElasticSetVacantEntry<'a, T, S = DefaultHashBuilder, A = Global> =
+    set::VacantEntry<'a, T, ElasticTable<T, (), S, A>>;
 
 /// Boxed slice of levels for one `(K, V)` parameterization.
 type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
