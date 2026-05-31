@@ -24,7 +24,7 @@ pre-commit install
 
 Criterion suite comparing `ElasticHashMap`, `FunnelHashMap`, `std::HashMap`, `hashbrown::HashMap` (SwissTable + foldhash — absolute ceiling).
 
-Use `scripts/bench.sh` for benchmark results you will act on. Raw `cargo bench` is unpinned; wall-clock noise can swing ±10% and flip the sign of real ±5% changes. Use raw cargo only for smoke runs or single-filter iteration.
+Use `scripts/bench.sh` for benchmark results you will act on. Raw `cargo bench` is unpinned; wall-clock noise can swing and flip the sign of real changes. Use raw cargo only for smoke runs or single-filter iteration.
 
 For A/B comparisons, save a known anchor, save each changed tree as a named variant, then compare stored runs offline with `LOAD` and `BASELINE`. Refresh `ref` when intentionally updating the default anchor after environment or benchmark-fixture changes.
 
@@ -36,8 +36,6 @@ SAVE=ref scripts/bench.sh                   # intentionally refresh the default 
 ```
 
 For many variants against the same anchor, save the anchor once (`SAVE=anchor`), save each variant (`SAVE=optN`), then compare with `LOAD=optN BASELINE=anchor`. Stored baselines persist in `target/criterion/`.
-
-Read results from JSON, not stdout. Stdout truncates and mixes runs.
 
 - `target/criterion/<group>/<variant>/new/estimates.json` — absolute ns (`mean.point_estimate`)
 - `target/criterion/<group>/<variant>/change/estimates.json` — fractional change vs the selected baseline (`+0.05` = 5% slower)
@@ -83,23 +81,28 @@ uv run scripts/generate_python_chart.py
 
 Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loaders, axis styling) live in `scripts/_plot_common.py`.
 
-## Project structure
+### Methodology
+
+- Re-save the anchor whenever a fixture constant changes (`OP_COUNT`, `MAP_SIZE`, `LATENCY_SIZES`). Comparing across different workloads makes `change/` deltas meaningless.
+- Treat unchanged controls (`std`, `hashbrown`) as the run's noise floor. Large movement in controls weakens any conclusion about `elastic` or `funnel`.
+- Rebuild before reading `callgrind`/CodSpeed output — stale binaries silently report pre-change asm. Check binary mtime against the commit you intend to measure.
+
+## Project Structure
 
 - `src/elastic.rs` — `ElasticHashMap` (tests inline)
 - `src/funnel.rs` — `FunnelHashMap` (tests inline)
-- `src/common/` — shared internals: control-byte SIMD ops, layout math, config
+- `src/common/` — shared internals used by library and benches: control-byte SIMD, bitmask, layout math, config
+- `benches/common.rs` — bench fixtures
 
-## Worktree naming
+Don't duplicate primitives across `src/` and `benches/`.
+
+## Worktree Naming
 
 When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-mut-iters`) and pass the same name to `git worktree add`.
 
-## Refactoring guidelines
+## Refactoring Guidelines
 
-### Where things live
-
-- Low-level helpers used by both the library and benchmarks live in `src/common/` (bitmask, simd, layout, math). Benches pull fixtures from `benches/common.rs`. Don't duplicate primitives across `src/` and `benches/`.
-
-### Design priorities
+### Design Priorities
 
 - Prefer layout and locality wins before adding more metadata. Keep hot metadata contiguous — if fields are read together, store them together.
 - Cache routing state that's reused in hot paths; never recompute it per probe.
@@ -111,14 +114,9 @@ When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-
 - Metadata that costs work on every insert/delete unless benchmarks prove a net win.
 - Optimizations that improve a narrow microbenchmark but regress the public `speedup` suite. `target/criterion/` is the final gate — if the relevant benchmark regresses, the change does not stay.
 
-### Bench methodology
-
-- Re-save the anchor whenever a fixture constant changes (`OP_COUNT`, `MAP_SIZE`, `LATENCY_SIZES`, etc.). Comparing across different workloads makes `change/` deltas meaningless.
-- Treat unchanged controls (`std`, `hashbrown`) as the run's noise floor. Large movement in controls weakens any conclusion about `elastic` or `funnel`.
-- Rebuild before reading callgrind output. Stale binaries silently report pre-change asm — check binary mtime against the commit you intend to measure.
-
-### Verify before refactor
+### Verification
 
 - Read the asm (`objdump -d`) on hot functions before factoring shared SIMD or arithmetic primitives. LLVM already CSEs same-pointer control-byte loads and folds duplicate masks; a "cleaner" abstraction may save nothing.
-- Adding a field to a hot struct (`RawTable`, `Level`) is a layout change. Downstream fields can shift across cache lines and regress lookups 15–20% with no semantic change. Measure offsets _and_ bench.
+- Confirm hot-path wins with `perf stat` (cycles, instructions, cache-misses, branch-misses) on a pinned run; a real win moves the matching counter, not just wallclock.
+- Adding a field to a hot struct (`RawTable`, `Level`) is a layout change. Downstream fields can shift across cache lines and regress lookups with no semantic change. Measure offsets _and_ bench.
 - Pure refactors (rename, extract, no logic change) can swing 5–50% from icache and branch-predictor layout shifts. A no-op refactor should leave CodSpeed sim instr-count at ±0.
