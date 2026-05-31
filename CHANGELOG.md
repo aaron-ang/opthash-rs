@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/aaron-ang/opthash-rs/compare/v0.10.0...v0.10.1) - 2026-05-31
+
+### Added
+
+- add max_probe_groups to elastic Level to restore query bound
+
+### Fixed
+
+- update default reserve fraction to improve allocation efficiency
+
+### Other
+
+- replot bench assets
+- change salt type from u64 to u32 in Level structs
+- update benchmark commands to use 'uv run' for consistency
+- optimize funnel bucket level access with unsafe indexing to eliminate bounds checks
+- split benches from speedup.rs
+- inline funnel higher level probe
+- set shell over map primitives ([#74](https://github.com/aaron-ang/opthash-rs/pull/74))
+- remove tail latency benchmarking and associated plotting scripts
+- Generic HashMap shell over a RawTable trait + Elastic/Funnel hash sets ([#72](https://github.com/aaron-ang/opthash-rs/pull/72))
+- Refactor shared slot iterators ([#71](https://github.com/aaron-ang/opthash-rs/pull/71))
+- update README to clarify probing methods for ElasticHashMap and FunnelHashMap
+- hashbrown-style iter primitives (IterRange, SlotHandle, ScanCursor) ([#70](https://github.com/aaron-ang/opthash-rs/pull/70))
+- drop &Arena arg from ArenaSlots + descriptor cleanup ([#69](https://github.com/aaron-ang/opthash-rs/pull/69))
+- single-arena descriptors + ArenaSlots trait ([#68](https://github.com/aaron-ang/opthash-rs/pull/68))
+- Equivalent trait, FreeSlot, IterPhase, common cleanup ([#67](https://github.com/aaron-ang/opthash-rs/pull/67))
+- *(funnel)* skip special-array dedup on clean probe chain ([#66](https://github.com/aaron-ang/opthash-rs/pull/66))
+- *(scripts)* swap to process-local noise mitigations ([#63](https://github.com/aaron-ang/opthash-rs/pull/63))
+
 ## [0.10.0](https://github.com/aaron-ang/opthash-rs/compare/v0.9.0...v0.10.0) - 2026-05-25
 
 ### Other
