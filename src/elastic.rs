@@ -1,5 +1,5 @@
 use std::hash::{BuildHasher, Hash};
-use std::mem;
+use std::mem::{self, MaybeUninit};
 
 use allocator_api2::alloc::{Allocator, Global, Layout};
 use equivalent::Equivalent;
@@ -25,7 +25,7 @@ struct Level<T> {
     /// Cached `arena.as_ptr() + ctrl_offset`, stamped at construction.
     ctrl_ptr: *mut u8,
     /// Cached `arena.as_ptr() + data_offset`, stamped at construction.
-    data_ptr: *mut T,
+    data_ptr: *mut MaybeUninit<T>,
     /// Slot capacity (= `group_count` * `GROUP_SIZE`). Bounded by `capacity`
     /// via the arena layout, so `len`/`tombstones` fit in `u32` too.
     capacity: u32,
@@ -57,7 +57,7 @@ impl<T> ArenaSlots<T> for Level<T> {
         self.ctrl_ptr
     }
     #[inline]
-    fn data_ptr(&self) -> *mut T {
+    fn data_ptr(&self) -> *mut MaybeUninit<T> {
         self.data_ptr
     }
     #[inline]
@@ -74,7 +74,7 @@ impl<T> Level<T> {
         cap_u32: u32,
         reserve_fraction: f64,
         ctrl_ptr: *mut u8,
-        data_ptr: *mut T,
+        data_ptr: *mut MaybeUninit<T>,
     ) -> Self {
         let cap = cap_u32 as usize;
         let gc = cap_u32 / GROUP_SIZE_U32;
@@ -245,7 +245,7 @@ impl<K, V, S, A: Allocator + Clone> Drop for ElasticTable<K, V, S, A> {
     fn drop(&mut self) {
         let arena = mem::replace(&mut self.arena, Arena::empty());
         let guard = arena::DeallocGuard::new(arena, &self.alloc);
-        for level in &self.levels {
+        for level in &mut self.levels {
             level.drop_values();
         }
         drop(guard);
@@ -366,7 +366,11 @@ fn build_elastic_levels<K, V>(
     for (level_idx, &cap) in level_capacities.iter().enumerate() {
         let cap_u32 = u32::try_from(cap).map_err(|_| TryReserveError::CapacityOverflow)?;
         let ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
-        let data_ptr = unsafe { arena_base.add(data_off as usize).cast::<SlotEntry<K, V>>() };
+        let data_ptr = unsafe {
+            arena_base
+                .add(data_off as usize)
+                .cast::<MaybeUninit<SlotEntry<K, V>>>()
+        };
         levels.push(Level::new_at(
             level_idx,
             cap_u32,
@@ -432,8 +436,8 @@ struct ArenaDropGuard<K, V, A: Allocator + Clone> {
 impl<K, V, A: Allocator + Clone> Drop for ArenaDropGuard<K, V, A> {
     fn drop(&mut self) {
         if let Some(arena) = self.arena.take() {
-            if let Some(levels) = self.levels.take() {
-                for level in &levels {
+            if let Some(mut levels) = self.levels.take() {
+                for level in &mut levels {
                     level.drop_values();
                 }
             }
@@ -565,7 +569,7 @@ where
         let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
         // SAFETY: shared `&Level` only — never `&mut` — so no aliasing tag.
         let level = unsafe { &*levels_ptr.add(level_idx) };
-        unsafe { level.data_ptr().add(slot_idx) }
+        level.slot_ptr(slot_idx)
     }
 
     /// Take + tombstone + decrement counters for the slot at `loc`. Backs
@@ -953,23 +957,20 @@ where
 
         // Move every live entry from old arena into the new levels.
         //
-        // Panic safety: clear each source ctrl right after `read` so the
-        // guard's drop walks only un-moved slots (no double-drop with
-        // entries already in the new arena). If `insert_unique` panics
-        // the guard unwinds: drops any survivors then deallocates
-        // `old_arena` — `Arena` has no `Drop`, so without the guard the
-        // backing allocation would leak.
-        let guard = ArenaDropGuard {
+        // Panic safety: clear each source ctrl before handing the moved entry
+        // to `insert_unique`, so the guard's drop walks only un-moved slots.
+        // If `insert_unique` panics, the guard unwinds: drops any survivors
+        // then deallocates `old_arena` — `Arena` has no `Drop`, so without the
+        // guard the backing allocation would leak.
+        let mut guard = ArenaDropGuard {
             arena: Some(old_arena),
             levels: Some(old_levels),
             alloc: self.alloc.clone(),
         };
-        for level in guard.levels.as_deref().unwrap() {
-            for idx in level.occupied() {
-                let entry = unsafe { level.take(idx) };
-                level.set_control(idx, CTRL_EMPTY);
+        for level in guard.levels.as_deref_mut().unwrap() {
+            level.drain_values_and_clear(|entry| {
                 self.insert_unique(entry.key, entry.value);
-            }
+            });
         }
         // guard drops at end of scope, deallocating old_arena. All slots
         // are CTRL_EMPTY so `drop_values` is a no-op on success.
@@ -990,17 +991,15 @@ where
             self.alloc.clone(),
         )?;
 
-        // Clear each source ctrl immediately after `take`. If `insert_unique`
-        // panics (e.g. via a user-provided `Hash` impl), the un-iterated slots
-        // remain OCCUPIED on `self` and the already-moved ones are EMPTY, so
-        // both `self.drop_values` and `new_map.drop_values` are sound on
-        // unwind (no double-drop).
-        for level in &self.levels {
-            for idx in level.occupied() {
-                let entry = unsafe { level.take(idx) };
-                level.set_control(idx, CTRL_EMPTY);
+        // Clear each source ctrl before handing the moved entry to
+        // `insert_unique`. If that panics (e.g. via a user-provided `Hash`
+        // impl), the un-iterated slots remain OCCUPIED on `self` and the
+        // already-moved ones are EMPTY, so both `self.drop_values` and
+        // `new_map.drop_values` are sound on unwind.
+        for level in &mut self.levels {
+            level.drain_values_and_clear(|entry| {
                 new_map.insert_unique(entry.key, entry.value);
-            }
+            });
         }
         self.len = 0;
         self.max_populated_level = 0;

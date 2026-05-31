@@ -1,5 +1,5 @@
 use std::hash::{BuildHasher, Hash};
-use std::mem;
+use std::mem::{self, MaybeUninit};
 use std::ops::Range;
 use std::slice;
 
@@ -26,7 +26,7 @@ pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
 /// (or the special array `A_{α+1}`).
 struct BucketLevel<T> {
     ctrl_ptr: *mut u8,
-    data_ptr: *mut T,
+    data_ptr: *mut MaybeUninit<T>,
     capacity: u32,
     bucket_count_mask: u32,
     bucket_size_log2: u32,
@@ -44,7 +44,7 @@ impl<T> ArenaSlots<T> for BucketLevel<T> {
         self.ctrl_ptr
     }
     #[inline]
-    fn data_ptr(&self) -> *mut T {
+    fn data_ptr(&self) -> *mut MaybeUninit<T> {
         self.data_ptr
     }
     #[inline]
@@ -61,7 +61,7 @@ impl<T> BucketLevel<T> {
         bucket_count: u32,
         bucket_width: u32,
         ctrl_ptr: *mut u8,
-        data_ptr: *mut T,
+        data_ptr: *mut MaybeUninit<T>,
     ) -> Self {
         let cap = bucket_count.saturating_mul(bucket_width);
         Self {
@@ -113,7 +113,7 @@ impl<T> BucketLevel<T> {
     /// (probe chain terminates here), else `CTRL_TOMBSTONE`.
     /// Returns whether a tombstone was written.
     #[inline]
-    fn erase(&self, idx: usize) -> bool {
+    fn erase(&mut self, idx: usize) -> bool {
         let group_idx = idx / GROUP_SIZE;
         let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
@@ -169,7 +169,7 @@ impl<K, V> BucketLevel<SlotEntry<K, V>> {
         let match_mask = unsafe { simd::eq_mask_16(group_ptr, key_fingerprint) };
         for relative_idx in match_mask {
             let slot_idx = bucket_range.start + relative_idx;
-            let entry = unsafe { &*self.data_ptr().add(slot_idx) };
+            let entry = unsafe { self.get_ref(slot_idx) };
             if key.equivalent(&entry.key) {
                 return LookupStep::Found(slot_idx);
             }
@@ -215,7 +215,7 @@ impl ProbeSeq {
 /// (step coprime to `group_count` ⇒ permutation over all groups).
 struct SpecialPrimary<T> {
     ctrl_ptr: *mut u8,
-    data_ptr: *mut T,
+    data_ptr: *mut MaybeUninit<T>,
     capacity: u32,
     group_count_mask: u32,
     len: u32,
@@ -231,7 +231,7 @@ impl<T> ArenaSlots<T> for SpecialPrimary<T> {
         self.ctrl_ptr
     }
     #[inline]
-    fn data_ptr(&self) -> *mut T {
+    fn data_ptr(&self) -> *mut MaybeUninit<T> {
         self.data_ptr
     }
     #[inline]
@@ -243,7 +243,12 @@ impl<T> ArenaSlots<T> for SpecialPrimary<T> {
 impl<T> SpecialPrimary<T> {
     /// Stamps a fresh primary descriptor.
     /// `group_count_mask` = `group_count - 1` (pow2-1) so probes wrap `& mask`.
-    fn new_at(cap: u32, group_count_mask: u32, ctrl_ptr: *mut u8, data_ptr: *mut T) -> Self {
+    fn new_at(
+        cap: u32,
+        group_count_mask: u32,
+        ctrl_ptr: *mut u8,
+        data_ptr: *mut MaybeUninit<T>,
+    ) -> Self {
         Self {
             ctrl_ptr,
             data_ptr,
@@ -276,7 +281,7 @@ impl<T> SpecialPrimary<T> {
 
     /// Erase slot: drop tombstone unless the group has free space.
     #[inline]
-    fn erase(&self, idx: usize) -> bool {
+    fn erase(&mut self, idx: usize) -> bool {
         let group_idx = idx / GROUP_SIZE;
         let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
@@ -294,7 +299,7 @@ impl<T> SpecialPrimary<T> {
 /// Reached only when a key exhausts the primary's probe budget.
 struct SpecialFallback<T> {
     ctrl_ptr: *mut u8,
-    data_ptr: *mut T,
+    data_ptr: *mut MaybeUninit<T>,
     capacity: u32,
     bucket_count: u32,
     bucket_size_log2: u32,
@@ -311,7 +316,7 @@ impl<T> ArenaSlots<T> for SpecialFallback<T> {
         self.ctrl_ptr
     }
     #[inline]
-    fn data_ptr(&self) -> *mut T {
+    fn data_ptr(&self) -> *mut MaybeUninit<T> {
         self.data_ptr
     }
     #[inline]
@@ -327,7 +332,7 @@ impl<T> SpecialFallback<T> {
         bucket_count: u32,
         bucket_size_log2: u32,
         ctrl_ptr: *mut u8,
-        data_ptr: *mut T,
+        data_ptr: *mut MaybeUninit<T>,
     ) -> Self {
         Self {
             ctrl_ptr,
@@ -358,7 +363,7 @@ impl<T> SpecialFallback<T> {
 
     /// Erase slot: drop tombstone unless the group has free space.
     #[inline]
-    fn erase(&self, idx: usize) -> bool {
+    fn erase(&mut self, idx: usize) -> bool {
         let group_idx = idx / GROUP_SIZE;
         let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
@@ -384,15 +389,9 @@ impl<T> SpecialArray<T> {
     /// Drain primary + fallback, calling `f` on each entry. Each slot's
     /// ctrl is cleared *before* the move so an `f` panic leaves no
     /// OCCUPIED ctrl for the map's drop to double-drop.
-    fn for_each_occupied<F: FnMut(T)>(&self, mut f: F) {
-        for idx in self.primary.occupied() {
-            self.primary.set_control(idx, CTRL_EMPTY);
-            f(unsafe { self.primary.take(idx) });
-        }
-        for idx in self.fallback.occupied() {
-            self.fallback.set_control(idx, CTRL_EMPTY);
-            f(unsafe { self.fallback.take(idx) });
-        }
+    fn drain_occupied_with<F: FnMut(T)>(&mut self, mut f: F) {
+        self.primary.drain_values_and_clear(&mut f);
+        self.fallback.drain_values_and_clear(f);
     }
 }
 
@@ -479,7 +478,7 @@ impl<K, V, S, A: Allocator + Clone> Drop for FunnelTable<K, V, S, A> {
     fn drop(&mut self) {
         let arena = mem::replace(&mut self.arena, Arena::empty());
         let guard = arena::DeallocGuard::new(arena, &self.alloc);
-        for level in &self.levels {
+        for level in &mut self.levels {
             level.drop_values();
         }
         self.special.primary.drop_values();
@@ -651,7 +650,11 @@ fn build_funnel_regions<K, V>(
         .map_err(|_| TryReserveError::CapacityOverflow)?;
         let cap = bc.saturating_mul(bw32);
         let ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
-        let data_ptr = unsafe { arena_base.add(data_off as usize).cast::<SlotEntry<K, V>>() };
+        let data_ptr = unsafe {
+            arena_base
+                .add(data_off as usize)
+                .cast::<MaybeUninit<SlotEntry<K, V>>>()
+        };
         levels.push(BucketLevel::new_at(level_idx, bc, bw32, ctrl_ptr, data_ptr));
         ctrl_off += cap;
         data_off += cap * slot_size;
@@ -663,7 +666,11 @@ fn build_funnel_regions<K, V>(
         .map_err(|_| TryReserveError::CapacityOverflow)?
         .wrapping_sub(1);
     let primary_ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
-    let primary_data_ptr = unsafe { arena_base.add(data_off as usize).cast::<SlotEntry<K, V>>() };
+    let primary_data_ptr = unsafe {
+        arena_base
+            .add(data_off as usize)
+            .cast::<MaybeUninit<SlotEntry<K, V>>>()
+    };
     let primary = SpecialPrimary::new_at(
         primary_cap,
         primary_gc_mask,
@@ -686,7 +693,11 @@ fn build_funnel_regions<K, V>(
         .map_err(|_| TryReserveError::CapacityOverflow)?
         .trailing_zeros();
     let fallback_ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
-    let fallback_data_ptr = unsafe { arena_base.add(data_off as usize).cast::<SlotEntry<K, V>>() };
+    let fallback_data_ptr = unsafe {
+        arena_base
+            .add(data_off as usize)
+            .cast::<MaybeUninit<SlotEntry<K, V>>>()
+    };
     let fallback = SpecialFallback::new_at(
         fallback_cap,
         fb_count,
@@ -795,12 +806,12 @@ struct ArenaDropGuard<K, V, A: Allocator + Clone> {
 impl<K, V, A: Allocator + Clone> Drop for ArenaDropGuard<K, V, A> {
     fn drop(&mut self) {
         if let Some(arena) = self.arena.take() {
-            if let Some(levels) = self.levels.take() {
-                for level in &levels {
+            if let Some(mut levels) = self.levels.take() {
+                for level in &mut levels {
                     level.drop_values();
                 }
             }
-            if let Some(special) = self.special.take() {
+            if let Some(mut special) = self.special.take() {
                 special.primary.drop_values();
                 special.fallback.drop_values();
             }
@@ -970,14 +981,10 @@ where
                 // SAFETY: shared `&BucketLevel` only — never `&mut` — so no
                 // aliasing tag.
                 let level = unsafe { &*levels_ptr.add(level_idx) };
-                unsafe { level.data_ptr().add(slot_idx) }
+                level.slot_ptr(slot_idx)
             }
-            SlotLocation::SpecialPrimary { slot_idx } => unsafe {
-                self.special.primary.data_ptr().add(slot_idx)
-            },
-            SlotLocation::SpecialFallback { slot_idx } => unsafe {
-                self.special.fallback.data_ptr().add(slot_idx)
-            },
+            SlotLocation::SpecialPrimary { slot_idx } => self.special.primary.slot_ptr(slot_idx),
+            SlotLocation::SpecialFallback { slot_idx } => self.special.fallback.slot_ptr(slot_idx),
         }
     }
 
@@ -1210,19 +1217,14 @@ where
     /// can free the old arena safely. Each ctrl is cleared *before* the move so
     /// a `Vec::push` realloc panic leaves no OCCUPIED slot behind to double-drop.
     fn drain_entries_into(&mut self, out: &mut Vec<(K, V)>) {
-        for level in &self.levels {
-            for idx in level.occupied() {
-                level.set_control(idx, CTRL_EMPTY);
-                let entry = unsafe { level.take(idx) };
+        for level in &mut self.levels {
+            level.drain_values_and_clear(|entry| {
                 out.push((entry.key, entry.value));
-            }
-            level.clear_all_controls();
+            });
         }
-        self.special.for_each_occupied(|entry| {
+        self.special.drain_occupied_with(|entry| {
             out.push((entry.key, entry.value));
         });
-        self.special.primary.clear_all_controls();
-        self.special.fallback.clear_all_controls();
         for level in &mut self.levels {
             level.len = 0;
             level.tombstones = 0;

@@ -1,6 +1,5 @@
 use std::fmt;
 use std::iter::FusedIterator;
-use std::marker::PhantomData;
 use std::ptr;
 
 use super::arena::ArenaSlots;
@@ -267,75 +266,6 @@ impl Clone for OccupiedSlots {
             end_ctrl: self.end_ctrl,
             current_group_slot: self.current_group_slot,
             current_mask: self.current_mask.clone(),
-        }
-    }
-}
-
-/// Shared single-region scanner over a slice of `D` descriptors, yielding
-/// occupied slot indices. Multi-region scans drive [`OccupiedSlots`] directly
-/// with explicit region tracking (see the backend `Scan` cursors).
-pub(crate) struct RegionIter<'a, T, D: ArenaSlots<T>> {
-    regions: *const D,
-    regions_len: usize,
-    region_idx: usize,
-    slots: OccupiedSlots,
-    _marker: PhantomData<(&'a [D], *const T)>,
-}
-
-// SAFETY: shared borrow of `[D]` is `Send` iff `D: Sync`; same here.
-unsafe impl<T: Sync, D: ArenaSlots<T> + Sync> Send for RegionIter<'_, T, D> {}
-unsafe impl<T: Sync, D: ArenaSlots<T> + Sync> Sync for RegionIter<'_, T, D> {}
-
-impl<'a, T, D: ArenaSlots<T>> RegionIter<'a, T, D> {
-    #[inline]
-    pub(crate) fn new(slice: &'a [D]) -> Self {
-        let mut me = Self {
-            regions: slice.as_ptr(),
-            regions_len: slice.len(),
-            region_idx: 0,
-            slots: OccupiedSlots::empty(),
-            _marker: PhantomData,
-        };
-        if me.regions_len > 0 {
-            // SAFETY: regions_len > 0.
-            me.slots.set_region(unsafe { &*me.regions });
-        }
-        me
-    }
-}
-
-impl<T, D: ArenaSlots<T>> Clone for RegionIter<'_, T, D> {
-    fn clone(&self) -> Self {
-        Self {
-            regions: self.regions,
-            regions_len: self.regions_len,
-            region_idx: self.region_idx,
-            slots: self.slots.clone(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<T, D: ArenaSlots<T>> Iterator for RegionIter<'_, T, D> {
-    type Item = usize;
-
-    #[inline]
-    fn next(&mut self) -> Option<usize> {
-        // Plain `usize` collapses level identity; valid only for single-region scans.
-        debug_assert!(
-            self.regions_len <= 1,
-            "RegionIter::next yields ambiguous indices across multiple regions; use next_handle"
-        );
-        loop {
-            if let Some(idx) = self.slots.step() {
-                return Some(idx);
-            }
-            self.region_idx += 1;
-            if self.region_idx >= self.regions_len {
-                return None;
-            }
-            self.slots
-                .set_region(unsafe { &*self.regions.add(self.region_idx) });
         }
     }
 }
