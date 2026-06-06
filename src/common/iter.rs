@@ -269,3 +269,59 @@ impl Clone for OccupiedSlots {
         }
     }
 }
+
+/// Per-region scan state shared by the backends' `Scan` cursors: an
+/// [`OccupiedSlots`] group scanner plus the current region's cached slot
+/// pointer. Owns the per-region mechanics; each backend keeps its own region
+/// ordering and location construction.
+pub(crate) struct RegionCursor {
+    cursor: OccupiedSlots,
+    /// Cached `data_ptr()` of the current region, refreshed by `enter`.
+    cur_data: *mut u8,
+    /// `false` until the first `enter`, keeping a fresh cursor pointer-free.
+    started: bool,
+}
+
+impl RegionCursor {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            cursor: OccupiedSlots::empty(),
+            cur_data: ptr::null_mut(),
+            started: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn started(&self) -> bool {
+        self.started
+    }
+
+    /// Binds the scanner to `region` and caches its slot pointer.
+    #[inline]
+    pub(crate) fn enter<T, D: ArenaSlots<T> + ?Sized>(&mut self, region: &D) {
+        self.cursor.set_region(region);
+        self.cur_data = region.data_ptr().cast();
+        self.started = true;
+    }
+
+    /// Next occupied slot in the current region as `(slot pointer, index)`.
+    #[inline]
+    pub(crate) fn step<E>(&mut self) -> Option<(*mut E, usize)> {
+        let slot_idx = self.cursor.step()?;
+        // SAFETY: `cur_data` is the current region's slot array; `slot_idx` is
+        // in-bounds for it (`step` yields only valid slots).
+        let ptr = unsafe { self.cur_data.cast::<E>().add(slot_idx) };
+        Some((ptr, slot_idx))
+    }
+}
+
+impl Clone for RegionCursor {
+    fn clone(&self) -> Self {
+        Self {
+            cursor: self.cursor.clone(),
+            cur_data: self.cur_data,
+            started: self.started,
+        }
+    }
+}

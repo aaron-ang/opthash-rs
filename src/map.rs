@@ -9,13 +9,14 @@ use equivalent::Equivalent;
 
 use crate::common::DefaultHashBuilder;
 use crate::common::arena::SlotEntry;
-use crate::common::config::DEFAULT_RESERVE_FRACTION;
+use crate::common::config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY};
 use crate::common::control;
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError, TryReserveError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     Values as CommonValues,
 };
+use crate::common::math::capacity;
 
 /// Backend storage + probing primitives that [`HashMap`] builds its public API
 /// on. Each implementor owns the slot storage, the hasher, and the allocator;
@@ -63,16 +64,68 @@ pub trait RawTable<K, V>: Sized {
     /// Maximum entries before the next automatic resize (the public `capacity`).
     fn capacity(&self) -> usize;
 
+    /// Total backing slot count (distinct from `capacity`, the live-entry ceiling).
+    fn total_slots(&self) -> usize;
+
+    /// The configured reserve fraction.
+    fn reserve_fraction(&self) -> f64;
+
+    /// Slot count holding `needed` live entries at this reserve fraction, or
+    /// `None` on overflow.
+    fn grow_capacity_for(&self, needed: usize) -> Option<usize>;
+
+    /// Reallocates to `new_capacity` slots and reinserts all entries.
+    fn resize(&mut self, new_capacity: usize);
+
+    /// Fallible [`resize`](RawTable::resize); `Err` leaves the table intact.
+    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
+    where
+        Self::Hasher: Clone;
+
     /// Ensures room for `additional` more entries.
-    fn reserve(&mut self, additional: usize);
+    fn reserve(&mut self, additional: usize) {
+        let needed = self.len().saturating_add(additional);
+        if needed <= self.capacity() {
+            return;
+        }
+        let new_capacity = self.grow_capacity_for(needed).expect("capacity overflow");
+        self.resize(new_capacity);
+    }
 
     /// Fallible [`reserve`](RawTable::reserve).
     fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
     where
-        Self::Hasher: Clone;
+        Self::Hasher: Clone,
+    {
+        let needed = self
+            .len()
+            .checked_add(additional)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        if needed <= self.capacity() {
+            return Ok(());
+        }
+        let new_capacity = self
+            .grow_capacity_for(needed)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        self.try_resize(new_capacity)
+    }
 
     /// Shrinks capacity toward `min_capacity`.
-    fn shrink_to(&mut self, min_capacity: usize);
+    fn shrink_to(&mut self, min_capacity: usize) {
+        if self.len() == 0 && min_capacity == 0 {
+            if self.total_slots() > 0 {
+                self.resize(0);
+            }
+            return;
+        }
+        let lower = self.len().max(min_capacity).max(INITIAL_CAPACITY);
+        let new_capacity = capacity::capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction())
+            .expect("capacity overflow");
+        if new_capacity >= self.total_slots() {
+            return;
+        }
+        self.resize(new_capacity);
+    }
 
     /// Drops all entries, keeping allocation.
     fn clear(&mut self);

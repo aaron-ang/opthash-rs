@@ -9,7 +9,7 @@ use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::{GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::common::error::TryReserveError;
-use crate::common::iter::OccupiedSlots;
+use crate::common::iter::RegionCursor;
 use crate::common::math::{self, align, capacity, probe};
 use crate::map::{self, RawTable};
 use crate::set;
@@ -591,29 +591,21 @@ where
     /// crossings. Kept out of line so the per-element hot path inlines.
     #[cold]
     fn scan_advance(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
-        if !scan.started {
+        if !scan.region.started() {
             if self.levels.is_empty() {
                 return None;
             }
-            scan.started = true;
-            let level = &self.levels[0];
-            scan.cursor.set_region(level);
-            scan.cur_data = level.data_ptr().cast();
+            scan.region.enter(&self.levels[0]);
         }
         loop {
-            if let Some(slot_idx) = scan.cursor.step() {
-                // SAFETY: `cur_data` is the current level's slot array; `slot_idx`
-                // is in-bounds for it (`step` yields only valid slots).
-                let ptr = unsafe { scan.cur_data.cast::<SlotEntry<K, V>>().add(slot_idx) };
+            if let Some((ptr, slot_idx)) = scan.region.step::<SlotEntry<K, V>>() {
                 return Some((ptr, (scan.level_idx, slot_idx)));
             }
             scan.level_idx += 1;
             if scan.level_idx >= self.levels.len() {
                 return None;
             }
-            let level = &self.levels[scan.level_idx];
-            scan.cursor.set_region(level);
-            scan.cur_data = level.data_ptr().cast();
+            scan.region.enter(&self.levels[scan.level_idx]);
         }
     }
 }
@@ -668,46 +660,32 @@ where
         self.max_insertions
     }
 
-    fn reserve(&mut self, additional: usize) {
-        let needed = self.len.saturating_add(additional);
-        if needed <= self.max_insertions {
-            return;
-        }
-        let new_capacity = self.grow_capacity_for(needed).expect("capacity overflow");
+    #[inline]
+    fn total_slots(&self) -> usize {
+        self.total_slots
+    }
+
+    #[inline]
+    fn reserve_fraction(&self) -> f64 {
+        self.reserve_fraction
+    }
+
+    #[inline]
+    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
+        self.grow_capacity_for(needed)
+    }
+
+    #[inline]
+    fn resize(&mut self, new_capacity: usize) {
         self.resize(new_capacity);
     }
 
-    fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
+    #[inline]
+    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
     where
         S: Clone,
     {
-        let needed = self
-            .len
-            .checked_add(additional)
-            .ok_or(TryReserveError::CapacityOverflow)?;
-        if needed <= self.max_insertions {
-            return Ok(());
-        }
-        let new_capacity = self
-            .grow_capacity_for(needed)
-            .ok_or(TryReserveError::CapacityOverflow)?;
         self.try_resize(new_capacity)
-    }
-
-    fn shrink_to(&mut self, min_capacity: usize) {
-        if self.len == 0 && min_capacity == 0 {
-            if self.total_slots > 0 {
-                self.resize(0);
-            }
-            return;
-        }
-        let lower = self.len.max(min_capacity).max(INITIAL_CAPACITY);
-        let new_capacity = capacity::capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction)
-            .expect("capacity overflow");
-        if new_capacity >= self.total_slots {
-            return;
-        }
-        self.resize(new_capacity);
     }
 
     #[inline]
@@ -772,21 +750,16 @@ where
     fn scan(&self) -> ElasticScan {
         ElasticScan {
             level_idx: 0,
-            cursor: OccupiedSlots::empty(),
-            cur_data: std::ptr::null_mut(),
-            started: false,
+            region: RegionCursor::new(),
         }
     }
 
     #[inline]
     fn scan_next(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
         // Hot path: another occupied slot in the level the cursor already holds.
-        if scan.started
-            && let Some(slot_idx) = scan.cursor.step()
+        if scan.region.started()
+            && let Some((ptr, slot_idx)) = scan.region.step::<SlotEntry<K, V>>()
         {
-            // SAFETY: `cur_data` is the current level's slot array; `slot_idx`
-            // is in-bounds for it (`step` yields only valid slots).
-            let ptr = unsafe { scan.cur_data.cast::<SlotEntry<K, V>>().add(slot_idx) };
             return Some((ptr, (scan.level_idx, slot_idx)));
         }
         self.scan_advance(scan)
@@ -868,30 +841,13 @@ where
 }
 
 /// Multi-level scan cursor for [`RawTable::scan`]. Holds the current level
-/// index, an in-region [`OccupiedSlots`], and the current level's cached slot
-/// pointer. `scan()` leaves it pointer-free (`started == false`); the cache is
-/// populated only on the first `scan_next`, so a consumed table can be moved
-/// before iteration begins.
+/// index and a shared [`RegionCursor`]. `scan()` leaves it pointer-free; the
+/// region pointer is populated only on the first `scan_next`, so a consumed
+/// table can be moved before iteration begins.
+#[derive(Clone)]
 pub struct ElasticScan {
     level_idx: usize,
-    cursor: OccupiedSlots,
-    /// Cached `data_ptr()` of the current level (as bytes), refreshed on each
-    /// region cross so `scan_next` yields a slot pointer with one offset.
-    cur_data: *mut u8,
-    /// `false` until the first [`RawTable::scan_next`] lazily sets the cursor
-    /// + `cur_data` from `&self.levels[0]`.
-    started: bool,
-}
-
-impl Clone for ElasticScan {
-    fn clone(&self) -> Self {
-        Self {
-            level_idx: self.level_idx,
-            cursor: self.cursor.clone(),
-            cur_data: self.cur_data,
-            started: self.started,
-        }
-    }
+    region: RegionCursor,
 }
 
 impl<K, V, S, A> ElasticTable<K, V, S, A>

@@ -11,7 +11,7 @@ use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::{GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::TryReserveError;
-use crate::common::iter::OccupiedSlots;
+use crate::common::iter::RegionCursor;
 use crate::common::math::{self, align, capacity, cast, probe};
 use crate::common::simd;
 use crate::map::{self, RawTable};
@@ -1733,41 +1733,35 @@ where
     /// per-element hot path inlines.
     #[cold]
     fn scan_advance(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, SlotLocation)> {
-        if !scan.started {
-            scan.started = true;
+        if !scan.region.started() {
             // Prime the cursor on the first region. With no levels, jump
             // straight to the special primary.
             if self.levels.is_empty() {
                 scan.phase = ScanPhase::Primary;
-                scan.cursor.set_region(&self.special.primary);
-                scan.cur_data = self.special.primary.data_ptr().cast();
+                scan.region.enter(&self.special.primary);
             } else {
-                scan.cursor.set_region(&self.levels[0]);
-                scan.cur_data = self.levels[0].data_ptr().cast();
+                scan.region.enter(&self.levels[0]);
             }
         }
         loop {
-            if let Some(slot_idx) = scan.cursor.step() {
-                return Some(scan.yield_at::<K, V>(slot_idx));
+            if let Some((ptr, slot_idx)) = scan.region.step::<SlotEntry<K, V>>() {
+                return Some((ptr, scan.location_at(slot_idx)));
             }
             // Current region exhausted: advance, re-deriving the region pointer
-            // + cached data ptr from `&self`.
+            // from `&self`.
             match scan.phase {
                 ScanPhase::Levels => {
                     scan.level_idx += 1;
                     if scan.level_idx < self.levels.len() {
-                        scan.cursor.set_region(&self.levels[scan.level_idx]);
-                        scan.cur_data = self.levels[scan.level_idx].data_ptr().cast();
+                        scan.region.enter(&self.levels[scan.level_idx]);
                     } else {
                         scan.phase = ScanPhase::Primary;
-                        scan.cursor.set_region(&self.special.primary);
-                        scan.cur_data = self.special.primary.data_ptr().cast();
+                        scan.region.enter(&self.special.primary);
                     }
                 }
                 ScanPhase::Primary => {
                     scan.phase = ScanPhase::Fallback;
-                    scan.cursor.set_region(&self.special.fallback);
-                    scan.cur_data = self.special.fallback.data_ptr().cast();
+                    scan.region.enter(&self.special.fallback);
                 }
                 ScanPhase::Fallback => {
                     scan.phase = ScanPhase::Done;
@@ -1829,46 +1823,32 @@ where
         self.max_insertions
     }
 
-    fn reserve(&mut self, additional: usize) {
-        let needed = self.len.saturating_add(additional);
-        if needed <= self.max_insertions {
-            return;
-        }
-        let new_capacity = self.grow_capacity_for(needed).expect("capacity overflow");
+    #[inline]
+    fn total_slots(&self) -> usize {
+        self.total_slots
+    }
+
+    #[inline]
+    fn reserve_fraction(&self) -> f64 {
+        self.reserve_fraction
+    }
+
+    #[inline]
+    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
+        self.grow_capacity_for(needed)
+    }
+
+    #[inline]
+    fn resize(&mut self, new_capacity: usize) {
         self.resize(new_capacity);
     }
 
-    fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
+    #[inline]
+    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
     where
         S: Clone,
     {
-        let needed = self
-            .len
-            .checked_add(additional)
-            .ok_or(TryReserveError::CapacityOverflow)?;
-        if needed <= self.max_insertions {
-            return Ok(());
-        }
-        let new_capacity = self
-            .grow_capacity_for(needed)
-            .ok_or(TryReserveError::CapacityOverflow)?;
         self.try_resize(new_capacity)
-    }
-
-    fn shrink_to(&mut self, min_capacity: usize) {
-        if self.len == 0 && min_capacity == 0 {
-            if self.total_slots > 0 {
-                self.resize(0);
-            }
-            return;
-        }
-        let lower = self.len.max(min_capacity).max(INITIAL_CAPACITY);
-        let new_capacity = capacity::capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction)
-            .expect("capacity overflow");
-        if new_capacity >= self.total_slots {
-            return;
-        }
-        self.resize(new_capacity);
     }
 
     #[inline]
@@ -2008,19 +1988,17 @@ where
         FunnelScan {
             phase: ScanPhase::Levels,
             level_idx: 0,
-            cursor: OccupiedSlots::empty(),
-            cur_data: std::ptr::null_mut(),
-            started: false,
+            region: RegionCursor::new(),
         }
     }
 
     #[inline]
     fn scan_next(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, SlotLocation)> {
         // Hot path: another occupied slot in the region the cursor already holds.
-        if scan.started
-            && let Some(slot_idx) = scan.cursor.step()
+        if scan.region.started()
+            && let Some((ptr, slot_idx)) = scan.region.step::<SlotEntry<K, V>>()
         {
-            return Some(scan.yield_at::<K, V>(slot_idx));
+            return Some((ptr, scan.location_at(slot_idx)));
         }
         self.scan_advance(scan)
     }
@@ -2050,40 +2028,23 @@ enum ScanPhase {
 }
 
 /// Pointerless multi-region scan cursor for [`RawTable::scan`]. Holds only the
-/// current phase + level index + an in-region [`OccupiedSlots`]; the owning
-/// iterator can move the table because no pointer into it is stored across
-/// calls. Mirrors [`crate::elastic::ElasticScan`] but crosses three region
-/// kinds (levels → special primary → special fallback).
+/// current phase + level index + a shared [`RegionCursor`]; the owning iterator
+/// can move the table because no pointer into it is stored across calls.
+/// Mirrors [`crate::elastic::ElasticScan`] but crosses three region kinds
+/// (levels → special primary → special fallback).
+#[derive(Clone)]
 pub struct FunnelScan {
     phase: ScanPhase,
     level_idx: usize,
-    cursor: OccupiedSlots,
-    /// Cached `data_ptr()` of the current region (as bytes), refreshed on each
-    /// region cross so `scan_next` yields a slot pointer with one offset.
-    cur_data: *mut u8,
-    /// `false` until the first [`RawTable::scan_next`] lazily sets the cursor
-    /// + `cur_data` from `&self`, keeping `scan()` pointer-free.
-    started: bool,
-}
-
-impl Clone for FunnelScan {
-    fn clone(&self) -> Self {
-        Self {
-            phase: self.phase,
-            level_idx: self.level_idx,
-            cursor: self.cursor.clone(),
-            cur_data: self.cur_data,
-            started: self.started,
-        }
-    }
+    region: RegionCursor,
 }
 
 impl FunnelScan {
-    /// Builds the `(slot ptr, location)` pair for `slot_idx` in the cursor's
-    /// current region. Shared by the hot and cold `scan_next` paths.
+    /// Maps `slot_idx` in the cursor's current region to its [`SlotLocation`].
+    /// Shared by the hot and cold `scan_next` paths.
     #[inline]
-    fn yield_at<K, V>(&self, slot_idx: usize) -> (*mut SlotEntry<K, V>, SlotLocation) {
-        let loc = match self.phase {
+    fn location_at(&self, slot_idx: usize) -> SlotLocation {
+        match self.phase {
             ScanPhase::Levels => SlotLocation::Level {
                 level_idx: self.level_idx,
                 slot_idx,
@@ -2093,11 +2054,7 @@ impl FunnelScan {
             // `step` returns `None` on an empty region, so the cursor never
             // yields once the phase machine reaches `Done`.
             ScanPhase::Done => unreachable!("cursor empty in Done phase"),
-        };
-        // SAFETY: `cur_data` is the current region's slot array; `slot_idx` is
-        // in-bounds for it (`step` yields only valid slots).
-        let ptr = unsafe { self.cur_data.cast::<SlotEntry<K, V>>().add(slot_idx) };
-        (ptr, loc)
+        }
     }
 }
 
