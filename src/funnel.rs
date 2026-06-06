@@ -577,219 +577,184 @@ pub type FunnelSetOccupiedEntry<'a, T, S = DefaultHashBuilder, A = Global> =
 pub type FunnelSetVacantEntry<'a, T, S = DefaultHashBuilder, A = Global> =
     set::VacantEntry<'a, T, FunnelTable<T, (), S, A>>;
 
-/// Total ctrl bytes for a funnel layout. Each level rounds bucket count up
-/// to pow2 then multiplies by `bw`; special arrays are pre-rounded.
-fn funnel_total_ctrl(
-    level_bucket_counts: &[usize],
-    bucket_width: usize,
-    primary_ctrl: usize,
-    fallback_ctrl: usize,
-) -> usize {
-    let bw = bucket_width.next_power_of_two();
-    level_bucket_counts
-        .iter()
-        .map(|&bc| {
-            let bc = if bc == 0 { 0 } else { bc.next_power_of_two() };
-            bc.saturating_mul(bw)
-        })
-        .sum::<usize>()
-        + primary_ctrl
-        + fallback_ctrl
-}
-
-/// Fallible single-arena builder for a funnel map.
-///
-/// `bucket_width` is rounded up to a power of two and applied to each
-/// `level_bucket_counts` entry (also rounded up). Returns the arena and
-/// the level + special descriptors with offsets stamped into a single
-/// contiguous allocation:
-/// `[ctrls_L0|ctrls_L1|...|sp_ctrl|sf_ctrl][pad][slots_L0|...|sf_slots]`.
+/// Boxed level descriptors for one funnel arena build.
 type BucketLevelSlice<K, V> = Box<[BucketLevel<SlotEntry<K, V>>]>;
 
+/// Full result of a funnel arena build: arena + level + special descriptors.
 type FunnelArenaBuild<K, V> = (Arena, BucketLevelSlice<K, V>, SpecialArray<SlotEntry<K, V>>);
 
-/// Subset of [`FunnelArenaBuild`] minus the arena — built by the inner
-/// closure of `try_alloc_funnel_arena` so a failure deallocates the arena
-/// before returning.
+/// [`FunnelArenaBuild`] minus the arena, returned by
+/// [`FunnelGeometry::build_regions`] so the caller deallocates on error.
 type FunnelArenaInner<K, V> = (BucketLevelSlice<K, V>, SpecialArray<SlotEntry<K, V>>);
 
-/// Layout inputs for [`build_funnel_regions`]: levels + special arrays
-/// with their pre-rounded sizes. Split out to keep the builder shallow.
+/// Power-of-two-rounded layout sizes for one funnel map: levels + the two
+/// special arrays. Derives every rounded size once in [`new`](Self::new), then
+/// owns the build/alloc steps so callers never re-thread or re-round them.
 struct FunnelGeometry<'a> {
     level_bucket_counts: &'a [usize],
-    bucket_width: u32,
+    /// `bucket_width` rounded up to a power of two.
+    bucket_width: usize,
     primary_ctrl: usize,
     fallback_ctrl: usize,
     fallback_bucket_size: usize,
 }
 
-/// Stamps level + special descriptors from the arena base. Split out so the
-/// alloc-then-deallocate-on-error wrapper stays shallow.
-fn build_funnel_regions<K, V>(
-    arena_base: *mut u8,
-    data_base_off: usize,
-    geom: &FunnelGeometry<'_>,
-) -> Result<FunnelArenaInner<K, V>, TryReserveError> {
-    let slot_size = u32::try_from(mem::size_of::<SlotEntry<K, V>>())
-        .map_err(|_| TryReserveError::CapacityOverflow)?;
-    let mut ctrl_off: u32 = 0;
-    let mut data_off: u32 =
-        u32::try_from(data_base_off).map_err(|_| TryReserveError::CapacityOverflow)?;
+impl<'a> FunnelGeometry<'a> {
+    /// Rounds the raw capacities to their final layout sizes once. `bucket_width`
+    /// rounds up to a power of two; the special capacities to their ctrl-byte
+    /// extents (idempotent if already rounded).
+    fn new(
+        level_bucket_counts: &'a [usize],
+        bucket_width: usize,
+        special_primary_capacity: usize,
+        special_fallback_capacity: usize,
+        fallback_bucket_size: usize,
+    ) -> Self {
+        Self {
+            level_bucket_counts,
+            bucket_width: bucket_width.next_power_of_two(),
+            primary_ctrl: align::round_up_to_pow2_groups(special_primary_capacity),
+            fallback_ctrl: align::round_up_to_group(special_fallback_capacity),
+            fallback_bucket_size,
+        }
+    }
 
-    let mut levels: Vec<BucketLevel<SlotEntry<K, V>>> = Vec::new();
-    levels
-        .try_reserve_exact(geom.level_bucket_counts.len())
-        .map_err(|_| TryReserveError::AllocError)?;
-    let bw32 = geom.bucket_width;
-    for (level_idx, &bc_raw) in geom.level_bucket_counts.iter().enumerate() {
-        let bc = u32::try_from(if bc_raw == 0 {
-            0
-        } else {
-            bc_raw.next_power_of_two()
-        })
-        .map_err(|_| TryReserveError::CapacityOverflow)?;
-        let cap = bc.saturating_mul(bw32);
-        let ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
-        let data_ptr = unsafe {
+    /// Total control-byte count across levels + both special arrays.
+    fn total_ctrl(&self) -> usize {
+        self.level_bucket_counts
+            .iter()
+            .map(|&bc| {
+                let bc = if bc == 0 { 0 } else { bc.next_power_of_two() };
+                bc.saturating_mul(self.bucket_width)
+            })
+            .sum::<usize>()
+            + self.primary_ctrl
+            + self.fallback_ctrl
+    }
+
+    /// Stamps level + special descriptors from the arena base into a single
+    /// contiguous allocation:
+    /// `[ctrls_L0|...|sp_ctrl|sf_ctrl][pad][slots_L0|...|sf_slots]`.
+    fn build_regions<K, V>(
+        &self,
+        arena_base: *mut u8,
+        data_base_off: usize,
+    ) -> Result<FunnelArenaInner<K, V>, TryReserveError> {
+        let slot_size = u32::try_from(mem::size_of::<SlotEntry<K, V>>())
+            .map_err(|_| TryReserveError::CapacityOverflow)?;
+        let mut ctrl_off: u32 = 0;
+        let mut data_off: u32 =
+            u32::try_from(data_base_off).map_err(|_| TryReserveError::CapacityOverflow)?;
+
+        let mut levels: Vec<BucketLevel<SlotEntry<K, V>>> = Vec::new();
+        levels
+            .try_reserve_exact(self.level_bucket_counts.len())
+            .map_err(|_| TryReserveError::AllocError)?;
+        let bw32 =
+            u32::try_from(self.bucket_width).map_err(|_| TryReserveError::CapacityOverflow)?;
+        for (level_idx, &bc_raw) in self.level_bucket_counts.iter().enumerate() {
+            let bc = u32::try_from(if bc_raw == 0 {
+                0
+            } else {
+                bc_raw.next_power_of_two()
+            })
+            .map_err(|_| TryReserveError::CapacityOverflow)?;
+            let cap = bc.saturating_mul(bw32);
+            let ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
+            let data_ptr = unsafe {
+                arena_base
+                    .add(data_off as usize)
+                    .cast::<MaybeUninit<SlotEntry<K, V>>>()
+            };
+            levels.push(BucketLevel::new_at(level_idx, bc, bw32, ctrl_ptr, data_ptr));
+            ctrl_off += cap;
+            data_off += cap * slot_size;
+        }
+
+        let primary_cap =
+            u32::try_from(self.primary_ctrl).map_err(|_| TryReserveError::CapacityOverflow)?;
+        let primary_gc_mask = u32::try_from(self.primary_ctrl / GROUP_SIZE)
+            .map_err(|_| TryReserveError::CapacityOverflow)?
+            .wrapping_sub(1);
+        let primary_ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
+        let primary_data_ptr = unsafe {
             arena_base
                 .add(data_off as usize)
                 .cast::<MaybeUninit<SlotEntry<K, V>>>()
         };
-        levels.push(BucketLevel::new_at(level_idx, bc, bw32, ctrl_ptr, data_ptr));
-        ctrl_off += cap;
-        data_off += cap * slot_size;
+        let primary = SpecialPrimary::new_at(
+            primary_cap,
+            primary_gc_mask,
+            primary_ctrl_ptr,
+            primary_data_ptr,
+        );
+        ctrl_off += primary_cap;
+        data_off += primary_cap * slot_size;
+
+        let fallback_cap =
+            u32::try_from(self.fallback_ctrl).map_err(|_| TryReserveError::CapacityOverflow)?;
+        let fb_size = self.fallback_bucket_size.next_power_of_two();
+        let fb_count = u32::try_from(if fb_size == 0 {
+            0
+        } else {
+            self.fallback_ctrl.div_ceil(fb_size)
+        })
+        .map_err(|_| TryReserveError::CapacityOverflow)?;
+        let fb_log2 = u32::try_from(fb_size)
+            .map_err(|_| TryReserveError::CapacityOverflow)?
+            .trailing_zeros();
+        let fallback_ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
+        let fallback_data_ptr = unsafe {
+            arena_base
+                .add(data_off as usize)
+                .cast::<MaybeUninit<SlotEntry<K, V>>>()
+        };
+        let fallback = SpecialFallback::new_at(
+            fallback_cap,
+            fb_count,
+            fb_log2,
+            fallback_ctrl_ptr,
+            fallback_data_ptr,
+        );
+
+        Ok((
+            levels.into_boxed_slice(),
+            SpecialArray {
+                primary,
+                fallback,
+                total_len: 0,
+            },
+        ))
     }
 
-    let primary_cap =
-        u32::try_from(geom.primary_ctrl).map_err(|_| TryReserveError::CapacityOverflow)?;
-    let primary_gc_mask = u32::try_from(geom.primary_ctrl / GROUP_SIZE)
-        .map_err(|_| TryReserveError::CapacityOverflow)?
-        .wrapping_sub(1);
-    let primary_ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
-    let primary_data_ptr = unsafe {
-        arena_base
-            .add(data_off as usize)
-            .cast::<MaybeUninit<SlotEntry<K, V>>>()
-    };
-    let primary = SpecialPrimary::new_at(
-        primary_cap,
-        primary_gc_mask,
-        primary_ctrl_ptr,
-        primary_data_ptr,
-    );
-    ctrl_off += primary_cap;
-    data_off += primary_cap * slot_size;
-
-    let fallback_cap =
-        u32::try_from(geom.fallback_ctrl).map_err(|_| TryReserveError::CapacityOverflow)?;
-    let fb_size = geom.fallback_bucket_size.next_power_of_two();
-    let fb_count = u32::try_from(if fb_size == 0 {
-        0
-    } else {
-        geom.fallback_ctrl.div_ceil(fb_size)
-    })
-    .map_err(|_| TryReserveError::CapacityOverflow)?;
-    let fb_log2 = u32::try_from(fb_size)
-        .map_err(|_| TryReserveError::CapacityOverflow)?
-        .trailing_zeros();
-    let fallback_ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
-    let fallback_data_ptr = unsafe {
-        arena_base
-            .add(data_off as usize)
-            .cast::<MaybeUninit<SlotEntry<K, V>>>()
-    };
-    let fallback = SpecialFallback::new_at(
-        fallback_cap,
-        fb_count,
-        fb_log2,
-        fallback_ctrl_ptr,
-        fallback_data_ptr,
-    );
-
-    Ok((
-        levels.into_boxed_slice(),
-        SpecialArray {
-            primary,
-            fallback,
-            total_len: 0,
-        },
-    ))
-}
-
-fn try_alloc_funnel_arena<K, V, A: Allocator + Clone>(
-    level_bucket_counts: &[usize],
-    bucket_width: usize,
-    special_primary_capacity: usize,
-    special_fallback_capacity: usize,
-    fallback_bucket_size: usize,
-    alloc: &A,
-) -> Result<FunnelArenaBuild<K, V>, TryReserveError> {
-    let bw = bucket_width.next_power_of_two();
-    let primary_ctrl = align::round_up_to_pow2_groups(special_primary_capacity);
-    let fallback_ctrl = align::round_up_to_group(special_fallback_capacity);
-    let total_ctrl = funnel_total_ctrl(
-        level_bucket_counts,
-        bucket_width,
-        primary_ctrl,
-        fallback_ctrl,
-    );
-    let (arena_layout, data_base_off) = arena::layout_for::<K, V>(total_ctrl)?;
-    let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout, total_ctrl, alloc)?;
-
-    let Ok(bw32) = u32::try_from(bw) else {
-        arena.deallocate(alloc);
-        return Err(TryReserveError::CapacityOverflow);
-    };
-    let geom = FunnelGeometry {
-        level_bucket_counts,
-        bucket_width: bw32,
-        primary_ctrl,
-        fallback_ctrl,
-        fallback_bucket_size,
-    };
-
-    // `Arena` has no `Drop`, so a bare `?` would leak the allocation if
-    // region construction fails. Deallocate explicitly on `Err`.
-    match build_funnel_regions::<K, V>(arena.as_ptr(), data_base_off, &geom) {
-        Ok((levels, special)) => Ok((arena, levels, special)),
-        Err(e) => {
-            arena.deallocate(alloc);
-            Err(e)
+    /// Fallible single-arena builder: allocates, stamps regions, deallocates on
+    /// error (`Arena` has no `Drop`, so a bare `?` would leak).
+    fn try_alloc<K, V, A: Allocator + Clone>(
+        &self,
+        alloc: &A,
+    ) -> Result<FunnelArenaBuild<K, V>, TryReserveError> {
+        let total_ctrl = self.total_ctrl();
+        let (arena_layout, data_base_off) = arena::layout_for::<K, V>(total_ctrl)?;
+        let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout, total_ctrl, alloc)?;
+        match self.build_regions::<K, V>(arena.as_ptr(), data_base_off) {
+            Ok((levels, special)) => Ok((arena, levels, special)),
+            Err(e) => {
+                arena.deallocate(alloc);
+                Err(e)
+            }
         }
     }
-}
 
-fn alloc_funnel_arena<K, V, A: Allocator + Clone>(
-    level_bucket_counts: &[usize],
-    bucket_width: usize,
-    special_primary_capacity: usize,
-    special_fallback_capacity: usize,
-    fallback_bucket_size: usize,
-    alloc: &A,
-) -> FunnelArenaBuild<K, V> {
-    try_alloc_funnel_arena(
-        level_bucket_counts,
-        bucket_width,
-        special_primary_capacity,
-        special_fallback_capacity,
-        fallback_bucket_size,
-        alloc,
-    )
-    .unwrap_or_else(|_| {
-        let primary_ctrl = align::round_up_to_pow2_groups(special_primary_capacity);
-        let fallback_ctrl = align::round_up_to_group(special_fallback_capacity);
-        let total_ctrl = funnel_total_ctrl(
-            level_bucket_counts,
-            bucket_width,
-            primary_ctrl,
-            fallback_ctrl,
-        );
-        let layout = match arena::layout_for::<K, V>(total_ctrl) {
-            Ok((l, _)) => l,
-            Err(_) => Layout::from_size_align(1, 1).unwrap(),
-        };
-        allocator_api2::alloc::handle_alloc_error(layout)
-    })
+    /// Infallible [`try_alloc`](Self::try_alloc); aborts via `handle_alloc_error`.
+    fn alloc<K, V, A: Allocator + Clone>(&self, alloc: &A) -> FunnelArenaBuild<K, V> {
+        self.try_alloc(alloc).unwrap_or_else(|_| {
+            let layout = match arena::layout_for::<K, V>(self.total_ctrl()) {
+                Ok((l, _)) => l,
+                Err(_) => Layout::from_size_align(1, 1).unwrap(),
+            };
+            allocator_api2::alloc::handle_alloc_error(layout)
+        })
+    }
 }
 
 /// Drops occupied slots + deallocates the arena if dropped before
@@ -871,14 +836,14 @@ where
         let fallback_ctrl =
             align::round_up_to_group(special_capacity.saturating_sub(special_capacity.div_ceil(2)));
 
-        let (arena, levels, special) = alloc_funnel_arena(
+        let (arena, levels, special) = FunnelGeometry::new(
             &level_bucket_counts,
             bucket_width,
             primary_ctrl,
             fallback_ctrl,
             fallback_bucket_size,
-            &alloc,
-        );
+        )
+        .alloc(&alloc);
 
         Self {
             levels,
@@ -1164,14 +1129,14 @@ where
         let primary_ctrl = align::round_up_to_pow2_groups(special_capacity.div_ceil(2));
         let fallback_ctrl =
             align::round_up_to_group(special_capacity.saturating_sub(special_capacity.div_ceil(2)));
-        let (arena, levels, special) = try_alloc_funnel_arena(
+        let (arena, levels, special) = FunnelGeometry::new(
             &level_bucket_counts,
             bucket_width,
             primary_ctrl,
             fallback_ctrl,
             fallback_bucket_size,
-            &alloc,
-        )?;
+        )
+        .try_alloc(&alloc)?;
 
         Ok(Self {
             levels,
@@ -1260,14 +1225,14 @@ where
         let fallback_ctrl = align::round_up_to_group(fallback_raw);
         let alloc = &self.alloc;
 
-        let (new_arena, new_levels, new_special) = alloc_funnel_arena(
+        let (new_arena, new_levels, new_special) = FunnelGeometry::new(
             &level_bucket_counts,
             bucket_width,
             primary_ctrl,
             fallback_ctrl,
             fallback_bucket_size,
-            alloc,
-        );
+        )
+        .alloc(alloc);
 
         // Drop old levels first (they read from old arena), then replace arena.
         let old_arena = mem::replace(&mut self.arena, new_arena);
@@ -2322,14 +2287,14 @@ where
             .collect();
         let fallback_bucket_size = (self.primary_probe_limit.saturating_mul(2)).max(2);
 
-        let (arena, levels, special) = alloc_funnel_arena(
+        let (arena, levels, special) = FunnelGeometry::new(
             &level_bucket_counts,
             bucket_width,
             primary_ctrl,
             fallback_ctrl,
             fallback_bucket_size,
-            &self.alloc,
-        );
+        )
+        .alloc(&self.alloc);
 
         // Drop guard: if a user-provided `Clone` impl panics inside
         // [`clone_region_panic_safe`], walk every region's OCCUPIED ctrls to
