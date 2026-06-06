@@ -1,16 +1,12 @@
-#[cfg(target_arch = "aarch64")]
 pub(crate) type BitMaskWord = u64;
-#[cfg(not(target_arch = "aarch64"))]
-pub(crate) type BitMaskWord = u16;
 
-/// Bits-per-slot in [`BitMask`]: 4 on aarch64 (NEON nibble layout), 1 elsewhere.
-#[cfg(target_arch = "aarch64")]
+/// Bits per slot in [`BitMask`]: 4 for NEON's nibble mask, 1 elsewhere.
+#[cfg(opthash_neon_group)]
 pub(crate) const BITMASK_STRIDE: u32 = 4;
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(opthash_neon_group))]
 pub(crate) const BITMASK_STRIDE: u32 = 1;
 
-/// Per-slot match mask over a control group. `u16` on `x86_64` (1 bit/slot),
-/// `u64` on `aarch64` (4 bits/slot — native `vshrn_n_u16` output).
+/// Per-slot match mask over a control group.
 #[derive(Debug, Clone)]
 pub(crate) struct BitMask(pub(crate) BitMaskWord);
 
@@ -43,13 +39,13 @@ impl Iterator for BitMask {
         }
         let bit = self.0.trailing_zeros();
         let slot = (bit / BITMASK_STRIDE) as usize;
-        // Clear all bits for this slot (one bit on x86, full nibble on aarch64).
-        #[cfg(target_arch = "aarch64")]
+        // NEON stores each set slot as a full nibble.
+        #[cfg(opthash_neon_group)]
         {
             let nibble = (0xFu64).wrapping_shl(bit);
             self.0 &= !nibble;
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(opthash_neon_group))]
         {
             self.0 &= self.0.wrapping_sub(1);
         }

@@ -1386,6 +1386,10 @@ mod tests {
             // Slot total covers the requested capacity, bounded above by 2x.
             let total: usize = sizes.iter().sum();
             assert!(total >= cap, "cap={cap} total={total} below request");
+            // The 2x space bound holds for the default 16-byte group. The
+            // nightly wide layout rounds each geometric level up to a full
+            // 64-slot group, so small capacities can fragment past 2x.
+            #[cfg(not(opthash_wide_group))]
             assert!(total <= cap * 2, "cap={cap} total={total} exceeds 2x");
             // Each next level is at most the previous (non-increasing) and at
             // least half — the geometric halving shape, with pow2 rounding

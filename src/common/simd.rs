@@ -1,30 +1,39 @@
 #[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::{self, uint8x16_t};
+use std::arch::aarch64;
+#[cfg(opthash_neon_group)]
+use std::arch::aarch64::uint8x16_t;
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{self, __m128i, __m256i};
+use std::arch::x86_64;
+#[cfg(all(target_arch = "x86_64", opthash_eq_bits_16))]
+use std::arch::x86_64::__m128i;
+#[cfg(opthash_avx2)]
+use std::arch::x86_64::__m256i;
+#[cfg(opthash_avx512_group)]
+use std::arch::x86_64::__m512i;
 
 use super::bitmask::BitMask;
+#[cfg(opthash_scalar_group)]
 use super::config::GROUP_SIZE;
 use super::control::FINGERPRINT_MASK;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(opthash_scalar_group)]
 use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
 
-/// 1-bit-per-byte u32 mask over a 16-byte chunk
+// Fixed 16-byte equality scan used by 16-byte groups and non-AVX2 cold scans.
 #[inline]
-pub(super) fn match_fingerprint_group_u32(ptr: *const u8, target: u8) -> u32 {
-    // _mm_loadu_si128 requires a *const __m128i but performs an unaligned
-    // load, so the alignment cast is safe; clippy can't see that.
+#[cfg(opthash_eq_bits_16)]
+unsafe fn eq_bits_16(ptr: *const u8, target: u8) -> u64 {
+    // _mm_loadu_si128 is unaligned despite taking `*const __m128i`.
     #[allow(clippy::cast_ptr_alignment)]
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
         let cmp = x86_64::_mm_cmpeq_epi8(data, x86_64::_mm_set1_epi8(target.cast_signed()));
-        x86_64::_mm_movemask_epi8(cmp).cast_unsigned() & 0xFFFF
+        u64::from(x86_64::_mm_movemask_epi8(cmp).cast_unsigned() & 0xFFFF)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let mut m = 0u32;
-        for i in 0..GROUP_SIZE {
+        let mut m = 0u64;
+        for i in 0..16 {
             if unsafe { *ptr.add(i) } == target {
                 m |= 1 << i;
             }
@@ -33,30 +42,46 @@ pub(super) fn match_fingerprint_group_u32(ptr: *const u8, target: u8) -> u32 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SIMD mask functions
-// ---------------------------------------------------------------------------
+/// # Safety
+///
+/// `ptr` must be valid to read `GROUP_SIZE` bytes.
+#[inline]
+pub(super) unsafe fn eq_bits_group(ptr: *const u8, target: u8) -> u64 {
+    #[cfg(opthash_avx512_group)]
+    unsafe {
+        eq_mask_64_avx512(ptr, target).0
+    }
+
+    #[cfg(not(opthash_wide_group))]
+    {
+        unsafe { eq_bits_16(ptr, target) }
+    }
+}
 
 /// # Safety
 ///
 /// `ptr` must be valid to read `GROUP_SIZE` bytes.
 #[inline]
 #[must_use]
-pub(crate) unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> BitMask {
-    #[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
+    #[cfg(opthash_neon_group)]
     unsafe {
         eq_mask_16_neon(ptr, target)
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(opthash_avx512_group)]
+    unsafe {
+        eq_mask_64_avx512(ptr, target)
+    }
+    #[cfg(opthash_x86_16_group)]
     unsafe {
         eq_mask_16_sse2(ptr, target)
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(opthash_scalar_group)]
     {
-        let mut m: u16 = 0;
+        let mut m = 0u64;
         for i in 0..GROUP_SIZE {
             if unsafe { *ptr.add(i) } == target {
-                m |= 1u16 << i;
+                m |= 1 << i;
             }
         }
         BitMask(m)
@@ -68,52 +93,59 @@ pub(crate) unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> BitMask {
 /// `ptr` must be valid to read `GROUP_SIZE` bytes.
 #[inline]
 #[must_use]
-pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> BitMask {
-    #[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
+    #[cfg(opthash_neon_group)]
     unsafe {
         free_mask_16_neon(ptr)
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(opthash_avx512_group)]
+    unsafe {
+        free_mask_64_avx512(ptr)
+    }
+    #[cfg(opthash_x86_16_group)]
     unsafe {
         free_mask_16_sse2(ptr)
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(opthash_scalar_group)]
     {
-        let mut m: u16 = 0;
+        let mut m = 0u64;
         for i in 0..GROUP_SIZE {
             let b = unsafe { *ptr.add(i) };
             if b == CTRL_EMPTY || b == CTRL_TOMBSTONE {
-                m |= 1u16 << i;
+                m |= 1 << i;
             }
         }
         BitMask(m)
     }
 }
 
-/// Bitmask of occupied slots (low-7-bit fingerprint set, high bit clear).
-/// Padding and tombstones are excluded.
+/// Bitmask of occupied slots; padding and tombstones are excluded.
 ///
 /// # Safety
 ///
 /// `ptr` must be valid to read `GROUP_SIZE` bytes.
 #[inline]
 #[must_use]
-pub(crate) unsafe fn occupied_mask_16(ptr: *const u8) -> BitMask {
-    #[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
+    #[cfg(opthash_neon_group)]
     unsafe {
         occupied_mask_16_neon(ptr)
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(opthash_avx512_group)]
+    unsafe {
+        occupied_mask_64_avx512(ptr)
+    }
+    #[cfg(opthash_x86_16_group)]
     unsafe {
         occupied_mask_16_sse2(ptr)
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(opthash_scalar_group)]
     {
-        let mut m: u16 = 0;
+        let mut m = 0u64;
         for i in 0..GROUP_SIZE {
             let b = unsafe { *ptr.add(i) };
             if (b & FINGERPRINT_MASK) != 0 {
-                m |= 1u16 << i;
+                m |= 1 << i;
             }
         }
         BitMask(m)
@@ -125,28 +157,25 @@ pub(crate) unsafe fn occupied_mask_16(ptr: *const u8) -> BitMask {
 /// `ptr` must be valid to read 32 bytes.
 #[inline]
 #[must_use]
-pub(crate) unsafe fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            unsafe { return eq_mask_32_avx2(ptr, target) };
-        }
+pub(crate) unsafe fn eq_bits_32(ptr: *const u8, target: u8) -> u64 {
+    #[cfg(opthash_avx2)]
+    unsafe {
+        eq_bits_32_avx2(ptr, target)
     }
-
-    let lo = match_fingerprint_group_u32(ptr, target);
-    let hi = match_fingerprint_group_u32(unsafe { ptr.add(GROUP_SIZE) }, target);
-    lo | (hi << GROUP_SIZE)
+    #[cfg(not(opthash_avx2))]
+    unsafe {
+        let lo = eq_bits_16(ptr, target);
+        let hi = eq_bits_16(ptr.add(16), target);
+        lo | (hi << 16)
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Platform-specific SIMD implementations
-// ---------------------------------------------------------------------------
+// Backend helpers. Numeric suffixes are the number of control bytes scanned.
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(opthash_neon_group)]
 #[inline]
 unsafe fn nibble_mask_from_cmp(cmp: uint8x16_t) -> BitMask {
-    // vshrn narrows 16×u8 → 8 bytes: each source byte of 0xFF becomes a nibble
-    // of 0xF in the output, 0x00 becomes 0x0. Result u64 has 4 bits per slot.
+    // NEON narrows compare bytes into one nibble per slot.
     unsafe {
         let narrowed = aarch64::vshrn_n_u16(aarch64::vreinterpretq_u16_u8(cmp), 4);
         BitMask(aarch64::vget_lane_u64(
@@ -156,7 +185,7 @@ unsafe fn nibble_mask_from_cmp(cmp: uint8x16_t) -> BitMask {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(opthash_neon_group)]
 #[inline]
 unsafe fn eq_mask_16_neon(ptr: *const u8, target: u8) -> BitMask {
     unsafe {
@@ -166,7 +195,7 @@ unsafe fn eq_mask_16_neon(ptr: *const u8, target: u8) -> BitMask {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(opthash_neon_group)]
 #[inline]
 unsafe fn free_mask_16_neon(ptr: *const u8) -> BitMask {
     unsafe {
@@ -177,11 +206,9 @@ unsafe fn free_mask_16_neon(ptr: *const u8) -> BitMask {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(opthash_neon_group)]
 #[inline]
 unsafe fn occupied_mask_16_neon(ptr: *const u8) -> BitMask {
-    // vtstq_u8(a, b) gives 0xFF where (a AND b) != 0 — with b = 0x7F that's
-    // exactly the occupied set.
     unsafe {
         let bytes = aarch64::vld1q_u8(ptr);
         let occ_cmp = aarch64::vtstq_u8(bytes, aarch64::vdupq_n_u8(FINGERPRINT_MASK));
@@ -189,25 +216,55 @@ unsafe fn occupied_mask_16_neon(ptr: *const u8) -> BitMask {
     }
 }
 
-// _mm_loadu_si128 takes `*const __m128i` but is an unaligned load — clippy
-// can't see that; allow the alignment cast for these intrinsic wrappers.
+// x86 unaligned loads require alignment casts that clippy cannot prove safe.
 #[allow(clippy::cast_ptr_alignment)]
-#[cfg(target_arch = "x86_64")]
+#[cfg(opthash_x86_16_group)]
 #[inline]
 unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> BitMask {
     unsafe {
         let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
         let target_vec = x86_64::_mm_set1_epi8(target.cast_signed());
         let cmp = x86_64::_mm_cmpeq_epi8(data, target_vec);
-        // movemask returns i32 with non-zero bits only in [0, 16);
-        // mask + try narrows to u16 losslessly.
         let bits = x86_64::_mm_movemask_epi8(cmp).cast_unsigned() & 0xFFFF;
-        BitMask(u16::try_from(bits).unwrap_or(0))
+        BitMask(u64::from(bits))
     }
 }
 
 #[allow(clippy::cast_ptr_alignment)]
-#[cfg(target_arch = "x86_64")]
+#[cfg(opthash_avx512_group)]
+#[inline]
+unsafe fn eq_mask_64_avx512(ptr: *const u8, target: u8) -> BitMask {
+    unsafe {
+        let data = x86_64::_mm512_loadu_si512(ptr.cast::<__m512i>());
+        let target_vec = x86_64::_mm512_set1_epi8(target.cast_signed());
+        BitMask(x86_64::_mm512_cmpeq_epi8_mask(data, target_vec))
+    }
+}
+
+#[allow(clippy::cast_ptr_alignment)]
+#[cfg(opthash_avx512_group)]
+#[inline]
+unsafe fn free_mask_64_avx512(ptr: *const u8) -> BitMask {
+    unsafe {
+        let data = x86_64::_mm512_loadu_si512(ptr.cast::<__m512i>());
+        let fingerprint_bits = x86_64::_mm512_set1_epi8(FINGERPRINT_MASK.cast_signed());
+        BitMask(x86_64::_mm512_testn_epi8_mask(data, fingerprint_bits))
+    }
+}
+
+#[allow(clippy::cast_ptr_alignment)]
+#[cfg(opthash_avx512_group)]
+#[inline]
+unsafe fn occupied_mask_64_avx512(ptr: *const u8) -> BitMask {
+    unsafe {
+        let data = x86_64::_mm512_loadu_si512(ptr.cast::<__m512i>());
+        let fingerprint_bits = x86_64::_mm512_set1_epi8(FINGERPRINT_MASK.cast_signed());
+        BitMask(x86_64::_mm512_test_epi8_mask(data, fingerprint_bits))
+    }
+}
+
+#[allow(clippy::cast_ptr_alignment)]
+#[cfg(opthash_x86_16_group)]
 #[inline]
 unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
     unsafe {
@@ -216,33 +273,32 @@ unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
             x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()));
         let free = x86_64::_mm_cmpeq_epi8(masked, x86_64::_mm_setzero_si128());
         let bits = x86_64::_mm_movemask_epi8(free).cast_unsigned() & 0xFFFF;
-        BitMask(u16::try_from(bits).unwrap_or(0))
+        BitMask(u64::from(bits))
     }
 }
 
 #[allow(clippy::cast_ptr_alignment)]
-#[cfg(target_arch = "x86_64")]
+#[cfg(opthash_x86_16_group)]
 #[inline]
 unsafe fn occupied_mask_16_sse2(ptr: *const u8) -> BitMask {
-    // cmpgt against zero on the low-7-bit mask yields 0xFF for occupied lanes.
     unsafe {
         let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
         let masked =
             x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()));
         let occ = x86_64::_mm_cmpgt_epi8(masked, x86_64::_mm_setzero_si128());
         let bits = x86_64::_mm_movemask_epi8(occ).cast_unsigned() & 0xFFFF;
-        BitMask(u16::try_from(bits).unwrap_or(0))
+        BitMask(u64::from(bits))
     }
 }
 
 #[allow(clippy::cast_ptr_alignment)]
-#[cfg(target_arch = "x86_64")]
+#[cfg(opthash_avx2)]
 #[inline]
-unsafe fn eq_mask_32_avx2(ptr: *const u8, target: u8) -> u32 {
+unsafe fn eq_bits_32_avx2(ptr: *const u8, target: u8) -> u64 {
     unsafe {
         let data = x86_64::_mm256_loadu_si256(ptr.cast::<__m256i>());
         let target_vec = x86_64::_mm256_set1_epi8(target.cast_signed());
         let cmp = x86_64::_mm256_cmpeq_epi8(data, target_vec);
-        x86_64::_mm256_movemask_epi8(cmp).cast_unsigned()
+        u64::from(x86_64::_mm256_movemask_epi8(cmp).cast_unsigned())
     }
 }

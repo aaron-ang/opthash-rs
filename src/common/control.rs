@@ -55,14 +55,14 @@ pub(crate) fn find_next_fingerprint_in_controls(
             .map(|offset| start + offset);
     }
 
-    let wide = preferred_group_width();
     let mut index = start;
-    while wide > GROUP_SIZE && index + wide <= controls.len() {
-        let mask = control_match_fingerprint_group(&controls[index..index + wide], fingerprint);
+    while WIDE_SCAN_WIDTH > GROUP_SIZE && index + WIDE_SCAN_WIDTH <= controls.len() {
+        let mask =
+            control_match_fingerprint_group(&controls[index..index + WIDE_SCAN_WIDTH], fingerprint);
         if mask != 0 {
             return Some(index + mask.trailing_zeros() as usize);
         }
-        index += wide;
+        index += WIDE_SCAN_WIDTH;
     }
 
     while index + GROUP_SIZE <= controls.len() {
@@ -80,39 +80,23 @@ pub(crate) fn find_next_fingerprint_in_controls(
         .map(|offset| index + offset)
 }
 
-#[inline]
-#[must_use]
-fn preferred_group_width() -> usize {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use std::sync::OnceLock;
-        static WIDTH: OnceLock<usize> = OnceLock::new();
-        *WIDTH.get_or_init(|| {
-            if std::is_x86_feature_detected!("avx2") {
-                32
-            } else {
-                GROUP_SIZE
-            }
-        })
-    }
+/// Cold fallback scan width: AVX2 scans 32 bytes, others one group.
+#[cfg(opthash_avx2)]
+const WIDE_SCAN_WIDTH: usize = 32;
+#[cfg(not(opthash_avx2))]
+const WIDE_SCAN_WIDTH: usize = GROUP_SIZE;
 
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        GROUP_SIZE
-    }
-}
-
-/// Cold-path 1-bit-per-byte `u32` mask. Hot callers should use `eq_mask_16`.
+/// Cold fallback equality mask. Hot callers should use `eq_mask_group`.
 ///
 /// # Panics
 ///
-/// `chunk.len()` must be 16 or 32.
+/// `chunk.len()` must be `GROUP_SIZE` or 32.
 #[inline]
 #[must_use]
-pub(crate) fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u32 {
+pub(crate) fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u64 {
     match chunk.len() {
-        GROUP_SIZE => simd::match_fingerprint_group_u32(chunk.as_ptr(), target),
-        32 => unsafe { simd::eq_mask_32(chunk.as_ptr(), target) },
-        _ => panic!("group matching requires 16 or 32 byte chunks"),
+        GROUP_SIZE => unsafe { simd::eq_bits_group(chunk.as_ptr(), target) },
+        32 => unsafe { simd::eq_bits_32(chunk.as_ptr(), target) },
+        _ => panic!("group matching requires GROUP_SIZE or 32-byte chunks"),
     }
 }

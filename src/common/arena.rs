@@ -249,12 +249,12 @@ pub(crate) trait ArenaSlots<T> {
 
     #[inline]
     fn group_match_mask(&self, group_idx: usize, target: u8) -> BitMask {
-        unsafe { simd::eq_mask_16(self.group_ctrl(group_idx), target) }
+        unsafe { simd::eq_mask_group(self.group_ctrl(group_idx), target) }
     }
 
     #[inline]
     fn group_free_mask(&self, group_idx: usize) -> BitMask {
-        unsafe { simd::free_mask_16(self.group_ctrl(group_idx)) }
+        unsafe { simd::free_mask_group(self.group_ctrl(group_idx)) }
     }
 
     #[inline]

@@ -104,7 +104,7 @@ impl<T> BucketLevel<T> {
         }
         let group_idx = bucket_range.start / GROUP_SIZE;
         let group_ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        unsafe { simd::free_mask_16(group_ptr) }
+        unsafe { simd::free_mask_group(group_ptr) }
             .lowest()
             .map(|offset| bucket_range.start + offset)
     }
@@ -116,7 +116,7 @@ impl<T> BucketLevel<T> {
     fn erase(&mut self, idx: usize) -> bool {
         let group_idx = idx / GROUP_SIZE;
         let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
+        if unsafe { simd::eq_mask_group(gp, CTRL_EMPTY).any() } {
             self.set_control(idx, CTRL_EMPTY);
             false
         } else {
@@ -166,7 +166,7 @@ impl<K, V> BucketLevel<SlotEntry<K, V>> {
         }
         let group_idx = bucket_range.start / GROUP_SIZE;
         let group_ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        let match_mask = unsafe { simd::eq_mask_16(group_ptr, key_fingerprint) };
+        let match_mask = unsafe { simd::eq_mask_group(group_ptr, key_fingerprint) };
         for relative_idx in match_mask {
             let slot_idx = bucket_range.start + relative_idx;
             let entry = unsafe { self.get_ref(slot_idx) };
@@ -175,14 +175,14 @@ impl<K, V> BucketLevel<SlotEntry<K, V>> {
             }
         }
         if wants_free {
-            let free_mask = unsafe { simd::free_mask_16(group_ptr) };
+            let free_mask = unsafe { simd::free_mask_group(group_ptr) };
             if let Some(o) = free_mask.lowest()
                 && let Some(out) = slot_out
             {
                 *out = Some(bucket_range.start + o);
             }
         }
-        if unsafe { simd::eq_mask_16(group_ptr, CTRL_EMPTY).any() } {
+        if unsafe { simd::eq_mask_group(group_ptr, CTRL_EMPTY).any() } {
             LookupStep::StopSearch
         } else {
             LookupStep::Continue
@@ -284,7 +284,7 @@ impl<T> SpecialPrimary<T> {
     fn erase(&mut self, idx: usize) -> bool {
         let group_idx = idx / GROUP_SIZE;
         let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
+        if unsafe { simd::eq_mask_group(gp, CTRL_EMPTY).any() } {
             self.set_control(idx, CTRL_EMPTY);
             false
         } else {
@@ -366,7 +366,7 @@ impl<T> SpecialFallback<T> {
     fn erase(&mut self, idx: usize) -> bool {
         let group_idx = idx / GROUP_SIZE;
         let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        if unsafe { simd::eq_mask_16(gp, CTRL_EMPTY).any() } {
+        if unsafe { simd::eq_mask_group(gp, CTRL_EMPTY).any() } {
             self.set_control(idx, CTRL_EMPTY);
             false
         } else {

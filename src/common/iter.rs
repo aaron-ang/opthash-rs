@@ -244,7 +244,7 @@ impl OccupiedSlots {
             }
             self.current_group_slot = self.current_group_slot.wrapping_add(GROUP_SIZE);
             // SAFETY: `next_ctrl < end_ctrl` ⇒ within the region's ctrl bytes.
-            self.current_mask = unsafe { simd::occupied_mask_16(self.next_ctrl) };
+            self.current_mask = unsafe { simd::occupied_mask_group(self.next_ctrl) };
             self.next_ctrl = unsafe { self.next_ctrl.add(GROUP_SIZE) };
         }
     }
