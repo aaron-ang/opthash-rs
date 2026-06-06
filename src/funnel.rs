@@ -2416,68 +2416,11 @@ where
     }
 }
 
-/// Test-only direct drivers for [`FunnelTable`] internals. The public
-/// insert/get/remove API now lives on the [`map::HashMap`] shell, but the
-/// unit tests below inspect backend-private fields (`levels`, `special`,
-/// `max_populated_level`, `reserve_fraction`), so they operate on the table
-/// directly.
-#[cfg(test)]
-impl<K, V, S, A> FunnelTable<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    fn test_insert(&mut self, key: K, value: V) -> Option<V> {
-        let hash = self.hash_key(&key);
-        let fp = control::control_fingerprint(hash);
-        if let Some(loc) = self.find_slot_location_with_hash(&key, hash, fp) {
-            return Some(self.replace_existing_value(loc, value));
-        }
-        self.insert_for_vacant_entry(key, value, hash);
-        None
-    }
-
-    fn test_get<Q>(&self, key: &Q) -> Option<&V>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let hash = self.hash_key(key);
-        let fp = control::control_fingerprint(hash);
-        let loc = self.find_slot_location_with_hash(key, hash, fp)?;
-        Some(unsafe { &self.slot_ref(loc).value })
-    }
-
-    fn test_remove<Q>(&mut self, key: &Q) -> Option<(K, V)>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let hash = self.hash_key(key);
-        let fp = control::control_fingerprint(hash);
-        let loc = self.find_slot_location_with_hash(key, hash, fp)?;
-        Some(RawTable::remove(self, loc))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::hash::{BuildHasher, Hasher};
-
-    /// Builds a [`FunnelTable`] directly (bypassing the shell) so tests can
-    /// reach backend-private fields.
-    fn table_with_capacity<K, V>(capacity: usize) -> FunnelTable<K, V>
-    where
-        K: Eq + Hash,
-    {
-        FunnelTable::with_capacity_and_reserve_fraction_and_hasher_in(
-            capacity,
-            crate::common::config::DEFAULT_RESERVE_FRACTION,
-            DefaultHashBuilder::default(),
-            Global,
-        )
-    }
 
     #[test]
     fn funnel_layout_covers_capacity() {
@@ -2485,12 +2428,13 @@ mod tests {
         // slot allocation rounds up so `capacity() >= n` and total slots
         // (level + special) cover that budget.
         let requested = 257;
-        let table: FunnelTable<i32, i32> = table_with_capacity(requested);
+        let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(requested);
         assert!(
-            table.capacity() >= requested,
+            map.capacity() >= requested,
             "capacity={} below requested={requested}",
-            table.capacity()
+            map.capacity()
         );
+        let table = map.table();
         let level_capacity: usize = table.levels.iter().map(BucketLevel::capacity).sum();
         let special_capacity = table.special.primary.capacity() + table.special.fallback.capacity();
         let total = level_capacity + special_capacity;
@@ -2526,25 +2470,26 @@ mod tests {
         // Smallest capacity exercises the SpecialPrimary path with
         // `group_count == 1` (`mask == 0`). The odd-step probe must still
         // make forward progress (loop terminates via `group_limit`).
-        let mut table: FunnelTable<u64, u64> = table_with_capacity(1);
+        let mut map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity(1);
         assert_eq!(
-            table.special.primary.group_count_mask, 0,
+            map.table().special.primary.group_count_mask,
+            0,
             "regression assumes a single-group special primary"
         );
         for i in 0..16 {
-            table.test_insert(i, i * 3);
+            map.insert(i, i * 3);
         }
         for i in 0..16 {
-            assert_eq!(table.test_get(&i), Some(&(i * 3)));
+            assert_eq!(map.get(&i), Some(&(i * 3)));
         }
         for i in 0..8 {
-            assert_eq!(table.test_remove(&i).map(|(_, v)| v), Some(i * 3));
+            assert_eq!(map.remove(&i), Some(i * 3));
         }
         for i in 0..8 {
-            assert_eq!(table.test_get(&i), None);
+            assert_eq!(map.get(&i), None);
         }
         for i in 8..16 {
-            assert_eq!(table.test_get(&i), Some(&(i * 3)));
+            assert_eq!(map.get(&i), Some(&(i * 3)));
         }
     }
 
@@ -2630,42 +2575,42 @@ mod tests {
             }
         }
 
-        let mut table: FunnelTable<i32, i32, ConstHashBuilder> =
-            FunnelTable::with_capacity_and_reserve_fraction_and_hasher_in(
+        let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
+            FunnelHashMap::with_capacity_and_reserve_fraction_and_hasher_in(
                 2048,
                 crate::common::config::DEFAULT_RESERVE_FRACTION,
                 ConstHashBuilder,
                 Global,
             );
-        assert!(table.levels.len() > 1, "test requires multi-level layout");
-        let l0_bucket_size = i32::try_from(1usize << table.levels[0].bucket_size_log2).unwrap();
+        assert!(
+            map.table().levels.len() > 1,
+            "test requires multi-level layout"
+        );
+        let l0_bucket_size =
+            i32::try_from(1usize << map.table().levels[0].bucket_size_log2).unwrap();
         // bucket holds at most l0_bucket_size; one more forces a spill.
         for i in 0..=l0_bucket_size {
-            table.test_insert(i, i);
+            map.insert(i, i);
         }
         assert_eq!(
-            table.max_populated_level, 1,
+            map.table().max_populated_level,
+            1,
             "first bucket overflow should land in A_1, not the special array"
         );
         for i in 0..=l0_bucket_size {
-            assert_eq!(table.test_get(&i), Some(&i));
+            assert_eq!(map.get(&i), Some(&i));
         }
     }
 
     #[test]
     fn reserve_fraction_clamped_to_funnel_max() {
         // Funnel's correctness proof requires reserve_fraction <= 1/8.
-        let table: FunnelTable<i32, i32> =
-            FunnelTable::with_capacity_and_reserve_fraction_and_hasher_in(
-                256,
-                0.5,
-                DefaultHashBuilder::default(),
-                Global,
-            );
+        let map: FunnelHashMap<i32, i32> =
+            FunnelHashMap::with_capacity_and_reserve_fraction(256, 0.5);
         assert!(
-            table.reserve_fraction <= MAX_FUNNEL_RESERVE_FRACTION,
+            map.table().reserve_fraction <= MAX_FUNNEL_RESERVE_FRACTION,
             "reserve_fraction={} not clamped to {MAX_FUNNEL_RESERVE_FRACTION}",
-            table.reserve_fraction
+            map.table().reserve_fraction
         );
     }
 }

@@ -175,6 +175,11 @@ impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn table(&self) -> &R {
+        &self.table
+    }
+
     /// Full constructor: capacity, reserve fraction, hasher, and allocator.
     #[must_use]
     pub fn with_capacity_and_reserve_fraction_and_hasher_in(

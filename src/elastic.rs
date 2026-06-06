@@ -1324,48 +1324,6 @@ fn build_batch_plan(
     plan.into_boxed_slice()
 }
 
-/// Test-only direct drivers for [`ElasticTable`] internals. The public
-/// insert/get/remove API now lives on the [`map::HashMap`] shell, but the
-/// unit tests below inspect backend-private fields (`levels`,
-/// `max_populated_level`), so they operate on the table directly.
-#[cfg(test)]
-impl<K, V, S, A> ElasticTable<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    fn test_insert(&mut self, key: K, value: V) -> Option<V> {
-        let hash = self.hash_key(&key);
-        let fp = control::control_fingerprint(hash);
-        if let Some(loc) = self.find_slot_indices_with_hash(&key, hash, fp) {
-            return Some(self.replace_value(loc, value));
-        }
-        self.insert_for_vacant_entry(key, value, hash);
-        None
-    }
-
-    fn test_get<Q>(&self, key: &Q) -> Option<&V>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let hash = self.hash_key(key);
-        let fp = control::control_fingerprint(hash);
-        let (l, s) = self.find_slot_indices_with_hash(key, hash, fp)?;
-        Some(unsafe { &self.slot_ref(l, s).value })
-    }
-
-    fn test_remove<Q>(&mut self, key: &Q) -> Option<(K, V)>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let hash = self.hash_key(key);
-        let fp = control::control_fingerprint(hash);
-        let loc = self.find_slot_indices_with_hash(key, hash, fp)?;
-        Some(RawTable::remove(self, loc))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1433,49 +1391,41 @@ mod tests {
     #[test]
     fn inserts_spill_to_deeper_levels_at_high_load() {
         // Paper §4: batches push later inserts into deeper levels.
-        let mut table: ElasticTable<i32, i32> =
-            ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
-                512,
-                crate::common::config::DEFAULT_RESERVE_FRACTION,
-                DefaultHashBuilder::default(),
-                Global,
-            );
-        assert!(table.levels.len() > 1, "test requires multi-level layout");
-        let max = i32::try_from(table.max_insertions).expect("test capacity fits i32");
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(512);
+        assert!(
+            map.table().levels.len() > 1,
+            "test requires multi-level layout"
+        );
+        let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
         for i in 0..max {
-            table.test_insert(i, i);
+            map.insert(i, i);
         }
         assert!(
-            table.max_populated_level > 0,
+            map.table().max_populated_level > 0,
             "expected spill into deeper level; max_populated_level = {}",
-            table.max_populated_level
+            map.table().max_populated_level
         );
         for i in 0..max {
-            assert_eq!(table.test_get(&i), Some(&i));
+            assert_eq!(map.get(&i), Some(&i));
         }
     }
 
     #[test]
     fn max_populated_level_shrinks_when_deepest_levels_emptied() {
-        let mut table: ElasticTable<i32, i32> =
-            ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
-                512,
-                crate::common::config::DEFAULT_RESERVE_FRACTION,
-                DefaultHashBuilder::default(),
-                Global,
-            );
-        let max = i32::try_from(table.max_insertions).expect("test capacity fits i32");
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(512);
+        let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
         for i in 0..max {
-            table.test_insert(i, i);
+            map.insert(i, i);
         }
-        let high_water = table.max_populated_level;
+        let high_water = map.table().max_populated_level;
         assert!(high_water > 0, "need a multi-level state to test shrinkage");
         for i in 0..max {
-            table.test_remove(&i);
+            map.remove(&i);
         }
-        assert_eq!(table.len, 0);
+        assert_eq!(map.len(), 0);
         assert_eq!(
-            table.max_populated_level, 0,
+            map.table().max_populated_level,
+            0,
             "max_populated_level should walk back to 0 once every level empties"
         );
     }
