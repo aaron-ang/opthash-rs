@@ -619,17 +619,28 @@ impl<'a> FunnelGeometry<'a> {
         }
     }
 
-    /// Total control-byte count across levels + both special arrays.
-    fn total_ctrl(&self) -> usize {
-        self.level_bucket_counts
-            .iter()
-            .map(|&bc| {
-                let bc = if bc == 0 { 0 } else { bc.next_power_of_two() };
-                bc.saturating_mul(self.bucket_width)
-            })
-            .sum::<usize>()
-            + self.primary_ctrl
-            + self.fallback_ctrl
+    /// Total control-byte count across levels + both special arrays. Checked
+    /// throughout: a fallible caller (`try_resize`/`try_reserve`) gets
+    /// `CapacityOverflow` rather than a wrapped under-count.
+    fn total_ctrl(&self) -> Result<usize, TryReserveError> {
+        let mut sum: usize = 0;
+        for &bc in self.level_bucket_counts {
+            let bc = if bc == 0 {
+                0
+            } else {
+                bc.checked_next_power_of_two()
+                    .ok_or(TryReserveError::CapacityOverflow)?
+            };
+            let part = bc
+                .checked_mul(self.bucket_width)
+                .ok_or(TryReserveError::CapacityOverflow)?;
+            sum = sum
+                .checked_add(part)
+                .ok_or(TryReserveError::CapacityOverflow)?;
+        }
+        sum.checked_add(self.primary_ctrl)
+            .and_then(|s| s.checked_add(self.fallback_ctrl))
+            .ok_or(TryReserveError::CapacityOverflow)
     }
 
     /// Stamps level + special descriptors from the arena base into a single
@@ -667,8 +678,15 @@ impl<'a> FunnelGeometry<'a> {
                     .cast::<MaybeUninit<SlotEntry<K, V>>>()
             };
             levels.push(BucketLevel::new_at(level_idx, bc, bw32, ctrl_ptr, data_ptr));
-            ctrl_off += cap;
-            data_off += cap * slot_size;
+            ctrl_off = ctrl_off
+                .checked_add(cap)
+                .ok_or(TryReserveError::CapacityOverflow)?;
+            let cap_data = cap
+                .checked_mul(slot_size)
+                .ok_or(TryReserveError::CapacityOverflow)?;
+            data_off = data_off
+                .checked_add(cap_data)
+                .ok_or(TryReserveError::CapacityOverflow)?;
         }
 
         let primary_cap =
@@ -688,8 +706,15 @@ impl<'a> FunnelGeometry<'a> {
             primary_ctrl_ptr,
             primary_data_ptr,
         );
-        ctrl_off += primary_cap;
-        data_off += primary_cap * slot_size;
+        let primary_data = primary_cap
+            .checked_mul(slot_size)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        ctrl_off = ctrl_off
+            .checked_add(primary_cap)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        data_off = data_off
+            .checked_add(primary_data)
+            .ok_or(TryReserveError::CapacityOverflow)?;
 
         let fallback_cap =
             u32::try_from(self.fallback_ctrl).map_err(|_| TryReserveError::CapacityOverflow)?;
@@ -733,7 +758,7 @@ impl<'a> FunnelGeometry<'a> {
         &self,
         alloc: &A,
     ) -> Result<FunnelArenaBuild<K, V>, TryReserveError> {
-        let total_ctrl = self.total_ctrl();
+        let total_ctrl = self.total_ctrl()?;
         let (arena_layout, data_base_off) = arena::layout_for::<K, V>(total_ctrl)?;
         let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout, total_ctrl, alloc)?;
         match self.build_regions::<K, V>(arena.as_ptr(), data_base_off) {
@@ -748,8 +773,11 @@ impl<'a> FunnelGeometry<'a> {
     /// Infallible [`try_alloc`](Self::try_alloc); aborts via `handle_alloc_error`.
     fn alloc<K, V, A: Allocator + Clone>(&self, alloc: &A) -> FunnelArenaBuild<K, V> {
         self.try_alloc(alloc).unwrap_or_else(|_| {
-            let layout = match arena::layout_for::<K, V>(self.total_ctrl()) {
-                Ok((l, _)) => l,
+            let layout = match self
+                .total_ctrl()
+                .and_then(|tc| arena::layout_for::<K, V>(tc).map(|(layout, _)| layout))
+            {
+                Ok(layout) => layout,
                 Err(_) => Layout::from_size_align(1, 1).unwrap(),
             };
             allocator_api2::alloc::handle_alloc_error(layout)
