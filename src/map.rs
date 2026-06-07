@@ -312,6 +312,37 @@ where
     K: Eq + Hash,
     R: RawTable<K, V>,
 {
+    #[inline]
+    fn find_location<Q>(&self, key: &Q) -> Option<R::Location>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let hash = self.table.hash(key);
+        self.table.find(key, hash, fingerprint(hash))
+    }
+
+    #[inline]
+    fn slot_entry(&self, loc: R::Location) -> &SlotEntry<K, V> {
+        // SAFETY: every caller gets `loc` from this table's `find` or insert path.
+        unsafe { self.table.slot_ref(loc) }
+    }
+
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    fn slot_entry_mut(&self, loc: R::Location) -> &mut SlotEntry<K, V> {
+        // SAFETY: callers hold the map borrow required by their operation; the
+        // backend forms the raw pointer without creating an intermediate alias.
+        unsafe { &mut *self.table.slot_ptr(loc) }
+    }
+
+    #[inline]
+    fn lookup_entry<Q>(&self, key: &Q) -> Option<&SlotEntry<K, V>>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.find_location(key).map(|loc| self.slot_entry(loc))
+    }
+
     /// Inserts `key`/`value`. Returns the previous value for `key`, if any.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let hash = self.table.hash(&key);
@@ -323,9 +354,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let hash = self.table.hash(key);
-        let loc = self.table.find(key, hash, fingerprint(hash))?;
-        Some(unsafe { &self.table.slot_ref(loc).value })
+        self.lookup_entry(key).map(|entry| &entry.value)
     }
 
     /// Returns the stored `(key, value)` pair for `key`.
@@ -333,9 +362,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let hash = self.table.hash(key);
-        let loc = self.table.find(key, hash, fingerprint(hash))?;
-        let entry = unsafe { self.table.slot_ref(loc) };
+        let entry = self.lookup_entry(key)?;
         Some((&entry.key, &entry.value))
     }
 
@@ -350,10 +377,10 @@ where
     {
         let hash = self.table.hash(key);
         if let Some(loc) = self.table.find(key, hash, fingerprint(hash)) {
-            return unsafe { &self.table.slot_ref(loc).key };
+            return &self.slot_entry(loc).key;
         }
         let loc = self.table.insert_for_vacant(f(key), value, hash);
-        unsafe { &self.table.slot_ref(loc).key }
+        &self.slot_entry(loc).key
     }
 
     /// Returns a mutable reference to the value for `key`.
@@ -361,10 +388,8 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let hash = self.table.hash(key);
-        let loc = self.table.find(key, hash, fingerprint(hash))?;
-        // SAFETY: `loc` is live; `&mut self` proves exclusivity.
-        Some(unsafe { &mut (*self.table.slot_ptr(loc)).value })
+        let loc = self.find_location(key)?;
+        Some(&mut self.slot_entry_mut(loc).value)
     }
 
     /// Returns `true` if `key` is present.
@@ -372,8 +397,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let hash = self.table.hash(key);
-        self.table.find(key, hash, fingerprint(hash)).is_some()
+        self.find_location(key).is_some()
     }
 
     /// Removes `key`, returning its value.
@@ -389,8 +413,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let hash = self.table.hash(key);
-        let loc = self.table.find(key, hash, fingerprint(hash))?;
+        let loc = self.find_location(key)?;
         Some(self.table.remove(loc))
     }
 
@@ -407,9 +430,8 @@ where
         crate::common::arena::check_disjoint_aliasing(&locations);
         std::array::from_fn(|i| {
             locations[i].map(|loc| {
-                // SAFETY: locations are unique among the hits (asserted above),
-                // and `slot_ptr` forms no intermediate region reference.
-                unsafe { &mut (*self.table.slot_ptr(loc)).value }
+                // Locations are unique among the hits (asserted above).
+                &mut self.slot_entry_mut(loc).value
             })
         })
     }
@@ -429,8 +451,7 @@ where
         crate::common::arena::check_disjoint_aliasing(&locations);
         std::array::from_fn(|i| {
             locations[i].map(|loc| {
-                // SAFETY: as in `get_disjoint_mut`.
-                let slot = unsafe { &mut *self.table.slot_ptr(loc) };
+                let slot = self.slot_entry_mut(loc);
                 (&slot.key, &mut slot.value)
             })
         })
@@ -451,7 +472,7 @@ where
         std::array::from_fn(|i| {
             locations[i].map(|loc|
                 // SAFETY: caller guarantees the hits are pairwise distinct.
-                unsafe { &mut (*self.table.slot_ptr(loc)).value })
+                &mut self.slot_entry_mut(loc).value)
         })
     }
 
@@ -460,10 +481,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        std::array::from_fn(|i| {
-            let hash = self.table.hash(keys[i]);
-            self.table.find(keys[i], hash, fingerprint(hash))
-        })
+        std::array::from_fn(|i| self.find_location(keys[i]))
     }
 
     /// Inserts `key`/`value` only if absent; otherwise returns an
@@ -485,8 +503,7 @@ where
             });
         }
         let loc = self.table.insert_for_vacant(key, value, hash);
-        // SAFETY: just inserted; `&mut self` proves exclusivity.
-        Ok(unsafe { &mut (*self.table.slot_ptr(loc)).value })
+        Ok(&mut self.slot_entry_mut(loc).value)
     }
 
     /// Gets the [`Entry`] for `key` for in-place manipulation.
@@ -597,32 +614,29 @@ where
     /// Reference to the entry's key.
     #[must_use]
     pub fn key(&self) -> &K {
-        unsafe { &self.map.table.slot_ref(self.loc).key }
+        &self.map.slot_entry(self.loc).key
     }
 
     /// Reference to the entry's value.
     #[must_use]
     pub fn get(&self) -> &V {
-        unsafe { &self.map.table.slot_ref(self.loc).value }
+        &self.map.slot_entry(self.loc).value
     }
 
     /// Mutable reference to the value, tied to `self`.
     pub fn get_mut(&mut self) -> &mut V {
-        // SAFETY: `loc` live; `&mut self` proves exclusivity.
-        unsafe { &mut (*self.map.table.slot_ptr(self.loc)).value }
+        &mut self.map.slot_entry_mut(self.loc).value
     }
 
     /// Consumes the entry, returning `&mut V` for the map's lifetime.
     #[must_use]
     pub fn into_mut(self) -> &'a mut V {
-        // SAFETY: `loc` live; the consumed `&'a mut` map borrow proves exclusivity.
-        unsafe { &mut (*self.map.table.slot_ptr(self.loc)).value }
+        &mut self.map.slot_entry_mut(self.loc).value
     }
 
     /// Consumes the entry, returning `&K` for the map's lifetime.
     pub(crate) fn into_key(self) -> &'a K {
-        // SAFETY: as in `into_mut`.
-        unsafe { &(*self.map.table.slot_ptr(self.loc)).key }
+        &self.map.slot_entry(self.loc).key
     }
 
     /// Replaces the value, returning the old one.
@@ -662,8 +676,7 @@ where
     /// Inserts `value` for the entry's key, returning `&mut V`.
     pub fn insert(self, value: V) -> &'a mut V {
         let loc = self.map.table.insert_for_vacant(self.key, value, self.hash);
-        // SAFETY: just inserted; consumed `&'a mut` map borrow proves exclusivity.
-        unsafe { &mut (*self.map.table.slot_ptr(loc)).value }
+        &mut self.map.slot_entry_mut(loc).value
     }
 
     /// Inserts `value` and returns the resulting [`OccupiedEntry`].
