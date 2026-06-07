@@ -346,6 +346,40 @@ pub type ElasticSetVacantEntry<'a, T, S = DefaultHashBuilder, A = Global> =
 type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
 type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>);
 
+/// Capacity shape and batch schedule for one elastic table allocation.
+struct ElasticGeometry {
+    total_slots: usize,
+    max_insertions: usize,
+    level_capacities: Box<[usize]>,
+    batch_plan: Box<[usize]>,
+    initial_batch_remaining: usize,
+}
+
+impl ElasticGeometry {
+    fn for_insert_budget(requested_insertions: usize, reserve_fraction: f64) -> Option<Self> {
+        let total_slots = if requested_insertions == 0 {
+            0
+        } else {
+            capacity::capacity_for(INITIAL_CAPACITY, requested_insertions, reserve_fraction)?
+        };
+        Some(Self::for_slots(total_slots, reserve_fraction))
+    }
+
+    fn for_slots(total_slots: usize, reserve_fraction: f64) -> Self {
+        let max_insertions = capacity::max_insertions(total_slots, reserve_fraction);
+        let level_capacities = partition_levels(total_slots).into_boxed_slice();
+        let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
+        let initial_batch_remaining = batch_plan.first().copied().unwrap_or(0);
+        Self {
+            total_slots,
+            max_insertions,
+            level_capacities,
+            batch_plan,
+            initial_batch_remaining,
+        }
+    }
+}
+
 /// Stamps level descriptors with arena-relative `(ctrl_ptr, data_ptr)`.
 /// Split out so the alloc-then-deallocate-on-error wrapper stays shallow.
 fn build_elastic_levels<K, V>(
@@ -457,28 +491,20 @@ where
         alloc: A,
     ) -> Self {
         let reserve_fraction = capacity::sanitize_reserve_fraction(reserve_fraction);
-        let total_slots = if capacity == 0 {
-            0
-        } else {
-            capacity::capacity_for(INITIAL_CAPACITY, capacity, reserve_fraction)
-                .expect("capacity overflow")
-        };
-        let max_insertions = capacity::max_insertions(total_slots, reserve_fraction);
-
-        let level_capacities = partition_levels(total_slots);
-        let (arena, levels) = alloc_elastic_arena(&level_capacities, reserve_fraction, &alloc);
-        let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
-        let batch_remaining = batch_plan.first().copied().unwrap_or(0);
+        let geometry = ElasticGeometry::for_insert_budget(capacity, reserve_fraction)
+            .expect("capacity overflow");
+        let (arena, levels) =
+            alloc_elastic_arena(&geometry.level_capacities, reserve_fraction, &alloc);
 
         Self {
             levels,
             len: 0,
-            total_slots,
-            max_insertions,
+            total_slots: geometry.total_slots,
+            max_insertions: geometry.max_insertions,
             reserve_fraction,
-            batch_plan,
+            batch_plan: geometry.batch_plan,
             current_batch_index: 0,
-            batch_remaining,
+            batch_remaining: geometry.initial_batch_remaining,
             max_populated_level: 0,
             hash_builder,
             alloc,
@@ -881,23 +907,22 @@ where
     /// `new_capacity` in-place, reinsert. Passing the current capacity
     /// performs a no-grow rehash that flushes accumulated tombstones.
     fn resize(&mut self, new_capacity: usize) {
-        let level_capacities = partition_levels(new_capacity);
-        let new_max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
-        let new_batch_plan =
-            build_batch_plan(&level_capacities, self.reserve_fraction, new_max_insertions);
-        let new_batch_remaining = new_batch_plan.first().copied().unwrap_or(0);
+        let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction);
 
-        let (new_arena, new_levels) =
-            alloc_elastic_arena(&level_capacities, self.reserve_fraction, &self.alloc);
+        let (new_arena, new_levels) = alloc_elastic_arena(
+            &geometry.level_capacities,
+            self.reserve_fraction,
+            &self.alloc,
+        );
 
         // Swap in fresh arena; keep old one alive until drain completes.
         let old_arena = mem::replace(&mut self.arena, new_arena);
         let old_levels = mem::replace(&mut self.levels, new_levels);
-        self.total_slots = new_capacity;
-        self.max_insertions = new_max_insertions;
-        self.batch_plan = new_batch_plan;
+        self.total_slots = geometry.total_slots;
+        self.max_insertions = geometry.max_insertions;
+        self.batch_plan = geometry.batch_plan;
         self.current_batch_index = 0;
-        self.batch_remaining = new_batch_remaining;
+        self.batch_remaining = geometry.initial_batch_remaining;
         self.max_populated_level = 0;
         self.len = 0;
 
@@ -962,24 +987,21 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let total_slots = slots;
         let reserve_fraction = capacity::sanitize_reserve_fraction(reserve_fraction);
-        let max_insertions = capacity::max_insertions(total_slots, reserve_fraction);
+        let geometry = ElasticGeometry::for_slots(slots, reserve_fraction);
 
-        let level_capacities = partition_levels(total_slots);
-        let (arena, levels) = try_alloc_elastic_arena(&level_capacities, reserve_fraction, &alloc)?;
-        let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
-        let batch_remaining = batch_plan.first().copied().unwrap_or(0);
+        let (arena, levels) =
+            try_alloc_elastic_arena(&geometry.level_capacities, reserve_fraction, &alloc)?;
 
         Ok(Self {
             levels,
             len: 0,
-            total_slots,
-            max_insertions,
+            total_slots: geometry.total_slots,
+            max_insertions: geometry.max_insertions,
             reserve_fraction,
-            batch_plan,
+            batch_plan: geometry.batch_plan,
             current_batch_index: 0,
-            batch_remaining,
+            batch_remaining: geometry.initial_batch_remaining,
             max_populated_level: 0,
             hash_builder,
             alloc,
@@ -1302,6 +1324,31 @@ mod tests {
                 assert!(w[1] <= w[0], "non-monotonic: {} → {}", w[0], w[1]);
                 assert!(w[1] * 2 >= w[0], "shrinks too fast: {} → {}", w[0], w[1]);
             }
+        }
+    }
+
+    #[test]
+    fn elastic_geometry_carries_capacity_and_batch_state() {
+        for &requested in &[0usize, 1, 127, 1_000, 10_000] {
+            let reserve_fraction = crate::common::config::DEFAULT_RESERVE_FRACTION;
+            let geometry = ElasticGeometry::for_insert_budget(requested, reserve_fraction).unwrap();
+            assert!(
+                geometry.max_insertions >= requested,
+                "requested={requested} max_insertions={}",
+                geometry.max_insertions
+            );
+            assert!(
+                geometry.level_capacities.iter().sum::<usize>() >= geometry.total_slots,
+                "rounded level capacities must cover total slots"
+            );
+            assert_eq!(
+                geometry.initial_batch_remaining,
+                geometry.batch_plan.first().copied().unwrap_or(0)
+            );
+            assert!(
+                geometry.batch_plan.iter().sum::<usize>() >= geometry.max_insertions,
+                "batch plan must cover the insertion budget"
+            );
         }
     }
 
