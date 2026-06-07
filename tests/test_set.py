@@ -167,6 +167,14 @@ def test_named_in_place_updates(set_cls):
     assert set(s) == {3, 4, 6}
 
 
+def test_symmetric_difference_uniqueifies_iterable_input(set_cls):
+    assert set(set_cls().symmetric_difference([1, 1])) == {1}
+
+    s = set_cls()
+    s.symmetric_difference_update([1, 1])
+    assert set(s) == {1}
+
+
 def test_iterator_mutation_detection(set_cls):
     s = set_cls([1, 2, 3, 4, 5])
     with pytest.raises(RuntimeError, match="changed size during iteration"):

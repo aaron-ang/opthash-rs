@@ -1139,16 +1139,18 @@ macro_rules! define_set_classes {
                     }
                     return Ok(touched);
                 }
-                let mut touched = false;
+                let mut unique_other = std::collections::HashSet::new();
                 for item in other.try_iter()? {
                     let item = item?;
-                    let probe = ProbeKey::from_bound(&item)?;
-                    if self.inner.remove(probe.as_key()) {
-                        touched = true;
-                    } else {
-                        self.inner.insert(HashedAny::from_bound(&item)?);
-                        touched = true;
+                    unique_other.insert(HashedAny::from_bound(&item)?);
+                }
+
+                let mut touched = false;
+                for value in unique_other {
+                    if !self.inner.remove(&value) {
+                        self.inner.insert(value);
                     }
+                    touched = true;
                 }
                 Ok(touched)
             }
