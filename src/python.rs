@@ -183,7 +183,7 @@ impl Drop for HashedAny {
 /// of the source `Bound` keeps the object live for the probe's lifetime.
 struct ProbeKey<'a> {
     inner: ManuallyDrop<HashedAny>,
-    _borrow: PhantomData<&'a Bound<'a, PyAny>>,
+    _borrow: PhantomData<&'a PyAny>,
 }
 
 impl<'a> ProbeKey<'a> {
