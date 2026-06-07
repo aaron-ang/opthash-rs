@@ -947,45 +947,77 @@ where
         }
     }
 
-    /// Take + erase + decrement counters for the slot at `loc`. Shared by
-    /// [`RawTable::remove`] and [`RawTable::extract_at`]; the former adds a
-    /// resize pass, the latter consolidates tombstones lazily.
-    fn take_and_tombstone(&mut self, location: SlotLocation) -> (K, V) {
-        let removed = match location {
+    #[inline]
+    unsafe fn take_entry_at(&mut self, location: SlotLocation) -> SlotEntry<K, V> {
+        match location {
             SlotLocation::Level {
                 level_idx,
                 slot_idx,
-            } => {
+            } => unsafe { self.levels[level_idx].take(slot_idx) },
+            SlotLocation::SpecialPrimary { slot_idx } => unsafe {
+                self.special.primary.take(slot_idx)
+            },
+            SlotLocation::SpecialFallback { slot_idx } => unsafe {
+                self.special.fallback.take(slot_idx)
+            },
+        }
+    }
+
+    #[inline]
+    fn erase_location(&mut self, location: SlotLocation) -> bool {
+        match location {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => self.levels[level_idx].erase(slot_idx),
+            SlotLocation::SpecialPrimary { slot_idx } => self.special.primary.erase(slot_idx),
+            SlotLocation::SpecialFallback { slot_idx } => self.special.fallback.erase(slot_idx),
+        }
+    }
+
+    #[inline]
+    fn account_erased_location(&mut self, location: SlotLocation, wrote_tombstone: bool) {
+        match location {
+            SlotLocation::Level { level_idx, .. } => {
                 let level = &mut self.levels[level_idx];
-                let removed = unsafe { level.take(slot_idx) };
-                if level.erase(slot_idx) {
+                if wrote_tombstone {
                     level.tombstones += 1;
                 }
                 level.len -= 1;
-                removed
             }
-            SlotLocation::SpecialPrimary { slot_idx } => {
+            SlotLocation::SpecialPrimary { .. } => {
                 let primary = &mut self.special.primary;
-                let removed = unsafe { primary.take(slot_idx) };
-                if primary.erase(slot_idx) {
+                if wrote_tombstone {
                     primary.tombstones += 1;
                 }
                 primary.len -= 1;
                 self.special.total_len -= 1;
-                removed
             }
-            SlotLocation::SpecialFallback { slot_idx } => {
+            SlotLocation::SpecialFallback { .. } => {
                 let fallback = &mut self.special.fallback;
-                let removed = unsafe { fallback.take(slot_idx) };
-                if fallback.erase(slot_idx) {
+                if wrote_tombstone {
                     fallback.tombstones += 1;
                 }
                 fallback.len -= 1;
                 self.special.total_len -= 1;
-                removed
             }
-        };
+        }
         self.len -= 1;
+    }
+
+    #[inline]
+    fn finish_counted_removal(&mut self, location: SlotLocation) {
+        let wrote_tombstone = self.erase_location(location);
+        self.account_erased_location(location, wrote_tombstone);
+    }
+
+    /// Take + erase + decrement counters for the slot at `loc`. Shared by
+    /// [`RawTable::remove`] and [`RawTable::extract_at`]; the former adds a
+    /// resize pass, the latter consolidates tombstones lazily.
+    fn take_and_tombstone(&mut self, location: SlotLocation) -> (K, V) {
+        // SAFETY: caller passes a live location found in this table.
+        let removed = unsafe { self.take_entry_at(location) };
+        self.finish_counted_removal(location);
         (removed.key, removed.value)
     }
 
@@ -1893,53 +1925,12 @@ where
 
     #[inline]
     fn tombstone_slot(&mut self, location: SlotLocation) {
-        match location {
-            SlotLocation::Level {
-                level_idx,
-                slot_idx,
-            } => {
-                self.levels[level_idx].erase(slot_idx);
-            }
-            SlotLocation::SpecialPrimary { slot_idx } => {
-                self.special.primary.erase(slot_idx);
-            }
-            SlotLocation::SpecialFallback { slot_idx } => {
-                self.special.fallback.erase(slot_idx);
-            }
-        }
+        self.erase_location(location);
     }
 
     #[inline]
     fn extract_finish(&mut self, location: SlotLocation) {
-        match location {
-            SlotLocation::Level {
-                level_idx,
-                slot_idx,
-            } => {
-                let level = &mut self.levels[level_idx];
-                if level.erase(slot_idx) {
-                    level.tombstones += 1;
-                }
-                level.len -= 1;
-            }
-            SlotLocation::SpecialPrimary { slot_idx } => {
-                let primary = &mut self.special.primary;
-                if primary.erase(slot_idx) {
-                    primary.tombstones += 1;
-                }
-                primary.len -= 1;
-                self.special.total_len -= 1;
-            }
-            SlotLocation::SpecialFallback { slot_idx } => {
-                let fallback = &mut self.special.fallback;
-                if fallback.erase(slot_idx) {
-                    fallback.tombstones += 1;
-                }
-                fallback.len -= 1;
-                self.special.total_len -= 1;
-            }
-        }
-        self.len -= 1;
+        self.finish_counted_removal(location);
     }
 
     #[inline]
@@ -2516,6 +2507,61 @@ mod tests {
         for i in 0..=l0_bucket_size {
             assert_eq!(map.get(&i), Some(&i));
         }
+    }
+
+    #[test]
+    fn special_array_removal_updates_region_counts_once() {
+        struct ConstHasher;
+        impl Hasher for ConstHasher {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, _: &[u8]) {}
+        }
+        struct ConstHashBuilder;
+        impl BuildHasher for ConstHashBuilder {
+            type Hasher = ConstHasher;
+            fn build_hasher(&self) -> Self::Hasher {
+                ConstHasher
+            }
+        }
+
+        let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
+            FunnelHashMap::with_capacity_and_reserve_fraction_and_hasher_in(
+                2048,
+                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                ConstHashBuilder,
+                Global,
+            );
+        let mut inserted = 0i32;
+        let max_insertions = i32::try_from(map.capacity()).expect("test capacity fits i32");
+        while map.table().special.total_len == 0 && inserted < max_insertions {
+            map.insert(inserted, inserted);
+            inserted += 1;
+        }
+        assert!(
+            map.table().special.total_len > 0,
+            "test requires at least one special-array entry"
+        );
+
+        let fingerprint = control::control_fingerprint(0);
+        let special_key = (0..inserted)
+            .find(|key| {
+                matches!(
+                    map.table()
+                        .find_slot_location_with_hash(key, 0, fingerprint),
+                    Some(
+                        SlotLocation::SpecialPrimary { .. } | SlotLocation::SpecialFallback { .. }
+                    )
+                )
+            })
+            .expect("inserted special entry must be findable");
+
+        let before_special = map.table().special.total_len;
+        let before_len = map.len();
+        assert_eq!(map.remove(&special_key), Some(special_key));
+        assert_eq!(map.table().special.total_len, before_special - 1);
+        assert_eq!(map.len(), before_len - 1);
     }
 
     #[test]
