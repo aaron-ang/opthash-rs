@@ -350,7 +350,7 @@ type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>);
 struct ElasticGeometry {
     total_slots: usize,
     max_insertions: usize,
-    level_capacities: Box<[usize]>,
+    level_capacities: Vec<usize>,
     batch_plan: Box<[usize]>,
     initial_batch_remaining: usize,
 }
@@ -367,7 +367,7 @@ impl ElasticGeometry {
 
     fn for_slots(total_slots: usize, reserve_fraction: f64) -> Self {
         let max_insertions = capacity::max_insertions(total_slots, reserve_fraction);
-        let level_capacities = partition_levels(total_slots).into_boxed_slice();
+        let level_capacities = partition_levels(total_slots);
         let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
         let initial_batch_remaining = batch_plan.first().copied().unwrap_or(0);
         Self {
