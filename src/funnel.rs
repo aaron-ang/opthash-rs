@@ -498,16 +498,16 @@ pub type FunnelHashMap<K, V, S = DefaultHashBuilder, A = Global> =
     map::HashMap<K, V, FunnelTable<K, V, S, A>>;
 
 /// A view into a single entry, occupied or vacant.
-pub type Entry<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type FunnelEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::Entry<'a, K, V, FunnelTable<K, V, S, A>>;
 /// View of an occupied entry.
-pub type OccupiedEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type FunnelOccupiedEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::OccupiedEntry<'a, K, V, FunnelTable<K, V, S, A>>;
 /// View of a vacant entry.
-pub type VacantEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type FunnelVacantEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::VacantEntry<'a, K, V, FunnelTable<K, V, S, A>>;
 /// Error returned by `try_insert` on key collision.
-pub type OccupiedError<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type FunnelOccupiedError<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::OccupiedError<'a, K, V, FunnelTable<K, V, S, A>>;
 /// Borrowing iterator over `(&K, &V)`.
 pub type FunnelIter<'a, K, V, S = DefaultHashBuilder, A = Global> =
@@ -519,10 +519,10 @@ pub type FunnelIterMut<'a, K, V, S = DefaultHashBuilder, A = Global> =
 pub type FunnelIntoIter<K, V, S = DefaultHashBuilder, A = Global> =
     map::IntoIter<K, V, FunnelTable<K, V, S, A>>;
 /// `&K` iterator.
-pub type Keys<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type FunnelKeys<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::Keys<'a, K, V, FunnelTable<K, V, S, A>>;
 /// `&V` iterator.
-pub type Values<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type FunnelValues<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::Values<'a, K, V, FunnelTable<K, V, S, A>>;
 /// `&mut V` iterator.
 pub type FunnelValuesMut<'a, K, V, S = DefaultHashBuilder, A = Global> =
@@ -534,10 +534,10 @@ pub type FunnelIntoKeys<K, V, S = DefaultHashBuilder, A = Global> =
 pub type FunnelIntoValues<K, V, S = DefaultHashBuilder, A = Global> =
     map::IntoValues<K, V, FunnelTable<K, V, S, A>>;
 /// Draining iterator that empties the map.
-pub type Drain<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type FunnelDrain<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::Drain<'a, K, V, FunnelTable<K, V, S, A>>;
 /// Iterator yielding entries removed by `extract_if`.
-pub type ExtractIf<'a, K, V, F, S = DefaultHashBuilder, A = Global> =
+pub type FunnelExtractIf<'a, K, V, F, S = DefaultHashBuilder, A = Global> =
     map::ExtractIf<'a, K, V, FunnelTable<K, V, S, A>, F>;
 
 /// Hash set using funnel hashing.

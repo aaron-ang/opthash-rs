@@ -263,16 +263,16 @@ pub type ElasticHashMap<K, V, S = DefaultHashBuilder, A = Global> =
     map::HashMap<K, V, ElasticTable<K, V, S, A>>;
 
 /// A view into a single entry, occupied or vacant.
-pub type Entry<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type ElasticEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::Entry<'a, K, V, ElasticTable<K, V, S, A>>;
 /// View of an occupied entry.
-pub type OccupiedEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type ElasticOccupiedEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::OccupiedEntry<'a, K, V, ElasticTable<K, V, S, A>>;
 /// View of a vacant entry.
-pub type VacantEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type ElasticVacantEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::VacantEntry<'a, K, V, ElasticTable<K, V, S, A>>;
 /// Error returned by `try_insert` on key collision.
-pub type OccupiedError<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type ElasticOccupiedError<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::OccupiedError<'a, K, V, ElasticTable<K, V, S, A>>;
 /// Borrowing iterator over `(&K, &V)`.
 pub type ElasticIter<'a, K, V, S = DefaultHashBuilder, A = Global> =
@@ -284,10 +284,10 @@ pub type ElasticIterMut<'a, K, V, S = DefaultHashBuilder, A = Global> =
 pub type ElasticIntoIter<K, V, S = DefaultHashBuilder, A = Global> =
     map::IntoIter<K, V, ElasticTable<K, V, S, A>>;
 /// `&K` iterator.
-pub type Keys<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type ElasticKeys<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::Keys<'a, K, V, ElasticTable<K, V, S, A>>;
 /// `&V` iterator.
-pub type Values<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type ElasticValues<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::Values<'a, K, V, ElasticTable<K, V, S, A>>;
 /// `&mut V` iterator.
 pub type ElasticValuesMut<'a, K, V, S = DefaultHashBuilder, A = Global> =
@@ -299,10 +299,10 @@ pub type ElasticIntoKeys<K, V, S = DefaultHashBuilder, A = Global> =
 pub type ElasticIntoValues<K, V, S = DefaultHashBuilder, A = Global> =
     map::IntoValues<K, V, ElasticTable<K, V, S, A>>;
 /// Draining iterator that empties the map.
-pub type Drain<'a, K, V, S = DefaultHashBuilder, A = Global> =
+pub type ElasticDrain<'a, K, V, S = DefaultHashBuilder, A = Global> =
     map::Drain<'a, K, V, ElasticTable<K, V, S, A>>;
 /// Iterator yielding entries removed by `extract_if`.
-pub type ExtractIf<'a, K, V, F, S = DefaultHashBuilder, A = Global> =
+pub type ElasticExtractIf<'a, K, V, F, S = DefaultHashBuilder, A = Global> =
     map::ExtractIf<'a, K, V, ElasticTable<K, V, S, A>, F>;
 
 /// Hash set using elastic hashing.
