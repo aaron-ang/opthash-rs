@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
+use std::mem::{self, MaybeUninit};
 use std::ptr;
 
 use allocator_api2::alloc::{Allocator, Layout};
@@ -83,13 +83,9 @@ pub(crate) fn layout_for<K, V>(total_ctrl: usize) -> Result<(Layout, usize), Try
     Ok((arena_layout.pad_to_align(), data_base_off))
 }
 
-/// Walks an arena's regions in layout order, handing out the
-/// `(ctrl_ptr, data_ptr)` pair for each and advancing the control + data
-/// offset cursors. Owns the checked arithmetic + the `unsafe` pointer math
-/// that every backend's region builder would otherwise repeat: an overflowing
-/// region footprint (e.g. a data section past 4 GiB) yields
-/// [`CapacityOverflow`](TryReserveError::CapacityOverflow) instead of wrapping
-/// a `u32` offset into an overlapping or out-of-bounds pointer.
+/// Hands out each arena region's `(ctrl_ptr, data_ptr)` in layout order,
+/// advancing the ctrl + data offsets with checked arithmetic — a `u32`
+/// overflow yields `CapacityOverflow`, never a wrapped pointer.
 pub(crate) struct LayoutCursor<T> {
     base: *mut u8,
     ctrl_off: u32,
@@ -106,40 +102,45 @@ impl<T> LayoutCursor<T> {
             ctrl_off: 0,
             data_off: u32::try_from(data_base_off)
                 .map_err(|_| TryReserveError::CapacityOverflow)?,
-            slot_size: u32::try_from(size_of::<T>())
+            slot_size: u32::try_from(mem::size_of::<T>())
                 .map_err(|_| TryReserveError::CapacityOverflow)?,
             _marker: PhantomData,
         })
     }
 
-    /// Returns the region's `(ctrl_ptr, data_ptr)` at the current cursor, then
-    /// advances past its `cap` ctrl bytes and `cap * slot_size` data bytes.
+    /// Current region's `(ctrl_ptr, data_ptr)`, then advances past its `cap`
+    /// ctrl bytes + `cap * slot_size` data bytes.
     ///
     /// # Safety
-    /// The caller must have allocated an arena at `base` whose layout (from
-    /// [`layout_for`]) covers every region it reserves, in this order.
+    /// `base` must point at a [`layout_for`] arena covering every reserved
+    /// region, in order.
     pub(crate) unsafe fn reserve(
         &mut self,
         cap: u32,
     ) -> Result<(*mut u8, *mut MaybeUninit<T>), TryReserveError> {
-        // SAFETY: offsets stay within the arena layout the caller allocated.
-        let ctrl_ptr = unsafe { self.base.add(self.ctrl_off as usize) };
-        let data_ptr = unsafe {
-            self.base
-                .add(self.data_off as usize)
-                .cast::<MaybeUninit<T>>()
-        };
-        self.ctrl_off = self
+        // Both offsets computed before committing, so overflow leaves the
+        // cursor unchanged.
+        let next_ctrl_off = self
             .ctrl_off
             .checked_add(cap)
             .ok_or(TryReserveError::CapacityOverflow)?;
         let data_bytes = cap
             .checked_mul(self.slot_size)
             .ok_or(TryReserveError::CapacityOverflow)?;
-        self.data_off = self
+        let next_data_off = self
             .data_off
             .checked_add(data_bytes)
             .ok_or(TryReserveError::CapacityOverflow)?;
+
+        // SAFETY: offsets stay within the caller's arena layout.
+        let ctrl_ptr = unsafe { self.base.add(self.ctrl_off as usize) };
+        let data_ptr = unsafe {
+            self.base
+                .add(self.data_off as usize)
+                .cast::<MaybeUninit<T>>()
+        };
+        self.ctrl_off = next_ctrl_off;
+        self.data_off = next_data_off;
         Ok((ctrl_ptr, data_ptr))
     }
 }
