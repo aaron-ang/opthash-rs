@@ -186,6 +186,58 @@ impl<A: Allocator> Drop for DeallocGuard<'_, A> {
     }
 }
 
+/// A map's complete set of arena regions, for panic-safe teardown. Each
+/// backend's region collection implements it so [`ArenaDropGuard`] can drop
+/// every region's live values from one place.
+pub(crate) trait RegionSet {
+    /// Drops the value in every occupied slot across all regions.
+    fn drop_all_values(&mut self);
+}
+
+/// Owns a half-built (clone) or being-rehashed (resize) arena and its regions.
+/// If a `clone`/`insert` unwinds, [`Drop`] drops the regions' live values then
+/// deallocates — `Arena` has no `Drop`, so this is what prevents the leak. On
+/// the success path call [`disarm`](Self::disarm) to reclaim both.
+pub(crate) struct ArenaDropGuard<RS: RegionSet, A: Allocator + Clone> {
+    arena: Option<Arena>,
+    regions: Option<RS>,
+    alloc: A,
+}
+
+impl<RS: RegionSet, A: Allocator + Clone> ArenaDropGuard<RS, A> {
+    #[inline]
+    pub(crate) fn new(arena: Arena, regions: RS, alloc: A) -> Self {
+        Self {
+            arena: Some(arena),
+            regions: Some(regions),
+            alloc,
+        }
+    }
+
+    /// Mutable access to the guarded regions (the clone/drain loop writes here).
+    #[inline]
+    pub(crate) fn regions_mut(&mut self) -> &mut RS {
+        self.regions.as_mut().unwrap()
+    }
+
+    /// Success path: reclaim `(arena, regions)`; the guard's `Drop` no-ops.
+    #[inline]
+    pub(crate) fn disarm(mut self) -> (Arena, RS) {
+        (self.arena.take().unwrap(), self.regions.take().unwrap())
+    }
+}
+
+impl<RS: RegionSet, A: Allocator + Clone> Drop for ArenaDropGuard<RS, A> {
+    fn drop(&mut self) {
+        if let Some(arena) = self.arena.take() {
+            if let Some(mut regions) = self.regions.take() {
+                regions.drop_all_values();
+            }
+            arena.deallocate(&self.alloc);
+        }
+    }
+}
+
 /// One slot's `(key, value)` pair. Co-located so `read`/`drop_in_place`
 /// touches both in one shot.
 pub(crate) struct SlotEntry<K, V> {
