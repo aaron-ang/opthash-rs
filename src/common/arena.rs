@@ -198,13 +198,13 @@ pub(crate) trait RegionSet {
 /// If a `clone`/`insert` unwinds, [`Drop`] drops the regions' live values then
 /// deallocates — `Arena` has no `Drop`, so this is what prevents the leak. On
 /// the success path call [`disarm`](Self::disarm) to reclaim both.
-pub(crate) struct ArenaDropGuard<RS: RegionSet, A: Allocator + Clone> {
+pub(crate) struct ArenaDropGuard<RS: RegionSet, A: Allocator> {
     arena: Option<Arena>,
     regions: Option<RS>,
     alloc: A,
 }
 
-impl<RS: RegionSet, A: Allocator + Clone> ArenaDropGuard<RS, A> {
+impl<RS: RegionSet, A: Allocator> ArenaDropGuard<RS, A> {
     #[inline]
     pub(crate) fn new(arena: Arena, regions: RS, alloc: A) -> Self {
         Self {
@@ -227,7 +227,7 @@ impl<RS: RegionSet, A: Allocator + Clone> ArenaDropGuard<RS, A> {
     }
 }
 
-impl<RS: RegionSet, A: Allocator + Clone> Drop for ArenaDropGuard<RS, A> {
+impl<RS: RegionSet, A: Allocator> Drop for ArenaDropGuard<RS, A> {
     fn drop(&mut self) {
         if let Some(arena) = self.arena.take() {
             // Deallocate even if a value's `Drop` unwinds out of
