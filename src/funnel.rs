@@ -947,6 +947,10 @@ where
         }
     }
 
+    /// Take the entry at `location` without updating counters or control bytes.
+    ///
+    /// # Safety
+    /// `location` must reference a live, initialized occupied slot in this table.
     #[inline]
     unsafe fn take_entry_at(&mut self, location: SlotLocation) -> SlotEntry<K, V> {
         match location {
@@ -1012,7 +1016,7 @@ where
     }
 
     /// Take + erase + decrement counters for the slot at `loc`. Shared by
-    /// [`RawTable::remove`] and [`RawTable::extract_at`]; the former adds a
+    /// [`RawTable::remove`] and [`RawTable::extract_finish`]; the former adds a
     /// resize pass, the latter consolidates tombstones lazily.
     fn take_and_tombstone(&mut self, location: SlotLocation) -> (K, V) {
         // SAFETY: caller passes a live location found in this table.
