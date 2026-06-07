@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::iter::FusedIterator;
@@ -11,7 +12,7 @@ use crate::common::DefaultHashBuilder;
 use crate::common::arena::SlotEntry;
 use crate::common::config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY};
 use crate::common::control;
-use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError, TryReserveError};
+use crate::common::error::TryReserveError;
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     Values as CommonValues,
@@ -474,7 +475,7 @@ where
         let hash = self.table.hash(&key);
         let fp = fingerprint(hash);
         if let Some(loc) = self.table.find(&key, hash, fp) {
-            return Err(CommonOccupiedError {
+            return Err(OccupiedError {
                 entry: OccupiedEntry {
                     map: self,
                     loc,
@@ -540,8 +541,53 @@ pub struct VacantEntry<'a, K, V, R: RawTable<K, V>> {
     hash: u64,
 }
 
-/// Error returned by [`HashMap::try_insert`] on key collision.
-pub type OccupiedError<'a, K, V, R> = CommonOccupiedError<OccupiedEntry<'a, K, V, R>, V>;
+/// Error returned by [`HashMap::try_insert`] on key collision. Holds the
+/// occupied entry that blocked the insert plus the rejected value.
+pub struct OccupiedError<'a, K, V, R: RawTable<K, V>> {
+    /// The entry whose key was already present.
+    pub entry: OccupiedEntry<'a, K, V, R>,
+    /// The value that could not be inserted.
+    pub value: V,
+}
+
+impl<K, V, R> fmt::Debug for OccupiedError<'_, K, V, R>
+where
+    K: Eq + Hash + fmt::Debug,
+    V: fmt::Debug,
+    R: RawTable<K, V>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("OccupiedError")
+            .field("key", self.entry.key())
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
+impl<K, V, R> fmt::Display for OccupiedError<'_, K, V, R>
+where
+    K: Eq + Hash + fmt::Debug,
+    V: fmt::Debug,
+    R: RawTable<K, V>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "tried to insert {:?}, but key {:?} was already present with {:?}",
+            self.value,
+            self.entry.key(),
+            self.entry.get(),
+        )
+    }
+}
+
+impl<K, V, R> Error for OccupiedError<'_, K, V, R>
+where
+    K: Eq + Hash + fmt::Debug,
+    V: fmt::Debug,
+    R: RawTable<K, V>,
+{
+}
 
 impl<'a, K, V, R> OccupiedEntry<'a, K, V, R>
 where
@@ -594,21 +640,6 @@ where
     #[must_use]
     pub fn remove_entry(self) -> (K, V) {
         self.map.table.remove(self.loc)
-    }
-}
-
-impl<K, V, R> EntryView for OccupiedEntry<'_, K, V, R>
-where
-    K: Eq + Hash,
-    R: RawTable<K, V>,
-{
-    type Key = K;
-    type Value = V;
-    fn view_key(&self) -> &K {
-        self.key()
-    }
-    fn view_value(&self) -> &V {
-        self.get()
     }
 }
 
