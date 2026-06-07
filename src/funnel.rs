@@ -651,11 +651,7 @@ impl<'a> FunnelGeometry<'a> {
         arena_base: *mut u8,
         data_base_off: usize,
     ) -> Result<FunnelArenaInner<K, V>, TryReserveError> {
-        let slot_size = u32::try_from(mem::size_of::<SlotEntry<K, V>>())
-            .map_err(|_| TryReserveError::CapacityOverflow)?;
-        let mut ctrl_off: u32 = 0;
-        let mut data_off: u32 =
-            u32::try_from(data_base_off).map_err(|_| TryReserveError::CapacityOverflow)?;
+        let mut cursor = arena::LayoutCursor::<SlotEntry<K, V>>::new(arena_base, data_base_off)?;
 
         let mut levels: Vec<BucketLevel<SlotEntry<K, V>>> = Vec::new();
         levels
@@ -671,22 +667,9 @@ impl<'a> FunnelGeometry<'a> {
             })
             .map_err(|_| TryReserveError::CapacityOverflow)?;
             let cap = bc.saturating_mul(bw32);
-            let ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
-            let data_ptr = unsafe {
-                arena_base
-                    .add(data_off as usize)
-                    .cast::<MaybeUninit<SlotEntry<K, V>>>()
-            };
+            // SAFETY: the arena was allocated for the layout these region caps sum to.
+            let (ctrl_ptr, data_ptr) = unsafe { cursor.reserve(cap)? };
             levels.push(BucketLevel::new_at(level_idx, bc, bw32, ctrl_ptr, data_ptr));
-            ctrl_off = ctrl_off
-                .checked_add(cap)
-                .ok_or(TryReserveError::CapacityOverflow)?;
-            let cap_data = cap
-                .checked_mul(slot_size)
-                .ok_or(TryReserveError::CapacityOverflow)?;
-            data_off = data_off
-                .checked_add(cap_data)
-                .ok_or(TryReserveError::CapacityOverflow)?;
         }
 
         let primary_cap =
@@ -694,27 +677,14 @@ impl<'a> FunnelGeometry<'a> {
         let primary_gc_mask = u32::try_from(self.primary_ctrl / GROUP_SIZE)
             .map_err(|_| TryReserveError::CapacityOverflow)?
             .wrapping_sub(1);
-        let primary_ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
-        let primary_data_ptr = unsafe {
-            arena_base
-                .add(data_off as usize)
-                .cast::<MaybeUninit<SlotEntry<K, V>>>()
-        };
+        // SAFETY: as above.
+        let (primary_ctrl_ptr, primary_data_ptr) = unsafe { cursor.reserve(primary_cap)? };
         let primary = SpecialPrimary::new_at(
             primary_cap,
             primary_gc_mask,
             primary_ctrl_ptr,
             primary_data_ptr,
         );
-        let primary_data = primary_cap
-            .checked_mul(slot_size)
-            .ok_or(TryReserveError::CapacityOverflow)?;
-        ctrl_off = ctrl_off
-            .checked_add(primary_cap)
-            .ok_or(TryReserveError::CapacityOverflow)?;
-        data_off = data_off
-            .checked_add(primary_data)
-            .ok_or(TryReserveError::CapacityOverflow)?;
 
         let fallback_cap =
             u32::try_from(self.fallback_ctrl).map_err(|_| TryReserveError::CapacityOverflow)?;
@@ -728,12 +698,8 @@ impl<'a> FunnelGeometry<'a> {
         let fb_log2 = u32::try_from(fb_size)
             .map_err(|_| TryReserveError::CapacityOverflow)?
             .trailing_zeros();
-        let fallback_ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
-        let fallback_data_ptr = unsafe {
-            arena_base
-                .add(data_off as usize)
-                .cast::<MaybeUninit<SlotEntry<K, V>>>()
-        };
+        // SAFETY: as above.
+        let (fallback_ctrl_ptr, fallback_data_ptr) = unsafe { cursor.reserve(fallback_cap)? };
         let fallback = SpecialFallback::new_at(
             fallback_cap,
             fb_count,

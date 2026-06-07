@@ -354,23 +354,15 @@ fn build_elastic_levels<K, V>(
     level_capacities: &[usize],
     reserve_fraction: f64,
 ) -> Result<LevelSlice<K, V>, TryReserveError> {
-    let slot_size = u32::try_from(mem::size_of::<SlotEntry<K, V>>())
-        .map_err(|_| TryReserveError::CapacityOverflow)?;
-    let mut ctrl_off: u32 = 0;
-    let mut data_off: u32 =
-        u32::try_from(data_base_off).map_err(|_| TryReserveError::CapacityOverflow)?;
+    let mut cursor = arena::LayoutCursor::<SlotEntry<K, V>>::new(arena_base, data_base_off)?;
     let mut levels: Vec<Level<SlotEntry<K, V>>> = Vec::new();
     levels
         .try_reserve_exact(level_capacities.len())
         .map_err(|_| TryReserveError::AllocError)?;
     for (level_idx, &cap) in level_capacities.iter().enumerate() {
         let cap_u32 = u32::try_from(cap).map_err(|_| TryReserveError::CapacityOverflow)?;
-        let ctrl_ptr = unsafe { arena_base.add(ctrl_off as usize) };
-        let data_ptr = unsafe {
-            arena_base
-                .add(data_off as usize)
-                .cast::<MaybeUninit<SlotEntry<K, V>>>()
-        };
+        // SAFETY: the arena was allocated for the layout these caps sum to.
+        let (ctrl_ptr, data_ptr) = unsafe { cursor.reserve(cap_u32)? };
         levels.push(Level::new_at(
             level_idx,
             cap_u32,
@@ -378,8 +370,6 @@ fn build_elastic_levels<K, V>(
             ctrl_ptr,
             data_ptr,
         ));
-        ctrl_off += cap_u32;
-        data_off += cap_u32 * slot_size;
     }
     Ok(levels.into_boxed_slice())
 }
