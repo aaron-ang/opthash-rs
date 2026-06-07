@@ -414,7 +414,6 @@ fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
     })
 }
 
-/// Drops values + deallocates an `Arena` if dropped before extraction.
 /// Drops every level's live values, backing [`arena::ArenaDropGuard`]'s
 /// panic-safe rollback in `resize`/`clone`.
 impl<K, V> arena::RegionSet for LevelSlice<K, V> {

@@ -230,10 +230,12 @@ impl<RS: RegionSet, A: Allocator + Clone> ArenaDropGuard<RS, A> {
 impl<RS: RegionSet, A: Allocator + Clone> Drop for ArenaDropGuard<RS, A> {
     fn drop(&mut self) {
         if let Some(arena) = self.arena.take() {
+            // Deallocate even if a value's `Drop` unwinds out of
+            // `drop_all_values` — otherwise the arena would leak.
+            let _dealloc = DeallocGuard::new(arena, &self.alloc);
             if let Some(mut regions) = self.regions.take() {
                 regions.drop_all_values();
             }
-            arena.deallocate(&self.alloc);
         }
     }
 }
