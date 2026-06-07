@@ -415,23 +415,12 @@ fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
 }
 
 /// Drops values + deallocates an `Arena` if dropped before extraction.
-/// Lets `resize`/`Clone` panic-safely roll back — `Arena` has no `Drop`.
-/// Owns the level slice so mut-iteration borrows from `guard.levels`.
-struct ArenaDropGuard<K, V, A: Allocator + Clone> {
-    arena: Option<Arena>,
-    levels: Option<LevelSlice<K, V>>,
-    alloc: A,
-}
-
-impl<K, V, A: Allocator + Clone> Drop for ArenaDropGuard<K, V, A> {
-    fn drop(&mut self) {
-        if let Some(arena) = self.arena.take() {
-            if let Some(mut levels) = self.levels.take() {
-                for level in &mut levels {
-                    level.drop_values();
-                }
-            }
-            arena.deallocate(&self.alloc);
+/// Drops every level's live values, backing [`arena::ArenaDropGuard`]'s
+/// panic-safe rollback in `resize`/`clone`.
+impl<K, V> arena::RegionSet for LevelSlice<K, V> {
+    fn drop_all_values(&mut self) {
+        for level in self.iter_mut() {
+            level.drop_values();
         }
     }
 }
@@ -782,19 +771,9 @@ where
         // `V::clone` panics, drop the already-cloned values (OCCUPIED on
         // `dst_arena`) and deallocate the partially-filled arena. `Arena`
         // has no `Drop`, so without this the whole allocation would leak.
-        let mut guard = ArenaDropGuard {
-            arena: Some(arena),
-            levels: Some(levels),
-            alloc: self.alloc.clone(),
-        };
+        let mut guard = arena::ArenaDropGuard::new(arena, levels, self.alloc.clone());
 
-        for (dst, src_lvl) in guard
-            .levels
-            .as_deref_mut()
-            .unwrap()
-            .iter_mut()
-            .zip(self.levels.iter())
-        {
+        for (dst, src_lvl) in guard.regions_mut().iter_mut().zip(self.levels.iter()) {
             arena::clone_region_panic_safe::<K, V>(
                 src_lvl.ctrl_ptr,
                 dst.ctrl_ptr,
@@ -807,11 +786,8 @@ where
             dst.max_probe_groups = src_lvl.max_probe_groups;
         }
 
-        // Success: extract arena + levels from the guard so its Drop becomes
-        // a no-op. Both fields now live in `Self` below.
-        let arena = guard.arena.take().unwrap();
-        let levels = guard.levels.take().unwrap();
-        drop(guard);
+        // Success: reclaim arena + levels so the guard's Drop no-ops.
+        let (arena, levels) = guard.disarm();
 
         Self {
             levels,
@@ -908,12 +884,8 @@ where
         // If `insert_unique` panics, the guard unwinds: drops any survivors
         // then deallocates `old_arena` — `Arena` has no `Drop`, so without the
         // guard the backing allocation would leak.
-        let mut guard = ArenaDropGuard {
-            arena: Some(old_arena),
-            levels: Some(old_levels),
-            alloc: self.alloc.clone(),
-        };
-        for level in guard.levels.as_deref_mut().unwrap() {
+        let mut guard = arena::ArenaDropGuard::new(old_arena, old_levels, self.alloc.clone());
+        for level in guard.regions_mut().iter_mut() {
             level.drain_values_and_clear(|entry| {
                 self.insert_unique(entry.key, entry.value);
             });

@@ -751,31 +751,20 @@ impl<'a> FunnelGeometry<'a> {
     }
 }
 
-/// Drops occupied slots + deallocates the arena if dropped before
-/// extraction. Lets `Clone` panic-safely roll back when user `K::clone` /
-/// `V::clone` unwinds — `Arena` has no `Drop`. Owns levels + special so
-/// mut-iteration borrows from the guard.
-struct ArenaDropGuard<K, V, A: Allocator + Clone> {
-    arena: Option<Arena>,
-    levels: Option<BucketLevelSlice<K, V>>,
-    special: Option<SpecialArray<SlotEntry<K, V>>>,
-    alloc: A,
+/// A funnel map's regions (bucket levels + the special array), bundled so
+/// [`arena::ArenaDropGuard`] can drop their values for panic-safe `clone`.
+struct FunnelRegions<K, V> {
+    levels: BucketLevelSlice<K, V>,
+    special: SpecialArray<SlotEntry<K, V>>,
 }
 
-impl<K, V, A: Allocator + Clone> Drop for ArenaDropGuard<K, V, A> {
-    fn drop(&mut self) {
-        if let Some(arena) = self.arena.take() {
-            if let Some(mut levels) = self.levels.take() {
-                for level in &mut levels {
-                    level.drop_values();
-                }
-            }
-            if let Some(mut special) = self.special.take() {
-                special.primary.drop_values();
-                special.fallback.drop_values();
-            }
-            arena.deallocate(&self.alloc);
+impl<K, V> arena::RegionSet for FunnelRegions<K, V> {
+    fn drop_all_values(&mut self) {
+        for level in &mut self.levels {
+            level.drop_values();
         }
+        self.special.primary.drop_values();
+        self.special.fallback.drop_values();
     }
 }
 
@@ -2252,19 +2241,17 @@ where
         // drop already-cloned values, then deallocate the partially-built arena.
         // `Arena` has no `Drop`, so without this the entire arena
         // allocation would leak on unwind.
-        let mut guard = ArenaDropGuard::<K, V, A> {
-            arena: Some(arena),
-            levels: Some(levels),
-            special: Some(special),
-            alloc: self.alloc.clone(),
-        };
+        let mut guard = arena::ArenaDropGuard::new(
+            arena,
+            FunnelRegions { levels, special },
+            self.alloc.clone(),
+        );
         // Panic-safe order: clone value, write slot, then ctrl byte. If a
         // clone panics, only initialized slots carry OCCUPIED ctrls — the
         // guard's `drop_values` walks exactly those.
         for (dst, src_lvl) in guard
+            .regions_mut()
             .levels
-            .as_deref_mut()
-            .unwrap()
             .iter_mut()
             .zip(self.levels.iter())
         {
@@ -2279,7 +2266,7 @@ where
             dst.tombstones = src_lvl.tombstones;
         }
 
-        let special_mut = guard.special.as_mut().unwrap();
+        let special_mut = &mut guard.regions_mut().special;
         {
             let s = &self.special.primary;
             let d = &mut special_mut.primary;
@@ -2310,11 +2297,8 @@ where
 
         special_mut.total_len = self.special.total_len;
 
-        // Success: extract from guard so its Drop is a no-op.
-        let arena = guard.arena.take().unwrap();
-        let levels = guard.levels.take().unwrap();
-        let special = guard.special.take().unwrap();
-        drop(guard);
+        // Success: reclaim arena + regions so the guard's Drop no-ops.
+        let (arena, FunnelRegions { levels, special }) = guard.disarm();
 
         Self {
             levels,
