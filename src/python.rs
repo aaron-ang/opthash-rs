@@ -43,6 +43,10 @@ fn validate_funnel_reserve_fraction(reserve_fraction: Option<f64>) -> PyResult<f
     Ok(rf)
 }
 
+fn missing_key(key: &Bound<PyAny>) -> PyErr {
+    PyKeyError::new_err(key.clone().unbind())
+}
+
 /// Type tag packed into `HashedAny::tagged`'s low bits so `PartialEq` skips
 /// `Py_TYPE` re-dispatch for str/str and int/int compares.
 #[derive(Debug, PartialEq, Eq)]
@@ -298,6 +302,13 @@ macro_rules! define_map_classes {
             fn bump(&mut self) {
                 self.generation = self.generation.wrapping_add(1);
             }
+
+            #[inline]
+            fn bump_if_changed(&mut self, changed: bool) {
+                if changed {
+                    self.bump();
+                }
+            }
         }
 
         #[pymethods]
@@ -387,7 +398,7 @@ macro_rules! define_map_classes {
                 let probe = ProbeKey::from_bound(key)?;
                 match self.inner.get(probe.as_key()) {
                     Some(v) => Ok(v.clone_ref(py)),
-                    None => Err(PyKeyError::new_err(key.clone().unbind())),
+                    None => Err(missing_key(key)),
                 }
             }
 
@@ -405,7 +416,7 @@ macro_rules! define_map_classes {
                         self.bump();
                         Ok(())
                     }
-                    None => Err(PyKeyError::new_err(key.clone().unbind())),
+                    None => Err(missing_key(key)),
                 }
             }
 
@@ -537,9 +548,7 @@ macro_rules! define_map_classes {
                         touched = true;
                     }
                 }
-                if touched {
-                    self.bump();
-                }
+                self.bump_if_changed(touched);
                 Ok(())
             }
 
@@ -555,7 +564,7 @@ macro_rules! define_map_classes {
                         self.bump();
                         Ok(v)
                     }
-                    None => default.ok_or_else(|| PyKeyError::new_err(key.clone().unbind())),
+                    None => default.ok_or_else(|| missing_key(key)),
                 }
             }
 
@@ -1049,6 +1058,13 @@ macro_rules! define_set_classes {
                 self.generation = self.generation.wrapping_add(1);
             }
 
+            #[inline]
+            fn bump_if_changed(&mut self, changed: bool) {
+                if changed {
+                    self.bump();
+                }
+            }
+
             /// Inserts every element of `other` (an opthash set or any iterable).
             /// Returns whether the set changed.
             fn add_all(&mut self, other: &Bound<PyAny>) -> PyResult<bool> {
@@ -1248,7 +1264,7 @@ macro_rules! define_set_classes {
                     self.bump();
                     Ok(())
                 } else {
-                    Err(PyKeyError::new_err(value.clone().unbind()))
+                    Err(missing_key(value))
                 }
             }
 
@@ -1381,9 +1397,7 @@ macro_rules! define_set_classes {
                 for other in others.try_iter()? {
                     touched |= self.add_all(&other?)?;
                 }
-                if touched {
-                    self.bump();
-                }
+                self.bump_if_changed(touched);
                 Ok(())
             }
 
@@ -1393,9 +1407,7 @@ macro_rules! define_set_classes {
                 for other in others.try_iter()? {
                     touched |= self.retain_in(&other?, py)?;
                 }
-                if touched {
-                    self.bump();
-                }
+                self.bump_if_changed(touched);
                 Ok(())
             }
 
@@ -1405,16 +1417,13 @@ macro_rules! define_set_classes {
                 for other in others.try_iter()? {
                     touched |= self.remove_all(&other?)?;
                 }
-                if touched {
-                    self.bump();
-                }
+                self.bump_if_changed(touched);
                 Ok(())
             }
 
             fn symmetric_difference_update(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                if self.symmetric_difference_with(other)? {
-                    self.bump();
-                }
+                let touched = self.symmetric_difference_with(other)?;
+                self.bump_if_changed(touched);
                 Ok(())
             }
 
