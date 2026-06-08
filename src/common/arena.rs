@@ -398,10 +398,10 @@ pub(crate) trait ArenaSlots<T> {
         }
     }
 
-    /// Drop every value + reset all ctrls to FREE in one pass. Clears each
-    /// ctrl *before* the drop so a panicking `Drop` leaves no OCCUPIED
-    /// behind to double-drop. Tombstones cleared too.
-    fn drop_values_and_clear(&mut self) {
+    /// Reset controls for every occupied slot and invoke `visit` with that
+    /// slot's pointer after its control byte has been cleared.
+    #[inline]
+    fn clear_occupied_slots_with<F: FnMut(*mut T)>(&mut self, mut visit: F) {
         if self.capacity() == 0 {
             return;
         }
@@ -414,7 +414,7 @@ pub(crate) trait ArenaSlots<T> {
                 let idx = group_start + offset;
                 unsafe {
                     *ctrl.add(idx) = CTRL_EMPTY;
-                    ptr::drop_in_place(self.slot_ptr(idx));
+                    visit(self.slot_ptr(idx));
                 }
             }
             unsafe { ptr::write_bytes(group_ctrl, CTRL_EMPTY, GROUP_SIZE) };
@@ -424,42 +424,24 @@ pub(crate) trait ArenaSlots<T> {
                 let prev = *ctrl.add(idx);
                 *ctrl.add(idx) = CTRL_EMPTY;
                 if prev.is_occupied() {
-                    ptr::drop_in_place(self.slot_ptr(idx));
+                    visit(self.slot_ptr(idx));
                 }
             }
         }
+    }
+
+    /// Drop every value + reset all ctrls to FREE in one pass. Clears each
+    /// ctrl *before* the drop so a panicking `Drop` leaves no OCCUPIED
+    /// behind to double-drop. Tombstones cleared too.
+    fn drop_values_and_clear(&mut self) {
+        self.clear_occupied_slots_with(|slot| unsafe { ptr::drop_in_place(slot) });
     }
 
     /// Move every occupied value out and reset all controls to EMPTY.
     /// The current ctrl byte is cleared before `f` runs, so a panic cannot
     /// leave the moved-out slot marked occupied.
     fn drain_values_and_clear<F: FnMut(T)>(&mut self, mut f: F) {
-        if self.capacity() == 0 {
-            return;
-        }
-        let ctrl = self.ctrl_ptr();
-        let full_groups = self.capacity() / GROUP_SIZE;
-        for group_idx in 0..full_groups {
-            let group_start = group_idx * GROUP_SIZE;
-            let group_ctrl = unsafe { ctrl.add(group_start) };
-            for offset in unsafe { simd::occupied_mask_group(group_ctrl) } {
-                let idx = group_start + offset;
-                unsafe {
-                    *ctrl.add(idx) = CTRL_EMPTY;
-                    f(self.slot_ptr(idx).read());
-                }
-            }
-            unsafe { ptr::write_bytes(group_ctrl, CTRL_EMPTY, GROUP_SIZE) };
-        }
-        for idx in full_groups * GROUP_SIZE..self.capacity() {
-            unsafe {
-                let prev = *ctrl.add(idx);
-                *ctrl.add(idx) = CTRL_EMPTY;
-                if prev.is_occupied() {
-                    f(self.slot_ptr(idx).read());
-                }
-            }
-        }
+        self.clear_occupied_slots_with(|slot| unsafe { f(slot.read()) });
     }
 }
 
