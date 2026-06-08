@@ -18,6 +18,11 @@ use crate::set;
 /// by iterators, the `(level, slot)` location backs removal.
 type ElasticScanItem<K, V> = (*mut SlotEntry<K, V>, (usize, usize));
 
+/// Defrag repacks fire at most once per `total_slots / DEFRAG_OPS_DIVISOR`
+/// inserts, keeping them O(1) amortized (like tombstone cleanup) so churn
+/// can't storm. Larger ⇒ more frequent repacks ⇒ less probe drift, more work.
+const DEFRAG_OPS_DIVISOR: usize = 4;
+
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
 /// [`SlotEntry`] data live contiguously in [`ElasticTable::arena`].
@@ -135,6 +140,14 @@ impl<T> Level<T> {
         self.tombstones as usize > capacity::tombstone_cleanup_threshold(self.capacity as usize)
     }
 
+    /// `max_probe_groups` drifted past the healthy `f(ε)` budget — every lookup
+    /// now scans too many groups, so a repack is worthwhile.
+    #[inline]
+    #[allow(clippy::cast_precision_loss)]
+    fn probe_drifted(&self) -> bool {
+        f64::from(self.max_probe_groups) > 3.0 * self.budget_cap.max(1.0)
+    }
+
     #[inline]
     fn triangular_group_start(&self, key_hash: u64) -> usize {
         let mixed = key_hash ^ self.salt;
@@ -223,6 +236,12 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     batch_remaining: usize,
     /// Highest level index ever written; bounds the lookup probe loop.
     max_populated_level: usize,
+    /// An insert drifted a level's probe bound; a defrag repack is owed (gated
+    /// by [`DEFRAG_OPS_DIVISOR`]). Decouples defrag from the resize cadence so
+    /// high-`reserve_fraction` churn stays fast.
+    defrag_pending: bool,
+    /// Inserts since the last resize; gates the amortized defrag repack.
+    inserts_since_repack: usize,
     /// Hash builder. Cloned across resizes to preserve probe sequences.
     hash_builder: S,
     /// Allocator used for all per-capacity allocations.
@@ -494,6 +513,8 @@ where
             current_batch_index: 0,
             batch_remaining: geometry.initial_batch_remaining,
             max_populated_level: 0,
+            defrag_pending: false,
+            inserts_since_repack: 0,
             hash_builder,
             alloc,
             arena,
@@ -530,6 +551,7 @@ where
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let key_fingerprint = control::control_fingerprint(key_hash);
 
+        self.inserts_since_repack += 1;
         if self.len >= self.max_insertions {
             let new_capacity = if self.total_slots == 0 {
                 INITIAL_CAPACITY
@@ -537,6 +559,12 @@ where
                 self.total_slots.saturating_mul(2)
             };
             self.resize(new_capacity);
+        } else if self.defrag_pending
+            && self.inserts_since_repack > (self.total_slots / DEFRAG_OPS_DIVISOR).max(1)
+        {
+            // Owed defrag, and enough inserts have passed to amortize it. Repack
+            // here, not at the drifting insert, so that insert's slot stays valid.
+            self.resize(self.total_slots);
         }
 
         self.advance_batch_window();
@@ -551,6 +579,10 @@ where
         level.len += 1;
         if prev_ctrl == CTRL_TOMBSTONE {
             level.tombstones -= 1;
+        }
+        let drifted = level.probe_drifted();
+        if drifted {
+            self.defrag_pending = true;
         }
         if level_idx > self.max_populated_level {
             self.max_populated_level = level_idx;
@@ -777,6 +809,8 @@ where
         }
         self.len = 0;
         self.max_populated_level = 0;
+        self.defrag_pending = false;
+        self.inserts_since_repack = 0;
         self.current_batch_index = 0;
         self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
     }
@@ -824,6 +858,8 @@ where
             current_batch_index: self.current_batch_index,
             batch_remaining: self.batch_remaining,
             max_populated_level: self.max_populated_level,
+            defrag_pending: self.defrag_pending,
+            inserts_since_repack: self.inserts_since_repack,
             hash_builder: self.hash_builder.clone(),
             alloc: self.alloc.clone(),
             arena,
@@ -882,6 +918,10 @@ where
     /// `new_capacity` in-place, reinsert. Passing the current capacity
     /// performs a no-grow rehash that flushes accumulated tombstones.
     fn resize(&mut self, new_capacity: usize) {
+        // The rebuild re-places every key from its home group, resetting each
+        // level's `max_probe_groups`, so any pending defrag is satisfied.
+        self.defrag_pending = false;
+        self.inserts_since_repack = 0;
         let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction);
 
         let (new_arena, new_levels) = alloc_elastic_arena(
@@ -974,6 +1014,8 @@ where
             current_batch_index: 0,
             batch_remaining: geometry.initial_batch_remaining,
             max_populated_level: 0,
+            defrag_pending: false,
+            inserts_since_repack: 0,
             hash_builder,
             alloc,
             arena,
