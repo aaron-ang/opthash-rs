@@ -1430,8 +1430,12 @@ where
                 slot_idx,
             } => {
                 let level = &mut self.levels[level_idx];
+                let was_tombstone = level.control_at(slot_idx) == CTRL_TOMBSTONE;
                 level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
                 level.len += 1;
+                if was_tombstone {
+                    level.tombstones -= 1;
+                }
                 if level_idx > self.max_populated_level {
                     self.max_populated_level = level_idx;
                 }
@@ -1468,8 +1472,12 @@ where
         key_fingerprint: u8,
     ) {
         let level = &mut self.levels[level_idx];
+        let was_tombstone = level.control_at(slot_idx) == CTRL_TOMBSTONE;
         level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
         level.len += 1;
+        if was_tombstone {
+            level.tombstones -= 1;
+        }
         if level_idx > self.max_populated_level {
             self.max_populated_level = level_idx;
         }
@@ -2440,6 +2448,46 @@ mod tests {
         for i in 512..896 {
             assert_eq!(map.get(&i), Some(&(i ^ 0x5a5a)));
         }
+    }
+
+    #[test]
+    fn level_tombstone_reuse_decrements_counter() {
+        struct ConstHasher;
+        impl Hasher for ConstHasher {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, _: &[u8]) {}
+        }
+        struct ConstHashBuilder;
+        impl BuildHasher for ConstHashBuilder {
+            type Hasher = ConstHasher;
+            fn build_hasher(&self) -> Self::Hasher {
+                ConstHasher
+            }
+        }
+
+        let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
+            FunnelHashMap::with_capacity_and_reserve_fraction_and_hasher_in(
+                2048,
+                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                ConstHashBuilder,
+                Global,
+            );
+
+        let l0_bucket_size = 1usize << map.table().levels[0].bucket_size_log2;
+        for i in 0..i32::try_from(l0_bucket_size).unwrap() {
+            map.insert(i, i);
+        }
+        assert_eq!(map.table().levels[0].tombstones, 0);
+
+        assert_eq!(map.remove(&0), Some(0));
+        assert_eq!(map.table().levels[0].tombstones, 1);
+
+        map.insert(10_000, 10_000);
+        assert_eq!(map.table().levels[0].tombstones, 0);
+        assert_eq!(map.table().levels[0].len as usize, l0_bucket_size);
+        assert_eq!(map.get(&10_000), Some(&10_000));
     }
 
     #[test]
