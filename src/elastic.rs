@@ -47,6 +47,9 @@ struct Level<T> {
     tombstones: u32,
     /// Cached `floor(reserve * cap / 2)`.
     half_reserve_slot_threshold: u32,
+    /// Precomputed `3 * budget_cap` so `probe_drifted` is an integer compare on
+    /// the insert hot path. Fills the struct's padding — `Level` stays 64 bytes.
+    probe_drift_threshold: u32,
     /// Per-level salt mixed into key hashes.
     salt: u64,
     /// Paper §2 cap on `f(ε)`.
@@ -55,6 +58,10 @@ struct Level<T> {
 
 unsafe impl<T: Send> Send for Level<T> {}
 unsafe impl<T: Sync> Sync for Level<T> {}
+
+// `Level` is read on every lookup; keep it within one 64-byte cache line.
+// `probe_drift_threshold` fills existing padding — adding it must not grow this.
+const _: () = assert!(mem::size_of::<Level<SlotEntry<u64, u64>>>() <= 64);
 
 impl<T> ArenaSlots<T> for Level<T> {
     #[inline]
@@ -83,6 +90,12 @@ impl<T> Level<T> {
     ) -> Self {
         let cap = cap_u32 as usize;
         let gc = cap_u32 / GROUP_SIZE_U32;
+        let budget_cap = compute_budget_cap(reserve_fraction, gc as usize);
+        // Precomputed `probe_drifted` threshold: `budget_cap >= 1.0` always, so
+        // `3 * budget_cap` keeps the insert hot path to an integer compare.
+        // `as u32` saturates (Rust >=1.45); the value is tiny in practice.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let probe_drift_threshold = (3.0 * budget_cap) as u32;
         Self {
             ctrl_ptr,
             data_ptr,
@@ -98,7 +111,8 @@ impl<T> Level<T> {
                 cap,
             ))
             .unwrap_or(u32::MAX),
-            budget_cap: compute_budget_cap(reserve_fraction, gc as usize),
+            probe_drift_threshold,
+            budget_cap,
         }
     }
 
@@ -143,9 +157,8 @@ impl<T> Level<T> {
     /// `max_probe_groups` drifted past the healthy `f(ε)` budget — every lookup
     /// now scans too many groups, so a repack is worthwhile.
     #[inline]
-    #[allow(clippy::cast_precision_loss)]
     fn probe_drifted(&self) -> bool {
-        f64::from(self.max_probe_groups) > 3.0 * self.budget_cap.max(1.0)
+        self.max_probe_groups > self.probe_drift_threshold
     }
 
     #[inline]
@@ -539,11 +552,14 @@ where
             level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
+            level.max_probe_groups = 0;
         }
         self.len = 0;
         self.current_batch_index = 0;
         self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
         self.max_populated_level = 0;
+        self.defrag_pending = false;
+        self.inserts_since_repack = 0;
     }
 
     /// Post-lookup insert for a key known to be absent. Returns the chosen
@@ -806,6 +822,7 @@ where
             level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
+            level.max_probe_groups = 0;
         }
         self.len = 0;
         self.max_populated_level = 0;
