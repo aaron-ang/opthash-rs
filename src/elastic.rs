@@ -132,7 +132,7 @@ impl<T> Level<T> {
 
     #[inline]
     fn needs_cleanup(&self) -> bool {
-        self.tombstones > self.capacity / 2
+        self.tombstones as usize > capacity::tombstone_cleanup_threshold(self.capacity as usize)
     }
 
     #[inline]
@@ -1320,6 +1320,33 @@ mod tests {
                 geometry.batch_plan.iter().sum::<usize>() >= geometry.max_insertions,
                 "batch plan must cover the insertion budget"
             );
+        }
+    }
+
+    #[test]
+    fn clone_and_clear_preserve_elastic_lookups() {
+        let mut map: ElasticHashMap<u64, u64> = ElasticHashMap::with_capacity(512);
+        for i in 0..384 {
+            map.insert(i, i ^ 0xa5a5);
+        }
+
+        let cloned = map.clone();
+        for i in 0..384 {
+            assert_eq!(cloned.get(&i), Some(&(i ^ 0xa5a5)));
+        }
+        for i in 10_000..10_128 {
+            assert_eq!(cloned.get(&i), None);
+        }
+
+        map.clear();
+        for i in 512..896 {
+            map.insert(i, i ^ 0x5a5a);
+        }
+        for i in 512..896 {
+            assert_eq!(map.get(&i), Some(&(i ^ 0x5a5a)));
+        }
+        for i in 0..384 {
+            assert_eq!(map.get(&i), None);
         }
     }
 

@@ -1014,8 +1014,8 @@ where
         (removed.key, removed.value)
     }
 
-    /// `true` if the region holding `loc` now has more tombstones than half
-    /// its capacity, so [`RawTable::remove`] should rehash in place.
+    /// `true` if the region holding `loc` has accumulated enough tombstones
+    /// that [`RawTable::remove`] should rehash in place.
     fn region_needs_cleanup(&self, location: SlotLocation) -> bool {
         let (tombstones, cap) = match location {
             SlotLocation::Level { level_idx, .. } => {
@@ -1031,7 +1031,7 @@ where
                 (fallback.tombstones, fallback.capacity())
             }
         };
-        tombstones as usize > cap / 2
+        tombstones as usize > capacity::tombstone_cleanup_threshold(cap)
     }
 
     /// Bulk-clears all control bytes and zeroes counters. Called by
@@ -1091,8 +1091,9 @@ where
             .map_err(|_| TryReserveError::AllocError)?;
         self.drain_entries_into(&mut entries);
 
+        let mut overflow: Vec<(K, V)> = Vec::new();
         loop {
-            let mut overflow: Vec<(K, V)> = Vec::new();
+            overflow.clear();
             for (k, v) in entries.drain(..) {
                 if let Err(pair) = new_map.try_insert_new_entry_unchecked(k, v) {
                     overflow.push(pair);
@@ -1103,7 +1104,7 @@ where
                 return Ok(());
             }
             new_map.drain_entries_into(&mut overflow);
-            entries = overflow;
+            mem::swap(&mut entries, &mut overflow);
             target = target
                 .checked_mul(2)
                 .ok_or(TryReserveError::CapacityOverflow)?;
@@ -1178,9 +1179,10 @@ where
     fn resize(&mut self, mut new_capacity: usize) {
         let mut entries: Vec<(K, V)> = Vec::with_capacity(self.len);
         self.drain_entries_into(&mut entries);
+        let mut overflow: Vec<(K, V)> = Vec::new();
         loop {
             self.install_fresh_storage(new_capacity);
-            let mut overflow: Vec<(K, V)> = Vec::new();
+            overflow.clear();
             for (k, v) in entries.drain(..) {
                 if let Err(pair) = self.try_insert_new_entry_unchecked(k, v) {
                     overflow.push(pair);
@@ -1189,8 +1191,8 @@ where
             if overflow.is_empty() {
                 return;
             }
-            entries = overflow;
-            self.drain_entries_into(&mut entries);
+            self.drain_entries_into(&mut overflow);
+            mem::swap(&mut entries, &mut overflow);
             new_capacity = new_capacity
                 .checked_mul(2)
                 .expect("capacity overflow during funnel resize retry");
@@ -1408,7 +1410,15 @@ where
         let Some(location) = self.choose_slot_for_new_key(key_hash) else {
             return Err((key, value));
         };
-        self.place_new_entry(location, key, value, key_fingerprint);
+        if let SlotLocation::Level {
+            level_idx,
+            slot_idx,
+        } = location
+        {
+            self.place_new_level_entry(level_idx, slot_idx, key, value, key_fingerprint);
+        } else {
+            self.place_new_entry(location, key, value, key_fingerprint);
+        }
         Ok(())
     }
 
@@ -1444,6 +1454,24 @@ where
                 fallback.len += 1;
                 self.special.total_len += 1;
             }
+        }
+        self.len += 1;
+    }
+
+    #[inline]
+    fn place_new_level_entry(
+        &mut self,
+        level_idx: usize,
+        slot_idx: usize,
+        key: K,
+        value: V,
+        key_fingerprint: u8,
+    ) {
+        let level = &mut self.levels[level_idx];
+        level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        level.len += 1;
+        if level_idx > self.max_populated_level {
+            self.max_populated_level = level_idx;
         }
         self.len += 1;
     }
@@ -1885,9 +1913,16 @@ where
 
         // Skip the special-array dedup when the chain ended clean (no overflow
         // possible) or special is empty — place at the level candidate.
-        if candidate.is_some()
-            && (matches!(miss, LevelMiss::ChainClean) || self.special.total_len == 0)
+        if (matches!(miss, LevelMiss::ChainClean) || self.special.total_len == 0)
+            && let Some(SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            }) = candidate
         {
+            if self.len < self.max_insertions {
+                self.place_new_level_entry(level_idx, slot_idx, key, value, key_fingerprint);
+                return None;
+            }
             return self.insert_at_location_after_resize_check(
                 candidate,
                 key_hash,
@@ -2385,6 +2420,25 @@ mod tests {
         }
         for i in 8..16 {
             assert_eq!(map.get(&i), Some(&(i * 3)));
+        }
+    }
+
+    #[test]
+    fn clear_then_reinsert_preserves_level_entries() {
+        let mut map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity(512);
+        for i in 0..384 {
+            map.insert(i, i ^ 0xa5a5);
+        }
+        map.clear();
+
+        for i in 512..896 {
+            map.insert(i, i ^ 0x5a5a);
+        }
+
+        assert_eq!(map.len(), 384);
+        assert_eq!(map.table().special.total_len, 0);
+        for i in 512..896 {
+            assert_eq!(map.get(&i), Some(&(i ^ 0x5a5a)));
         }
     }
 

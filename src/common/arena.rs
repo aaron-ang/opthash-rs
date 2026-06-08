@@ -406,7 +406,20 @@ pub(crate) trait ArenaSlots<T> {
             return;
         }
         let ctrl = self.ctrl_ptr();
-        for idx in 0..self.capacity() {
+        let full_groups = self.capacity() / GROUP_SIZE;
+        for group_idx in 0..full_groups {
+            let group_start = group_idx * GROUP_SIZE;
+            let group_ctrl = unsafe { ctrl.add(group_start) };
+            for offset in unsafe { simd::occupied_mask_group(group_ctrl) } {
+                let idx = group_start + offset;
+                unsafe {
+                    *ctrl.add(idx) = CTRL_EMPTY;
+                    ptr::drop_in_place(self.slot_ptr(idx));
+                }
+            }
+            unsafe { ptr::write_bytes(group_ctrl, CTRL_EMPTY, GROUP_SIZE) };
+        }
+        for idx in full_groups * GROUP_SIZE..self.capacity() {
             unsafe {
                 let prev = *ctrl.add(idx);
                 *ctrl.add(idx) = CTRL_EMPTY;
@@ -425,7 +438,20 @@ pub(crate) trait ArenaSlots<T> {
             return;
         }
         let ctrl = self.ctrl_ptr();
-        for idx in 0..self.capacity() {
+        let full_groups = self.capacity() / GROUP_SIZE;
+        for group_idx in 0..full_groups {
+            let group_start = group_idx * GROUP_SIZE;
+            let group_ctrl = unsafe { ctrl.add(group_start) };
+            for offset in unsafe { simd::occupied_mask_group(group_ctrl) } {
+                let idx = group_start + offset;
+                unsafe {
+                    *ctrl.add(idx) = CTRL_EMPTY;
+                    f(self.slot_ptr(idx).read());
+                }
+            }
+            unsafe { ptr::write_bytes(group_ctrl, CTRL_EMPTY, GROUP_SIZE) };
+        }
+        for idx in full_groups * GROUP_SIZE..self.capacity() {
             unsafe {
                 let prev = *ctrl.add(idx);
                 *ctrl.add(idx) = CTRL_EMPTY;

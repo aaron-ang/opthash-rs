@@ -69,6 +69,14 @@ pub(crate) mod capacity {
     pub(crate) fn floor_half_reserve_slots(reserve_fraction: f64, value: usize) -> usize {
         floor_to_usize((reserve_fraction * usize_to_f64(value)) / 2.0)
     }
+
+    #[inline]
+    pub(crate) fn tombstone_cleanup_threshold(capacity: usize) -> usize {
+        let half = capacity / 2;
+        let cap_three_quarters = capacity.saturating_mul(3) / 4;
+        let hysteresis = half.saturating_add(super::GROUP_SIZE.saturating_mul(4));
+        hysteresis.min(cap_three_quarters).max(half)
+    }
 }
 
 /// Slot/group-count rounding for layout alignment.
