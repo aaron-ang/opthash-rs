@@ -1428,38 +1428,14 @@ where
             SlotLocation::Level {
                 level_idx,
                 slot_idx,
-            } => {
-                let level = &mut self.levels[level_idx];
-                let was_tombstone = level.control_at(slot_idx) == CTRL_TOMBSTONE;
-                level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
-                level.len += 1;
-                if was_tombstone {
-                    level.tombstones -= 1;
-                }
-                if level_idx > self.max_populated_level {
-                    self.max_populated_level = level_idx;
-                }
-            }
+            } => self.place_new_level_entry(level_idx, slot_idx, key, value, key_fingerprint),
             SlotLocation::SpecialPrimary { slot_idx } => {
-                let primary = &mut self.special.primary;
-                // Reusing a tombstone slot must decrement the counter;
-                // otherwise resize triggers on stale-since-resize counts.
-                let was_tombstone = primary.control_at(slot_idx) == CTRL_TOMBSTONE;
-                primary.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
-                primary.len += 1;
-                if was_tombstone {
-                    primary.tombstones -= 1;
-                }
-                self.special.total_len += 1;
+                self.place_new_special_primary_entry(slot_idx, key, value, key_fingerprint);
             }
             SlotLocation::SpecialFallback { slot_idx } => {
-                let fallback = &mut self.special.fallback;
-                fallback.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
-                fallback.len += 1;
-                self.special.total_len += 1;
+                self.place_new_special_fallback_entry(slot_idx, key, value, key_fingerprint);
             }
         }
-        self.len += 1;
     }
 
     #[inline]
@@ -1481,6 +1457,42 @@ where
         if level_idx > self.max_populated_level {
             self.max_populated_level = level_idx;
         }
+        self.len += 1;
+    }
+
+    #[inline]
+    fn place_new_special_primary_entry(
+        &mut self,
+        slot_idx: usize,
+        key: K,
+        value: V,
+        key_fingerprint: u8,
+    ) {
+        let primary = &mut self.special.primary;
+        // Reusing a tombstone slot must decrement the counter; otherwise
+        // cleanup triggers on stale-since-resize counts.
+        let was_tombstone = primary.control_at(slot_idx) == CTRL_TOMBSTONE;
+        primary.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        primary.len += 1;
+        if was_tombstone {
+            primary.tombstones -= 1;
+        }
+        self.special.total_len += 1;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn place_new_special_fallback_entry(
+        &mut self,
+        slot_idx: usize,
+        key: K,
+        value: V,
+        key_fingerprint: u8,
+    ) {
+        let fallback = &mut self.special.fallback;
+        fallback.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        fallback.len += 1;
+        self.special.total_len += 1;
         self.len += 1;
     }
 
