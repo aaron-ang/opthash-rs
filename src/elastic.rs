@@ -19,9 +19,14 @@ use crate::set;
 type ElasticScanItem<K, V> = (*mut SlotEntry<K, V>, (usize, usize));
 
 /// Defrag repacks fire at most once per `total_slots / DEFRAG_OPS_DIVISOR`
-/// inserts, keeping them O(1) amortized (like tombstone cleanup) so churn
-/// can't storm. Larger ⇒ more frequent repacks ⇒ less probe drift, more work.
+/// inserts, keeping them O(1) amortized so churn can't storm. Larger means more
+/// frequent repacks: less probe drift, more repack work.
 const DEFRAG_OPS_DIVISOR: usize = 4;
+
+/// A level is "drifted" once `max_probe_groups` exceeds this multiple of its
+/// `f(ε)` budget. `>1` since the high-water max sits above the mean budget; 3
+/// is delete-optimal in the sweep (2 over-repacks, 6 lets probes drift).
+const DEFRAG_DRIFT_MULT: f64 = 3.0;
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
@@ -47,8 +52,8 @@ struct Level<T> {
     tombstones: u32,
     /// Cached `floor(reserve * cap / 2)`.
     half_reserve_slot_threshold: u32,
-    /// Precomputed `3 * budget_cap` so `probe_drifted` is an integer compare on
-    /// the insert hot path. Fills the struct's padding — `Level` stays 64 bytes.
+    /// Precomputed `DEFRAG_DRIFT_MULT * budget_cap`; keeps `probe_drifted` an
+    /// integer compare.
     probe_drift_threshold: u32,
     /// Per-level salt mixed into key hashes.
     salt: u64,
@@ -59,8 +64,7 @@ struct Level<T> {
 unsafe impl<T: Send> Send for Level<T> {}
 unsafe impl<T: Sync> Sync for Level<T> {}
 
-// `Level` is read on every lookup; keep it within one 64-byte cache line.
-// `probe_drift_threshold` fills existing padding — adding it must not grow this.
+// `Level` is read on every lookup — keep it within one 64-byte cache line.
 const _: () = assert!(mem::size_of::<Level<SlotEntry<u64, u64>>>() <= 64);
 
 impl<T> ArenaSlots<T> for Level<T> {
@@ -91,11 +95,9 @@ impl<T> Level<T> {
         let cap = cap_u32 as usize;
         let gc = cap_u32 / GROUP_SIZE_U32;
         let budget_cap = compute_budget_cap(reserve_fraction, gc as usize);
-        // Precomputed `probe_drifted` threshold: `budget_cap >= 1.0` always, so
-        // `3 * budget_cap` keeps the insert hot path to an integer compare.
-        // `as u32` saturates (Rust >=1.45); the value is tiny in practice.
+        // `budget_cap >= 1.0`; `as u32` saturates and the value is tiny.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let probe_drift_threshold = (3.0 * budget_cap) as u32;
+        let probe_drift_threshold = (DEFRAG_DRIFT_MULT * budget_cap) as u32;
         Self {
             ctrl_ptr,
             data_ptr,
@@ -154,8 +156,7 @@ impl<T> Level<T> {
         self.tombstones as usize > capacity::tombstone_cleanup_threshold(self.capacity as usize)
     }
 
-    /// `max_probe_groups` drifted past the healthy `f(ε)` budget — every lookup
-    /// now scans too many groups, so a repack is worthwhile.
+    /// `max_probe_groups` drifted past the healthy `f(ε)` budget; a repack pays.
     #[inline]
     fn probe_drifted(&self) -> bool {
         self.max_probe_groups > self.probe_drift_threshold
@@ -249,9 +250,8 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     batch_remaining: usize,
     /// Highest level index ever written; bounds the lookup probe loop.
     max_populated_level: usize,
-    /// An insert drifted a level's probe bound; a defrag repack is owed (gated
-    /// by [`DEFRAG_OPS_DIVISOR`]). Decouples defrag from the resize cadence so
-    /// high-`reserve_fraction` churn stays fast.
+    /// A defrag repack is owed (gated by [`DEFRAG_OPS_DIVISOR`]). Decouples
+    /// defrag from the resize cadence so high-`reserve_fraction` churn stays fast.
     defrag_pending: bool,
     /// Inserts since the last resize; gates the amortized defrag repack.
     inserts_since_repack: usize,
@@ -578,8 +578,7 @@ where
         } else if self.defrag_pending
             && self.inserts_since_repack > (self.total_slots / DEFRAG_OPS_DIVISOR).max(1)
         {
-            // Owed defrag, and enough inserts have passed to amortize it. Repack
-            // here, not at the drifting insert, so that insert's slot stays valid.
+            // Repack here, not at the drifting insert, so its slot stays valid.
             self.resize(self.total_slots);
         }
 
@@ -935,8 +934,7 @@ where
     /// `new_capacity` in-place, reinsert. Passing the current capacity
     /// performs a no-grow rehash that flushes accumulated tombstones.
     fn resize(&mut self, new_capacity: usize) {
-        // The rebuild re-places every key from its home group, resetting each
-        // level's `max_probe_groups`, so any pending defrag is satisfied.
+        // Rebuild resets every level's `max_probe_groups`, satisfying any defrag.
         self.defrag_pending = false;
         self.inserts_since_repack = 0;
         let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction);
