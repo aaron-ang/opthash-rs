@@ -2,7 +2,7 @@
 
 Date: 2026-06-08
 Scope: `ElasticTable` and `FunnelTable` lookup hot paths.
-Status: design approved, pending spec review.
+Status: approved. Lever 1 (prefetch) this round; Lever 2 (load knob) deferred to a follow-up.
 
 ## Problem
 
@@ -76,7 +76,7 @@ is the uncovered serial fraction.
   `core::arch::aarch64::_prefetch` behind cfg). Prefer the portable path.
 - Gate behind a cargo feature / cfg during the spike so the A/B is clean.
 
-## Lever 2 — get-optimized load knob (secondary, opt-in, both maps)
+## Lever 2 — get-optimized load knob (DEFERRED — follow-up, not in this plan)
 
 Lower load factor → more hits resolve at L0 → fewer lines touched.
 
