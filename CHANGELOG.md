@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2](https://github.com/aaron-ang/opthash-rs/compare/v0.10.1...v0.10.2) - 2026-06-09
+
+### Added
+
+- optimize funnel throughput paths ([#91](https://github.com/aaron-ang/opthash-rs/pull/91))
+- add nightly AVX-512 SIMD groups ([#77](https://github.com/aaron-ang/opthash-rs/pull/77))
+
+### Other
+
+- implementation plan for get-hit prefetch lever
+- scope get-hit plan to prefetch (Lever 1); defer load knob
+- design spec for get-hit latency scaling (prefetch + load knob)
+- *(elastic)* amortized defrag + raise default reserve to 0.45 ([#92](https://github.com/aaron-ang/opthash-rs/pull/92))
+- *(map)* deepen RawTable lookup helpers ([#87](https://github.com/aaron-ang/opthash-rs/pull/87))
+- *(funnel)* centralize region removal ([#89](https://github.com/aaron-ang/opthash-rs/pull/89))
+- *(elastic)* package geometry setup ([#86](https://github.com/aaron-ang/opthash-rs/pull/86))
+- *(arena)* unify arena lifecycle guards ([#88](https://github.com/aaron-ang/opthash-rs/pull/88))
+- *(python)* centralize adapter policies ([#90](https://github.com/aaron-ang/opthash-rs/pull/90))
+- *(arena)* extract LayoutCursor for region offset stamping ([#81](https://github.com/aaron-ang/opthash-rs/pull/81))
+- name backend type aliases consistently at definition ([#83](https://github.com/aaron-ang/opthash-rs/pull/83))
+- flatten EntryView into a concrete OccupiedError ([#82](https://github.com/aaron-ang/opthash-rs/pull/82))
+- drive backend white-box tests through the public shell ([#80](https://github.com/aaron-ang/opthash-rs/pull/80))
+- *(funnel)* fold arena builders into FunnelGeometry methods ([#79](https://github.com/aaron-ang/opthash-rs/pull/79))
+- deepen RawTable resize + scan seams ([#78](https://github.com/aaron-ang/opthash-rs/pull/78))
+- replace raw pointers with MaybeUninit in arena and funnel modules
+
 ## [0.10.1](https://github.com/aaron-ang/opthash-rs/compare/v0.10.0...v0.10.1) - 2026-05-31
 
 ### Added
