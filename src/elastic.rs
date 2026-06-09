@@ -20,7 +20,8 @@ type ElasticScanItem<K, V> = (*mut SlotEntry<K, V>, (usize, usize));
 
 /// Defrag repacks fire at most once per `total_slots / DEFRAG_OPS_DIVISOR`
 /// inserts, keeping them O(1) amortized so churn can't storm. Larger means more
-/// frequent repacks: less probe drift, more repack work.
+/// frequent repacks: less probe drift, more repack work. 4 is the swept knee:
+/// 2 inserts pay +16% from drift, 8+ erode the delete win with repack overhead.
 const DEFRAG_OPS_DIVISOR: usize = 4;
 
 /// A level is "drifted" once `max_probe_groups` exceeds this multiple of its
