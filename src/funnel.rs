@@ -361,6 +361,19 @@ impl<T> SpecialFallback<T> {
         probe::hash_to_usize(key_hash.rotate_left(37)) % self.bucket_count as usize
     }
 
+    #[inline]
+    fn bucket_occupied_count(&self, bucket_idx: usize) -> usize {
+        self.bucket_range(bucket_idx)
+            .filter(|&slot_idx| !self.control_at(slot_idx).is_free())
+            .count()
+    }
+
+    #[inline]
+    fn first_free_in_bucket(&self, bucket_idx: usize) -> Option<usize> {
+        self.bucket_range(bucket_idx)
+            .find(|&slot_idx| self.control_at(slot_idx).is_free())
+    }
+
     /// Erase slot: drop tombstone unless the group has free space.
     #[inline]
     fn erase(&mut self, idx: usize) -> bool {
@@ -1523,17 +1536,21 @@ where
 
         let bucket_a = fallback.bucket_a(key_hash);
         let bucket_b = fallback.bucket_b(key_hash);
-
-        for &bucket_idx in &[bucket_a, bucket_b] {
-            let range = fallback.bucket_range(bucket_idx);
-            for slot_idx in range {
-                if fallback.control_at(slot_idx).is_free() {
-                    return Some(slot_idx);
-                }
-            }
+        if bucket_a == bucket_b {
+            return fallback.first_free_in_bucket(bucket_a);
         }
 
-        None
+        let (first_bucket, second_bucket) = if fallback.bucket_occupied_count(bucket_a)
+            <= fallback.bucket_occupied_count(bucket_b)
+        {
+            (bucket_a, bucket_b)
+        } else {
+            (bucket_b, bucket_a)
+        };
+
+        fallback
+            .first_free_in_bucket(first_bucket)
+            .or_else(|| fallback.first_free_in_bucket(second_bucket))
     }
 
     /// Probe special primary for `key`. Bounded by `primary_probe_limit`
@@ -2664,6 +2681,46 @@ mod tests {
         assert_eq!(map.remove(&special_key), Some(special_key));
         assert_eq!(map.table().special.total_len, before_special - 1);
         assert_eq!(map.len(), before_len - 1);
+    }
+
+    #[test]
+    fn special_fallback_insert_prefers_emptier_bucket() {
+        let mut table: FunnelTable<u64, u64, DefaultHashBuilder, Global> =
+            FunnelTable::with_capacity_and_reserve_fraction_and_hasher_in(
+                2048,
+                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DefaultHashBuilder::default(),
+                Global,
+            );
+        let fallback = &mut table.special.fallback;
+        assert!(
+            fallback.bucket_count > 1,
+            "test requires at least two fallback buckets"
+        );
+
+        let key_hash = (0u64..10_000)
+            .map(|candidate| candidate.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .find(|&candidate| fallback.bucket_a(candidate) != fallback.bucket_b(candidate))
+            .expect("must find two distinct fallback buckets");
+        let bucket_a = fallback.bucket_a(key_hash);
+        let bucket_b = fallback.bucket_b(key_hash);
+        let range_a = fallback.bucket_range(bucket_a);
+        let range_b = fallback.bucket_range(bucket_b);
+        assert!(
+            range_a.len() >= 3 && !range_b.is_empty(),
+            "test requires non-empty candidate buckets"
+        );
+
+        let occupied = control::control_fingerprint(0xabc);
+        fallback.set_control(range_a.start, occupied);
+        fallback.set_control(range_a.start + 1, occupied);
+        fallback.len = 2;
+
+        assert_eq!(
+            table.first_free_in_special_fallback(key_hash),
+            Some(range_b.start),
+            "fallback C should choose the emptier of the two paper buckets"
+        );
     }
 
     #[test]
