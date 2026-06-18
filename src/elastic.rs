@@ -148,7 +148,7 @@ impl<T> Level<T> {
             return 1;
         }
         let log_inv_eps = (cap as f64 / free as f64).log2();
-        let raw = 1.0 + log_inv_eps * log_inv_eps;
+        let raw = 1.0 + log_inv_eps;
         raw.min(self.budget_cap) as usize
     }
 
@@ -1324,6 +1324,7 @@ fn build_batch_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ptr;
 
     #[test]
     fn level_partition_inflates_to_pow2_groups_and_preserves_halving() {
@@ -1354,6 +1355,20 @@ mod tests {
                 assert!(w[1] * 2 >= w[0], "shrinks too fast: {} → {}", w[0], w[1]);
             }
         }
+    }
+
+    #[test]
+    fn limited_group_budget_uses_paper_linear_log() {
+        let mut level = Level::<SlotEntry<u64, u64>>::new_at(
+            0,
+            1024,
+            1.0 / 4096.0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        level.len = 1008;
+
+        assert_eq!(level.limited_group_budget(), 7);
     }
 
     #[test]
