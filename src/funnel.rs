@@ -362,16 +362,17 @@ impl<T> SpecialFallback<T> {
     }
 
     #[inline]
-    fn bucket_occupied_count(&self, bucket_idx: usize) -> usize {
-        self.bucket_range(bucket_idx)
-            .filter(|&slot_idx| !self.control_at(slot_idx).is_free())
-            .count()
-    }
-
-    #[inline]
-    fn first_free_in_bucket(&self, bucket_idx: usize) -> Option<usize> {
-        self.bucket_range(bucket_idx)
-            .find(|&slot_idx| self.control_at(slot_idx).is_free())
+    fn bucket_info(&self, bucket_idx: usize) -> (Option<usize>, usize) {
+        let mut first_free = None;
+        let mut occupied_count = 0;
+        for slot_idx in self.bucket_range(bucket_idx) {
+            if self.control_at(slot_idx).is_free() {
+                first_free.get_or_insert(slot_idx);
+            } else {
+                occupied_count += 1;
+            }
+        }
+        (first_free, occupied_count)
     }
 
     /// Erase slot: drop tombstone unless the group has free space.
@@ -1536,21 +1537,23 @@ where
 
         let bucket_a = fallback.bucket_a(key_hash);
         let bucket_b = fallback.bucket_b(key_hash);
+        let (free_a, occupied_a) = fallback.bucket_info(bucket_a);
         if bucket_a == bucket_b {
-            return fallback.first_free_in_bucket(bucket_a);
+            return free_a;
         }
 
-        let (first_bucket, second_bucket) = if fallback.bucket_occupied_count(bucket_a)
-            <= fallback.bucket_occupied_count(bucket_b)
-        {
-            (bucket_a, bucket_b)
-        } else {
-            (bucket_b, bucket_a)
-        };
+        let (free_b, occupied_b) = fallback.bucket_info(bucket_b);
 
-        fallback
-            .first_free_in_bucket(first_bucket)
-            .or_else(|| fallback.first_free_in_bucket(second_bucket))
+        match (free_a, free_b) {
+            (Some(slot_a), Some(slot_b)) => {
+                if occupied_a <= occupied_b {
+                    Some(slot_a)
+                } else {
+                    Some(slot_b)
+                }
+            }
+            (free_a, free_b) => free_a.or(free_b),
+        }
     }
 
     /// Probe special primary for `key`. Bounded by `primary_probe_limit`
