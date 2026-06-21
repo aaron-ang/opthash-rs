@@ -94,12 +94,7 @@ fn bench_mixed(c: &mut Criterion) {
 
 fn bench_delete_heavy(c: &mut Criterion) {
     let initial_pairs = common::make_pairs(MAP_SIZE);
-    let replacement_pairs: Vec<(u64, u64)> = (0..OP_COUNT)
-        .map(|idx| {
-            let key = common::key_at(idx + 20_000_000);
-            (key, key ^ common::VALUE_XOR_MIX_ALT)
-        })
-        .collect();
+    let churn_keys: Vec<u64> = (0..OP_COUNT + MAP_SIZE).map(common::key_at).collect();
 
     let mut group = c.benchmark_group("delete_heavy");
     group.throughput(Throughput::Elements((OP_COUNT * 2) as u64));
@@ -111,9 +106,9 @@ fn bench_delete_heavy(c: &mut Criterion) {
         &initial_pairs,
         |map| {
             for idx in 0..OP_COUNT {
-                black_box(map.remove(black_box(&initial_pairs[idx % MAP_SIZE].0)));
-                let (key, value) = replacement_pairs[idx];
-                black_box(map.insert(black_box(key), black_box(value)));
+                black_box(map.remove(black_box(&churn_keys[idx])));
+                let key = churn_keys[idx + MAP_SIZE];
+                black_box(map.insert(black_box(key), black_box(key ^ common::VALUE_XOR_MIX_ALT)));
             }
         },
     );
