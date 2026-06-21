@@ -1359,14 +1359,18 @@ mod tests {
 
     #[test]
     fn limited_group_budget_uses_paper_linear_log() {
+        // cap/free = 1024/12 = 85.3 (non-pow2): 1 + log2(85.3) = 7.42 floors to
+        // 7 off any integer boundary, immune to libm's last-ULP wobble.
+        const CAP: u32 = 1024;
+        const FREE: u32 = 12;
         let mut level = Level::<SlotEntry<u64, u64>>::new_at(
             0,
-            1024,
+            CAP,
             1.0 / 4096.0,
             ptr::null_mut(),
             ptr::null_mut(),
         );
-        level.len = 1008;
+        level.len = CAP - FREE;
 
         assert_eq!(level.limited_group_budget(), 7);
     }
