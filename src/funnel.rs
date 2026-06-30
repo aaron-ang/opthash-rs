@@ -81,7 +81,10 @@ impl<T> BucketLevel<T> {
         data_ptr: *mut MaybeUninit<T>,
     ) -> Self {
         let cap = bucket_count.saturating_mul(bucket_width);
-        let bucket_count_mask = if pow2 {
+        let bucket_count_mask = if bucket_count == 0 {
+            // Empty level: route to the `& 0` path, never `% 0`.
+            0
+        } else if pow2 {
             bucket_count.saturating_sub(1)
         } else {
             u32::MAX
@@ -101,16 +104,15 @@ impl<T> BucketLevel<T> {
 
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
-    // Hot pow2 branch first for the predictor; cold modulo is the rare fallback.
-    #[allow(clippy::if_not_else)]
     fn bucket_index(&self, key_hash: u64) -> usize {
         let h = (key_hash as u32) ^ self.salt;
-        if self.bucket_count_mask != u32::MAX {
-            (h as usize) & self.bucket_count_mask as usize
-        } else {
-            // Callers guard `capacity == 0`, so a cold level here is non-empty.
+        if self.bucket_count_mask == u32::MAX {
+            // Cold exact level. Empty levels carry mask 0 (see `new_at`), so a
+            // level reaching the modulo path always has bucket_count != 0.
             debug_assert!(self.bucket_count != 0);
             (h % self.bucket_count) as usize
+        } else {
+            (h as usize) & self.bucket_count_mask as usize
         }
     }
 
