@@ -21,6 +21,19 @@ use crate::set;
 /// level capacities become unstable beyond this load factor.
 pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
 
+/// Levels `[0, FUNNEL_POW2_LEVELS)` use pow2 bucket counts + `& mask` routing
+/// (hot path); deeper levels store exact paper counts + `% count`, avoiding pow2
+/// inflation on cold levels.
+pub(crate) const FUNNEL_POW2_LEVELS: usize = 8;
+
+/// Pow2 (`& mask`) vs exact (`% count`) routing for a level. `total_ctrl` and
+/// `build_regions` MUST agree per level or the arena mis-allocates (UB), so both
+/// route through this one predicate.
+#[inline]
+const fn funnel_level_is_pow2(level_idx: usize) -> bool {
+    level_idx < FUNNEL_POW2_LEVELS
+}
+
 /// One funnel level `A_i` (paper §5). Fixed grid of `β`-sized buckets `A_{i,j}`;
 /// inserts hash to one bucket and probe within it. Overflow spills to `A_{i+1}`
 /// (or the special array `A_{α+1}`).
@@ -29,6 +42,9 @@ struct BucketLevel<T> {
     data_ptr: *mut MaybeUninit<T>,
     capacity: u32,
     bucket_count_mask: u32,
+    /// Exact bucket count. Pow2 levels: `bucket_count_mask + 1`. Cold levels:
+    /// `bucket_count_mask == u32::MAX` (sentinel) → `% bucket_count` routing.
+    bucket_count: u32,
     bucket_size_log2: u32,
     salt: u32,
     len: u32,
@@ -60,15 +76,22 @@ impl<T> BucketLevel<T> {
         level_idx: usize,
         bucket_count: u32,
         bucket_width: u32,
+        pow2: bool,
         ctrl_ptr: *mut u8,
         data_ptr: *mut MaybeUninit<T>,
     ) -> Self {
         let cap = bucket_count.saturating_mul(bucket_width);
+        let bucket_count_mask = if pow2 {
+            bucket_count.saturating_sub(1)
+        } else {
+            u32::MAX
+        };
         Self {
             ctrl_ptr,
             data_ptr,
             capacity: cap,
-            bucket_count_mask: bucket_count.saturating_sub(1),
+            bucket_count_mask,
+            bucket_count,
             bucket_size_log2: bucket_width.trailing_zeros(),
             salt: math::level_salt(level_idx),
             len: 0,
@@ -78,8 +101,17 @@ impl<T> BucketLevel<T> {
 
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
+    // Hot pow2 branch first for the predictor; cold modulo is the rare fallback.
+    #[allow(clippy::if_not_else)]
     fn bucket_index(&self, key_hash: u64) -> usize {
-        ((key_hash as u32) ^ self.salt) as usize & self.bucket_count_mask as usize
+        let h = (key_hash as u32) ^ self.salt;
+        if self.bucket_count_mask != u32::MAX {
+            (h as usize) & self.bucket_count_mask as usize
+        } else {
+            // Callers guard `capacity == 0`, so a cold level here is non-empty.
+            debug_assert!(self.bucket_count != 0);
+            (h % self.bucket_count) as usize
+        }
     }
 
     /// Slot index range covering all entries in `bucket_idx`.
@@ -638,12 +670,14 @@ impl<'a> FunnelGeometry<'a> {
     /// `CapacityOverflow` rather than a wrapped under-count.
     fn total_ctrl(&self) -> Result<usize, TryReserveError> {
         let mut sum: usize = 0;
-        for &bc in self.level_bucket_counts {
+        for (level_idx, &bc) in self.level_bucket_counts.iter().enumerate() {
             let bc = if bc == 0 {
                 0
-            } else {
+            } else if funnel_level_is_pow2(level_idx) {
                 bc.checked_next_power_of_two()
                     .ok_or(TryReserveError::CapacityOverflow)?
+            } else {
+                bc
             };
             let part = bc
                 .checked_mul(self.bucket_width)
@@ -674,16 +708,21 @@ impl<'a> FunnelGeometry<'a> {
         let bw32 =
             u32::try_from(self.bucket_width).map_err(|_| TryReserveError::CapacityOverflow)?;
         for (level_idx, &bc_raw) in self.level_bucket_counts.iter().enumerate() {
+            let pow2 = funnel_level_is_pow2(level_idx);
             let bc = u32::try_from(if bc_raw == 0 {
                 0
-            } else {
+            } else if pow2 {
                 bc_raw.next_power_of_two()
+            } else {
+                bc_raw
             })
             .map_err(|_| TryReserveError::CapacityOverflow)?;
             let cap = bc.saturating_mul(bw32);
             // SAFETY: the arena was allocated for the layout these region caps sum to.
             let (ctrl_ptr, data_ptr) = unsafe { cursor.reserve(cap)? };
-            levels.push(BucketLevel::new_at(level_idx, bc, bw32, ctrl_ptr, data_ptr));
+            levels.push(BucketLevel::new_at(
+                level_idx, bc, bw32, pow2, ctrl_ptr, data_ptr,
+            ));
         }
 
         let primary_cap =
@@ -2284,16 +2323,13 @@ where
         let bucket_width = align::round_up_to_group(compute_bucket_width(self.reserve_fraction));
         let primary_ctrl = self.special.primary.capacity as usize;
         let fallback_ctrl = self.special.fallback.capacity as usize;
+        // Use stored `bucket_count`: pow2 for hot levels (idempotent under
+        // `build_regions`), exact paper count for cold. `bucket_count_mask` would
+        // read the `u32::MAX` sentinel.
         let level_bucket_counts: Vec<usize> = self
             .levels
             .iter()
-            .map(|l| {
-                if l.bucket_count_mask == 0 && l.capacity == 0 {
-                    0
-                } else {
-                    l.bucket_count_mask as usize + 1
-                }
-            })
+            .map(|l| l.bucket_count as usize)
             .collect();
         let fallback_bucket_size = (self.primary_probe_limit.saturating_mul(2)).max(2);
 
@@ -2411,6 +2447,101 @@ mod tests {
         assert!(
             total >= requested,
             "total={total} below requested={requested}"
+        );
+    }
+
+    /// Recompute `(bucket_width, paper_bucket_counts)` from a table's geometry,
+    /// mirroring the constructor. Counts are the raw §5 partition, pre-rounding.
+    fn paper_geometry(total_slots: usize, reserve_fraction: f64) -> (usize, Vec<usize>) {
+        let level_count = compute_level_count(reserve_fraction);
+        let bucket_width = align::round_up_to_group(compute_bucket_width(reserve_fraction));
+        let special_capacity = choose_special_capacity(total_slots, reserve_fraction, bucket_width);
+        let mut main_capacity = total_slots.saturating_sub(special_capacity);
+        main_capacity -= main_capacity % bucket_width.max(1);
+        let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
+        // Mirror `FunnelGeometry::new`: round `bucket_width` up to a power of two.
+        let bucket_width = bucket_width.next_power_of_two();
+        (
+            bucket_width,
+            partition_funnel_buckets(total_main_buckets, level_count),
+        )
+    }
+
+    #[test]
+    fn funnel_layout_keeps_exact_bucket_counts_for_cold_levels() {
+        let map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity(2_000_000);
+        let table = map.table();
+        let levels = &table.levels;
+        assert!(
+            levels.len() > FUNNEL_POW2_LEVELS,
+            "need a cold level; got {}",
+            levels.len()
+        );
+
+        let (_, paper_counts) = paper_geometry(table.total_slots, table.reserve_fraction);
+        assert!(
+            paper_counts[FUNNEL_POW2_LEVELS] > 0,
+            "cold level under test must be non-empty: {paper_counts:?}"
+        );
+
+        let cold = &levels[FUNNEL_POW2_LEVELS];
+        assert_eq!(
+            cold.bucket_count_mask,
+            u32::MAX,
+            "cold level must use modulo routing"
+        );
+        // Exact paper count, not a pow2 round-up.
+        assert_eq!(cold.bucket_count as usize, paper_counts[FUNNEL_POW2_LEVELS]);
+
+        // Hot levels keep pow2 + `& mask` routing.
+        for hot in &levels[..FUNNEL_POW2_LEVELS] {
+            if hot.bucket_count != 0 {
+                assert_ne!(
+                    hot.bucket_count_mask,
+                    u32::MAX,
+                    "hot level must use mask routing"
+                );
+                assert_eq!(
+                    hot.bucket_count_mask,
+                    hot.bucket_count - 1,
+                    "pow2 level: mask == count - 1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cold_exact_counts_shrink_the_arena() {
+        let map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity(2_000_000);
+        let table = map.table();
+        let (bw, paper_counts) = paper_geometry(table.total_slots, table.reserve_fraction);
+
+        let pow2_ctrl: usize = paper_counts
+            .iter()
+            .map(|&bc| {
+                if bc == 0 {
+                    0
+                } else {
+                    bc.next_power_of_two() * bw
+                }
+            })
+            .sum();
+        let exact_ctrl: usize = paper_counts
+            .iter()
+            .enumerate()
+            .map(|(i, &bc)| {
+                if bc == 0 {
+                    0
+                } else if i < FUNNEL_POW2_LEVELS {
+                    bc.next_power_of_two() * bw
+                } else {
+                    bc * bw
+                }
+            })
+            .sum();
+        assert!(
+            exact_ctrl < pow2_ctrl,
+            "cold-exact must cut ctrl bytes: {exact_ctrl} !< {pow2_ctrl}"
         );
     }
 
