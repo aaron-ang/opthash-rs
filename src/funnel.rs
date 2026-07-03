@@ -40,13 +40,13 @@ const fn funnel_level_is_pow2(level_idx: usize) -> bool {
 struct BucketLevel<T> {
     ctrl_ptr: *mut u8,
     data_ptr: *mut MaybeUninit<T>,
-    capacity: u32,
     bucket_count_mask: u32,
     /// Exact bucket count. Pow2 levels: `bucket_count_mask + 1`. Cold levels:
     /// `bucket_count_mask == u32::MAX` (sentinel) → `% bucket_count` routing.
     bucket_count: u32,
     bucket_size_log2: u32,
     salt: u32,
+    capacity: u32,
     len: u32,
     tombstones: u32,
 }
@@ -92,11 +92,11 @@ impl<T> BucketLevel<T> {
         Self {
             ctrl_ptr,
             data_ptr,
-            capacity: cap,
             bucket_count_mask,
             bucket_count,
             bucket_size_log2: bucket_width.trailing_zeros(),
             salt: math::level_salt(level_idx),
+            capacity: cap,
             len: 0,
             tombstones: 0,
         }
@@ -2470,6 +2470,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // Large geometry-only allocation is too slow under Miri.
     fn funnel_layout_keeps_exact_bucket_counts_for_cold_levels() {
         let map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity(2_000_000);
         let table = map.table();
@@ -2513,6 +2514,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // Large geometry-only allocation is too slow under Miri.
     fn cold_exact_counts_shrink_the_arena() {
         let map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity(2_000_000);
         let table = map.table();
@@ -2765,6 +2767,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // Constant-hash special-array search is slow under Miri.
     fn special_array_removal_updates_region_counts_once() {
         struct ConstHasher;
         impl Hasher for ConstHasher {
