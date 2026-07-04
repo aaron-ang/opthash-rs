@@ -1250,6 +1250,10 @@ fn set_issubset<P: TableProbing<HashedAny, ()>>(
     for item in other.try_iter()? {
         other_set.add(item?)?;
     }
+    // `inner` is a set, so it cannot be a subset of a smaller collection.
+    if other_set.len() < inner.len() {
+        return Ok(false);
+    }
     for value in inner {
         if !other_set.contains(value.obj_borrowed(py))? {
             return Ok(false);
