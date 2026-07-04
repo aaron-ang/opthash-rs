@@ -14,8 +14,8 @@ use crate::common::error::TryReserveError;
 use crate::common::iter::RegionCursor;
 use crate::common::math::{self, align, capacity, cast, probe};
 use crate::common::simd;
+use crate::macros;
 use crate::map;
-use crate::set;
 
 /// Upper bound on `reserve_fraction`;
 /// level capacities become unstable beyond this load factor.
@@ -38,16 +38,29 @@ const fn funnel_level_is_pow2(level_idx: usize) -> bool {
 /// inserts hash to one bucket and probe within it. Overflow spills to `A_{i+1}`
 /// (or the special array `A_{α+1}`).
 struct BucketLevel<T> {
+    /// Cached `arena.as_ptr() + ctrl_offset`, stamped at construction.
     ctrl_ptr: *mut u8,
+    /// Cached `arena.as_ptr() + data_offset`, stamped at construction.
     data_ptr: *mut MaybeUninit<T>,
+    /// Bucket-routing mask. Pow2 levels: `bucket_count - 1`, so routing is
+    /// `& mask`. Cold (exact) levels: `u32::MAX` sentinel selecting the
+    /// `% bucket_count` path. Empty levels carry `0` to avoid `% 0`.
     bucket_count_mask: u32,
     /// Exact bucket count. Pow2 levels: `bucket_count_mask + 1`. Cold levels:
     /// `bucket_count_mask == u32::MAX` (sentinel) → `% bucket_count` routing.
     bucket_count: u32,
+    /// `log2(bucket width β)`. A bucket spans `1 << bucket_size_log2` slots
+    /// starting at `bucket_idx << bucket_size_log2` (always `GROUP_SIZE`-aligned).
     bucket_size_log2: u32,
+    /// Per-level salt mixed into the low 32 bits of the key hash before routing,
+    /// decorrelating bucket choice across levels.
     salt: u32,
+    /// Slot capacity (`bucket_count * bucket_width`). Bounds `len`/`tombstones`
+    /// so both fit in `u32`.
     capacity: u32,
+    /// Live entry count in this level.
     len: u32,
+    /// Deleted-slot (tombstone) count in this level.
     tombstones: u32,
 }
 
@@ -142,22 +155,6 @@ impl<T> BucketLevel<T> {
             .lowest()
             .map(|offset| bucket_range.start + offset)
     }
-
-    /// Erase slot: become `CTRL_EMPTY` if the bucket has any EMPTY byte
-    /// (probe chain terminates here), else `CTRL_TOMBSTONE`.
-    /// Returns whether a tombstone was written.
-    #[inline]
-    fn erase(&mut self, idx: usize) -> bool {
-        let group_idx = idx / GROUP_SIZE;
-        let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        if unsafe { simd::eq_mask_group(gp, CTRL_EMPTY).any() } {
-            self.set_control(idx, CTRL_EMPTY);
-            false
-        } else {
-            self.set_control(idx, CTRL_TOMBSTONE);
-            true
-        }
-    }
 }
 
 impl<K, V> BucketLevel<SlotEntry<K, V>> {
@@ -248,11 +245,17 @@ impl ProbeSeq {
 /// SIMD-group open addressing with per-key odd-step probing over pow2 `group_count`
 /// (step coprime to `group_count` ⇒ permutation over all groups).
 struct SpecialPrimary<T> {
+    /// Cached `arena.as_ptr() + ctrl_offset`, stamped at construction.
     ctrl_ptr: *mut u8,
+    /// Cached `arena.as_ptr() + data_offset`, stamped at construction.
     data_ptr: *mut MaybeUninit<T>,
+    /// Slot capacity (`group_count * GROUP_SIZE`). Bounds `len`/`tombstones`.
     capacity: u32,
+    /// `group_count - 1`; pow2 so per-key odd-step probes wrap with `& mask`.
     group_count_mask: u32,
+    /// Live entry count.
     len: u32,
+    /// Deleted-slot (tombstone) count.
     tombstones: u32,
 }
 
@@ -312,32 +315,26 @@ impl<T> SpecialPrimary<T> {
     fn group_step(&self, key_hash: u64) -> usize {
         (probe::hash_to_usize(key_hash.rotate_left(43)) | 1) & self.group_count_mask as usize
     }
-
-    /// Erase slot: drop tombstone unless the group has free space.
-    #[inline]
-    fn erase(&mut self, idx: usize) -> bool {
-        let group_idx = idx / GROUP_SIZE;
-        let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        if unsafe { simd::eq_mask_group(gp, CTRL_EMPTY).any() } {
-            self.set_control(idx, CTRL_EMPTY);
-            false
-        } else {
-            self.set_control(idx, CTRL_TOMBSTONE);
-            true
-        }
-    }
 }
 
 /// Half `C` of the special array `A_{α+1}` (paper §5):
 /// two-choice table with buckets of size `2 * primary_probe_limit` ≈ 2 log log n.
 /// Reached only when a key exhausts the primary's probe budget.
 struct SpecialFallback<T> {
+    /// Cached `arena.as_ptr() + ctrl_offset`, stamped at construction.
     ctrl_ptr: *mut u8,
+    /// Cached `arena.as_ptr() + data_offset`, stamped at construction.
     data_ptr: *mut MaybeUninit<T>,
+    /// Slot capacity (`bucket_count * bucket_width`). Bounds `len`/`tombstones`.
     capacity: u32,
+    /// Number of two-choice buckets; a key probes exactly `bucket_a`/`bucket_b`.
     bucket_count: u32,
+    /// `log2(bucket width)`; a bucket spans `1 << bucket_size_log2` slots
+    /// (`≈ 2 * primary_probe_limit`, rounded to a power of two).
     bucket_size_log2: u32,
+    /// Live entry count.
     len: u32,
+    /// Deleted-slot (tombstone) count.
     tombstones: u32,
 }
 
@@ -407,20 +404,6 @@ impl<T> SpecialFallback<T> {
             }
         }
         (first_free, occupied_count)
-    }
-
-    /// Erase slot: drop tombstone unless the group has free space.
-    #[inline]
-    fn erase(&mut self, idx: usize) -> bool {
-        let group_idx = idx / GROUP_SIZE;
-        let gp = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        if unsafe { simd::eq_mask_group(gp, CTRL_EMPTY).any() } {
-            self.set_control(idx, CTRL_EMPTY);
-            false
-        } else {
-            self.set_control(idx, CTRL_TOMBSTONE);
-            true
-        }
     }
 }
 
@@ -1024,92 +1007,51 @@ impl<K, V, S, A: Allocator + Clone> Drop for FunnelTable<K, V, S, A> {
 // ---------------------------------------------------------------------------
 // Public type aliases. The generic [`map::HashMap`] shell supplies the public
 // API; these names keep `FunnelHashMap` and its iterator/entry types nameable
-// (and re-exportable from `lib.rs` / `set.rs`).
+// (and re-exportable from `lib.rs` / `set.rs`). The generic-argument threading
+// lives once in `declare_backend_aliases!`; each entry below is just `doc`,
+// alias name, and the unprefixed shell type.
 // ---------------------------------------------------------------------------
 
-/// Open-addressed hash map using funnel hashing.
-pub type FunnelHashMap<K, V, S = DefaultHashBuilder, A = Global> =
-    map::HashMap<K, V, FunnelTable<K, V, S, A>>;
-
-/// A view into a single entry, occupied or vacant.
-pub type FunnelEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::Entry<'a, K, V, FunnelTable<K, V, S, A>>;
-/// View of an occupied entry.
-pub type FunnelOccupiedEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::OccupiedEntry<'a, K, V, FunnelTable<K, V, S, A>>;
-/// View of a vacant entry.
-pub type FunnelVacantEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::VacantEntry<'a, K, V, FunnelTable<K, V, S, A>>;
-/// Error returned by `try_insert` on key collision.
-pub type FunnelOccupiedError<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::OccupiedError<'a, K, V, FunnelTable<K, V, S, A>>;
-/// Borrowing iterator over `(&K, &V)`.
-pub type FunnelIter<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::Iter<'a, K, V, FunnelTable<K, V, S, A>>;
-/// Borrowing iterator over `(&K, &mut V)`.
-pub type FunnelIterMut<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::IterMut<'a, K, V, FunnelTable<K, V, S, A>>;
-/// Consuming iterator over owned `(K, V)`.
-pub type FunnelIntoIter<K, V, S = DefaultHashBuilder, A = Global> =
-    map::IntoIter<K, V, FunnelTable<K, V, S, A>>;
-/// `&K` iterator.
-pub type FunnelKeys<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::Keys<'a, K, V, FunnelTable<K, V, S, A>>;
-/// `&V` iterator.
-pub type FunnelValues<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::Values<'a, K, V, FunnelTable<K, V, S, A>>;
-/// `&mut V` iterator.
-pub type FunnelValuesMut<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::ValuesMut<'a, K, V, FunnelTable<K, V, S, A>>;
-/// Owned `K` iterator.
-pub type FunnelIntoKeys<K, V, S = DefaultHashBuilder, A = Global> =
-    map::IntoKeys<K, V, FunnelTable<K, V, S, A>>;
-/// Owned `V` iterator.
-pub type FunnelIntoValues<K, V, S = DefaultHashBuilder, A = Global> =
-    map::IntoValues<K, V, FunnelTable<K, V, S, A>>;
-/// Draining iterator that empties the map.
-pub type FunnelDrain<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::Drain<'a, K, V, FunnelTable<K, V, S, A>>;
-/// Iterator yielding entries removed by `extract_if`.
-pub type FunnelExtractIf<'a, K, V, F, S = DefaultHashBuilder, A = Global> =
-    map::ExtractIf<'a, K, V, FunnelTable<K, V, S, A>, F>;
-
-/// Hash set using funnel hashing.
-pub type FunnelHashSet<T, S = DefaultHashBuilder, A = Global> =
-    set::HashSet<T, FunnelTable<T, (), S, A>>;
-/// Borrowing iterator over set values.
-pub type FunnelSetIter<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Iter<'a, T, FunnelTable<T, (), S, A>>;
-/// Consuming iterator over set values.
-pub type FunnelSetIntoIter<T, S = DefaultHashBuilder, A = Global> =
-    set::IntoIter<T, FunnelTable<T, (), S, A>>;
-/// Draining iterator that empties the set.
-pub type FunnelSetDrain<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Drain<'a, T, FunnelTable<T, (), S, A>>;
-/// Iterator yielding values removed by set `extract_if`.
-pub type FunnelSetExtractIf<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::ExtractIf<'a, T, FunnelTable<T, (), S, A>>;
-/// Iterator over values present only in the first set.
-pub type FunnelDifference<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Difference<'a, T, FunnelTable<T, (), S, A>>;
-/// Iterator over values present in both sets.
-pub type FunnelIntersection<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Intersection<'a, T, FunnelTable<T, (), S, A>>;
-/// Iterator over values present in exactly one set.
-pub type FunnelSymmetricDifference<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::SymmetricDifference<'a, T, FunnelTable<T, (), S, A>>;
-/// Iterator over values present in either set.
-pub type FunnelUnion<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Union<'a, T, FunnelTable<T, (), S, A>>;
-/// A view into a single set entry.
-pub type FunnelSetEntry<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Entry<'a, T, FunnelTable<T, (), S, A>>;
-/// View of an occupied set entry.
-pub type FunnelSetOccupiedEntry<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::OccupiedEntry<'a, T, FunnelTable<T, (), S, A>>;
-/// View of a vacant set entry.
-pub type FunnelSetVacantEntry<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::VacantEntry<'a, T, FunnelTable<T, (), S, A>>;
+macros::declare_backend_aliases! {
+    table = FunnelTable,
+    map_no_lifetime {
+        "Open-addressed hash map using funnel hashing." FunnelHashMap => HashMap,
+        "Consuming iterator over owned `(K, V)`." FunnelIntoIter => IntoIter,
+        "Owned `K` iterator." FunnelIntoKeys => IntoKeys,
+        "Owned `V` iterator." FunnelIntoValues => IntoValues,
+    },
+    map_ref {
+        "A view into a single entry, occupied or vacant." FunnelEntry => Entry,
+        "View of an occupied entry." FunnelOccupiedEntry => OccupiedEntry,
+        "View of a vacant entry." FunnelVacantEntry => VacantEntry,
+        "Error returned by `try_insert` on key collision." FunnelOccupiedError => OccupiedError,
+        "Borrowing iterator over `(&K, &V)`." FunnelIter => Iter,
+        "Borrowing iterator over `(&K, &mut V)`." FunnelIterMut => IterMut,
+        "`&K` iterator." FunnelKeys => Keys,
+        "`&V` iterator." FunnelValues => Values,
+        "`&mut V` iterator." FunnelValuesMut => ValuesMut,
+        "Draining iterator that empties the map." FunnelDrain => Drain,
+    },
+    map_extract_if {
+        "Iterator yielding entries removed by `extract_if`." FunnelExtractIf
+    },
+    set_no_lifetime {
+        "Hash set using funnel hashing." FunnelHashSet => HashSet,
+        "Consuming iterator over set values." FunnelSetIntoIter => IntoIter,
+    },
+    set_ref {
+        "Borrowing iterator over set values." FunnelSetIter => Iter,
+        "Draining iterator that empties the set." FunnelSetDrain => Drain,
+        "Iterator yielding values removed by set `extract_if`." FunnelSetExtractIf => ExtractIf,
+        "Iterator over values present only in the first set." FunnelDifference => Difference,
+        "Iterator over values present in both sets." FunnelIntersection => Intersection,
+        "Iterator over values present in exactly one set." FunnelSymmetricDifference => SymmetricDifference,
+        "Iterator over values present in either set." FunnelUnion => Union,
+        "A view into a single set entry." FunnelSetEntry => Entry,
+        "View of an occupied set entry." FunnelSetOccupiedEntry => OccupiedEntry,
+        "View of a vacant set entry." FunnelSetVacantEntry => VacantEntry,
+    },
+}
 
 /// Boxed level descriptors for one funnel arena build.
 type BucketLevelSlice<K, V> = Box<[BucketLevel<SlotEntry<K, V>>]>;
@@ -1383,17 +1325,6 @@ where
             alloc,
             arena,
         }
-    }
-
-    /// Round up to the smallest capacity whose `max_insertions` accommodates
-    /// `needed` live entries. Returns `None` if no representable capacity
-    /// suffices.
-    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
-        capacity::capacity_for(
-            self.total_slots.max(INITIAL_CAPACITY),
-            needed,
-            self.reserve_fraction,
-        )
     }
 
     /// Post-lookup insert for a key known to be absent. Returns the chosen
@@ -2292,11 +2223,6 @@ where
     }
 
     #[inline]
-    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
-        self.grow_capacity_for(needed)
-    }
-
-    #[inline]
     fn resize(&mut self, new_capacity: usize) {
         self.resize(new_capacity);
     }
@@ -2680,6 +2606,8 @@ mod tests {
 
     use std::hash::{BuildHasher, Hasher};
 
+    use crate::common::config::DEFAULT_RESERVE_FRACTION;
+
     #[test]
     fn resize_scheduler_owns_pending_entries_and_checked_growth() {
         let mut scheduler = ResizeScheduler::new(64, vec![(1, 10), (2, 20)]);
@@ -2897,7 +2825,7 @@ mod tests {
         let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
             FunnelHashMap::with_capacity_and_reserve_fraction_and_hasher_in(
                 2048,
-                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DEFAULT_RESERVE_FRACTION,
                 ConstHashBuilder,
                 Global,
             );
@@ -2955,7 +2883,7 @@ mod tests {
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(1024);
         let max = i32::try_from(capacity::max_insertions(
             map.capacity(),
-            crate::common::config::DEFAULT_RESERVE_FRACTION,
+            DEFAULT_RESERVE_FRACTION,
         ))
         .expect("test capacity fits i32");
         for i in 0..max {
@@ -3002,7 +2930,7 @@ mod tests {
         let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
             FunnelHashMap::with_capacity_and_reserve_fraction_and_hasher_in(
                 2048,
-                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DEFAULT_RESERVE_FRACTION,
                 ConstHashBuilder,
                 Global,
             );
@@ -3047,7 +2975,7 @@ mod tests {
         let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
             FunnelHashMap::with_capacity_and_reserve_fraction_and_hasher_in(
                 2048,
-                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DEFAULT_RESERVE_FRACTION,
                 ConstHashBuilder,
                 Global,
             );
@@ -3087,7 +3015,7 @@ mod tests {
         let mut table: FunnelTable<u64, u64, DefaultHashBuilder, Global> =
             FunnelTable::with_capacity_and_reserve_fraction_and_hasher_in(
                 2048,
-                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DEFAULT_RESERVE_FRACTION,
                 DefaultHashBuilder::default(),
                 Global,
             );
@@ -3127,7 +3055,7 @@ mod tests {
         let mut table: FunnelTable<u64, u64, DefaultHashBuilder, Global> =
             FunnelTable::with_capacity_and_reserve_fraction_and_hasher_in(
                 2048,
-                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DEFAULT_RESERVE_FRACTION,
                 DefaultHashBuilder::default(),
                 Global,
             );

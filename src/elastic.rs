@@ -11,8 +11,8 @@ use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::common::error::TryReserveError;
 use crate::common::iter::RegionCursor;
 use crate::common::math::{self, align, capacity, probe};
+use crate::macros;
 use crate::map;
-use crate::set;
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -152,6 +152,9 @@ impl<T> Level<T> {
         raw.min(self.budget_cap) as usize
     }
 
+    /// Tombstones exceed [`capacity::tombstone_cleanup_threshold`], so `remove`
+    /// should repack this level in place; the threshold's hysteresis keeps
+    /// deletes amortized O(1).
     #[inline]
     fn needs_cleanup(&self) -> bool {
         self.tombstones as usize > capacity::tombstone_cleanup_threshold(self.capacity as usize)
@@ -271,92 +274,51 @@ impl<K, V, S, A: Allocator + Clone> Drop for ElasticTable<K, V, S, A> {
 // ---------------------------------------------------------------------------
 // Public type aliases. The generic [`map::HashMap`] shell supplies the public
 // API; these names keep `ElasticHashMap` and its iterator/entry types
-// nameable (and re-exportable from `lib.rs` / `set.rs`).
+// nameable (and re-exportable from `lib.rs` / `set.rs`). The generic-argument
+// threading lives once in `declare_backend_aliases!`; each entry below is just
+// `doc`, alias name, and the unprefixed shell type.
 // ---------------------------------------------------------------------------
 
-/// Open-addressed hash map using elastic hashing.
-pub type ElasticHashMap<K, V, S = DefaultHashBuilder, A = Global> =
-    map::HashMap<K, V, ElasticTable<K, V, S, A>>;
-
-/// A view into a single entry, occupied or vacant.
-pub type ElasticEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::Entry<'a, K, V, ElasticTable<K, V, S, A>>;
-/// View of an occupied entry.
-pub type ElasticOccupiedEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::OccupiedEntry<'a, K, V, ElasticTable<K, V, S, A>>;
-/// View of a vacant entry.
-pub type ElasticVacantEntry<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::VacantEntry<'a, K, V, ElasticTable<K, V, S, A>>;
-/// Error returned by `try_insert` on key collision.
-pub type ElasticOccupiedError<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::OccupiedError<'a, K, V, ElasticTable<K, V, S, A>>;
-/// Borrowing iterator over `(&K, &V)`.
-pub type ElasticIter<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::Iter<'a, K, V, ElasticTable<K, V, S, A>>;
-/// Borrowing iterator over `(&K, &mut V)`.
-pub type ElasticIterMut<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::IterMut<'a, K, V, ElasticTable<K, V, S, A>>;
-/// Consuming iterator over owned `(K, V)`.
-pub type ElasticIntoIter<K, V, S = DefaultHashBuilder, A = Global> =
-    map::IntoIter<K, V, ElasticTable<K, V, S, A>>;
-/// `&K` iterator.
-pub type ElasticKeys<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::Keys<'a, K, V, ElasticTable<K, V, S, A>>;
-/// `&V` iterator.
-pub type ElasticValues<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::Values<'a, K, V, ElasticTable<K, V, S, A>>;
-/// `&mut V` iterator.
-pub type ElasticValuesMut<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::ValuesMut<'a, K, V, ElasticTable<K, V, S, A>>;
-/// Owned `K` iterator.
-pub type ElasticIntoKeys<K, V, S = DefaultHashBuilder, A = Global> =
-    map::IntoKeys<K, V, ElasticTable<K, V, S, A>>;
-/// Owned `V` iterator.
-pub type ElasticIntoValues<K, V, S = DefaultHashBuilder, A = Global> =
-    map::IntoValues<K, V, ElasticTable<K, V, S, A>>;
-/// Draining iterator that empties the map.
-pub type ElasticDrain<'a, K, V, S = DefaultHashBuilder, A = Global> =
-    map::Drain<'a, K, V, ElasticTable<K, V, S, A>>;
-/// Iterator yielding entries removed by `extract_if`.
-pub type ElasticExtractIf<'a, K, V, F, S = DefaultHashBuilder, A = Global> =
-    map::ExtractIf<'a, K, V, ElasticTable<K, V, S, A>, F>;
-
-/// Hash set using elastic hashing.
-pub type ElasticHashSet<T, S = DefaultHashBuilder, A = Global> =
-    set::HashSet<T, ElasticTable<T, (), S, A>>;
-/// Borrowing iterator over set values.
-pub type ElasticSetIter<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Iter<'a, T, ElasticTable<T, (), S, A>>;
-/// Consuming iterator over set values.
-pub type ElasticSetIntoIter<T, S = DefaultHashBuilder, A = Global> =
-    set::IntoIter<T, ElasticTable<T, (), S, A>>;
-/// Draining iterator that empties the set.
-pub type ElasticSetDrain<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Drain<'a, T, ElasticTable<T, (), S, A>>;
-/// Iterator yielding values removed by set `extract_if`.
-pub type ElasticSetExtractIf<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::ExtractIf<'a, T, ElasticTable<T, (), S, A>>;
-/// Iterator over values present only in the first set.
-pub type ElasticDifference<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Difference<'a, T, ElasticTable<T, (), S, A>>;
-/// Iterator over values present in both sets.
-pub type ElasticIntersection<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Intersection<'a, T, ElasticTable<T, (), S, A>>;
-/// Iterator over values present in exactly one set.
-pub type ElasticSymmetricDifference<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::SymmetricDifference<'a, T, ElasticTable<T, (), S, A>>;
-/// Iterator over values present in either set.
-pub type ElasticUnion<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Union<'a, T, ElasticTable<T, (), S, A>>;
-/// A view into a single set entry.
-pub type ElasticSetEntry<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::Entry<'a, T, ElasticTable<T, (), S, A>>;
-/// View of an occupied set entry.
-pub type ElasticSetOccupiedEntry<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::OccupiedEntry<'a, T, ElasticTable<T, (), S, A>>;
-/// View of a vacant set entry.
-pub type ElasticSetVacantEntry<'a, T, S = DefaultHashBuilder, A = Global> =
-    set::VacantEntry<'a, T, ElasticTable<T, (), S, A>>;
+macros::declare_backend_aliases! {
+    table = ElasticTable,
+    map_no_lifetime {
+        "Open-addressed hash map using elastic hashing." ElasticHashMap => HashMap,
+        "Consuming iterator over owned `(K, V)`." ElasticIntoIter => IntoIter,
+        "Owned `K` iterator." ElasticIntoKeys => IntoKeys,
+        "Owned `V` iterator." ElasticIntoValues => IntoValues,
+    },
+    map_ref {
+        "A view into a single entry, occupied or vacant." ElasticEntry => Entry,
+        "View of an occupied entry." ElasticOccupiedEntry => OccupiedEntry,
+        "View of a vacant entry." ElasticVacantEntry => VacantEntry,
+        "Error returned by `try_insert` on key collision." ElasticOccupiedError => OccupiedError,
+        "Borrowing iterator over `(&K, &V)`." ElasticIter => Iter,
+        "Borrowing iterator over `(&K, &mut V)`." ElasticIterMut => IterMut,
+        "`&K` iterator." ElasticKeys => Keys,
+        "`&V` iterator." ElasticValues => Values,
+        "`&mut V` iterator." ElasticValuesMut => ValuesMut,
+        "Draining iterator that empties the map." ElasticDrain => Drain,
+    },
+    map_extract_if {
+        "Iterator yielding entries removed by `extract_if`." ElasticExtractIf
+    },
+    set_no_lifetime {
+        "Hash set using elastic hashing." ElasticHashSet => HashSet,
+        "Consuming iterator over set values." ElasticSetIntoIter => IntoIter,
+    },
+    set_ref {
+        "Borrowing iterator over set values." ElasticSetIter => Iter,
+        "Draining iterator that empties the set." ElasticSetDrain => Drain,
+        "Iterator yielding values removed by set `extract_if`." ElasticSetExtractIf => ExtractIf,
+        "Iterator over values present only in the first set." ElasticDifference => Difference,
+        "Iterator over values present in both sets." ElasticIntersection => Intersection,
+        "Iterator over values present in exactly one set." ElasticSymmetricDifference => SymmetricDifference,
+        "Iterator over values present in either set." ElasticUnion => Union,
+        "A view into a single set entry." ElasticSetEntry => Entry,
+        "View of an occupied set entry." ElasticSetOccupiedEntry => OccupiedEntry,
+        "View of a vacant set entry." ElasticSetVacantEntry => VacantEntry,
+    },
+}
 
 /// Boxed slice of levels for one `(K, V)` parameterization.
 type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
@@ -586,6 +548,12 @@ where
     /// `hash_builder` and allocator so all keys keep the same hash sequence
     /// across grows.
     ///
+    /// # Load factor
+    ///
+    /// `reserve_fraction` is clamped to `[1e-6, 0.999999]`. Unlike funnel
+    /// hashing (capped at δ ≤ 1/8), elastic stays sound at near-full load — the
+    /// per-level `f(ε)` probe budget absorbs it.
+    ///
     /// # Panics
     ///
     /// Panics if no representable capacity satisfies the requested budget.
@@ -618,17 +586,6 @@ where
             alloc,
             arena,
         }
-    }
-
-    /// Round up to the smallest capacity whose `max_insertions` accommodates
-    /// `needed` live entries. Returns `None` if no representable capacity
-    /// suffices. Used by `reserve` / `try_reserve`.
-    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
-        capacity::capacity_for(
-            self.total_slots.max(INITIAL_CAPACITY),
-            needed,
-            self.reserve_fraction,
-        )
     }
 
     /// Removes all entries, keeping allocated capacity.
@@ -889,11 +846,6 @@ where
             hash_builder,
             alloc,
         )
-    }
-
-    #[inline]
-    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
-        self.grow_capacity_for(needed)
     }
 
     #[inline]
@@ -1404,7 +1356,10 @@ fn build_batch_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::ptr;
+
+    use crate::common::config::DEFAULT_RESERVE_FRACTION;
 
     #[test]
     fn level_partition_inflates_to_pow2_groups_and_preserves_halving() {
@@ -1458,7 +1413,7 @@ mod tests {
     #[test]
     fn elastic_geometry_carries_capacity_and_batch_state() {
         for &requested in &[0usize, 1, 127, 1_000, 10_000] {
-            let reserve_fraction = crate::common::config::DEFAULT_RESERVE_FRACTION;
+            let reserve_fraction = DEFAULT_RESERVE_FRACTION;
             let geometry = ElasticGeometry::for_insert_budget(requested, reserve_fraction).unwrap();
             assert!(
                 geometry.max_insertions >= requested,
@@ -1498,7 +1453,7 @@ mod tests {
         let mut table: ElasticTable<usize, usize> =
             ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
                 1024,
-                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DEFAULT_RESERVE_FRACTION,
                 DefaultHashBuilder::default(),
                 Global,
             );
@@ -1521,7 +1476,7 @@ mod tests {
         let mut table: ElasticTable<usize, usize> =
             ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
                 1024,
-                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DEFAULT_RESERVE_FRACTION,
                 DefaultHashBuilder::default(),
                 Global,
             );

@@ -3,6 +3,7 @@
 mod common;
 mod elastic;
 mod funnel;
+mod macros;
 mod map;
 mod set;
 

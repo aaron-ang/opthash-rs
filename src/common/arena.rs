@@ -319,6 +319,21 @@ pub(crate) trait ArenaSlots<T> {
         self.set_control(idx, CTRL_TOMBSTONE);
     }
 
+    /// Erase the slot at `idx`: reset to `CTRL_EMPTY` if its SIMD group still
+    /// holds an EMPTY byte (probe chain terminates here, no tombstone needed),
+    /// else write `CTRL_TOMBSTONE`. Return whether a tombstone was written.
+    #[inline]
+    fn erase(&mut self, idx: usize) -> bool {
+        let group_idx = idx / GROUP_SIZE;
+        if self.group_match_mask(group_idx, CTRL_EMPTY).any() {
+            self.set_control(idx, CTRL_EMPTY);
+            false
+        } else {
+            self.set_control(idx, CTRL_TOMBSTONE);
+            true
+        }
+    }
+
     /// Wipe every ctrl byte in this region to FREE.
     /// Caller is responsible for having dropped occupied values first.
     #[inline]

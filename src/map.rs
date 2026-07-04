@@ -23,7 +23,13 @@ use crate::common::math::capacity;
 // This crate-private contract intentionally exposes `SlotEntry`.
 #[allow(private_interfaces)]
 pub trait TableStorage<K, V>: Sized {
-    /// Identify an occupied slot.
+    /// Identify an occupied slot in this table.
+    ///
+    /// Valid only until the next structural mutation of the same table (a
+    /// resize/repack from `insert`/`remove`, or `resize`/`clear`/`shrink_to`).
+    /// Every method taking a `Location` requires one from the same table, still
+    /// valid; a stale or foreign location reads or writes the wrong slot.
+    /// Consume it before the next mutation; never store it across one.
     type Location: Copy + PartialEq;
     /// Build hashes for stored keys.
     type Hasher: BuildHasher;
@@ -64,13 +70,15 @@ pub trait TableStorage<K, V>: Sized {
     /// `loc` must be a live location from this table.
     unsafe fn slot_ptr(&self, loc: Self::Location) -> *mut SlotEntry<K, V>;
 
-    /// Replace the value at `loc` and return the previous value.
+    /// Replace the value at `loc` (valid per [`Location`](TableStorage::Location))
+    /// and return the previous.
     fn replace_value(&mut self, loc: Self::Location, value: V) -> V;
 }
 
 /// Find keys in table storage.
 pub trait TableLookup<K, V>: TableStorage<K, V> {
-    /// Find the slot for `key` using the precomputed hash and fingerprint.
+    /// Find the slot for `key` by precomputed hash and fingerprint; the
+    /// location is valid per [`Location`](TableStorage::Location).
     fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<Self::Location>
     where
         Q: Hash + Equivalent<K> + ?Sized;
@@ -78,7 +86,8 @@ pub trait TableLookup<K, V>: TableStorage<K, V> {
 
 /// Insert and remove entries using storage and lookup primitives.
 pub trait TableInsert<K, V>: TableLookup<K, V> {
-    /// Insert a known-absent key, resize as needed, and return its location.
+    /// Insert a known-absent key, resize as needed, and return its location
+    /// (valid per [`Location`](TableStorage::Location)).
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> Self::Location;
 
     /// Insert `key` → `value` and return the previous value. Backends may
@@ -95,14 +104,17 @@ pub trait TableInsert<K, V>: TableLookup<K, V> {
         None
     }
 
-    /// Remove the entry at `loc`, update bookkeeping, and resize if needed.
+    /// Remove the entry at `loc` (valid per [`Location`](TableStorage::Location)),
+    /// update bookkeeping, and resize if needed.
     fn remove(&mut self, loc: Self::Location) -> (K, V);
 
-    /// Mark `loc` as a tombstone without updating counters. Draining iterators
-    /// use this after moving out the value to prevent a second drop.
+    /// Mark `loc` (valid per [`Location`](TableStorage::Location)) as a tombstone
+    /// without updating counters — draining iterators use it after moving the
+    /// value out to avoid a double drop.
     fn tombstone_slot(&mut self, loc: Self::Location);
 
-    /// Mark a moved-out slot as a tombstone and update counters without resizing.
+    /// Mark a moved-out `loc` (valid per [`Location`](TableStorage::Location)) as
+    /// a tombstone and update counters without resizing.
     fn extract_finish(&mut self, loc: Self::Location);
 }
 
@@ -115,8 +127,11 @@ pub trait TableIterate<K, V>: TableStorage<K, V> {
     /// Create a cursor positioned before the first occupied slot.
     fn scan(&self) -> Self::Scan;
 
-    /// Advance `scan` and return the next occupied slot. The cursor remains
+    /// Advance `scan` and return the next occupied slot. The cursor stays
     /// pointerless between calls so a consumed table can move safely.
+    ///
+    /// Yield each occupied slot exactly once per traversal, with distinct
+    /// pointers: `IterMut`/`Drain` lift each to a `&mut`, so a repeat aliases (UB).
     fn scan_next(&self, scan: &mut Self::Scan) -> Option<(*mut SlotEntry<K, V>, Self::Location)>;
 }
 
@@ -130,8 +145,16 @@ pub trait TableLifecycle<K, V>: TableStorage<K, V> {
         alloc: Self::Alloc,
     ) -> Self;
 
-    /// Compute the slot count needed for `needed` live entries.
-    fn grow_capacity_for(&self, needed: usize) -> Option<usize>;
+    /// Compute the slot count for `needed` live entries, or `None` if none is
+    /// representable. Round up from `total_slots()` (min `INITIAL_CAPACITY`) by
+    /// `reserve_fraction()`.
+    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
+        capacity::capacity_for(
+            self.total_slots().max(INITIAL_CAPACITY),
+            needed,
+            self.reserve_fraction(),
+        )
+    }
 
     /// Reallocate to `new_capacity` slots and reinsert every entry.
     fn resize(&mut self, new_capacity: usize);

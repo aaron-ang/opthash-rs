@@ -91,9 +91,10 @@ Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loade
 
 ## Project Structure
 
-- `src/map.rs` — generic `HashMap<K, V, R>` public shell + `RawTable<K, V>` backend trait; both maps share it
-- `src/elastic.rs` — `ElasticTable: RawTable` + `ElasticHashMap` shell alias (tests inline)
-- `src/funnel.rs` — `FunnelTable: RawTable` + `FunnelHashMap` shell alias (tests inline)
+- `src/map.rs` — generic `HashMap<K, V, P>` public shell + `TableProbing<K, V>` backend trait (the umbrella over `TableStorage`/`TableLookup`/`TableInsert`/`TableIterate`/`TableLifecycle`); both maps share it
+- `src/macros.rs` — `declare_backend_aliases!`, generating each backend's public type-alias surface
+- `src/elastic.rs` — `ElasticTable` (impls `TableProbing`) + `ElasticHashMap` shell alias (tests inline)
+- `src/funnel.rs` — `FunnelTable` (impls `TableProbing`) + `FunnelHashMap` shell alias (tests inline)
 - `src/set.rs` — `ElasticHashSet`/`FunnelHashSet` wrapping the maps; set algebra
 - `src/python.rs` — pyo3 bindings, `#[cfg(feature = "python")]`
 - `src/common/` — shared internals (library + benches): `arena` (slot storage), control-byte SIMD, bitmask, layout math, config, error
@@ -123,5 +124,5 @@ When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-
 
 - Read the asm (`objdump -d`) on hot functions before factoring shared SIMD or arithmetic primitives. LLVM already CSEs same-pointer control-byte loads and folds duplicate masks; a "cleaner" abstraction may save nothing.
 - Confirm hot-path wins with `perf stat` (cycles, instructions, cache-misses, branch-misses) on a pinned run; a real win moves the matching counter, not just wallclock.
-- Adding a field to a hot struct (`RawTable`, `Level`) is a layout change. Downstream fields can shift across cache lines and regress lookups with no semantic change. Measure offsets _and_ bench.
+- Adding a field to a hot struct (`ElasticTable`/`FunnelTable`, `Level`, `BucketLevel`) is a layout change. Downstream fields can shift across cache lines and regress lookups with no semantic change. Measure offsets _and_ bench.
 - Pure refactors (rename, extract, no logic change) can swing 5–50% from icache and branch-predictor layout shifts. A no-op refactor should leave CodSpeed sim instr-count at ±0.

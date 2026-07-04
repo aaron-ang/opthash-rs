@@ -16,6 +16,8 @@ use pyo3::types::{PyDict, PyFrozenSet, PySet, PyString, PyTuple, PyType};
 
 use crate::common::config::DEFAULT_RESERVE_FRACTION;
 use crate::funnel::MAX_FUNNEL_RESERVE_FRACTION;
+use crate::map::{HashMap, TableProbing};
+use crate::set::HashSet;
 use crate::{ElasticHashMap, ElasticHashSet, FunnelHashMap, FunnelHashSet};
 
 fn validate_elastic_reserve_fraction(reserve_fraction: Option<f64>) -> PyResult<f64> {
@@ -265,6 +267,174 @@ impl PartialEq for HashedAny {
 
 impl Eq for HashedAny {}
 
+// ---------------------------------------------------------------------------
+// Backend-generic map operations. The per-backend `#[pyclass]` shims below
+// resolve the same-type fast path (`other.cast::<Self>()`) and pass the peer's
+// `inner` as `same_inner`; all the actual logic lives here, once, reachable by
+// rust-analyzer, unit tests, and coverage. `P` is the backend table; every op
+// works on the generic [`HashMap`] shell.
+// ---------------------------------------------------------------------------
+
+/// Clone every entry of `src` into `dst` under `py`.
+fn map_extend_cloned<P: TableProbing<HashedAny, Py<PyAny>>>(
+    dst: &mut HashMap<HashedAny, Py<PyAny>, P>,
+    src: &HashMap<HashedAny, Py<PyAny>, P>,
+    py: Python,
+) {
+    for (k, v) in src {
+        dst.insert(k.clone_with_py(py), v.clone_ref(py));
+    }
+}
+
+/// Apply `dict.update` semantics to `inner`: same-type peer (`same_inner`,
+/// honored regardless of `other`), then `PyDict`, `keys()` mapping, `(k, v)`
+/// iterable, and `kwargs`. Return whether anything was inserted (the caller
+/// bumps its generation only on a real change).
+fn map_update<P: TableProbing<HashedAny, Py<PyAny>>>(
+    inner: &mut HashMap<HashedAny, Py<PyAny>, P>,
+    other: Option<&Bound<PyAny>>,
+    kwargs: Option<&Bound<PyDict>>,
+    py: Python,
+    same_inner: Option<&HashMap<HashedAny, Py<PyAny>, P>>,
+) -> PyResult<bool> {
+    let mut touched = false;
+    if let Some(peer) = same_inner {
+        inner.reserve(peer.len());
+        for (k, v) in peer {
+            inner.insert(k.clone_with_py(py), v.clone_ref(py));
+            touched = true;
+        }
+    } else if let Some(other) = other {
+        if let Ok(dict) = other.cast::<PyDict>() {
+            inner.reserve(dict.len());
+            for (k, v) in dict.iter() {
+                let key = HashedAny::from_bound(&k)?;
+                inner.insert(key, v.unbind());
+                touched = true;
+            }
+        } else if other.hasattr("keys")? {
+            if let Ok(hint) = other.len() {
+                inner.reserve(hint);
+            }
+            let keys = other.call_method0("keys")?;
+            for k in keys.try_iter()? {
+                let k = k?;
+                let v = other.get_item(&k)?;
+                let key = HashedAny::from_bound(&k)?;
+                inner.insert(key, v.unbind());
+                touched = true;
+            }
+        } else {
+            if let Ok(hint) = other.len() {
+                inner.reserve(hint);
+            }
+            for item in other.try_iter()? {
+                let item = item?;
+                let len = item.len().map_err(|_| {
+                    PyValueError::new_err("update sequence elements must be 2-tuples")
+                })?;
+                if len != 2 {
+                    return Err(PyValueError::new_err(
+                        "update sequence elements must be 2-tuples",
+                    ));
+                }
+                let k = item.get_item(0)?;
+                let v = item.get_item(1)?;
+                let key = HashedAny::from_bound(&k)?;
+                inner.insert(key, v.unbind());
+                touched = true;
+            }
+        }
+    }
+    if let Some(kwargs) = kwargs {
+        inner.reserve(kwargs.len());
+        for (k, v) in kwargs.iter() {
+            let key = HashedAny::from_bound(&k)?;
+            inner.insert(key, v.unbind());
+            touched = true;
+        }
+    }
+    Ok(touched)
+}
+
+/// Compare `inner` to `other` (same-type, `PyDict`, or any `keys()` mapping)
+/// by key membership and per-value Python `==`.
+fn map_eq<P: TableProbing<HashedAny, Py<PyAny>>>(
+    inner: &HashMap<HashedAny, Py<PyAny>, P>,
+    other: &Bound<PyAny>,
+    py: Python,
+    same_inner: Option<&HashMap<HashedAny, Py<PyAny>, P>>,
+) -> bool {
+    if let Some(peer) = same_inner {
+        if inner.len() != peer.len() {
+            return false;
+        }
+        for (k, v) in inner {
+            match peer.get(k) {
+                Some(ov) => {
+                    if !v.bind(py).eq(ov.bind(py)).unwrap_or(false) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        return true;
+    }
+    if let Ok(d) = other.cast::<PyDict>() {
+        if d.len() != inner.len() {
+            return false;
+        }
+        for (k, v) in inner {
+            let key_b = k.obj_borrowed(py);
+            match d.get_item(key_b) {
+                Ok(Some(other_v)) => {
+                    if !v.bind(py).eq(&other_v).unwrap_or(false) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        return true;
+    }
+    if !other.hasattr("keys").unwrap_or(false) {
+        return false;
+    }
+    let Ok(other_len) = other.len() else {
+        return false;
+    };
+    if other_len != inner.len() {
+        return false;
+    }
+    for (k, v) in inner {
+        let key_b = k.obj_borrowed(py);
+        let Ok(other_v) = other.get_item(key_b) else {
+            return false;
+        };
+        if !v.bind(py).eq(&other_v).unwrap_or(false) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Route a `#[pyclass]` method to its backend-generic op, resolving the
+/// same-type fast path: if `other` is the same pyclass, borrow its `inner` and
+/// pass it as the trailing `same_inner`, else pass `None`. `$recv` is
+/// `&self.inner` or `&mut self.inner`; `$arg`s go between `other` and `same_inner`.
+macro_rules! dispatch_same_type {
+    ($f:ident, $recv:expr, $other:expr $(, $arg:expr)*) => {
+        match $other.cast::<Self>() {
+            Ok(o) => {
+                let peer = o.borrow();
+                $f($recv, $other $(, $arg)*, Some(&peer.inner))
+            }
+            Err(_) => $f($recv, $other $(, $arg)*, None),
+        }
+    };
+}
+
 /// Emits one Python-facing map surface (class + iterators + views) per
 /// backend. `PyO3` can't `#[pyclass]` over a generic, hence the macro;
 /// invoked once each for `Elastic` and `Funnel` to keep behavior in sync.
@@ -319,13 +489,14 @@ macro_rules! define_map_classes {
                 other: Option<&Bound<PyAny>>,
                 capacity: usize,
                 kwargs: Option<&Bound<PyDict>>,
+                py: Python,
             ) -> PyResult<Self> {
                 let mut me = Self {
                     inner: $Inner::with_capacity(capacity),
                     generation: 0,
                 };
                 if other.is_some() || kwargs.is_some() {
-                    me.update(other, kwargs)?;
+                    me.update(other, kwargs, py)?;
                 }
                 Ok(me)
             }
@@ -479,75 +650,23 @@ macro_rules! define_map_classes {
                 $ItemsView { map: slf.unbind() }
             }
 
-            /// Mirror of `dict.update`. Branches in priority order: same-type,
-            /// `PyDict`, mapping with `keys()`, then `(k, v)` iterable. Reserves
-            /// up front when length is known. `bump()` only on actual inserts —
-            /// empty `update()` keeps iterators valid.
+            /// Mirror of `dict.update`; see [`map_update`] for the branch logic.
+            /// `bump()` only on actual inserts — empty `update()` keeps
+            /// iterators valid.
             #[pyo3(signature = (other = None, **kwargs))]
             fn update(
                 &mut self,
                 other: Option<&Bound<PyAny>>,
                 kwargs: Option<&Bound<PyDict>>,
+                py: Python,
             ) -> PyResult<()> {
-                let mut touched = false;
-                if let Some(other) = other {
-                    if let Ok(other_map) = other.cast::<Self>() {
-                        let py = other.py();
-                        let borrowed = other_map.borrow();
-                        self.inner.reserve(borrowed.inner.len());
-                        for (k, v) in &borrowed.inner {
-                            self.inner.insert(k.clone_with_py(py), v.clone_ref(py));
-                            touched = true;
-                        }
-                    } else if let Ok(dict) = other.cast::<PyDict>() {
-                        self.inner.reserve(dict.len());
-                        for (k, v) in dict.iter() {
-                            let key = HashedAny::from_bound(&k)?;
-                            self.inner.insert(key, v.unbind());
-                            touched = true;
-                        }
-                    } else if other.hasattr("keys")? {
-                        if let Ok(hint) = other.len() {
-                            self.inner.reserve(hint);
-                        }
-                        let keys = other.call_method0("keys")?;
-                        for k in keys.try_iter()? {
-                            let k = k?;
-                            let v = other.get_item(&k)?;
-                            let key = HashedAny::from_bound(&k)?;
-                            self.inner.insert(key, v.unbind());
-                            touched = true;
-                        }
-                    } else {
-                        if let Ok(hint) = other.len() {
-                            self.inner.reserve(hint);
-                        }
-                        for item in other.try_iter()? {
-                            let item = item?;
-                            let len = item.len().map_err(|_| {
-                                PyValueError::new_err("update sequence elements must be 2-tuples")
-                            })?;
-                            if len != 2 {
-                                return Err(PyValueError::new_err(
-                                    "update sequence elements must be 2-tuples",
-                                ));
-                            }
-                            let k = item.get_item(0)?;
-                            let v = item.get_item(1)?;
-                            let key = HashedAny::from_bound(&k)?;
-                            self.inner.insert(key, v.unbind());
-                            touched = true;
-                        }
+                let touched = match other.and_then(|o| o.cast::<Self>().ok()) {
+                    Some(o) => {
+                        let peer = o.borrow();
+                        map_update(&mut self.inner, other, kwargs, py, Some(&peer.inner))?
                     }
-                }
-                if let Some(kwargs) = kwargs {
-                    self.inner.reserve(kwargs.len());
-                    for (k, v) in kwargs.iter() {
-                        let key = HashedAny::from_bound(&k)?;
-                        self.inner.insert(key, v.unbind());
-                        touched = true;
-                    }
-                }
+                    None => map_update(&mut self.inner, other, kwargs, py, None)?,
+                };
                 self.bump_if_changed(touched);
                 Ok(())
             }
@@ -600,9 +719,7 @@ macro_rules! define_map_classes {
 
             fn copy(&self, py: Python) -> Self {
                 let mut new = $Inner::with_capacity(self.inner.len());
-                for (k, v) in &self.inner {
-                    new.insert(k.clone_with_py(py), v.clone_ref(py));
-                }
+                map_extend_cloned(&mut new, &self.inner, py);
                 Self {
                     inner: new,
                     generation: 0,
@@ -610,59 +727,7 @@ macro_rules! define_map_classes {
             }
 
             fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> bool {
-                if let Ok(other_map) = other.cast::<Self>() {
-                    let other_inner = &other_map.borrow().inner;
-                    if self.inner.len() != other_inner.len() {
-                        return false;
-                    }
-                    for (k, v) in &self.inner {
-                        match other_inner.get(k) {
-                            Some(ov) => {
-                                if !v.bind(py).eq(ov.bind(py)).unwrap_or(false) {
-                                    return false;
-                                }
-                            }
-                            None => return false,
-                        }
-                    }
-                    return true;
-                }
-                if let Ok(d) = other.cast::<PyDict>() {
-                    if d.len() != self.inner.len() {
-                        return false;
-                    }
-                    for (k, v) in &self.inner {
-                        let key_b = k.obj_borrowed(py);
-                        match d.get_item(key_b) {
-                            Ok(Some(other_v)) => {
-                                if !v.bind(py).eq(&other_v).unwrap_or(false) {
-                                    return false;
-                                }
-                            }
-                            _ => return false,
-                        }
-                    }
-                    return true;
-                }
-                if !other.hasattr("keys").unwrap_or(false) {
-                    return false;
-                }
-                let Ok(other_len) = other.len() else {
-                    return false;
-                };
-                if other_len != self.inner.len() {
-                    return false;
-                }
-                for (k, v) in &self.inner {
-                    let key_b = k.obj_borrowed(py);
-                    let Ok(other_v) = other.get_item(key_b) else {
-                        return false;
-                    };
-                    if !v.bind(py).eq(&other_v).unwrap_or(false) {
-                        return false;
-                    }
-                }
-                true
+                dispatch_same_type!(map_eq, &self.inner, other, py)
             }
 
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
@@ -672,10 +737,8 @@ macro_rules! define_map_classes {
                     inner: $Inner::with_capacity(cap),
                     generation: 0,
                 };
-                for (k, v) in &self.inner {
-                    new.inner.insert(k.clone_with_py(py), v.clone_ref(py));
-                }
-                new.update(Some(other), None)?;
+                map_extend_cloned(&mut new.inner, &self.inner, py);
+                new.update(Some(other), None, py)?;
                 Ok(new)
             }
 
@@ -686,16 +749,14 @@ macro_rules! define_map_classes {
                     inner: $Inner::with_capacity(cap),
                     generation: 0,
                 };
-                new.update(Some(other), None)?;
-                for (k, v) in &self.inner {
-                    new.inner.insert(k.clone_with_py(py), v.clone_ref(py));
-                }
+                new.update(Some(other), None, py)?;
+                map_extend_cloned(&mut new.inner, &self.inner, py);
                 new.bump();
                 Ok(new)
             }
 
-            fn __ior__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                self.update(Some(other), None)
+            fn __ior__(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<()> {
+                self.update(Some(other), None, py)
             }
         }
 
@@ -1031,6 +1092,228 @@ fn is_set_like(other: &Bound<PyAny>) -> PyResult<bool> {
     other.is_instance(&set_abc)
 }
 
+// ---------------------------------------------------------------------------
+// Backend-generic set operations. The per-backend `#[pyclass]` shims below
+// resolve the same-type fast path (`other.cast::<Self>()`) and pass the peer's
+// `inner` as `same_inner`; all the actual logic lives here, once, reachable by
+// rust-analyzer, unit tests, and coverage. `P` is the backend table; every op
+// works on the generic [`HashSet`] shell.
+// ---------------------------------------------------------------------------
+
+/// Insert every element of `other` into `inner`; return whether it changed.
+fn set_add_all<P: TableProbing<HashedAny, ()>>(
+    inner: &mut HashSet<HashedAny, P>,
+    other: &Bound<PyAny>,
+    same_inner: Option<&HashSet<HashedAny, P>>,
+) -> PyResult<bool> {
+    let before = inner.len();
+    if let Some(peer) = same_inner {
+        let py = other.py();
+        inner.reserve(peer.len());
+        for value in peer {
+            inner.insert(value.clone_with_py(py));
+        }
+    } else {
+        if let Ok(hint) = other.len() {
+            inner.reserve(hint);
+        }
+        for item in other.try_iter()? {
+            let item = item?;
+            inner.insert(HashedAny::from_bound(&item)?);
+        }
+    }
+    Ok(inner.len() != before)
+}
+
+/// Remove every element of `other` from `inner`; return whether it changed.
+fn set_remove_all<P: TableProbing<HashedAny, ()>>(
+    inner: &mut HashSet<HashedAny, P>,
+    other: &Bound<PyAny>,
+    same_inner: Option<&HashSet<HashedAny, P>>,
+) -> PyResult<bool> {
+    let before = inner.len();
+    if let Some(peer) = same_inner {
+        for value in peer {
+            inner.remove(value);
+        }
+    } else {
+        for item in other.try_iter()? {
+            let item = item?;
+            let probe = ProbeKey::from_bound(&item)?;
+            inner.remove(probe.as_key());
+        }
+    }
+    Ok(inner.len() != before)
+}
+
+/// Retain only elements also in `other`; return whether it changed.
+fn set_retain_in<P: TableProbing<HashedAny, ()>>(
+    inner: &mut HashSet<HashedAny, P>,
+    other: &Bound<PyAny>,
+    py: Python,
+    same_inner: Option<&HashSet<HashedAny, P>>,
+) -> PyResult<bool> {
+    let before = inner.len();
+    if let Some(peer) = same_inner {
+        inner.retain(|value| peer.contains(value));
+        return Ok(inner.len() != before);
+    }
+    let other_set = PySet::empty(py)?;
+    for item in other.try_iter()? {
+        other_set.add(item?)?;
+    }
+    inner.retain(|value| other_set.contains(value.obj_borrowed(py)).unwrap_or(false));
+    Ok(inner.len() != before)
+}
+
+/// Symmetric-difference `inner` with `other` in place; return whether it
+/// changed (any non-empty `other` counts as changed).
+fn set_symmetric_difference_with<P: TableProbing<HashedAny, ()>>(
+    inner: &mut HashSet<HashedAny, P>,
+    other: &Bound<PyAny>,
+    same_inner: Option<&HashSet<HashedAny, P>>,
+) -> PyResult<bool> {
+    if let Some(peer) = same_inner {
+        let py = other.py();
+        let mut touched = false;
+        for value in peer {
+            if !inner.remove(value) {
+                inner.insert(value.clone_with_py(py));
+            }
+            touched = true;
+        }
+        return Ok(touched);
+    }
+    let mut unique_other = std::collections::HashSet::new();
+    for item in other.try_iter()? {
+        let item = item?;
+        unique_other.insert(HashedAny::from_bound(&item)?);
+    }
+    let mut touched = false;
+    for value in unique_other {
+        if !inner.remove(&value) {
+            inner.insert(value);
+        }
+        touched = true;
+    }
+    Ok(touched)
+}
+
+/// Report whether `inner` and `other` share no elements.
+fn set_isdisjoint<P: TableProbing<HashedAny, ()>>(
+    inner: &HashSet<HashedAny, P>,
+    other: &Bound<PyAny>,
+    same_inner: Option<&HashSet<HashedAny, P>>,
+) -> PyResult<bool> {
+    if let Some(peer) = same_inner {
+        let (smaller, larger) = if inner.len() <= peer.len() {
+            (inner, peer)
+        } else {
+            (peer, inner)
+        };
+        for value in smaller {
+            if larger.contains(value) {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    for item in other.try_iter()? {
+        let item = item?;
+        let probe = ProbeKey::from_bound(&item)?;
+        if inner.contains(probe.as_key()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Report whether every element of `inner` is in `other`.
+fn set_issubset<P: TableProbing<HashedAny, ()>>(
+    inner: &HashSet<HashedAny, P>,
+    other: &Bound<PyAny>,
+    py: Python,
+    same_inner: Option<&HashSet<HashedAny, P>>,
+) -> PyResult<bool> {
+    if let Some(peer) = same_inner {
+        if inner.len() > peer.len() {
+            return Ok(false);
+        }
+        for value in inner {
+            if !peer.contains(value) {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    let other_set = PySet::empty(py)?;
+    for item in other.try_iter()? {
+        other_set.add(item?)?;
+    }
+    for value in inner {
+        if !other_set.contains(value.obj_borrowed(py))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Report whether every element of `other` is in `inner`.
+fn set_issuperset<P: TableProbing<HashedAny, ()>>(
+    inner: &HashSet<HashedAny, P>,
+    other: &Bound<PyAny>,
+    same_inner: Option<&HashSet<HashedAny, P>>,
+) -> PyResult<bool> {
+    if let Some(peer) = same_inner {
+        if inner.len() < peer.len() {
+            return Ok(false);
+        }
+        for value in peer {
+            if !inner.contains(value) {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    for item in other.try_iter()? {
+        let item = item?;
+        let probe = ProbeKey::from_bound(&item)?;
+        if !inner.contains(probe.as_key()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Report whether `inner` equals `other` (same length and membership); a
+/// non-set-like `other` is unequal.
+fn set_eq<P: TableProbing<HashedAny, ()>>(
+    inner: &HashSet<HashedAny, P>,
+    other: &Bound<PyAny>,
+    same_inner: Option<&HashSet<HashedAny, P>>,
+) -> PyResult<bool> {
+    if let Some(peer) = same_inner {
+        return Ok(inner == peer);
+    }
+    if !is_set_like(other)? {
+        return Ok(false);
+    }
+    let Ok(other_len) = other.len() else {
+        return Ok(false);
+    };
+    if other_len != inner.len() {
+        return Ok(false);
+    }
+    for item in other.try_iter()? {
+        let item = item?;
+        let probe = ProbeKey::from_bound(&item)?;
+        if !inner.contains(probe.as_key()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Emits one Python-facing set surface (class + element iterator) per backend.
 /// Mirrors `define_map_classes!`: invoked once each for `Elastic` and `Funnel`.
 macro_rules! define_set_classes {
@@ -1068,91 +1351,24 @@ macro_rules! define_set_classes {
             /// Inserts every element of `other` (an opthash set or any iterable).
             /// Returns whether the set changed.
             fn add_all(&mut self, other: &Bound<PyAny>) -> PyResult<bool> {
-                let before = self.inner.len();
-                if let Ok(other_set) = other.cast::<Self>() {
-                    let py = other.py();
-                    let borrowed = other_set.borrow();
-                    self.inner.reserve(borrowed.inner.len());
-                    for value in borrowed.inner.iter() {
-                        self.inner.insert(value.clone_with_py(py));
-                    }
-                } else {
-                    if let Ok(hint) = other.len() {
-                        self.inner.reserve(hint);
-                    }
-                    for item in other.try_iter()? {
-                        let item = item?;
-                        self.inner.insert(HashedAny::from_bound(&item)?);
-                    }
-                }
-                Ok(self.inner.len() != before)
+                dispatch_same_type!(set_add_all, &mut self.inner, other)
             }
 
             /// Removes every element of `other` from the set. Returns whether
             /// the set changed.
             fn remove_all(&mut self, other: &Bound<PyAny>) -> PyResult<bool> {
-                let before = self.inner.len();
-                if let Ok(other_set) = other.cast::<Self>() {
-                    let borrowed = other_set.borrow();
-                    for value in borrowed.inner.iter() {
-                        self.inner.remove(value);
-                    }
-                } else {
-                    for item in other.try_iter()? {
-                        let item = item?;
-                        let probe = ProbeKey::from_bound(&item)?;
-                        self.inner.remove(probe.as_key());
-                    }
-                }
-                Ok(self.inner.len() != before)
+                dispatch_same_type!(set_remove_all, &mut self.inner, other)
             }
 
             /// Retains only the elements also present in `other`. Returns
             /// whether the set changed.
             fn retain_in(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
-                let before = self.inner.len();
-                if let Ok(other_set) = other.cast::<Self>() {
-                    let borrowed = other_set.borrow();
-                    self.inner.retain(|value| borrowed.inner.contains(value));
-                    return Ok(self.inner.len() != before);
-                }
-                let other_set = PySet::empty(py)?;
-                for item in other.try_iter()? {
-                    other_set.add(item?)?;
-                }
-                self.inner
-                    .retain(|value| other_set.contains(value.obj_borrowed(py)).unwrap_or(false));
-                Ok(self.inner.len() != before)
+                dispatch_same_type!(set_retain_in, &mut self.inner, other, py)
             }
 
             /// In-place symmetric difference with `other`.
             fn symmetric_difference_with(&mut self, other: &Bound<PyAny>) -> PyResult<bool> {
-                if let Ok(other_set) = other.cast::<Self>() {
-                    let py = other.py();
-                    let borrowed = other_set.borrow();
-                    let mut touched = false;
-                    for value in borrowed.inner.iter() {
-                        if !self.inner.remove(value) {
-                            self.inner.insert(value.clone_with_py(py));
-                        }
-                        touched = true;
-                    }
-                    return Ok(touched);
-                }
-                let mut unique_other = std::collections::HashSet::new();
-                for item in other.try_iter()? {
-                    let item = item?;
-                    unique_other.insert(HashedAny::from_bound(&item)?);
-                }
-
-                let mut touched = false;
-                for value in unique_other {
-                    if !self.inner.remove(&value) {
-                        self.inner.insert(value);
-                    }
-                    touched = true;
-                }
-                Ok(touched)
+                dispatch_same_type!(set_symmetric_difference_with, &mut self.inner, other)
             }
         }
 
@@ -1288,76 +1504,15 @@ macro_rules! define_set_classes {
             }
 
             fn isdisjoint(&self, other: &Bound<PyAny>) -> PyResult<bool> {
-                if let Ok(other_set) = other.cast::<Self>() {
-                    let borrowed = other_set.borrow();
-                    let (smaller, larger) = if self.inner.len() <= borrowed.inner.len() {
-                        (&self.inner, &borrowed.inner)
-                    } else {
-                        (&borrowed.inner, &self.inner)
-                    };
-                    for value in smaller.iter() {
-                        if larger.contains(value) {
-                            return Ok(false);
-                        }
-                    }
-                    return Ok(true);
-                }
-                for item in other.try_iter()? {
-                    let item = item?;
-                    let probe = ProbeKey::from_bound(&item)?;
-                    if self.inner.contains(probe.as_key()) {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+                dispatch_same_type!(set_isdisjoint, &self.inner, other)
             }
 
             fn issubset(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
-                if let Ok(other_set) = other.cast::<Self>() {
-                    let borrowed = other_set.borrow();
-                    if self.inner.len() > borrowed.inner.len() {
-                        return Ok(false);
-                    }
-                    for value in self.inner.iter() {
-                        if !borrowed.inner.contains(value) {
-                            return Ok(false);
-                        }
-                    }
-                    return Ok(true);
-                }
-                let other_set = PySet::empty(py)?;
-                for item in other.try_iter()? {
-                    other_set.add(item?)?;
-                }
-                for value in self.inner.iter() {
-                    if !other_set.contains(value.obj_borrowed(py))? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+                dispatch_same_type!(set_issubset, &self.inner, other, py)
             }
 
             fn issuperset(&self, other: &Bound<PyAny>) -> PyResult<bool> {
-                if let Ok(other_set) = other.cast::<Self>() {
-                    let borrowed = other_set.borrow();
-                    if self.inner.len() < borrowed.inner.len() {
-                        return Ok(false);
-                    }
-                    for value in borrowed.inner.iter() {
-                        if !self.inner.contains(value) {
-                            return Ok(false);
-                        }
-                    }
-                    return Ok(true);
-                }
-                for item in other.try_iter()? {
-                    let item = item?;
-                    let probe = ProbeKey::from_bound(&item)?;
-                    if !self.inner.contains(probe.as_key()) {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+                dispatch_same_type!(set_issuperset, &self.inner, other)
             }
 
             #[pyo3(signature = (*others))]
@@ -1430,35 +1585,7 @@ macro_rules! define_set_classes {
             }
 
             fn __eq__(&self, other: &Bound<PyAny>) -> PyResult<bool> {
-                if let Ok(other_set) = other.cast::<Self>() {
-                    let borrowed = other_set.borrow();
-                    if self.inner.len() != borrowed.inner.len() {
-                        return Ok(false);
-                    }
-                    for value in self.inner.iter() {
-                        if !borrowed.inner.contains(value) {
-                            return Ok(false);
-                        }
-                    }
-                    return Ok(true);
-                }
-                if !is_set_like(other)? {
-                    return Ok(false);
-                }
-                let Ok(other_len) = other.len() else {
-                    return Ok(false);
-                };
-                if other_len != self.inner.len() {
-                    return Ok(false);
-                }
-                for item in other.try_iter()? {
-                    let item = item?;
-                    let probe = ProbeKey::from_bound(&item)?;
-                    if !self.inner.contains(probe.as_key()) {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+                dispatch_same_type!(set_eq, &self.inner, other)
             }
 
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
