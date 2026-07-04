@@ -8,25 +8,25 @@ use equivalent::Equivalent;
 
 use crate::common::DefaultHashBuilder;
 use crate::common::error::TryReserveError;
-use crate::map::{self, RawTable};
+use crate::map::{self, TableProbing};
 
 /// Boxed predicate adapting a set-level `FnMut(&T) -> bool` to the map's
 /// `FnMut(&K, &mut V) -> bool`. Boxing keeps the public `ExtractIf` type
 /// nameable; the allocation is once per `extract_if` call, off the hot path.
 type SetExtractPred<'a, T> = Box<dyn FnMut(&T, &mut ()) -> bool + 'a>;
 
-/// A hash set backed by a [`RawTable`] implementation.
-pub struct HashSet<T, R: RawTable<T, ()>>
+/// Use a [`TableProbing`] backend to store unique values.
+pub struct HashSet<T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
-    map: map::HashMap<T, (), R>,
+    map: map::HashMap<T, (), P>,
 }
 
-impl<T, R> HashSet<T, R>
+impl<T, P> HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableProbing<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     /// Creates an empty set.
     #[must_use]
@@ -61,14 +61,14 @@ where
     }
 }
 
-impl<T, R> HashSet<T, R>
+impl<T, P> HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, (), Alloc = Global>,
+    P: TableProbing<T, (), Alloc = Global>,
 {
     /// Creates an empty set that uses `hash_builder` to hash values.
     #[must_use]
-    pub fn with_hasher(hash_builder: R::Hasher) -> Self {
+    pub fn with_hasher(hash_builder: P::Hasher) -> Self {
         Self {
             map: map::HashMap::with_hasher(hash_builder),
         }
@@ -76,7 +76,7 @@ where
 
     /// Creates an empty set with the given capacity and hasher.
     #[must_use]
-    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: R::Hasher) -> Self {
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: P::Hasher) -> Self {
         Self {
             map: map::HashMap::with_capacity_and_hasher(capacity, hash_builder),
         }
@@ -86,7 +86,7 @@ where
     #[must_use]
     pub fn with_reserve_fraction_and_hasher(
         reserve_fraction: f64,
-        hash_builder: R::Hasher,
+        hash_builder: P::Hasher,
     ) -> Self {
         Self {
             map: map::HashMap::with_reserve_fraction_and_hasher(reserve_fraction, hash_builder),
@@ -98,7 +98,7 @@ where
     pub fn with_capacity_and_reserve_fraction_and_hasher(
         capacity: usize,
         reserve_fraction: f64,
-        hash_builder: R::Hasher,
+        hash_builder: P::Hasher,
     ) -> Self {
         Self {
             map: map::HashMap::with_capacity_and_reserve_fraction_and_hasher(
@@ -110,14 +110,14 @@ where
     }
 }
 
-impl<T, R> HashSet<T, R>
+impl<T, P> HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, (), Hasher = DefaultHashBuilder>,
+    P: TableProbing<T, (), Hasher = DefaultHashBuilder>,
 {
     /// Creates an empty set in the given allocator.
     #[must_use]
-    pub fn new_in(alloc: R::Alloc) -> Self {
+    pub fn new_in(alloc: P::Alloc) -> Self {
         Self {
             map: map::HashMap::new_in(alloc),
         }
@@ -125,25 +125,25 @@ where
 
     /// Creates an empty set with the given capacity in the given allocator.
     #[must_use]
-    pub fn with_capacity_in(capacity: usize, alloc: R::Alloc) -> Self {
+    pub fn with_capacity_in(capacity: usize, alloc: P::Alloc) -> Self {
         Self {
             map: map::HashMap::with_capacity_in(capacity, alloc),
         }
     }
 }
 
-impl<T, R> HashSet<T, R>
+impl<T, P> HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     /// Full constructor: capacity, reserve fraction, hasher, and allocator.
     #[must_use]
     pub fn with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
         reserve_fraction: f64,
-        hash_builder: R::Hasher,
-        alloc: R::Alloc,
+        hash_builder: P::Hasher,
+        alloc: P::Alloc,
     ) -> Self {
         Self {
             map: map::HashMap::with_capacity_and_reserve_fraction_and_hasher_in(
@@ -156,12 +156,12 @@ where
     }
 
     /// Reference to the set's allocator.
-    pub fn allocator(&self) -> &R::Alloc {
+    pub fn allocator(&self) -> &P::Alloc {
         self.map.allocator()
     }
 
     /// Reference to the set's [`std::hash::BuildHasher`].
-    pub fn hasher(&self) -> &R::Hasher {
+    pub fn hasher(&self) -> &P::Hasher {
         self.map.hasher()
     }
 
@@ -192,7 +192,7 @@ where
     /// Returns [`TryReserveError`] on capacity overflow or allocator failure.
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
     where
-        R::Hasher: Clone,
+        P::Hasher: Clone,
     {
         self.map.try_reserve(additional)
     }
@@ -275,14 +275,14 @@ where
     }
 
     /// Borrowing iterator over the set's values, in arbitrary order.
-    pub fn iter(&self) -> Iter<'_, T, R> {
+    pub fn iter(&self) -> Iter<'_, T, P> {
         Iter {
             inner: self.map.keys(),
         }
     }
 
     /// Draining iterator. Removes and yields every value.
-    pub fn drain(&mut self) -> Drain<'_, T, R> {
+    pub fn drain(&mut self) -> Drain<'_, T, P> {
         Drain {
             inner: self.map.drain(),
         }
@@ -290,7 +290,7 @@ where
 
     /// Removes and yields values for which `f` returns `true`. Retains the
     /// rest, and retains any unvisited values if the iterator is dropped early.
-    pub fn extract_if<'s, F>(&'s mut self, mut f: F) -> ExtractIf<'s, T, R>
+    pub fn extract_if<'s, F>(&'s mut self, mut f: F) -> ExtractIf<'s, T, P>
     where
         T: 's,
         F: FnMut(&T) -> bool + 's,
@@ -310,7 +310,7 @@ where
     }
 
     /// Gets the [`Entry`] for `value` for in-place manipulation.
-    pub fn entry(&mut self, value: T) -> Entry<'_, T, R> {
+    pub fn entry(&mut self, value: T) -> Entry<'_, T, P> {
         match self.map.entry(value) {
             map::Entry::Occupied(entry) => Entry::Occupied(OccupiedEntry { inner: entry }),
             map::Entry::Vacant(entry) => Entry::Vacant(VacantEntry { inner: entry }),
@@ -318,7 +318,7 @@ where
     }
 
     /// Visits the values present in `self` but not in `other`.
-    pub fn difference<'a>(&'a self, other: &'a Self) -> Difference<'a, T, R> {
+    pub fn difference<'a>(&'a self, other: &'a Self) -> Difference<'a, T, P> {
         Difference {
             iter: self.iter(),
             other,
@@ -326,14 +326,14 @@ where
     }
 
     /// Visits the values present in either `self` or `other` but not both.
-    pub fn symmetric_difference<'a>(&'a self, other: &'a Self) -> SymmetricDifference<'a, T, R> {
+    pub fn symmetric_difference<'a>(&'a self, other: &'a Self) -> SymmetricDifference<'a, T, P> {
         SymmetricDifference {
             iter: self.difference(other).chain(other.difference(self)),
         }
     }
 
     /// Visits the values present in both `self` and `other`.
-    pub fn intersection<'a>(&'a self, other: &'a Self) -> Intersection<'a, T, R> {
+    pub fn intersection<'a>(&'a self, other: &'a Self) -> Intersection<'a, T, P> {
         // Iterate the smaller set and probe the larger, minimizing membership
         // lookups when sizes differ.
         let (smaller, larger) = if self.len() <= other.len() {
@@ -348,7 +348,7 @@ where
     }
 
     /// Visits the values present in either `self` or `other`.
-    pub fn union<'a>(&'a self, other: &'a Self) -> Union<'a, T, R> {
+    pub fn union<'a>(&'a self, other: &'a Self) -> Union<'a, T, P> {
         // Iterate the larger set in full and only the difference of the
         // smaller one, minimizing membership lookups.
         let (smaller, larger) = if self.len() <= other.len() {
@@ -377,21 +377,21 @@ where
     }
 }
 
-impl<T, R> Default for HashSet<T, R>
+impl<T, P> Default for HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableProbing<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, R> Clone for HashSet<T, R>
+impl<T, P> Clone for HashSet<T, P>
 where
     T: Clone + Eq + Hash,
-    R: RawTable<T, ()>,
-    R::Hasher: Clone,
+    P: TableProbing<T, ()>,
+    P::Hasher: Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -400,156 +400,156 @@ where
     }
 }
 
-impl<T, R> fmt::Debug for HashSet<T, R>
+impl<T, P> fmt::Debug for HashSet<T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_set().entries(self.iter()).finish()
     }
 }
 
-impl<T, R> PartialEq for HashSet<T, R>
+impl<T, P> PartialEq for HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len() && self.iter().all(|value| other.contains(value))
     }
 }
 
-impl<T, R> Eq for HashSet<T, R>
+impl<T, P> Eq for HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
 }
 
-impl<T, R> FromIterator<T> for HashSet<T, R>
+impl<T, P> FromIterator<T> for HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, (), Alloc = Global>,
-    R::Hasher: Default,
+    P: TableProbing<T, (), Alloc = Global>,
+    P::Hasher: Default,
 {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut set = Self::with_hasher(R::Hasher::default());
+        let mut set = Self::with_hasher(P::Hasher::default());
         set.extend(iter);
         set
     }
 }
 
-impl<T, R, const N: usize> From<[T; N]> for HashSet<T, R>
+impl<T, P, const N: usize> From<[T; N]> for HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableProbing<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     fn from(arr: [T; N]) -> Self {
         arr.into_iter().collect()
     }
 }
 
-impl<T, R> Extend<T> for HashSet<T, R>
+impl<T, P> Extend<T> for HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         self.map.extend(iter.into_iter().map(|value| (value, ())));
     }
 }
 
-impl<'a, T, R> Extend<&'a T> for HashSet<T, R>
+impl<'a, T, P> Extend<&'a T> for HashSet<T, P>
 where
     T: 'a + Eq + Hash + Copy,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
         self.extend(iter.into_iter().copied());
     }
 }
 
-impl<'a, T, R> IntoIterator for &'a HashSet<T, R>
+impl<'a, T, P> IntoIterator for &'a HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     type Item = &'a T;
-    type IntoIter = Iter<'a, T, R>;
-    fn into_iter(self) -> Iter<'a, T, R> {
+    type IntoIter = Iter<'a, T, P>;
+    fn into_iter(self) -> Iter<'a, T, P> {
         self.iter()
     }
 }
 
-impl<T, R> IntoIterator for HashSet<T, R>
+impl<T, P> IntoIterator for HashSet<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     type Item = T;
-    type IntoIter = IntoIter<T, R>;
-    fn into_iter(self) -> IntoIter<T, R> {
+    type IntoIter = IntoIter<T, P>;
+    fn into_iter(self) -> IntoIter<T, P> {
         IntoIter {
             inner: self.map.into_keys(),
         }
     }
 }
 
-impl<T, R> BitOr<&HashSet<T, R>> for &HashSet<T, R>
+impl<T, P> BitOr<&HashSet<T, P>> for &HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    R: RawTable<T, (), Alloc = Global>,
-    R::Hasher: Default,
+    P: TableProbing<T, (), Alloc = Global>,
+    P::Hasher: Default,
 {
-    type Output = HashSet<T, R>;
-    fn bitor(self, rhs: &HashSet<T, R>) -> HashSet<T, R> {
+    type Output = HashSet<T, P>;
+    fn bitor(self, rhs: &HashSet<T, P>) -> HashSet<T, P> {
         self.union(rhs).cloned().collect()
     }
 }
 
-impl<T, R> BitAnd<&HashSet<T, R>> for &HashSet<T, R>
+impl<T, P> BitAnd<&HashSet<T, P>> for &HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    R: RawTable<T, (), Alloc = Global>,
-    R::Hasher: Default,
+    P: TableProbing<T, (), Alloc = Global>,
+    P::Hasher: Default,
 {
-    type Output = HashSet<T, R>;
-    fn bitand(self, rhs: &HashSet<T, R>) -> HashSet<T, R> {
+    type Output = HashSet<T, P>;
+    fn bitand(self, rhs: &HashSet<T, P>) -> HashSet<T, P> {
         self.intersection(rhs).cloned().collect()
     }
 }
 
-impl<T, R> BitXor<&HashSet<T, R>> for &HashSet<T, R>
+impl<T, P> BitXor<&HashSet<T, P>> for &HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    R: RawTable<T, (), Alloc = Global>,
-    R::Hasher: Default,
+    P: TableProbing<T, (), Alloc = Global>,
+    P::Hasher: Default,
 {
-    type Output = HashSet<T, R>;
-    fn bitxor(self, rhs: &HashSet<T, R>) -> HashSet<T, R> {
+    type Output = HashSet<T, P>;
+    fn bitxor(self, rhs: &HashSet<T, P>) -> HashSet<T, P> {
         self.symmetric_difference(rhs).cloned().collect()
     }
 }
 
-impl<T, R> Sub<&HashSet<T, R>> for &HashSet<T, R>
+impl<T, P> Sub<&HashSet<T, P>> for &HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    R: RawTable<T, (), Alloc = Global>,
-    R::Hasher: Default,
+    P: TableProbing<T, (), Alloc = Global>,
+    P::Hasher: Default,
 {
-    type Output = HashSet<T, R>;
-    fn sub(self, rhs: &HashSet<T, R>) -> HashSet<T, R> {
+    type Output = HashSet<T, P>;
+    fn sub(self, rhs: &HashSet<T, P>) -> HashSet<T, P> {
         self.difference(rhs).cloned().collect()
     }
 }
 
-impl<T, R> BitOrAssign<&HashSet<T, R>> for HashSet<T, R>
+impl<T, P> BitOrAssign<&HashSet<T, P>> for HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
-    fn bitor_assign(&mut self, rhs: &HashSet<T, R>) {
+    fn bitor_assign(&mut self, rhs: &HashSet<T, P>) {
         for value in rhs {
             if !self.contains(value) {
                 self.insert(value.clone());
@@ -558,22 +558,22 @@ where
     }
 }
 
-impl<T, R> BitAndAssign<&HashSet<T, R>> for HashSet<T, R>
+impl<T, P> BitAndAssign<&HashSet<T, P>> for HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
-    fn bitand_assign(&mut self, rhs: &HashSet<T, R>) {
+    fn bitand_assign(&mut self, rhs: &HashSet<T, P>) {
         self.retain(|value| rhs.contains(value));
     }
 }
 
-impl<T, R> BitXorAssign<&HashSet<T, R>> for HashSet<T, R>
+impl<T, P> BitXorAssign<&HashSet<T, P>> for HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
-    fn bitxor_assign(&mut self, rhs: &HashSet<T, R>) {
+    fn bitxor_assign(&mut self, rhs: &HashSet<T, P>) {
         for value in rhs {
             if self.contains(value) {
                 self.remove(value);
@@ -584,12 +584,12 @@ where
     }
 }
 
-impl<T, R> SubAssign<&HashSet<T, R>> for HashSet<T, R>
+impl<T, P> SubAssign<&HashSet<T, P>> for HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
-    fn sub_assign(&mut self, rhs: &HashSet<T, R>) {
+    fn sub_assign(&mut self, rhs: &HashSet<T, P>) {
         if rhs.len() < self.len() {
             for value in rhs {
                 self.remove(value);
@@ -601,18 +601,18 @@ where
 }
 
 /// Borrowing iterator over [`HashSet`] values.
-pub struct Iter<'a, T, R: RawTable<T, ()>>
+pub struct Iter<'a, T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
-    inner: map::Keys<'a, T, (), R>,
+    inner: map::Keys<'a, T, (), P>,
 }
 
-impl<T, R> Clone for Iter<'_, T, R>
+impl<T, P> Clone for Iter<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
-    R::Scan: Clone,
+    P: TableProbing<T, ()>,
+    P::Scan: Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -621,10 +621,10 @@ where
     }
 }
 
-impl<'a, T, R> Iterator for Iter<'a, T, R>
+impl<'a, T, P> Iterator for Iter<'a, T, P>
 where
     T: 'a + Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
@@ -635,28 +635,28 @@ where
     }
 }
 
-impl<'a, T, R> ExactSizeIterator for Iter<'a, T, R>
+impl<'a, T, P> ExactSizeIterator for Iter<'a, T, P>
 where
     T: 'a + Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
 
-impl<'a, T, R> FusedIterator for Iter<'a, T, R>
+impl<'a, T, P> FusedIterator for Iter<'a, T, P>
 where
     T: 'a + Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
 }
 
-impl<T, R> fmt::Debug for Iter<'_, T, R>
+impl<T, P> fmt::Debug for Iter<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    R: RawTable<T, ()>,
-    R::Scan: Clone,
+    P: TableProbing<T, ()>,
+    P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
@@ -664,17 +664,17 @@ where
 }
 
 /// Consuming iterator over [`HashSet`] values.
-pub struct IntoIter<T, R: RawTable<T, ()>>
+pub struct IntoIter<T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
-    inner: map::IntoKeys<T, (), R>,
+    inner: map::IntoKeys<T, (), P>,
 }
 
-impl<T, R> Iterator for IntoIter<T, R>
+impl<T, P> Iterator for IntoIter<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     type Item = T;
     fn next(&mut self) -> Option<T> {
@@ -685,27 +685,27 @@ where
     }
 }
 
-impl<T, R> ExactSizeIterator for IntoIter<T, R>
+impl<T, P> ExactSizeIterator for IntoIter<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
 
-impl<T, R> FusedIterator for IntoIter<T, R>
+impl<T, P> FusedIterator for IntoIter<T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
 }
 
-impl<T, R> fmt::Debug for IntoIter<T, R>
+impl<T, P> fmt::Debug for IntoIter<T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IntoIter").finish_non_exhaustive()
@@ -713,17 +713,17 @@ where
 }
 
 /// Draining iterator over [`HashSet`] values.
-pub struct Drain<'a, T, R: RawTable<T, ()>>
+pub struct Drain<'a, T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
-    inner: map::Drain<'a, T, (), R>,
+    inner: map::Drain<'a, T, (), P>,
 }
 
-impl<T, R> Iterator for Drain<'_, T, R>
+impl<T, P> Iterator for Drain<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     type Item = T;
     fn next(&mut self) -> Option<T> {
@@ -734,27 +734,27 @@ where
     }
 }
 
-impl<T, R> ExactSizeIterator for Drain<'_, T, R>
+impl<T, P> ExactSizeIterator for Drain<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
 
-impl<T, R> FusedIterator for Drain<'_, T, R>
+impl<T, P> FusedIterator for Drain<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
 }
 
-impl<T, R> fmt::Debug for Drain<'_, T, R>
+impl<T, P> fmt::Debug for Drain<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Drain").finish_non_exhaustive()
@@ -762,17 +762,17 @@ where
 }
 
 /// Iterator yielding the extracted values of a [`HashSet`].
-pub struct ExtractIf<'a, T, R: RawTable<T, ()>>
+pub struct ExtractIf<'a, T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
-    inner: map::ExtractIf<'a, T, (), R, SetExtractPred<'a, T>>,
+    inner: map::ExtractIf<'a, T, (), P, SetExtractPred<'a, T>>,
 }
 
-impl<T, R> Iterator for ExtractIf<'_, T, R>
+impl<T, P> Iterator for ExtractIf<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     type Item = T;
     fn next(&mut self) -> Option<T> {
@@ -783,17 +783,17 @@ where
     }
 }
 
-impl<T, R> FusedIterator for ExtractIf<'_, T, R>
+impl<T, P> FusedIterator for ExtractIf<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
 }
 
-impl<T, R> fmt::Debug for ExtractIf<'_, T, R>
+impl<T, P> fmt::Debug for ExtractIf<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExtractIf").finish_non_exhaustive()
@@ -801,19 +801,19 @@ where
 }
 
 /// Iterator over the difference of two [`HashSet`]s.
-pub struct Difference<'a, T, R: RawTable<T, ()>>
+pub struct Difference<'a, T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
-    iter: Iter<'a, T, R>,
-    other: &'a HashSet<T, R>,
+    iter: Iter<'a, T, P>,
+    other: &'a HashSet<T, P>,
 }
 
-impl<T, R> Clone for Difference<'_, T, R>
+impl<T, P> Clone for Difference<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
-    R::Scan: Clone,
+    P: TableProbing<T, ()>,
+    P::Scan: Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -823,10 +823,10 @@ where
     }
 }
 
-impl<'a, T, R> Iterator for Difference<'a, T, R>
+impl<'a, T, P> Iterator for Difference<'a, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
@@ -843,18 +843,18 @@ where
     }
 }
 
-impl<T, R> FusedIterator for Difference<'_, T, R>
+impl<T, P> FusedIterator for Difference<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
 }
 
-impl<T, R> fmt::Debug for Difference<'_, T, R>
+impl<T, P> fmt::Debug for Difference<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    R: RawTable<T, ()>,
-    R::Scan: Clone,
+    P: TableProbing<T, ()>,
+    P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
@@ -862,19 +862,19 @@ where
 }
 
 /// Iterator over the intersection of two [`HashSet`]s.
-pub struct Intersection<'a, T, R: RawTable<T, ()>>
+pub struct Intersection<'a, T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
-    iter: Iter<'a, T, R>,
-    other: &'a HashSet<T, R>,
+    iter: Iter<'a, T, P>,
+    other: &'a HashSet<T, P>,
 }
 
-impl<T, R> Clone for Intersection<'_, T, R>
+impl<T, P> Clone for Intersection<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
-    R::Scan: Clone,
+    P: TableProbing<T, ()>,
+    P::Scan: Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -884,10 +884,10 @@ where
     }
 }
 
-impl<'a, T, R> Iterator for Intersection<'a, T, R>
+impl<'a, T, P> Iterator for Intersection<'a, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
@@ -904,18 +904,18 @@ where
     }
 }
 
-impl<T, R> FusedIterator for Intersection<'_, T, R>
+impl<T, P> FusedIterator for Intersection<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
 }
 
-impl<T, R> fmt::Debug for Intersection<'_, T, R>
+impl<T, P> fmt::Debug for Intersection<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    R: RawTable<T, ()>,
-    R::Scan: Clone,
+    P: TableProbing<T, ()>,
+    P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
@@ -923,18 +923,18 @@ where
 }
 
 /// Iterator over the symmetric difference of two [`HashSet`]s.
-pub struct SymmetricDifference<'a, T, R: RawTable<T, ()>>
+pub struct SymmetricDifference<'a, T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
-    iter: Chain<Difference<'a, T, R>, Difference<'a, T, R>>,
+    iter: Chain<Difference<'a, T, P>, Difference<'a, T, P>>,
 }
 
-impl<T, R> Clone for SymmetricDifference<'_, T, R>
+impl<T, P> Clone for SymmetricDifference<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
-    R::Scan: Clone,
+    P: TableProbing<T, ()>,
+    P::Scan: Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -943,10 +943,10 @@ where
     }
 }
 
-impl<'a, T, R> Iterator for SymmetricDifference<'a, T, R>
+impl<'a, T, P> Iterator for SymmetricDifference<'a, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
@@ -957,18 +957,18 @@ where
     }
 }
 
-impl<T, R> FusedIterator for SymmetricDifference<'_, T, R>
+impl<T, P> FusedIterator for SymmetricDifference<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
 }
 
-impl<T, R> fmt::Debug for SymmetricDifference<'_, T, R>
+impl<T, P> fmt::Debug for SymmetricDifference<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    R: RawTable<T, ()>,
-    R::Scan: Clone,
+    P: TableProbing<T, ()>,
+    P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
@@ -976,18 +976,18 @@ where
 }
 
 /// Iterator over the union of two [`HashSet`]s.
-pub struct Union<'a, T, R: RawTable<T, ()>>
+pub struct Union<'a, T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
-    iter: Chain<Iter<'a, T, R>, Difference<'a, T, R>>,
+    iter: Chain<Iter<'a, T, P>, Difference<'a, T, P>>,
 }
 
-impl<T, R> Clone for Union<'_, T, R>
+impl<T, P> Clone for Union<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
-    R::Scan: Clone,
+    P: TableProbing<T, ()>,
+    P::Scan: Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -996,10 +996,10 @@ where
     }
 }
 
-impl<'a, T, R> Iterator for Union<'a, T, R>
+impl<'a, T, P> Iterator for Union<'a, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
@@ -1010,18 +1010,18 @@ where
     }
 }
 
-impl<T, R> FusedIterator for Union<'_, T, R>
+impl<T, P> FusedIterator for Union<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
 }
 
-impl<T, R> fmt::Debug for Union<'_, T, R>
+impl<T, P> fmt::Debug for Union<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    R: RawTable<T, ()>,
-    R::Scan: Clone,
+    P: TableProbing<T, ()>,
+    P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
@@ -1029,39 +1029,39 @@ where
 }
 
 /// A view into a single [`HashSet`] entry.
-pub enum Entry<'a, T, R: RawTable<T, ()>>
+pub enum Entry<'a, T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
     /// Value already present.
-    Occupied(OccupiedEntry<'a, T, R>),
+    Occupied(OccupiedEntry<'a, T, P>),
     /// Value absent.
-    Vacant(VacantEntry<'a, T, R>),
+    Vacant(VacantEntry<'a, T, P>),
 }
 
 /// View of an occupied [`HashSet`] entry.
-pub struct OccupiedEntry<'a, T, R: RawTable<T, ()>>
+pub struct OccupiedEntry<'a, T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
-    inner: map::OccupiedEntry<'a, T, (), R>,
+    inner: map::OccupiedEntry<'a, T, (), P>,
 }
 
 /// View of a vacant [`HashSet`] entry.
-pub struct VacantEntry<'a, T, R: RawTable<T, ()>>
+pub struct VacantEntry<'a, T, P: TableProbing<T, ()>>
 where
     T: Eq + Hash,
 {
-    inner: map::VacantEntry<'a, T, (), R>,
+    inner: map::VacantEntry<'a, T, (), P>,
 }
 
-impl<'a, T, R> Entry<'a, T, R>
+impl<'a, T, P> Entry<'a, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     /// Ensures the value is present, returning the occupied entry.
-    pub fn insert(self) -> OccupiedEntry<'a, T, R> {
+    pub fn insert(self) -> OccupiedEntry<'a, T, P> {
         match self {
             Entry::Occupied(entry) => entry,
             Entry::Vacant(entry) => entry.insert(),
@@ -1084,10 +1084,10 @@ where
     }
 }
 
-impl<T, R> OccupiedEntry<'_, T, R>
+impl<T, P> OccupiedEntry<'_, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     /// Reference to the value in the entry.
     pub fn get(&self) -> &T {
@@ -1100,10 +1100,10 @@ where
     }
 }
 
-impl<'a, T, R> VacantEntry<'a, T, R>
+impl<'a, T, P> VacantEntry<'a, T, P>
 where
     T: Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     /// Reference to the value that would be inserted.
     pub fn get(&self) -> &T {
@@ -1116,17 +1116,17 @@ where
     }
 
     /// Inserts the value and returns the resulting occupied entry.
-    pub fn insert(self) -> OccupiedEntry<'a, T, R> {
+    pub fn insert(self) -> OccupiedEntry<'a, T, P> {
         OccupiedEntry {
             inner: self.inner.insert_entry(()),
         }
     }
 }
 
-impl<T, R> fmt::Debug for OccupiedEntry<'_, T, R>
+impl<T, P> fmt::Debug for OccupiedEntry<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OccupiedEntry")
@@ -1135,20 +1135,20 @@ where
     }
 }
 
-impl<T, R> fmt::Debug for VacantEntry<'_, T, R>
+impl<T, P> fmt::Debug for VacantEntry<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("VacantEntry").field(self.get()).finish()
     }
 }
 
-impl<T, R> fmt::Debug for Entry<'_, T, R>
+impl<T, P> fmt::Debug for Entry<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    R: RawTable<T, ()>,
+    P: TableProbing<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

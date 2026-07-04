@@ -19,28 +19,110 @@ use crate::common::iter::{
 };
 use crate::common::math::capacity;
 
-/// Backend storage + probing primitives that [`HashMap`] builds its public API
-/// on. Each implementor owns the slot storage, the hasher, and the allocator;
-/// the map shell never touches raw slots except through these methods.
-///
-/// All `unsafe` accessors take a [`Location`](RawTable::Location) previously
-/// returned by [`find`](RawTable::find) or an insert primitive; passing a stale
-/// or out-of-range location is undefined behavior.
-// `slot_ref`/`slot_ptr` traffic in the crate-private `SlotEntry`; this trait is
-// an internal contract (the `map` module is private), so the leak is intended.
+/// Provide storage metadata and direct slot access.
+// This crate-private contract intentionally exposes `SlotEntry`.
 #[allow(private_interfaces)]
-pub trait RawTable<K, V>: Sized {
-    /// Opaque handle to an occupied slot (e.g. `(level, slot)` or a region enum).
+pub trait TableStorage<K, V>: Sized {
+    /// Identify an occupied slot.
     type Location: Copy + PartialEq;
-    /// Hash builder type.
+    /// Build hashes for stored keys.
     type Hasher: BuildHasher;
-    /// Allocator type.
+    /// Allocate backing storage.
     type Alloc: Allocator + Clone;
-    /// Pointerless cursor over occupied slots in storage order. Holds only
-    /// indices so the owning [`IntoIter`] can move the table without dangling.
+    /// Return the hash builder.
+    fn hasher(&self) -> &Self::Hasher;
+
+    /// Hash `key` with the table's hash builder.
+    fn hash<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
+        self.hasher().hash_one(key)
+    }
+
+    /// Return the allocator.
+    fn allocator(&self) -> &Self::Alloc;
+
+    /// Return the number of live entries.
+    fn len(&self) -> usize;
+
+    /// Return the live-entry limit before resizing.
+    fn capacity(&self) -> usize;
+
+    /// Return the backing slot count, including reserved slots.
+    fn total_slots(&self) -> usize;
+
+    /// Return the configured reserve fraction.
+    fn reserve_fraction(&self) -> f64;
+
+    /// Borrow the slot at `loc`.
+    ///
+    /// # Safety
+    /// `loc` must be a live location from this table.
+    unsafe fn slot_ref(&self, loc: Self::Location) -> &SlotEntry<K, V>;
+
+    /// Return a raw slot pointer without forming an intermediate `&mut`.
+    ///
+    /// # Safety
+    /// `loc` must be a live location from this table.
+    unsafe fn slot_ptr(&self, loc: Self::Location) -> *mut SlotEntry<K, V>;
+
+    /// Replace the value at `loc` and return the previous value.
+    fn replace_value(&mut self, loc: Self::Location, value: V) -> V;
+}
+
+/// Find keys in table storage.
+pub trait TableLookup<K, V>: TableStorage<K, V> {
+    /// Find the slot for `key` using the precomputed hash and fingerprint.
+    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<Self::Location>
+    where
+        Q: Hash + Equivalent<K> + ?Sized;
+}
+
+/// Insert and remove entries using storage and lookup primitives.
+pub trait TableInsert<K, V>: TableLookup<K, V> {
+    /// Insert a known-absent key, resize as needed, and return its location.
+    fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> Self::Location;
+
+    /// Insert `key` → `value` and return the previous value. Backends may
+    /// override this two-probe default with single-pass insertion.
+    fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
+    where
+        K: Hash + Eq,
+    {
+        let fp = fingerprint(hash);
+        if let Some(loc) = self.find(&key, hash, fp) {
+            return Some(self.replace_value(loc, value));
+        }
+        self.insert_for_vacant(key, value, hash);
+        None
+    }
+
+    /// Remove the entry at `loc`, update bookkeeping, and resize if needed.
+    fn remove(&mut self, loc: Self::Location) -> (K, V);
+
+    /// Mark `loc` as a tombstone without updating counters. Draining iterators
+    /// use this after moving out the value to prevent a second drop.
+    fn tombstone_slot(&mut self, loc: Self::Location);
+
+    /// Mark a moved-out slot as a tombstone and update counters without resizing.
+    fn extract_finish(&mut self, loc: Self::Location);
+}
+
+/// Scan occupied slots in storage order without retaining pointers.
+#[allow(private_interfaces)]
+pub trait TableIterate<K, V>: TableStorage<K, V> {
+    /// Track scan progress by index so a consumed table can move safely.
     type Scan;
 
-    /// Full constructor mirroring the public `with_capacity_*` family.
+    /// Create a cursor positioned before the first occupied slot.
+    fn scan(&self) -> Self::Scan;
+
+    /// Advance `scan` and return the next occupied slot. The cursor remains
+    /// pointerless between calls so a consumed table can move safely.
+    fn scan_next(&self, scan: &mut Self::Scan) -> Option<(*mut SlotEntry<K, V>, Self::Location)>;
+}
+
+/// Construct, resize, clean up, and clone table storage.
+pub trait TableLifecycle<K, V>: TableStorage<K, V> {
+    /// Construct storage for the public `with_capacity_*` family.
     fn with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
         reserve_fraction: f64,
@@ -48,42 +130,18 @@ pub trait RawTable<K, V>: Sized {
         alloc: Self::Alloc,
     ) -> Self;
 
-    /// Reference to the hash builder.
-    fn hasher(&self) -> &Self::Hasher;
-
-    /// Hashes `key` with the table's hasher.
-    fn hash<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
-        self.hasher().hash_one(key)
-    }
-
-    /// Reference to the allocator.
-    fn allocator(&self) -> &Self::Alloc;
-
-    /// Number of live entries.
-    fn len(&self) -> usize;
-
-    /// Maximum entries before the next automatic resize (the public `capacity`).
-    fn capacity(&self) -> usize;
-
-    /// Total backing slot count (distinct from `capacity`, the live-entry ceiling).
-    fn total_slots(&self) -> usize;
-
-    /// The configured reserve fraction.
-    fn reserve_fraction(&self) -> f64;
-
-    /// Slot count holding `needed` live entries at this reserve fraction, or
-    /// `None` on overflow.
+    /// Compute the slot count needed for `needed` live entries.
     fn grow_capacity_for(&self, needed: usize) -> Option<usize>;
 
-    /// Reallocates to `new_capacity` slots and reinserts all entries.
+    /// Reallocate to `new_capacity` slots and reinsert every entry.
     fn resize(&mut self, new_capacity: usize);
 
-    /// Fallible [`resize`](RawTable::resize); `Err` leaves the table intact.
+    /// Attempt to resize while leaving the table intact on `Err`.
     fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
     where
         Self::Hasher: Clone;
 
-    /// Ensures room for `additional` more entries.
+    /// Ensure room for `additional` entries.
     fn reserve(&mut self, additional: usize) {
         let needed = self.len().saturating_add(additional);
         if needed <= self.capacity() {
@@ -93,7 +151,7 @@ pub trait RawTable<K, V>: Sized {
         self.resize(new_capacity);
     }
 
-    /// Fallible [`reserve`](RawTable::reserve).
+    /// Attempt to reserve room for `additional` entries.
     fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
     where
         Self::Hasher: Clone,
@@ -111,7 +169,7 @@ pub trait RawTable<K, V>: Sized {
         self.try_resize(new_capacity)
     }
 
-    /// Shrinks capacity toward `min_capacity`.
+    /// Shrink capacity toward `min_capacity` without dropping entries.
     fn shrink_to(&mut self, min_capacity: usize) {
         if self.len() == 0 && min_capacity == 0 {
             if self.total_slots() > 0 {
@@ -128,84 +186,37 @@ pub trait RawTable<K, V>: Sized {
         self.resize(new_capacity);
     }
 
-    /// Drops all entries, keeping allocation.
+    /// Drop all entries while retaining the allocation.
     fn clear(&mut self);
 
-    /// Finds the slot for `key` (hash + fingerprint precomputed by the shell).
-    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<Self::Location>
-    where
-        Q: Hash + Equivalent<K> + ?Sized;
-
-    /// Shared reference to the slot at `loc`.
-    ///
-    /// # Safety
-    /// `loc` must be a live location from this table.
-    unsafe fn slot_ref(&self, loc: Self::Location) -> &SlotEntry<K, V>;
-
-    /// Raw pointer to the slot at `loc`. Takes `&self` (not `&mut`) and forms no
-    /// intermediate reference to the owning region, so callers may derive
-    /// disjoint `&mut` from distinct locations without aliasing.
-    ///
-    /// # Safety
-    /// `loc` must be a live location from this table.
-    unsafe fn slot_ptr(&self, loc: Self::Location) -> *mut SlotEntry<K, V>;
-
-    /// Replaces the value at `loc`, returning the old one.
-    fn replace_value(&mut self, loc: Self::Location, value: V) -> V;
-
-    /// Inserts a known-absent key, resizing as needed. Returns its location.
-    fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> Self::Location;
-
-    /// Inserts `key`→`value`, returning the previous value if present. The
-    /// default probes twice (find, then a vacant slot); a backend that records a
-    /// candidate during the find probe overrides this for a single pass.
-    fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
-    where
-        K: Hash + Eq,
-    {
-        let fp = fingerprint(hash);
-        if let Some(loc) = self.find(&key, hash, fp) {
-            return Some(self.replace_value(loc, value));
-        }
-        self.insert_for_vacant(key, value, hash);
-        None
-    }
-
-    /// Removes the entry at `loc` (tombstone + bookkeeping + maybe resize).
-    fn remove(&mut self, loc: Self::Location) -> (K, V);
-
-    /// Marks the slot at `loc` as a tombstone without touching live/tombstone
-    /// counters. For draining iterators whose value was already read out and
-    /// whose counters are reset wholesale ([`Drain`] via [`wipe_all`](RawTable::wipe_all))
-    /// or irrelevant (a consumed [`IntoIter`]); the mark stops the table's
-    /// `Drop` from re-dropping the moved-out slot.
-    fn tombstone_slot(&mut self, loc: Self::Location);
-
-    /// Finalizes removal of the slot at `loc` whose value was already read out:
-    /// marks a tombstone and updates counters, but does not resize. For
-    /// [`ExtractIf`], where the map keeps being used afterward.
-    fn extract_finish(&mut self, loc: Self::Location);
-
-    /// Fresh cursor positioned before the first occupied slot.
-    fn scan(&self) -> Self::Scan;
-
-    /// Advances `scan`, returning the next occupied slot's pointer and location
-    /// in storage order. Iterators read through the pointer directly; the
-    /// location backs removal. `scan` caches the current region so the pointer
-    /// is one offset, not a per-element region lookup. `scan` itself holds no
-    /// pointer until the first call, so a consumed table may be moved first.
-    fn scan_next(&self, scan: &mut Self::Scan) -> Option<(*mut SlotEntry<K, V>, Self::Location)>;
-
-    /// Bulk-clears all control bytes and zeroes counters. Called by
-    /// [`Drain::drop`] after the slots' values have been taken.
+    /// Clear control bytes and counters after [`Drain::drop`] moves out values.
     fn wipe_all(&mut self);
 
-    /// Deep-clones the table (storage + hasher + allocator).
+    /// Clone storage, hash builder, allocator, and entries.
     fn clone_table(&self) -> Self
     where
         K: Clone,
         V: Clone,
         Self::Hasher: Clone;
+}
+
+/// Combine the five backend capabilities required by [`HashMap`].
+pub trait TableProbing<K, V>:
+    TableStorage<K, V>
+    + TableLookup<K, V>
+    + TableInsert<K, V>
+    + TableIterate<K, V>
+    + TableLifecycle<K, V>
+{
+}
+
+impl<K, V, T> TableProbing<K, V> for T where
+    T: TableStorage<K, V>
+        + TableLookup<K, V>
+        + TableInsert<K, V>
+        + TableIterate<K, V>
+        + TableLifecycle<K, V>
+{
 }
 
 /// Computes the control-byte fingerprint the backends scan on.
@@ -214,15 +225,15 @@ fn fingerprint(hash: u64) -> u8 {
     control::control_fingerprint(hash)
 }
 
-/// A hash map backed by a [`RawTable`] implementation `R`.
-pub struct HashMap<K, V, R: RawTable<K, V>> {
-    table: R,
+/// Use a [`TableProbing`] backend to store key-value pairs.
+pub struct HashMap<K, V, P: TableProbing<K, V>> {
+    table: P,
     _marker: PhantomData<(K, V)>,
 }
 
-impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
+impl<K, V, P: TableProbing<K, V>> HashMap<K, V, P> {
     #[inline]
-    fn from_table(table: R) -> Self {
+    fn from_table(table: P) -> Self {
         Self {
             table,
             _marker: PhantomData,
@@ -230,7 +241,7 @@ impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
     }
 
     #[cfg(test)]
-    pub(crate) fn table(&self) -> &R {
+    pub(crate) fn table(&self) -> &P {
         &self.table
     }
 
@@ -239,10 +250,10 @@ impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
     pub fn with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
         reserve_fraction: f64,
-        hash_builder: R::Hasher,
-        alloc: R::Alloc,
+        hash_builder: P::Hasher,
+        alloc: P::Alloc,
     ) -> Self {
-        Self::from_table(R::with_capacity_and_reserve_fraction_and_hasher_in(
+        Self::from_table(P::with_capacity_and_reserve_fraction_and_hasher_in(
             capacity,
             reserve_fraction,
             hash_builder,
@@ -251,12 +262,12 @@ impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
     }
 
     /// Reference to the map's allocator.
-    pub fn allocator(&self) -> &R::Alloc {
+    pub fn allocator(&self) -> &P::Alloc {
         self.table.allocator()
     }
 
     /// Reference to the map's [`BuildHasher`].
-    pub fn hasher(&self) -> &R::Hasher {
+    pub fn hasher(&self) -> &P::Hasher {
         self.table.hasher()
     }
 
@@ -286,7 +297,7 @@ impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
     /// Returns [`TryReserveError`] on capacity overflow or allocator failure.
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
     where
-        R::Hasher: Clone,
+        P::Hasher: Clone,
     {
         self.table.try_reserve(additional)
     }
@@ -307,13 +318,13 @@ impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
     }
 }
 
-impl<K, V, R> HashMap<K, V, R>
+impl<K, V, P> HashMap<K, V, P>
 where
     K: Eq + Hash,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     #[inline]
-    fn find_location<Q>(&self, key: &Q) -> Option<R::Location>
+    fn find_location<Q>(&self, key: &Q) -> Option<P::Location>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
@@ -326,7 +337,7 @@ where
     /// # Safety
     /// `loc` must be a live location from this table.
     #[inline]
-    unsafe fn slot_entry(&self, loc: R::Location) -> &SlotEntry<K, V> {
+    unsafe fn slot_entry(&self, loc: P::Location) -> &SlotEntry<K, V> {
         unsafe { self.table.slot_ref(loc) }
     }
 
@@ -337,7 +348,7 @@ where
     /// aliasing rules for the returned slot.
     #[inline]
     #[allow(clippy::mut_from_ref)]
-    unsafe fn slot_entry_mut(&self, loc: R::Location) -> &mut SlotEntry<K, V> {
+    unsafe fn slot_entry_mut(&self, loc: P::Location) -> &mut SlotEntry<K, V> {
         unsafe { &mut *self.table.slot_ptr(loc) }
     }
 
@@ -375,7 +386,7 @@ where
 
     /// Returns the stored key equal to `key`, inserting `f(key)` (with `value`)
     /// if absent, in one hit-path probe. The `Copy` location from
-    /// [`RawTable::find`] frees the borrow before the key ref is re-derived —
+    /// [`TableLookup::find`] frees the borrow before the key ref is re-derived —
     /// the naive `get`-then-insert needs Polonius. Backs set `get_or_insert_with`.
     pub(crate) fn get_or_insert_key_with<Q, F>(&mut self, key: &Q, value: V, f: F) -> &K
     where
@@ -488,7 +499,7 @@ where
     }
 
     #[inline]
-    fn locate_disjoint<Q, const N: usize>(&self, keys: [&Q; N]) -> [Option<R::Location>; N]
+    fn locate_disjoint<Q, const N: usize>(&self, keys: [&Q; N]) -> [Option<P::Location>; N]
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
@@ -500,7 +511,7 @@ where
     ///
     /// # Errors
     /// [`OccupiedError`] when `key` is already present.
-    pub fn try_insert(&mut self, key: K, value: V) -> Result<&mut V, OccupiedError<'_, K, V, R>> {
+    pub fn try_insert(&mut self, key: K, value: V) -> Result<&mut V, OccupiedError<'_, K, V, P>> {
         let hash = self.table.hash(&key);
         let fp = fingerprint(hash);
         if let Some(loc) = self.table.find(&key, hash, fp) {
@@ -519,7 +530,7 @@ where
     }
 
     /// Gets the [`Entry`] for `key` for in-place manipulation.
-    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, R> {
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, P> {
         let hash = self.table.hash(&key);
         match self.table.find(&key, hash, fingerprint(hash)) {
             Some(loc) => Entry::Occupied(OccupiedEntry {
@@ -549,41 +560,41 @@ where
 // ---------------------------------------------------------------------------
 
 /// A view into a single map entry, occupied or vacant.
-pub enum Entry<'a, K, V, R: RawTable<K, V>> {
+pub enum Entry<'a, K, V, P: TableProbing<K, V>> {
     /// Key present.
-    Occupied(OccupiedEntry<'a, K, V, R>),
+    Occupied(OccupiedEntry<'a, K, V, P>),
     /// Key absent.
-    Vacant(VacantEntry<'a, K, V, R>),
+    Vacant(VacantEntry<'a, K, V, P>),
 }
 
 /// View of an occupied entry.
-pub struct OccupiedEntry<'a, K, V, R: RawTable<K, V>> {
-    map: &'a mut HashMap<K, V, R>,
-    loc: R::Location,
+pub struct OccupiedEntry<'a, K, V, P: TableProbing<K, V>> {
+    map: &'a mut HashMap<K, V, P>,
+    loc: P::Location,
     _marker: PhantomData<K>,
 }
 
 /// View of a vacant entry.
-pub struct VacantEntry<'a, K, V, R: RawTable<K, V>> {
-    map: &'a mut HashMap<K, V, R>,
+pub struct VacantEntry<'a, K, V, P: TableProbing<K, V>> {
+    map: &'a mut HashMap<K, V, P>,
     key: K,
     hash: u64,
 }
 
 /// Error returned by [`HashMap::try_insert`] on key collision. Holds the
 /// occupied entry that blocked the insert plus the rejected value.
-pub struct OccupiedError<'a, K, V, R: RawTable<K, V>> {
+pub struct OccupiedError<'a, K, V, P: TableProbing<K, V>> {
     /// The entry whose key was already present.
-    pub entry: OccupiedEntry<'a, K, V, R>,
+    pub entry: OccupiedEntry<'a, K, V, P>,
     /// The value that could not be inserted.
     pub value: V,
 }
 
-impl<K, V, R> fmt::Debug for OccupiedError<'_, K, V, R>
+impl<K, V, P> fmt::Debug for OccupiedError<'_, K, V, P>
 where
     K: Eq + Hash + fmt::Debug,
     V: fmt::Debug,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("OccupiedError")
@@ -593,11 +604,11 @@ where
     }
 }
 
-impl<K, V, R> fmt::Display for OccupiedError<'_, K, V, R>
+impl<K, V, P> fmt::Display for OccupiedError<'_, K, V, P>
 where
     K: Eq + Hash + fmt::Debug,
     V: fmt::Debug,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
@@ -610,18 +621,18 @@ where
     }
 }
 
-impl<K, V, R> Error for OccupiedError<'_, K, V, R>
+impl<K, V, P> Error for OccupiedError<'_, K, V, P>
 where
     K: Eq + Hash + fmt::Debug,
     V: fmt::Debug,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
 }
 
-impl<'a, K, V, R> OccupiedEntry<'a, K, V, R>
+impl<'a, K, V, P> OccupiedEntry<'a, K, V, P>
 where
     K: Eq + Hash,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     /// Reference to the entry's key.
     #[must_use]
@@ -675,10 +686,10 @@ where
     }
 }
 
-impl<'a, K, V, R> VacantEntry<'a, K, V, R>
+impl<'a, K, V, P> VacantEntry<'a, K, V, P>
 where
     K: Eq + Hash,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     /// Reference to the key that would be inserted.
     pub fn key(&self) -> &K {
@@ -699,7 +710,7 @@ where
     }
 
     /// Inserts `value` and returns the resulting [`OccupiedEntry`].
-    pub(crate) fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, R> {
+    pub(crate) fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, P> {
         let loc = self.map.table.insert_for_vacant(self.key, value, self.hash);
         OccupiedEntry {
             map: self.map,
@@ -709,10 +720,10 @@ where
     }
 }
 
-impl<'a, K, V, R> Entry<'a, K, V, R>
+impl<'a, K, V, P> Entry<'a, K, V, P>
 where
     K: Eq + Hash,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     /// Returns `&mut V`, inserting `default` if vacant.
     pub fn or_insert(self, default: V) -> &'a mut V {
@@ -762,10 +773,10 @@ where
     }
 }
 
-impl<'a, K, V, R> Entry<'a, K, V, R>
+impl<'a, K, V, P> Entry<'a, K, V, P>
 where
     K: Eq + Hash,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
     V: Default,
 {
     /// Returns `&mut V`, inserting `V::default()` if vacant.
@@ -781,9 +792,9 @@ where
 // Convenience constructors (reproduced generically from the full constructor)
 // ---------------------------------------------------------------------------
 
-impl<K, V, R> HashMap<K, V, R>
+impl<K, V, P> HashMap<K, V, P>
 where
-    R: RawTable<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableProbing<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     /// Creates an empty map.
     #[must_use]
@@ -825,13 +836,13 @@ where
     }
 }
 
-impl<K, V, R> HashMap<K, V, R>
+impl<K, V, P> HashMap<K, V, P>
 where
-    R: RawTable<K, V, Alloc = Global>,
+    P: TableProbing<K, V, Alloc = Global>,
 {
     /// Creates an empty map that uses `hash_builder`.
     #[must_use]
-    pub fn with_hasher(hash_builder: R::Hasher) -> Self {
+    pub fn with_hasher(hash_builder: P::Hasher) -> Self {
         Self::with_capacity_and_reserve_fraction_and_hasher_in(
             0,
             DEFAULT_RESERVE_FRACTION,
@@ -842,7 +853,7 @@ where
 
     /// Creates an empty map with the given capacity and hasher.
     #[must_use]
-    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: R::Hasher) -> Self {
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: P::Hasher) -> Self {
         Self::with_capacity_and_reserve_fraction_and_hasher_in(
             capacity,
             DEFAULT_RESERVE_FRACTION,
@@ -855,7 +866,7 @@ where
     #[must_use]
     pub fn with_reserve_fraction_and_hasher(
         reserve_fraction: f64,
-        hash_builder: R::Hasher,
+        hash_builder: P::Hasher,
     ) -> Self {
         Self::with_capacity_and_reserve_fraction_and_hasher_in(
             0,
@@ -870,7 +881,7 @@ where
     pub fn with_capacity_and_reserve_fraction_and_hasher(
         capacity: usize,
         reserve_fraction: f64,
-        hash_builder: R::Hasher,
+        hash_builder: P::Hasher,
     ) -> Self {
         Self::with_capacity_and_reserve_fraction_and_hasher_in(
             capacity,
@@ -881,13 +892,13 @@ where
     }
 }
 
-impl<K, V, R> HashMap<K, V, R>
+impl<K, V, P> HashMap<K, V, P>
 where
-    R: RawTable<K, V, Hasher = DefaultHashBuilder>,
+    P: TableProbing<K, V, Hasher = DefaultHashBuilder>,
 {
     /// Creates an empty map in the given allocator.
     #[must_use]
-    pub fn new_in(alloc: R::Alloc) -> Self {
+    pub fn new_in(alloc: P::Alloc) -> Self {
         Self::with_capacity_and_reserve_fraction_and_hasher_in(
             0,
             DEFAULT_RESERVE_FRACTION,
@@ -898,7 +909,7 @@ where
 
     /// Creates an empty map with the given capacity in the given allocator.
     #[must_use]
-    pub fn with_capacity_in(capacity: usize, alloc: R::Alloc) -> Self {
+    pub fn with_capacity_in(capacity: usize, alloc: P::Alloc) -> Self {
         Self::with_capacity_and_reserve_fraction_and_hasher_in(
             capacity,
             DEFAULT_RESERVE_FRACTION,
@@ -912,9 +923,9 @@ where
 // Iteration accessors
 // ---------------------------------------------------------------------------
 
-impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
+impl<K, V, P: TableProbing<K, V>> HashMap<K, V, P> {
     /// Borrowing iterator over `(&K, &V)`, in arbitrary order.
-    pub fn iter(&self) -> Iter<'_, K, V, R> {
+    pub fn iter(&self) -> Iter<'_, K, V, P> {
         Iter {
             table: &self.table,
             scan: self.table.scan(),
@@ -924,7 +935,7 @@ impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
     }
 
     /// Borrowing iterator over `(&K, &mut V)`.
-    pub fn iter_mut(&mut self) -> IterMut<'_, K, V, R> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V, P> {
         let scan = self.table.scan();
         let remaining = self.table.len();
         IterMut {
@@ -936,32 +947,32 @@ impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
     }
 
     /// Iterator over `&K`.
-    pub fn keys(&self) -> Keys<'_, K, V, R> {
+    pub fn keys(&self) -> Keys<'_, K, V, P> {
         CommonKeys::new(self.iter())
     }
 
     /// Iterator over `&V`.
-    pub fn values(&self) -> Values<'_, K, V, R> {
+    pub fn values(&self) -> Values<'_, K, V, P> {
         CommonValues::new(self.iter())
     }
 
     /// Iterator over `&mut V`.
-    pub fn values_mut(&mut self) -> ValuesMut<'_, K, V, R> {
+    pub fn values_mut(&mut self) -> ValuesMut<'_, K, V, P> {
         CommonValues::new(self.iter_mut())
     }
 
     /// Consuming iterator over owned keys.
-    pub fn into_keys(self) -> IntoKeys<K, V, R> {
+    pub fn into_keys(self) -> IntoKeys<K, V, P> {
         CommonIntoKeys::new(self.into_iter())
     }
 
     /// Consuming iterator over owned values.
-    pub fn into_values(self) -> IntoValues<K, V, R> {
+    pub fn into_values(self) -> IntoValues<K, V, P> {
         CommonIntoValues::new(self.into_iter())
     }
 
     /// Draining iterator that empties the map.
-    pub fn drain(&mut self) -> Drain<'_, K, V, R> {
+    pub fn drain(&mut self) -> Drain<'_, K, V, P> {
         let scan = self.table.scan();
         let remaining = self.table.len();
         Drain {
@@ -973,7 +984,7 @@ impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
     }
 
     /// Removes and yields the entries for which `f` returns `true`.
-    pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, K, V, R, F>
+    pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, K, V, P, F>
     where
         F: FnMut(&K, &mut V) -> bool,
     {
@@ -992,19 +1003,19 @@ impl<K, V, R: RawTable<K, V>> HashMap<K, V, R> {
 // ---------------------------------------------------------------------------
 
 /// Borrowing iterator over `(&K, &V)`.
-pub struct Iter<'a, K, V, R: RawTable<K, V>> {
-    table: &'a R,
-    scan: R::Scan,
+pub struct Iter<'a, K, V, P: TableProbing<K, V>> {
+    table: &'a P,
+    scan: P::Scan,
     remaining: usize,
     _marker: PhantomData<(&'a K, &'a V)>,
 }
 
-impl<'a, K, V, R: RawTable<K, V>> Iterator for Iter<'a, K, V, R> {
+impl<'a, K, V, P: TableProbing<K, V>> Iterator for Iter<'a, K, V, P> {
     type Item = (&'a K, &'a V);
     fn next(&mut self) -> Option<(&'a K, &'a V)> {
         let (ptr, _loc) = self.table.scan_next(&mut self.scan)?;
         self.remaining -= 1;
-        // SAFETY: `ptr` is a live slot from this table's scan; the `&'a R`
+        // SAFETY: `ptr` is a live slot from this table's scan; the `&'a P`
         // borrow keeps it alive for `'a`.
         let slot: &'a SlotEntry<K, V> = unsafe { &*ptr };
         Some((&slot.key, &slot.value))
@@ -1014,17 +1025,17 @@ impl<'a, K, V, R: RawTable<K, V>> Iterator for Iter<'a, K, V, R> {
     }
 }
 
-impl<K, V, R: RawTable<K, V>> ExactSizeIterator for Iter<'_, K, V, R> {
+impl<K, V, P: TableProbing<K, V>> ExactSizeIterator for Iter<'_, K, V, P> {
     fn len(&self) -> usize {
         self.remaining
     }
 }
-impl<K, V, R: RawTable<K, V>> FusedIterator for Iter<'_, K, V, R> {}
+impl<K, V, P: TableProbing<K, V>> FusedIterator for Iter<'_, K, V, P> {}
 
-impl<K, V, R> Clone for Iter<'_, K, V, R>
+impl<K, V, P> Clone for Iter<'_, K, V, P>
 where
-    R: RawTable<K, V>,
-    R::Scan: Clone,
+    P: TableProbing<K, V>,
+    P::Scan: Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -1036,10 +1047,10 @@ where
     }
 }
 
-impl<K: fmt::Debug, V: fmt::Debug, R> fmt::Debug for Iter<'_, K, V, R>
+impl<K: fmt::Debug, V: fmt::Debug, P> fmt::Debug for Iter<'_, K, V, P>
 where
-    R: RawTable<K, V>,
-    R::Scan: Clone,
+    P: TableProbing<K, V>,
+    P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
@@ -1047,14 +1058,14 @@ where
 }
 
 /// Borrowing iterator over `(&K, &mut V)`.
-pub struct IterMut<'a, K, V, R: RawTable<K, V>> {
-    table: *mut R,
-    scan: R::Scan,
+pub struct IterMut<'a, K, V, P: TableProbing<K, V>> {
+    table: *mut P,
+    scan: P::Scan,
     remaining: usize,
     _marker: PhantomData<(&'a K, &'a mut V)>,
 }
 
-impl<'a, K, V, R: RawTable<K, V>> Iterator for IterMut<'a, K, V, R> {
+impl<'a, K, V, P: TableProbing<K, V>> Iterator for IterMut<'a, K, V, P> {
     type Item = (&'a K, &'a mut V);
     fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
         // SAFETY: `table` points to the borrowed map; `scan_next` yields each
@@ -1070,21 +1081,21 @@ impl<'a, K, V, R: RawTable<K, V>> Iterator for IterMut<'a, K, V, R> {
     }
 }
 
-impl<K, V, R: RawTable<K, V>> ExactSizeIterator for IterMut<'_, K, V, R> {
+impl<K, V, P: TableProbing<K, V>> ExactSizeIterator for IterMut<'_, K, V, P> {
     fn len(&self) -> usize {
         self.remaining
     }
 }
-impl<K, V, R: RawTable<K, V>> FusedIterator for IterMut<'_, K, V, R> {}
+impl<K, V, P: TableProbing<K, V>> FusedIterator for IterMut<'_, K, V, P> {}
 
 /// Consuming iterator over owned `(K, V)`.
-pub struct IntoIter<K, V, R: RawTable<K, V>> {
-    table: R,
-    scan: R::Scan,
+pub struct IntoIter<K, V, P: TableProbing<K, V>> {
+    table: P,
+    scan: P::Scan,
     remaining: usize,
 }
 
-impl<K, V, R: RawTable<K, V>> Iterator for IntoIter<K, V, R> {
+impl<K, V, P: TableProbing<K, V>> Iterator for IntoIter<K, V, P> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
         let (ptr, loc) = self.table.scan_next(&mut self.scan)?;
@@ -1100,22 +1111,22 @@ impl<K, V, R: RawTable<K, V>> Iterator for IntoIter<K, V, R> {
     }
 }
 
-impl<K, V, R: RawTable<K, V>> ExactSizeIterator for IntoIter<K, V, R> {
+impl<K, V, P: TableProbing<K, V>> ExactSizeIterator for IntoIter<K, V, P> {
     fn len(&self) -> usize {
         self.remaining
     }
 }
-impl<K, V, R: RawTable<K, V>> FusedIterator for IntoIter<K, V, R> {}
+impl<K, V, P: TableProbing<K, V>> FusedIterator for IntoIter<K, V, P> {}
 
 /// Draining iterator; empties the map on consumption or drop.
-pub struct Drain<'a, K, V, R: RawTable<K, V>> {
-    table: *mut R,
-    scan: R::Scan,
+pub struct Drain<'a, K, V, P: TableProbing<K, V>> {
+    table: *mut P,
+    scan: P::Scan,
     remaining: usize,
-    _marker: PhantomData<&'a mut R>,
+    _marker: PhantomData<&'a mut P>,
 }
 
-impl<K, V, R: RawTable<K, V>> Iterator for Drain<'_, K, V, R> {
+impl<K, V, P: TableProbing<K, V>> Iterator for Drain<'_, K, V, P> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
         // SAFETY: `table` points to the borrowed map for the drain's lifetime.
@@ -1132,14 +1143,14 @@ impl<K, V, R: RawTable<K, V>> Iterator for Drain<'_, K, V, R> {
     }
 }
 
-impl<K, V, R: RawTable<K, V>> ExactSizeIterator for Drain<'_, K, V, R> {
+impl<K, V, P: TableProbing<K, V>> ExactSizeIterator for Drain<'_, K, V, P> {
     fn len(&self) -> usize {
         self.remaining
     }
 }
-impl<K, V, R: RawTable<K, V>> FusedIterator for Drain<'_, K, V, R> {}
+impl<K, V, P: TableProbing<K, V>> FusedIterator for Drain<'_, K, V, P> {}
 
-impl<K, V, R: RawTable<K, V>> Drop for Drain<'_, K, V, R> {
+impl<K, V, P: TableProbing<K, V>> Drop for Drain<'_, K, V, P> {
     fn drop(&mut self) {
         // Drain any unyielded entries so values run their `Drop`, then wipe.
         for _ in &mut *self {}
@@ -1149,16 +1160,16 @@ impl<K, V, R: RawTable<K, V>> Drop for Drain<'_, K, V, R> {
 
 /// Iterator yielding entries removed by [`HashMap::extract_if`]. Unyielded
 /// non-matching entries are retained; its `Drop` is a no-op.
-pub struct ExtractIf<'a, K, V, R: RawTable<K, V>, F> {
-    table: *mut R,
-    scan: R::Scan,
+pub struct ExtractIf<'a, K, V, P: TableProbing<K, V>, F> {
+    table: *mut P,
+    scan: P::Scan,
     pred: F,
-    _marker: PhantomData<&'a mut R>,
+    _marker: PhantomData<&'a mut P>,
 }
 
-impl<K, V, R, F> Iterator for ExtractIf<'_, K, V, R, F>
+impl<K, V, P, F> Iterator for ExtractIf<'_, K, V, P, F>
 where
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
     F: FnMut(&K, &mut V) -> bool,
 {
     type Item = (K, V);
@@ -1182,65 +1193,65 @@ where
     }
 }
 
-impl<K, V, R, F> FusedIterator for ExtractIf<'_, K, V, R, F>
+impl<K, V, P, F> FusedIterator for ExtractIf<'_, K, V, P, F>
 where
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
     F: FnMut(&K, &mut V) -> bool,
 {
 }
 
 /// Iterator over `&K`.
-pub type Keys<'a, K, V, R> = CommonKeys<Iter<'a, K, V, R>>;
+pub type Keys<'a, K, V, P> = CommonKeys<Iter<'a, K, V, P>>;
 /// Iterator over `&V`.
-pub type Values<'a, K, V, R> = CommonValues<Iter<'a, K, V, R>>;
+pub type Values<'a, K, V, P> = CommonValues<Iter<'a, K, V, P>>;
 /// Iterator over `&mut V`.
-pub type ValuesMut<'a, K, V, R> = CommonValues<IterMut<'a, K, V, R>>;
+pub type ValuesMut<'a, K, V, P> = CommonValues<IterMut<'a, K, V, P>>;
 /// Consuming iterator over owned keys.
-pub type IntoKeys<K, V, R> = CommonIntoKeys<IntoIter<K, V, R>>;
+pub type IntoKeys<K, V, P> = CommonIntoKeys<IntoIter<K, V, P>>;
 /// Consuming iterator over owned values.
-pub type IntoValues<K, V, R> = CommonIntoValues<IntoIter<K, V, R>>;
+pub type IntoValues<K, V, P> = CommonIntoValues<IntoIter<K, V, P>>;
 
 // ---------------------------------------------------------------------------
 // Trait impls
 // ---------------------------------------------------------------------------
 
-impl<K, V, R> Default for HashMap<K, V, R>
+impl<K, V, P> Default for HashMap<K, V, P>
 where
-    R: RawTable<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableProbing<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     fn default() -> Self {
         Self::with_capacity(0)
     }
 }
 
-impl<K, V, R> Clone for HashMap<K, V, R>
+impl<K, V, P> Clone for HashMap<K, V, P>
 where
     K: Clone,
     V: Clone,
-    R: RawTable<K, V>,
-    R::Hasher: Clone,
+    P: TableProbing<K, V>,
+    P::Hasher: Clone,
 {
     fn clone(&self) -> Self {
         Self::from_table(self.table.clone_table())
     }
 }
 
-impl<K, V, R> fmt::Debug for HashMap<K, V, R>
+impl<K, V, P> fmt::Debug for HashMap<K, V, P>
 where
     K: fmt::Debug,
     V: fmt::Debug,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<K, V, R> PartialEq for HashMap<K, V, R>
+impl<K, V, P> PartialEq for HashMap<K, V, P>
 where
     K: Eq + Hash,
     V: PartialEq,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len()
@@ -1250,19 +1261,19 @@ where
     }
 }
 
-impl<K, V, R> Eq for HashMap<K, V, R>
+impl<K, V, P> Eq for HashMap<K, V, P>
 where
     K: Eq + Hash,
     V: Eq,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
 }
 
-impl<K, Q, V, R> Index<&Q> for HashMap<K, V, R>
+impl<K, Q, V, P> Index<&Q> for HashMap<K, V, P>
 where
     K: Eq + Hash,
     Q: Hash + Equivalent<K> + ?Sized,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     type Output = V;
     fn index(&self, key: &Q) -> &V {
@@ -1270,10 +1281,10 @@ where
     }
 }
 
-impl<K, V, R> Extend<(K, V)> for HashMap<K, V, R>
+impl<K, V, P> Extend<(K, V)> for HashMap<K, V, P>
 where
     K: Eq + Hash,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         let iter = iter.into_iter();
@@ -1284,32 +1295,32 @@ where
     }
 }
 
-impl<'a, K, V, R> Extend<(&'a K, &'a V)> for HashMap<K, V, R>
+impl<'a, K, V, P> Extend<(&'a K, &'a V)> for HashMap<K, V, P>
 where
     K: Eq + Hash + Copy,
     V: Copy,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     fn extend<I: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: I) {
         self.extend(iter.into_iter().map(|(k, v)| (*k, *v)));
     }
 }
 
-impl<'a, K, V, R> Extend<&'a (K, V)> for HashMap<K, V, R>
+impl<'a, K, V, P> Extend<&'a (K, V)> for HashMap<K, V, P>
 where
     K: Eq + Hash + Copy,
     V: Copy,
-    R: RawTable<K, V>,
+    P: TableProbing<K, V>,
 {
     fn extend<I: IntoIterator<Item = &'a (K, V)>>(&mut self, iter: I) {
         self.extend(iter.into_iter().map(|(k, v)| (*k, *v)));
     }
 }
 
-impl<K, V, R> FromIterator<(K, V)> for HashMap<K, V, R>
+impl<K, V, P> FromIterator<(K, V)> for HashMap<K, V, P>
 where
     K: Eq + Hash,
-    R: RawTable<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableProbing<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
         let iter = iter.into_iter();
@@ -1319,26 +1330,26 @@ where
     }
 }
 
-impl<'a, K, V, R: RawTable<K, V>> IntoIterator for &'a HashMap<K, V, R> {
+impl<'a, K, V, P: TableProbing<K, V>> IntoIterator for &'a HashMap<K, V, P> {
     type Item = (&'a K, &'a V);
-    type IntoIter = Iter<'a, K, V, R>;
-    fn into_iter(self) -> Iter<'a, K, V, R> {
+    type IntoIter = Iter<'a, K, V, P>;
+    fn into_iter(self) -> Iter<'a, K, V, P> {
         self.iter()
     }
 }
 
-impl<'a, K, V, R: RawTable<K, V>> IntoIterator for &'a mut HashMap<K, V, R> {
+impl<'a, K, V, P: TableProbing<K, V>> IntoIterator for &'a mut HashMap<K, V, P> {
     type Item = (&'a K, &'a mut V);
-    type IntoIter = IterMut<'a, K, V, R>;
-    fn into_iter(self) -> IterMut<'a, K, V, R> {
+    type IntoIter = IterMut<'a, K, V, P>;
+    fn into_iter(self) -> IterMut<'a, K, V, P> {
         self.iter_mut()
     }
 }
 
-impl<K, V, R: RawTable<K, V>> IntoIterator for HashMap<K, V, R> {
+impl<K, V, P: TableProbing<K, V>> IntoIterator for HashMap<K, V, P> {
     type Item = (K, V);
-    type IntoIter = IntoIter<K, V, R>;
-    fn into_iter(self) -> IntoIter<K, V, R> {
+    type IntoIter = IntoIter<K, V, P>;
+    fn into_iter(self) -> IntoIter<K, V, P> {
         let scan = self.table.scan();
         let remaining = self.table.len();
         IntoIter {

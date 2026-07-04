@@ -11,7 +11,7 @@ use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::common::error::TryReserveError;
 use crate::common::iter::RegionCursor;
 use crate::common::math::{self, align, capacity, probe};
-use crate::map::{self, RawTable};
+use crate::map;
 use crate::set;
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
@@ -233,35 +233,18 @@ impl<K, V> Level<SlotEntry<K, V>> {
 /// simplification as `SwissTable` / hashbrown — preserves coverage with
 /// far better cache behavior than recomputing random positions.
 pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    /// Geometrically shrinking partition of capacity; length fixed at ctor.
     levels: LevelSlice<K, V>,
-    /// Total live entries.
     len: usize,
-    /// Total slot count across all levels.
     total_slots: usize,
-    /// Insert count that triggers `resize(2x)`.
     max_insertions: usize,
-    /// Slot reserve fraction per level. Set at construction.
     reserve_fraction: f64,
-    /// Per-batch insert quota; drives `current_batch_index` advancement.
-    batch_plan: Box<[usize]>,
-    /// Index into `batch_plan`. Selects which level pair new keys target.
-    current_batch_index: usize,
-    /// Remaining inserts in the current batch before advancing.
-    batch_remaining: usize,
-    /// Highest level index ever written; bounds the lookup probe loop.
+    /// Schedule batch progression, resizing, and defragmentation.
+    scheduler: BatchScheduler,
+    /// Bound lookups by the deepest populated level.
     max_populated_level: usize,
-    /// A defrag repack is owed (gated by [`DEFRAG_OPS_DIVISOR`]). Decouples
-    /// defrag from the resize cadence so high-`reserve_fraction` churn stays fast.
-    defrag_pending: bool,
-    /// Inserts since the last resize; gates the amortized defrag repack.
-    inserts_since_repack: usize,
-    /// Hash builder. Cloned across resizes to preserve probe sequences.
     hash_builder: S,
-    /// Allocator used for all per-capacity allocations.
     alloc: A,
-    /// One allocation holding all levels' ctrl bytes then all slot arrays.
-    /// Layout: [`ctrl_L0` | `ctrl_L1` | ...] [pad] [`slots_L0` | `slots_L1` | ...]
+    /// [`ctrl_L0|ctrl_L1|...`][pad][`slots_L0|slots_L1|...`].
     arena: Arena,
 }
 
@@ -379,13 +362,117 @@ pub type ElasticSetVacantEntry<'a, T, S = DefaultHashBuilder, A = Global> =
 type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
 type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>);
 
+/// Schedule resize, repack, and batch progression.
+#[derive(Clone)]
+pub struct BatchScheduler {
+    batch_plan: Box<[usize]>,
+    current_batch_index: usize,
+    batch_remaining: usize,
+    defrag_pending: bool,
+    inserts_since_repack: usize,
+    total_slots: usize,
+    max_insertions: usize,
+}
+
+/// Direct the structural work required before insertion.
+pub enum InsertAction {
+    /// Resize to the specified slot count.
+    Resize(usize),
+    /// Repack at the current slot count.
+    Defrag(usize),
+    /// Continue without structural work.
+    Continue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchTarget {
+    Bootstrap,
+    LevelPair(usize),
+}
+
+impl BatchScheduler {
+    pub fn new(batch_plan: Box<[usize]>, total_slots: usize, max_insertions: usize) -> Self {
+        let initial_remaining = batch_plan.first().copied().unwrap_or(0);
+        Self {
+            batch_plan,
+            current_batch_index: 0,
+            batch_remaining: initial_remaining,
+            defrag_pending: false,
+            inserts_since_repack: 0,
+            total_slots,
+            max_insertions,
+        }
+    }
+
+    /// Select structural work for the next insert.
+    #[inline]
+    pub fn on_insert(&mut self, current_len: usize) -> InsertAction {
+        self.inserts_since_repack += 1;
+        if current_len >= self.max_insertions {
+            // Bootstrap empty storage instead of doubling zero slots.
+            let new_cap = if self.total_slots == 0 {
+                INITIAL_CAPACITY
+            } else {
+                self.total_slots.saturating_mul(2)
+            };
+            return InsertAction::Resize(new_cap);
+        }
+        if self.defrag_pending
+            && self.inserts_since_repack > (self.total_slots / DEFRAG_OPS_DIVISOR).max(1)
+        {
+            return InsertAction::Defrag(self.total_slots);
+        }
+        self.advance_batch_window();
+        InsertAction::Continue
+    }
+
+    /// Request a repack after probe depth exceeds its budget.
+    #[inline]
+    pub fn report_drift(&mut self) {
+        self.defrag_pending = true;
+    }
+
+    /// Distinguish bootstrap placement from the level pair for later batches.
+    #[inline]
+    fn target(&self) -> BatchTarget {
+        if self.current_batch_index == 0 {
+            BatchTarget::Bootstrap
+        } else {
+            BatchTarget::LevelPair(self.current_batch_index - 1)
+        }
+    }
+
+    /// Consume one insertion from the active batch.
+    #[inline]
+    fn complete_insert(&mut self) {
+        self.batch_remaining = self.batch_remaining.saturating_sub(1);
+    }
+
+    /// Skip exhausted and zero-quota batches.
+    #[inline]
+    pub fn advance_batch_window(&mut self) {
+        while self.batch_remaining == 0 && self.current_batch_index + 1 < self.batch_plan.len() {
+            self.current_batch_index += 1;
+            self.batch_remaining = self.batch_plan[self.current_batch_index];
+        }
+    }
+
+    /// Reset batch and repack progress after resize or clear.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.current_batch_index = 0;
+        self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
+        self.defrag_pending = false;
+        self.inserts_since_repack = 0;
+    }
+}
+
 /// Capacity shape and batch schedule for one elastic table allocation.
 struct ElasticGeometry {
     total_slots: usize,
     max_insertions: usize,
     level_capacities: Vec<usize>,
     batch_plan: Box<[usize]>,
-    initial_batch_remaining: usize,
 }
 
 impl ElasticGeometry {
@@ -402,13 +489,11 @@ impl ElasticGeometry {
         let max_insertions = capacity::max_insertions(total_slots, reserve_fraction);
         let level_capacities = partition_levels(total_slots);
         let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
-        let initial_batch_remaining = batch_plan.first().copied().unwrap_or(0);
         Self {
             total_slots,
             max_insertions,
             level_capacities,
             batch_plan,
-            initial_batch_remaining,
         }
     }
 }
@@ -523,12 +608,12 @@ where
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            batch_plan: geometry.batch_plan,
-            current_batch_index: 0,
-            batch_remaining: geometry.initial_batch_remaining,
+            scheduler: BatchScheduler::new(
+                geometry.batch_plan,
+                geometry.total_slots,
+                geometry.max_insertions,
+            ),
             max_populated_level: 0,
-            defrag_pending: false,
-            inserts_since_repack: 0,
             hash_builder,
             alloc,
             arena,
@@ -556,11 +641,8 @@ where
             level.max_probe_groups = 0;
         }
         self.len = 0;
-        self.current_batch_index = 0;
-        self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
         self.max_populated_level = 0;
-        self.defrag_pending = false;
-        self.inserts_since_repack = 0;
+        self.scheduler.reset();
     }
 
     /// Post-lookup insert for a key known to be absent. Returns the chosen
@@ -568,24 +650,15 @@ where
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let key_fingerprint = control::control_fingerprint(key_hash);
 
-        self.inserts_since_repack += 1;
-        if self.len >= self.max_insertions {
-            let new_capacity = if self.total_slots == 0 {
-                INITIAL_CAPACITY
-            } else {
-                self.total_slots.saturating_mul(2)
-            };
-            self.resize(new_capacity);
-        } else if self.defrag_pending
-            && self.inserts_since_repack > (self.total_slots / DEFRAG_OPS_DIVISOR).max(1)
-        {
-            // Repack here, not at the drifting insert, so its slot stays valid.
-            self.resize(self.total_slots);
+        match self.scheduler.on_insert(self.len) {
+            InsertAction::Resize(cap) | InsertAction::Defrag(cap) => self.resize(cap),
+            InsertAction::Continue => {}
         }
 
-        self.advance_batch_window();
+        self.scheduler.advance_batch_window();
+        let target = self.scheduler.target();
         let (level_idx, slot_idx) = self
-            .choose_slot_for_new_key(key_hash)
+            .choose_slot_for_new_key(key_hash, target)
             .expect("no free slot found after resize");
 
         let level = &mut self.levels[level_idx];
@@ -598,15 +671,13 @@ where
         }
         let drifted = level.probe_drifted();
         if drifted {
-            self.defrag_pending = true;
+            self.scheduler.report_drift();
         }
         if level_idx > self.max_populated_level {
             self.max_populated_level = level_idx;
         }
         self.len += 1;
-        if self.batch_remaining > 0 {
-            self.batch_remaining -= 1;
-        }
+        self.scheduler.complete_insert();
         (level_idx, slot_idx)
     }
 
@@ -625,7 +696,7 @@ where
     }
 
     /// Take + tombstone + decrement counters for the slot at `loc`. Backs
-    /// [`RawTable::remove`], which adds a resize pass.
+    /// [`map::TableInsert::remove`], which adds a resize pass.
     fn take_and_tombstone(&mut self, level_idx: usize, slot_idx: usize) -> (K, V) {
         let removed = {
             let level = &mut self.levels[level_idx];
@@ -639,8 +710,7 @@ where
         (removed.key, removed.value)
     }
 
-    /// Cold path of [`RawTable::scan_next`]: first-call region prime and level
-    /// crossings. Kept out of line so the per-element hot path inlines.
+    /// Prime the scan and cross level boundaries off the hot path.
     #[cold]
     fn scan_advance(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
         if !scan.region.started() {
@@ -662,11 +732,8 @@ where
     }
 }
 
-// `SlotEntry` is `pub(crate)`; the `RawTable` trait (in the private `map`
-// module) exposes it in `slot_ref`/`slot_ptr`, so the impl mirrors the trait's
-// private-interface lint exemption.
 #[allow(private_interfaces)]
-impl<K, V, S, A> RawTable<K, V> for ElasticTable<K, V, S, A>
+impl<K, V, S, A> map::TableStorage<K, V> for ElasticTable<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
@@ -675,22 +742,6 @@ where
     type Location = (usize, usize);
     type Hasher = S;
     type Alloc = A;
-    type Scan = ElasticScan;
-
-    #[inline]
-    fn with_capacity_and_reserve_fraction_and_hasher_in(
-        capacity: usize,
-        reserve_fraction: f64,
-        hash_builder: S,
-        alloc: A,
-    ) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
-            capacity,
-            reserve_fraction,
-            hash_builder,
-            alloc,
-        )
-    }
 
     #[inline]
     fn hasher(&self) -> &S {
@@ -723,37 +774,6 @@ where
     }
 
     #[inline]
-    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
-        self.grow_capacity_for(needed)
-    }
-
-    #[inline]
-    fn resize(&mut self, new_capacity: usize) {
-        self.resize(new_capacity);
-    }
-
-    #[inline]
-    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
-    where
-        S: Clone,
-    {
-        self.try_resize(new_capacity)
-    }
-
-    #[inline]
-    fn clear(&mut self) {
-        self.clear();
-    }
-
-    #[inline]
-    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<(usize, usize)>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        self.find_slot_indices_with_hash(key, hash, fingerprint)
-    }
-
-    #[inline]
     unsafe fn slot_ref(&self, (level_idx, slot_idx): (usize, usize)) -> &SlotEntry<K, V> {
         unsafe { self.slot_ref(level_idx, slot_idx) }
     }
@@ -768,7 +788,29 @@ where
         let slot = unsafe { self.slot_mut(level_idx, slot_idx) };
         mem::replace(&mut slot.value, value)
     }
+}
 
+impl<K, V, S, A> map::TableLookup<K, V> for ElasticTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    #[inline]
+    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<(usize, usize)>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.find_slot_indices_with_hash(key, hash, fingerprint)
+    }
+}
+
+impl<K, V, S, A> map::TableInsert<K, V> for ElasticTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> (usize, usize) {
         self.insert_for_vacant_entry(key, value, hash)
@@ -797,6 +839,16 @@ where
         level.tombstones += 1;
         self.len -= 1;
     }
+}
+
+#[allow(private_interfaces)]
+impl<K, V, S, A> map::TableIterate<K, V> for ElasticTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    type Scan = ElasticScan;
 
     #[inline]
     fn scan(&self) -> ElasticScan {
@@ -816,6 +868,51 @@ where
         }
         self.scan_advance(scan)
     }
+}
+
+impl<K, V, S, A> map::TableLifecycle<K, V> for ElasticTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    #[inline]
+    fn with_capacity_and_reserve_fraction_and_hasher_in(
+        capacity: usize,
+        reserve_fraction: f64,
+        hash_builder: S,
+        alloc: A,
+    ) -> Self {
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            reserve_fraction,
+            hash_builder,
+            alloc,
+        )
+    }
+
+    #[inline]
+    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
+        self.grow_capacity_for(needed)
+    }
+
+    #[inline]
+    fn resize(&mut self, new_capacity: usize) {
+        self.resize(new_capacity);
+    }
+
+    #[inline]
+    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
+    where
+        S: Clone,
+    {
+        self.try_resize(new_capacity)
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.clear();
+    }
 
     fn wipe_all(&mut self) {
         for level in &mut self.levels {
@@ -826,10 +923,7 @@ where
         }
         self.len = 0;
         self.max_populated_level = 0;
-        self.defrag_pending = false;
-        self.inserts_since_repack = 0;
-        self.current_batch_index = 0;
-        self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
+        self.scheduler.reset();
     }
 
     fn clone_table(&self) -> Self
@@ -871,12 +965,8 @@ where
             total_slots: self.total_slots,
             max_insertions: self.max_insertions,
             reserve_fraction: self.reserve_fraction,
-            batch_plan: self.batch_plan.clone(),
-            current_batch_index: self.current_batch_index,
-            batch_remaining: self.batch_remaining,
+            scheduler: self.scheduler.clone(),
             max_populated_level: self.max_populated_level,
-            defrag_pending: self.defrag_pending,
-            inserts_since_repack: self.inserts_since_repack,
             hash_builder: self.hash_builder.clone(),
             alloc: self.alloc.clone(),
             arena,
@@ -884,10 +974,7 @@ where
     }
 }
 
-/// Multi-level scan cursor for [`RawTable::scan`]. Holds the current level
-/// index and a shared [`RegionCursor`]. `scan()` leaves it pointer-free; the
-/// region pointer is populated only on the first `scan_next`, so a consumed
-/// table can be moved before iteration begins.
+/// Track a pointerless scan across elastic levels.
 #[derive(Clone)]
 pub struct ElasticScan {
     level_idx: usize,
@@ -913,9 +1000,10 @@ where
         let key_hash = self.hash_key(&key);
         let key_fingerprint = control::control_fingerprint(key_hash);
 
-        self.advance_batch_window();
+        self.scheduler.advance_batch_window();
+        let target = self.scheduler.target();
         let (level_idx, slot_idx) = self
-            .choose_slot_for_new_key(key_hash)
+            .choose_slot_for_new_key(key_hash, target)
             .expect("no free slot found in freshly-allocated map");
 
         let level = &mut self.levels[level_idx];
@@ -926,18 +1014,13 @@ where
             self.max_populated_level = level_idx;
         }
         self.len += 1;
-        if self.batch_remaining > 0 {
-            self.batch_remaining -= 1;
-        }
+        self.scheduler.complete_insert();
     }
 
     /// Drain all live entries into a temp Vec, rebuild levels at
     /// `new_capacity` in-place, reinsert. Passing the current capacity
     /// performs a no-grow rehash that flushes accumulated tombstones.
     fn resize(&mut self, new_capacity: usize) {
-        // Rebuild resets every level's `max_probe_groups`, satisfying any defrag.
-        self.defrag_pending = false;
-        self.inserts_since_repack = 0;
         let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction);
 
         let (new_arena, new_levels) = alloc_elastic_arena(
@@ -951,9 +1034,11 @@ where
         let old_levels = mem::replace(&mut self.levels, new_levels);
         self.total_slots = geometry.total_slots;
         self.max_insertions = geometry.max_insertions;
-        self.batch_plan = geometry.batch_plan;
-        self.current_batch_index = 0;
-        self.batch_remaining = geometry.initial_batch_remaining;
+        self.scheduler = BatchScheduler::new(
+            geometry.batch_plan,
+            geometry.total_slots,
+            geometry.max_insertions,
+        );
         self.max_populated_level = 0;
         self.len = 0;
 
@@ -1026,12 +1111,12 @@ where
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            batch_plan: geometry.batch_plan,
-            current_batch_index: 0,
-            batch_remaining: geometry.initial_batch_remaining,
+            scheduler: BatchScheduler::new(
+                geometry.batch_plan,
+                geometry.total_slots,
+                geometry.max_insertions,
+            ),
             max_populated_level: 0,
-            defrag_pending: false,
-            inserts_since_repack: 0,
             hash_builder,
             alloc,
             arena,
@@ -1046,25 +1131,19 @@ where
         self.hash_builder.hash_one(key)
     }
 
-    /// Advance the batch state machine past any zero-quota batches so the
-    /// next insert routes to the correct level pair.
-    #[inline]
-    fn advance_batch_window(&mut self) {
-        while self.batch_remaining == 0 && self.current_batch_index + 1 < self.batch_plan.len() {
-            self.current_batch_index += 1;
-            self.batch_remaining = self.batch_plan[self.current_batch_index];
-        }
-    }
-
     /// Paper §4 places each insert in `A_i` or `A_{i+1}` per the current batch `B_i`;
     /// The full-sweep fallback covers the tombstone-reuse case the paper's analysis doesn't model.
     #[inline]
-    fn choose_slot_for_new_key(&mut self, key_hash: u64) -> Option<(usize, usize)> {
+    fn choose_slot_for_new_key(
+        &mut self,
+        key_hash: u64,
+        target: BatchTarget,
+    ) -> Option<(usize, usize)> {
         if self.levels.is_empty() {
             return None;
         }
 
-        if let Some(pair) = self.choose_slot_targeted(key_hash) {
+        if let Some(pair) = self.choose_slot_targeted(key_hash, target) {
             return Some(pair);
         }
 
@@ -1085,14 +1164,15 @@ where
     /// Paper proves success w.h.p. but not w.p. 1,
     /// so we avoid a hard insert failure on the rare bad event.
     #[inline]
-    fn choose_slot_targeted(&self, key_hash: u64) -> Option<(usize, usize)> {
-        if self.current_batch_index == 0 {
-            return self
-                .first_free_uniform(key_hash, 0)
-                .map(|slot_idx| (0, slot_idx));
-        }
-
-        let level_idx = self.current_batch_index.saturating_sub(1);
+    fn choose_slot_targeted(&self, key_hash: u64, target: BatchTarget) -> Option<(usize, usize)> {
+        let level_idx = match target {
+            BatchTarget::Bootstrap => {
+                return self
+                    .first_free_uniform(key_hash, 0)
+                    .map(|slot_idx| (0, slot_idx));
+            }
+            BatchTarget::LevelPair(level_idx) => level_idx,
+        };
         if level_idx + 1 >= self.levels.len() {
             let last = self.levels.len() - 1;
             return self
@@ -1389,15 +1469,77 @@ mod tests {
                 geometry.level_capacities.iter().sum::<usize>() >= geometry.total_slots,
                 "rounded level capacities must cover total slots"
             );
-            assert_eq!(
-                geometry.initial_batch_remaining,
-                geometry.batch_plan.first().copied().unwrap_or(0)
-            );
             assert!(
                 geometry.batch_plan.iter().sum::<usize>() >= geometry.max_insertions,
                 "batch plan must cover the insertion budget"
             );
         }
+    }
+
+    #[test]
+    fn normal_inserts_advance_batch_scheduler() {
+        let mut map: ElasticHashMap<usize, usize> = ElasticHashMap::with_capacity(1024);
+        let initial_quota = map.table().scheduler.batch_remaining;
+        assert!(
+            initial_quota > 0,
+            "test requires a non-empty bootstrap batch"
+        );
+
+        for key in 0..=initial_quota {
+            map.insert(key, key);
+        }
+
+        assert!(map.table().scheduler.current_batch_index > 0);
+        assert_eq!(map.table().scheduler.target(), BatchTarget::LevelPair(0));
+    }
+
+    #[test]
+    fn rebuild_inserts_advance_batch_scheduler() {
+        let mut table: ElasticTable<usize, usize> =
+            ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
+                1024,
+                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DefaultHashBuilder::default(),
+                Global,
+            );
+        let initial_quota = table.scheduler.batch_remaining;
+        assert!(
+            initial_quota > 0,
+            "test requires a non-empty bootstrap batch"
+        );
+
+        for key in 0..=initial_quota {
+            table.insert_unique(key, key);
+        }
+
+        assert!(table.scheduler.current_batch_index > 0);
+        assert_eq!(table.scheduler.target(), BatchTarget::LevelPair(0));
+    }
+
+    #[test]
+    fn insert_after_rebuild_advances_exhausted_batch() {
+        let mut table: ElasticTable<usize, usize> =
+            ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
+                1024,
+                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DefaultHashBuilder::default(),
+                Global,
+            );
+        let rebuild_slots = table.total_slots * 2;
+        let rebuild_geometry = ElasticGeometry::for_slots(rebuild_slots, table.reserve_fraction);
+        let bootstrap_quota = rebuild_geometry.batch_plan[0];
+
+        for key in 0..bootstrap_quota {
+            table.insert_unique(key, key);
+        }
+        table.scheduler.max_insertions = table.len;
+
+        let key = bootstrap_quota;
+        let hash = table.hash_key(&key);
+        table.insert_for_vacant_entry(key, key, hash);
+
+        assert!(table.scheduler.current_batch_index > 0);
+        assert_eq!(table.scheduler.target(), BatchTarget::LevelPair(0));
     }
 
     #[test]

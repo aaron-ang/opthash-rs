@@ -14,7 +14,7 @@ use crate::common::error::TryReserveError;
 use crate::common::iter::RegionCursor;
 use crate::common::math::{self, align, capacity, cast, probe};
 use crate::common::simd;
-use crate::map::{self, RawTable};
+use crate::map;
 use crate::set;
 
 /// Upper bound on `reserve_fraction`;
@@ -443,8 +443,421 @@ impl<T> SpecialArray<T> {
     }
 }
 
-/// Where in the funnel structure a key/slot lives. Returned by lookups,
-/// consumed by inserts / removes to avoid recomputing the location.
+/// Handle primary and fallback overflow regions.
+struct OverflowHandler<K, V> {
+    special: SpecialArray<SlotEntry<K, V>>,
+    primary_probe_limit: usize,
+}
+
+impl<K, V> OverflowHandler<K, V> {
+    fn new(special: SpecialArray<SlotEntry<K, V>>, primary_probe_limit: usize) -> Self {
+        Self {
+            special,
+            primary_probe_limit,
+        }
+    }
+
+    // ---- Lookup / probe ----
+
+    /// Probe primary then fallback, optionally recording a free slot.
+    #[cold]
+    #[inline(never)]
+    fn find_in_special<Q>(
+        &self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+        mut free_slot: FreeSlot,
+    ) -> Option<SlotLocation>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        match self.find_in_special_primary(key_hash, key_fingerprint, key, free_slot.as_deref_mut())
+        {
+            LookupStep::Found(slot_idx) => {
+                return Some(SlotLocation::SpecialPrimary { slot_idx });
+            }
+            LookupStep::StopSearch => return None,
+            LookupStep::Continue => {}
+        }
+        self.find_in_special_fallback(key_hash, key_fingerprint, key, free_slot)
+            .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
+    }
+
+    /// Probe at most `primary_probe_limit` primary groups. Return `StopSearch`
+    /// when an empty group proves fallback cannot contain the key. Pass
+    /// `Some(out)` to record the first free `SlotLocation`; use `None` for
+    /// lookup-only probes.
+    #[inline]
+    fn find_in_special_primary<Q>(
+        &self,
+        key_hash: u64,
+        key_fingerprint: u8,
+        key: &Q,
+        free_slot: FreeSlot,
+    ) -> LookupStep
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let wants_free = matches!(&free_slot, Some(out) if out.is_none());
+        let primary = &self.special.primary;
+
+        if primary.capacity() == 0 || primary.len == 0 {
+            if wants_free && let Some(out) = free_slot {
+                *out = self
+                    .first_free_in_special_primary(key_hash)
+                    .map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx });
+            }
+            return LookupStep::Continue;
+        }
+
+        let group_count = primary.group_count();
+        let group_limit = self.primary_probe_limit.min(group_count.max(1));
+        let mask = primary.group_count_mask as usize;
+        let mut local: Option<usize> = None;
+        let mut probe = ProbeSeq::new(primary.group_start(key_hash), primary.group_step(key_hash));
+
+        let outcome: LookupStep = 'probe: {
+            for _ in 0..group_limit {
+                let has_free = if wants_free && local.is_none() {
+                    let slot = primary.first_free_in_group(probe.group);
+                    if let Some(s) = slot {
+                        local = Some(s);
+                    }
+                    slot.is_some()
+                } else {
+                    primary.group_match_mask(probe.group, CTRL_EMPTY).any()
+                };
+                for relative_idx in primary.group_match_mask(probe.group, key_fingerprint) {
+                    let slot_idx = probe.group * GROUP_SIZE + relative_idx;
+                    let entry = unsafe { primary.get_ref(slot_idx) };
+                    if key.equivalent(&entry.key) {
+                        break 'probe LookupStep::Found(slot_idx);
+                    }
+                }
+                if has_free && !primary.group_match_mask(probe.group, CTRL_TOMBSTONE).any() {
+                    break 'probe LookupStep::StopSearch;
+                }
+                probe.advance(mask);
+            }
+            LookupStep::Continue
+        };
+
+        if wants_free && let Some(out) = free_slot {
+            *out = local.map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx });
+        }
+        outcome
+    }
+
+    #[inline]
+    fn find_in_special_fallback<Q>(
+        &self,
+        key_hash: u64,
+        key_fingerprint: u8,
+        key: &Q,
+        free_slot: FreeSlot,
+    ) -> Option<usize>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let wants_free = matches!(&free_slot, Some(out) if out.is_none());
+        let fallback = &self.special.fallback;
+
+        if fallback.capacity() == 0 || fallback.len == 0 {
+            if wants_free && let Some(out) = free_slot {
+                *out = self
+                    .first_free_in_special_fallback(key_hash)
+                    .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx });
+            }
+            return None;
+        }
+
+        let bucket_a = fallback.bucket_a(key_hash);
+        let bucket_b = fallback.bucket_b(key_hash);
+
+        let mut local: Option<usize> = None;
+        let mut found: Option<usize> = None;
+        for bucket_idx in [bucket_a, bucket_b] {
+            let need_match = found.is_none();
+            let need_candidate = wants_free && local.is_none();
+            if !need_match && !need_candidate {
+                break;
+            }
+            let range = fallback.bucket_range(bucket_idx);
+            if need_candidate {
+                for slot_idx in range.clone() {
+                    if fallback.control_at(slot_idx).is_free() {
+                        local = Some(slot_idx);
+                        break;
+                    }
+                }
+            }
+            if need_match {
+                let controls = unsafe {
+                    slice::from_raw_parts(fallback.ctrl_ptr().add(range.start), range.len())
+                };
+                let mut match_offset = 0;
+                while let Some(relative_idx) = control::find_next_fingerprint_in_controls(
+                    controls,
+                    key_fingerprint,
+                    match_offset,
+                ) {
+                    let slot_idx = range.start + relative_idx;
+                    let entry = unsafe { fallback.get_ref(slot_idx) };
+                    if key.equivalent(&entry.key) {
+                        found = Some(slot_idx);
+                        break;
+                    }
+                    match_offset = relative_idx + 1;
+                }
+            }
+        }
+
+        if wants_free && let Some(out) = free_slot {
+            *out = local.map(|slot_idx| SlotLocation::SpecialFallback { slot_idx });
+        }
+        found
+    }
+
+    // ---- Free-slot search ----
+
+    fn first_free_in_special_primary(&self, key_hash: u64) -> Option<usize> {
+        let primary = &self.special.primary;
+        if primary.len as usize >= primary.capacity() {
+            return None;
+        }
+
+        let group_count = primary.group_count();
+        let group_limit = self.primary_probe_limit.min(group_count.max(1));
+        let mask = primary.group_count_mask as usize;
+        let mut probe = ProbeSeq::new(primary.group_start(key_hash), primary.group_step(key_hash));
+        for _ in 0..group_limit {
+            if let Some(slot_idx) = primary.first_free_in_group(probe.group) {
+                return Some(slot_idx);
+            }
+            probe.advance(mask);
+        }
+        None
+    }
+
+    fn first_free_in_special_fallback(&self, key_hash: u64) -> Option<usize> {
+        let fallback = &self.special.fallback;
+        if fallback.len as usize >= fallback.capacity() {
+            return None;
+        }
+
+        let bucket_a = fallback.bucket_a(key_hash);
+        let bucket_b = fallback.bucket_b(key_hash);
+        let (free_a, occupied_a) = fallback.bucket_info(bucket_a);
+        if bucket_a == bucket_b {
+            return free_a;
+        }
+
+        let (free_b, occupied_b) = fallback.bucket_info(bucket_b);
+
+        match (free_a, free_b) {
+            (Some(slot_a), Some(slot_b)) => {
+                if occupied_a <= occupied_b {
+                    Some(slot_a)
+                } else {
+                    Some(slot_b)
+                }
+            }
+            (free_a, free_b) => free_a.or(free_b),
+        }
+    }
+
+    // ---- Insertion ----
+
+    fn place_new_special_primary_entry(
+        &mut self,
+        slot_idx: usize,
+        key: K,
+        value: V,
+        key_fingerprint: u8,
+    ) {
+        let primary = &mut self.special.primary;
+        let was_tombstone = primary.control_at(slot_idx) == CTRL_TOMBSTONE;
+        primary.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        primary.len += 1;
+        if was_tombstone {
+            primary.tombstones -= 1;
+        }
+        self.special.total_len += 1;
+    }
+
+    fn place_new_special_fallback_entry(
+        &mut self,
+        slot_idx: usize,
+        key: K,
+        value: V,
+        key_fingerprint: u8,
+    ) {
+        let fallback = &mut self.special.fallback;
+        let was_tombstone = fallback.control_at(slot_idx) == CTRL_TOMBSTONE;
+        fallback.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        fallback.len += 1;
+        if was_tombstone {
+            fallback.tombstones -= 1;
+        }
+        self.special.total_len += 1;
+    }
+
+    #[inline]
+    fn replace_special_primary_value(&mut self, slot_idx: usize, value: V) -> V {
+        let entry = unsafe { self.special.primary.get_mut(slot_idx) };
+        mem::replace(&mut entry.value, value)
+    }
+
+    #[inline]
+    fn replace_special_fallback_value(&mut self, slot_idx: usize, value: V) -> V {
+        let entry = unsafe { self.special.fallback.get_mut(slot_idx) };
+        mem::replace(&mut entry.value, value)
+    }
+
+    // ---- Erase / cleanup ----
+
+    #[inline]
+    fn erase_special_primary(&mut self, slot_idx: usize) -> bool {
+        self.special.primary.erase(slot_idx)
+    }
+
+    #[inline]
+    fn erase_special_fallback(&mut self, slot_idx: usize) -> bool {
+        self.special.fallback.erase(slot_idx)
+    }
+
+    fn account_erased(&mut self, location: SlotLocation, wrote_tombstone: bool) {
+        match location {
+            SlotLocation::SpecialPrimary { .. } => {
+                self.special.primary.tombstones += u32::from(wrote_tombstone);
+                self.special.primary.len -= 1;
+            }
+            SlotLocation::SpecialFallback { .. } => {
+                self.special.fallback.tombstones += u32::from(wrote_tombstone);
+                self.special.fallback.len -= 1;
+            }
+            SlotLocation::Level { .. } => unreachable!("level location passed to overflow"),
+        }
+        self.special.total_len -= 1;
+    }
+
+    fn special_primary_needs_cleanup(&self) -> bool {
+        let primary = &self.special.primary;
+        primary.tombstones as usize > capacity::tombstone_cleanup_threshold(primary.capacity())
+    }
+
+    fn special_fallback_needs_cleanup(&self) -> bool {
+        let fallback = &self.special.fallback;
+        fallback.tombstones as usize > capacity::tombstone_cleanup_threshold(fallback.capacity())
+    }
+
+    fn region_needs_cleanup(&self, location: SlotLocation) -> bool {
+        match location {
+            SlotLocation::SpecialPrimary { .. } => self.special_primary_needs_cleanup(),
+            SlotLocation::SpecialFallback { .. } => self.special_fallback_needs_cleanup(),
+            SlotLocation::Level { .. } => unreachable!("level location passed to overflow"),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.special.total_len
+    }
+
+    #[inline]
+    fn primary(&self) -> &SpecialPrimary<SlotEntry<K, V>> {
+        &self.special.primary
+    }
+
+    #[inline]
+    fn fallback(&self) -> &SpecialFallback<SlotEntry<K, V>> {
+        &self.special.fallback
+    }
+
+    // ---- Bulk operations ----
+
+    fn drain_special_into<F: FnMut((K, V))>(&mut self, mut f: F) {
+        self.special.drain_occupied_with(|entry| {
+            f((entry.key, entry.value));
+        });
+    }
+
+    fn wipe_special(&mut self) {
+        self.special.primary.clear_all_controls();
+        self.special.primary.len = 0;
+        self.special.primary.tombstones = 0;
+        self.special.fallback.clear_all_controls();
+        self.special.fallback.len = 0;
+        self.special.fallback.tombstones = 0;
+        self.special.total_len = 0;
+    }
+
+    fn clear_special(&mut self) {
+        self.special.primary.drop_values_and_clear();
+        self.special.primary.len = 0;
+        self.special.primary.tombstones = 0;
+        self.special.fallback.drop_values_and_clear();
+        self.special.fallback.len = 0;
+        self.special.fallback.tombstones = 0;
+        self.special.total_len = 0;
+    }
+
+    fn drop_values(&mut self) {
+        self.special.primary.drop_values();
+        self.special.fallback.drop_values();
+    }
+
+    /// Take a primary entry without updating counters.
+    /// # Safety
+    /// `slot_idx` must reference a live, initialized occupied slot.
+    #[inline]
+    unsafe fn take_special_primary_entry(&mut self, slot_idx: usize) -> SlotEntry<K, V> {
+        unsafe { self.special.primary.take(slot_idx) }
+    }
+
+    /// Take a fallback entry without updating counters.
+    /// # Safety
+    /// `slot_idx` must reference a live, initialized occupied slot.
+    #[inline]
+    unsafe fn take_special_fallback_entry(&mut self, slot_idx: usize) -> SlotEntry<K, V> {
+        unsafe { self.special.fallback.take(slot_idx) }
+    }
+
+    /// Borrow an occupied primary slot.
+    /// # Safety
+    /// `slot_idx` must reference an occupied slot.
+    #[inline]
+    unsafe fn special_primary_ref(&self, slot_idx: usize) -> &SlotEntry<K, V> {
+        unsafe { self.special.primary.get_ref(slot_idx) }
+    }
+
+    /// Borrow an occupied fallback slot.
+    /// # Safety
+    /// `slot_idx` must reference an occupied slot.
+    #[inline]
+    unsafe fn special_fallback_ref(&self, slot_idx: usize) -> &SlotEntry<K, V> {
+        unsafe { self.special.fallback.get_ref(slot_idx) }
+    }
+
+    /// Return a mutable pointer to a live primary slot.
+    /// # Safety
+    /// `slot_idx` must reference a live slot.
+    #[inline]
+    unsafe fn special_primary_ptr(&self, slot_idx: usize) -> *mut SlotEntry<K, V> {
+        self.special.primary.slot_ptr(slot_idx)
+    }
+
+    /// Return a mutable pointer to a live fallback slot.
+    /// # Safety
+    /// `slot_idx` must reference a live slot.
+    #[inline]
+    unsafe fn special_fallback_ptr(&self, slot_idx: usize) -> *mut SlotEntry<K, V> {
+        self.special.fallback.slot_ptr(slot_idx)
+    }
+}
+
+/// Identify a slot without re-probing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotLocation {
     Level { level_idx: usize, slot_idx: usize },
@@ -452,12 +865,10 @@ pub enum SlotLocation {
     SpecialFallback { slot_idx: usize },
 }
 
-/// Out-parameter for free-slot tracking during probes.
-/// `None` = lookup-only; `Some(out)` = also record the first free
-/// `SlotLocation` seen. Written once; ignored if `*out` is already `Some`.
+/// Record the first free slot, or omit tracking for lookup-only probes.
 type FreeSlot<'a> = Option<&'a mut Option<SlotLocation>>;
 
-/// Outcome of probing one bucket / group during lookup.
+/// Direct lookup after probing one region.
 /// - `Found(slot_idx)`: key matched at slot.
 /// - `Continue`: bucket has tombstones; keep probing for the key elsewhere.
 /// - `StopSearch`: bucket has free space and no tombstones — key cannot
@@ -468,22 +879,58 @@ enum LookupStep {
     StopSearch,
 }
 
-/// Why a single-pass level probe missed, deciding whether overflow to the
-/// special array is possible.
+/// Decide whether a level miss can continue into overflow.
 enum LevelMiss {
-    /// An EMPTY byte ended the chain; no overflow to special possible.
+    /// Stop because an empty byte proves overflow cannot contain the key.
     ChainClean,
-    /// Levels exhausted without a clean stop; key may be in the special array.
+    /// Continue because exhausted levels do not rule out overflow.
     MayContinue,
 }
 
-/// Open-addressed funnel-hashing backend for the generic [`map::HashMap`]
-/// shell. See [`FunnelHashMap`] for the public map type.
+/// Stage entries between Funnel rebuild attempts.
+struct ResizeScheduler<K, V> {
+    target: usize,
+    pending: Vec<(K, V)>,
+    overflow: Vec<(K, V)>,
+}
+
+impl<K, V> ResizeScheduler<K, V> {
+    fn new(target: usize, pending: Vec<(K, V)>) -> Self {
+        Self {
+            target,
+            pending,
+            overflow: Vec::new(),
+        }
+    }
+
+    fn try_empty(target: usize, entry_capacity: usize) -> Result<Self, TryReserveError> {
+        let mut pending = Vec::new();
+        pending
+            .try_reserve(entry_capacity)
+            .map_err(|_| TryReserveError::AllocError)?;
+        Ok(Self::new(target, pending))
+    }
+
+    #[inline]
+    fn target(&self) -> usize {
+        self.target
+    }
+
+    fn advance_target(&mut self) -> Result<usize, TryReserveError> {
+        self.target = self
+            .target
+            .checked_mul(2)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        Ok(self.target)
+    }
+}
+
+/// Implement funnel hashing for [`map::HashMap`].
 ///
 /// Capacity is split between a stack of bucket-grouped `levels` (each level
-/// half the size of the previous) and a `special` array catching overflow.
+/// half the size of the previous) and an `overflow` handler catching overflow.
 /// Inserts try level 0 first, then descend to deeper levels, then to
-/// `special.primary`, then `special.fallback`. Lookups follow the same
+/// `overflow` (special primary → special fallback). Lookups follow the same
 /// order. The funnel structure trades a small probe budget per level for
 /// hard worst-case guarantees on lookup cost.
 ///
@@ -491,26 +938,66 @@ enum LevelMiss {
 /// `Ω(log² δ⁻¹)` worst-case probes (`δ` = empty fraction). Funnel matches
 /// this asymptotically — no constant-factor rewrite can do better.
 pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    /// Level descriptors (bucket-grouped).
     levels: BucketLevelSlice<K, V>,
-    /// Special array descriptor.
-    special: SpecialArray<SlotEntry<K, V>>,
-    /// Total live entries.
+    overflow: OverflowHandler<K, V>,
     len: usize,
-    /// Total slot count across all levels + special arrays.
     total_slots: usize,
-    /// Insert count that triggers resize.
     max_insertions: usize,
-    /// Slot reserve fraction.
     reserve_fraction: f64,
-    /// Cap on groups probed in the special primary before fallback.
-    primary_probe_limit: usize,
-    /// Highest level index ever written.
+    /// Bound lookups by the deepest populated level.
     max_populated_level: usize,
     hash_builder: S,
     alloc: A,
-    /// Single allocation: [`ctrl_L0|ctrl_L1|...|ctrl_SP|ctrl_SF`][pad][`slots_L0|...|slots_SP|slots_SF`].
+    /// [`ctrl_L0|...|ctrl_SP|ctrl_SF`][pad][`slots_L0|...|slots_SP|slots_SF`].
     arena: Arena,
+}
+
+impl<K, V> ResizeScheduler<K, V>
+where
+    K: Eq + Hash,
+{
+    fn collect_from<S, A>(target: usize, table: &mut FunnelTable<K, V, S, A>) -> Self
+    where
+        S: BuildHasher,
+        A: Allocator + Clone,
+    {
+        let mut scheduler = Self::new(target, Vec::with_capacity(table.len));
+        table.drain_entries_into(&mut scheduler.pending);
+        scheduler
+    }
+
+    fn try_collect_from<S, A>(
+        target: usize,
+        table: &mut FunnelTable<K, V, S, A>,
+    ) -> Result<Self, TryReserveError>
+    where
+        S: BuildHasher,
+        A: Allocator + Clone,
+    {
+        let mut scheduler = Self::try_empty(target, table.len)?;
+        table.drain_entries_into(&mut scheduler.pending);
+        Ok(scheduler)
+    }
+
+    /// Reinsert staged entries, recovering all entries after a failed attempt.
+    fn reinsert_into<S, A>(&mut self, table: &mut FunnelTable<K, V, S, A>) -> bool
+    where
+        S: BuildHasher,
+        A: Allocator + Clone,
+    {
+        self.overflow.clear();
+        for (key, value) in self.pending.drain(..) {
+            if let Err(pair) = table.try_insert_new_entry_unchecked(key, value) {
+                self.overflow.push(pair);
+            }
+        }
+        if self.overflow.is_empty() {
+            return true;
+        }
+        table.drain_entries_into(&mut self.overflow);
+        mem::swap(&mut self.pending, &mut self.overflow);
+        false
+    }
 }
 
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
@@ -529,8 +1016,7 @@ impl<K, V, S, A: Allocator + Clone> Drop for FunnelTable<K, V, S, A> {
         for level in &mut self.levels {
             level.drop_values();
         }
-        self.special.primary.drop_values();
-        self.special.fallback.drop_values();
+        self.overflow.drop_values();
         drop(guard);
     }
 }
@@ -883,14 +1369,15 @@ where
         )
         .alloc(&alloc);
 
+        let overflow = OverflowHandler::new(special, primary_probe_limit);
+
         Self {
             levels,
-            special,
+            overflow,
             len: 0,
             total_slots,
             max_insertions,
             reserve_fraction,
-            primary_probe_limit,
             max_populated_level: 0,
             hash_builder,
             alloc,
@@ -986,8 +1473,12 @@ where
                 let level = unsafe { &*levels_ptr.add(level_idx) };
                 level.slot_ptr(slot_idx)
             }
-            SlotLocation::SpecialPrimary { slot_idx } => self.special.primary.slot_ptr(slot_idx),
-            SlotLocation::SpecialFallback { slot_idx } => self.special.fallback.slot_ptr(slot_idx),
+            SlotLocation::SpecialPrimary { slot_idx } => unsafe {
+                self.overflow.special_primary_ptr(slot_idx)
+            },
+            SlotLocation::SpecialFallback { slot_idx } => unsafe {
+                self.overflow.special_fallback_ptr(slot_idx)
+            },
         }
     }
 
@@ -1003,10 +1494,10 @@ where
                 slot_idx,
             } => unsafe { self.levels[level_idx].take(slot_idx) },
             SlotLocation::SpecialPrimary { slot_idx } => unsafe {
-                self.special.primary.take(slot_idx)
+                self.overflow.take_special_primary_entry(slot_idx)
             },
             SlotLocation::SpecialFallback { slot_idx } => unsafe {
-                self.special.fallback.take(slot_idx)
+                self.overflow.take_special_fallback_entry(slot_idx)
             },
         }
     }
@@ -1018,8 +1509,12 @@ where
                 level_idx,
                 slot_idx,
             } => self.levels[level_idx].erase(slot_idx),
-            SlotLocation::SpecialPrimary { slot_idx } => self.special.primary.erase(slot_idx),
-            SlotLocation::SpecialFallback { slot_idx } => self.special.fallback.erase(slot_idx),
+            SlotLocation::SpecialPrimary { slot_idx } => {
+                self.overflow.erase_special_primary(slot_idx)
+            }
+            SlotLocation::SpecialFallback { slot_idx } => {
+                self.overflow.erase_special_fallback(slot_idx)
+            }
         }
     }
 
@@ -1033,21 +1528,8 @@ where
                 }
                 level.len -= 1;
             }
-            SlotLocation::SpecialPrimary { .. } => {
-                let primary = &mut self.special.primary;
-                if wrote_tombstone {
-                    primary.tombstones += 1;
-                }
-                primary.len -= 1;
-                self.special.total_len -= 1;
-            }
-            SlotLocation::SpecialFallback { .. } => {
-                let fallback = &mut self.special.fallback;
-                if wrote_tombstone {
-                    fallback.tombstones += 1;
-                }
-                fallback.len -= 1;
-                self.special.total_len -= 1;
+            SlotLocation::SpecialPrimary { .. } | SlotLocation::SpecialFallback { .. } => {
+                self.overflow.account_erased(location, wrote_tombstone);
             }
         }
         self.len -= 1;
@@ -1060,7 +1542,7 @@ where
     }
 
     /// Take + erase + decrement counters for the slot at `loc`. Shared by
-    /// [`RawTable::remove`] and [`RawTable::extract_finish`]; the former adds a
+    /// [`map::TableInsert::remove`] and [`map::TableInsert::extract_finish`]; the former adds a
     /// resize pass, the latter consolidates tombstones lazily.
     fn take_and_tombstone(&mut self, location: SlotLocation) -> (K, V) {
         // SAFETY: caller passes a live location found in this table.
@@ -1070,20 +1552,15 @@ where
     }
 
     /// `true` if the region holding `loc` has accumulated enough tombstones
-    /// that [`RawTable::remove`] should rehash in place.
+    /// that [`map::TableInsert::remove`] should rehash in place.
     fn region_needs_cleanup(&self, location: SlotLocation) -> bool {
         let (tombstones, cap) = match location {
             SlotLocation::Level { level_idx, .. } => {
                 let level = &self.levels[level_idx];
                 (level.tombstones, level.capacity())
             }
-            SlotLocation::SpecialPrimary { .. } => {
-                let primary = &self.special.primary;
-                (primary.tombstones, primary.capacity())
-            }
-            SlotLocation::SpecialFallback { .. } => {
-                let fallback = &self.special.fallback;
-                (fallback.tombstones, fallback.capacity())
+            SlotLocation::SpecialPrimary { .. } | SlotLocation::SpecialFallback { .. } => {
+                return self.overflow.region_needs_cleanup(location);
             }
         };
         tombstones as usize > capacity::tombstone_cleanup_threshold(cap)
@@ -1097,13 +1574,7 @@ where
             level.len = 0;
             level.tombstones = 0;
         }
-        self.special.primary.clear_all_controls();
-        self.special.primary.len = 0;
-        self.special.primary.tombstones = 0;
-        self.special.fallback.clear_all_controls();
-        self.special.fallback.len = 0;
-        self.special.fallback.tombstones = 0;
-        self.special.total_len = 0;
+        self.overflow.wipe_special();
         self.len = 0;
         self.max_populated_level = 0;
     }
@@ -1115,13 +1586,7 @@ where
             level.len = 0;
             level.tombstones = 0;
         }
-        self.special.primary.drop_values_and_clear();
-        self.special.primary.len = 0;
-        self.special.primary.tombstones = 0;
-        self.special.fallback.drop_values_and_clear();
-        self.special.fallback.len = 0;
-        self.special.fallback.tombstones = 0;
-        self.special.total_len = 0;
+        self.overflow.clear_special();
         self.len = 0;
         self.max_populated_level = 0;
     }
@@ -1132,37 +1597,19 @@ where
     where
         S: Clone,
     {
-        let mut target = new_capacity;
         let mut new_map = Self::try_with_slots_and_reserve_fraction_and_hasher_in(
-            target,
+            new_capacity,
             self.reserve_fraction,
             self.hash_builder.clone(),
             self.alloc.clone(),
         )?;
-
-        let mut entries: Vec<(K, V)> = Vec::new();
-        entries
-            .try_reserve(self.len)
-            .map_err(|_| TryReserveError::AllocError)?;
-        self.drain_entries_into(&mut entries);
-
-        let mut overflow: Vec<(K, V)> = Vec::new();
+        let mut scheduler = ResizeScheduler::try_collect_from(new_capacity, self)?;
         loop {
-            overflow.clear();
-            for (k, v) in entries.drain(..) {
-                if let Err(pair) = new_map.try_insert_new_entry_unchecked(k, v) {
-                    overflow.push(pair);
-                }
-            }
-            if overflow.is_empty() {
+            if scheduler.reinsert_into(&mut new_map) {
                 *self = new_map;
                 return Ok(());
             }
-            new_map.drain_entries_into(&mut overflow);
-            mem::swap(&mut entries, &mut overflow);
-            target = target
-                .checked_mul(2)
-                .ok_or(TryReserveError::CapacityOverflow)?;
+            let target = scheduler.advance_target()?;
             new_map = Self::try_with_slots_and_reserve_fraction_and_hasher_in(
                 target,
                 self.reserve_fraction,
@@ -1213,14 +1660,15 @@ where
         )
         .try_alloc(&alloc)?;
 
+        let overflow = OverflowHandler::new(special, primary_probe_limit);
+
         Ok(Self {
             levels,
-            special,
+            overflow,
             len: 0,
             total_slots,
             max_insertions,
             reserve_fraction,
-            primary_probe_limit,
             max_populated_level: 0,
             hash_builder,
             alloc,
@@ -1231,25 +1679,15 @@ where
     /// Rebuild in-place at `new_capacity`. Doubles `new_capacity` on
     /// insert overflow (funnel's structural failure mode under adversarial
     /// hashing) until every entry places.
-    fn resize(&mut self, mut new_capacity: usize) {
-        let mut entries: Vec<(K, V)> = Vec::with_capacity(self.len);
-        self.drain_entries_into(&mut entries);
-        let mut overflow: Vec<(K, V)> = Vec::new();
+    fn resize(&mut self, new_capacity: usize) {
+        let mut scheduler = ResizeScheduler::collect_from(new_capacity, self);
         loop {
-            self.install_fresh_storage(new_capacity);
-            overflow.clear();
-            for (k, v) in entries.drain(..) {
-                if let Err(pair) = self.try_insert_new_entry_unchecked(k, v) {
-                    overflow.push(pair);
-                }
-            }
-            if overflow.is_empty() {
+            self.install_fresh_storage(scheduler.target());
+            if scheduler.reinsert_into(self) {
                 return;
             }
-            self.drain_entries_into(&mut overflow);
-            mem::swap(&mut entries, &mut overflow);
-            new_capacity = new_capacity
-                .checked_mul(2)
+            scheduler
+                .advance_target()
                 .expect("capacity overflow during funnel resize retry");
         }
     }
@@ -1263,18 +1701,14 @@ where
                 out.push((entry.key, entry.value));
             });
         }
-        self.special.drain_occupied_with(|entry| {
-            out.push((entry.key, entry.value));
+        self.overflow.drain_special_into(|entry| {
+            out.push(entry);
         });
         for level in &mut self.levels {
             level.len = 0;
             level.tombstones = 0;
         }
-        self.special.primary.len = 0;
-        self.special.primary.tombstones = 0;
-        self.special.fallback.len = 0;
-        self.special.fallback.tombstones = 0;
-        self.special.total_len = 0;
+        self.overflow.wipe_special();
         self.len = 0;
         self.max_populated_level = 0;
     }
@@ -1310,13 +1744,14 @@ where
         )
         .alloc(alloc);
 
+        let new_overflow = OverflowHandler::new(new_special, new_primary_probe_limit);
+
         // Drop old levels first (they read from old arena), then replace arena.
         let old_arena = mem::replace(&mut self.arena, new_arena);
         self.levels = new_levels;
-        self.special = new_special;
+        self.overflow = new_overflow;
         self.total_slots = new_capacity;
         self.max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
-        self.primary_probe_limit = new_primary_probe_limit;
         self.max_populated_level = 0;
 
         // Free old arena (drain_entries_into already moved all values out).
@@ -1345,16 +1780,16 @@ where
             }
         }
 
-        if let Some(slot_idx) = self.first_free_in_special_primary(key_hash) {
+        if let Some(slot_idx) = self.overflow.first_free_in_special_primary(key_hash) {
             return Some(SlotLocation::SpecialPrimary { slot_idx });
         }
 
-        self.first_free_in_special_fallback(key_hash)
+        self.overflow
+            .first_free_in_special_fallback(key_hash)
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
-    /// Probe primary then fallback for `key`. Pass `Some(candidate)` to also
-    /// record the first free slot seen (for insert); `None` for lookup-only.
+    /// Delegate to [`OverflowHandler::find_in_special`].
     #[cold]
     #[inline(never)]
     fn find_in_special<Q>(
@@ -1362,21 +1797,13 @@ where
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
-        mut free_slot: FreeSlot,
+        free_slot: FreeSlot,
     ) -> Option<SlotLocation>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        match self.find_in_special_primary(key_hash, key_fingerprint, key, free_slot.as_deref_mut())
-        {
-            LookupStep::Found(slot_idx) => {
-                return Some(SlotLocation::SpecialPrimary { slot_idx });
-            }
-            LookupStep::StopSearch => return None,
-            LookupStep::Continue => {}
-        }
-        self.find_in_special_fallback(key_hash, key_fingerprint, key, free_slot)
-            .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
+        self.overflow
+            .find_in_special(key, key_hash, key_fingerprint, free_slot)
     }
 
     /// Single-pass level probe. Returns the match if any; with `Some(free_slot)`
@@ -1446,13 +1873,11 @@ where
                 mem::replace(&mut entry.value, value)
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
-                let entry = unsafe { self.special.primary.get_mut(slot_idx) };
-                mem::replace(&mut entry.value, value)
+                self.overflow.replace_special_primary_value(slot_idx, value)
             }
-            SlotLocation::SpecialFallback { slot_idx } => {
-                let entry = unsafe { self.special.fallback.get_mut(slot_idx) };
-                mem::replace(&mut entry.value, value)
-            }
+            SlotLocation::SpecialFallback { slot_idx } => self
+                .overflow
+                .replace_special_fallback_value(slot_idx, value),
         }
     }
 
@@ -1523,16 +1948,8 @@ where
         value: V,
         key_fingerprint: u8,
     ) {
-        let primary = &mut self.special.primary;
-        // Reusing a tombstone slot must decrement the counter; otherwise
-        // cleanup triggers on stale-since-resize counts.
-        let was_tombstone = primary.control_at(slot_idx) == CTRL_TOMBSTONE;
-        primary.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
-        primary.len += 1;
-        if was_tombstone {
-            primary.tombstones -= 1;
-        }
-        self.special.total_len += 1;
+        self.overflow
+            .place_new_special_primary_entry(slot_idx, key, value, key_fingerprint);
         self.len += 1;
     }
 
@@ -1544,199 +1961,9 @@ where
         value: V,
         key_fingerprint: u8,
     ) {
-        let fallback = &mut self.special.fallback;
-        fallback.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
-        fallback.len += 1;
-        self.special.total_len += 1;
+        self.overflow
+            .place_new_special_fallback_entry(slot_idx, key, value, key_fingerprint);
         self.len += 1;
-    }
-
-    fn first_free_in_special_primary(&self, key_hash: u64) -> Option<usize> {
-        let primary = &self.special.primary;
-        if primary.len as usize >= primary.capacity() {
-            return None;
-        }
-
-        let group_count = primary.group_count();
-        let group_limit = self.primary_probe_limit.min(group_count.max(1));
-        let mask = primary.group_count_mask as usize;
-        let mut probe = ProbeSeq::new(primary.group_start(key_hash), primary.group_step(key_hash));
-        for _ in 0..group_limit {
-            if let Some(slot_idx) = primary.first_free_in_group(probe.group) {
-                return Some(slot_idx);
-            }
-            probe.advance(mask);
-        }
-        None
-    }
-
-    fn first_free_in_special_fallback(&self, key_hash: u64) -> Option<usize> {
-        let fallback = &self.special.fallback;
-        if fallback.len as usize >= fallback.capacity() {
-            return None;
-        }
-
-        let bucket_a = fallback.bucket_a(key_hash);
-        let bucket_b = fallback.bucket_b(key_hash);
-        let (free_a, occupied_a) = fallback.bucket_info(bucket_a);
-        if bucket_a == bucket_b {
-            return free_a;
-        }
-
-        let (free_b, occupied_b) = fallback.bucket_info(bucket_b);
-
-        match (free_a, free_b) {
-            (Some(slot_a), Some(slot_b)) => {
-                if occupied_a <= occupied_b {
-                    Some(slot_a)
-                } else {
-                    Some(slot_b)
-                }
-            }
-            (free_a, free_b) => free_a.or(free_b),
-        }
-    }
-
-    /// Probe special primary for `key`. Bounded by `primary_probe_limit`
-    /// groups; if reached without a match and no tombstones seen, returns
-    /// `StopSearch` so the caller skips fallback. Pass `Some(out)` to
-    /// record the first free `SlotLocation`; `None` for lookup-only.
-    #[inline]
-    fn find_in_special_primary<Q>(
-        &self,
-        key_hash: u64,
-        key_fingerprint: u8,
-        key: &Q,
-        free_slot: FreeSlot,
-    ) -> LookupStep
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        let wants_free = matches!(&free_slot, Some(out) if out.is_none());
-        let primary = &self.special.primary;
-
-        if primary.capacity() == 0 || primary.len == 0 {
-            if wants_free && let Some(out) = free_slot {
-                *out = self
-                    .first_free_in_special_primary(key_hash)
-                    .map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx });
-            }
-            return LookupStep::Continue;
-        }
-
-        let group_count = primary.group_count();
-        let group_limit = self.primary_probe_limit.min(group_count.max(1));
-        let mask = primary.group_count_mask as usize;
-        let mut local: Option<usize> = None;
-        let mut probe = ProbeSeq::new(primary.group_start(key_hash), primary.group_step(key_hash));
-
-        let outcome: LookupStep = 'probe: {
-            for _ in 0..group_limit {
-                // Track free slots only when asked AND we don't already have
-                // one. `first_free_in_group` doubles as the "any free?" check;
-                // when not tracking we use the cheaper EMPTY-only mask.
-                let has_free = if wants_free && local.is_none() {
-                    let slot = primary.first_free_in_group(probe.group);
-                    if let Some(s) = slot {
-                        local = Some(s);
-                    }
-                    slot.is_some()
-                } else {
-                    primary.group_match_mask(probe.group, CTRL_EMPTY).any()
-                };
-                for relative_idx in primary.group_match_mask(probe.group, key_fingerprint) {
-                    let slot_idx = probe.group * GROUP_SIZE + relative_idx;
-                    let entry = unsafe { primary.get_ref(slot_idx) };
-                    if key.equivalent(&entry.key) {
-                        break 'probe LookupStep::Found(slot_idx);
-                    }
-                }
-                // StopSearch: probe chain terminated naturally — an EMPTY
-                // slot in the group, with no TOMBSTONE that might be hiding
-                // an overflow we'd need to chase.
-                if has_free && !primary.group_match_mask(probe.group, CTRL_TOMBSTONE).any() {
-                    break 'probe LookupStep::StopSearch;
-                }
-                probe.advance(mask);
-            }
-            LookupStep::Continue
-        };
-
-        if wants_free && let Some(out) = free_slot {
-            *out = local.map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx });
-        }
-        outcome
-    }
-
-    /// Probe special fallback for `key` across its two candidate buckets.
-    #[inline]
-    fn find_in_special_fallback<Q>(
-        &self,
-        key_hash: u64,
-        key_fingerprint: u8,
-        key: &Q,
-        free_slot: FreeSlot,
-    ) -> Option<usize>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        let wants_free = matches!(&free_slot, Some(out) if out.is_none());
-        let fallback = &self.special.fallback;
-
-        if fallback.capacity() == 0 || fallback.len == 0 {
-            if wants_free && let Some(out) = free_slot {
-                *out = self
-                    .first_free_in_special_fallback(key_hash)
-                    .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx });
-            }
-            return None;
-        }
-
-        let bucket_a = fallback.bucket_a(key_hash);
-        let bucket_b = fallback.bucket_b(key_hash);
-
-        let mut local: Option<usize> = None;
-        let mut found: Option<usize> = None;
-        for bucket_idx in [bucket_a, bucket_b] {
-            let need_match = found.is_none();
-            let need_candidate = wants_free && local.is_none();
-            if !need_match && !need_candidate {
-                break;
-            }
-            let range = fallback.bucket_range(bucket_idx);
-            if need_candidate {
-                for slot_idx in range.clone() {
-                    if fallback.control_at(slot_idx).is_free() {
-                        local = Some(slot_idx);
-                        break;
-                    }
-                }
-            }
-            if need_match {
-                let controls = unsafe {
-                    slice::from_raw_parts(fallback.ctrl_ptr().add(range.start), range.len())
-                };
-                let mut match_offset = 0;
-                while let Some(relative_idx) = control::find_next_fingerprint_in_controls(
-                    controls,
-                    key_fingerprint,
-                    match_offset,
-                ) {
-                    let slot_idx = range.start + relative_idx;
-                    let entry = unsafe { fallback.get_ref(slot_idx) };
-                    if key.equivalent(&entry.key) {
-                        found = Some(slot_idx);
-                        break;
-                    }
-                    match_offset = relative_idx + 1;
-                }
-            }
-        }
-
-        if wants_free && let Some(out) = free_slot {
-            *out = local.map(|slot_idx| SlotLocation::SpecialFallback { slot_idx });
-        }
-        found
     }
 
     /// Dispatch `loc` to the right descriptor and return a shared reference
@@ -1749,10 +1976,10 @@ where
                 slot_idx,
             } => unsafe { self.levels[level_idx].get_ref(slot_idx) },
             SlotLocation::SpecialPrimary { slot_idx } => unsafe {
-                self.special.primary.get_ref(slot_idx)
+                self.overflow.special_primary_ref(slot_idx)
             },
             SlotLocation::SpecialFallback { slot_idx } => unsafe {
-                self.special.fallback.get_ref(slot_idx)
+                self.overflow.special_fallback_ref(slot_idx)
             },
         }
     }
@@ -1802,7 +2029,7 @@ where
         }
 
         // Special tables are only populated under overflow.
-        if self.special.total_len == 0 {
+        if self.overflow.len() == 0 {
             return None;
         }
         self.find_in_special(key, key_hash, key_fingerprint, None)
@@ -1821,9 +2048,7 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
-    /// Cold path of [`RawTable::scan_next`]: first-call region prime and region
-    /// crossings (levels → special primary → fallback). Kept out of line so the
-    /// per-element hot path inlines.
+    /// Prime the scan and cross region boundaries off the hot path.
     #[cold]
     fn scan_advance(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, SlotLocation)> {
         if !scan.region.started() {
@@ -1831,7 +2056,7 @@ where
             // straight to the special primary.
             if self.levels.is_empty() {
                 scan.phase = ScanPhase::Primary;
-                scan.region.enter(&self.special.primary);
+                scan.region.enter(self.overflow.primary());
             } else {
                 scan.region.enter(&self.levels[0]);
             }
@@ -1849,12 +2074,12 @@ where
                         scan.region.enter(&self.levels[scan.level_idx]);
                     } else {
                         scan.phase = ScanPhase::Primary;
-                        scan.region.enter(&self.special.primary);
+                        scan.region.enter(self.overflow.primary());
                     }
                 }
                 ScanPhase::Primary => {
                     scan.phase = ScanPhase::Fallback;
-                    scan.region.enter(&self.special.fallback);
+                    scan.region.enter(self.overflow.fallback());
                 }
                 ScanPhase::Fallback => {
                     scan.phase = ScanPhase::Done;
@@ -1866,11 +2091,8 @@ where
     }
 }
 
-// `SlotEntry` is `pub(crate)`; the `RawTable` trait (in the private `map`
-// module) exposes it in `slot_ref`/`slot_ptr`, so the impl mirrors the trait's
-// private-interface lint exemption.
 #[allow(private_interfaces)]
-impl<K, V, S, A> RawTable<K, V> for FunnelTable<K, V, S, A>
+impl<K, V, S, A> map::TableStorage<K, V> for FunnelTable<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
@@ -1879,22 +2101,6 @@ where
     type Location = SlotLocation;
     type Hasher = S;
     type Alloc = A;
-    type Scan = FunnelScan;
-
-    #[inline]
-    fn with_capacity_and_reserve_fraction_and_hasher_in(
-        capacity: usize,
-        reserve_fraction: f64,
-        hash_builder: S,
-        alloc: A,
-    ) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
-            capacity,
-            reserve_fraction,
-            hash_builder,
-            alloc,
-        )
-    }
 
     #[inline]
     fn hasher(&self) -> &S {
@@ -1927,37 +2133,6 @@ where
     }
 
     #[inline]
-    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
-        self.grow_capacity_for(needed)
-    }
-
-    #[inline]
-    fn resize(&mut self, new_capacity: usize) {
-        self.resize(new_capacity);
-    }
-
-    #[inline]
-    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
-    where
-        S: Clone,
-    {
-        self.try_resize(new_capacity)
-    }
-
-    #[inline]
-    fn clear(&mut self) {
-        self.clear();
-    }
-
-    #[inline]
-    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<SlotLocation>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        self.find_slot_location_with_hash(key, hash, fingerprint)
-    }
-
-    #[inline]
     unsafe fn slot_ref(&self, loc: SlotLocation) -> &SlotEntry<K, V> {
         unsafe { self.slot_ref(loc) }
     }
@@ -1971,7 +2146,29 @@ where
     fn replace_value(&mut self, loc: SlotLocation, value: V) -> V {
         self.replace_existing_value(loc, value)
     }
+}
 
+impl<K, V, S, A> map::TableLookup<K, V> for FunnelTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    #[inline]
+    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<SlotLocation>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.find_slot_location_with_hash(key, hash, fingerprint)
+    }
+}
+
+impl<K, V, S, A> map::TableInsert<K, V> for FunnelTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> SlotLocation {
         self.insert_for_vacant_entry(key, value, hash)
@@ -1994,7 +2191,7 @@ where
 
         // Skip the special-array dedup when the chain ended clean (no overflow
         // possible) or special is empty — place at the level candidate.
-        if (matches!(miss, LevelMiss::ChainClean) || self.special.total_len == 0)
+        if (matches!(miss, LevelMiss::ChainClean) || self.overflow.len() == 0)
             && let Some(SlotLocation::Level {
                 level_idx,
                 slot_idx,
@@ -2041,6 +2238,16 @@ where
     fn extract_finish(&mut self, location: SlotLocation) {
         self.finish_counted_removal(location);
     }
+}
+
+#[allow(private_interfaces)]
+impl<K, V, S, A> map::TableIterate<K, V> for FunnelTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    type Scan = FunnelScan;
 
     #[inline]
     fn scan(&self) -> FunnelScan {
@@ -2060,6 +2267,51 @@ where
             return Some((ptr, scan.location_at(slot_idx)));
         }
         self.scan_advance(scan)
+    }
+}
+
+impl<K, V, S, A> map::TableLifecycle<K, V> for FunnelTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    #[inline]
+    fn with_capacity_and_reserve_fraction_and_hasher_in(
+        capacity: usize,
+        reserve_fraction: f64,
+        hash_builder: S,
+        alloc: A,
+    ) -> Self {
+        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            reserve_fraction,
+            hash_builder,
+            alloc,
+        )
+    }
+
+    #[inline]
+    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
+        self.grow_capacity_for(needed)
+    }
+
+    #[inline]
+    fn resize(&mut self, new_capacity: usize) {
+        self.resize(new_capacity);
+    }
+
+    #[inline]
+    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
+    where
+        S: Clone,
+    {
+        self.try_resize(new_capacity)
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.clear();
     }
 
     fn wipe_all(&mut self) {
@@ -2086,11 +2338,8 @@ enum ScanPhase {
     Done,
 }
 
-/// Pointerless multi-region scan cursor for [`RawTable::scan`]. Holds only the
-/// current phase + level index + a shared [`RegionCursor`]; the owning iterator
-/// can move the table because no pointer into it is stored across calls.
-/// Mirrors [`crate::elastic::ElasticScan`] but crosses three region kinds
-/// (levels → special primary → special fallback).
+/// Track [`map::TableIterate::scan`] across levels, primary, and fallback without
+/// retaining pointers between calls.
 #[derive(Clone)]
 pub struct FunnelScan {
     phase: ScanPhase,
@@ -2318,13 +2567,13 @@ where
     A: Allocator + Clone,
 {
     /// Deep-clones storage + hasher + allocator. Backs the
-    /// [`RawTable::clone_table`] impl; the [`map::HashMap`] shell provides the
+    /// [`map::TableLifecycle::clone_table`] impl; the [`map::HashMap`] shell provides the
     /// public [`Clone`].
     fn clone_storage(&self) -> Self {
         // Build level_bucket_counts from existing level descriptors.
         let bucket_width = align::round_up_to_group(compute_bucket_width(self.reserve_fraction));
-        let primary_ctrl = self.special.primary.capacity as usize;
-        let fallback_ctrl = self.special.fallback.capacity as usize;
+        let primary_ctrl = self.overflow.primary().capacity as usize;
+        let fallback_ctrl = self.overflow.fallback().capacity as usize;
         // Use stored `bucket_count`: pow2 for hot levels (idempotent under
         // `build_regions`), exact paper count for cold. `bucket_count_mask` would
         // read the `u32::MAX` sentinel.
@@ -2333,7 +2582,7 @@ where
             .iter()
             .map(|l| l.bucket_count as usize)
             .collect();
-        let fallback_bucket_size = (self.primary_probe_limit.saturating_mul(2)).max(2);
+        let fallback_bucket_size = (self.overflow.primary_probe_limit.saturating_mul(2)).max(2);
 
         let (arena, levels, special) = FunnelGeometry::new(
             &level_bucket_counts,
@@ -2376,7 +2625,7 @@ where
 
         let special_mut = &mut guard.regions_mut().special;
         {
-            let s = &self.special.primary;
+            let s = self.overflow.primary();
             let d = &mut special_mut.primary;
             arena::clone_region_panic_safe::<K, V>(
                 s.ctrl_ptr,
@@ -2390,7 +2639,7 @@ where
         }
 
         {
-            let s = &self.special.fallback;
+            let s = self.overflow.fallback();
             let d = &mut special_mut.fallback;
             arena::clone_region_panic_safe::<K, V>(
                 s.ctrl_ptr,
@@ -2403,19 +2652,20 @@ where
             d.tombstones = s.tombstones;
         }
 
-        special_mut.total_len = self.special.total_len;
+        special_mut.total_len = self.overflow.len();
 
         // Success: reclaim arena + regions so the guard's Drop no-ops.
         let (arena, FunnelRegions { levels, special }) = guard.disarm();
 
+        let overflow = OverflowHandler::new(special, self.overflow.primary_probe_limit);
+
         Self {
             levels,
-            special,
+            overflow,
             len: self.len,
             total_slots: self.total_slots,
             max_insertions: self.max_insertions,
             reserve_fraction: self.reserve_fraction,
-            primary_probe_limit: self.primary_probe_limit,
             max_populated_level: self.max_populated_level,
             hash_builder: self.hash_builder.clone(),
             alloc: self.alloc.clone(),
@@ -2431,6 +2681,15 @@ mod tests {
     use std::hash::{BuildHasher, Hasher};
 
     #[test]
+    fn resize_scheduler_owns_pending_entries_and_checked_growth() {
+        let mut scheduler = ResizeScheduler::new(64, vec![(1, 10), (2, 20)]);
+        assert_eq!(scheduler.target(), 64);
+        assert_eq!(scheduler.pending.len(), 2);
+        assert_eq!(scheduler.advance_target(), Ok(128));
+        assert_eq!(scheduler.target(), 128);
+    }
+
+    #[test]
     fn funnel_layout_covers_capacity() {
         // `with_capacity(n)` interprets `n` as the insertion budget. Internal
         // slot allocation rounds up so `capacity() >= n` and total slots
@@ -2444,7 +2703,8 @@ mod tests {
         );
         let table = map.table();
         let level_capacity: usize = table.levels.iter().map(BucketLevel::capacity).sum();
-        let special_capacity = table.special.primary.capacity() + table.special.fallback.capacity();
+        let special_capacity =
+            table.overflow.special.primary.capacity() + table.overflow.special.fallback.capacity();
         let total = level_capacity + special_capacity;
         assert!(
             total >= requested,
@@ -2575,7 +2835,7 @@ mod tests {
         // make forward progress (loop terminates via `group_limit`).
         let mut map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity(1);
         assert_eq!(
-            map.table().special.primary.group_count_mask,
+            map.table().overflow.primary().group_count_mask,
             0,
             "regression assumes a single-group special primary"
         );
@@ -2609,7 +2869,7 @@ mod tests {
         }
 
         assert_eq!(map.len(), 384);
-        assert_eq!(map.table().special.total_len, 0);
+        assert_eq!(map.table().overflow.len(), 0);
         for i in 512..896 {
             assert_eq!(map.get(&i), Some(&(i ^ 0x5a5a)));
         }
@@ -2790,12 +3050,12 @@ mod tests {
             );
         let mut inserted = 0i32;
         let max_insertions = i32::try_from(map.capacity()).expect("test capacity fits i32");
-        while map.table().special.total_len == 0 && inserted < max_insertions {
+        while map.table().overflow.len() == 0 && inserted < max_insertions {
             map.insert(inserted, inserted);
             inserted += 1;
         }
         assert!(
-            map.table().special.total_len > 0,
+            map.table().overflow.len() > 0,
             "test requires at least one special-array entry"
         );
 
@@ -2812,10 +3072,10 @@ mod tests {
             })
             .expect("inserted special entry must be findable");
 
-        let before_special = map.table().special.total_len;
+        let before_special = map.table().overflow.len();
         let before_len = map.len();
         assert_eq!(map.remove(&special_key), Some(special_key));
-        assert_eq!(map.table().special.total_len, before_special - 1);
+        assert_eq!(map.table().overflow.len(), before_special - 1);
         assert_eq!(map.len(), before_len - 1);
     }
 
@@ -2828,7 +3088,7 @@ mod tests {
                 DefaultHashBuilder::default(),
                 Global,
             );
-        let fallback = &mut table.special.fallback;
+        let fallback = &mut table.overflow.special.fallback;
         assert!(
             fallback.bucket_count > 1,
             "test requires at least two fallback buckets"
@@ -2853,10 +3113,37 @@ mod tests {
         fallback.len = 2;
 
         assert_eq!(
-            table.first_free_in_special_fallback(key_hash),
+            table.overflow.first_free_in_special_fallback(key_hash),
             Some(range_b.start),
             "fallback C should choose the emptier of the two paper buckets"
         );
+    }
+
+    #[test]
+    fn fallback_tombstone_reuse_decrements_counter() {
+        let mut table: FunnelTable<u64, u64, DefaultHashBuilder, Global> =
+            FunnelTable::with_capacity_and_reserve_fraction_and_hasher_in(
+                2048,
+                crate::common::config::DEFAULT_RESERVE_FRACTION,
+                DefaultHashBuilder::default(),
+                Global,
+            );
+        let slot_idx = 0;
+        table
+            .overflow
+            .special
+            .fallback
+            .set_control(slot_idx, CTRL_TOMBSTONE);
+        table.overflow.special.fallback.tombstones = 1;
+
+        table.overflow.place_new_special_fallback_entry(
+            slot_idx,
+            7,
+            11,
+            control::control_fingerprint(7),
+        );
+
+        assert_eq!(table.overflow.special.fallback.tombstones, 0);
     }
 
     #[test]
