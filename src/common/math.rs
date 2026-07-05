@@ -283,6 +283,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // Miri's per-call `log2` jitter flakes the exact/monotone checks.
     fn log_log_probe_limit_at_least_one_and_monotone() {
         assert_eq!(probe::log_log_probe_limit(0), 1);
         assert_eq!(probe::log_log_probe_limit(4), 1);
