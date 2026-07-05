@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3](https://github.com/aaron-ang/opthash-rs/compare/v0.10.2...v0.10.3) - 2026-07-05
+
+### Added
+
+- *(simd)* SWAR-8 generic control-scan fallback ([#112](https://github.com/aaron-ang/opthash-rs/pull/112))
+
+### Fixed
+
+- *(tests)* ignore slow tests under Miri ([#102](https://github.com/aaron-ang/opthash-rs/pull/102))
+- make funnel fallback choose emptier bucket ([#98](https://github.com/aaron-ang/opthash-rs/pull/98))
+- use paper-linear elastic probe budget ([#99](https://github.com/aaron-ang/opthash-rs/pull/99))
+
+### Other
+
+- no_std support, optional foldhash, Cargo/lint hygiene ([#111](https://github.com/aaron-ang/opthash-rs/pull/111))
+- *(funnel)* assert clear/reinsert invariants, not special-array placement ([#109](https://github.com/aaron-ang/opthash-rs/pull/109))
+- *(bench,docs)* drop redundant bench, relocate helpers, tidy README ([#107](https://github.com/aaron-ang/opthash-rs/pull/107))
+- cut hot-path instructions in elastic insert and funnel remove ([#108](https://github.com/aaron-ang/opthash-rs/pull/108))
+- deterministic hasher + drop redundant crate:: qualification ([#106](https://github.com/aaron-ang/opthash-rs/pull/106))
+- deepen backend seams and shared internals ([#105](https://github.com/aaron-ang/opthash-rs/pull/105))
+- consolidate backend code-gen mechanisms and contracts ([#104](https://github.com/aaron-ang/opthash-rs/pull/104))
+- hash table backend architecture ([#103](https://github.com/aaron-ang/opthash-rs/pull/103))
+- *(funnel)* exact paper bucket counts on cold levels ([#101](https://github.com/aaron-ang/opthash-rs/pull/101))
+- fix flaky Miri (limited_group_budget) + steady-state delete_heavy bench ([#100](https://github.com/aaron-ang/opthash-rs/pull/100))
+- *(deps)* bump pyo3 from 0.28.3 to 0.29.0 in the cargo group across 1 directory ([#95](https://github.com/aaron-ang/opthash-rs/pull/95))
+
 ## [0.10.2](https://github.com/aaron-ang/opthash-rs/compare/v0.10.1...v0.10.2) - 2026-06-09
 
 ### Added
