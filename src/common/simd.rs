@@ -94,13 +94,10 @@ unsafe fn eq_bits_16(ptr: *const u8, target: u8) -> u64 {
 #[inline]
 pub(super) unsafe fn eq_bits_group(ptr: *const u8, target: u8) -> u64 {
     #[cfg(opthash_avx512_group)]
-    unsafe {
-        eq_mask_64_avx512(ptr, target).0
-    }
-
+    let bits = unsafe { eq_mask_64_avx512(ptr, target).0 };
     // Cold scan wants a stride-1 bit-per-byte mask, unlike the hot stride-8 SWAR.
     #[cfg(opthash_scalar_group)]
-    {
+    let bits = {
         let mut m = 0u64;
         for i in 0..GROUP_SIZE {
             if unsafe { *ptr.add(i) } == target {
@@ -108,12 +105,10 @@ pub(super) unsafe fn eq_bits_group(ptr: *const u8, target: u8) -> u64 {
             }
         }
         m
-    }
-
+    };
     #[cfg(any(opthash_neon_group, opthash_x86_16_group))]
-    {
-        unsafe { eq_bits_16(ptr, target) }
-    }
+    let bits = unsafe { eq_bits_16(ptr, target) };
+    bits
 }
 
 /// # Safety
@@ -123,21 +118,14 @@ pub(super) unsafe fn eq_bits_group(ptr: *const u8, target: u8) -> u64 {
 #[must_use]
 pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
     #[cfg(opthash_neon_group)]
-    unsafe {
-        eq_mask_16_neon(ptr, target)
-    }
+    let mask = unsafe { eq_mask_16_neon(ptr, target) };
     #[cfg(opthash_avx512_group)]
-    unsafe {
-        eq_mask_64_avx512(ptr, target)
-    }
+    let mask = unsafe { eq_mask_64_avx512(ptr, target) };
     #[cfg(opthash_x86_16_group)]
-    unsafe {
-        eq_mask_16_sse2(ptr, target)
-    }
+    let mask = unsafe { eq_mask_16_sse2(ptr, target) };
     #[cfg(opthash_scalar_group)]
-    unsafe {
-        BitMask(swar_eq_mask(swar_word(ptr), target))
-    }
+    let mask = unsafe { BitMask(swar_eq_mask(swar_word(ptr), target)) };
+    mask
 }
 
 /// # Safety
@@ -147,21 +135,14 @@ pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
 #[must_use]
 pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
     #[cfg(opthash_neon_group)]
-    unsafe {
-        free_mask_16_neon(ptr)
-    }
+    let mask = unsafe { free_mask_16_neon(ptr) };
     #[cfg(opthash_avx512_group)]
-    unsafe {
-        free_mask_64_avx512(ptr)
-    }
+    let mask = unsafe { free_mask_64_avx512(ptr) };
     #[cfg(opthash_x86_16_group)]
-    unsafe {
-        free_mask_16_sse2(ptr)
-    }
+    let mask = unsafe { free_mask_16_sse2(ptr) };
     #[cfg(opthash_scalar_group)]
-    unsafe {
-        BitMask(swar_free_mask(swar_word(ptr)))
-    }
+    let mask = unsafe { BitMask(swar_free_mask(swar_word(ptr))) };
+    mask
 }
 
 /// Bitmask of occupied slots; padding and tombstones are excluded.
@@ -173,21 +154,14 @@ pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
 #[must_use]
 pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
     #[cfg(opthash_neon_group)]
-    unsafe {
-        occupied_mask_16_neon(ptr)
-    }
+    let mask = unsafe { occupied_mask_16_neon(ptr) };
     #[cfg(opthash_avx512_group)]
-    unsafe {
-        occupied_mask_64_avx512(ptr)
-    }
+    let mask = unsafe { occupied_mask_64_avx512(ptr) };
     #[cfg(opthash_x86_16_group)]
-    unsafe {
-        occupied_mask_16_sse2(ptr)
-    }
+    let mask = unsafe { occupied_mask_16_sse2(ptr) };
     #[cfg(opthash_scalar_group)]
-    unsafe {
-        BitMask(swar_occupied_mask(swar_word(ptr)))
-    }
+    let mask = unsafe { BitMask(swar_occupied_mask(swar_word(ptr))) };
+    mask
 }
 
 /// # Safety
@@ -197,19 +171,17 @@ pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
 #[must_use]
 pub(crate) unsafe fn eq_bits_32(ptr: *const u8, target: u8) -> u64 {
     #[cfg(opthash_avx2)]
-    unsafe {
-        eq_bits_32_avx2(ptr, target)
-    }
+    let bits = unsafe { eq_bits_32_avx2(ptr, target) };
     #[cfg(all(opthash_eq_bits_16, not(opthash_avx2)))]
-    unsafe {
+    let bits = unsafe {
         let lo = eq_bits_16(ptr, target);
         let hi = eq_bits_16(ptr.add(16), target);
         lo | (hi << 16)
-    }
+    };
     // SWAR never widens the cold scan past GROUP_SIZE (8), so this is unreachable;
     // a self-contained loop keeps it compiling without eq_bits_16.
     #[cfg(opthash_scalar_group)]
-    {
+    let bits = {
         let mut m = 0u64;
         for i in 0..32 {
             if unsafe { *ptr.add(i) } == target {
@@ -217,7 +189,8 @@ pub(crate) unsafe fn eq_bits_32(ptr: *const u8, target: u8) -> u64 {
             }
         }
         m
-    }
+    };
+    bits
 }
 
 // Backend helpers. Numeric suffixes are the number of control bytes scanned.
