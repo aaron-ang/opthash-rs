@@ -1,9 +1,12 @@
 pub(crate) type BitMaskWord = u64;
 
-/// Bits per slot in [`BitMask`]: 4 for NEON's nibble mask, 1 elsewhere.
+/// Bits per slot in [`BitMask`]: 4 for NEON's nibble mask, 8 for the SWAR-8
+/// fallback (one `0x80` sentinel per control byte), 1 elsewhere.
 #[cfg(opthash_neon_group)]
 pub(crate) const BITMASK_STRIDE: u32 = 4;
-#[cfg(not(opthash_neon_group))]
+#[cfg(opthash_scalar_group)]
+pub(crate) const BITMASK_STRIDE: u32 = 8;
+#[cfg(any(opthash_x86_16_group, opthash_avx512_group))]
 pub(crate) const BITMASK_STRIDE: u32 = 1;
 
 /// Per-slot match mask over a control group.

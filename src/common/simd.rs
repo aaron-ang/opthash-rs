@@ -14,9 +14,55 @@ use std::arch::x86_64::__m512i;
 use super::bitmask::BitMask;
 #[cfg(opthash_scalar_group)]
 use super::config::GROUP_SIZE;
+#[cfg(any(opthash_neon_group, opthash_x86_16_group, opthash_avx512_group))]
 use super::control::FINGERPRINT_MASK;
+
+// Portable SWAR-8 control scan (hashbrown's "generic" backend): 8 control bytes
+// packed into one u64, matched with exact borrow-free masks. Lane `i`'s match is
+// flagged by its high bit at bit `8*i + 7` (BITMASK_STRIDE 8).
 #[cfg(opthash_scalar_group)]
-use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
+const SWAR_LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+#[cfg(opthash_scalar_group)]
+const SWAR_HI: u64 = 0x8080_8080_8080_8080;
+#[cfg(opthash_scalar_group)]
+const SWAR_ONES: u64 = 0x0101_0101_0101_0101;
+
+/// Load eight control bytes as one little-endian word (lane `i` = bits `[8*i, 8*i+7]`).
+///
+/// # Safety
+///
+/// `ptr` must be valid to read 8 bytes.
+#[cfg(opthash_scalar_group)]
+#[inline]
+unsafe fn swar_word(ptr: *const u8) -> u64 {
+    #[allow(clippy::cast_ptr_alignment)]
+    let raw = unsafe { ptr.cast::<u64>().read_unaligned() };
+    raw.to_le()
+}
+
+/// 0x80 in each lane equal to `target`. Exact: matching `CTRL_EMPTY` (0x00) never
+/// flags a tombstone (0x80) or an occupied byte.
+#[cfg(opthash_scalar_group)]
+#[inline]
+fn swar_eq_mask(word: u64, target: u8) -> u64 {
+    let cmp = word ^ (u64::from(target).wrapping_mul(SWAR_ONES));
+    let ne = (((cmp & SWAR_LO7).wrapping_add(SWAR_LO7)) | cmp) & SWAR_HI; // 0x80 where != target
+    ne ^ SWAR_HI
+}
+
+/// 0x80 in each occupied lane (fingerprint bits nonzero).
+#[cfg(opthash_scalar_group)]
+#[inline]
+fn swar_occupied_mask(word: u64) -> u64 {
+    ((word & SWAR_LO7).wrapping_add(SWAR_LO7)) & SWAR_HI
+}
+
+/// 0x80 in each EMPTY|TOMBSTONE lane.
+#[cfg(opthash_scalar_group)]
+#[inline]
+fn swar_free_mask(word: u64) -> u64 {
+    swar_occupied_mask(word) ^ SWAR_HI
+}
 
 // Fixed 16-byte equality scan used by 16-byte groups and non-AVX2 cold scans.
 #[inline]
@@ -52,7 +98,19 @@ pub(super) unsafe fn eq_bits_group(ptr: *const u8, target: u8) -> u64 {
         eq_mask_64_avx512(ptr, target).0
     }
 
-    #[cfg(not(opthash_wide_group))]
+    // Cold scan wants a stride-1 bit-per-byte mask, unlike the hot stride-8 SWAR.
+    #[cfg(opthash_scalar_group)]
+    {
+        let mut m = 0u64;
+        for i in 0..GROUP_SIZE {
+            if unsafe { *ptr.add(i) } == target {
+                m |= 1 << i;
+            }
+        }
+        m
+    }
+
+    #[cfg(any(opthash_neon_group, opthash_x86_16_group))]
     {
         unsafe { eq_bits_16(ptr, target) }
     }
@@ -77,14 +135,8 @@ pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
         eq_mask_16_sse2(ptr, target)
     }
     #[cfg(opthash_scalar_group)]
-    {
-        let mut m = 0u64;
-        for i in 0..GROUP_SIZE {
-            if unsafe { *ptr.add(i) } == target {
-                m |= 1 << i;
-            }
-        }
-        BitMask(m)
+    unsafe {
+        BitMask(swar_eq_mask(swar_word(ptr), target))
     }
 }
 
@@ -107,15 +159,8 @@ pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
         free_mask_16_sse2(ptr)
     }
     #[cfg(opthash_scalar_group)]
-    {
-        let mut m = 0u64;
-        for i in 0..GROUP_SIZE {
-            let b = unsafe { *ptr.add(i) };
-            if b == CTRL_EMPTY || b == CTRL_TOMBSTONE {
-                m |= 1 << i;
-            }
-        }
-        BitMask(m)
+    unsafe {
+        BitMask(swar_free_mask(swar_word(ptr)))
     }
 }
 
@@ -140,15 +185,8 @@ pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
         occupied_mask_16_sse2(ptr)
     }
     #[cfg(opthash_scalar_group)]
-    {
-        let mut m = 0u64;
-        for i in 0..GROUP_SIZE {
-            let b = unsafe { *ptr.add(i) };
-            if (b & FINGERPRINT_MASK) != 0 {
-                m |= 1 << i;
-            }
-        }
-        BitMask(m)
+    unsafe {
+        BitMask(swar_occupied_mask(swar_word(ptr)))
     }
 }
 
@@ -162,11 +200,23 @@ pub(crate) unsafe fn eq_bits_32(ptr: *const u8, target: u8) -> u64 {
     unsafe {
         eq_bits_32_avx2(ptr, target)
     }
-    #[cfg(not(opthash_avx2))]
+    #[cfg(all(opthash_eq_bits_16, not(opthash_avx2)))]
     unsafe {
         let lo = eq_bits_16(ptr, target);
         let hi = eq_bits_16(ptr.add(16), target);
         lo | (hi << 16)
+    }
+    // SWAR never widens the cold scan past GROUP_SIZE (8), so this is unreachable;
+    // a self-contained loop keeps it compiling without eq_bits_16.
+    #[cfg(opthash_scalar_group)]
+    {
+        let mut m = 0u64;
+        for i in 0..32 {
+            if unsafe { *ptr.add(i) } == target {
+                m |= 1 << i;
+            }
+        }
+        m
     }
 }
 
@@ -300,5 +350,131 @@ unsafe fn eq_bits_32_avx2(ptr: *const u8, target: u8) -> u64 {
         let target_vec = x86_64::_mm256_set1_epi8(target.cast_signed());
         let cmp = x86_64::_mm256_cmpeq_epi8(data, target_vec);
         u64::from(x86_64::_mm256_movemask_epi8(cmp).cast_unsigned())
+    }
+}
+
+#[cfg(all(test, opthash_scalar_group))]
+mod swar_tests {
+    use super::*;
+    use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, FINGERPRINT_MASK};
+
+    fn word(bytes: [u8; 8]) -> u64 {
+        u64::from_le_bytes(bytes)
+    }
+    // Naive per-byte references in the SWAR encoding: 0x80 in lane `i` (bit
+    // `8*i + 7`) when the predicate holds for byte `i`.
+    fn ref_eq(bytes: [u8; 8], target: u8) -> u64 {
+        let mut m = 0u64;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == target {
+                m |= 0x80u64 << (8 * i);
+            }
+        }
+        m
+    }
+    fn ref_occupied(bytes: [u8; 8]) -> u64 {
+        let mut m = 0u64;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b & FINGERPRINT_MASK != 0 {
+                m |= 0x80u64 << (8 * i);
+            }
+        }
+        m
+    }
+
+    // Representative and adversarial words: cross-byte borrow adjacencies
+    // (0x00/0x01/0x80) and the full 0..=255 range, not just real control bytes.
+    fn sample_words() -> [[u8; 8]; 10] {
+        [
+            [CTRL_EMPTY; 8],
+            [CTRL_TOMBSTONE; 8],
+            [0x2a; 8],
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07],
+            [0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            [0x7f, 0x80, 0x00, 0x01, 0x7f, 0x80, 0x00, 0x01],
+            [0xff, 0xfe, 0xfd, 0xfc, 0x80, 0x7f, 0x01, 0x00],
+            [0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80],
+        ]
+    }
+
+    #[test]
+    fn eq_matches_reference_for_every_target() {
+        for bytes in sample_words() {
+            for target in 0..=u8::MAX {
+                assert_eq!(
+                    swar_eq_mask(word(bytes), target),
+                    ref_eq(bytes, target),
+                    "word={bytes:02x?} target={target:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eq_empty_flags_only_exact_zero() {
+        // Matching CTRL_EMPTY must never false-positive against a tombstone or
+        // occupied byte: that would terminate a present key's probe early.
+        for bytes in sample_words() {
+            assert_eq!(
+                swar_eq_mask(word(bytes), CTRL_EMPTY),
+                ref_eq(bytes, CTRL_EMPTY)
+            );
+        }
+        assert_eq!(swar_eq_mask(word([CTRL_TOMBSTONE; 8]), CTRL_EMPTY), 0);
+        assert_eq!(swar_eq_mask(word([0x2a; 8]), CTRL_EMPTY), 0);
+    }
+
+    #[test]
+    fn free_and_occupied_partition_all_lanes() {
+        for bytes in sample_words() {
+            let f = swar_free_mask(word(bytes));
+            let o = swar_occupied_mask(word(bytes));
+            assert_eq!(o, ref_occupied(bytes), "occupied mismatch: {bytes:02x?}");
+            // free and occupied are exact complements over the 8 sentinel bits.
+            assert_eq!(f & o, 0, "free/occupied overlap: {bytes:02x?}");
+            assert_eq!(f | o, SWAR_HI, "free|occupied != all lanes: {bytes:02x?}");
+        }
+    }
+
+    #[test]
+    fn free_is_empty_or_tombstone() {
+        assert_eq!(swar_free_mask(word([CTRL_EMPTY; 8])), SWAR_HI);
+        assert_eq!(swar_free_mask(word([CTRL_TOMBSTONE; 8])), SWAR_HI);
+        assert_eq!(swar_occupied_mask(word([CTRL_EMPTY; 8])), 0);
+        assert_eq!(swar_occupied_mask(word([CTRL_TOMBSTONE; 8])), 0);
+        // Every occupied fingerprint (1..=127) reads occupied, never free.
+        for fp in 1..=FINGERPRINT_MASK {
+            assert_eq!(swar_occupied_mask(word([fp; 8])), SWAR_HI, "fp {fp:#04x}");
+            assert_eq!(swar_free_mask(word([fp; 8])), 0, "fp {fp:#04x}");
+        }
+    }
+
+    #[test]
+    fn no_cross_byte_borrow() {
+        // A lone occupied byte among empties flags exactly its own lane.
+        let bytes = [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(swar_occupied_mask(word(bytes)), 0x80u64 << 8);
+        assert_eq!(swar_eq_mask(word(bytes), 0x01), 0x80u64 << 8);
+        // Ascending distinct bytes: eq to byte i flags only lane i.
+        let asc = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+        for (i, &b) in asc.iter().enumerate() {
+            assert_eq!(
+                swar_eq_mask(word(asc), b),
+                0x80u64 << (8 * i),
+                "byte {b:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn match_lands_in_lane_high_bit() {
+        // Lane `i`'s sentinel is bit `8*i + 7`.
+        assert_eq!(swar_eq_mask(word([9; 8]), 9), SWAR_HI);
+        assert_eq!(
+            swar_eq_mask(word([0, 0, 0, 9, 0, 0, 0, 0]), 9),
+            0x80u64 << (8 * 3)
+        );
     }
 }
