@@ -2,11 +2,43 @@
 // may be used in another, so `dead_code` has to be suppressed module-wide.
 #![allow(dead_code)]
 
-use std::collections::HashMap as StdHashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{BuildHasherDefault, Hash};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hashbrown::HashMap as HashbrownMap;
-use opthash::{ElasticHashMap, FunnelHashMap};
+/// Fixed-seed foldhash — opthash's production hasher, shared with hashbrown — so
+/// their comparison is apples-to-apples and key layout is stable run to run
+/// (`DefaultHashBuilder` reseeds per process).
+pub type BenchHasher = foldhash::fast::FixedState;
+
+/// std keeps its own hasher (`SipHash`), fixed-seed for reproducibility.
+pub type StdHasher = BuildHasherDefault<DefaultHasher>;
+
+pub type StdHashMap<K, V> = std::collections::HashMap<K, V, StdHasher>;
+pub type HashbrownMap<K, V> = hashbrown::HashMap<K, V, BenchHasher>;
+pub type ElasticHashMap<K, V> = opthash::ElasticHashMap<K, V, BenchHasher>;
+pub type FunnelHashMap<K, V> = opthash::FunnelHashMap<K, V, BenchHasher>;
+
+/// Empty map with std's own fixed-seed hasher, sized for `cap` entries.
+#[must_use]
+pub fn std_map_cap<K: Eq + Hash, V>(cap: usize) -> StdHashMap<K, V> {
+    StdHashMap::with_capacity_and_hasher(cap, StdHasher::default())
+}
+/// See [`std_map_cap`].
+#[must_use]
+pub fn hashbrown_map_cap<K: Eq + Hash, V>(cap: usize) -> HashbrownMap<K, V> {
+    HashbrownMap::with_capacity_and_hasher(cap, BenchHasher::default())
+}
+/// See [`std_map_cap`].
+#[must_use]
+pub fn elastic_map_cap<K: Eq + Hash, V>(cap: usize) -> ElasticHashMap<K, V> {
+    ElasticHashMap::with_capacity_and_hasher(cap, BenchHasher::default())
+}
+/// See [`std_map_cap`].
+#[must_use]
+pub fn funnel_map_cap<K: Eq + Hash, V>(cap: usize) -> FunnelHashMap<K, V> {
+    FunnelHashMap::with_capacity_and_hasher(cap, BenchHasher::default())
+}
 
 /// Map sizes the Criterion latency suite sweeps over.
 pub const LATENCY_SIZES: &[usize] = &[1_000, 10_000, 100_000, 1_000_000, 10_000_000];
@@ -42,7 +74,7 @@ macro_rules! pairs_builders {
         $(
             #[must_use]
             pub fn $fn(pairs: &[(u64, $val)]) -> $Map<u64, $val> {
-                let mut map = $Map::with_capacity(pairs.len());
+                let mut map = $Map::with_capacity_and_hasher(pairs.len(), Default::default());
                 for &(key, value) in pairs {
                     map.insert(key, value);
                 }
@@ -59,7 +91,7 @@ macro_rules! drop_builders {
         $(
             #[must_use]
             pub fn $fn(n: usize) -> $Map<DropU64, DropU64> {
-                let mut map = $Map::with_capacity(n);
+                let mut map = $Map::with_capacity_and_hasher(n, Default::default());
                 for idx in 0..n {
                     let key = key_at(idx);
                     map.insert(DropU64(key), DropU64(key ^ VALUE_XOR_MIX));

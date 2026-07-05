@@ -3,9 +3,9 @@
 use std::path::Path;
 
 use criterion::{Criterion, Throughput, profiler::Profiler};
-use hashbrown::HashMap as HashbrownMap;
-use opthash::{ElasticHashMap, FunnelHashMap};
 use pprof::{ProfilerGuard, flamegraph::Options as FlamegraphOptions};
+
+use crate::common::{ElasticHashMap, FunnelHashMap, HashbrownMap, StdHashMap};
 
 /// Pre-populated map size for the throughput benches.
 pub const MAP_SIZE: usize = 20_000;
@@ -55,7 +55,7 @@ pub fn bench_one_lookup_group(
     c: &mut Criterion,
     group_name: &str,
     query_keys: &[u64],
-    std_map: &std::collections::HashMap<u64, u64>,
+    std_map: &StdHashMap<u64, u64>,
     hb_map: &HashbrownMap<u64, u64>,
     el_map: &ElasticHashMap<u64, u64>,
     fn_map: &FunnelHashMap<u64, u64>,
@@ -119,10 +119,10 @@ macro_rules! bench_populated {
             $group,
             $op,
             $batch,
-            || crate::common::build_std_map($pairs),
-            || crate::common::build_hashbrown_map($pairs),
-            || crate::common::build_elastic_map($pairs),
-            || crate::common::build_funnel_map($pairs),
+            || common::build_std_map($pairs),
+            || common::build_hashbrown_map($pairs),
+            || common::build_elastic_map($pairs),
+            || common::build_funnel_map($pairs),
             $body,
         )
     };
@@ -135,10 +135,10 @@ macro_rules! bench_populated_big {
             $group,
             $op,
             $batch,
-            || crate::common::build_std_big_map($pairs),
-            || crate::common::build_hashbrown_big_map($pairs),
-            || crate::common::build_elastic_big_map($pairs),
-            || crate::common::build_funnel_big_map($pairs),
+            || common::build_std_big_map($pairs),
+            || common::build_hashbrown_big_map($pairs),
+            || common::build_elastic_big_map($pairs),
+            || common::build_funnel_big_map($pairs),
             $body,
         )
     };
@@ -151,10 +151,10 @@ macro_rules! bench_empty {
             $group,
             $op,
             $batch,
-            std::collections::HashMap::new,
-            hashbrown::HashMap::new,
-            opthash::ElasticHashMap::new,
-            opthash::FunnelHashMap::new,
+            || common::std_map_cap(0),
+            || common::hashbrown_map_cap(0),
+            || common::elastic_map_cap(0),
+            || common::funnel_map_cap(0),
             $body,
         )
     };
@@ -167,10 +167,10 @@ macro_rules! bench_with_cap {
             $group,
             $op,
             $batch,
-            || std::collections::HashMap::with_capacity($cap),
-            || hashbrown::HashMap::with_capacity($cap),
-            || opthash::ElasticHashMap::with_capacity($cap),
-            || opthash::FunnelHashMap::with_capacity($cap),
+            || common::std_map_cap($cap),
+            || common::hashbrown_map_cap($cap),
+            || common::elastic_map_cap($cap),
+            || common::funnel_map_cap($cap),
             $body,
         )
     };
@@ -184,25 +184,25 @@ macro_rules! bench_insert_reuse {
         bench_insert_reuse_one!(
             $group,
             concat!($op, "_std"),
-            std::collections::HashMap::with_capacity($cap),
+            common::std_map_cap($cap),
             $pairs
         );
         bench_insert_reuse_one!(
             $group,
             concat!($op, "_hashbrown"),
-            hashbrown::HashMap::with_capacity($cap),
+            common::hashbrown_map_cap($cap),
             $pairs
         );
         bench_insert_reuse_one!(
             $group,
             concat!($op, "_elastic"),
-            opthash::ElasticHashMap::with_capacity($cap),
+            common::elastic_map_cap($cap),
             $pairs
         );
         bench_insert_reuse_one!(
             $group,
             concat!($op, "_funnel"),
-            opthash::FunnelHashMap::with_capacity($cap),
+            common::funnel_map_cap($cap),
             $pairs
         );
     }};
