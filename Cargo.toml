@@ -74,7 +74,6 @@ harness = false
 name = "set_ops"
 harness = false
 
-
 [[bench]]
 name = "mean_latency"
 harness = false

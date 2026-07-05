@@ -1,3 +1,4 @@
+#[path = "support/common.rs"]
 mod common;
 #[macro_use]
 #[path = "support/throughput.rs"]

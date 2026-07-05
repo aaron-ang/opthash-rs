@@ -19,7 +19,7 @@ Both maps share a common core: a single-`Arena` allocation per map indexed by pe
 - **`ElasticHashMap<K, V>`** — Levels with geometrically halving capacities, each probed by a SwissTable-style triangular sequence (`(idx + delta) & mask`); inserts follow a per-level probe budget.
 - **`FunnelHashMap<K, V>`** — Bucketed levels (paper §5): a key maps to one bucket per level; overflow spills to the next level, not other buckets. Plus a split special array: `primary` (odd-step group probe) and `fallback` (two-choice buckets).
 
-Both maps mirror `std::collections::HashMap`'s API and support the same operations. Each map starts with zero allocation (`new()`) and grows dynamically on demand. The `reserve_fraction` headroom knob is exposed via dedicated constructors.
+Both maps mirror the `std::collections::HashMap` API. Each starts with zero allocation (`new()`) and grows on demand; the `reserve_fraction` headroom knob is exposed via dedicated constructors.
 
 ## Usage
 
@@ -70,68 +70,54 @@ m = FunnelHashMap.with_options(capacity=1024, reserve_fraction=0.10)
 Arena (one allocation per map)
 ==============================
 
-  fp = fingerprint (7-bit control byte)
-  kv = key-value entry, __ = empty (CTRL_EMPTY = 0x00), xx = tombstone (CTRL_TOMBSTONE = 0x80)
+  fp = fingerprint (7-bit control byte)   kv = key-value entry
+  __ = empty (CTRL_EMPTY 0x00)            xx = tombstone (CTRL_TOMBSTONE 0x80)
+  a tombstoned kv may still sit in its slot physically, but is logically uninit
 
-  All control bytes pack first, then alignment padding so the slot region
-  starts at `align_of::<SlotEntry<K, V>>()`, then all slots:
+  Control bytes pack first, then alignment padding so the slot region starts
+  at align_of::<SlotEntry<K, V>>(), then the slots:
 
   arena::ptr ► [fp fp xx __ ... ][fp xx fp __ ...][fp fp ...][  pad  ][kv kv kv ...][kv ... ]
                └─── ctrl L0 ────┘└─── ctrl L1 ───┘└── ... ──┘         └─ slots L0 ─┘└─ ... ─┘
-               ▲ each descriptor caches `ctrl_ptr` + `data_ptr` into the arena.
+               ▲ each level descriptor caches ctrl_ptr + data_ptr into the arena.
 
-  Each descriptor stores cached `ctrl_ptr`, `data_ptr`, capacity, plus
-  per-shape metadata (salt, mask, etc). All slot/ctrl/SIMD ops live on
-  the `ArenaSlots` trait (`src/common/arena.rs`).
+  All slot/ctrl/SIMD ops live on the ArenaSlots trait (src/common/arena.rs).
 
 
-ElasticHashMap
-==============
+ElasticHashMap — geometrically halving levels
+=============================================
 
-  levels: Box<[Level]> (descriptors only)
+  Box<[Level]> over the arena; each level ~half the previous, probed by a
+  SwissTable triangular sequence (idx → idx+1 → idx+3 ... & mask). A full
+  level sends the key down to the next:
 
-    Level 0    ctrl_ptr, data_ptr, capacity (~half of total slots)
-    Level 1    geometrically halved
-    Level 2    ...
-
-    per-level  group_count, group_count_mask, salt, len, tombstones,
-               half_reserve_slot_threshold, budget_cap
-
-  arena:       Arena (the single allocation backing every level above)
-
-  map-wide     len, total_slots, max_insertions, reserve_fraction,
-               batch_plan, current_batch_index, batch_remaining,
-               max_populated_level, hash_builder, alloc
+    L0  [################################]  ~half of all slots
+    L1  [################]
+    L2  [########]
+    L3  [####]
+    ...
 
 
-FunnelHashMap
-=============
+FunnelHashMap — fixed-width buckets, overflow down the funnel
+=============================================================
 
-  levels: Box<[BucketLevel]> (descriptors)
+  Box<[BucketLevel]>; each level is a grid of β-wide buckets. A key hashes
+  to one bucket per level (levels salt independently); a full bucket spills
+  the key to the next level. β is fixed, so levels differ only in bucket count:
 
-    Level 0
-      ctrl region   fp xx fp __ ... fp fp xx __ ... fp ...
-      slot region   kv kv kv __ ... kv kv kv __ ... kv ...
-                    └── bucket 0 ──┘└── bucket 1 ──┘
-      (xx in ctrl marks a removed slot; the slot bytes may still hold
-       the stale kv physically, but are logically uninit — never read.)
+    key
+     │  hashed independently to one β-wide bucket per level
+     ▼
+    L0  [b0][b1][b2][b3][b4][b5] ┐ bucket full?
+    L1  [b0][b1][b2]             ▼ rehash to next level
+    L2  [b0]
+    special ─► primary (group-probed · paper B) → fallback (two-choice · paper C)
 
-    Level 1    (same layout, smaller buckets)
+  within one level (buckets sit side by side in the ctrl/slot regions):
 
-    per-level  bucket_count_mask, bucket_size_log2, salt, len, tombstones
-
-  special: SpecialArray
-
-    primary    group-probed (paper B)
-               group_count_mask, len, tombstones
-
-    fallback   two-choice bucketed (paper C)
-               bucket_count, bucket_size_log2, len, tombstones
-
-  arena:       Arena (covers every level + both special regions)
-
-  map-wide     len, total_slots, max_insertions, reserve_fraction,
-               primary_probe_limit, max_populated_level, hash_builder, alloc
+    ctrl  fp xx fp __ ... fp fp xx __ ...
+    slot  kv kv kv __ ... kv kv kv __ ...
+          └── bucket 0 ──┘└── bucket 1 ──┘
 ```
 
 ## Benchmarks

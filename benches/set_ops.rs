@@ -1,3 +1,4 @@
+#[path = "support/common.rs"]
 mod common;
 #[path = "support/throughput.rs"]
 mod throughput;

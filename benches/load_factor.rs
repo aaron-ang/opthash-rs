@@ -3,6 +3,7 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+#[path = "support/common.rs"]
 mod common;
 
 use std::hint::black_box;

@@ -1,3 +1,4 @@
+#[path = "support/common.rs"]
 mod common;
 #[macro_use]
 #[path = "support/throughput.rs"]
@@ -7,22 +8,6 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use throughput::MAP_SIZE;
-
-fn bench_grow_insert(c: &mut Criterion) {
-    let pairs = common::make_pairs(MAP_SIZE);
-    let mut group = c.benchmark_group("grow_insert");
-    group.throughput(Throughput::Elements(MAP_SIZE as u64));
-
-    // No `with_capacity` hint - each impl pays growth-through-rehash.
-    bench_empty!(group, "grow_insert", BatchSize::PerIteration, |map| {
-        for &(key, value) in &pairs {
-            map.insert(black_box(key), black_box(value));
-        }
-        black_box(map.len())
-    },);
-
-    group.finish();
-}
 
 fn bench_iter(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
@@ -195,7 +180,6 @@ criterion_group!(
     name = benches;
     config = Criterion::default().with_profiler(throughput::FlamegraphProfiler::new());
     targets =
-        bench_grow_insert,
         bench_iter,
         bench_iter_mut,
         bench_drain,

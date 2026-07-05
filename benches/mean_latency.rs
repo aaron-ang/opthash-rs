@@ -7,6 +7,7 @@
 //! uv run scripts/generate_latency_chart.py
 //! ```
 
+#[path = "support/common.rs"]
 mod common;
 
 use std::hint::black_box;
