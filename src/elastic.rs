@@ -172,20 +172,14 @@ impl<T> Level<T> {
         probe::hash_to_usize(mixed) & self.group_count_mask as usize
     }
 
-    /// Extends `max_probe_groups` to cover `slot_idx`'s probe distance. Run on
-    /// every insert so a bounded lookup never stops short of a live key.
+    /// Extend `max_probe_groups` to cover a placement `group_dist` steps from its
+    /// probe start, so a bounded lookup never stops short of a live key. The
+    /// placing search already walked this distance.
     #[inline]
-    fn note_placement(&mut self, key_hash: u64, slot_idx: usize) {
-        let target_group = slot_idx / GROUP_SIZE;
-        let mask = self.group_count_mask as usize;
-        let mut probe = probe::TriangularProbe::new(self.triangular_group_start(key_hash));
-        let mut steps = 0u32;
-        while probe.pos != target_group {
-            probe.advance(mask);
-            steps += 1;
-        }
-        if steps + 1 > self.max_probe_groups {
-            self.max_probe_groups = steps + 1;
+    fn note_probe_distance(&mut self, group_dist: u32) {
+        let reached = group_dist + 1;
+        if reached > self.max_probe_groups {
+            self.max_probe_groups = reached;
         }
     }
 }
@@ -608,20 +602,24 @@ where
         let key_fingerprint = control::control_fingerprint(key_hash);
 
         match self.scheduler.on_insert(self.len) {
-            InsertAction::Resize(cap) | InsertAction::Defrag(cap) => self.resize(cap),
+            InsertAction::Resize(cap) | InsertAction::Defrag(cap) => {
+                self.resize(cap);
+                // Post-resize the scheduler is fresh; skip leading zero-quota
+                // batches. The `Continue` arm already advanced in `on_insert`.
+                self.scheduler.advance_batch_window();
+            }
             InsertAction::Continue => {}
         }
 
-        self.scheduler.advance_batch_window();
         let target = self.scheduler.target();
-        let (level_idx, slot_idx) = self
+        let (level_idx, slot_idx, group_dist) = self
             .choose_slot_for_new_key(key_hash, target)
             .expect("no free slot found after resize");
 
         let level = &mut self.levels[level_idx];
         let prev_ctrl = level.control_at(slot_idx);
         level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
-        level.note_placement(key_hash, slot_idx);
+        level.note_probe_distance(group_dist);
         level.len += 1;
         if prev_ctrl == CTRL_TOMBSTONE {
             level.tombstones -= 1;
@@ -927,13 +925,13 @@ where
 
         self.scheduler.advance_batch_window();
         let target = self.scheduler.target();
-        let (level_idx, slot_idx) = self
+        let (level_idx, slot_idx, group_dist) = self
             .choose_slot_for_new_key(key_hash, target)
             .expect("no free slot found in freshly-allocated map");
 
         let level = &mut self.levels[level_idx];
         level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
-        level.note_placement(key_hash, slot_idx);
+        level.note_probe_distance(group_dist);
         level.len += 1;
         if level_idx > self.max_populated_level {
             self.max_populated_level = level_idx;
@@ -1063,18 +1061,18 @@ where
         &mut self,
         key_hash: u64,
         target: BatchTarget,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<(usize, usize, u32)> {
         if self.levels.is_empty() {
             return None;
         }
 
-        if let Some(pair) = self.choose_slot_targeted(key_hash, target) {
-            return Some(pair);
+        if let Some(found) = self.choose_slot_targeted(key_hash, target) {
+            return Some(found);
         }
 
         for li in 0..self.levels.len() {
-            if let Some(slot_idx) = self.first_free_uniform(key_hash, li) {
-                return Some((li, slot_idx));
+            if let Some((slot_idx, dist)) = self.first_free_uniform(key_hash, li) {
+                return Some((li, slot_idx, dist));
             }
         }
         None
@@ -1089,12 +1087,16 @@ where
     /// Paper proves success w.h.p. but not w.p. 1,
     /// so we avoid a hard insert failure on the rare bad event.
     #[inline]
-    fn choose_slot_targeted(&self, key_hash: u64, target: BatchTarget) -> Option<(usize, usize)> {
+    fn choose_slot_targeted(
+        &self,
+        key_hash: u64,
+        target: BatchTarget,
+    ) -> Option<(usize, usize, u32)> {
         let level_idx = match target {
             BatchTarget::Bootstrap => {
                 return self
                     .first_free_uniform(key_hash, 0)
-                    .map(|slot_idx| (0, slot_idx));
+                    .map(|(slot_idx, dist)| (0, slot_idx, dist));
             }
             BatchTarget::LevelPair(level_idx) => level_idx,
         };
@@ -1102,7 +1104,7 @@ where
             let last = self.levels.len() - 1;
             return self
                 .first_free_uniform(key_hash, last)
-                .map(|slot_idx| (last, slot_idx));
+                .map(|(slot_idx, dist)| (last, slot_idx, dist));
         }
 
         let current_level = &self.levels[level_idx];
@@ -1114,31 +1116,33 @@ where
             && next_free_slots.saturating_mul(4) > next_level.capacity()
         {
             let limited_budget = current_level.limited_group_budget();
-            if let Some(slot_idx) = self.first_free_limited(key_hash, level_idx, limited_budget) {
-                return Some((level_idx, slot_idx));
+            if let Some((slot_idx, dist)) =
+                self.first_free_limited(key_hash, level_idx, limited_budget)
+            {
+                return Some((level_idx, slot_idx, dist));
             }
-            if let Some(slot_idx) = self.first_free_uniform(key_hash, level_idx + 1) {
-                return Some((level_idx + 1, slot_idx));
+            if let Some((slot_idx, dist)) = self.first_free_uniform(key_hash, level_idx + 1) {
+                return Some((level_idx + 1, slot_idx, dist));
             }
             return self
                 .first_free_uniform(key_hash, level_idx)
-                .map(|slot_idx| (level_idx, slot_idx));
+                .map(|(slot_idx, dist)| (level_idx, slot_idx, dist));
         }
 
         if current_free_slots <= current_level.half_reserve_slot_threshold as usize {
-            if let Some(slot_idx) = self.first_free_uniform(key_hash, level_idx + 1) {
-                return Some((level_idx + 1, slot_idx));
+            if let Some((slot_idx, dist)) = self.first_free_uniform(key_hash, level_idx + 1) {
+                return Some((level_idx + 1, slot_idx, dist));
             }
             return self
                 .first_free_uniform(key_hash, level_idx)
-                .map(|slot_idx| (level_idx, slot_idx));
+                .map(|(slot_idx, dist)| (level_idx, slot_idx, dist));
         }
 
-        if let Some(slot_idx) = self.first_free_uniform(key_hash, level_idx) {
-            return Some((level_idx, slot_idx));
+        if let Some((slot_idx, dist)) = self.first_free_uniform(key_hash, level_idx) {
+            return Some((level_idx, slot_idx, dist));
         }
         self.first_free_uniform(key_hash, level_idx + 1)
-            .map(|slot_idx| (level_idx + 1, slot_idx))
+            .map(|(slot_idx, dist)| (level_idx + 1, slot_idx, dist))
     }
 
     /// SAFETY: `level_idx` < `self.levels.len()` and `slot_idx` references an
@@ -1176,16 +1180,17 @@ where
         None
     }
 
-    /// Probe-bounded variant of `first_free_uniform`: scans at most
-    /// `max_groups` groups. Used by the elastic schedule when
-    /// `current_level` still has reserve headroom.
+    /// Probe-bounded `first_free_uniform`: scans at most `max_groups` groups.
+    /// Returns `(slot_idx, group_dist)`, the probe step where the slot was found,
+    /// which the insert feeds to [`Level::note_probe_distance`].
     #[inline]
+    #[allow(clippy::cast_possible_truncation)] // group_dist < group_count ≤ u32::MAX
     fn first_free_limited(
         &self,
         key_hash: u64,
         level_idx: usize,
         max_groups: usize,
-    ) -> Option<usize> {
+    ) -> Option<(usize, u32)> {
         let level = &self.levels[level_idx];
         if level.len as usize >= level.capacity() {
             return None;
@@ -1194,9 +1199,9 @@ where
         let max_groups = max_groups.min(group_count.max(1));
         let mask = level.group_count_mask as usize;
         let mut probe = probe::TriangularProbe::new(level.triangular_group_start(key_hash));
-        for _ in 0..max_groups {
+        for step in 0..max_groups {
             if let Some(slot_idx) = level.first_free_in_group(probe.pos) {
-                return Some(slot_idx);
+                return Some((slot_idx, step as u32));
             }
             probe.advance(mask);
         }
@@ -1204,9 +1209,11 @@ where
     }
 
     /// Triangular scan over all groups for the first FREE-or-TOMBSTONE slot.
-    /// Returns `None` only if the level is completely OCCUPIED.
+    /// Returns `(slot_idx, group_dist)` (see [`Self::first_free_limited`]), or
+    /// `None` only if the level is completely OCCUPIED.
     #[inline]
-    fn first_free_uniform(&self, key_hash: u64, level_idx: usize) -> Option<usize> {
+    #[allow(clippy::cast_possible_truncation)] // group_dist < group_count ≤ u32::MAX
+    fn first_free_uniform(&self, key_hash: u64, level_idx: usize) -> Option<(usize, u32)> {
         let level = &self.levels[level_idx];
         if level.len as usize >= level.capacity() {
             return None;
@@ -1214,9 +1221,9 @@ where
         let group_count = level.group_count();
         let mask = level.group_count_mask as usize;
         let mut probe = probe::TriangularProbe::new(level.triangular_group_start(key_hash));
-        for _ in 0..group_count {
+        for step in 0..group_count {
             if let Some(slot_idx) = level.first_free_in_group(probe.pos) {
-                return Some(slot_idx);
+                return Some((slot_idx, step as u32));
             }
             probe.advance(mask);
         }

@@ -2126,9 +2126,32 @@ where
     }
 
     fn remove(&mut self, loc: SlotLocation) -> (K, V) {
-        let kv = self.take_and_tombstone(loc);
+        // Common level case: take + erase + counters + cleanup decision behind
+        // one level borrow, not four re-resolutions of `levels[level_idx]`.
+        let (kv, needs_cleanup) = match loc {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => {
+                let level = &mut self.levels[level_idx];
+                // SAFETY: caller passes a live location found in this table.
+                let removed = unsafe { level.take(slot_idx) };
+                if level.erase(slot_idx) {
+                    level.tombstones += 1;
+                }
+                level.len -= 1;
+                let needs_cleanup = level.tombstones as usize
+                    > capacity::tombstone_cleanup_threshold(level.capacity());
+                self.len -= 1;
+                ((removed.key, removed.value), needs_cleanup)
+            }
+            special => (
+                self.take_and_tombstone(special),
+                self.region_needs_cleanup(special),
+            ),
+        };
         self.shrink_max_populated_level();
-        if self.region_needs_cleanup(loc) {
+        if needs_cleanup {
             self.resize(self.total_slots);
         }
         kv
