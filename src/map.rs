@@ -9,7 +9,7 @@ use allocator_api2::alloc::{Allocator, Global};
 use equivalent::Equivalent;
 
 use crate::common::DefaultHashBuilder;
-use crate::common::arena::SlotEntry;
+use crate::common::arena::{self, SlotEntry};
 use crate::common::config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY};
 use crate::common::control;
 use crate::common::error::TryReserveError;
@@ -450,7 +450,7 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
-        crate::common::arena::check_disjoint_aliasing(&locations);
+        arena::check_disjoint_aliasing(&locations);
         std::array::from_fn(|i| {
             locations[i].map(|loc| {
                 // SAFETY: locations are live and unique among the hits (asserted above).
@@ -471,7 +471,7 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
-        crate::common::arena::check_disjoint_aliasing(&locations);
+        arena::check_disjoint_aliasing(&locations);
         std::array::from_fn(|i| {
             locations[i].map(|loc| {
                 // SAFETY: locations are live and unique among the hits (asserted above).

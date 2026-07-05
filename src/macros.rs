@@ -28,7 +28,7 @@ macro_rules! declare_backend_aliases {
             pub type $mp_alias<
                 K,
                 V,
-                S = $crate::common::DefaultHashBuilder,
+                S = $crate::DefaultHashBuilder,
                 A = allocator_api2::alloc::Global,
             > = $crate::map::$mp_target<K, V, $Table<K, V, S, A>>;
         )*
@@ -38,7 +38,7 @@ macro_rules! declare_backend_aliases {
                 'a,
                 K,
                 V,
-                S = $crate::common::DefaultHashBuilder,
+                S = $crate::DefaultHashBuilder,
                 A = allocator_api2::alloc::Global,
             > = $crate::map::$mr_target<'a, K, V, $Table<K, V, S, A>>;
         )*
@@ -48,14 +48,14 @@ macro_rules! declare_backend_aliases {
             K,
             V,
             F,
-            S = $crate::common::DefaultHashBuilder,
+            S = $crate::DefaultHashBuilder,
             A = allocator_api2::alloc::Global,
         > = $crate::map::ExtractIf<'a, K, V, $Table<K, V, S, A>, F>;
         $(
             #[doc = $sp_doc]
             pub type $sp_alias<
                 T,
-                S = $crate::common::DefaultHashBuilder,
+                S = $crate::DefaultHashBuilder,
                 A = allocator_api2::alloc::Global,
             > = $crate::set::$sp_target<T, $Table<T, (), S, A>>;
         )*
@@ -64,7 +64,7 @@ macro_rules! declare_backend_aliases {
             pub type $sr_alias<
                 'a,
                 T,
-                S = $crate::common::DefaultHashBuilder,
+                S = $crate::DefaultHashBuilder,
                 A = allocator_api2::alloc::Global,
             > = $crate::set::$sr_target<'a, T, $Table<T, (), S, A>>;
         )*
