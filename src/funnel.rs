@@ -2576,6 +2576,23 @@ mod tests {
 
     use crate::common::config::DEFAULT_RESERVE_FRACTION;
 
+    /// Every key hashes to 0, so all collide into bucket 0 of each level and,
+    /// once those fill, into the special array — deterministic, seed-free.
+    struct ConstHasher;
+    impl Hasher for ConstHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, _: &[u8]) {}
+    }
+    struct ConstHashBuilder;
+    impl BuildHasher for ConstHashBuilder {
+        type Hasher = ConstHasher;
+        fn build_hasher(&self) -> Self::Hasher {
+            ConstHasher
+        }
+    }
+
     #[test]
     fn resize_scheduler_owns_pending_entries_and_checked_growth() {
         let mut scheduler = ResizeScheduler::new(64, vec![(1, 10), (2, 20)]);
@@ -2755,7 +2772,9 @@ mod tests {
     }
 
     #[test]
-    fn clear_then_reinsert_preserves_level_entries() {
+    fn clear_then_reinsert_preserves_entries() {
+        // Assert preservation (len + retrievable), not placement: which entries
+        // reach the special array is distribution-dependent, never zero-guaranteed.
         let mut map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity(512);
         for i in 0..384 {
             map.insert(i, i ^ 0xa5a5);
@@ -2767,29 +2786,35 @@ mod tests {
         }
 
         assert_eq!(map.len(), 384);
-        assert_eq!(map.table().overflow.len(), 0);
         for i in 512..896 {
             assert_eq!(map.get(&i), Some(&(i ^ 0x5a5a)));
         }
     }
 
     #[test]
-    fn level_tombstone_reuse_decrements_counter() {
-        struct ConstHasher;
-        impl Hasher for ConstHasher {
-            fn finish(&self) -> u64 {
-                0
-            }
-            fn write(&mut self, _: &[u8]) {}
+    fn clear_empties_the_special_array() {
+        // All keys collide into the special array; clear must empty it, so
+        // `overflow.len() == 0` after clear is a real invariant here.
+        let mut map: FunnelHashMap<u64, u64, ConstHashBuilder> =
+            FunnelHashMap::with_capacity_and_hasher(512, ConstHashBuilder);
+        let budget = u64::try_from(map.capacity()).expect("capacity fits u64");
+        let mut inserted = 0;
+        while map.table().overflow.len() == 0 && inserted < budget {
+            map.insert(inserted, inserted);
+            inserted += 1;
         }
-        struct ConstHashBuilder;
-        impl BuildHasher for ConstHashBuilder {
-            type Hasher = ConstHasher;
-            fn build_hasher(&self) -> Self::Hasher {
-                ConstHasher
-            }
-        }
+        assert!(
+            map.table().overflow.len() > 0,
+            "all-colliding keys should populate the special array"
+        );
 
+        map.clear();
+        assert_eq!(map.len(), 0);
+        assert_eq!(map.table().overflow.len(), 0);
+    }
+
+    #[test]
+    fn level_tombstone_reuse_decrements_counter() {
         let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
             FunnelHashMap::with_capacity_and_reserve_fraction_and_hasher_in(
                 2048,
@@ -2880,21 +2905,6 @@ mod tests {
     fn bucket_overflow_promotes_max_populated_level() {
         // Paper §5: A_{i,j} overflow must spill into A_{i+1}, not skip to the
         // special array. Constant hasher pins every key to the same L0 bucket.
-        struct ConstHasher;
-        impl Hasher for ConstHasher {
-            fn finish(&self) -> u64 {
-                0
-            }
-            fn write(&mut self, _: &[u8]) {}
-        }
-        struct ConstHashBuilder;
-        impl BuildHasher for ConstHashBuilder {
-            type Hasher = ConstHasher;
-            fn build_hasher(&self) -> Self::Hasher {
-                ConstHasher
-            }
-        }
-
         let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
             FunnelHashMap::with_capacity_and_reserve_fraction_and_hasher_in(
                 2048,
@@ -2925,21 +2935,6 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)] // Constant-hash special-array search is slow under Miri.
     fn special_array_removal_updates_region_counts_once() {
-        struct ConstHasher;
-        impl Hasher for ConstHasher {
-            fn finish(&self) -> u64 {
-                0
-            }
-            fn write(&mut self, _: &[u8]) {}
-        }
-        struct ConstHashBuilder;
-        impl BuildHasher for ConstHashBuilder {
-            type Hasher = ConstHasher;
-            fn build_hasher(&self) -> Self::Hasher {
-                ConstHasher
-            }
-        }
-
         let mut map: FunnelHashMap<i32, i32, ConstHashBuilder> =
             FunnelHashMap::with_capacity_and_reserve_fraction_and_hasher_in(
                 2048,
