@@ -1,3 +1,7 @@
+//! Build script: emits the `opthash_*` control-group `cfg`s (and their
+//! `check-cfg` declarations) chosen from the target arch, target features, and
+//! the `nightly` feature.
+
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_FEATURE");

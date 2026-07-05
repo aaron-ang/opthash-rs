@@ -2,6 +2,10 @@
 // Raw-pointer casts in pyo3 macro expansions. Per-fn `#[allow]` doesn't reach
 // the generated wrapper, so suppression must be file-level.
 #![allow(clippy::ptr_as_ptr, clippy::borrow_as_ptr, clippy::ref_as_ptr)]
+// pyo3 signatures (`Bound<PyModule>`, `PyRef<Self>`, …) elide the lifetime by
+// convention; the crate-wide `elided_lifetimes_in_paths` lint is waived here for
+// the same macro-reach reason as above. The rest of the crate keeps it on.
+#![allow(elided_lifetimes_in_paths)]
 
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;

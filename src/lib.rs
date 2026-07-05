@@ -1,4 +1,17 @@
+//! Open-addressing hash maps and sets built on Elastic Hashing and Funnel
+//! Hashing, sharing a `SwissTable`-style control-byte core.
+//!
+//! The crate is `no_std` (needs `alloc`); the default features `std` and
+//! `default-hasher` are on for the usual std-backed, `foldhash`-seeded setup.
+//! Disable them for a `core`-only build where callers supply their own hasher.
+#![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(feature = "nightly", feature(allocator_api))]
+// Library-API lints, scoped here rather than in `Cargo.toml [lints]` so they
+// govern only the library and not benches/tests/build-script.
+#![warn(missing_docs)]
+#![warn(unreachable_pub)]
+
+extern crate alloc;
 
 mod common;
 mod elastic;

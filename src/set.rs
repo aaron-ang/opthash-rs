@@ -1,11 +1,13 @@
-use std::fmt;
-use std::hash::Hash;
-use std::iter::{Chain, FusedIterator};
-use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Sub, SubAssign};
+use core::fmt;
+use core::hash::Hash;
+use core::iter::{Chain, FusedIterator};
+use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Sub, SubAssign};
 
+use alloc::boxed::Box;
 use allocator_api2::alloc::Global;
 use equivalent::Equivalent;
 
+#[cfg(feature = "default-hasher")]
 use crate::common::DefaultHashBuilder;
 use crate::common::error::TryReserveError;
 use crate::map::{self, TableBackend};
@@ -23,6 +25,7 @@ where
     map: map::HashMap<T, (), P>,
 }
 
+#[cfg(feature = "default-hasher")]
 impl<T, P> HashSet<T, P>
 where
     T: Eq + Hash,
@@ -110,6 +113,7 @@ where
     }
 }
 
+#[cfg(feature = "default-hasher")]
 impl<T, P> HashSet<T, P>
 where
     T: Eq + Hash,
@@ -160,7 +164,7 @@ where
         self.map.allocator()
     }
 
-    /// Reference to the set's [`std::hash::BuildHasher`].
+    /// Reference to the set's [`core::hash::BuildHasher`].
     pub fn hasher(&self) -> &P::Hasher {
         self.map.hasher()
     }
@@ -377,6 +381,7 @@ where
     }
 }
 
+#[cfg(feature = "default-hasher")]
 impl<T, P> Default for HashSet<T, P>
 where
     T: Eq + Hash,
@@ -440,6 +445,7 @@ where
     }
 }
 
+#[cfg(feature = "default-hasher")]
 impl<T, P, const N: usize> From<[T; N]> for HashSet<T, P>
 where
     T: Eq + Hash,

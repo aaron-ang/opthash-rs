@@ -1,13 +1,14 @@
-use std::error::Error;
-use std::fmt;
-use std::hash::{BuildHasher, Hash};
-use std::iter::FusedIterator;
-use std::marker::PhantomData;
-use std::ops::Index;
+use core::error::Error;
+use core::fmt;
+use core::hash::{BuildHasher, Hash};
+use core::iter::FusedIterator;
+use core::marker::PhantomData;
+use core::ops::Index;
 
 use allocator_api2::alloc::{Allocator, Global};
 use equivalent::Equivalent;
 
+#[cfg(feature = "default-hasher")]
 use crate::common::DefaultHashBuilder;
 use crate::common::arena::{self, SlotEntry};
 use crate::common::config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY};
@@ -451,7 +452,7 @@ where
     {
         let locations = self.locate_disjoint(keys);
         arena::check_disjoint_aliasing(&locations);
-        std::array::from_fn(|i| {
+        core::array::from_fn(|i| {
             locations[i].map(|loc| {
                 // SAFETY: locations are live and unique among the hits (asserted above).
                 unsafe { &mut self.slot_entry_mut(loc).value }
@@ -472,7 +473,7 @@ where
     {
         let locations = self.locate_disjoint(keys);
         arena::check_disjoint_aliasing(&locations);
-        std::array::from_fn(|i| {
+        core::array::from_fn(|i| {
             locations[i].map(|loc| {
                 // SAFETY: locations are live and unique among the hits (asserted above).
                 let slot = unsafe { self.slot_entry_mut(loc) };
@@ -493,7 +494,7 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let locations = self.locate_disjoint(keys);
-        std::array::from_fn(|i| {
+        core::array::from_fn(|i| {
             locations[i].map(|loc|
                 // SAFETY: caller guarantees the hits are pairwise distinct.
                 unsafe { &mut self.slot_entry_mut(loc).value })
@@ -505,7 +506,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        std::array::from_fn(|i| self.find_location(keys[i]))
+        core::array::from_fn(|i| self.find_location(keys[i]))
     }
 
     /// Inserts `key`/`value` only if absent; otherwise returns an
@@ -598,7 +599,7 @@ where
     V: fmt::Debug,
     P: TableBackend<K, V>,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OccupiedError")
             .field("key", self.entry.key())
             .field("value", &self.value)
@@ -612,7 +613,7 @@ where
     V: fmt::Debug,
     P: TableBackend<K, V>,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "tried to insert {:?}, but key {:?} was already present with {:?}",
@@ -794,6 +795,7 @@ where
 // Convenience constructors (reproduced generically from the full constructor)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "default-hasher")]
 impl<K, V, P> HashMap<K, V, P>
 where
     P: TableBackend<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
@@ -894,6 +896,7 @@ where
     }
 }
 
+#[cfg(feature = "default-hasher")]
 impl<K, V, P> HashMap<K, V, P>
 where
     P: TableBackend<K, V, Hasher = DefaultHashBuilder>,
@@ -941,7 +944,7 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
         let scan = self.table.scan();
         let remaining = self.table.len();
         IterMut {
-            table: std::ptr::from_mut(&mut self.table),
+            table: core::ptr::from_mut(&mut self.table),
             scan,
             remaining,
             _marker: PhantomData,
@@ -978,7 +981,7 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
         let scan = self.table.scan();
         let remaining = self.table.len();
         Drain {
-            table: std::ptr::from_mut(&mut self.table),
+            table: core::ptr::from_mut(&mut self.table),
             scan,
             remaining,
             _marker: PhantomData,
@@ -992,7 +995,7 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     {
         let scan = self.table.scan();
         ExtractIf {
-            table: std::ptr::from_mut(&mut self.table),
+            table: core::ptr::from_mut(&mut self.table),
             scan,
             pred: f,
             _marker: PhantomData,
@@ -1104,7 +1107,7 @@ impl<K, V, P: TableBackend<K, V>> Iterator for IntoIter<K, V, P> {
         self.remaining -= 1;
         // SAFETY: `ptr` is a live slot; read the entry out, then tombstone so
         // the consumed table's `Drop` won't re-drop the moved-out slot.
-        let entry = unsafe { std::ptr::read(ptr) };
+        let entry = unsafe { core::ptr::read(ptr) };
         self.table.tombstone_slot(loc);
         Some((entry.key, entry.value))
     }
@@ -1136,7 +1139,7 @@ impl<K, V, P: TableBackend<K, V>> Iterator for Drain<'_, K, V, P> {
         self.remaining -= 1;
         // SAFETY: live slot; read the entry out and mark a tombstone (counters
         // are reset wholesale by `wipe_all` on drop).
-        let entry = unsafe { std::ptr::read(ptr) };
+        let entry = unsafe { core::ptr::read(ptr) };
         unsafe { (*self.table).tombstone_slot(loc) };
         Some((entry.key, entry.value))
     }
@@ -1184,7 +1187,7 @@ where
             if (self.pred)(&slot.key, &mut slot.value) {
                 // SAFETY: matched — read the entry out, then finalize removal
                 // (tombstone + counters; the map keeps being used).
-                let entry = unsafe { std::ptr::read(ptr) };
+                let entry = unsafe { core::ptr::read(ptr) };
                 unsafe { (*self.table).extract_finish(loc) };
                 return Some((entry.key, entry.value));
             }
@@ -1203,20 +1206,21 @@ where
 }
 
 /// Iterator over `&K`.
-pub type Keys<'a, K, V, P> = CommonKeys<Iter<'a, K, V, P>>;
+pub(crate) type Keys<'a, K, V, P> = CommonKeys<Iter<'a, K, V, P>>;
 /// Iterator over `&V`.
-pub type Values<'a, K, V, P> = CommonValues<Iter<'a, K, V, P>>;
+pub(crate) type Values<'a, K, V, P> = CommonValues<Iter<'a, K, V, P>>;
 /// Iterator over `&mut V`.
-pub type ValuesMut<'a, K, V, P> = CommonValues<IterMut<'a, K, V, P>>;
+pub(crate) type ValuesMut<'a, K, V, P> = CommonValues<IterMut<'a, K, V, P>>;
 /// Consuming iterator over owned keys.
-pub type IntoKeys<K, V, P> = CommonIntoKeys<IntoIter<K, V, P>>;
+pub(crate) type IntoKeys<K, V, P> = CommonIntoKeys<IntoIter<K, V, P>>;
 /// Consuming iterator over owned values.
-pub type IntoValues<K, V, P> = CommonIntoValues<IntoIter<K, V, P>>;
+pub(crate) type IntoValues<K, V, P> = CommonIntoValues<IntoIter<K, V, P>>;
 
 // ---------------------------------------------------------------------------
 // Trait impls
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "default-hasher")]
 impl<K, V, P> Default for HashMap<K, V, P>
 where
     P: TableBackend<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
@@ -1319,6 +1323,7 @@ where
     }
 }
 
+#[cfg(feature = "default-hasher")]
 impl<K, V, P> FromIterator<(K, V)> for HashMap<K, V, P>
 where
     K: Eq + Hash,

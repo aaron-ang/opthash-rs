@@ -1,15 +1,15 @@
 #[cfg(target_arch = "aarch64")]
-use std::arch::aarch64;
+use core::arch::aarch64;
 #[cfg(opthash_neon_group)]
-use std::arch::aarch64::uint8x16_t;
+use core::arch::aarch64::uint8x16_t;
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64;
+use core::arch::x86_64;
 #[cfg(all(target_arch = "x86_64", opthash_eq_bits_16))]
-use std::arch::x86_64::__m128i;
+use core::arch::x86_64::__m128i;
 #[cfg(opthash_avx2)]
-use std::arch::x86_64::__m256i;
+use core::arch::x86_64::__m256i;
 #[cfg(opthash_avx512_group)]
-use std::arch::x86_64::__m512i;
+use core::arch::x86_64::__m512i;
 
 use super::bitmask::BitMask;
 #[cfg(opthash_scalar_group)]

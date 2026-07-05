@@ -7,8 +7,8 @@ description = "Rust implementations of Elastic Hashing and Funnel Hashing"
 readme = "README.md"
 repository = "https://github.com/aaron-ang/opthash-rs"
 license = "Apache-2.0"
-keywords = ["hashmap", "open_addressing", "elastic_hashing", "funnel_hashing"]
-categories = ["algorithms", "data-structures"]
+keywords = ["hashmap", "open_addressing", "elastic_hashing", "funnel_hashing", "no_std"]
+categories = ["algorithms", "data-structures", "no-std"]
 exclude = [
     "/benches/",
     "/opthash/",
@@ -25,16 +25,24 @@ exclude = [
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[package.metadata.docs.rs]
+features = ["nightly"]
+rustdoc-args = ["--generate-link-to-definition"]
+
 [features]
-python = ["dep:pyo3"]
-nightly = ["allocator-api2/nightly", "hashbrown/nightly"]
+default = ["std", "default-hasher"]
+default-hasher = ["dep:foldhash"]
+std = ["foldhash?/std", "allocator-api2/std"]
+python = ["std", "dep:pyo3"]
+nightly = ["allocator-api2/nightly", "hashbrown/nightly", "foldhash?/nightly"]
 
 [dependencies]
 allocator-api2 = { version = "0.2", default-features = false, features = [
     "alloc",
 ] }
 equivalent = "1"
-foldhash = "0.2"
+foldhash = { version = "0.2", default-features = false, optional = true }
+libm = { version = "0.2", default-features = false }
 pyo3 = { version = "0.29", features = [
     "extension-module",
     "abi3-py310",
@@ -44,7 +52,6 @@ pyo3 = { version = "0.29", features = [
 criterion = { package = "codspeed-criterion-compat", version = "4", features = [
     "html_reports",
 ] }
-foldhash = "0.2"
 hashbrown = "0.17"
 hdrhistogram = "7.5"
 pprof = { version = "0.15", features = ["flamegraph"] }
@@ -52,7 +59,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+elided_lifetimes_in_paths = "warn"
+unused_extern_crates = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(codspeed)'] }
+
+[lints.clippy]
+borrow_as_ptr = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+ref_as_ptr = "warn"
+semicolon_if_nothing_returned = "warn"
 
 [[bench]]
 name = "speedup"

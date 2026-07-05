@@ -4,6 +4,9 @@ use super::config::{
 
 /// `f64 ↔ usize` casts with the truncation/sign lints we accept here.
 pub(crate) mod cast {
+    #[cfg(not(feature = "std"))]
+    use crate::common::float::FloatExt as _;
+
     #[allow(clippy::cast_precision_loss)]
     #[inline]
     pub(crate) fn usize_to_f64(value: usize) -> f64 {
@@ -106,6 +109,9 @@ pub(crate) mod align {
 
 /// Probe-limit and hash-to-index helpers shared across maps.
 pub(crate) mod probe {
+    #[cfg(not(feature = "std"))]
+    use crate::common::float::FloatExt as _;
+
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,

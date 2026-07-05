@@ -1,6 +1,6 @@
-use std::marker::PhantomData;
-use std::mem::{self, MaybeUninit};
-use std::ptr;
+use core::marker::PhantomData;
+use core::mem::{self, MaybeUninit};
+use core::ptr;
 
 use allocator_api2::alloc::{Allocator, Layout};
 

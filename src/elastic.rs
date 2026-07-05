@@ -1,6 +1,7 @@
-use std::hash::{BuildHasher, Hash};
-use std::mem::{self, MaybeUninit};
+use core::hash::{BuildHasher, Hash};
+use core::mem::{self, MaybeUninit};
 
+use alloc::{boxed::Box, vec::Vec};
 use allocator_api2::alloc::{Allocator, Global, Layout};
 use equivalent::Equivalent;
 
@@ -9,6 +10,8 @@ use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::{GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::common::error::TryReserveError;
+#[cfg(not(feature = "std"))]
+use crate::common::float::FloatExt as _;
 use crate::common::iter::RegionCursor;
 use crate::common::math::{self, align, capacity, probe};
 use crate::macros;
@@ -320,7 +323,7 @@ type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>);
 
 /// Schedule resize, repack, and batch progression.
 #[derive(Clone)]
-pub struct BatchScheduler {
+pub(crate) struct BatchScheduler {
     batch_plan: Box<[usize]>,
     current_batch_index: usize,
     batch_remaining: usize,
@@ -331,7 +334,7 @@ pub struct BatchScheduler {
 }
 
 /// Direct the structural work required before insertion.
-pub enum InsertAction {
+pub(crate) enum InsertAction {
     /// Resize to the specified slot count.
     Resize(usize),
     /// Repack at the current slot count.
@@ -347,7 +350,7 @@ enum BatchTarget {
 }
 
 impl BatchScheduler {
-    pub fn new(batch_plan: Box<[usize]>, total_slots: usize, max_insertions: usize) -> Self {
+    pub(crate) fn new(batch_plan: Box<[usize]>, total_slots: usize, max_insertions: usize) -> Self {
         let initial_remaining = batch_plan.first().copied().unwrap_or(0);
         Self {
             batch_plan,
@@ -362,7 +365,7 @@ impl BatchScheduler {
 
     /// Select structural work for the next insert.
     #[inline]
-    pub fn on_insert(&mut self, current_len: usize) -> InsertAction {
+    pub(crate) fn on_insert(&mut self, current_len: usize) -> InsertAction {
         self.inserts_since_repack += 1;
         if current_len >= self.max_insertions {
             // Bootstrap empty storage instead of doubling zero slots.
@@ -384,7 +387,7 @@ impl BatchScheduler {
 
     /// Request a repack after probe depth exceeds its budget.
     #[inline]
-    pub fn report_drift(&mut self) {
+    pub(crate) fn report_drift(&mut self) {
         self.defrag_pending = true;
     }
 
@@ -406,7 +409,7 @@ impl BatchScheduler {
 
     /// Skip exhausted and zero-quota batches.
     #[inline]
-    pub fn advance_batch_window(&mut self) {
+    pub(crate) fn advance_batch_window(&mut self) {
         while self.batch_remaining == 0 && self.current_batch_index + 1 < self.batch_plan.len() {
             self.current_batch_index += 1;
             self.batch_remaining = self.batch_plan[self.current_batch_index];
@@ -415,7 +418,7 @@ impl BatchScheduler {
 
     /// Reset batch and repack progress after resize or clear.
     #[inline]
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.current_batch_index = 0;
         self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
         self.defrag_pending = false;
@@ -1337,7 +1340,7 @@ fn build_batch_plan(
 mod tests {
     use super::*;
 
-    use std::ptr;
+    use core::ptr;
 
     use crate::common::config::DEFAULT_RESERVE_FRACTION;
 

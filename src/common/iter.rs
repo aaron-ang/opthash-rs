@@ -1,6 +1,6 @@
-use std::fmt;
-use std::iter::FusedIterator;
-use std::ptr;
+use core::fmt;
+use core::iter::FusedIterator;
+use core::ptr;
 
 use super::arena::ArenaSlots;
 use super::bitmask::BitMask;
@@ -53,7 +53,7 @@ impl<I, K, V> ExactSizeIterator for Keys<I> where I: ExactSizeIterator<Item = (K
 impl<I, K, V> FusedIterator for Keys<I> where I: FusedIterator<Item = (K, V)> {}
 
 impl<I> fmt::Debug for Keys<I> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Keys").finish_non_exhaustive()
     }
 }
@@ -104,7 +104,7 @@ impl<I, K, V> ExactSizeIterator for Values<I> where I: ExactSizeIterator<Item = 
 impl<I, K, V> FusedIterator for Values<I> where I: FusedIterator<Item = (K, V)> {}
 
 impl<I> fmt::Debug for Values<I> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Values").finish_non_exhaustive()
     }
 }
@@ -147,7 +147,7 @@ impl<I, K, V> ExactSizeIterator for IntoKeys<I> where I: ExactSizeIterator<Item 
 impl<I, K, V> FusedIterator for IntoKeys<I> where I: FusedIterator<Item = (K, V)> {}
 
 impl<I> fmt::Debug for IntoKeys<I> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IntoKeys").finish_non_exhaustive()
     }
 }
@@ -190,7 +190,7 @@ impl<I, K, V> ExactSizeIterator for IntoValues<I> where I: ExactSizeIterator<Ite
 impl<I, K, V> FusedIterator for IntoValues<I> where I: FusedIterator<Item = (K, V)> {}
 
 impl<I> fmt::Debug for IntoValues<I> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IntoValues").finish_non_exhaustive()
     }
 }

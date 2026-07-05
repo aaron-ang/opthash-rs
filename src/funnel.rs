@@ -1,8 +1,9 @@
-use std::hash::{BuildHasher, Hash};
-use std::mem::{self, MaybeUninit};
-use std::ops::Range;
-use std::slice;
+use core::hash::{BuildHasher, Hash};
+use core::mem::{self, MaybeUninit};
+use core::ops::Range;
+use core::slice;
 
+use alloc::{boxed::Box, vec, vec::Vec};
 use allocator_api2::alloc::{Allocator, Global, Layout};
 use equivalent::Equivalent;
 
@@ -11,6 +12,8 @@ use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::{GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::TryReserveError;
+#[cfg(not(feature = "std"))]
+use crate::common::float::FloatExt as _;
 use crate::common::iter::RegionCursor;
 use crate::common::math::{self, align, capacity, cast, probe};
 use crate::macros;
@@ -146,7 +149,7 @@ impl<T> BucketLevel<T> {
         let bucket_range = self.bucket_range(bucket_idx);
         debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
         if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
-            unsafe { std::hint::unreachable_unchecked() };
+            unsafe { core::hint::unreachable_unchecked() };
         }
         let group_idx = bucket_range.start / GROUP_SIZE;
         self.group(group_idx)
@@ -192,7 +195,7 @@ impl<K, V> BucketLevel<SlotEntry<K, V>> {
         let bucket_range = self.bucket_range(bucket_idx);
         debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
         if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
-            unsafe { std::hint::unreachable_unchecked() };
+            unsafe { core::hint::unreachable_unchecked() };
         }
         let group = self.group(bucket_range.start / GROUP_SIZE);
         for relative_idx in group.match_mask(key_fingerprint) {
@@ -445,7 +448,7 @@ impl<K, V> OverflowHandler<K, V> {
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
-        mut free_slot: FreeSlot,
+        mut free_slot: FreeSlot<'_>,
     ) -> Option<SlotLocation>
     where
         Q: Equivalent<K> + ?Sized,
@@ -472,7 +475,7 @@ impl<K, V> OverflowHandler<K, V> {
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
-        free_slot: FreeSlot,
+        free_slot: FreeSlot<'_>,
     ) -> LookupStep
     where
         Q: Equivalent<K> + ?Sized,
@@ -533,7 +536,7 @@ impl<K, V> OverflowHandler<K, V> {
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
-        free_slot: FreeSlot,
+        free_slot: FreeSlot<'_>,
     ) -> Option<usize>
     where
         Q: Equivalent<K> + ?Sized,
@@ -1712,7 +1715,7 @@ where
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
-        free_slot: FreeSlot,
+        free_slot: FreeSlot<'_>,
     ) -> Option<SlotLocation>
     where
         Q: Equivalent<K> + ?Sized,
@@ -1729,7 +1732,7 @@ where
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
-        free_slot: FreeSlot,
+        free_slot: FreeSlot<'_>,
     ) -> (Option<SlotLocation>, LevelMiss)
     where
         Q: Equivalent<K> + ?Sized,
@@ -2572,7 +2575,7 @@ where
 mod tests {
     use super::*;
 
-    use std::hash::{BuildHasher, Hasher};
+    use core::hash::{BuildHasher, Hasher};
 
     use crate::common::config::DEFAULT_RESERVE_FRACTION;
 
