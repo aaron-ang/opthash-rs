@@ -435,7 +435,7 @@ pub(crate) trait ArenaSlots<T> {
     /// → write → stamp OCCUPIED. A panic mid-loop leaves `self` OCCUPIED only on
     /// fully-written slots; TOMBSTONE bytes follow in a second pass. `self` must
     /// match `src`'s capacity.
-    fn clone_region_from(&self, src: &Self)
+    fn clone_region_from(&mut self, src: &Self)
     where
         Self: Sized,
         T: Clone,
