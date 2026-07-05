@@ -262,12 +262,12 @@ unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
 
 impl<K, V, S, A: Allocator + Clone> Drop for ElasticTable<K, V, S, A> {
     fn drop(&mut self) {
-        let arena = mem::replace(&mut self.arena, Arena::empty());
-        let guard = arena::DeallocGuard::new(arena, &self.alloc);
-        for level in &mut self.levels {
-            level.drop_values();
-        }
-        drop(guard);
+        let levels = &mut self.levels;
+        self.arena.drop_table(&self.alloc, || {
+            for level in levels {
+                level.drop_values();
+            }
+        });
     }
 }
 
@@ -653,7 +653,7 @@ where
     }
 
     /// Take + tombstone + decrement counters for the slot at `loc`. Backs
-    /// [`map::TableInsert::remove`], which adds a resize pass.
+    /// [`map::TableBackend::remove`], which adds a resize pass.
     fn take_and_tombstone(&mut self, level_idx: usize, slot_idx: usize) -> (K, V) {
         let removed = {
             let level = &mut self.levels[level_idx];
@@ -690,7 +690,7 @@ where
 }
 
 #[allow(private_interfaces)]
-impl<K, V, S, A> map::TableStorage<K, V> for ElasticTable<K, V, S, A>
+impl<K, V, S, A> map::TableBackend<K, V> for ElasticTable<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
@@ -745,14 +745,9 @@ where
         let slot = unsafe { self.slot_mut(level_idx, slot_idx) };
         mem::replace(&mut slot.value, value)
     }
-}
 
-impl<K, V, S, A> map::TableLookup<K, V> for ElasticTable<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
+    // -- Lookup --
+
     #[inline]
     fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<(usize, usize)>
     where
@@ -760,14 +755,9 @@ where
     {
         self.find_slot_indices_with_hash(key, hash, fingerprint)
     }
-}
 
-impl<K, V, S, A> map::TableInsert<K, V> for ElasticTable<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
+    // -- Insert / remove --
+
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> (usize, usize) {
         self.insert_for_vacant_entry(key, value, hash)
@@ -796,15 +786,9 @@ where
         level.tombstones += 1;
         self.len -= 1;
     }
-}
 
-#[allow(private_interfaces)]
-impl<K, V, S, A> map::TableIterate<K, V> for ElasticTable<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
+    // -- Iterate --
+
     type Scan = ElasticScan;
 
     #[inline]
@@ -825,14 +809,9 @@ where
         }
         self.scan_advance(scan)
     }
-}
 
-impl<K, V, S, A> map::TableLifecycle<K, V> for ElasticTable<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
+    // -- Lifecycle --
+
     #[inline]
     fn with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
@@ -896,13 +875,7 @@ where
         let mut guard = arena::ArenaDropGuard::new(arena, levels, self.alloc.clone());
 
         for (dst, src_lvl) in guard.regions_mut().iter_mut().zip(self.levels.iter()) {
-            arena::clone_region_panic_safe::<K, V>(
-                src_lvl.ctrl_ptr,
-                dst.ctrl_ptr,
-                src_lvl.data_ptr,
-                dst.data_ptr,
-                src_lvl.capacity as usize,
-            );
+            dst.clone_region_from(src_lvl);
             dst.len = src_lvl.len;
             dst.tombstones = src_lvl.tombstones;
             dst.max_probe_groups = src_lvl.max_probe_groups;

@@ -8,15 +8,15 @@ use equivalent::Equivalent;
 
 use crate::common::DefaultHashBuilder;
 use crate::common::error::TryReserveError;
-use crate::map::{self, TableProbing};
+use crate::map::{self, TableBackend};
 
 /// Boxed predicate adapting a set-level `FnMut(&T) -> bool` to the map's
 /// `FnMut(&K, &mut V) -> bool`. Boxing keeps the public `ExtractIf` type
 /// nameable; the allocation is once per `extract_if` call, off the hot path.
 type SetExtractPred<'a, T> = Box<dyn FnMut(&T, &mut ()) -> bool + 'a>;
 
-/// Use a [`TableProbing`] backend to store unique values.
-pub struct HashSet<T, P: TableProbing<T, ()>>
+/// Use a [`TableBackend`] backend to store unique values.
+pub struct HashSet<T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -26,7 +26,7 @@ where
 impl<T, P> HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableBackend<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     /// Creates an empty set.
     #[must_use]
@@ -64,7 +64,7 @@ where
 impl<T, P> HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, (), Alloc = Global>,
+    P: TableBackend<T, (), Alloc = Global>,
 {
     /// Creates an empty set that uses `hash_builder` to hash values.
     #[must_use]
@@ -113,7 +113,7 @@ where
 impl<T, P> HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, (), Hasher = DefaultHashBuilder>,
+    P: TableBackend<T, (), Hasher = DefaultHashBuilder>,
 {
     /// Creates an empty set in the given allocator.
     #[must_use]
@@ -135,7 +135,7 @@ where
 impl<T, P> HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     /// Full constructor: capacity, reserve fraction, hasher, and allocator.
     #[must_use]
@@ -380,7 +380,7 @@ where
 impl<T, P> Default for HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableBackend<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     fn default() -> Self {
         Self::new()
@@ -390,7 +390,7 @@ where
 impl<T, P> Clone for HashSet<T, P>
 where
     T: Clone + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
     P::Hasher: Clone,
 {
     fn clone(&self) -> Self {
@@ -403,7 +403,7 @@ where
 impl<T, P> fmt::Debug for HashSet<T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_set().entries(self.iter()).finish()
@@ -413,7 +413,7 @@ where
 impl<T, P> PartialEq for HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len() && self.iter().all(|value| other.contains(value))
@@ -423,14 +423,14 @@ where
 impl<T, P> Eq for HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
 }
 
 impl<T, P> FromIterator<T> for HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, (), Alloc = Global>,
+    P: TableBackend<T, (), Alloc = Global>,
     P::Hasher: Default,
 {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
@@ -443,7 +443,7 @@ where
 impl<T, P, const N: usize> From<[T; N]> for HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableBackend<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     fn from(arr: [T; N]) -> Self {
         arr.into_iter().collect()
@@ -453,7 +453,7 @@ where
 impl<T, P> Extend<T> for HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         self.map.extend(iter.into_iter().map(|value| (value, ())));
@@ -463,7 +463,7 @@ where
 impl<'a, T, P> Extend<&'a T> for HashSet<T, P>
 where
     T: 'a + Eq + Hash + Copy,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
         self.extend(iter.into_iter().copied());
@@ -473,7 +473,7 @@ where
 impl<'a, T, P> IntoIterator for &'a HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     type Item = &'a T;
     type IntoIter = Iter<'a, T, P>;
@@ -485,7 +485,7 @@ where
 impl<T, P> IntoIterator for HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     type Item = T;
     type IntoIter = IntoIter<T, P>;
@@ -499,7 +499,7 @@ where
 impl<T, P> BitOr<&HashSet<T, P>> for &HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    P: TableProbing<T, (), Alloc = Global>,
+    P: TableBackend<T, (), Alloc = Global>,
     P::Hasher: Default,
 {
     type Output = HashSet<T, P>;
@@ -511,7 +511,7 @@ where
 impl<T, P> BitAnd<&HashSet<T, P>> for &HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    P: TableProbing<T, (), Alloc = Global>,
+    P: TableBackend<T, (), Alloc = Global>,
     P::Hasher: Default,
 {
     type Output = HashSet<T, P>;
@@ -523,7 +523,7 @@ where
 impl<T, P> BitXor<&HashSet<T, P>> for &HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    P: TableProbing<T, (), Alloc = Global>,
+    P: TableBackend<T, (), Alloc = Global>,
     P::Hasher: Default,
 {
     type Output = HashSet<T, P>;
@@ -535,7 +535,7 @@ where
 impl<T, P> Sub<&HashSet<T, P>> for &HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    P: TableProbing<T, (), Alloc = Global>,
+    P: TableBackend<T, (), Alloc = Global>,
     P::Hasher: Default,
 {
     type Output = HashSet<T, P>;
@@ -547,7 +547,7 @@ where
 impl<T, P> BitOrAssign<&HashSet<T, P>> for HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn bitor_assign(&mut self, rhs: &HashSet<T, P>) {
         for value in rhs {
@@ -561,7 +561,7 @@ where
 impl<T, P> BitAndAssign<&HashSet<T, P>> for HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn bitand_assign(&mut self, rhs: &HashSet<T, P>) {
         self.retain(|value| rhs.contains(value));
@@ -571,7 +571,7 @@ where
 impl<T, P> BitXorAssign<&HashSet<T, P>> for HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn bitxor_assign(&mut self, rhs: &HashSet<T, P>) {
         for value in rhs {
@@ -587,7 +587,7 @@ where
 impl<T, P> SubAssign<&HashSet<T, P>> for HashSet<T, P>
 where
     T: Eq + Hash + Clone,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn sub_assign(&mut self, rhs: &HashSet<T, P>) {
         if rhs.len() < self.len() {
@@ -601,7 +601,7 @@ where
 }
 
 /// Borrowing iterator over [`HashSet`] values.
-pub struct Iter<'a, T, P: TableProbing<T, ()>>
+pub struct Iter<'a, T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -611,7 +611,7 @@ where
 impl<T, P> Clone for Iter<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
     P::Scan: Clone,
 {
     fn clone(&self) -> Self {
@@ -624,7 +624,7 @@ where
 impl<'a, T, P> Iterator for Iter<'a, T, P>
 where
     T: 'a + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
@@ -638,7 +638,7 @@ where
 impl<'a, T, P> ExactSizeIterator for Iter<'a, T, P>
 where
     T: 'a + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn len(&self) -> usize {
         self.inner.len()
@@ -648,14 +648,14 @@ where
 impl<'a, T, P> FusedIterator for Iter<'a, T, P>
 where
     T: 'a + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
 }
 
 impl<T, P> fmt::Debug for Iter<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
     P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -664,7 +664,7 @@ where
 }
 
 /// Consuming iterator over [`HashSet`] values.
-pub struct IntoIter<T, P: TableProbing<T, ()>>
+pub struct IntoIter<T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -674,7 +674,7 @@ where
 impl<T, P> Iterator for IntoIter<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     type Item = T;
     fn next(&mut self) -> Option<T> {
@@ -688,7 +688,7 @@ where
 impl<T, P> ExactSizeIterator for IntoIter<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn len(&self) -> usize {
         self.inner.len()
@@ -698,14 +698,14 @@ where
 impl<T, P> FusedIterator for IntoIter<T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
 }
 
 impl<T, P> fmt::Debug for IntoIter<T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IntoIter").finish_non_exhaustive()
@@ -713,7 +713,7 @@ where
 }
 
 /// Draining iterator over [`HashSet`] values.
-pub struct Drain<'a, T, P: TableProbing<T, ()>>
+pub struct Drain<'a, T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -723,7 +723,7 @@ where
 impl<T, P> Iterator for Drain<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     type Item = T;
     fn next(&mut self) -> Option<T> {
@@ -737,7 +737,7 @@ where
 impl<T, P> ExactSizeIterator for Drain<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn len(&self) -> usize {
         self.inner.len()
@@ -747,14 +747,14 @@ where
 impl<T, P> FusedIterator for Drain<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
 }
 
 impl<T, P> fmt::Debug for Drain<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Drain").finish_non_exhaustive()
@@ -762,7 +762,7 @@ where
 }
 
 /// Iterator yielding the extracted values of a [`HashSet`].
-pub struct ExtractIf<'a, T, P: TableProbing<T, ()>>
+pub struct ExtractIf<'a, T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -772,7 +772,7 @@ where
 impl<T, P> Iterator for ExtractIf<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     type Item = T;
     fn next(&mut self) -> Option<T> {
@@ -786,14 +786,14 @@ where
 impl<T, P> FusedIterator for ExtractIf<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
 }
 
 impl<T, P> fmt::Debug for ExtractIf<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExtractIf").finish_non_exhaustive()
@@ -801,7 +801,7 @@ where
 }
 
 /// Iterator over the difference of two [`HashSet`]s.
-pub struct Difference<'a, T, P: TableProbing<T, ()>>
+pub struct Difference<'a, T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -812,7 +812,7 @@ where
 impl<T, P> Clone for Difference<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
     P::Scan: Clone,
 {
     fn clone(&self) -> Self {
@@ -826,7 +826,7 @@ where
 impl<'a, T, P> Iterator for Difference<'a, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
@@ -846,14 +846,14 @@ where
 impl<T, P> FusedIterator for Difference<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
 }
 
 impl<T, P> fmt::Debug for Difference<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
     P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -862,7 +862,7 @@ where
 }
 
 /// Iterator over the intersection of two [`HashSet`]s.
-pub struct Intersection<'a, T, P: TableProbing<T, ()>>
+pub struct Intersection<'a, T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -873,7 +873,7 @@ where
 impl<T, P> Clone for Intersection<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
     P::Scan: Clone,
 {
     fn clone(&self) -> Self {
@@ -887,7 +887,7 @@ where
 impl<'a, T, P> Iterator for Intersection<'a, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
@@ -907,14 +907,14 @@ where
 impl<T, P> FusedIterator for Intersection<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
 }
 
 impl<T, P> fmt::Debug for Intersection<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
     P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -923,7 +923,7 @@ where
 }
 
 /// Iterator over the symmetric difference of two [`HashSet`]s.
-pub struct SymmetricDifference<'a, T, P: TableProbing<T, ()>>
+pub struct SymmetricDifference<'a, T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -933,7 +933,7 @@ where
 impl<T, P> Clone for SymmetricDifference<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
     P::Scan: Clone,
 {
     fn clone(&self) -> Self {
@@ -946,7 +946,7 @@ where
 impl<'a, T, P> Iterator for SymmetricDifference<'a, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
@@ -960,14 +960,14 @@ where
 impl<T, P> FusedIterator for SymmetricDifference<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
 }
 
 impl<T, P> fmt::Debug for SymmetricDifference<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
     P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -976,7 +976,7 @@ where
 }
 
 /// Iterator over the union of two [`HashSet`]s.
-pub struct Union<'a, T, P: TableProbing<T, ()>>
+pub struct Union<'a, T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -986,7 +986,7 @@ where
 impl<T, P> Clone for Union<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
     P::Scan: Clone,
 {
     fn clone(&self) -> Self {
@@ -999,7 +999,7 @@ where
 impl<'a, T, P> Iterator for Union<'a, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
@@ -1013,14 +1013,14 @@ where
 impl<T, P> FusedIterator for Union<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
 }
 
 impl<T, P> fmt::Debug for Union<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
     P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1029,7 +1029,7 @@ where
 }
 
 /// A view into a single [`HashSet`] entry.
-pub enum Entry<'a, T, P: TableProbing<T, ()>>
+pub enum Entry<'a, T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -1040,7 +1040,7 @@ where
 }
 
 /// View of an occupied [`HashSet`] entry.
-pub struct OccupiedEntry<'a, T, P: TableProbing<T, ()>>
+pub struct OccupiedEntry<'a, T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -1048,7 +1048,7 @@ where
 }
 
 /// View of a vacant [`HashSet`] entry.
-pub struct VacantEntry<'a, T, P: TableProbing<T, ()>>
+pub struct VacantEntry<'a, T, P: TableBackend<T, ()>>
 where
     T: Eq + Hash,
 {
@@ -1058,7 +1058,7 @@ where
 impl<'a, T, P> Entry<'a, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     /// Ensures the value is present, returning the occupied entry.
     pub fn insert(self) -> OccupiedEntry<'a, T, P> {
@@ -1087,7 +1087,7 @@ where
 impl<T, P> OccupiedEntry<'_, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     /// Reference to the value in the entry.
     pub fn get(&self) -> &T {
@@ -1103,7 +1103,7 @@ where
 impl<'a, T, P> VacantEntry<'a, T, P>
 where
     T: Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     /// Reference to the value that would be inserted.
     pub fn get(&self) -> &T {
@@ -1126,7 +1126,7 @@ where
 impl<T, P> fmt::Debug for OccupiedEntry<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OccupiedEntry")
@@ -1138,7 +1138,7 @@ where
 impl<T, P> fmt::Debug for VacantEntry<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("VacantEntry").field(self.get()).finish()
@@ -1148,7 +1148,7 @@ where
 impl<T, P> fmt::Debug for Entry<'_, T, P>
 where
     T: fmt::Debug + Eq + Hash,
-    P: TableProbing<T, ()>,
+    P: TableBackend<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

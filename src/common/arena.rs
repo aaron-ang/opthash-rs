@@ -63,6 +63,17 @@ impl Arena {
         }
         unsafe { alloc.deallocate(self.ptr, self.layout) };
     }
+
+    /// Tear down the arena from a map's `Drop`: swap it out, drop live values via
+    /// `drop_values`, free the allocation. A [`DeallocGuard`] still frees on an
+    /// unwinding value `Drop` — `Arena` has none of its own.
+    #[inline]
+    pub(crate) fn drop_table<A: Allocator>(&mut self, alloc: &A, drop_values: impl FnOnce()) {
+        let arena = mem::replace(self, Arena::empty());
+        let guard = DeallocGuard::new(arena, alloc);
+        drop_values();
+        drop(guard);
+    }
 }
 
 /// Combined ctrl+data layout for an arena whose ctrl section holds
@@ -256,30 +267,30 @@ impl<K: Clone, V: Clone> Clone for SlotEntry<K, V> {
     }
 }
 
-/// Clone one arena region's slots in panic-safe order: clone → write →
-/// stamp OCCUPIED ctrl. A panic mid-loop leaves `dst` with OCCUPIED only
-/// on fully-written slots. TOMBSTONE bytes copied in a second pass.
-pub(crate) fn clone_region_panic_safe<K: Clone, V: Clone>(
-    src_ctrl: *const u8,
-    dst_ctrl: *mut u8,
-    src_slots: *const MaybeUninit<SlotEntry<K, V>>,
-    dst_slots: *mut MaybeUninit<SlotEntry<K, V>>,
-    capacity: usize,
-) {
-    for idx in 0..capacity {
-        let ctrl = unsafe { *src_ctrl.add(idx) };
-        if ctrl.is_occupied() {
-            let src_slot = unsafe { (*src_slots.add(idx)).assume_init_ref() };
-            let cloned = src_slot.clone();
-            unsafe { dst_slots.add(idx).write(MaybeUninit::new(cloned)) };
-            unsafe { *dst_ctrl.add(idx) = ctrl };
-        }
+/// A borrowed control-byte group: its `ctrl` pointer resolved once,
+/// so every mask read reuses the same load.
+#[derive(Clone, Copy)]
+pub(crate) struct GroupRef {
+    ctrl: *const u8,
+}
+
+impl GroupRef {
+    /// Match the slots whose fingerprint equals `fp`.
+    #[inline]
+    pub(crate) fn match_mask(self, fp: u8) -> BitMask {
+        unsafe { simd::eq_mask_group(self.ctrl, fp) }
     }
-    for idx in 0..capacity {
-        let ctrl = unsafe { *src_ctrl.add(idx) };
-        if ctrl == CTRL_TOMBSTONE {
-            unsafe { *dst_ctrl.add(idx) = CTRL_TOMBSTONE };
-        }
+
+    /// Match the slots free for insertion (empty or tombstone).
+    #[inline]
+    pub(crate) fn free_mask(self) -> BitMask {
+        unsafe { simd::free_mask_group(self.ctrl) }
+    }
+
+    /// Report whether any slot is empty, which ends a probe chain.
+    #[inline]
+    pub(crate) fn has_empty(self) -> bool {
+        unsafe { simd::eq_mask_group(self.ctrl, CTRL_EMPTY).any() }
     }
 }
 
@@ -300,6 +311,13 @@ pub(crate) trait ArenaSlots<T> {
     fn group_ctrl(&self, group_idx: usize) -> *const u8 {
         debug_assert!(group_idx * GROUP_SIZE < self.capacity());
         unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) }
+    }
+
+    #[inline]
+    fn group(&self, group_idx: usize) -> GroupRef {
+        GroupRef {
+            ctrl: self.group_ctrl(group_idx),
+        }
     }
 
     #[inline]
@@ -409,6 +427,37 @@ pub(crate) trait ArenaSlots<T> {
         for idx in 0..self.capacity() {
             if unsafe { (*ctrl.add(idx)).is_occupied() } {
                 unsafe { ptr::drop_in_place(self.slot_ptr(idx)) }
+            }
+        }
+    }
+
+    /// Clone every occupied slot of `src` into `self` in panic-safe order: clone
+    /// → write → stamp OCCUPIED. A panic mid-loop leaves `self` OCCUPIED only on
+    /// fully-written slots; TOMBSTONE bytes follow in a second pass. `self` must
+    /// match `src`'s capacity.
+    fn clone_region_from(&self, src: &Self)
+    where
+        Self: Sized,
+        T: Clone,
+    {
+        let capacity = src.capacity();
+        debug_assert_eq!(capacity, self.capacity(), "clone dst must match src");
+        let src_ctrl = src.ctrl_ptr();
+        let dst_ctrl = self.ctrl_ptr();
+        let src_slots = src.data_ptr();
+        let dst_slots = self.data_ptr();
+        for idx in 0..capacity {
+            let ctrl = unsafe { *src_ctrl.add(idx) };
+            if ctrl.is_occupied() {
+                let cloned = unsafe { (*src_slots.add(idx)).assume_init_ref() }.clone();
+                unsafe { dst_slots.add(idx).write(MaybeUninit::new(cloned)) };
+                unsafe { *dst_ctrl.add(idx) = ctrl };
+            }
+        }
+        for idx in 0..capacity {
+            let ctrl = unsafe { *src_ctrl.add(idx) };
+            if ctrl == CTRL_TOMBSTONE {
+                unsafe { *dst_ctrl.add(idx) = CTRL_TOMBSTONE };
             }
         }
     }

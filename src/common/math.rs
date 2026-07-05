@@ -171,3 +171,155 @@ pub(crate) fn level_salt_wide(level_idx: usize) -> u64 {
     // usize fits in u64 on every Rust target (max 64-bit pointer width).
     GOLDEN_RATIO_U64.wrapping_mul((level_idx as u64).wrapping_add(1))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Only exact binary fractions (0.25, 0.5) are used so `floor`/`div` land
+    // deterministically across platforms.
+    #[test]
+    fn max_insertions_reserves_floor_fraction() {
+        assert_eq!(capacity::max_insertions(0, 0.25), 0);
+        assert_eq!(capacity::max_insertions(16, 0.25), 12); // 16 - floor(4)
+        assert_eq!(capacity::max_insertions(100, 0.5), 50);
+        // Full reserve saturates at zero rather than underflowing.
+        assert_eq!(capacity::max_insertions(10, 1.0), 0);
+    }
+
+    #[test]
+    fn capacity_for_finds_smallest_doubling_fit() {
+        // 16 already reserves headroom for 12 at rf=0.25.
+        assert_eq!(capacity::capacity_for(16, 12, 0.25), Some(16));
+        // 13 forces the next doubling: 32 reserves headroom for 24.
+        assert_eq!(capacity::capacity_for(16, 13, 0.25), Some(32));
+        assert_eq!(capacity::capacity_for(16, 0, 0.25), Some(16));
+    }
+
+    #[test]
+    fn capacity_for_returns_none_on_overflow() {
+        // No representable capacity reserves headroom for usize::MAX.
+        assert_eq!(capacity::capacity_for(1, usize::MAX, 0.5), None);
+    }
+
+    #[test]
+    // `sanitize` returns its inputs verbatim (clamp bounds / the default const),
+    // so these are exact bit-for-bit comparisons, not approximate float math.
+    #[allow(clippy::float_cmp)]
+    fn sanitize_reserve_fraction_clamps_and_defaults() {
+        assert_eq!(capacity::sanitize_reserve_fraction(0.5), 0.5);
+        assert_eq!(
+            capacity::sanitize_reserve_fraction(-1.0),
+            MIN_RESERVE_FRACTION
+        );
+        assert_eq!(
+            capacity::sanitize_reserve_fraction(2.0),
+            MAX_RESERVE_FRACTION
+        );
+        assert_eq!(
+            capacity::sanitize_reserve_fraction(f64::NAN),
+            DEFAULT_RESERVE_FRACTION
+        );
+        assert_eq!(
+            capacity::sanitize_reserve_fraction(f64::INFINITY),
+            DEFAULT_RESERVE_FRACTION
+        );
+    }
+
+    #[test]
+    fn ceil_three_quarters_rounds_up() {
+        assert_eq!(capacity::ceil_three_quarters(0), 0);
+        assert_eq!(capacity::ceil_three_quarters(1), 1); // ceil(0.75)
+        assert_eq!(capacity::ceil_three_quarters(2), 2); // ceil(1.5)
+        assert_eq!(capacity::ceil_three_quarters(4), 3); // ceil(3.0)
+        assert_eq!(capacity::ceil_three_quarters(5), 4); // ceil(3.75)
+    }
+
+    #[test]
+    fn floor_half_reserve_slots_floors() {
+        assert_eq!(capacity::floor_half_reserve_slots(0.25, 16), 2); // floor(4/2)
+        assert_eq!(capacity::floor_half_reserve_slots(0.5, 10), 2); // floor(5/2)
+    }
+
+    #[test]
+    fn tombstone_cleanup_threshold_stays_between_half_and_three_quarters() {
+        for &cap in &[0usize, GROUP_SIZE, 128, 1024, 1_000_000] {
+            let t = capacity::tombstone_cleanup_threshold(cap);
+            assert!(t >= cap / 2, "threshold {t} below half of {cap}");
+            assert!(
+                t <= cap * 3 / 4 || cap == 0,
+                "threshold {t} above 3/4 of {cap}"
+            );
+        }
+        // At large capacity the hysteresis band (half + 4 groups) binds.
+        let cap = 1_000_000;
+        let expected = (cap / 2 + 4 * GROUP_SIZE).min(cap * 3 / 4).max(cap / 2);
+        assert_eq!(capacity::tombstone_cleanup_threshold(cap), expected);
+    }
+
+    #[test]
+    fn round_up_to_group_snaps_to_group_multiple() {
+        assert_eq!(align::round_up_to_group(0), 0);
+        assert_eq!(align::round_up_to_group(1), GROUP_SIZE);
+        assert_eq!(align::round_up_to_group(GROUP_SIZE), GROUP_SIZE);
+        assert_eq!(align::round_up_to_group(GROUP_SIZE + 1), 2 * GROUP_SIZE);
+    }
+
+    #[test]
+    fn round_up_to_pow2_groups_yields_pow2_group_count() {
+        assert_eq!(align::round_up_to_pow2_groups(0), 0);
+        for slots in [
+            1,
+            GROUP_SIZE,
+            GROUP_SIZE * 3,
+            GROUP_SIZE * 5,
+            GROUP_SIZE * 9,
+        ] {
+            let rounded = align::round_up_to_pow2_groups(slots);
+            assert!(rounded >= slots);
+            let groups = rounded / GROUP_SIZE;
+            assert!(groups.is_power_of_two(), "group count {groups} not pow2");
+        }
+    }
+
+    #[test]
+    fn log_log_probe_limit_at_least_one_and_monotone() {
+        assert_eq!(probe::log_log_probe_limit(0), 1);
+        assert_eq!(probe::log_log_probe_limit(4), 1);
+        let mut prev = 0;
+        for shift in 0..40 {
+            let l = probe::log_log_probe_limit(1usize << shift);
+            assert!(l >= 1);
+            assert!(l >= prev, "not monotone at 2^{shift}");
+            prev = l;
+        }
+    }
+
+    #[test]
+    fn triangular_probe_visits_every_group_once() {
+        let group_count = 8usize;
+        let mask = group_count - 1;
+        for start in 0..group_count {
+            let mut p = probe::TriangularProbe::new(start);
+            let mut seen = vec![p.pos];
+            for _ in 1..group_count {
+                p.advance(mask);
+                seen.push(p.pos);
+            }
+            seen.sort_unstable();
+            assert_eq!(
+                seen,
+                (0..group_count).collect::<Vec<_>>(),
+                "start {start} is not a full permutation"
+            );
+        }
+    }
+
+    #[test]
+    fn level_salt_is_deterministic_and_decorrelated() {
+        assert_eq!(level_salt(3), level_salt(3));
+        assert_ne!(level_salt(0), level_salt(1));
+        assert_eq!(level_salt_wide(3), level_salt_wide(3));
+        assert_ne!(level_salt_wide(0), level_salt_wide(1));
+    }
+}

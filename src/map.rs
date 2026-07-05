@@ -19,10 +19,13 @@ use crate::common::iter::{
 };
 use crate::common::math::capacity;
 
-/// Provide storage metadata and direct slot access.
+/// The backend contract behind [`HashMap`]: storage, lookup, insert, iteration,
+/// and lifecycle, grouped into sections below.
 // This crate-private contract intentionally exposes `SlotEntry`.
 #[allow(private_interfaces)]
-pub trait TableStorage<K, V>: Sized {
+pub trait TableBackend<K, V>: Sized {
+    // -- Storage: metadata + direct slot access --
+
     /// Identify an occupied slot in this table.
     ///
     /// Valid only until the next structural mutation of the same table (a
@@ -70,24 +73,22 @@ pub trait TableStorage<K, V>: Sized {
     /// `loc` must be a live location from this table.
     unsafe fn slot_ptr(&self, loc: Self::Location) -> *mut SlotEntry<K, V>;
 
-    /// Replace the value at `loc` (valid per [`Location`](TableStorage::Location))
+    /// Replace the value at `loc` (valid per [`Location`](TableBackend::Location))
     /// and return the previous.
     fn replace_value(&mut self, loc: Self::Location, value: V) -> V;
-}
 
-/// Find keys in table storage.
-pub trait TableLookup<K, V>: TableStorage<K, V> {
+    // -- Lookup --
+
     /// Find the slot for `key` by precomputed hash and fingerprint; the
-    /// location is valid per [`Location`](TableStorage::Location).
+    /// location is valid per [`Location`](TableBackend::Location).
     fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<Self::Location>
     where
         Q: Hash + Equivalent<K> + ?Sized;
-}
 
-/// Insert and remove entries using storage and lookup primitives.
-pub trait TableInsert<K, V>: TableLookup<K, V> {
+    // -- Insert / remove --
+
     /// Insert a known-absent key, resize as needed, and return its location
-    /// (valid per [`Location`](TableStorage::Location)).
+    /// (valid per [`Location`](TableBackend::Location)).
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> Self::Location;
 
     /// Insert `key` → `value` and return the previous value. Backends may
@@ -104,23 +105,21 @@ pub trait TableInsert<K, V>: TableLookup<K, V> {
         None
     }
 
-    /// Remove the entry at `loc` (valid per [`Location`](TableStorage::Location)),
+    /// Remove the entry at `loc` (valid per [`Location`](TableBackend::Location)),
     /// update bookkeeping, and resize if needed.
     fn remove(&mut self, loc: Self::Location) -> (K, V);
 
-    /// Mark `loc` (valid per [`Location`](TableStorage::Location)) as a tombstone
+    /// Mark `loc` (valid per [`Location`](TableBackend::Location)) as a tombstone
     /// without updating counters — draining iterators use it after moving the
     /// value out to avoid a double drop.
     fn tombstone_slot(&mut self, loc: Self::Location);
 
-    /// Mark a moved-out `loc` (valid per [`Location`](TableStorage::Location)) as
+    /// Mark a moved-out `loc` (valid per [`Location`](TableBackend::Location)) as
     /// a tombstone and update counters without resizing.
     fn extract_finish(&mut self, loc: Self::Location);
-}
 
-/// Scan occupied slots in storage order without retaining pointers.
-#[allow(private_interfaces)]
-pub trait TableIterate<K, V>: TableStorage<K, V> {
+    // -- Iterate: scan occupied slots without retaining pointers --
+
     /// Track scan progress by index so a consumed table can move safely.
     type Scan;
 
@@ -133,10 +132,9 @@ pub trait TableIterate<K, V>: TableStorage<K, V> {
     /// Yield each occupied slot exactly once per traversal, with distinct
     /// pointers: `IterMut`/`Drain` lift each to a `&mut`, so a repeat aliases (UB).
     fn scan_next(&self, scan: &mut Self::Scan) -> Option<(*mut SlotEntry<K, V>, Self::Location)>;
-}
 
-/// Construct, resize, clean up, and clone table storage.
-pub trait TableLifecycle<K, V>: TableStorage<K, V> {
+    // -- Lifecycle: construct, resize, clean up, clone --
+
     /// Construct storage for the public `with_capacity_*` family.
     fn with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
@@ -223,38 +221,19 @@ pub trait TableLifecycle<K, V>: TableStorage<K, V> {
         Self::Hasher: Clone;
 }
 
-/// Combine the five backend capabilities required by [`HashMap`].
-pub trait TableProbing<K, V>:
-    TableStorage<K, V>
-    + TableLookup<K, V>
-    + TableInsert<K, V>
-    + TableIterate<K, V>
-    + TableLifecycle<K, V>
-{
-}
-
-impl<K, V, T> TableProbing<K, V> for T where
-    T: TableStorage<K, V>
-        + TableLookup<K, V>
-        + TableInsert<K, V>
-        + TableIterate<K, V>
-        + TableLifecycle<K, V>
-{
-}
-
 /// Computes the control-byte fingerprint the backends scan on.
 #[inline]
 fn fingerprint(hash: u64) -> u8 {
     control::control_fingerprint(hash)
 }
 
-/// Use a [`TableProbing`] backend to store key-value pairs.
-pub struct HashMap<K, V, P: TableProbing<K, V>> {
+/// Use a [`TableBackend`] backend to store key-value pairs.
+pub struct HashMap<K, V, P: TableBackend<K, V>> {
     table: P,
     _marker: PhantomData<(K, V)>,
 }
 
-impl<K, V, P: TableProbing<K, V>> HashMap<K, V, P> {
+impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     #[inline]
     fn from_table(table: P) -> Self {
         Self {
@@ -344,7 +323,7 @@ impl<K, V, P: TableProbing<K, V>> HashMap<K, V, P> {
 impl<K, V, P> HashMap<K, V, P>
 where
     K: Eq + Hash,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     #[inline]
     fn find_location<Q>(&self, key: &Q) -> Option<P::Location>
@@ -409,7 +388,7 @@ where
 
     /// Returns the stored key equal to `key`, inserting `f(key)` (with `value`)
     /// if absent, in one hit-path probe. The `Copy` location from
-    /// [`TableLookup::find`] frees the borrow before the key ref is re-derived —
+    /// [`TableBackend::find`] frees the borrow before the key ref is re-derived —
     /// the naive `get`-then-insert needs Polonius. Backs set `get_or_insert_with`.
     pub(crate) fn get_or_insert_key_with<Q, F>(&mut self, key: &Q, value: V, f: F) -> &K
     where
@@ -583,7 +562,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// A view into a single map entry, occupied or vacant.
-pub enum Entry<'a, K, V, P: TableProbing<K, V>> {
+pub enum Entry<'a, K, V, P: TableBackend<K, V>> {
     /// Key present.
     Occupied(OccupiedEntry<'a, K, V, P>),
     /// Key absent.
@@ -591,14 +570,14 @@ pub enum Entry<'a, K, V, P: TableProbing<K, V>> {
 }
 
 /// View of an occupied entry.
-pub struct OccupiedEntry<'a, K, V, P: TableProbing<K, V>> {
+pub struct OccupiedEntry<'a, K, V, P: TableBackend<K, V>> {
     map: &'a mut HashMap<K, V, P>,
     loc: P::Location,
     _marker: PhantomData<K>,
 }
 
 /// View of a vacant entry.
-pub struct VacantEntry<'a, K, V, P: TableProbing<K, V>> {
+pub struct VacantEntry<'a, K, V, P: TableBackend<K, V>> {
     map: &'a mut HashMap<K, V, P>,
     key: K,
     hash: u64,
@@ -606,7 +585,7 @@ pub struct VacantEntry<'a, K, V, P: TableProbing<K, V>> {
 
 /// Error returned by [`HashMap::try_insert`] on key collision. Holds the
 /// occupied entry that blocked the insert plus the rejected value.
-pub struct OccupiedError<'a, K, V, P: TableProbing<K, V>> {
+pub struct OccupiedError<'a, K, V, P: TableBackend<K, V>> {
     /// The entry whose key was already present.
     pub entry: OccupiedEntry<'a, K, V, P>,
     /// The value that could not be inserted.
@@ -617,7 +596,7 @@ impl<K, V, P> fmt::Debug for OccupiedError<'_, K, V, P>
 where
     K: Eq + Hash + fmt::Debug,
     V: fmt::Debug,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("OccupiedError")
@@ -631,7 +610,7 @@ impl<K, V, P> fmt::Display for OccupiedError<'_, K, V, P>
 where
     K: Eq + Hash + fmt::Debug,
     V: fmt::Debug,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
@@ -648,14 +627,14 @@ impl<K, V, P> Error for OccupiedError<'_, K, V, P>
 where
     K: Eq + Hash + fmt::Debug,
     V: fmt::Debug,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
 }
 
 impl<'a, K, V, P> OccupiedEntry<'a, K, V, P>
 where
     K: Eq + Hash,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     /// Reference to the entry's key.
     #[must_use]
@@ -712,7 +691,7 @@ where
 impl<'a, K, V, P> VacantEntry<'a, K, V, P>
 where
     K: Eq + Hash,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     /// Reference to the key that would be inserted.
     pub fn key(&self) -> &K {
@@ -746,7 +725,7 @@ where
 impl<'a, K, V, P> Entry<'a, K, V, P>
 where
     K: Eq + Hash,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     /// Returns `&mut V`, inserting `default` if vacant.
     pub fn or_insert(self, default: V) -> &'a mut V {
@@ -799,7 +778,7 @@ where
 impl<'a, K, V, P> Entry<'a, K, V, P>
 where
     K: Eq + Hash,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
     V: Default,
 {
     /// Returns `&mut V`, inserting `V::default()` if vacant.
@@ -817,7 +796,7 @@ where
 
 impl<K, V, P> HashMap<K, V, P>
 where
-    P: TableProbing<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableBackend<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     /// Creates an empty map.
     #[must_use]
@@ -861,7 +840,7 @@ where
 
 impl<K, V, P> HashMap<K, V, P>
 where
-    P: TableProbing<K, V, Alloc = Global>,
+    P: TableBackend<K, V, Alloc = Global>,
 {
     /// Creates an empty map that uses `hash_builder`.
     #[must_use]
@@ -917,7 +896,7 @@ where
 
 impl<K, V, P> HashMap<K, V, P>
 where
-    P: TableProbing<K, V, Hasher = DefaultHashBuilder>,
+    P: TableBackend<K, V, Hasher = DefaultHashBuilder>,
 {
     /// Creates an empty map in the given allocator.
     #[must_use]
@@ -946,7 +925,7 @@ where
 // Iteration accessors
 // ---------------------------------------------------------------------------
 
-impl<K, V, P: TableProbing<K, V>> HashMap<K, V, P> {
+impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     /// Borrowing iterator over `(&K, &V)`, in arbitrary order.
     pub fn iter(&self) -> Iter<'_, K, V, P> {
         Iter {
@@ -1026,14 +1005,14 @@ impl<K, V, P: TableProbing<K, V>> HashMap<K, V, P> {
 // ---------------------------------------------------------------------------
 
 /// Borrowing iterator over `(&K, &V)`.
-pub struct Iter<'a, K, V, P: TableProbing<K, V>> {
+pub struct Iter<'a, K, V, P: TableBackend<K, V>> {
     table: &'a P,
     scan: P::Scan,
     remaining: usize,
     _marker: PhantomData<(&'a K, &'a V)>,
 }
 
-impl<'a, K, V, P: TableProbing<K, V>> Iterator for Iter<'a, K, V, P> {
+impl<'a, K, V, P: TableBackend<K, V>> Iterator for Iter<'a, K, V, P> {
     type Item = (&'a K, &'a V);
     fn next(&mut self) -> Option<(&'a K, &'a V)> {
         let (ptr, _loc) = self.table.scan_next(&mut self.scan)?;
@@ -1048,16 +1027,16 @@ impl<'a, K, V, P: TableProbing<K, V>> Iterator for Iter<'a, K, V, P> {
     }
 }
 
-impl<K, V, P: TableProbing<K, V>> ExactSizeIterator for Iter<'_, K, V, P> {
+impl<K, V, P: TableBackend<K, V>> ExactSizeIterator for Iter<'_, K, V, P> {
     fn len(&self) -> usize {
         self.remaining
     }
 }
-impl<K, V, P: TableProbing<K, V>> FusedIterator for Iter<'_, K, V, P> {}
+impl<K, V, P: TableBackend<K, V>> FusedIterator for Iter<'_, K, V, P> {}
 
 impl<K, V, P> Clone for Iter<'_, K, V, P>
 where
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
     P::Scan: Clone,
 {
     fn clone(&self) -> Self {
@@ -1072,7 +1051,7 @@ where
 
 impl<K: fmt::Debug, V: fmt::Debug, P> fmt::Debug for Iter<'_, K, V, P>
 where
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
     P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1081,14 +1060,14 @@ where
 }
 
 /// Borrowing iterator over `(&K, &mut V)`.
-pub struct IterMut<'a, K, V, P: TableProbing<K, V>> {
+pub struct IterMut<'a, K, V, P: TableBackend<K, V>> {
     table: *mut P,
     scan: P::Scan,
     remaining: usize,
     _marker: PhantomData<(&'a K, &'a mut V)>,
 }
 
-impl<'a, K, V, P: TableProbing<K, V>> Iterator for IterMut<'a, K, V, P> {
+impl<'a, K, V, P: TableBackend<K, V>> Iterator for IterMut<'a, K, V, P> {
     type Item = (&'a K, &'a mut V);
     fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
         // SAFETY: `table` points to the borrowed map; `scan_next` yields each
@@ -1104,21 +1083,21 @@ impl<'a, K, V, P: TableProbing<K, V>> Iterator for IterMut<'a, K, V, P> {
     }
 }
 
-impl<K, V, P: TableProbing<K, V>> ExactSizeIterator for IterMut<'_, K, V, P> {
+impl<K, V, P: TableBackend<K, V>> ExactSizeIterator for IterMut<'_, K, V, P> {
     fn len(&self) -> usize {
         self.remaining
     }
 }
-impl<K, V, P: TableProbing<K, V>> FusedIterator for IterMut<'_, K, V, P> {}
+impl<K, V, P: TableBackend<K, V>> FusedIterator for IterMut<'_, K, V, P> {}
 
 /// Consuming iterator over owned `(K, V)`.
-pub struct IntoIter<K, V, P: TableProbing<K, V>> {
+pub struct IntoIter<K, V, P: TableBackend<K, V>> {
     table: P,
     scan: P::Scan,
     remaining: usize,
 }
 
-impl<K, V, P: TableProbing<K, V>> Iterator for IntoIter<K, V, P> {
+impl<K, V, P: TableBackend<K, V>> Iterator for IntoIter<K, V, P> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
         let (ptr, loc) = self.table.scan_next(&mut self.scan)?;
@@ -1134,22 +1113,22 @@ impl<K, V, P: TableProbing<K, V>> Iterator for IntoIter<K, V, P> {
     }
 }
 
-impl<K, V, P: TableProbing<K, V>> ExactSizeIterator for IntoIter<K, V, P> {
+impl<K, V, P: TableBackend<K, V>> ExactSizeIterator for IntoIter<K, V, P> {
     fn len(&self) -> usize {
         self.remaining
     }
 }
-impl<K, V, P: TableProbing<K, V>> FusedIterator for IntoIter<K, V, P> {}
+impl<K, V, P: TableBackend<K, V>> FusedIterator for IntoIter<K, V, P> {}
 
 /// Draining iterator; empties the map on consumption or drop.
-pub struct Drain<'a, K, V, P: TableProbing<K, V>> {
+pub struct Drain<'a, K, V, P: TableBackend<K, V>> {
     table: *mut P,
     scan: P::Scan,
     remaining: usize,
     _marker: PhantomData<&'a mut P>,
 }
 
-impl<K, V, P: TableProbing<K, V>> Iterator for Drain<'_, K, V, P> {
+impl<K, V, P: TableBackend<K, V>> Iterator for Drain<'_, K, V, P> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
         // SAFETY: `table` points to the borrowed map for the drain's lifetime.
@@ -1166,14 +1145,14 @@ impl<K, V, P: TableProbing<K, V>> Iterator for Drain<'_, K, V, P> {
     }
 }
 
-impl<K, V, P: TableProbing<K, V>> ExactSizeIterator for Drain<'_, K, V, P> {
+impl<K, V, P: TableBackend<K, V>> ExactSizeIterator for Drain<'_, K, V, P> {
     fn len(&self) -> usize {
         self.remaining
     }
 }
-impl<K, V, P: TableProbing<K, V>> FusedIterator for Drain<'_, K, V, P> {}
+impl<K, V, P: TableBackend<K, V>> FusedIterator for Drain<'_, K, V, P> {}
 
-impl<K, V, P: TableProbing<K, V>> Drop for Drain<'_, K, V, P> {
+impl<K, V, P: TableBackend<K, V>> Drop for Drain<'_, K, V, P> {
     fn drop(&mut self) {
         // Drain any unyielded entries so values run their `Drop`, then wipe.
         for _ in &mut *self {}
@@ -1183,7 +1162,7 @@ impl<K, V, P: TableProbing<K, V>> Drop for Drain<'_, K, V, P> {
 
 /// Iterator yielding entries removed by [`HashMap::extract_if`]. Unyielded
 /// non-matching entries are retained; its `Drop` is a no-op.
-pub struct ExtractIf<'a, K, V, P: TableProbing<K, V>, F> {
+pub struct ExtractIf<'a, K, V, P: TableBackend<K, V>, F> {
     table: *mut P,
     scan: P::Scan,
     pred: F,
@@ -1192,7 +1171,7 @@ pub struct ExtractIf<'a, K, V, P: TableProbing<K, V>, F> {
 
 impl<K, V, P, F> Iterator for ExtractIf<'_, K, V, P, F>
 where
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
     F: FnMut(&K, &mut V) -> bool,
 {
     type Item = (K, V);
@@ -1218,7 +1197,7 @@ where
 
 impl<K, V, P, F> FusedIterator for ExtractIf<'_, K, V, P, F>
 where
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
     F: FnMut(&K, &mut V) -> bool,
 {
 }
@@ -1240,7 +1219,7 @@ pub type IntoValues<K, V, P> = CommonIntoValues<IntoIter<K, V, P>>;
 
 impl<K, V, P> Default for HashMap<K, V, P>
 where
-    P: TableProbing<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableBackend<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     fn default() -> Self {
         Self::with_capacity(0)
@@ -1251,7 +1230,7 @@ impl<K, V, P> Clone for HashMap<K, V, P>
 where
     K: Clone,
     V: Clone,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
     P::Hasher: Clone,
 {
     fn clone(&self) -> Self {
@@ -1263,7 +1242,7 @@ impl<K, V, P> fmt::Debug for HashMap<K, V, P>
 where
     K: fmt::Debug,
     V: fmt::Debug,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.iter()).finish()
@@ -1274,7 +1253,7 @@ impl<K, V, P> PartialEq for HashMap<K, V, P>
 where
     K: Eq + Hash,
     V: PartialEq,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len()
@@ -1288,7 +1267,7 @@ impl<K, V, P> Eq for HashMap<K, V, P>
 where
     K: Eq + Hash,
     V: Eq,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
 }
 
@@ -1296,7 +1275,7 @@ impl<K, Q, V, P> Index<&Q> for HashMap<K, V, P>
 where
     K: Eq + Hash,
     Q: Hash + Equivalent<K> + ?Sized,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     type Output = V;
     fn index(&self, key: &Q) -> &V {
@@ -1307,7 +1286,7 @@ where
 impl<K, V, P> Extend<(K, V)> for HashMap<K, V, P>
 where
     K: Eq + Hash,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         let iter = iter.into_iter();
@@ -1322,7 +1301,7 @@ impl<'a, K, V, P> Extend<(&'a K, &'a V)> for HashMap<K, V, P>
 where
     K: Eq + Hash + Copy,
     V: Copy,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     fn extend<I: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: I) {
         self.extend(iter.into_iter().map(|(k, v)| (*k, *v)));
@@ -1333,7 +1312,7 @@ impl<'a, K, V, P> Extend<&'a (K, V)> for HashMap<K, V, P>
 where
     K: Eq + Hash + Copy,
     V: Copy,
-    P: TableProbing<K, V>,
+    P: TableBackend<K, V>,
 {
     fn extend<I: IntoIterator<Item = &'a (K, V)>>(&mut self, iter: I) {
         self.extend(iter.into_iter().map(|(k, v)| (*k, *v)));
@@ -1343,7 +1322,7 @@ where
 impl<K, V, P> FromIterator<(K, V)> for HashMap<K, V, P>
 where
     K: Eq + Hash,
-    P: TableProbing<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableBackend<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
         let iter = iter.into_iter();
@@ -1353,7 +1332,7 @@ where
     }
 }
 
-impl<'a, K, V, P: TableProbing<K, V>> IntoIterator for &'a HashMap<K, V, P> {
+impl<'a, K, V, P: TableBackend<K, V>> IntoIterator for &'a HashMap<K, V, P> {
     type Item = (&'a K, &'a V);
     type IntoIter = Iter<'a, K, V, P>;
     fn into_iter(self) -> Iter<'a, K, V, P> {
@@ -1361,7 +1340,7 @@ impl<'a, K, V, P: TableProbing<K, V>> IntoIterator for &'a HashMap<K, V, P> {
     }
 }
 
-impl<'a, K, V, P: TableProbing<K, V>> IntoIterator for &'a mut HashMap<K, V, P> {
+impl<'a, K, V, P: TableBackend<K, V>> IntoIterator for &'a mut HashMap<K, V, P> {
     type Item = (&'a K, &'a mut V);
     type IntoIter = IterMut<'a, K, V, P>;
     fn into_iter(self) -> IterMut<'a, K, V, P> {
@@ -1369,7 +1348,7 @@ impl<'a, K, V, P: TableProbing<K, V>> IntoIterator for &'a mut HashMap<K, V, P> 
     }
 }
 
-impl<K, V, P: TableProbing<K, V>> IntoIterator for HashMap<K, V, P> {
+impl<K, V, P: TableBackend<K, V>> IntoIterator for HashMap<K, V, P> {
     type Item = (K, V);
     type IntoIter = IntoIter<K, V, P>;
     fn into_iter(self) -> IntoIter<K, V, P> {

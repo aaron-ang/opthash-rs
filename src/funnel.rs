@@ -13,7 +13,6 @@ use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::TryReserveError;
 use crate::common::iter::RegionCursor;
 use crate::common::math::{self, align, capacity, cast, probe};
-use crate::common::simd;
 use crate::macros;
 use crate::map;
 
@@ -150,8 +149,8 @@ impl<T> BucketLevel<T> {
             unsafe { std::hint::unreachable_unchecked() };
         }
         let group_idx = bucket_range.start / GROUP_SIZE;
-        let group_ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        unsafe { simd::free_mask_group(group_ptr) }
+        self.group(group_idx)
+            .free_mask()
             .lowest()
             .map(|offset| bucket_range.start + offset)
     }
@@ -195,25 +194,21 @@ impl<K, V> BucketLevel<SlotEntry<K, V>> {
         if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
             unsafe { std::hint::unreachable_unchecked() };
         }
-        let group_idx = bucket_range.start / GROUP_SIZE;
-        let group_ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
-        let match_mask = unsafe { simd::eq_mask_group(group_ptr, key_fingerprint) };
-        for relative_idx in match_mask {
+        let group = self.group(bucket_range.start / GROUP_SIZE);
+        for relative_idx in group.match_mask(key_fingerprint) {
             let slot_idx = bucket_range.start + relative_idx;
             let entry = unsafe { self.get_ref(slot_idx) };
             if key.equivalent(&entry.key) {
                 return LookupStep::Found(slot_idx);
             }
         }
-        if wants_free {
-            let free_mask = unsafe { simd::free_mask_group(group_ptr) };
-            if let Some(o) = free_mask.lowest()
-                && let Some(out) = slot_out
-            {
-                *out = Some(bucket_range.start + o);
-            }
+        if wants_free
+            && let Some(o) = group.free_mask().lowest()
+            && let Some(out) = slot_out
+        {
+            *out = Some(bucket_range.start + o);
         }
-        if unsafe { simd::eq_mask_group(group_ptr, CTRL_EMPTY).any() } {
+        if group.has_empty() {
             LookupStep::StopSearch
         } else {
             LookupStep::Continue
@@ -994,13 +989,14 @@ unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
 
 impl<K, V, S, A: Allocator + Clone> Drop for FunnelTable<K, V, S, A> {
     fn drop(&mut self) {
-        let arena = mem::replace(&mut self.arena, Arena::empty());
-        let guard = arena::DeallocGuard::new(arena, &self.alloc);
-        for level in &mut self.levels {
-            level.drop_values();
-        }
-        self.overflow.drop_values();
-        drop(guard);
+        let levels = &mut self.levels;
+        let overflow = &mut self.overflow;
+        self.arena.drop_table(&self.alloc, || {
+            for level in levels {
+                level.drop_values();
+            }
+            overflow.drop_values();
+        });
     }
 }
 
@@ -1234,6 +1230,66 @@ impl<'a> FunnelGeometry<'a> {
     }
 }
 
+/// Split a raw slot budget into funnel regions: main bucket levels plus the
+/// special primary/fallback arrays (paper §5). The single home for the split, so
+/// every fresh-allocation constructor derives one consistent layout.
+struct FunnelSplit {
+    level_bucket_counts: Vec<usize>,
+    bucket_width: usize,
+    primary_ctrl: usize,
+    fallback_ctrl: usize,
+    fallback_bucket_size: usize,
+    /// Special-primary probe budget; also feeds [`OverflowHandler::new`].
+    primary_probe_limit: usize,
+}
+
+impl FunnelSplit {
+    /// Partition `total_slots` at an already-sanitized `reserve_fraction`: trim
+    /// the main capacity to a `β` multiple, fold the remainder into the special
+    /// arrays, then split the leftover evenly across primary and fallback.
+    fn for_slots(total_slots: usize, reserve_fraction: f64) -> Self {
+        let level_count = compute_level_count(reserve_fraction);
+        let bucket_width = align::round_up_to_group(compute_bucket_width(reserve_fraction));
+        let primary_probe_limit = probe::log_log_probe_limit(total_slots).max(1);
+
+        let mut special_capacity =
+            choose_special_capacity(total_slots, reserve_fraction, bucket_width);
+        let mut main_capacity = total_slots.saturating_sub(special_capacity);
+        let main_remainder = main_capacity % bucket_width.max(1);
+        if main_remainder != 0 {
+            main_capacity = main_capacity.saturating_sub(main_remainder);
+            special_capacity = total_slots.saturating_sub(main_capacity);
+        }
+
+        let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
+        let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
+        let fallback_bucket_size = (primary_probe_limit.saturating_mul(2)).max(2);
+        let primary_ctrl = align::round_up_to_pow2_groups(special_capacity.div_ceil(2));
+        let fallback_ctrl =
+            align::round_up_to_group(special_capacity.saturating_sub(special_capacity.div_ceil(2)));
+
+        Self {
+            level_bucket_counts,
+            bucket_width,
+            primary_ctrl,
+            fallback_ctrl,
+            fallback_bucket_size,
+            primary_probe_limit,
+        }
+    }
+
+    /// Borrow the split as an arena layout; keep the split alive until it allocates.
+    fn geometry(&self) -> FunnelGeometry<'_> {
+        FunnelGeometry::new(
+            &self.level_bucket_counts,
+            self.bucket_width,
+            self.primary_ctrl,
+            self.fallback_ctrl,
+            self.fallback_bucket_size,
+        )
+    }
+}
+
 /// A funnel map's regions (bucket levels + the special array), bundled so
 /// [`arena::ArenaDropGuard`] can drop their values for panic-safe `clone`.
 struct FunnelRegions<K, V> {
@@ -1282,34 +1338,9 @@ where
         };
         let max_insertions = capacity::max_insertions(total_slots, reserve_fraction);
 
-        let level_count = compute_level_count(reserve_fraction);
-        let bucket_width = align::round_up_to_group(compute_bucket_width(reserve_fraction));
-        let primary_probe_limit = probe::log_log_probe_limit(total_slots).max(1);
-
-        let mut special_capacity =
-            choose_special_capacity(total_slots, reserve_fraction, bucket_width);
-        let mut main_capacity = total_slots.saturating_sub(special_capacity);
-        let main_remainder = main_capacity % bucket_width.max(1);
-        if main_remainder != 0 {
-            main_capacity = main_capacity.saturating_sub(main_remainder);
-            special_capacity = total_slots.saturating_sub(main_capacity);
-        }
-
-        let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
-        let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
-        let fallback_bucket_size = (primary_probe_limit.saturating_mul(2)).max(2);
-        let primary_ctrl = align::round_up_to_pow2_groups(special_capacity.div_ceil(2));
-        let fallback_ctrl =
-            align::round_up_to_group(special_capacity.saturating_sub(special_capacity.div_ceil(2)));
-
-        let (arena, levels, special) = FunnelGeometry::new(
-            &level_bucket_counts,
-            bucket_width,
-            primary_ctrl,
-            fallback_ctrl,
-            fallback_bucket_size,
-        )
-        .alloc(&alloc);
+        let split = FunnelSplit::for_slots(total_slots, reserve_fraction);
+        let primary_probe_limit = split.primary_probe_limit;
+        let (arena, levels, special) = split.geometry().alloc(&alloc);
 
         let overflow = OverflowHandler::new(special, primary_probe_limit);
 
@@ -1473,7 +1504,7 @@ where
     }
 
     /// Take + erase + decrement counters for the slot at `loc`. Shared by
-    /// [`map::TableInsert::remove`] and [`map::TableInsert::extract_finish`]; the former adds a
+    /// [`map::TableBackend::remove`] and [`map::TableBackend::extract_finish`]; the former adds a
     /// resize pass, the latter consolidates tombstones lazily.
     fn take_and_tombstone(&mut self, location: SlotLocation) -> (K, V) {
         // SAFETY: caller passes a live location found in this table.
@@ -1483,7 +1514,7 @@ where
     }
 
     /// `true` if the region holding `loc` has accumulated enough tombstones
-    /// that [`map::TableInsert::remove`] should rehash in place.
+    /// that [`map::TableBackend::remove`] should rehash in place.
     fn region_needs_cleanup(&self, location: SlotLocation) -> bool {
         let (tombstones, cap) = match location {
             SlotLocation::Level { level_idx, .. } => {
@@ -1563,33 +1594,9 @@ where
             capacity::sanitize_reserve_fraction(reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
         let max_insertions = capacity::max_insertions(total_slots, reserve_fraction);
 
-        let level_count = compute_level_count(reserve_fraction);
-        let bucket_width = align::round_up_to_group(compute_bucket_width(reserve_fraction));
-        let primary_probe_limit = probe::log_log_probe_limit(total_slots).max(1);
-
-        let mut special_capacity =
-            choose_special_capacity(total_slots, reserve_fraction, bucket_width);
-        let mut main_capacity = total_slots.saturating_sub(special_capacity);
-        let main_remainder = main_capacity % bucket_width.max(1);
-        if main_remainder != 0 {
-            main_capacity = main_capacity.saturating_sub(main_remainder);
-            special_capacity = total_slots.saturating_sub(main_capacity);
-        }
-
-        let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
-        let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
-        let fallback_bucket_size = (primary_probe_limit.saturating_mul(2)).max(2);
-        let primary_ctrl = align::round_up_to_pow2_groups(special_capacity.div_ceil(2));
-        let fallback_ctrl =
-            align::round_up_to_group(special_capacity.saturating_sub(special_capacity.div_ceil(2)));
-        let (arena, levels, special) = FunnelGeometry::new(
-            &level_bucket_counts,
-            bucket_width,
-            primary_ctrl,
-            fallback_ctrl,
-            fallback_bucket_size,
-        )
-        .try_alloc(&alloc)?;
+        let split = FunnelSplit::for_slots(total_slots, reserve_fraction);
+        let primary_probe_limit = split.primary_probe_limit;
+        let (arena, levels, special) = split.geometry().try_alloc(&alloc)?;
 
         let overflow = OverflowHandler::new(special, primary_probe_limit);
 
@@ -1646,34 +1653,11 @@ where
 
     /// Replace `self`'s tables with empty storage sized for `new_capacity`.
     fn install_fresh_storage(&mut self, new_capacity: usize) {
-        let level_count = compute_level_count(self.reserve_fraction);
-        let bucket_width = align::round_up_to_group(compute_bucket_width(self.reserve_fraction));
-        let mut special_capacity =
-            choose_special_capacity(new_capacity, self.reserve_fraction, bucket_width);
-        let mut main_capacity = new_capacity.saturating_sub(special_capacity);
-        let main_remainder = main_capacity % bucket_width.max(1);
-        if main_remainder != 0 {
-            main_capacity = main_capacity.saturating_sub(main_remainder);
-            special_capacity = new_capacity.saturating_sub(main_capacity);
-        }
-        let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
-        let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
-        let new_primary_probe_limit = probe::log_log_probe_limit(new_capacity).max(1);
-        let fallback_bucket_size = (new_primary_probe_limit.saturating_mul(2)).max(2);
-        let primary_raw = special_capacity.div_ceil(2);
-        let fallback_raw = special_capacity.saturating_sub(primary_raw);
-        let primary_ctrl = align::round_up_to_pow2_groups(primary_raw);
-        let fallback_ctrl = align::round_up_to_group(fallback_raw);
+        let split = FunnelSplit::for_slots(new_capacity, self.reserve_fraction);
+        let new_primary_probe_limit = split.primary_probe_limit;
         let alloc = &self.alloc;
 
-        let (new_arena, new_levels, new_special) = FunnelGeometry::new(
-            &level_bucket_counts,
-            bucket_width,
-            primary_ctrl,
-            fallback_ctrl,
-            fallback_bucket_size,
-        )
-        .alloc(alloc);
+        let (new_arena, new_levels, new_special) = split.geometry().alloc(alloc);
 
         let new_overflow = OverflowHandler::new(new_special, new_primary_probe_limit);
 
@@ -2023,7 +2007,7 @@ where
 }
 
 #[allow(private_interfaces)]
-impl<K, V, S, A> map::TableStorage<K, V> for FunnelTable<K, V, S, A>
+impl<K, V, S, A> map::TableBackend<K, V> for FunnelTable<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
@@ -2077,14 +2061,9 @@ where
     fn replace_value(&mut self, loc: SlotLocation, value: V) -> V {
         self.replace_existing_value(loc, value)
     }
-}
 
-impl<K, V, S, A> map::TableLookup<K, V> for FunnelTable<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
+    // -- Lookup --
+
     #[inline]
     fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<SlotLocation>
     where
@@ -2092,14 +2071,9 @@ where
     {
         self.find_slot_location_with_hash(key, hash, fingerprint)
     }
-}
 
-impl<K, V, S, A> map::TableInsert<K, V> for FunnelTable<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
+    // -- Insert / remove --
+
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> SlotLocation {
         self.insert_for_vacant_entry(key, value, hash)
@@ -2169,15 +2143,9 @@ where
     fn extract_finish(&mut self, location: SlotLocation) {
         self.finish_counted_removal(location);
     }
-}
 
-#[allow(private_interfaces)]
-impl<K, V, S, A> map::TableIterate<K, V> for FunnelTable<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
+    // -- Iterate --
+
     type Scan = FunnelScan;
 
     #[inline]
@@ -2199,14 +2167,9 @@ where
         }
         self.scan_advance(scan)
     }
-}
 
-impl<K, V, S, A> map::TableLifecycle<K, V> for FunnelTable<K, V, S, A>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
+    // -- Lifecycle --
+
     #[inline]
     fn with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
@@ -2264,7 +2227,7 @@ enum ScanPhase {
     Done,
 }
 
-/// Track [`map::TableIterate::scan`] across levels, primary, and fallback without
+/// Track [`map::TableBackend::scan`] across levels, primary, and fallback without
 /// retaining pointers between calls.
 #[derive(Clone)]
 pub struct FunnelScan {
@@ -2493,7 +2456,7 @@ where
     A: Allocator + Clone,
 {
     /// Deep-clones storage + hasher + allocator. Backs the
-    /// [`map::TableLifecycle::clone_table`] impl; the [`map::HashMap`] shell provides the
+    /// [`map::TableBackend::clone_table`] impl; the [`map::HashMap`] shell provides the
     /// public [`Clone`].
     fn clone_storage(&self) -> Self {
         // Build level_bucket_counts from existing level descriptors.
@@ -2538,13 +2501,7 @@ where
             .iter_mut()
             .zip(self.levels.iter())
         {
-            arena::clone_region_panic_safe::<K, V>(
-                src_lvl.ctrl_ptr,
-                dst.ctrl_ptr,
-                src_lvl.data_ptr,
-                dst.data_ptr,
-                src_lvl.capacity as usize,
-            );
+            dst.clone_region_from(src_lvl);
             dst.len = src_lvl.len;
             dst.tombstones = src_lvl.tombstones;
         }
@@ -2553,13 +2510,7 @@ where
         {
             let s = self.overflow.primary();
             let d = &mut special_mut.primary;
-            arena::clone_region_panic_safe::<K, V>(
-                s.ctrl_ptr,
-                d.ctrl_ptr,
-                s.data_ptr,
-                d.data_ptr,
-                s.capacity as usize,
-            );
+            d.clone_region_from(s);
             d.len = s.len;
             d.tombstones = s.tombstones;
         }
@@ -2567,13 +2518,7 @@ where
         {
             let s = self.overflow.fallback();
             let d = &mut special_mut.fallback;
-            arena::clone_region_panic_safe::<K, V>(
-                s.ctrl_ptr,
-                d.ctrl_ptr,
-                s.data_ptr,
-                d.data_ptr,
-                s.capacity as usize,
-            );
+            d.clone_region_from(s);
             d.len = s.len;
             d.tombstones = s.tombstones;
         }
