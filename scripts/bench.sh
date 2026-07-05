@@ -7,8 +7,8 @@
 # All settings are process-local — die with the bench process.
 #
 # Hardware-aware:
-# - CORE unset: claims a free core in the perf cluster (max cpufreq) via
-#   flock. Falls back to the full cluster list when every core is claimed.
+# - CORE unset: pins to the lowest-numbered max-cpufreq core and blocks on its
+#   flock, so concurrent runs serialize on one core instead of contending.
 # - Multi-node NUMA: binds memory to the pinned core's node via numactl
 #   --membind so cache misses don't traverse the inter-socket interconnect.
 #
@@ -75,28 +75,24 @@ claim_perf_core() {
 		CORE=0
 		return
 	fi
-	local c lock
+	# Lowest-numbered perf core (glob order is lexical, not numeric).
+	local c min=${perf_cores[0]}
 	for c in "${perf_cores[@]}"; do
-		lock="$LOCK_DIR/core-${c}.lock"
-		# Permission-denied (e.g. lock owned by another user) → try next core.
-		if ! (exec {fd}>"$lock") 2>/dev/null; then
-			continue
-		fi
-		exec {LOCK_FD}>"$lock"
-		if flock -n "$LOCK_FD"; then
-			CORE=$c
-			echo "info: claimed perf core $c (lock: $lock)" >&2
-			return
-		fi
-		exec {LOCK_FD}>&-
-		unset LOCK_FD
+		((c < min)) && min=$c
 	done
-	# All perf cores busy or unlockable: restrict to the cluster, let OS schedule.
-	CORE=$(
-		IFS=,
-		echo "${perf_cores[*]}"
-	)
-	echo "info: all perf cores busy; restricting to cluster CORE=$CORE" >&2
+	CORE=$min
+	local lock="$LOCK_DIR/core-${CORE}.lock"
+	# Subshell contains a failed exec redirect (a bare one would kill the shell
+	# under set -e). Unopenable (e.g. foreign owner) => exit, don't run
+	# unserialized; set CORE=<n> to bypass locking entirely.
+	if ! (exec {fd}>"$lock") 2>/dev/null; then
+		echo "error: cannot open $lock; set CORE=<n> to bypass locking" >&2
+		exit 1
+	fi
+	exec {LOCK_FD}>"$lock"
+	echo "info: waiting for perf core $CORE lock..." >&2
+	flock "$LOCK_FD" # blocks until free -> runs serialize on this core
+	echo "info: acquired perf core $CORE" >&2
 }
 
 if ((IS_LINUX)) && [[ -z ${CORE:-} ]]; then
