@@ -96,21 +96,77 @@ def methodology_fingerprint(source_root: Path, target: str) -> str:
     return hash_paths(source_root, paths)
 
 
+def _registration_name(value: object, sidecar: Path) -> str:
+    if not isinstance(value, str):
+        raise MetadataError(f"invalid ownership metadata in {sidecar}")
+    parts = value.split("/")
+    if len(parts) != 2 or any(part in {"", ".", ".."} for part in parts):
+        raise MetadataError(f"invalid ownership metadata in {sidecar}")
+    return value
+
+
+def other_target_registrations(root: Path, target: str, baseline: str) -> set[str]:
+    current_sidecar = metadata_path(root, target, baseline)
+    metadata_root = current_sidecar.parent.parent
+    registrations: set[str] = set()
+    for sidecar in sorted(metadata_root.glob(f"*/{baseline}.json")):
+        if sidecar == current_sidecar:
+            continue
+        try:
+            value = json.loads(sidecar.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise MetadataError(
+                f"cannot read ownership metadata from {sidecar}"
+            ) from error
+        sidecar_target = sidecar.parent.name
+        if (
+            not isinstance(value, dict)
+            or value.get("schema") != SCHEMA_VERSION
+            or value.get("target") != sidecar_target
+            or not isinstance(value.get("registrations"), list)
+            or not value["registrations"]
+        ):
+            raise MetadataError(f"invalid ownership metadata in {sidecar}")
+        registrations.update(
+            _registration_name(registration, sidecar)
+            for registration in value["registrations"]
+        )
+    return registrations
+
+
 def begin(root: Path, source_root: Path, target: str, baseline: str) -> str:
-    metadata_path(root, target, baseline).unlink(missing_ok=True)
+    root = root.resolve()
+    sidecar = metadata_path(root, target, baseline)
+    protected = other_target_registrations(root, target, baseline)
+    sidecar.unlink(missing_ok=True)
     for directory in root.glob(f"*/*/{baseline}"):
-        if directory.is_dir():
+        registration = "/".join(directory.relative_to(root).parts[:2])
+        if directory.is_dir() and registration not in protected:
             shutil.rmtree(directory)
     return source_fingerprint(source_root)
 
 
-def measured_registrations(root: Path, baseline: str) -> list[str]:
+def measured_registrations(
+    root: Path, baseline: str, *, exclude: set[str] | None = None
+) -> list[str]:
+    excluded = set() if exclude is None else exclude
     registrations = []
     for estimates in root.glob(f"*/*/{baseline}/estimates.json"):
-        registrations.append("/".join(estimates.relative_to(root).parts[:2]))
+        registration = "/".join(estimates.relative_to(root).parts[:2])
+        if registration not in excluded:
+            registrations.append(registration)
     if not registrations:
         raise MetadataError(f"no Criterion registrations for baseline {baseline!r}")
     return sorted(registrations)
+
+
+def target_registrations(root: Path, target: str, baseline: str) -> list[str]:
+    root = root.resolve()
+    return measured_registrations(
+        root,
+        baseline,
+        exclude=other_target_registrations(root, target, baseline),
+    )
 
 
 def write_json_atomic(path: Path, value: object) -> None:
@@ -197,7 +253,7 @@ def publish(
         "target": target,
         "requested_bench": requested_bench,
         "forwarded_args": list(forwarded_args),
-        "registrations": measured_registrations(root, baseline),
+        "registrations": target_registrations(root, target, baseline),
         "cpu_identity": cpu_identity(),
         "core": core,
         "os": platform.platform(),

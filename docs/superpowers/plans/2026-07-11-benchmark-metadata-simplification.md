@@ -177,10 +177,13 @@ git commit -m "bench: define compact baseline metadata"
 
 **Interfaces:**
 - Produces: `begin(root, source_root, target, baseline) -> str`, which removes
-  only that named baseline's old Criterion directories and sidecar, then
-  returns the pre-run source fingerprint.
+  the current target's sidecar and only baseline directories not protected by
+  another target sidecar, then returns the pre-run source fingerprint.
 - Produces: `publish(*, root, source_root, target, baseline, source_before, core, requested_bench, forwarded_args) -> dict[str, object]`
 - Consumes: Criterion directories at `<root>/<group>/<function>/<baseline>/`.
+- Consumes: ownership from existing sidecars at
+  `<root>/.opthash/metadata/<other-target>/<baseline>.json` without hard-coded
+  registration IDs.
 
 - [ ] **Step 1: Write failing publication tests**
 
@@ -246,6 +249,10 @@ def test_publish_rejects_source_change_without_sidecar(tmp_path: Path) -> None:
     assert not benchmark_metadata.metadata_path(criterion, "speedup", "anchor").exists()
 ```
 
+Also cover sequential `speedup` then `mean_latency` publication for one
+baseline, stale unclaimed directory cleanup, and fail-closed malformed or
+missing other-target ownership metadata.
+
 - [ ] **Step 2: Run the tests and verify failure**
 
 Run: `uv run pytest tests/test_benchmark_metadata.py -q`
@@ -256,20 +263,38 @@ Expected: failures because `publish` is undefined.
 
 ```python
 def begin(root: Path, source_root: Path, target: str, baseline: str) -> str:
-    metadata_path(root, target, baseline).unlink(missing_ok=True)
+    root = root.resolve()
+    sidecar = metadata_path(root, target, baseline)
+    protected = other_target_registrations(root, target, baseline)
+    sidecar.unlink(missing_ok=True)
     for directory in root.glob(f"*/*/{baseline}"):
-        if directory.is_dir():
+        registration = "/".join(directory.relative_to(root).parts[:2])
+        if directory.is_dir() and registration not in protected:
             shutil.rmtree(directory)
     return source_fingerprint(source_root)
 
 
-def measured_registrations(root: Path, baseline: str) -> list[str]:
+def measured_registrations(
+    root: Path, baseline: str, *, exclude: set[str] | None = None
+) -> list[str]:
+    excluded = set() if exclude is None else exclude
     registrations = []
     for estimates in root.glob(f"*/*/{baseline}/estimates.json"):
-        registrations.append("/".join(estimates.relative_to(root).parts[:2]))
+        registration = "/".join(estimates.relative_to(root).parts[:2])
+        if registration not in excluded:
+            registrations.append(registration)
     if not registrations:
         raise MetadataError(f"no Criterion registrations for baseline {baseline!r}")
     return sorted(registrations)
+
+
+def target_registrations(root: Path, target: str, baseline: str) -> list[str]:
+    root = root.resolve()
+    return measured_registrations(
+        root,
+        baseline,
+        exclude=other_target_registrations(root, target, baseline),
+    )
 
 
 def write_json_atomic(path: Path, value: object) -> None:
@@ -294,7 +319,7 @@ The published object must have this stable shape (values shown are examples):
     "target": target,
     "requested_bench": requested_bench,
     "forwarded_args": forwarded_args,
-    "registrations": measured_registrations(root, baseline),
+    "registrations": target_registrations(root, target, baseline),
     "cpu_identity": cpu_identity(),
     "core": core,
     "os": platform.platform(),
@@ -302,6 +327,14 @@ The published object must have this stable shape (values shown are examples):
     "measured_at_utc": datetime.now(timezone.utc).isoformat(),
 }
 ```
+
+`other_target_registrations` discovers other target sidecars dynamically and
+returns the union of their recorded registrations. It validates the sidecar
+schema, target ownership, and non-empty two-component registration list. Any
+unreadable, missing-after-discovery, or malformed ownership sidecar raises
+`MetadataError` before the current sidecar or any Criterion directory is
+removed. Publication records `target_registrations(root, target, baseline)` so
+each sidecar excludes registrations already owned by another target.
 
 `forwarded_args` contains the exact baseline-neutral arguments passed after
 Criterion's baseline flags, including filters and tuning such as
@@ -437,7 +470,7 @@ def verify(root: Path, target: str, baseline: str, compare: str | None = None, *
             raise MetadataError(f"invalid metadata schema or target for {name!r}")
         if value["source"]["before"] != value["source"]["after"]:
             raise MetadataError(f"source changed during baseline {name!r}")
-        registrations = measured_registrations(root, name)
+        registrations = target_registrations(root, target, name)
         if registrations != value["registrations"]:
             raise MetadataError(f"Criterion registrations differ for {name!r}")
     if require_clean and any(value["source"]["dirty"] for value in values):

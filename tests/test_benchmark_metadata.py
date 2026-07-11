@@ -31,7 +31,12 @@ def make_source_tree(root: Path) -> Path:
 
 
 def make_criterion_baseline(root: Path, baseline: str) -> Path:
-    estimates = root / "get_hit" / "get_hit_elastic" / baseline / "estimates.json"
+    return make_criterion_registration(root, "get_hit/get_hit_elastic", baseline)
+
+
+def make_criterion_registration(root: Path, registration: str, baseline: str) -> Path:
+    group, function = registration.split("/")
+    estimates = root / group / function / baseline / "estimates.json"
     estimates.parent.mkdir(parents=True)
     estimates.write_text(json.dumps({"mean": {"point_estimate": 1.0}}))
     return root
@@ -220,3 +225,115 @@ def test_publish_cli_accepts_exact_forwarded_arguments(tmp_path: Path) -> None:
         "10",
         "get_hit",
     ]
+
+
+def test_sequential_targets_preserve_distinct_baseline_ownership(
+    tmp_path: Path,
+) -> None:
+    repo = make_source_tree(tmp_path / "repo")
+    criterion = tmp_path / "criterion"
+
+    speed_before = benchmark_metadata.begin(criterion, repo, "speedup", "anchor")
+    make_criterion_registration(criterion, "get_hit/get_hit_elastic", "anchor")
+    speed = benchmark_metadata.publish(
+        root=criterion,
+        source_root=repo,
+        target="speedup",
+        baseline="anchor",
+        source_before=speed_before,
+        core=5,
+        requested_bench="all",
+        forwarded_args=[],
+    )
+    speed_sidecar = benchmark_metadata.metadata_path(criterion, "speedup", "anchor")
+    speed_sidecar_before = speed_sidecar.read_text()
+
+    latency_before = benchmark_metadata.begin(criterion, repo, "mean_latency", "anchor")
+
+    assert speed_sidecar.read_text() == speed_sidecar_before
+    assert (criterion / "get_hit/get_hit_elastic/anchor").exists()
+
+    make_criterion_registration(
+        criterion,
+        "get_hit_latency_1K/get_hit_latency_1K_elastic",
+        "anchor",
+    )
+    latency = benchmark_metadata.publish(
+        root=criterion,
+        source_root=repo,
+        target="mean_latency",
+        baseline="anchor",
+        source_before=latency_before,
+        core=5,
+        requested_bench="all",
+        forwarded_args=[],
+    )
+
+    assert speed["registrations"] == ["get_hit/get_hit_elastic"]
+    assert latency["registrations"] == ["get_hit_latency_1K/get_hit_latency_1K_elastic"]
+    assert json.loads(speed_sidecar.read_text())["registrations"] == [
+        "get_hit/get_hit_elastic"
+    ]
+
+
+def test_begin_removes_stale_registrations_unclaimed_by_other_targets(
+    tmp_path: Path,
+) -> None:
+    repo = make_source_tree(tmp_path / "repo")
+    criterion = tmp_path / "criterion"
+    speed_before = benchmark_metadata.begin(criterion, repo, "speedup", "anchor")
+    make_criterion_registration(criterion, "get_hit/get_hit_elastic", "anchor")
+    benchmark_metadata.publish(
+        root=criterion,
+        source_root=repo,
+        target="speedup",
+        baseline="anchor",
+        source_before=speed_before,
+        core=5,
+        requested_bench="all",
+        forwarded_args=[],
+    )
+    make_criterion_registration(criterion, "interrupted/interrupted_elastic", "anchor")
+
+    benchmark_metadata.begin(criterion, repo, "mean_latency", "anchor")
+
+    assert (criterion / "get_hit/get_hit_elastic/anchor").exists()
+    assert not (criterion / "interrupted/interrupted_elastic/anchor").exists()
+
+
+def test_begin_fails_closed_for_malformed_other_target_ownership(
+    tmp_path: Path,
+) -> None:
+    repo = make_source_tree(tmp_path / "repo")
+    criterion = make_criterion_baseline(tmp_path / "criterion", "anchor")
+    other_sidecar = benchmark_metadata.metadata_path(criterion, "speedup", "anchor")
+    other_sidecar.parent.mkdir(parents=True)
+    other_sidecar.write_text("{")
+    current_sidecar = benchmark_metadata.metadata_path(
+        criterion, "mean_latency", "anchor"
+    )
+    current_sidecar.parent.mkdir(parents=True)
+    current_sidecar.write_text("{}")
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="ownership metadata"):
+        benchmark_metadata.begin(criterion, repo, "mean_latency", "anchor")
+
+    assert other_sidecar.exists()
+    assert current_sidecar.exists()
+    assert (criterion / "get_hit/get_hit_elastic/anchor").exists()
+
+
+def test_begin_fails_closed_when_other_target_sidecar_disappears(
+    tmp_path: Path,
+) -> None:
+    repo = make_source_tree(tmp_path / "repo")
+    criterion = make_criterion_baseline(tmp_path / "criterion", "anchor")
+    missing_sidecar = benchmark_metadata.metadata_path(criterion, "speedup", "anchor")
+    missing_sidecar.parent.mkdir(parents=True)
+    missing_sidecar.symlink_to(tmp_path / "missing.json")
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="ownership metadata"):
+        benchmark_metadata.begin(criterion, repo, "mean_latency", "anchor")
+
+    assert missing_sidecar.is_symlink()
+    assert (criterion / "get_hit/get_hit_elastic/anchor").exists()
