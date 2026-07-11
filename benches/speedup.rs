@@ -1,5 +1,7 @@
 #[path = "support/common.rs"]
 mod common;
+#[path = "support/fixtures.rs"]
+mod fixtures;
 #[macro_use]
 #[path = "support/throughput.rs"]
 mod throughput;
@@ -27,13 +29,23 @@ fn bench_lookups(c: &mut Criterion) {
     let el_map = common::build_elastic_map(&pairs);
     let fn_map = common::build_funnel_map(&pairs);
 
-    let hit_keys: Vec<u64> = (0..OP_COUNT).map(|idx| pairs[idx % MAP_SIZE].0).collect();
+    let hit_keys = fixtures::shuffled_hit_keys(&pairs, OP_COUNT);
+    let sequential_hit_keys = fixtures::sequential_hit_keys(&pairs, OP_COUNT);
     let miss_keys: Vec<u64> = (0..OP_COUNT)
         .map(|idx| common::key_at(idx + MAP_SIZE + 10_000_000))
         .collect();
 
     throughput::bench_one_lookup_group(
         c, "get_hit", &hit_keys, &std_map, &hb_map, &el_map, &fn_map,
+    );
+    throughput::bench_one_lookup_group(
+        c,
+        "get_hit_sequential",
+        &sequential_hit_keys,
+        &std_map,
+        &hb_map,
+        &el_map,
+        &fn_map,
     );
     throughput::bench_one_lookup_group(
         c, "get_miss", &miss_keys, &std_map, &hb_map, &el_map, &fn_map,

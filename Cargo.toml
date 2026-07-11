@@ -10,16 +10,23 @@ license = "Apache-2.0"
 keywords = ["hashmap", "open_addressing", "elastic_hashing", "funnel_hashing", "no_std"]
 categories = ["algorithms", "data-structures", "no-std"]
 exclude = [
+    "/.github/",
+    "/assets/",
     "/benches/",
+    "/ci/",
     "/opthash/",
     "/paper/",
     "/scripts/",
     "/tests/",
     "/.gitattributes",
     "/.gitignore",
+    "/.pre-commit-config.yaml",
+    "/.vscode/",
     "/AGENTS.md",
     "/CLAUDE.md",
+    "/pyproject.toml",
     "/requirements.txt",
+    "/uv.lock",
 ]
 
 [lib]
@@ -42,7 +49,6 @@ allocator-api2 = { version = "0.2", default-features = false, features = [
 ] }
 equivalent = "1"
 foldhash = { version = "0.2", default-features = false, optional = true }
-libm = { version = "0.2", default-features = false }
 pyo3 = { version = "0.29", features = [
     "extension-module",
     "abi3-py310",
@@ -53,10 +59,7 @@ criterion = { package = "codspeed-criterion-compat", version = "4", features = [
     "html_reports",
 ] }
 hashbrown = "0.17"
-hdrhistogram = "7.5"
 pprof = { version = "0.15", features = ["flamegraph"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
@@ -93,4 +96,8 @@ harness = false
 
 [[bench]]
 name = "mean_latency"
+harness = false
+
+[[bench]]
+name = "scaled_insert"
 harness = false

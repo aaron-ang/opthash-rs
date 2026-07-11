@@ -7,12 +7,15 @@
 # All settings are process-local — die with the bench process.
 #
 # Hardware-aware:
-# - CORE unset: pins to the lowest-numbered max-cpufreq core and blocks on its
-#   flock, so concurrent runs serialize on one core instead of contending.
+# - CORE unset: pins to the lowest-numbered max-cpufreq core.
+# - CORE set or detected: blocks on that core's flock, so concurrent runs
+#   serialize instead of contending.
 # - Multi-node NUMA: binds memory to the pinned core's node via numactl
 #   --membind so cache misses don't traverse the inter-socket interconnect.
 #
 # Env knobs:
+#   CORE=5           pin to one explicit CPU; detected or explicit CPUs are
+#                    always locked for the script's lifetime.
 #   BENCH=all        cargo bench --bench target (default all = speedup + latency)
 #   SAVE=            --save-baseline <name>; runs the bench and stores results
 #                    under <name>. Default: ref (only when neither BASELINE nor
@@ -39,7 +42,18 @@ BENCH=${BENCH:-all}
 SAVE=${SAVE:-}
 BASELINE=${BASELINE:-}
 LOAD=${LOAD:-}
-LOCK_DIR=${LOCK_DIR:-/tmp/opthash-bench-locks}
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+cd "$REPO_ROOT"
+CRITERION_ROOT=${OPTHASH_CRITERION_ROOT:-$REPO_ROOT/target/criterion}
+if [[ -n ${OPTHASH_CRITERION_MANIFEST_HELPER:-} ]]; then
+	manifest_helper=("$OPTHASH_CRITERION_MANIFEST_HELPER")
+else
+	manifest_helper=(python3 "$REPO_ROOT/scripts/criterion_manifest.py")
+fi
+# Each per-core lock is a readable directory under this root. The default /tmp
+# sticky directory lets sudo and non-sudo invocations open the same inode
+# without requiring a shared writable file.
+LOCK_DIR=${LOCK_DIR:-/tmp}
 
 # Low-noise primitives below are Linux-only; elsewhere we fall through to
 # plain `cargo bench`.
@@ -65,9 +79,9 @@ detect_perf_cores() {
 	done
 }
 
-# Lock fd is held for the script's lifetime; the kernel releases it on exit.
-claim_perf_core() {
-	mkdir -p "$LOCK_DIR" 2>/dev/null || true
+# Select the lowest-numbered performance core when the caller did not provide
+# one explicitly.
+select_perf_core() {
 	local perf_cores=()
 	while IFS= read -r c; do perf_cores+=("$c"); done < <(detect_perf_cores)
 	if ((${#perf_cores[@]} == 0)); then
@@ -81,22 +95,47 @@ claim_perf_core() {
 		((c < min)) && min=$c
 	done
 	CORE=$min
-	local lock="$LOCK_DIR/core-${CORE}.lock"
-	# Subshell contains a failed exec redirect (a bare one would kill the shell
-	# under set -e). Unopenable (e.g. foreign owner) => exit, don't run
-	# unserialized; set CORE=<n> to bypass locking entirely.
-	if ! (exec {fd}>"$lock") 2>/dev/null; then
-		echo "error: cannot open $lock; set CORE=<n> to bypass locking" >&2
+}
+
+# Lock fd is held for the script's lifetime; the kernel releases it on exit.
+# Low-noise measurements are single-core by construction, so reject CPU-list
+# syntax rather than allowing partially overlapping lists to evade the lock.
+claim_core_lock() {
+	if [[ ! $CORE =~ ^[0-9]+$ ]]; then
+		echo "error: CORE must be one CPU number so benchmark locking is unambiguous" >&2
 		exit 1
 	fi
-	exec {LOCK_FD}>"$lock"
+	mkdir -p "$LOCK_DIR" 2>/dev/null || true
+	local lock="$LOCK_DIR/opthash-bench-core-${CORE}.lock"
+	# A directory gives every user a read-only flockable inode and avoids
+	# truncating or writing a predictable /tmp path under sudo. mkdir is atomic;
+	# a concurrent creator is harmless.
+	if [[ ! -e "$lock" ]] && ! mkdir -m 0755 "$lock" 2>/dev/null && [[ ! -e "$lock" ]]; then
+		echo "error: cannot create benchmark lock $lock" >&2
+		exit 1
+	fi
+	# Accept a regular file created by an older release, but never follow a
+	# symbolic link. Read-only exclusive flock works for both files and
+	# directories on Linux and is independent of the creator's uid.
+	if [[ -L "$lock" || (! -d "$lock" && ! -f "$lock") ]]; then
+		echo "error: unsafe benchmark lock $lock" >&2
+		exit 1
+	fi
+	if ! (exec {fd}<"$lock") 2>/dev/null; then
+		echo "error: cannot open benchmark lock $lock" >&2
+		exit 1
+	fi
+	exec {LOCK_FD}<"$lock"
 	echo "info: waiting for perf core $CORE lock..." >&2
 	flock "$LOCK_FD" # blocks until free -> runs serialize on this core
 	echo "info: acquired perf core $CORE" >&2
 }
 
-if ((IS_LINUX)) && [[ -z ${CORE:-} ]]; then
-	claim_perf_core
+if ((IS_LINUX)); then
+	if [[ -z ${CORE:-} ]]; then
+		select_perf_core
+	fi
+	claim_core_lock
 fi
 
 # sudo strips PATH/HOME; recover invoker's rustup so the shim resolves their
@@ -168,12 +207,24 @@ echo "info: running benchmarks: ${bench_targets[*]}" >&2
 
 if [[ -n "$LOAD" ]]; then
 	criterion_args=(--load-baseline "$LOAD" --baseline "${BASELINE:-ref}")
+	metadata_save=
+	metadata_load=$LOAD
+	metadata_compare=${BASELINE:-ref}
 elif [[ -n "$BASELINE" ]]; then
 	criterion_args=(--baseline "$BASELINE")
+	metadata_save=
+	metadata_load=
+	metadata_compare=$BASELINE
 elif [[ -n "$SAVE" ]]; then
 	criterion_args=(--save-baseline "$SAVE")
+	metadata_save=$SAVE
+	metadata_load=
+	metadata_compare=
 else
 	criterion_args=(--save-baseline ref)
+	metadata_save=ref
+	metadata_load=
+	metadata_compare=
 fi
 echo "info: Criterion args: ${criterion_args[*]}" >&2
 
@@ -185,6 +236,78 @@ fi
 echo "info: forwarding args: ${forward_args[*]}" >&2
 
 for target in "${bench_targets[@]}"; do
-	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" cargo bench --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
-	"${launcher[@]}" "${cmd[@]}"
+	cargo_feature_args=()
+	transaction=
+	manifest_mode=
+	if [[ "$target" == "speedup" || "$target" == "mean_latency" ]]; then
+		if [[ -n "$metadata_save" ]]; then
+			manifest_args=(prepare-save --root "$CRITERION_ROOT" --source-root "$REPO_ROOT"
+				--target "$target" --baseline "$metadata_save" --requested-bench "$BENCH")
+			if [[ -n ${CORE:-} ]]; then
+				manifest_args+=(--core "$CORE")
+			fi
+			for arg in "${criterion_args[@]}"; do
+				manifest_args+=("--criterion-arg=$arg")
+			done
+			for arg in "${forward_args[@]}"; do
+				manifest_args+=("--forwarded-arg=$arg")
+			done
+			transaction=$("${launcher[@]}" "${manifest_helper[@]}" "${manifest_args[@]}")
+			manifest_mode=save
+		elif [[ -n "$metadata_load" ]]; then
+			manifest_args=(hydrate --root "$CRITERION_ROOT" --target "$target"
+				--baseline "$metadata_load" --compare "$metadata_compare"
+				--strict-measured --source-root "$REPO_ROOT")
+			if [[ -n ${CORE:-} ]]; then
+				manifest_args+=(--core "$CORE")
+			fi
+			for arg in "${criterion_args[@]}"; do
+				manifest_args+=("--criterion-arg=$arg")
+			done
+			for arg in "${forward_args[@]}"; do
+				manifest_args+=("--forwarded-arg=$arg")
+			done
+			transaction=$("${launcher[@]}" "${manifest_helper[@]}" "${manifest_args[@]}")
+			manifest_mode=hydrate
+		elif [[ -n "$metadata_compare" ]]; then
+			manifest_args=(hydrate --root "$CRITERION_ROOT" --target "$target"
+				--baseline "$metadata_compare" --strict-measured --source-root "$REPO_ROOT")
+			if [[ -n ${CORE:-} ]]; then
+				manifest_args+=(--core "$CORE")
+			fi
+			for arg in "${criterion_args[@]}"; do
+				manifest_args+=("--criterion-arg=$arg")
+			done
+			for arg in "${forward_args[@]}"; do
+				manifest_args+=("--forwarded-arg=$arg")
+			done
+			transaction=$("${launcher[@]}" "${manifest_helper[@]}" "${manifest_args[@]}")
+			manifest_mode=hydrate
+		fi
+	fi
+
+	env_args=(
+		"OPTHASH_BENCH_SAVE_BASELINE=$metadata_save"
+		"OPTHASH_BENCH_LOAD_BASELINE=$metadata_load"
+		"OPTHASH_BENCH_COMPARE_BASELINE=$metadata_compare"
+	)
+	if [[ -n "$transaction" ]]; then
+		env_args+=("CRITERION_HOME=$transaction")
+	fi
+	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" env "${env_args[@]}"
+		cargo bench "${cargo_feature_args[@]}" --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
+	if "${launcher[@]}" "${cmd[@]}"; then
+		:
+	else
+		status=$?
+		if [[ "$manifest_mode" == "hydrate" ]]; then
+			"${launcher[@]}" "${manifest_helper[@]}" discard --root "$CRITERION_ROOT" --transaction "$transaction" || true
+		fi
+		exit "$status"
+	fi
+	if [[ "$manifest_mode" == "save" ]]; then
+		"${launcher[@]}" "${manifest_helper[@]}" publish-save --root "$CRITERION_ROOT" --transaction "$transaction" >/dev/null
+	elif [[ "$manifest_mode" == "hydrate" ]]; then
+		"${launcher[@]}" "${manifest_helper[@]}" discard --root "$CRITERION_ROOT" --transaction "$transaction"
+	fi
 done

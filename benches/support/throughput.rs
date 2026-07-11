@@ -208,6 +208,67 @@ macro_rules! bench_insert_reuse {
     }};
 }
 
+/// Dynamic-name variant of [`bench_insert_reuse`] for size-labelled groups.
+macro_rules! bench_insert_reuse_named {
+    ($group:expr, $op:expr, $cap:expr, $pairs:expr $(,)?) => {{
+        bench_insert_reuse_one!(
+            $group,
+            format!("{}_std", $op),
+            common::std_map_cap($cap),
+            $pairs
+        );
+        bench_insert_reuse_one!(
+            $group,
+            format!("{}_hashbrown", $op),
+            common::hashbrown_map_cap($cap),
+            $pairs
+        );
+        bench_insert_reuse_one!(
+            $group,
+            format!("{}_elastic", $op),
+            common::elastic_map_cap($cap),
+            $pairs
+        );
+        bench_insert_reuse_one!(
+            $group,
+            format!("{}_funnel", $op),
+            common::funnel_map_cap($cap),
+            $pairs
+        );
+    }};
+}
+
+/// Validate the reused-map fixture once before Criterion starts sampling.
+macro_rules! preflight_insert_reuse_map {
+    ($map:expr, $pairs:expr $(,)?) => {{
+        let expected_capacity = $map.capacity();
+        for &(key, value) in $pairs {
+            assert_eq!(
+                $map.insert(key, value),
+                None,
+                "scaled-insert fixtures must contain distinct keys"
+            );
+        }
+        assert_eq!($map.len(), $pairs.len(), "preflight inserted length");
+        assert_eq!(
+            $map.capacity(),
+            expected_capacity,
+            "preallocated map grew during preflight"
+        );
+        for &(key, value) in $pairs {
+            assert_eq!($map.get(&key), Some(&value), "preflight key/value");
+        }
+        $map.clear();
+        assert_eq!($map.len(), 0, "preflight clear length");
+        assert_eq!(
+            $map.capacity(),
+            expected_capacity,
+            "clear changed preallocated capacity"
+        );
+        expected_capacity
+    }};
+}
+
 /// One impl variant of [`bench_insert_reuse`]. Native: `iter_custom` so
 /// only the insert loop is timed (no per-iter alloc pollution). Under
 /// `cfg(codspeed)` falls back to `iter_batched_ref` (codspeed-criterion-
@@ -216,34 +277,56 @@ macro_rules! bench_insert_reuse {
 macro_rules! bench_insert_reuse_one {
     ($group:expr, $name:expr, $setup:expr, $pairs:expr $(,)?) => {{
         #[cfg(not(codspeed))]
-        $group.bench_function($name, |b| {
+        {
+            let pairs = $pairs;
             let mut map = $setup;
-            b.iter_custom(|iters| {
-                let mut total = std::time::Duration::ZERO;
-                for _ in 0..iters {
-                    map.clear();
-                    let t0 = std::time::Instant::now();
-                    for &(key, value) in $pairs {
-                        map.insert(std::hint::black_box(key), std::hint::black_box(value));
+            let expected_capacity = preflight_insert_reuse_map!(map, pairs);
+            $group.bench_function($name, move |b| {
+                b.iter_custom(|iters| {
+                    let mut total = std::time::Duration::ZERO;
+                    for _ in 0..iters {
+                        map.clear();
+                        assert_eq!(map.len(), 0, "timed-fill clear length");
+                        assert_eq!(
+                            map.capacity(),
+                            expected_capacity,
+                            "timed-fill clear changed capacity"
+                        );
+                        let t0 = std::time::Instant::now();
+                        for &(key, value) in pairs {
+                            map.insert(std::hint::black_box(key), std::hint::black_box(value));
+                        }
+                        let elapsed = t0.elapsed();
+                        assert_eq!(map.len(), pairs.len(), "timed-fill inserted length");
+                        assert_eq!(
+                            map.capacity(),
+                            expected_capacity,
+                            "preallocated map grew during timed fill"
+                        );
+                        total += elapsed;
                     }
-                    total += t0.elapsed();
-                    std::hint::black_box(map.len());
-                }
-                total
+                    total
+                });
             });
-        });
+        }
         #[cfg(codspeed)]
-        $group.bench_function($name, |b| {
-            b.iter_batched_ref(
-                || $setup,
-                |map| {
-                    for &(key, value) in $pairs {
-                        map.insert(std::hint::black_box(key), std::hint::black_box(value));
-                    }
-                    std::hint::black_box(map.len())
-                },
-                criterion::BatchSize::PerIteration,
-            );
-        });
+        {
+            let pairs = $pairs;
+            let mut preflight = $setup;
+            let _ = preflight_insert_reuse_map!(preflight, pairs);
+            drop(preflight);
+            $group.bench_function($name, move |b| {
+                b.iter_batched_ref(
+                    || $setup,
+                    |map| {
+                        for &(key, value) in pairs {
+                            map.insert(std::hint::black_box(key), std::hint::black_box(value));
+                        }
+                        std::hint::black_box(map.len())
+                    },
+                    criterion::BatchSize::PerIteration,
+                );
+            });
+        }
     }};
 }

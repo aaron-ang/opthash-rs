@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -9,7 +10,9 @@ from _plot_common import (
     IMPLEMENTATIONS,
     apply_axis_style,
     load_criterion_mean_ns,
+    provenance_text,
     save_svg,
+    verify_criterion_baseline,
 )
 
 
@@ -24,24 +27,28 @@ THROUGHPUT_WORKLOADS = (
 )
 
 
-def plot_throughput_speedup(assets_dir: Path):
+def plot_throughput_speedup(assets_dir: Path, *, baseline: str):
     """Single bar chart: all throughput workloads, speedup vs std."""
+    manifest = verify_criterion_baseline("speedup", baseline)
     labels = []
     elastic_speedups = []
     funnel_speedups = []
 
     # Group name is the workload; bench id is `<workload>_<impl>`.
     for workload, label in THROUGHPUT_WORKLOADS:
-        try:
-            times = {
-                impl: load_criterion_mean_ns(workload, f"{workload}_{impl}")
-                for impl in IMPLEMENTATIONS
-            }
-        except FileNotFoundError:
-            continue
+        times = {
+            impl: load_criterion_mean_ns(
+                workload, f"{workload}_{impl}", baseline=baseline
+            )
+            for impl in IMPLEMENTATIONS
+        }
         labels.append(label)
-        elastic_speedups.append(times["std"] / times["elastic"])
-        funnel_speedups.append(times["std"] / times["funnel"])
+        elastic_speedups.append(
+            times["std"].point_estimate / times["elastic"].point_estimate
+        )
+        funnel_speedups.append(
+            times["std"].point_estimate / times["funnel"].point_estimate
+        )
 
     if not labels:
         print("no throughput data found, skipping")
@@ -76,7 +83,10 @@ def plot_throughput_speedup(assets_dir: Path):
     apply_axis_style(
         ax,
         title="Throughput Speedup over std::HashMap",
-        subtitle="Criterion throughput benchmarks \u2014 std::HashMap is the 1.0\u00d7 baseline",
+        subtitle=(
+            "Criterion throughput — std::HashMap is 1.0× · "
+            f"Selected baseline: {baseline}\n{provenance_text(manifest)}"
+        ),
         xlabel="Workload",
         ylabel="Speedup (higher is better)",
         y_formatter=lambda v, _: f"{v:.1f}",
@@ -101,7 +111,14 @@ def plot_throughput_speedup(assets_dir: Path):
 
 
 def main():
-    plot_throughput_speedup(ASSETS_DIR)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--baseline",
+        required=True,
+        help="safe named Criterion baseline to chart",
+    )
+    args = parser.parse_args()
+    plot_throughput_speedup(ASSETS_DIR, baseline=args.baseline)
 
 
 if __name__ == "__main__":
