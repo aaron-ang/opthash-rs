@@ -365,6 +365,15 @@ git commit -m "bench: publish atomic baseline metadata"
 - Produces: `verify(root, target, baseline, compare=None, require_clean=False) -> list[dict]`.
 - Produces: CLI command `verify --root --target --baseline [--compare] [--require-clean]`.
 
+Verification validates the complete published sidecar schema before source,
+artifact, cleanliness, or compatibility checks. The top-level, source, and CPU
+identity field sets are exact. Fingerprints and Git commits use their lowercase
+hex formats; booleans and integers reject Python's bool/int equivalence;
+argument and registration collections have exact element types; registrations
+are nonempty, sorted, and unique; CPU identity binds its canonical field hash;
+and the measurement timestamp is the UTC ISO format emitted by publication.
+Every named sidecar is validated independently before a pair is compared.
+
 - [ ] **Step 1: Write compatibility tests**
 
 ```python
@@ -468,8 +477,10 @@ def verify(root: Path, target: str, baseline: str, compare: str | None = None, *
     names = [baseline] if compare is None else [baseline, compare]
     values = [read_metadata(root, target, name) for name in names]
     for name, value in zip(names, values, strict=True):
-        if value.get("schema") != SCHEMA_VERSION or value.get("target") != target:
-            raise MetadataError(f"invalid metadata schema or target for {name!r}")
+        _validate_metadata(value, name)
+    for name, value in zip(names, values, strict=True):
+        if value["target"] != target:
+            raise MetadataError(f"invalid metadata target for {name!r}")
         if value["source"]["before"] != value["source"]["after"]:
             raise MetadataError(f"source changed during baseline {name!r}")
         registrations = target_registrations(root, target, name)

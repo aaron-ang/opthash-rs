@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -48,6 +49,16 @@ def write_metadata(root: Path, name: str, value: dict[str, object]) -> None:
     path.write_text(json.dumps(value))
 
 
+def fixture_cpu_identity(model: str) -> dict[str, object]:
+    fields = {"Architecture": "fixture-arch", "Model name": model}
+    canonical = json.dumps(fields, separators=(",", ":"), sort_keys=True).encode()
+    return {
+        "algorithm": "sha256_canonical_cpu_fields_v1",
+        "fields": fields,
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+
+
 def compatible_metadata_pair(
     root: Path,
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -58,7 +69,7 @@ def compatible_metadata_pair(
         "requested_bench": "speedup",
         "forwarded_args": ["--measurement-time", "10", "get_hit"],
         "registrations": ["get_hit/get_hit_elastic"],
-        "cpu_identity": "fixture-cpu",
+        "cpu_identity": fixture_cpu_identity("fixture-cpu"),
         "core": 5,
         "os": "fixture-os",
         "rustc_vv": "rustc fixture",
@@ -91,7 +102,7 @@ def incompatible_value(field: str) -> object:
     return {
         "methodology": "c" * 64,
         "core": 6,
-        "cpu_identity": "other-cpu",
+        "cpu_identity": fixture_cpu_identity("other-cpu"),
         "os": "other-os",
         "rustc_vv": "other-rustc",
         "forwarded_args": ["get_miss"],
@@ -463,8 +474,151 @@ def test_verify_rejects_unknown_cleanliness_for_final_evidence(tmp_path: Path) -
     anchor["source"]["dirty"] = None
     write_metadata(tmp_path, "anchor", anchor)
 
-    with pytest.raises(benchmark_metadata.MetadataError, match="requires clean"):
+    with pytest.raises(benchmark_metadata.MetadataError, match="invalid benchmark"):
         benchmark_metadata.verify(tmp_path, "speedup", "anchor", require_clean=True)
+
+
+def test_verify_rejects_boolean_schema_before_artifact_checks(tmp_path: Path) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    anchor["schema"] = True
+    write_metadata(tmp_path, "anchor", anchor)
+    (tmp_path / "get_hit/get_hit_elastic/anchor/estimates.json").unlink()
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="anchor.*schema"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source", None),
+        ("forwarded_args", {"argument": "get_hit"}),
+        ("cpu_identity", ["fixture-cpu"]),
+        ("measured_at_utc", None),
+    ],
+)
+def test_verify_rejects_json_type_substitutions(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    anchor[field] = value
+    write_metadata(tmp_path, "anchor", anchor)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match=f"anchor.*{field}"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("before", "a" * 63),
+        ("after", "A" * 64),
+        ("commit", "1" * 39),
+        ("dirty", 0),
+    ],
+)
+def test_verify_rejects_malformed_source_metadata(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    anchor["source"][field] = value
+    write_metadata(tmp_path, "anchor", anchor)
+
+    with pytest.raises(
+        benchmark_metadata.MetadataError, match=f"anchor.*source.{field}"
+    ):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+@pytest.mark.parametrize("change", ["missing", "extra"])
+def test_verify_rejects_incomplete_or_extended_source_shape(
+    tmp_path: Path, change: str
+) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    if change == "missing":
+        del anchor["source"]["commit"]
+    else:
+        anchor["source"]["unexpected"] = "value"
+    write_metadata(tmp_path, "anchor", anchor)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="anchor.*source fields"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+def test_verify_rejects_malformed_methodology_fingerprint(tmp_path: Path) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    anchor["methodology"] = "A" * 64
+    write_metadata(tmp_path, "anchor", anchor)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="anchor.*methodology"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+@pytest.mark.parametrize(
+    "registrations",
+    [
+        ["z/z", "a/a"],
+        ["get_hit/get_hit_elastic", "get_hit/get_hit_elastic"],
+        [""],
+        ["get_hit"],
+    ],
+)
+def test_verify_rejects_invalid_registration_metadata(
+    tmp_path: Path, registrations: list[str]
+) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    anchor["registrations"] = registrations
+    write_metadata(tmp_path, "anchor", anchor)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="anchor.*registrations"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+@pytest.mark.parametrize("change", ["missing", "extra"])
+def test_verify_rejects_incomplete_or_extended_sidecar_shape(
+    tmp_path: Path, change: str
+) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    if change == "missing":
+        del anchor["requested_bench"]
+    else:
+        anchor["unexpected"] = "value"
+    write_metadata(tmp_path, "anchor", anchor)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="anchor.*fields"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+def test_verify_rejects_malformed_cpu_identity(tmp_path: Path) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    anchor["cpu_identity"]["sha256"] = "0" * 64
+    write_metadata(tmp_path, "anchor", anchor)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="anchor.*cpu_identity"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+def test_verify_rejects_nonpublisher_timestamp_format(tmp_path: Path) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    anchor["measured_at_utc"] = "2026-07-11T00:00:00Z"
+    write_metadata(tmp_path, "anchor", anchor)
+
+    with pytest.raises(
+        benchmark_metadata.MetadataError, match="anchor.*measured_at_utc"
+    ):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+@pytest.mark.parametrize("core", [None, True])
+def test_verify_rejects_malformed_candidate_before_comparison(
+    tmp_path: Path, core: object
+) -> None:
+    _, candidate = compatible_metadata_pair(tmp_path)
+    candidate["core"] = core
+    write_metadata(tmp_path, "candidate", candidate)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="candidate.*core"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor", "candidate")
 
 
 def test_verify_cli_prints_compatible_metadata(tmp_path: Path) -> None:

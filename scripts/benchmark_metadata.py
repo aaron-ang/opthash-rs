@@ -14,6 +14,9 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 RESERVED_NAMES = {"new", "base", "change", "report"}
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+GIT_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+UTC_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6})?\+00:00\Z")
 CPU_IDENTITY_FIELDS = {
     "Architecture",
     "Byte Order",
@@ -52,6 +55,22 @@ COMPATIBILITY_FIELDS = (
     "forwarded_args",
     "registrations",
 )
+METADATA_FIELDS = {
+    "schema",
+    "source",
+    "methodology",
+    "target",
+    "requested_bench",
+    "forwarded_args",
+    "registrations",
+    "cpu_identity",
+    "core",
+    "os",
+    "rustc_vv",
+    "measured_at_utc",
+}
+SOURCE_FIELDS = {"before", "after", "commit", "dirty"}
+CPU_IDENTITY_METADATA_FIELDS = {"algorithm", "fields", "sha256"}
 
 
 class MetadataError(Exception):
@@ -196,6 +215,102 @@ def read_metadata(root: Path, target: str, baseline: str) -> dict[str, object]:
     return value
 
 
+def _invalid_metadata(name: str, field: str) -> None:
+    raise MetadataError(f"invalid benchmark metadata for {name!r}: {field}")
+
+
+def _validate_metadata(value: dict[str, object], name: str) -> None:
+    if set(value) != METADATA_FIELDS:
+        _invalid_metadata(name, "fields")
+    schema = value["schema"]
+    if type(schema) is not int or schema != SCHEMA_VERSION:
+        _invalid_metadata(name, "schema")
+
+    source = value["source"]
+    if not isinstance(source, dict):
+        _invalid_metadata(name, "source")
+    if set(source) != SOURCE_FIELDS:
+        _invalid_metadata(name, "source fields")
+    for field in ("before", "after"):
+        fingerprint = source[field]
+        if not isinstance(fingerprint, str) or SHA256.fullmatch(fingerprint) is None:
+            _invalid_metadata(name, f"source.{field}")
+    commit = source["commit"]
+    if not isinstance(commit, str) or GIT_COMMIT.fullmatch(commit) is None:
+        _invalid_metadata(name, "source.commit")
+    if type(source["dirty"]) is not bool:
+        _invalid_metadata(name, "source.dirty")
+
+    methodology = value["methodology"]
+    if not isinstance(methodology, str) or SHA256.fullmatch(methodology) is None:
+        _invalid_metadata(name, "methodology")
+    for field in ("target", "requested_bench"):
+        field_value = value[field]
+        if not isinstance(field_value, str) or not field_value:
+            _invalid_metadata(name, field)
+
+    forwarded_args = value["forwarded_args"]
+    if not isinstance(forwarded_args, list) or any(
+        not isinstance(argument, str) for argument in forwarded_args
+    ):
+        _invalid_metadata(name, "forwarded_args")
+
+    registrations = value["registrations"]
+    if (
+        not isinstance(registrations, list)
+        or not registrations
+        or any(not isinstance(registration, str) for registration in registrations)
+        or registrations != sorted(set(registrations))
+        or any(
+            len(registration.split("/")) != 2
+            or any(part in {"", ".", ".."} for part in registration.split("/"))
+            for registration in registrations
+        )
+    ):
+        _invalid_metadata(name, "registrations")
+
+    cpu = value["cpu_identity"]
+    if not isinstance(cpu, dict) or set(cpu) != CPU_IDENTITY_METADATA_FIELDS:
+        _invalid_metadata(name, "cpu_identity")
+    fields = cpu["fields"]
+    if (
+        cpu["algorithm"] != "sha256_canonical_cpu_fields_v1"
+        or not isinstance(fields, dict)
+        or not fields
+        or any(
+            not isinstance(field, str)
+            or not field
+            or field not in CPU_IDENTITY_FIELDS | {"Processor"}
+            or not isinstance(field_value, str)
+            for field, field_value in fields.items()
+        )
+        or not isinstance(cpu["sha256"], str)
+        or SHA256.fullmatch(cpu["sha256"]) is None
+    ):
+        _invalid_metadata(name, "cpu_identity")
+    canonical_cpu = json.dumps(fields, separators=(",", ":"), sort_keys=True).encode()
+    if cpu["sha256"] != hashlib.sha256(canonical_cpu).hexdigest():
+        _invalid_metadata(name, "cpu_identity")
+
+    core = value["core"]
+    if type(core) is not int or core < 0:
+        _invalid_metadata(name, "core")
+    for field in ("os", "rustc_vv"):
+        field_value = value[field]
+        if not isinstance(field_value, str) or not field_value:
+            _invalid_metadata(name, field)
+
+    measured_at = value["measured_at_utc"]
+    if not isinstance(measured_at, str) or UTC_TIMESTAMP.fullmatch(measured_at) is None:
+        _invalid_metadata(name, "measured_at_utc")
+    try:
+        measured_datetime = datetime.fromisoformat(measured_at)
+    except ValueError:
+        _invalid_metadata(name, "measured_at_utc")
+    if measured_datetime.utcoffset() != timezone.utc.utcoffset(measured_datetime):
+        _invalid_metadata(name, "measured_at_utc")
+
+
 def verify(
     root: Path,
     target: str,
@@ -207,18 +322,12 @@ def verify(
     names = [baseline] if compare is None else [baseline, compare]
     values = [read_metadata(root, target, name) for name in names]
     for name, value in zip(names, values, strict=True):
-        if value.get("schema") != SCHEMA_VERSION or value.get("target") != target:
-            raise MetadataError(f"invalid metadata schema or target for {name!r}")
-        source = value.get("source")
-        if not isinstance(source, dict):
-            raise MetadataError(f"invalid source metadata for {name!r}")
-        try:
-            source_changed = source["before"] != source["after"]
-            dirty = source["dirty"]
-            recorded_registrations = value["registrations"]
-        except KeyError as error:
-            raise MetadataError(f"invalid benchmark metadata for {name!r}") from error
-        if source_changed:
+        _validate_metadata(value, name)
+    for name, value in zip(names, values, strict=True):
+        if value["target"] != target:
+            raise MetadataError(f"invalid metadata target for {name!r}")
+        source = value["source"]
+        if source["before"] != source["after"]:
             raise MetadataError(f"source changed during baseline {name!r}")
         try:
             registrations = target_registrations(root, target, name)
@@ -226,16 +335,13 @@ def verify(
             raise MetadataError(
                 f"Criterion registrations differ for {name!r}: {error}"
             ) from error
-        if registrations != recorded_registrations:
+        if registrations != value["registrations"]:
             raise MetadataError(f"Criterion registrations differ for {name!r}")
-        if require_clean and dirty is not False:
+        if require_clean and source["dirty"]:
             raise MetadataError("final evidence requires clean source metadata")
     for field in COMPATIBILITY_FIELDS:
-        try:
-            reference = values[0][field]
-            incompatible = any(value[field] != reference for value in values[1:])
-        except KeyError as error:
-            raise MetadataError(f"invalid benchmark metadata field: {field}") from error
+        reference = values[0][field]
+        incompatible = any(value[field] != reference for value in values[1:])
         if incompatible:
             raise MetadataError(f"incompatible benchmark metadata field: {field}")
     return values
