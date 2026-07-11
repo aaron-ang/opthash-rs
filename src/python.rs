@@ -18,35 +18,48 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyFrozenSet, PySet, PyString, PyTuple, PyType};
 
-use crate::common::config::DEFAULT_RESERVE_FRACTION;
-use crate::funnel::MAX_FUNNEL_RESERVE_FRACTION;
 use crate::map::{HashMap, TableBackend};
 use crate::set::HashSet;
-use crate::{ElasticHashMap, ElasticHashSet, FunnelHashMap, FunnelHashSet};
+use crate::{ElasticHashMap, ElasticHashSet, FunnelHashMap, FunnelHashSet, ReserveFraction};
 
-fn validate_elastic_reserve_fraction(reserve_fraction: Option<f64>) -> PyResult<f64> {
-    let Some(rf) = reserve_fraction else {
-        return Ok(DEFAULT_RESERVE_FRACTION);
-    };
-    if !(rf > 0.0 && rf < 1.0) {
+fn parse_reserve(
+    reserve_fraction: Option<f64>,
+    delta_log2: Option<u32>,
+) -> PyResult<ReserveFraction> {
+    if reserve_fraction.is_some() && delta_log2.is_some() {
         return Err(PyValueError::new_err(
-            "reserve_fraction must be in the open interval (0, 1)",
+            "reserve_fraction and delta_log2 are mutually exclusive",
         ));
     }
-    Ok(rf)
+    if let Some(delta_log2) = delta_log2 {
+        return ReserveFraction::from_delta_log2(delta_log2)
+            .map_err(|error| PyValueError::new_err(error.to_string()));
+    }
+    if let Some(reserve_fraction) = reserve_fraction {
+        return ReserveFraction::try_from(reserve_fraction)
+            .map_err(|error| PyValueError::new_err(error.to_string()));
+    }
+    Ok(ReserveFraction::DEFAULT)
 }
 
-fn validate_funnel_reserve_fraction(reserve_fraction: Option<f64>) -> PyResult<f64> {
-    let Some(rf) = reserve_fraction else {
-        return Ok(DEFAULT_RESERVE_FRACTION);
-    };
-    if !(rf > 0.0 && rf <= MAX_FUNNEL_RESERVE_FRACTION) {
-        return Err(PyValueError::new_err(format!(
-            "reserve_fraction must be in (0, {MAX_FUNNEL_RESERVE_FRACTION}]; \
-             FunnelHashMap caps the load factor at 1/8 by design"
-        )));
+fn validate_elastic_reserve_fraction(
+    reserve_fraction: Option<f64>,
+    delta_log2: Option<u32>,
+) -> PyResult<ReserveFraction> {
+    parse_reserve(reserve_fraction, delta_log2)
+}
+
+fn validate_funnel_reserve_fraction(
+    reserve_fraction: Option<f64>,
+    delta_log2: Option<u32>,
+) -> PyResult<ReserveFraction> {
+    let reserve = parse_reserve(reserve_fraction, delta_log2)?;
+    if reserve.delta_log2() < 3 {
+        return Err(PyValueError::new_err(
+            "Funnel reserve must be at most 1/8 (delta_log2 >= 3)",
+        ));
     }
-    Ok(rf)
+    Ok(reserve)
 }
 
 fn missing_key(key: &Bound<PyAny>) -> PyErr {
@@ -650,15 +663,16 @@ macro_rules! define_map_classes {
             }
 
             #[classmethod]
-            #[pyo3(signature = (capacity = 0, reserve_fraction = None))]
+            #[pyo3(signature = (capacity = 0, reserve_fraction = None, delta_log2 = None))]
             fn with_options(
                 _cls: &Bound<PyType>,
                 capacity: usize,
                 reserve_fraction: Option<f64>,
+                delta_log2: Option<u32>,
             ) -> PyResult<Self> {
-                let rf = $validate_rf(reserve_fraction)?;
+                let reserve = $validate_rf(reserve_fraction, delta_log2)?;
                 Ok(Self {
-                    inner: $Inner::with_capacity_and_reserve_fraction(capacity, rf),
+                    inner: $Inner::with_capacity_and_reserve(capacity, reserve),
                     generation: 0,
                 })
             }
@@ -1477,15 +1491,16 @@ macro_rules! define_set_classes {
             }
 
             #[classmethod]
-            #[pyo3(signature = (capacity = 0, reserve_fraction = None))]
+            #[pyo3(signature = (capacity = 0, reserve_fraction = None, delta_log2 = None))]
             fn with_options(
                 _cls: &Bound<PyType>,
                 capacity: usize,
                 reserve_fraction: Option<f64>,
+                delta_log2: Option<u32>,
             ) -> PyResult<Self> {
-                let rf = $validate_rf(reserve_fraction)?;
+                let reserve = $validate_rf(reserve_fraction, delta_log2)?;
                 Ok(Self {
-                    inner: $Inner::with_capacity_and_reserve_fraction(capacity, rf),
+                    inner: $Inner::with_capacity_and_reserve(capacity, reserve),
                     generation: 0,
                 })
             }

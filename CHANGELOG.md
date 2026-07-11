@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Exact dyadic [`ReserveFraction`] configuration and fallible construction via
+  `TryBuildError`.
+- Observable allocation epochs for growth, cleanup, and placement recovery.
+- Source-bound randomized and sequential throughput/latency methodology.
+
+### Changed
+
+- **Breaking:** Elastic and Funnel now use their exact finite paper-placement
+  cores by default with a `1/8` reserve. This changes geometry, `capacity()`,
+  and growth points.
+- **Breaking:** `f64` reserve compatibility constructors accept only exact
+  inverse powers of two; they no longer sanitize or clamp invalid values.
+- **Breaking:** Funnel rejects reserves above `1/8` instead of clamping them.
+- Tombstones are reused. Crossing the cleanup threshold starts an observable
+  same-size epoch; fully consuming `extract_if` may perform that deferred
+  cleanup.
+
+### Removed
+
+- Rounded legacy geometry, validator adapters, public physical-layout
+  snapshots, and one-off geometry/same-heap/percentile evidence machinery.
+
 ## [0.10.3](https://github.com/aaron-ang/opthash-rs/compare/v0.10.2...v0.10.3) - 2026-07-05
 
 ### Added

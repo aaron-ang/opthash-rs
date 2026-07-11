@@ -9,8 +9,9 @@ use equivalent::Equivalent;
 
 #[cfg(feature = "default-hasher")]
 use crate::common::DefaultHashBuilder;
-use crate::common::error::TryReserveError;
+use crate::common::error::{TryBuildError, TryReserveError};
 use crate::map::{self, TableBackend};
+use crate::{EpochSnapshot, ReserveFraction};
 
 /// Boxed predicate adapting a set-level `FnMut(&T) -> bool` to the map's
 /// `FnMut(&K, &mut V) -> bool`. Boxing keeps the public `ExtractIf` type
@@ -47,7 +48,43 @@ where
         }
     }
 
-    /// Creates an empty set with the given reserve fraction.
+    /// Creates an empty set with the exact dyadic `reserve`.
+    ///
+    /// # Panics
+    /// Panics if the backend rejects `reserve` or allocation fails.
+    #[must_use]
+    pub fn with_reserve(reserve: ReserveFraction) -> Self {
+        Self {
+            map: map::HashMap::with_reserve(reserve),
+        }
+    }
+
+    /// Creates an empty set with `capacity` and the exact dyadic `reserve`.
+    ///
+    /// # Panics
+    /// Panics if the backend rejects the inputs or allocation fails.
+    #[must_use]
+    pub fn with_capacity_and_reserve(capacity: usize, reserve: ReserveFraction) -> Self {
+        Self {
+            map: map::HashMap::with_capacity_and_reserve(capacity, reserve),
+        }
+    }
+
+    /// Fallible exact-reserve constructor.
+    ///
+    /// # Errors
+    /// Returns [`TryBuildError`] for policy, capacity, or allocation failures.
+    pub fn try_with_capacity_and_reserve(
+        capacity: usize,
+        reserve: ReserveFraction,
+    ) -> Result<Self, TryBuildError> {
+        map::HashMap::try_with_capacity_and_reserve(capacity, reserve).map(|map| Self { map })
+    }
+
+    /// Compatibility constructor for an exact dyadic `f64` reserve.
+    ///
+    /// # Panics
+    /// Panics for non-dyadic input, unsupported reserve, or allocation failure.
     #[must_use]
     pub fn with_reserve_fraction(reserve_fraction: f64) -> Self {
         Self {
@@ -55,12 +92,27 @@ where
         }
     }
 
-    /// Creates an empty set with the given capacity and reserve fraction.
+    /// Compatibility constructor for capacity and an exact dyadic `f64` reserve.
+    ///
+    /// # Panics
+    /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
     pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self {
         Self {
             map: map::HashMap::with_capacity_and_reserve_fraction(capacity, reserve_fraction),
         }
+    }
+
+    /// Fallible compatibility constructor for an exact dyadic `f64` reserve.
+    ///
+    /// # Errors
+    /// Returns [`TryBuildError`] for invalid input or construction failure.
+    pub fn try_with_capacity_and_reserve_fraction(
+        capacity: usize,
+        reserve_fraction: f64,
+    ) -> Result<Self, TryBuildError> {
+        map::HashMap::try_with_capacity_and_reserve_fraction(capacity, reserve_fraction)
+            .map(|map| Self { map })
     }
 }
 
@@ -85,7 +137,10 @@ where
         }
     }
 
-    /// Creates an empty set with the given reserve fraction and hasher.
+    /// Compatibility constructor for an exact dyadic `f64` reserve and hasher.
+    ///
+    /// # Panics
+    /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
     pub fn with_reserve_fraction_and_hasher(
         reserve_fraction: f64,
@@ -96,7 +151,10 @@ where
         }
     }
 
-    /// Creates an empty set with the given capacity, reserve fraction, and hasher.
+    /// Compatibility constructor for capacity, exact dyadic reserve, and hasher.
+    ///
+    /// # Panics
+    /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
     pub fn with_capacity_and_reserve_fraction_and_hasher(
         capacity: usize,
@@ -107,6 +165,25 @@ where
             map: map::HashMap::with_capacity_and_reserve_fraction_and_hasher(
                 capacity,
                 reserve_fraction,
+                hash_builder,
+            ),
+        }
+    }
+
+    /// Creates an empty set with exact reserve and custom hasher.
+    ///
+    /// # Panics
+    /// Panics if the backend rejects the inputs or allocation fails.
+    #[must_use]
+    pub fn with_capacity_and_reserve_and_hasher(
+        capacity: usize,
+        reserve: ReserveFraction,
+        hash_builder: P::Hasher,
+    ) -> Self {
+        Self {
+            map: map::HashMap::with_capacity_and_reserve_and_hasher(
+                capacity,
+                reserve,
                 hash_builder,
             ),
         }
@@ -142,6 +219,9 @@ where
     P: TableBackend<T, ()>,
 {
     /// Full constructor: capacity, reserve fraction, hasher, and allocator.
+    ///
+    /// # Panics
+    /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
     pub fn with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
@@ -157,6 +237,46 @@ where
                 alloc,
             ),
         }
+    }
+
+    /// Full exact constructor: capacity, reserve, hasher, and allocator.
+    ///
+    /// # Panics
+    /// Panics if the backend rejects the inputs or allocation fails.
+    #[must_use]
+    pub fn with_capacity_and_reserve_and_hasher_in(
+        capacity: usize,
+        reserve: ReserveFraction,
+        hash_builder: P::Hasher,
+        alloc: P::Alloc,
+    ) -> Self {
+        Self {
+            map: map::HashMap::with_capacity_and_reserve_and_hasher_in(
+                capacity,
+                reserve,
+                hash_builder,
+                alloc,
+            ),
+        }
+    }
+
+    /// Fallible full exact constructor.
+    ///
+    /// # Errors
+    /// Returns [`TryBuildError`] for policy, capacity, or allocation failures.
+    pub fn try_with_capacity_and_reserve_and_hasher_in(
+        capacity: usize,
+        reserve: ReserveFraction,
+        hash_builder: P::Hasher,
+        alloc: P::Alloc,
+    ) -> Result<Self, TryBuildError> {
+        map::HashMap::try_with_capacity_and_reserve_and_hasher_in(
+            capacity,
+            reserve,
+            hash_builder,
+            alloc,
+        )
+        .map(|map| Self { map })
     }
 
     /// Reference to the set's allocator.
@@ -182,6 +302,18 @@ where
     /// Current slot capacity.
     pub fn capacity(&self) -> usize {
         self.map.capacity()
+    }
+
+    /// Returns the exact reserve fraction fixed for the current epoch.
+    #[must_use]
+    pub fn reserve_fraction(&self) -> ReserveFraction {
+        self.map.reserve_fraction()
+    }
+
+    /// Returns the current allocation epoch.
+    #[must_use]
+    pub fn epoch(&self) -> EpochSnapshot {
+        self.map.epoch()
     }
 
     /// Reserves room for at least `additional` more values.

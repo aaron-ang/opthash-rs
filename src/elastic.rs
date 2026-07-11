@@ -1,19 +1,26 @@
+#![allow(clippy::inline_always, clippy::trivially_copy_pass_by_ref)]
+
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
+use core::ptr;
 
 use alloc::{boxed::Box, vec::Vec};
 use allocator_api2::alloc::{Allocator, Global, Layout};
 use equivalent::Equivalent;
 
+use crate::ReserveFraction;
 use crate::common::DefaultHashBuilder;
 use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
-use crate::common::config::{GROUP_SIZE, GROUP_SIZE_U32, INITIAL_CAPACITY};
-use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
-use crate::common::error::TryReserveError;
-#[cfg(not(feature = "std"))]
-use crate::common::float::FloatExt as _;
+use crate::common::config::{CACHE_LINE, INITIAL_CAPACITY};
+use crate::common::control::{self, CTRL_TOMBSTONE, ControlByte};
+use crate::common::error::{TryBuildError, TryReserveError};
+use crate::common::exact::{
+    CounterPrf, PaperConfig, PreparedElasticLevelProbe, PreparedElasticProbe,
+    elastic_dyadic_probe_budget, elastic_phi, unbiased_prepared_elastic_probe_index,
+};
 use crate::common::iter::RegionCursor;
-use crate::common::math::{self, align, capacity, probe};
+use crate::common::math::capacity;
+use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
 use crate::macros;
 use crate::map;
 
@@ -21,16 +28,92 @@ use crate::map;
 /// by iterators, the `(level, slot)` location backs removal.
 type ElasticScanItem<K, V> = (*mut SlotEntry<K, V>, (usize, usize));
 
-/// Defrag repacks fire at most once per `total_slots / DEFRAG_OPS_DIVISOR`
-/// inserts, keeping them O(1) amortized so churn can't storm. Larger means more
-/// frequent repacks: less probe drift, more repack work. 4 is the swept knee:
-/// 2 inserts pay +16% from drift, 8+ erode the delete win with repack overhead.
-const DEFRAG_OPS_DIVISOR: usize = 4;
+const ELASTIC_PROBE_SEED: u64 = 0xD1B5_4A32_D192_ED03;
+const ELASTIC_PROBE_BUDGET_C: usize = 8;
+const RANGE_WORD_CAP: u32 = 8;
+const UNIFORM_SEARCH_CAP: u64 = 4_096;
+const QUERY_POSITION_CAP: u128 = 1_000_000;
+const EXCEPTIONAL_PLACEMENT_FLAG: u32 = 1 << 31;
+const QUERY_PROBE_LANE_COUNT: usize = 384;
+const MAX_ELASTIC_SLOTS: usize = match 1_usize.checked_shl(u32::BITS) {
+    Some(slots) => slots,
+    None => usize::MAX,
+};
+const MEMBERSHIP_BITS_PER_SLOT: usize = 8;
+const MEMBERSHIP_SLOTS_PER_WORD: usize = u64::BITS as usize / MEMBERSHIP_BITS_PER_SLOT;
+const MEMBERSHIP_SALT_1: u64 = 0xA076_1D64_78BD_642F;
+const MEMBERSHIP_SALT_2: u64 = 0xE703_7ED1_A0B4_28DB;
+const ELASTIC_LEVEL_LANES: [u64; u32::BITS as usize] = elastic_level_lanes();
+const ELASTIC_QUERY_PROBE_LANES: [u64; QUERY_PROBE_LANE_COUNT] = elastic_query_probe_lanes();
 
-/// A level is "drifted" once `max_probe_groups` exceeds this multiple of its
-/// `f(ε)` budget. `>1` since the high-water max sits above the mean budget; 3
-/// is delete-optimal in the sweep (2 over-repacks, 6 lets probes drift).
-const DEFRAG_DRIFT_MULT: f64 = 3.0;
+const fn elastic_level_lanes() -> [u64; u32::BITS as usize] {
+    let mut lanes = [0; u32::BITS as usize];
+    let mut level = 0;
+    while level < lanes.len() {
+        lanes[level] = PreparedElasticProbe::level_lane(level as u64);
+        level += 1;
+    }
+    lanes
+}
+
+const fn elastic_query_probe_lanes() -> [u64; QUERY_PROBE_LANE_COUNT] {
+    let mut lanes = [0; QUERY_PROBE_LANE_COUNT];
+    let mut logical_probe = 0;
+    while logical_probe < lanes.len() {
+        lanes[logical_probe] = PreparedElasticProbe::logical_probe_lane(logical_probe as u64);
+        logical_probe += 1;
+    }
+    lanes
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactInsertionCase {
+    Batch0 {
+        level: usize,
+    },
+    Case1 {
+        batch: usize,
+        current_level: usize,
+        next_level: usize,
+        free_current: usize,
+        free_next: usize,
+        budget: usize,
+    },
+    Case2 {
+        batch: usize,
+        current_level: usize,
+        next_level: usize,
+        free_current: usize,
+        free_next: usize,
+    },
+    Case3 {
+        batch: usize,
+        current_level: usize,
+        next_level: usize,
+        free_current: usize,
+        free_next: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactPlacement {
+    case: ExactInsertionCase,
+    level: usize,
+    slot: usize,
+    paper_probe: u64,
+    phi: u128,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PhiRoute {
+    /// Temporarily holds `phi` while a new suffix is sorted, then the exact
+    /// level bound used by every lookup in the epoch.
+    range_upper: u32,
+    logical_probe_index: u16,
+    level: u8,
+}
+
+const _: () = assert!(mem::size_of::<PhiRoute>() == 8);
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
@@ -40,29 +123,13 @@ struct Level<T> {
     ctrl_ptr: *mut u8,
     /// Cached `arena.as_ptr() + data_offset`, stamped at construction.
     data_ptr: *mut MaybeUninit<T>,
-    /// Slot capacity (= `group_count` * `GROUP_SIZE`). Bounded by `capacity`
-    /// via the arena layout, so `len`/`tombstones` fit in `u32` too.
+    /// Exact logical slot count. Bounded by the arena layout, so the counters
+    /// fit in `u32` too.
     capacity: u32,
-    /// Number of SIMD groups.
-    group_count: u32,
-    /// `group_count - 1`; pow2 so probe wrap is `& mask`.
-    group_count_mask: u32,
-    /// `1 +` the largest probe distance any live key needed (high-water).
-    /// Bounds the lookup scan; only grows until a resize resets it.
-    max_probe_groups: u32,
     /// Live entry count.
     len: u32,
     /// Deleted-slot count.
     tombstones: u32,
-    /// Cached `floor(reserve * cap / 2)`.
-    half_reserve_slot_threshold: u32,
-    /// Precomputed `DEFRAG_DRIFT_MULT * budget_cap`; keeps `probe_drifted` an
-    /// integer compare.
-    probe_drift_threshold: u32,
-    /// Per-level salt mixed into key hashes.
-    salt: u64,
-    /// Paper §2 cap on `f(ε)`.
-    budget_cap: f64,
 }
 
 unsafe impl<T: Send> Send for Level<T> {}
@@ -89,47 +156,15 @@ impl<T> ArenaSlots<T> for Level<T> {
 impl<T> Level<T> {
     /// Stamps a fresh descriptor at the given arena ptrs.
     /// Caller advances the offset cursor.
-    fn new_at(
-        level_idx: usize,
-        cap_u32: u32,
-        reserve_fraction: f64,
-        ctrl_ptr: *mut u8,
-        data_ptr: *mut MaybeUninit<T>,
-    ) -> Self {
-        let cap = cap_u32 as usize;
-        let gc = cap_u32 / GROUP_SIZE_U32;
-        let budget_cap = compute_budget_cap(reserve_fraction, gc as usize);
-        // `budget_cap >= 1.0`; `as u32` saturates and the value is tiny.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let probe_drift_threshold = (DEFRAG_DRIFT_MULT * budget_cap) as u32;
+    fn new_at(cap_u32: u32, ctrl_ptr: *mut u8, data_ptr: *mut MaybeUninit<T>) -> Self {
         Self {
             ctrl_ptr,
             data_ptr,
             capacity: cap_u32,
-            group_count: gc,
-            group_count_mask: gc.wrapping_sub(1),
-            max_probe_groups: 0,
-            salt: math::level_salt_wide(level_idx),
             len: 0,
             tombstones: 0,
-            half_reserve_slot_threshold: u32::try_from(capacity::floor_half_reserve_slots(
-                reserve_fraction,
-                cap,
-            ))
-            .unwrap_or(u32::MAX),
-            probe_drift_threshold,
-            budget_cap,
         }
     }
-
-    #[inline]
-    fn group_count(&self) -> usize {
-        self.group_count as usize
-    }
-
-    // ---------------------------------------------------------------- //
-    // Probe helpers                                                      //
-    // ---------------------------------------------------------------- //
 
     /// Slots minus live entries (includes tombstones, reusable on insert).
     #[inline]
@@ -137,85 +172,11 @@ impl<T> Level<T> {
         self.capacity.saturating_sub(self.len) as usize
     }
 
-    /// Paper §2 `f(ε)` probe budget.
-    #[inline]
-    #[allow(
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation
-    )]
-    fn limited_group_budget(&self) -> usize {
-        let cap = self.capacity as usize;
-        let free = self.free_slots();
-        if cap == 0 || free == 0 {
-            return 1;
-        }
-        let log_inv_eps = (cap as f64 / free as f64).log2();
-        let raw = 1.0 + log_inv_eps;
-        raw.min(self.budget_cap) as usize
-    }
-
-    /// Tombstones exceed [`capacity::tombstone_cleanup_threshold`], so `remove`
-    /// should repack this level in place; the threshold's hysteresis keeps
-    /// deletes amortized O(1).
+    /// Tombstones exceed [`capacity::tombstone_cleanup_threshold`], so the
+    /// table should begin a same-size cleanup epoch after the active scan.
     #[inline]
     fn needs_cleanup(&self) -> bool {
         self.tombstones as usize > capacity::tombstone_cleanup_threshold(self.capacity as usize)
-    }
-
-    /// `max_probe_groups` drifted past the healthy `f(ε)` budget; a repack pays.
-    #[inline]
-    fn probe_drifted(&self) -> bool {
-        self.max_probe_groups > self.probe_drift_threshold
-    }
-
-    #[inline]
-    fn triangular_group_start(&self, key_hash: u64) -> usize {
-        let mixed = key_hash ^ self.salt;
-        probe::hash_to_usize(mixed) & self.group_count_mask as usize
-    }
-
-    /// Extend `max_probe_groups` to cover a placement `group_dist` steps from its
-    /// probe start, so a bounded lookup never stops short of a live key. The
-    /// placing search already walked this distance.
-    #[inline]
-    fn note_probe_distance(&mut self, group_dist: u32) {
-        let reached = group_dist + 1;
-        if reached > self.max_probe_groups {
-            self.max_probe_groups = reached;
-        }
-    }
-}
-
-impl<K, V> Level<SlotEntry<K, V>> {
-    /// Triangular probe: fingerprint scan + key compare. Returns the slot on a
-    /// hit, `None` on a miss. Scans at most `max_probe_groups` groups — every
-    /// live key sits within that distance — or stops earlier at an EMPTY byte.
-    #[inline]
-    fn find_by_probe<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> Option<usize>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        if self.len == 0 {
-            return None;
-        }
-        let mask = self.group_count_mask as usize;
-        let mut probe = probe::TriangularProbe::new(self.triangular_group_start(key_hash));
-        for _ in 0..self.max_probe_groups as usize {
-            let match_mask = self.group_match_mask(probe.pos, key_fingerprint);
-            for relative_idx in match_mask {
-                let slot_idx = probe.pos * GROUP_SIZE + relative_idx;
-                let entry = unsafe { self.get_ref(slot_idx) };
-                if key.equivalent(&entry.key) {
-                    return Some(slot_idx);
-                }
-            }
-            if self.group_match_mask(probe.pos, CTRL_EMPTY).any() {
-                return None;
-            }
-            probe.advance(mask);
-        }
-        None
     }
 }
 
@@ -225,27 +186,25 @@ impl<K, V> Level<SlotEntry<K, V>> {
 /// Splits capacity across geometrically shrinking `levels` and routes inserts
 /// through a `batch_plan`: early batches concentrate on level 0; later
 /// batches push toward deeper levels. Lookups probe every level whose
-/// `len > 0`. Unlike standard open addressing, expected probe count stays
-/// low even at high load.
+/// `len > 0`.
 ///
-/// **Probe sequence**: paper §2 assumes uniform random probes per level;
-/// we use triangular probing with a per-level salt instead. Same
-/// simplification as `SwissTable` / hashbrown — preserves coverage with
-/// far better cache behavior than recomputing random positions.
+/// Placement uses the paper's exact level schedule and uniform per-level
+/// probes. Query positions are compressed without changing their order.
 pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     levels: LevelSlice<K, V>,
     len: usize,
     total_slots: usize,
     max_insertions: usize,
-    reserve_fraction: f64,
-    /// Schedule batch progression, resizing, and defragmentation.
+    reserve_fraction: ReserveFraction,
+    /// Schedule batch progression and epoch boundaries.
     scheduler: BatchScheduler,
-    /// Bound lookups by the deepest populated level.
-    max_populated_level: usize,
     hash_builder: S,
     alloc: A,
     /// [`ctrl_L0|ctrl_L1|...`][pad][`slots_L0|slots_L1|...`].
     arena: Arena,
+    epoch: EpochState,
+    probe_high_water: u32,
+    probe_schedule: Vec<PhiRoute>,
 }
 
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
@@ -321,14 +280,118 @@ macros::declare_backend_aliases! {
 type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
 type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>);
 
-/// Schedule resize, repack, and batch progression.
+struct ElasticArenaLayout {
+    layout: Layout,
+    data_base_off: usize,
+    membership_offset: usize,
+    membership_words: usize,
+}
+
+#[inline]
+fn membership_word_count(total_slots: usize) -> usize {
+    total_slots.div_ceil(MEMBERSHIP_SLOTS_PER_WORD)
+}
+
+fn elastic_arena_layout<K, V>(total_slots: usize) -> Result<ElasticArenaLayout, TryReserveError> {
+    let (base_layout, data_base_off) = arena::layout_for::<K, V>(total_slots)?;
+    let membership_words = membership_word_count(total_slots);
+    if membership_words == 0 {
+        return Ok(ElasticArenaLayout {
+            layout: base_layout,
+            data_base_off,
+            membership_offset: 0,
+            membership_words: 0,
+        });
+    }
+
+    let membership_layout =
+        Layout::array::<u64>(membership_words).map_err(|_| TryReserveError::AllocError)?;
+    let (layout, membership_offset) = base_layout
+        .extend(membership_layout)
+        .map_err(|_| TryReserveError::AllocError)?;
+    Ok(ElasticArenaLayout {
+        layout: layout.pad_to_align(),
+        data_base_off,
+        membership_offset,
+        membership_words,
+    })
+}
+
+#[inline]
+fn membership_tail_span<K, V>(total_slots: usize) -> usize {
+    let bytes = membership_word_count(total_slots)
+        .checked_mul(mem::size_of::<u64>())
+        .expect("constructed Elastic membership size");
+    if bytes == 0 {
+        return 0;
+    }
+    let alignment = CACHE_LINE.max(mem::align_of::<SlotEntry<K, V>>());
+    bytes
+        .checked_add(alignment - 1)
+        .expect("constructed Elastic membership padding")
+        & !(alignment - 1)
+}
+
+#[inline]
+fn membership_mix(hash: u64, salt: u64) -> u64 {
+    let mut mixed = hash ^ salt;
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^ (mixed >> 31)
+}
+
+#[inline]
+fn membership_location(hash: u64, salt: u64, word_count: usize) -> (usize, u64) {
+    let mixed = membership_mix(hash, salt);
+    let product =
+        u128::from(mixed) * u128::try_from(word_count).expect("usize is representable as u128");
+    let word = usize::try_from(product >> 64).expect("multiply-high index is below word count");
+    let bit = 1_u64 << (mixed.rotate_left(17) & 63);
+    (word, bit)
+}
+
+fn probe_schedule_capacity(level_count: usize) -> usize {
+    let mut count = 0;
+    for level in 0..level_count {
+        let paper_level = level as u128 + 1;
+        for paper_probe in 1..=u128::from(UNIFORM_SEARCH_CAP) {
+            let phi =
+                elastic_phi(paper_level, paper_probe).expect("bounded Elastic query coordinate");
+            if phi > QUERY_POSITION_CAP {
+                break;
+            }
+            if level != 0 || paper_probe != 1 {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn probe_schedule(level_count: usize) -> Vec<PhiRoute> {
+    Vec::with_capacity(probe_schedule_capacity(level_count))
+}
+
+fn try_probe_schedule(level_count: usize) -> Result<Vec<PhiRoute>, TryReserveError> {
+    let mut schedule = Vec::new();
+    schedule
+        .try_reserve_exact(probe_schedule_capacity(level_count))
+        .map_err(|_| TryReserveError::AllocError)?;
+    Ok(schedule)
+}
+
+fn clone_probe_schedule(source: &[PhiRoute], level_count: usize) -> Vec<PhiRoute> {
+    let mut schedule = probe_schedule(level_count);
+    schedule.extend_from_slice(source);
+    schedule
+}
+
+/// Schedule paper batches and allocation-epoch boundaries.
 #[derive(Clone)]
 pub(crate) struct BatchScheduler {
     batch_plan: Box<[usize]>,
     current_batch_index: usize,
     batch_remaining: usize,
-    defrag_pending: bool,
-    inserts_since_repack: usize,
     total_slots: usize,
     max_insertions: usize,
 }
@@ -337,8 +400,6 @@ pub(crate) struct BatchScheduler {
 pub(crate) enum InsertAction {
     /// Resize to the specified slot count.
     Resize(usize),
-    /// Repack at the current slot count.
-    Defrag(usize),
     /// Continue without structural work.
     Continue,
 }
@@ -356,8 +417,6 @@ impl BatchScheduler {
             batch_plan,
             current_batch_index: 0,
             batch_remaining: initial_remaining,
-            defrag_pending: false,
-            inserts_since_repack: 0,
             total_slots,
             max_insertions,
         }
@@ -366,29 +425,25 @@ impl BatchScheduler {
     /// Select structural work for the next insert.
     #[inline]
     pub(crate) fn on_insert(&mut self, current_len: usize) -> InsertAction {
-        self.inserts_since_repack += 1;
-        if current_len >= self.max_insertions {
-            // Bootstrap empty storage instead of doubling zero slots.
-            let new_cap = if self.total_slots == 0 {
-                INITIAL_CAPACITY
-            } else {
-                self.total_slots.saturating_mul(2)
-            };
-            return InsertAction::Resize(new_cap);
-        }
-        if self.defrag_pending
-            && self.inserts_since_repack > (self.total_slots / DEFRAG_OPS_DIVISOR).max(1)
-        {
-            return InsertAction::Defrag(self.total_slots);
+        let structural_action = self.structural_action_for_next_insert(current_len);
+        if let Some(action) = structural_action {
+            return action;
         }
         self.advance_batch_window();
         InsertAction::Continue
     }
 
-    /// Request a repack after probe depth exceeds its budget.
     #[inline]
-    pub(crate) fn report_drift(&mut self) {
-        self.defrag_pending = true;
+    fn structural_action_for_next_insert(&self, current_len: usize) -> Option<InsertAction> {
+        if current_len >= self.max_insertions {
+            let new_cap = if self.total_slots == 0 {
+                INITIAL_CAPACITY
+            } else {
+                self.total_slots.saturating_mul(2)
+            };
+            return Some(InsertAction::Resize(new_cap));
+        }
+        None
     }
 
     /// Distinguish bootstrap placement from the level pair for later batches.
@@ -416,13 +471,11 @@ impl BatchScheduler {
         }
     }
 
-    /// Reset batch and repack progress after resize or clear.
+    /// Reset batch progress after resize or clear.
     #[inline]
     pub(crate) fn reset(&mut self) {
         self.current_batch_index = 0;
         self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
-        self.defrag_pending = false;
-        self.inserts_since_repack = 0;
     }
 }
 
@@ -435,22 +488,52 @@ struct ElasticGeometry {
 }
 
 impl ElasticGeometry {
-    fn for_insert_budget(requested_insertions: usize, reserve_fraction: f64) -> Option<Self> {
+    fn for_insert_budget(
+        requested_insertions: usize,
+        reserve_fraction: ReserveFraction,
+    ) -> Option<Self> {
         let total_slots = if requested_insertions == 0 {
             0
         } else {
             capacity::capacity_for(INITIAL_CAPACITY, requested_insertions, reserve_fraction)?
         };
+        if total_slots > MAX_ELASTIC_SLOTS {
+            return None;
+        }
         Some(Self::for_slots(total_slots, reserve_fraction))
     }
 
-    fn for_slots(total_slots: usize, reserve_fraction: f64) -> Self {
-        let max_insertions = capacity::max_insertions(total_slots, reserve_fraction);
-        let level_capacities = partition_levels(total_slots);
-        let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
+    fn for_slots(total_slots: usize, reserve_fraction: ReserveFraction) -> Self {
+        assert!(total_slots <= MAX_ELASTIC_SLOTS, "capacity overflow");
+        if total_slots == 0 {
+            return Self {
+                total_slots: 0,
+                max_insertions: 0,
+                level_capacities: Vec::new(),
+                batch_plan: Box::new([]),
+            };
+        }
+
+        // Public construction rounds positive maps up to INITIAL_CAPACITY, so
+        // one slot is only an internal bootstrap shape outside the paper's
+        // n >= 2 domain.
+        if total_slots == 1 {
+            return Self {
+                total_slots: 1,
+                max_insertions: 1,
+                level_capacities: alloc::vec![1],
+                batch_plan: Box::new([1]),
+            };
+        }
+
+        let config = PaperConfig::new(total_slots, reserve_fraction.delta_log2())
+            .expect("validated Elastic production geometry");
+        let plan = config.elastic_plan();
+        let level_capacities = plan.level_lengths().collect();
+        let batch_plan = plan.batch_quotas().collect::<Vec<_>>().into_boxed_slice();
         Self {
             total_slots,
-            max_insertions,
+            max_insertions: config.target_insertions(),
             level_capacities,
             batch_plan,
         }
@@ -463,45 +546,50 @@ fn build_elastic_levels<K, V>(
     arena_base: *mut u8,
     data_base_off: usize,
     level_capacities: &[usize],
-    reserve_fraction: f64,
 ) -> Result<LevelSlice<K, V>, TryReserveError> {
     let mut cursor = arena::LayoutCursor::<SlotEntry<K, V>>::new(arena_base, data_base_off)?;
     let mut levels: Vec<Level<SlotEntry<K, V>>> = Vec::new();
     levels
         .try_reserve_exact(level_capacities.len())
         .map_err(|_| TryReserveError::AllocError)?;
-    for (level_idx, &cap) in level_capacities.iter().enumerate() {
+    for &cap in level_capacities {
         let cap_u32 = u32::try_from(cap).map_err(|_| TryReserveError::CapacityOverflow)?;
         // SAFETY: the arena was allocated for the layout these caps sum to.
         let (ctrl_ptr, data_ptr) = unsafe { cursor.reserve(cap_u32)? };
-        levels.push(Level::new_at(
-            level_idx,
-            cap_u32,
-            reserve_fraction,
-            ctrl_ptr,
-            data_ptr,
-        ));
+        levels.push(Level::new_at(cap_u32, ctrl_ptr, data_ptr));
     }
     Ok(levels.into_boxed_slice())
 }
 
+#[allow(clippy::cast_ptr_alignment)]
 fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     level_capacities: &[usize],
-    reserve_fraction: f64,
     alloc: &A,
 ) -> Result<ElasticArenaBuild<K, V>, TryReserveError> {
     let total_ctrl: usize = level_capacities.iter().sum();
-    let (arena_layout, data_base_off) = arena::layout_for::<K, V>(total_ctrl)?;
-    let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout, total_ctrl, alloc)?;
+    let arena_layout = elastic_arena_layout::<K, V>(total_ctrl)?;
+    debug_assert_eq!(
+        arena_layout.membership_offset,
+        arena_layout.layout.size() - membership_tail_span::<K, V>(total_ctrl)
+    );
+    let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout.layout, total_ctrl, alloc)?;
+    if arena_layout.membership_words != 0 {
+        unsafe {
+            ptr::write_bytes(
+                arena
+                    .as_ptr()
+                    .add(arena_layout.membership_offset)
+                    .cast::<u64>(),
+                0,
+                arena_layout.membership_words,
+            );
+        };
+    }
 
     // `Arena` has no `Drop`, so a bare `?` would leak the allocation if
     // level construction fails. Deallocate explicitly on `Err`.
-    match build_elastic_levels::<K, V>(
-        arena.as_ptr(),
-        data_base_off,
-        level_capacities,
-        reserve_fraction,
-    ) {
+    match build_elastic_levels::<K, V>(arena.as_ptr(), arena_layout.data_base_off, level_capacities)
+    {
         Ok(levels) => Ok((arena, levels)),
         Err(e) => {
             arena.deallocate(alloc);
@@ -512,13 +600,12 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
 
 fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
     level_capacities: &[usize],
-    reserve_fraction: f64,
     alloc: &A,
 ) -> ElasticArenaBuild<K, V> {
-    try_alloc_elastic_arena(level_capacities, reserve_fraction, alloc).unwrap_or_else(|_| {
+    try_alloc_elastic_arena(level_capacities, alloc).unwrap_or_else(|_| {
         let total_ctrl: usize = level_capacities.iter().sum();
-        let layout = match arena::layout_for::<K, V>(total_ctrl) {
-            Ok((l, _)) => l,
+        let layout = match elastic_arena_layout::<K, V>(total_ctrl) {
+            Ok(layout) => layout.layout,
             Err(_) => Layout::from_size_align(1, 1).unwrap(),
         };
         allocator_api2::alloc::handle_alloc_error(layout)
@@ -541,19 +628,6 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
-    /// Full constructor. `resize` also calls this with the existing
-    /// `hash_builder` and allocator so all keys keep the same hash sequence
-    /// across grows.
-    ///
-    /// # Load factor
-    ///
-    /// `reserve_fraction` is clamped to `[1e-6, 0.999999]`. Unlike funnel
-    /// hashing (capped at δ ≤ 1/8), elastic stays sound at near-full load — the
-    /// per-level `f(ε)` probe budget absorbs it.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no representable capacity satisfies the requested budget.
     #[must_use]
     pub fn with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
@@ -561,11 +635,28 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Self {
-        let reserve_fraction = capacity::sanitize_reserve_fraction(reserve_fraction);
+        let reserve_fraction = ReserveFraction::try_from(reserve_fraction)
+            .unwrap_or_else(|error| panic!("invalid reserve fraction: {error}"));
+        Self::with_capacity_and_reserve_and_hasher_in(
+            capacity,
+            reserve_fraction,
+            hash_builder,
+            alloc,
+        )
+    }
+
+    /// Full constructor using an exact dyadic reserve.
+    #[must_use]
+    pub fn with_capacity_and_reserve_and_hasher_in(
+        capacity: usize,
+        reserve_fraction: ReserveFraction,
+        hash_builder: S,
+        alloc: A,
+    ) -> Self {
         let geometry = ElasticGeometry::for_insert_budget(capacity, reserve_fraction)
             .expect("capacity overflow");
-        let (arena, levels) =
-            alloc_elastic_arena(&geometry.level_capacities, reserve_fraction, &alloc);
+        let probe_schedule = probe_schedule(geometry.level_capacities.len());
+        let (arena, levels) = alloc_elastic_arena(&geometry.level_capacities, &alloc);
 
         Self {
             levels,
@@ -578,10 +669,107 @@ where
                 geometry.total_slots,
                 geometry.max_insertions,
             ),
-            max_populated_level: 0,
             hash_builder,
             alloc,
             arena,
+            epoch: EpochState::initial(),
+            probe_high_water: 0,
+            probe_schedule,
+        }
+    }
+
+    /// Fallible full constructor using an exact dyadic reserve.
+    fn try_with_capacity_and_reserve_and_hasher_in(
+        capacity: usize,
+        reserve_fraction: ReserveFraction,
+        hash_builder: S,
+        alloc: A,
+    ) -> Result<Self, TryBuildError> {
+        let geometry = ElasticGeometry::for_insert_budget(capacity, reserve_fraction)
+            .ok_or(TryBuildError::CapacityOverflow)?;
+        let probe_schedule = try_probe_schedule(geometry.level_capacities.len())?;
+        let (arena, levels) = try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
+
+        Ok(Self {
+            levels,
+            len: 0,
+            total_slots: geometry.total_slots,
+            max_insertions: geometry.max_insertions,
+            reserve_fraction,
+            scheduler: BatchScheduler::new(
+                geometry.batch_plan,
+                geometry.total_slots,
+                geometry.max_insertions,
+            ),
+            hash_builder,
+            alloc,
+            arena,
+            epoch: EpochState::initial(),
+            probe_high_water: 0,
+            probe_schedule,
+        })
+    }
+
+    #[inline]
+    fn membership_words(&self) -> usize {
+        membership_word_count(self.total_slots)
+    }
+
+    #[inline]
+    #[allow(clippy::cast_ptr_alignment)]
+    fn membership_ptr(&self) -> *mut u64 {
+        let tail_span = membership_tail_span::<K, V>(self.total_slots);
+        debug_assert!(tail_span <= self.arena.layout_size());
+        unsafe {
+            self.arena
+                .as_ptr()
+                .add(self.arena.layout_size() - tail_span)
+                .cast::<u64>()
+        }
+    }
+
+    #[inline]
+    fn membership_maybe_contains(&self, hash: u64) -> bool {
+        let words = self.membership_words();
+        if words == 0 {
+            return false;
+        }
+        let (first_word, first_bit) = membership_location(hash, MEMBERSHIP_SALT_1, words);
+        let (second_word, second_bit) = membership_location(hash, MEMBERSHIP_SALT_2, words);
+        unsafe {
+            (*self.membership_ptr().add(first_word) & first_bit) != 0
+                && (*self.membership_ptr().add(second_word) & second_bit) != 0
+        }
+    }
+
+    #[inline]
+    fn record_membership(&mut self, hash: u64) {
+        let words = self.membership_words();
+        if words == 0 {
+            return;
+        }
+        let (first_word, first_bit) = membership_location(hash, MEMBERSHIP_SALT_1, words);
+        let (second_word, second_bit) = membership_location(hash, MEMBERSHIP_SALT_2, words);
+        unsafe {
+            *self.membership_ptr().add(first_word) |= first_bit;
+            *self.membership_ptr().add(second_word) |= second_bit;
+        }
+    }
+
+    fn clear_membership(&mut self) {
+        let words = self.membership_words();
+        if words != 0 {
+            unsafe { ptr::write_bytes(self.membership_ptr(), 0, words) };
+        }
+    }
+
+    fn copy_membership_from(&mut self, source: &Self) {
+        let words = self.membership_words();
+        debug_assert_eq!(words, source.membership_words());
+        if words != 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(source.membership_ptr(), self.membership_ptr(), words);
+            };
         }
     }
 
@@ -592,11 +780,13 @@ where
             level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
-            level.max_probe_groups = 0;
         }
         self.len = 0;
-        self.max_populated_level = 0;
         self.scheduler.reset();
+        self.probe_high_water = 0;
+        self.probe_schedule.clear();
+        self.clear_membership();
+        self.epoch.start(EpochTransition::Clear, 0);
     }
 
     /// Post-lookup insert for a key known to be absent. Returns the chosen
@@ -605,35 +795,93 @@ where
         let key_fingerprint = control::control_fingerprint(key_hash);
 
         match self.scheduler.on_insert(self.len) {
-            InsertAction::Resize(cap) | InsertAction::Defrag(cap) => {
-                self.resize(cap);
-                // Post-resize the scheduler is fresh; skip leading zero-quota
-                // batches. The `Continue` arm already advanced in `on_insert`.
+            InsertAction::Resize(cap) => {
+                self.resize_with_transition(cap, EpochTransition::Growth);
                 self.scheduler.advance_batch_window();
             }
             InsertAction::Continue => {}
         }
 
-        let target = self.scheduler.target();
-        let (level_idx, slot_idx, group_dist) = self
-            .choose_slot_for_new_key(key_hash, target)
-            .expect("no free slot found after resize");
+        if let Some(placement) = self.choose_slot_for_new_key(key_hash, self.scheduler.target()) {
+            return self.place_new_entry(key, value, key_hash, key_fingerprint, placement);
+        }
 
-        let level = &mut self.levels[level_idx];
-        let prev_ctrl = level.control_at(slot_idx);
-        level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
-        level.note_probe_distance(group_dist);
-        level.len += 1;
-        if prev_ctrl == CTRL_TOMBSTONE {
-            level.tombstones -= 1;
+        self.resize_with_transition(self.total_slots, EpochTransition::PlacementRecovery);
+        self.scheduler.advance_batch_window();
+        if let Some(placement) = self.choose_slot_for_new_key(key_hash, self.scheduler.target()) {
+            self.place_new_entry(key, value, key_hash, key_fingerprint, placement)
+        } else {
+            self.place_exceptional_entry(key, value, key_hash, key_fingerprint)
         }
-        let drifted = level.probe_drifted();
-        if drifted {
-            self.scheduler.report_drift();
+    }
+
+    /// Write a new entry and update placement and batch metadata.
+    #[inline]
+    fn place_new_entry(
+        &mut self,
+        key: K,
+        value: V,
+        key_hash: u64,
+        key_fingerprint: u8,
+        placement: ExactPlacement,
+    ) -> (usize, usize) {
+        self.extend_probe_schedule(placement.phi);
+        self.write_new_entry(
+            key,
+            value,
+            key_hash,
+            key_fingerprint,
+            placement.level,
+            placement.slot,
+        )
+    }
+
+    #[cold]
+    fn place_exceptional_entry(
+        &mut self,
+        key: K,
+        value: V,
+        key_hash: u64,
+        key_fingerprint: u8,
+    ) -> (usize, usize) {
+        let (level, slot) = self
+            .first_free_slot()
+            .expect("Elastic insertion limit must leave a free slot");
+        self.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG;
+        self.write_new_entry(key, value, key_hash, key_fingerprint, level, slot)
+    }
+
+    fn first_free_slot(&self) -> Option<(usize, usize)> {
+        self.levels
+            .iter()
+            .enumerate()
+            .find_map(|(level_index, level)| {
+                (0..level.capacity())
+                    .find(|&slot| level.control_at(slot).is_free())
+                    .map(|slot| (level_index, slot))
+            })
+    }
+
+    #[inline]
+    fn write_new_entry(
+        &mut self,
+        key: K,
+        value: V,
+        key_hash: u64,
+        key_fingerprint: u8,
+        level_idx: usize,
+        slot_idx: usize,
+    ) -> (usize, usize) {
+        {
+            let level = &mut self.levels[level_idx];
+            let prev_ctrl = level.control_at(slot_idx);
+            level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+            level.len += 1;
+            if prev_ctrl == CTRL_TOMBSTONE {
+                level.tombstones -= 1;
+            }
         }
-        if level_idx > self.max_populated_level {
-            self.max_populated_level = level_idx;
-        }
+        self.record_membership(key_hash);
         self.len += 1;
         self.scheduler.complete_insert();
         (level_idx, slot_idx)
@@ -665,7 +913,54 @@ where
             removed
         };
         self.len -= 1;
+        self.epoch.note_delete();
         (removed.key, removed.value)
+    }
+
+    fn extend_probe_schedule(&mut self, high_water: u128) {
+        assert!(
+            high_water <= QUERY_POSITION_CAP,
+            "Elastic query-position convention exhausted"
+        );
+        let prior_high_water = self.probe_high_water & !EXCEPTIONAL_PLACEMENT_FLAG;
+        if high_water <= u128::from(prior_high_water) {
+            return;
+        }
+        let old_len = self.probe_schedule.len();
+        for level in 0..self.levels.len() {
+            let paper_level = level as u128 + 1;
+            let mut paper_probe =
+                first_paper_probe_after(paper_level, u128::from(prior_high_water));
+            while paper_probe <= u128::from(UNIFORM_SEARCH_CAP) {
+                let phi = elastic_phi(paper_level, paper_probe)
+                    .expect("bounded Elastic query coordinate");
+                if phi > high_water {
+                    break;
+                }
+                if level == 0 && paper_probe == 1 {
+                    paper_probe += 1;
+                    continue;
+                }
+                let logical_probe_index =
+                    u16::try_from(paper_probe - 1).expect("Elastic probe cap fits u16");
+                assert!(
+                    usize::from(logical_probe_index) < QUERY_PROBE_LANE_COUNT,
+                    "Elastic query-lane table exhausted"
+                );
+                self.probe_schedule.push(PhiRoute {
+                    range_upper: u32::try_from(phi).expect("Elastic query cap fits u32"),
+                    logical_probe_index,
+                    level: u8::try_from(level).expect("Elastic level count fits u8"),
+                });
+                paper_probe += 1;
+            }
+        }
+        self.probe_schedule[old_len..].sort_unstable_by_key(|route| route.range_upper);
+        for route in &mut self.probe_schedule[old_len..] {
+            route.range_upper = self.levels[usize::from(route.level)].capacity;
+        }
+        self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
+            | u32::try_from(high_water).expect("Elastic query cap fits u32");
     }
 
     /// Prime the scan and cross level boundaries off the hot path.
@@ -727,8 +1022,12 @@ where
     }
 
     #[inline]
-    fn reserve_fraction(&self) -> f64 {
+    fn reserve_config(&self) -> ReserveFraction {
         self.reserve_fraction
+    }
+
+    fn epoch_snapshot(&self) -> EpochSnapshot {
+        self.epoch.snapshot(self.len)
     }
 
     #[inline]
@@ -757,6 +1056,19 @@ where
         self.find_slot_indices_with_hash(key, hash, fingerprint)
     }
 
+    #[inline]
+    fn find_entry<'a, Q>(
+        &'a self,
+        key: &Q,
+        hash: u64,
+        fingerprint: u8,
+    ) -> Option<&'a SlotEntry<K, V>>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.find_entry_with_hash(key, hash, fingerprint)
+    }
+
     // -- Insert / remove --
 
     #[inline]
@@ -764,12 +1076,26 @@ where
         self.insert_for_vacant_entry(key, value, hash)
     }
 
+    #[inline]
+    fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
+    where
+        K: Hash + Eq,
+    {
+        if self.membership_maybe_contains(hash) {
+            let fingerprint = control::control_fingerprint(hash);
+            if let Some(location) = self.find_slot_indices_with_hash(&key, hash, fingerprint) {
+                return Some(self.replace_value(location, value));
+            }
+        }
+        self.insert_for_vacant_entry(key, value, hash);
+        None
+    }
+
     fn remove(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
         let kv = self.take_and_tombstone(level_idx, slot_idx);
         let needs_resize = self.levels[level_idx].needs_cleanup();
-        self.shrink_max_populated_level();
         if needs_resize {
-            self.resize(self.total_slots);
+            self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
         }
         kv
     }
@@ -786,6 +1112,13 @@ where
         level.len -= 1;
         level.tombstones += 1;
         self.len -= 1;
+        self.epoch.note_delete();
+    }
+
+    fn finish_deferred_removals(&mut self) {
+        if self.levels.iter().any(Level::needs_cleanup) {
+            self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
+        }
     }
 
     // -- Iterate --
@@ -814,13 +1147,28 @@ where
     // -- Lifecycle --
 
     #[inline]
-    fn with_capacity_and_reserve_fraction_and_hasher_in(
+    fn with_capacity_and_reserve_and_hasher_in(
         capacity: usize,
-        reserve_fraction: f64,
+        reserve_fraction: ReserveFraction,
         hash_builder: S,
         alloc: A,
     ) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+        Self::with_capacity_and_reserve_and_hasher_in(
+            capacity,
+            reserve_fraction,
+            hash_builder,
+            alloc,
+        )
+    }
+
+    #[inline]
+    fn try_with_capacity_and_reserve_and_hasher_in(
+        capacity: usize,
+        reserve_fraction: ReserveFraction,
+        hash_builder: S,
+        alloc: A,
+    ) -> Result<Self, TryBuildError> {
+        Self::try_with_capacity_and_reserve_and_hasher_in(
             capacity,
             reserve_fraction,
             hash_builder,
@@ -851,11 +1199,13 @@ where
             level.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
-            level.max_probe_groups = 0;
         }
         self.len = 0;
-        self.max_populated_level = 0;
         self.scheduler.reset();
+        self.probe_high_water = 0;
+        self.probe_schedule.clear();
+        self.clear_membership();
+        self.epoch.start(EpochTransition::Clear, 0);
     }
 
     fn clone_table(&self) -> Self
@@ -864,10 +1214,13 @@ where
         V: Clone,
         S: Clone,
     {
+        let scheduler = self.scheduler.clone();
+        let hash_builder = self.hash_builder.clone();
+        let alloc = self.alloc.clone();
+        let probe_schedule = clone_probe_schedule(&self.probe_schedule, self.levels.len());
         let level_capacities: Vec<usize> =
             self.levels.iter().map(|l| l.capacity as usize).collect();
-        let (arena, levels) =
-            alloc_elastic_arena(&level_capacities, self.reserve_fraction, &self.alloc);
+        let (arena, levels) = alloc_elastic_arena(&level_capacities, &self.alloc);
 
         // Drop guard for the half-built clone: if any user `K::clone` /
         // `V::clone` panics, drop the already-cloned values (OCCUPIED on
@@ -879,24 +1232,27 @@ where
             dst.clone_region_from(src_lvl);
             dst.len = src_lvl.len;
             dst.tombstones = src_lvl.tombstones;
-            dst.max_probe_groups = src_lvl.max_probe_groups;
         }
 
         // Success: reclaim arena + levels so the guard's Drop no-ops.
         let (arena, levels) = guard.disarm();
 
-        Self {
+        let mut cloned = Self {
             levels,
             len: self.len,
             total_slots: self.total_slots,
             max_insertions: self.max_insertions,
             reserve_fraction: self.reserve_fraction,
-            scheduler: self.scheduler.clone(),
-            max_populated_level: self.max_populated_level,
-            hash_builder: self.hash_builder.clone(),
-            alloc: self.alloc.clone(),
+            scheduler,
+            hash_builder,
+            alloc,
             arena,
-        }
+            epoch: self.epoch,
+            probe_high_water: self.probe_high_water,
+            probe_schedule,
+        };
+        cloned.copy_membership_from(self);
+        cloned
     }
 }
 
@@ -917,43 +1273,38 @@ where
     /// capacity check in `insert`; resize loops drain old levels into fresh
     /// (all-EMPTY) ones, so neither check can succeed.
     ///
-    /// # Panics
-    ///
-    /// Panics if `choose_slot_for_new_key` finds no slot — caller is
-    /// responsible for sizing the new levels to fit every drained entry.
     #[inline]
-    fn insert_unique(&mut self, key: K, value: V) {
+    fn insert_unique(&mut self, key: K, value: V) -> bool {
         let key_hash = self.hash_key(&key);
         let key_fingerprint = control::control_fingerprint(key_hash);
 
         self.scheduler.advance_batch_window();
         let target = self.scheduler.target();
-        let (level_idx, slot_idx, group_dist) = self
-            .choose_slot_for_new_key(key_hash, target)
-            .expect("no free slot found in freshly-allocated map");
-
-        let level = &mut self.levels[level_idx];
-        level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
-        level.note_probe_distance(group_dist);
-        level.len += 1;
-        if level_idx > self.max_populated_level {
-            self.max_populated_level = level_idx;
+        if let Some(placement) = self.choose_slot_for_new_key(key_hash, target) {
+            self.place_new_entry(key, value, key_hash, key_fingerprint, placement);
+            false
+        } else {
+            self.place_exceptional_entry(key, value, key_hash, key_fingerprint);
+            true
         }
-        self.len += 1;
-        self.scheduler.complete_insert();
     }
 
     /// Drain all live entries into a temp Vec, rebuild levels at
     /// `new_capacity` in-place, reinsert. Passing the current capacity
     /// performs a no-grow rehash that flushes accumulated tombstones.
     fn resize(&mut self, new_capacity: usize) {
-        let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction);
+        self.resize_with_transition(new_capacity, EpochTransition::ExplicitResize);
+    }
 
-        let (new_arena, new_levels) = alloc_elastic_arena(
-            &geometry.level_capacities,
-            self.reserve_fraction,
-            &self.alloc,
-        );
+    fn resize_with_transition(&mut self, new_capacity: usize, transition: EpochTransition) {
+        let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction);
+        let required_schedule_capacity = probe_schedule_capacity(geometry.level_capacities.len());
+        if self.probe_schedule.capacity() < required_schedule_capacity {
+            self.probe_schedule
+                .reserve_exact(required_schedule_capacity - self.probe_schedule.len());
+        }
+
+        let (new_arena, new_levels) = alloc_elastic_arena(&geometry.level_capacities, &self.alloc);
 
         // Swap in fresh arena; keep old one alive until drain completes.
         let old_arena = mem::replace(&mut self.arena, new_arena);
@@ -965,8 +1316,9 @@ where
             geometry.total_slots,
             geometry.max_insertions,
         );
-        self.max_populated_level = 0;
         self.len = 0;
+        self.probe_high_water = 0;
+        self.probe_schedule.clear();
 
         // Move every live entry from old arena into the new levels.
         //
@@ -976,14 +1328,21 @@ where
         // then deallocates `old_arena` — `Arena` has no `Drop`, so without the
         // guard the backing allocation would leak.
         let mut guard = arena::ArenaDropGuard::new(old_arena, old_levels, self.alloc.clone());
+        let mut used_exceptional_placement = false;
         for level in guard.regions_mut().iter_mut() {
             level.drain_values_and_clear(|entry| {
-                self.insert_unique(entry.key, entry.value);
+                used_exceptional_placement |= self.insert_unique(entry.key, entry.value);
             });
         }
         // guard drops at end of scope, deallocating old_arena. All slots
         // are CTRL_EMPTY so `drop_values` is a no-op on success.
         drop(guard);
+        if transition == EpochTransition::PlacementRecovery || used_exceptional_placement {
+            self.epoch
+                .start_with_placement_recovery(transition, self.len);
+        } else {
+            self.epoch.start(transition, self.len);
+        }
     }
 
     /// Fallible counterpart to [`Self::resize`]. Allocates the new backing
@@ -992,6 +1351,7 @@ where
     where
         S: Clone,
     {
+        let prior_epoch = self.epoch;
         let hash_builder = self.hash_builder.clone();
         let mut new_map = Self::try_with_slots_and_reserve_fraction_and_hasher_in(
             new_capacity,
@@ -1005,14 +1365,21 @@ where
         // impl), the un-iterated slots remain OCCUPIED on `self` and the
         // already-moved ones are EMPTY, so both `self.drop_values` and
         // `new_map.drop_values` are sound on unwind.
+        let mut used_exceptional_placement = false;
         for level in &mut self.levels {
             level.drain_values_and_clear(|entry| {
-                new_map.insert_unique(entry.key, entry.value);
+                used_exceptional_placement |= new_map.insert_unique(entry.key, entry.value);
             });
         }
         self.len = 0;
-        self.max_populated_level = 0;
         *self = new_map;
+        self.epoch = prior_epoch;
+        if used_exceptional_placement {
+            self.epoch
+                .start_with_placement_recovery(EpochTransition::ExplicitResize, self.len);
+        } else {
+            self.epoch.start(EpochTransition::ExplicitResize, self.len);
+        }
         Ok(())
     }
 
@@ -1021,15 +1388,17 @@ where
     /// budget and inflate via `capacity_for` — this one skips that.
     fn try_with_slots_and_reserve_fraction_and_hasher_in(
         slots: usize,
-        reserve_fraction: f64,
+        reserve_fraction: ReserveFraction,
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let reserve_fraction = capacity::sanitize_reserve_fraction(reserve_fraction);
+        if slots > MAX_ELASTIC_SLOTS {
+            return Err(TryReserveError::CapacityOverflow);
+        }
         let geometry = ElasticGeometry::for_slots(slots, reserve_fraction);
 
-        let (arena, levels) =
-            try_alloc_elastic_arena(&geometry.level_capacities, reserve_fraction, &alloc)?;
+        let probe_schedule = try_probe_schedule(geometry.level_capacities.len())?;
+        let (arena, levels) = try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
 
         Ok(Self {
             levels,
@@ -1042,10 +1411,12 @@ where
                 geometry.total_slots,
                 geometry.max_insertions,
             ),
-            max_populated_level: 0,
             hash_builder,
             alloc,
             arena,
+            epoch: EpochState::initial(),
+            probe_high_water: 0,
+            probe_schedule,
         })
     }
 
@@ -1057,95 +1428,177 @@ where
         self.hash_builder.hash_one(key)
     }
 
-    /// Paper §4 places each insert in `A_i` or `A_{i+1}` per the current batch `B_i`;
-    /// The full-sweep fallback covers the tombstone-reuse case the paper's analysis doesn't model.
-    #[inline]
     fn choose_slot_for_new_key(
-        &mut self,
+        &self,
         key_hash: u64,
         target: BatchTarget,
-    ) -> Option<(usize, usize, u32)> {
+    ) -> Option<ExactPlacement> {
         if self.levels.is_empty() {
             return None;
         }
+        let probe = CounterPrf::new(ELASTIC_PROBE_SEED).prepare_elastic(key_hash);
 
-        if let Some(found) = self.choose_slot_targeted(key_hash, target) {
-            return Some(found);
+        let (case, level, slot, paper_probe) = match target {
+            BatchTarget::Bootstrap => {
+                let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[0]);
+                let (slot, paper_probe) = self.uniform_vacancy(&level_probe, 0)?;
+                (
+                    ExactInsertionCase::Batch0 { level: 0 },
+                    0,
+                    slot,
+                    paper_probe,
+                )
+            }
+            BatchTarget::LevelPair(current) => {
+                let next = current.checked_add(1)?;
+                let current_level = self.levels.get(current)?;
+                let next_level = self.levels.get(next)?;
+                let free_current = current_level.free_slots();
+                let free_next = next_level.free_slots();
+                let current_low = free_current
+                    <= self
+                        .reserve_fraction
+                        .floor_half_reserved(current_level.capacity());
+                let next_low = free_next.saturating_mul(4) <= next_level.capacity();
+
+                if current_low {
+                    let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[next]);
+                    let (slot, paper_probe) = self.uniform_vacancy(&level_probe, next)?;
+                    (
+                        ExactInsertionCase::Case2 {
+                            batch: next,
+                            current_level: current,
+                            next_level: next,
+                            free_current,
+                            free_next,
+                        },
+                        next,
+                        slot,
+                        paper_probe,
+                    )
+                } else if next_low {
+                    let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[current]);
+                    let (slot, paper_probe) = self.uniform_vacancy(&level_probe, current)?;
+                    (
+                        ExactInsertionCase::Case3 {
+                            batch: next,
+                            current_level: current,
+                            next_level: next,
+                            free_current,
+                            free_next,
+                        },
+                        current,
+                        slot,
+                        paper_probe,
+                    )
+                } else {
+                    let budget = elastic_dyadic_probe_budget(
+                        free_current,
+                        current_level.capacity(),
+                        self.reserve_fraction.delta_log2(),
+                        ELASTIC_PROBE_BUDGET_C,
+                    )
+                    .ok()?;
+                    let case = ExactInsertionCase::Case1 {
+                        batch: next,
+                        current_level: current,
+                        next_level: next,
+                        free_current,
+                        free_next,
+                        budget,
+                    };
+                    let current_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[current]);
+                    if let Some((slot, probe)) = (0..budget).find_map(|logical_index| {
+                        let logical_index = u64::try_from(logical_index).ok()?;
+                        self.vacancy(current, &current_probe, logical_index)
+                            .map(|slot| (slot, logical_index + 1))
+                    }) {
+                        (case, current, slot, probe)
+                    } else {
+                        let next_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[next]);
+                        let (slot, paper_probe) = self.uniform_vacancy(&next_probe, next)?;
+                        (case, next, slot, paper_probe)
+                    }
+                }
+            }
+        };
+        let phi = elastic_phi(level as u128 + 1, u128::from(paper_probe)).ok()?;
+        if phi > QUERY_POSITION_CAP {
+            return None;
         }
+        Some(ExactPlacement {
+            case,
+            level,
+            slot,
+            paper_probe,
+            phi,
+        })
+    }
 
-        for li in 0..self.levels.len() {
-            if let Some((slot_idx, dist)) = self.first_free_uniform(key_hash, li) {
-                return Some((li, slot_idx, dist));
+    fn uniform_vacancy(
+        &self,
+        probe: &PreparedElasticLevelProbe,
+        level: usize,
+    ) -> Option<(usize, u64)> {
+        for logical_index in 0..UNIFORM_SEARCH_CAP {
+            if let Some(slot) = self.vacancy(level, probe, logical_index) {
+                return Some((slot, logical_index + 1));
             }
         }
         None
     }
 
-    /// Batch-driven slot selection per paper §4 Cases 1/2/3 during batch `B_i`:
-    /// - Case 1 (`ε₁ > δ/2` ∧ `ε₂ > 0.25`): limited probe in `A_i`, else uniform `A_{i+1}`.
-    /// - Case 2 (`ε₁ ≤ δ/2`): uniform `A_{i+1}`.
-    /// - Case 3 (`ε₂ ≤ 0.25`): uniform `A_i`.
-    ///
-    /// Cases 2 and 3 swap to the other level if the paper-mandated one is full.
-    /// Paper proves success w.h.p. but not w.p. 1,
-    /// so we avoid a hard insert failure on the rare bad event.
-    #[inline]
-    fn choose_slot_targeted(
+    fn vacancy(
         &self,
-        key_hash: u64,
-        target: BatchTarget,
-    ) -> Option<(usize, usize, u32)> {
-        let level_idx = match target {
-            BatchTarget::Bootstrap => {
-                return self
-                    .first_free_uniform(key_hash, 0)
-                    .map(|(slot_idx, dist)| (0, slot_idx, dist));
-            }
-            BatchTarget::LevelPair(level_idx) => level_idx,
-        };
-        if level_idx + 1 >= self.levels.len() {
-            let last = self.levels.len() - 1;
-            return self
-                .first_free_uniform(key_hash, last)
-                .map(|(slot_idx, dist)| (last, slot_idx, dist));
-        }
+        level: usize,
+        probe: &PreparedElasticLevelProbe,
+        logical_index: u64,
+    ) -> Option<usize> {
+        let slot = self.route_prepared(level, probe, logical_index)?;
+        self.levels[level]
+            .control_at(slot)
+            .is_free()
+            .then_some(slot)
+    }
 
-        let current_level = &self.levels[level_idx];
-        let next_level = &self.levels[level_idx + 1];
-        let current_free_slots = current_level.free_slots();
-        let next_free_slots = next_level.free_slots();
+    #[cfg(test)]
+    fn route_exact(&self, level: usize, key_hash: u64, logical_index: u64) -> Option<usize> {
+        let probe = CounterPrf::new(ELASTIC_PROBE_SEED).prepare_elastic(key_hash);
+        let level_lane = *ELASTIC_LEVEL_LANES.get(level)?;
+        let level_probe = probe.prepare_level_lane(level_lane);
+        self.route_prepared(level, &level_probe, logical_index)
+    }
 
-        if current_free_slots > current_level.half_reserve_slot_threshold as usize
-            && next_free_slots.saturating_mul(4) > next_level.capacity()
-        {
-            let limited_budget = current_level.limited_group_budget();
-            if let Some((slot_idx, dist)) =
-                self.first_free_limited(key_hash, level_idx, limited_budget)
-            {
-                return Some((level_idx, slot_idx, dist));
-            }
-            if let Some((slot_idx, dist)) = self.first_free_uniform(key_hash, level_idx + 1) {
-                return Some((level_idx + 1, slot_idx, dist));
-            }
-            return self
-                .first_free_uniform(key_hash, level_idx)
-                .map(|(slot_idx, dist)| (level_idx, slot_idx, dist));
-        }
+    fn route_prepared(
+        &self,
+        level: usize,
+        probe: &PreparedElasticLevelProbe,
+        logical_index: u64,
+    ) -> Option<usize> {
+        let logical_probe_lane = PreparedElasticProbe::logical_probe_lane(logical_index);
+        self.route_prepared_lane(level, probe, logical_probe_lane)
+    }
 
-        if current_free_slots <= current_level.half_reserve_slot_threshold as usize {
-            if let Some((slot_idx, dist)) = self.first_free_uniform(key_hash, level_idx + 1) {
-                return Some((level_idx + 1, slot_idx, dist));
-            }
-            return self
-                .first_free_uniform(key_hash, level_idx)
-                .map(|(slot_idx, dist)| (level_idx, slot_idx, dist));
-        }
+    #[inline(always)]
+    fn route_prepared_lane(
+        &self,
+        level: usize,
+        probe: &PreparedElasticLevelProbe,
+        logical_probe_lane: u64,
+    ) -> Option<usize> {
+        let upper = self.levels.get(level)?.capacity();
+        Self::route_prepared_lane_for_upper(probe, logical_probe_lane, upper)
+    }
 
-        if let Some((slot_idx, dist)) = self.first_free_uniform(key_hash, level_idx) {
-            return Some((level_idx, slot_idx, dist));
-        }
-        self.first_free_uniform(key_hash, level_idx + 1)
-            .map(|(slot_idx, dist)| (level_idx + 1, slot_idx, dist))
+    #[inline(always)]
+    fn route_prepared_lane_for_upper(
+        probe: &PreparedElasticLevelProbe,
+        logical_probe_lane: u64,
+        upper: usize,
+    ) -> Option<usize> {
+        unbiased_prepared_elastic_probe_index(probe, logical_probe_lane, upper, RANGE_WORD_CAP)
+            .ok()
+            .map(|probe| probe.index)
     }
 
     /// SAFETY: `level_idx` < `self.levels.len()` and `slot_idx` references an
@@ -1161,9 +1614,6 @@ where
         unsafe { self.levels[level_idx].get_mut(slot_idx) }
     }
 
-    /// Paper §4 lookup: walk levels `A_1`, `A_2`, … in order using each
-    /// level's probe sequence `h_{i,1}(x)`, `h_{i,2}(x)`, … until the key is
-    /// found or all populated levels are exhausted.
     #[inline]
     fn find_slot_indices_with_hash<Q>(
         &self,
@@ -1174,244 +1624,541 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let search_limit = (self.max_populated_level + 1).min(self.levels.len());
-        for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            if let Some(slot_idx) = level.find_by_probe(key_hash, key_fingerprint, key) {
-                return Some((level_idx, slot_idx));
-            }
-        }
-        None
+        self.find_by_exact_schedule(key, key_hash, key_fingerprint, |level, slot, _entry| {
+            (level, slot)
+        })
     }
 
-    /// Probe-bounded `first_free_uniform`: scans at most `max_groups` groups.
-    /// Returns `(slot_idx, group_dist)`, the probe step where the slot was found,
-    /// which the insert feeds to [`Level::note_probe_distance`].
     #[inline]
-    #[allow(clippy::cast_possible_truncation)] // group_dist < group_count ≤ u32::MAX
-    fn first_free_limited(
-        &self,
+    fn find_entry_with_hash<'a, Q>(
+        &'a self,
+        key: &Q,
         key_hash: u64,
-        level_idx: usize,
-        max_groups: usize,
-    ) -> Option<(usize, u32)> {
-        let level = &self.levels[level_idx];
-        if level.len as usize >= level.capacity() {
+        key_fingerprint: u8,
+    ) -> Option<&'a SlotEntry<K, V>>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        self.find_by_exact_schedule(key, key_hash, key_fingerprint, |_level, _slot, entry| entry)
+    }
+
+    fn find_by_exact_schedule<'a, Q, R>(
+        &'a self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+        mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
+    ) -> Option<R>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        if self.len == 0 || self.levels.is_empty() {
             return None;
         }
-        let group_count = level.group_count();
-        let max_groups = max_groups.min(group_count.max(1));
-        let mask = level.group_count_mask as usize;
-        let mut probe = probe::TriangularProbe::new(level.triangular_group_start(key_hash));
-        for step in 0..max_groups {
-            if let Some(slot_idx) = level.first_free_in_group(probe.pos) {
-                return Some((slot_idx, step as u32));
+        let probe = CounterPrf::new(ELASTIC_PROBE_SEED).prepare_elastic(key_hash);
+        let mut level_probes =
+            [MaybeUninit::<PreparedElasticLevelProbe>::uninit(); u32::BITS as usize];
+        let level_zero_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[0]);
+        level_probes[0].write(level_zero_probe);
+        let mut prepared_levels = 1_u32;
+
+        let Some(h11_slot) = Self::route_prepared_lane_for_upper(
+            &level_zero_probe,
+            ELASTIC_QUERY_PROBE_LANES[0],
+            self.levels[0].capacity(),
+        ) else {
+            return self.find_by_full_scan(key, key_fingerprint, on_hit);
+        };
+        if let Some(entry) = self.entry_if_match(0, h11_slot, key_fingerprint, key) {
+            return Some(on_hit(0, h11_slot, entry));
+        }
+
+        for route in &self.probe_schedule {
+            let level = usize::from(route.level);
+            let logical_probe = usize::from(route.logical_probe_index);
+            let level_bit = 1_u32 << level;
+            let level_probe = if prepared_levels & level_bit == 0 {
+                // SAFETY: this path is selected only for geometries with at
+                // most 32 levels, and routes come from that level slice.
+                let level_lane = unsafe { *ELASTIC_LEVEL_LANES.get_unchecked(level) };
+                let prepared = probe.prepare_level_lane(level_lane);
+                unsafe { level_probes.get_unchecked_mut(level) }.write(prepared);
+                prepared_levels |= level_bit;
+                prepared
+            } else {
+                // SAFETY: the bit is set only after this slot is written.
+                unsafe { level_probes.get_unchecked(level).assume_init() }
+            };
+            // SAFETY: routes are admitted only after proving their logical
+            // probe index is within the fixed lane table.
+            let logical_probe_lane =
+                unsafe { *ELASTIC_QUERY_PROBE_LANES.get_unchecked(logical_probe) };
+            let upper = route.range_upper as usize;
+            let Some(slot) =
+                Self::route_prepared_lane_for_upper(&level_probe, logical_probe_lane, upper)
+            else {
+                return self.find_by_full_scan(key, key_fingerprint, on_hit);
+            };
+            if let Some(entry) = self.entry_if_match(level, slot, key_fingerprint, key) {
+                return Some(on_hit(level, slot, entry));
             }
-            probe.advance(mask);
+        }
+        if self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG != 0 {
+            self.find_by_full_scan(key, key_fingerprint, on_hit)
+        } else {
+            None
+        }
+    }
+
+    fn find_by_full_scan<'a, Q, R>(
+        &'a self,
+        key: &Q,
+        key_fingerprint: u8,
+        mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
+    ) -> Option<R>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        for (level_index, level) in self.levels.iter().enumerate() {
+            for slot in 0..level.capacity() {
+                if let Some(entry) = self.entry_if_match(level_index, slot, key_fingerprint, key) {
+                    return Some(on_hit(level_index, slot, entry));
+                }
+            }
         }
         None
     }
 
-    /// Triangular scan over all groups for the first FREE-or-TOMBSTONE slot.
-    /// Returns `(slot_idx, group_dist)` (see [`Self::first_free_limited`]), or
-    /// `None` only if the level is completely OCCUPIED.
     #[inline]
-    #[allow(clippy::cast_possible_truncation)] // group_dist < group_count ≤ u32::MAX
-    fn first_free_uniform(&self, key_hash: u64, level_idx: usize) -> Option<(usize, u32)> {
-        let level = &self.levels[level_idx];
-        if level.len as usize >= level.capacity() {
+    fn entry_if_match<'a, Q>(
+        &'a self,
+        level: usize,
+        slot: usize,
+        key_fingerprint: u8,
+        key: &Q,
+    ) -> Option<&'a SlotEntry<K, V>>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        debug_assert!(level < self.levels.len());
+        let level = unsafe { self.levels.get_unchecked(level) };
+        if level.control_at(slot) != key_fingerprint {
             return None;
         }
-        let group_count = level.group_count();
-        let mask = level.group_count_mask as usize;
-        let mut probe = probe::TriangularProbe::new(level.triangular_group_start(key_hash));
-        for step in 0..group_count {
-            if let Some(slot_idx) = level.first_free_in_group(probe.pos) {
-                return Some((slot_idx, step as u32));
-            }
-            probe.advance(mask);
-        }
-        None
-    }
-
-    /// After a remove, walk down `max_populated_level` past any now-empty
-    /// trailing levels so subsequent lookups don't probe them.
-    fn shrink_max_populated_level(&mut self) {
-        while self.max_populated_level > 0
-            && self.levels[self.max_populated_level].len == 0
-            && self.levels[self.max_populated_level].tombstones == 0
-        {
-            self.max_populated_level -= 1;
-        }
-        if self.levels.is_empty() || (self.levels[0].len == 0 && self.levels[0].tombstones == 0) {
-            self.max_populated_level = 0;
-        }
+        let entry = unsafe { level.get_ref(slot) };
+        key.equivalent(&entry.key).then_some(entry)
     }
 }
 
-/// `min(1 + log δ⁻¹, group_count)` — paper §2 cap on `f(ε)` with `c = 1`.
-fn compute_budget_cap(reserve_fraction: f64, group_count: usize) -> f64 {
-    let log_cap = 1.0 + (1.0 / reserve_fraction).log2();
-    let max_budget = math::cast::usize_to_f64(group_count.max(1));
-    log_cap.min(max_budget).max(1.0)
-}
-
-/// Paper §4: split into `|A_{i+1}| = |A_i|/2 ± 1`, then round each up so
-/// `group_count = size / GROUP_SIZE` is pow2 (triangular probe needs `(idx + delta) & mask` wrap).
-/// Total slots may exceed `total_capacity` by up to ~2x.
-/// Returns `[]` for capacity 0.
-fn partition_levels(total_capacity: usize) -> Vec<usize> {
-    if total_capacity == 0 {
-        return Vec::new();
-    }
-
-    let mut sizes = Vec::new();
-    let mut remaining = total_capacity;
-    let mut next_size = total_capacity.div_ceil(2);
-
-    while remaining > 0 {
-        let size = next_size.min(remaining).max(1);
-        sizes.push(size);
-        remaining -= size;
-        if remaining == 0 {
-            break;
+fn first_paper_probe_after(paper_level: u128, position: u128) -> u128 {
+    let mut lower = 1_u128;
+    let mut upper = u128::from(UNIFORM_SEARCH_CAP) + 1;
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        let phi = elastic_phi(paper_level, middle).expect("bounded Elastic query coordinate");
+        if phi <= position {
+            lower = middle + 1;
+        } else {
+            upper = middle;
         }
-        next_size = (size / 2).max(1);
     }
-
-    sizes
-        .into_iter()
-        .map(align::round_up_to_pow2_groups)
-        .collect()
-}
-
-/// Paper §4: batch `B_0` fills `A_1` to `⌈0.75|A_1|⌉`;
-/// batch `B_i` (i ≥ 1) has `|A_i| - ⌊δ|A_i|/2⌋ - ⌈0.75|A_i|⌉ + ⌈0.75|A_{i+1}|⌉` insertions,
-/// leaving `A_i` at `(1 - δ/2)` full and `A_{i+1}` at 3/4 full (eq. 1).
-/// Total = `max_insertions`.
-fn build_batch_plan(
-    level_capacities: &[usize],
-    reserve_fraction: f64,
-    max_insertions: usize,
-) -> Box<[usize]> {
-    if level_capacities.is_empty() || max_insertions == 0 {
-        return Box::new([]);
-    }
-
-    let mut plan = Vec::with_capacity(level_capacities.len() + 1);
-    plan.push(capacity::ceil_three_quarters(level_capacities[0]));
-
-    for level_index in 1..level_capacities.len() {
-        let current_level_capacity = level_capacities[level_index - 1];
-        let next_level_capacity = level_capacities[level_index];
-
-        let target_current_level_occupancy = current_level_capacity.saturating_sub(
-            capacity::floor_half_reserve_slots(reserve_fraction, current_level_capacity),
-        );
-        let initial_current_level_occupancy = capacity::ceil_three_quarters(current_level_capacity);
-        let initial_next_level_occupancy = capacity::ceil_three_quarters(next_level_capacity);
-
-        let batch_size = target_current_level_occupancy
-            .saturating_sub(initial_current_level_occupancy)
-            .saturating_add(initial_next_level_occupancy);
-        plan.push(batch_size);
-    }
-
-    let mut inserted = 0;
-    for size in &mut plan {
-        if inserted >= max_insertions {
-            *size = 0;
-            continue;
-        }
-        let room = max_insertions - inserted;
-        if *size > room {
-            *size = room;
-        }
-        inserted += *size;
-    }
-
-    if inserted < max_insertions {
-        plan.push(max_insertions - inserted);
-    }
-
-    plan.into_boxed_slice()
+    lower
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use core::hash::{BuildHasher, Hasher};
+    use core::num::{NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
     use core::ptr;
+    use core::ptr::NonNull;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     use crate::common::config::DEFAULT_RESERVE_FRACTION;
+    use crate::common::exact::reference::{ScalarElastic, ScalarElasticCase, ScalarElasticLimits};
+    use alloc::sync::Arc;
+    use allocator_api2::alloc::AllocError as RawAllocError;
 
-    #[test]
-    fn level_partition_inflates_to_pow2_groups_and_preserves_halving() {
-        for &cap in &[127usize, 1_000, 10_000, 100_000] {
-            let sizes = partition_levels(cap);
-            assert!(!sizes.is_empty());
-            // Each level's group_count must be pow2 (triangular precondition).
-            for &s in &sizes {
-                let g = s / GROUP_SIZE;
-                assert!(
-                    g.is_power_of_two(),
-                    "cap={cap} level slots={s} groups={g} not pow2"
-                );
+    #[derive(Clone, Copy)]
+    struct ConstHashBuilder;
+
+    struct ConstHasher;
+
+    impl Hasher for ConstHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, _: &[u8]) {}
+    }
+
+    impl BuildHasher for ConstHashBuilder {
+        type Hasher = ConstHasher;
+
+        fn build_hasher(&self) -> Self::Hasher {
+            ConstHasher
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct IdentityBuildHasher;
+
+    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+    struct Zst;
+
+    #[repr(align(256))]
+    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+    struct OverAligned(u64);
+
+    #[derive(Clone)]
+    struct ToggleAllocator {
+        fail: Arc<AtomicBool>,
+    }
+
+    unsafe impl Allocator for ToggleAllocator {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, RawAllocError> {
+            if self.fail.load(Ordering::Relaxed) {
+                Err(RawAllocError)
+            } else {
+                Global.allocate(layout)
             }
-            // Slot total covers the requested capacity, bounded above by 2x.
-            let total: usize = sizes.iter().sum();
-            assert!(total >= cap, "cap={cap} total={total} below request");
-            // The 2x space bound holds for the default 16-byte group. The
-            // nightly wide layout rounds each geometric level up to a full
-            // 64-slot group, so small capacities can fragment past 2x.
-            #[cfg(not(opthash_wide_group))]
-            assert!(total <= cap * 2, "cap={cap} total={total} exceeds 2x");
-            // Each next level is at most the previous (non-increasing) and at
-            // least half — the geometric halving shape, with pow2 rounding
-            // tolerance.
-            for w in sizes.windows(2) {
-                assert!(w[1] <= w[0], "non-monotonic: {} → {}", w[0], w[1]);
-                assert!(w[1] * 2 >= w[0], "shrinks too fast: {} → {}", w[0], w[1]);
-            }
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            unsafe { Global.deallocate(ptr, layout) };
+        }
+    }
+
+    #[derive(Default)]
+    struct IdentityHasher(u64);
+
+    impl Hasher for IdentityHasher {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            assert_eq!(bytes.len(), 8);
+            let mut word = [0; 8];
+            word.copy_from_slice(bytes);
+            self.0 = u64::from_ne_bytes(word);
+        }
+
+        fn write_u64(&mut self, value: u64) {
+            self.0 = value;
+        }
+    }
+
+    impl BuildHasher for IdentityBuildHasher {
+        type Hasher = IdentityHasher;
+
+        fn build_hasher(&self) -> Self::Hasher {
+            IdentityHasher::default()
+        }
+    }
+
+    fn production_case(case: ScalarElasticCase) -> ExactInsertionCase {
+        match case {
+            ScalarElasticCase::Batch0 { level } => ExactInsertionCase::Batch0 { level },
+            ScalarElasticCase::Case1 {
+                batch,
+                current_level,
+                next_level,
+                free_current,
+                free_next,
+                budget,
+            } => ExactInsertionCase::Case1 {
+                batch,
+                current_level,
+                next_level,
+                free_current,
+                free_next,
+                budget,
+            },
+            ScalarElasticCase::Case2 {
+                batch,
+                current_level,
+                next_level,
+                free_current,
+                free_next,
+            } => ExactInsertionCase::Case2 {
+                batch,
+                current_level,
+                next_level,
+                free_current,
+                free_next,
+            },
+            ScalarElasticCase::Case3 {
+                batch,
+                current_level,
+                next_level,
+                free_current,
+                free_next,
+            } => ExactInsertionCase::Case3 {
+                batch,
+                current_level,
+                next_level,
+                free_current,
+                free_next,
+            },
+        }
+    }
+
+    fn assert_exact_trace(n: usize, delta_log2: u32, identities: impl IntoIterator<Item = u64>) {
+        let reserve = ReserveFraction::from_delta_log2(delta_log2).unwrap();
+        let config = PaperConfig::new(n, delta_log2).unwrap();
+        let plan = config.elastic_plan();
+        let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                n,
+                reserve,
+                IdentityBuildHasher,
+                Global,
+            )
+            .unwrap();
+        assert_eq!(
+            table
+                .levels
+                .iter()
+                .map(ArenaSlots::capacity)
+                .collect::<Vec<_>>(),
+            plan.level_lengths().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            table.scheduler.batch_plan.as_ref(),
+            plan.batch_quotas().collect::<Vec<_>>()
+        );
+
+        let limits = ScalarElasticLimits::new(
+            NonZeroUsize::new(ELASTIC_PROBE_BUDGET_C).unwrap(),
+            NonZeroU32::new(RANGE_WORD_CAP).unwrap(),
+            NonZeroU64::new(UNIFORM_SEARCH_CAP).unwrap(),
+            NonZeroU128::new(QUERY_POSITION_CAP).unwrap(),
+        );
+        let mut scalar = ScalarElastic::new(config, CounterPrf::new(ELASTIC_PROBE_SEED), limits);
+
+        for identity in identities {
+            assert_eq!(table.hash_key(&identity), identity);
+            assert!(matches!(
+                table.scheduler.on_insert(table.len),
+                InsertAction::Continue
+            ));
+            let placement = table
+                .choose_slot_for_new_key(identity, table.scheduler.target())
+                .unwrap();
+            let expected = scalar.insert(identity);
+            let global_slot = table.levels[..placement.level]
+                .iter()
+                .map(ArenaSlots::capacity)
+                .sum::<usize>()
+                + placement.slot;
+
+            assert_eq!(placement.case, production_case(expected.case));
+            assert_eq!(placement.level, expected.location.level);
+            assert_eq!(placement.slot, expected.location.slot_in_level);
+            assert_eq!(global_slot, expected.location.global_slot);
+            assert_eq!(placement.paper_probe, expected.paper_probe);
+            assert_eq!(placement.phi, expected.phi);
+
+            let fingerprint = control::control_fingerprint(identity);
+            assert_eq!(
+                table.place_new_entry(identity, identity, identity, fingerprint, placement),
+                (placement.level, placement.slot)
+            );
+            assert_eq!(
+                table
+                    .levels
+                    .iter()
+                    .map(|level| level.len as usize)
+                    .collect::<Vec<_>>(),
+                scalar.level_occupancy()
+            );
+            assert_eq!(
+                table.find_slot_indices_with_hash(&identity, identity, fingerprint),
+                Some((placement.level, placement.slot))
+            );
         }
     }
 
     #[test]
-    fn limited_group_budget_uses_paper_linear_log() {
-        // cap/free = 1024/12 = 85.3 (non-pow2): 1 + log2(85.3) = 7.42 floors to
-        // 7 off any integer boundary, immune to libm's last-ULP wobble.
-        const CAP: u32 = 1024;
-        const FREE: u32 = 12;
-        let mut level = Level::<SlotEntry<u64, u64>>::new_at(
-            0,
-            CAP,
-            1.0 / 4096.0,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        );
-        level.len = CAP - FREE;
+    fn production_placement_matches_the_scalar_paper_model() {
+        assert_exact_trace(8, 3, [0, 1, 2, 1523, 2540, 2541, 2542]);
+        for &(n, delta_log2) in &[(31, 4), (65, 6), (257, 8)] {
+            let target = PaperConfig::new(n, delta_log2).unwrap().target_insertions();
+            assert_exact_trace(n, delta_log2, (0..target).map(|identity| identity as u64));
+        }
+    }
 
-        assert_eq!(level.limited_group_budget(), 7);
+    #[test]
+    fn compact_query_lane_tables_cover_every_supported_geometry() {
+        assert_eq!(ELASTIC_LEVEL_LANES.len(), u32::BITS as usize);
+        assert_eq!(
+            PaperConfig::new(MAX_ELASTIC_SLOTS, ReserveFraction::DEFAULT.delta_log2())
+                .unwrap()
+                .elastic_plan()
+                .level_count(),
+            ELASTIC_LEVEL_LANES.len()
+        );
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(
+                ElasticGeometry::for_insert_budget(MAX_ELASTIC_SLOTS, ReserveFraction::DEFAULT,)
+                    .is_none()
+            );
+            let result = ElasticTable::<u64, u64, IdentityBuildHasher>::
+                try_with_slots_and_reserve_fraction_and_hasher_in(
+                    MAX_ELASTIC_SLOTS + 1,
+                    ReserveFraction::DEFAULT,
+                    IdentityBuildHasher,
+                    Global,
+                );
+            assert!(matches!(result, Err(TryReserveError::CapacityOverflow)));
+        }
+        assert!(elastic_phi(1, 383).unwrap() <= QUERY_POSITION_CAP);
+        assert!(elastic_phi(1, 384).unwrap() > QUERY_POSITION_CAP);
+        for level in 1..=u128::from(u64::BITS) {
+            let mut paper_probe = 1_u128;
+            while elastic_phi(level, paper_probe).unwrap() <= QUERY_POSITION_CAP {
+                assert!(usize::try_from(paper_probe - 1).unwrap() < QUERY_PROBE_LANE_COUNT);
+                paper_probe += 1;
+            }
+        }
+
+        let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                31,
+                ReserveFraction::from_delta_log2(4).unwrap(),
+                IdentityBuildHasher,
+                Global,
+            )
+            .unwrap();
+        table.extend_probe_schedule(QUERY_POSITION_CAP);
+        assert!(
+            table
+                .probe_schedule
+                .iter()
+                .all(|route| route.level != 0 || route.logical_probe_index != 0)
+        );
+    }
+
+    #[test]
+    fn query_schedule_never_reallocates_within_an_epoch() {
+        let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                8_192,
+                ReserveFraction::DEFAULT,
+                IdentityBuildHasher,
+                Global,
+            )
+            .unwrap();
+        let initial_ptr = table.probe_schedule.as_ptr();
+        let initial_capacity = table.probe_schedule.capacity();
+
+        table.extend_probe_schedule(QUERY_POSITION_CAP);
+
+        assert_eq!(table.probe_schedule.as_ptr(), initial_ptr);
+        assert_eq!(table.probe_schedule.capacity(), initial_capacity);
+        assert_eq!(table.probe_schedule.len(), initial_capacity);
+    }
+
+    #[test]
+    fn query_schedule_caches_each_routes_exact_level_bound() {
+        let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                8_193,
+                ReserveFraction::DEFAULT,
+                IdentityBuildHasher,
+                Global,
+            )
+            .unwrap();
+
+        table.extend_probe_schedule(QUERY_POSITION_CAP);
+
+        for route in &table.probe_schedule {
+            assert_eq!(
+                route.range_upper as usize,
+                table.levels[usize::from(route.level)].capacity()
+            );
+        }
     }
 
     #[test]
     fn elastic_geometry_carries_capacity_and_batch_state() {
         for &requested in &[0usize, 1, 127, 1_000, 10_000] {
-            let reserve_fraction = DEFAULT_RESERVE_FRACTION;
+            let reserve_fraction = ReserveFraction::DEFAULT;
             let geometry = ElasticGeometry::for_insert_budget(requested, reserve_fraction).unwrap();
             assert!(
                 geometry.max_insertions >= requested,
                 "requested={requested} max_insertions={}",
                 geometry.max_insertions
             );
-            assert!(
-                geometry.level_capacities.iter().sum::<usize>() >= geometry.total_slots,
-                "rounded level capacities must cover total slots"
+            assert_eq!(
+                geometry.level_capacities.iter().sum::<usize>(),
+                geometry.total_slots
             );
-            assert!(
-                geometry.batch_plan.iter().sum::<usize>() >= geometry.max_insertions,
-                "batch plan must cover the insertion budget"
+            assert_eq!(
+                geometry.batch_plan.iter().sum::<usize>(),
+                geometry.max_insertions
             );
+            if geometry.total_slots >= 2 {
+                let config =
+                    PaperConfig::new(geometry.total_slots, reserve_fraction.delta_log2()).unwrap();
+                let plan = config.elastic_plan();
+                assert_eq!(
+                    geometry.level_capacities,
+                    plan.level_lengths().collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    geometry.batch_plan.as_ref(),
+                    plan.batch_quotas().collect::<Vec<_>>()
+                );
+            }
         }
+    }
+
+    #[test]
+    fn membership_filter_is_appended_without_moving_control_or_data() {
+        fn assert_layout<K, V>() {
+            for &slots in &[0, 1, 7, 8, 31, 256] {
+                let (base, data_offset) = arena::layout_for::<K, V>(slots).unwrap();
+                let extended = elastic_arena_layout::<K, V>(slots).unwrap();
+                assert_eq!(extended.data_base_off, data_offset);
+                if slots == 0 {
+                    assert_eq!(extended.layout.size(), 0);
+                    assert_eq!(extended.membership_words, 0);
+                } else {
+                    assert_eq!(extended.membership_offset, base.size());
+                    assert_eq!(
+                        extended.membership_words,
+                        slots.div_ceil(MEMBERSHIP_SLOTS_PER_WORD)
+                    );
+                    assert!(extended.layout.size() > base.size());
+                }
+            }
+        }
+
+        assert_layout::<u64, u64>();
+        assert_layout::<Zst, Zst>();
+        assert_layout::<OverAligned, OverAligned>();
+
+        let table =
+            ElasticTable::<OverAligned, OverAligned>::with_capacity_and_reserve_and_hasher_in(
+                64,
+                ReserveFraction::DEFAULT,
+                DefaultHashBuilder::default(),
+                Global,
+            );
+        let layout = elastic_arena_layout::<OverAligned, OverAligned>(table.total_slots).unwrap();
+        assert_eq!(
+            table.membership_ptr().addr(),
+            unsafe { table.arena.as_ptr().add(layout.membership_offset) }.addr()
+        );
+        assert_eq!(table.membership_ptr().addr() % mem::align_of::<u64>(), 0);
+        assert_eq!(
+            table.levels[0].data_ptr().addr() % mem::align_of::<OverAligned>(),
+            0
+        );
     }
 
     #[test]
@@ -1429,6 +2176,299 @@ mod tests {
 
         assert!(map.table().scheduler.current_batch_index > 0);
         assert_eq!(map.table().scheduler.target(), BatchTarget::LevelPair(0));
+    }
+
+    #[test]
+    fn duplicate_insert_does_not_advance_the_paper_schedule() {
+        let mut map: ElasticHashMap<u64, u64> = ElasticHashMap::with_capacity(64);
+        assert_eq!(map.insert(7, 11), None);
+        let batch = map.table().scheduler.current_batch_index;
+        let remaining = map.table().scheduler.batch_remaining;
+
+        assert_eq!(map.insert(7, 13), Some(11));
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.table().scheduler.current_batch_index, batch);
+        assert_eq!(map.table().scheduler.batch_remaining, remaining);
+        assert_eq!(map.get(&7), Some(&13));
+    }
+
+    #[test]
+    fn membership_filter_never_forgets_live_or_deleted_hashes() {
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
+        let inserted_hash = map.table().hash_key(&7_u64);
+        assert!(!map.table().membership_maybe_contains(inserted_hash));
+
+        assert_eq!(map.insert(7, 11), None);
+        assert!(map.table().membership_maybe_contains(inserted_hash));
+
+        assert_eq!(map.insert(7, 13), Some(11));
+        assert_eq!(map.len(), 1);
+        assert!(map.table().membership_maybe_contains(inserted_hash));
+
+        assert_eq!(map.remove(&7), Some(13));
+        assert!(map.table().membership_maybe_contains(inserted_hash));
+        assert_eq!(map.insert(7, 17), None);
+        assert_eq!(map.get(&7), Some(&17));
+    }
+
+    #[test]
+    fn membership_filter_resets_and_rebuilds_at_table_boundaries() {
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(128, IdentityBuildHasher);
+        for key in 0_u64..96 {
+            map.insert(key, key ^ 0x55);
+        }
+
+        let mut cloned = map.clone();
+        for key in 0_u64..96 {
+            let hash = cloned.table().hash_key(&key);
+            assert!(cloned.table().membership_maybe_contains(hash));
+            assert_eq!(cloned.get(&key), Some(&(key ^ 0x55)));
+        }
+
+        cloned.clear();
+        for key in 0_u64..96 {
+            let hash = cloned.table().hash_key(&key);
+            assert!(!cloned.table().membership_maybe_contains(hash));
+        }
+
+        for key in 256_u64..384 {
+            cloned.insert(key, key);
+        }
+        cloned.reserve(512);
+        for key in 256_u64..384 {
+            let hash = cloned.table().hash_key(&key);
+            assert!(cloned.table().membership_maybe_contains(hash));
+            assert_eq!(cloned.get(&key), Some(&key));
+        }
+    }
+
+    #[test]
+    fn all_vacant_entry_apis_record_membership() {
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(128, IdentityBuildHasher);
+
+        map.try_insert(11, 1).unwrap();
+        map.entry(22).or_insert(2);
+        map.get_or_insert_key_with(&33_u64, 3, |key| *key);
+
+        for key in [11_u64, 22, 33] {
+            let hash = map.table().hash_key(&key);
+            assert!(map.table().membership_maybe_contains(hash));
+            assert!(map.contains_key(&key));
+        }
+    }
+
+    #[test]
+    fn drain_and_failed_reserve_preserve_membership_invariants() {
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(128, IdentityBuildHasher);
+        for key in 0_u64..64 {
+            map.insert(key, key);
+        }
+        assert!(map.try_reserve(usize::MAX).is_err());
+        for key in 0_u64..64 {
+            let hash = map.table().hash_key(&key);
+            assert!(map.table().membership_maybe_contains(hash));
+            assert_eq!(map.get(&key), Some(&key));
+        }
+
+        map.drain().for_each(drop);
+        assert!(map.is_empty());
+        for key in 0_u64..64 {
+            let hash = map.table().hash_key(&key);
+            assert!(!map.table().membership_maybe_contains(hash));
+        }
+    }
+
+    #[test]
+    fn allocator_failure_does_not_publish_or_forget_membership() {
+        let fail = Arc::new(AtomicBool::new(true));
+        let failed = ElasticHashMap::<u64, u64, IdentityBuildHasher, ToggleAllocator>::
+            try_with_capacity_and_reserve_and_hasher_in(
+                128,
+                ReserveFraction::DEFAULT,
+                IdentityBuildHasher,
+                ToggleAllocator {
+                    fail: Arc::clone(&fail),
+                },
+            );
+        assert!(matches!(failed, Err(TryBuildError::AllocError)));
+
+        fail.store(false, Ordering::Relaxed);
+        let mut map = ElasticHashMap::<u64, u64, IdentityBuildHasher, ToggleAllocator>::
+            with_capacity_and_reserve_and_hasher_in(
+                128,
+                ReserveFraction::DEFAULT,
+                IdentityBuildHasher,
+                ToggleAllocator {
+                    fail: Arc::clone(&fail),
+                },
+            );
+        for key in 0_u64..64 {
+            map.insert(key, key ^ 0x5a);
+        }
+
+        fail.store(true, Ordering::Relaxed);
+        assert_eq!(map.try_reserve(4_096), Err(TryReserveError::AllocError));
+        for key in 0_u64..64 {
+            let hash = map.table().hash_key(&key);
+            assert!(map.table().membership_maybe_contains(hash));
+            assert_eq!(map.get(&key), Some(&(key ^ 0x5a)));
+        }
+    }
+
+    #[test]
+    fn colliding_hashes_remain_distinguishable_through_delete_and_reuse() {
+        let mut map: ElasticHashMap<u64, u64, ConstHashBuilder> =
+            ElasticHashMap::with_capacity_and_hasher(512, ConstHashBuilder);
+        let colliding_count = 64_u64;
+        for key in 0..colliding_count {
+            map.insert(key, key);
+        }
+        assert_eq!(map.remove(&0), Some(0));
+        assert_eq!(map.insert(u64::MAX, 7), None);
+        for key in 1..colliding_count {
+            assert_eq!(map.get(&key), Some(&key));
+        }
+        assert_eq!(map.get(&u64::MAX), Some(&7));
+    }
+
+    #[test]
+    fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
+        let reserve = ReserveFraction::DEFAULT;
+        let mut table = ElasticTable::<u64, u64, ConstHashBuilder>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                8_192,
+                reserve,
+                ConstHashBuilder,
+                Global,
+            )
+            .unwrap();
+        let fingerprint = control::control_fingerprint(0);
+        let mut next_key = 0_u64;
+
+        for logical_index in 0..UNIFORM_SEARCH_CAP {
+            let paper_probe = u128::from(logical_index) + 1;
+            if elastic_phi(1, paper_probe).unwrap() > QUERY_POSITION_CAP {
+                break;
+            }
+            let slot = table.route_exact(0, 0, logical_index).unwrap();
+            if table.levels[0].control_at(slot).is_free() {
+                table.levels[0].write_with_control(
+                    slot,
+                    SlotEntry {
+                        key: next_key,
+                        value: next_key,
+                    },
+                    fingerprint,
+                );
+                table.levels[0].len += 1;
+                table.len += 1;
+                next_key += 1;
+            }
+        }
+        assert!(
+            table
+                .choose_slot_for_new_key(0, BatchTarget::Bootstrap)
+                .is_none()
+        );
+
+        let before = table.epoch.snapshot(table.len);
+        let location = table.insert_for_vacant_entry(u64::MAX, 7, 0);
+        let after = table.epoch.snapshot(table.len);
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.placement_recoveries, before.placement_recoveries + 1);
+        assert_eq!(after.transition, EpochTransition::PlacementRecovery);
+        assert_ne!(table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
+        assert!(table.membership_maybe_contains(0));
+        assert_eq!(
+            table.find_slot_indices_with_hash(&u64::MAX, 0, fingerprint),
+            Some(location)
+        );
+        for key in 0..next_key {
+            assert!(
+                table
+                    .find_slot_indices_with_hash(&key, 0, fingerprint)
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn direct_lookup_returns_the_compared_slot_reference() {
+        let mut table: ElasticTable<usize, usize> =
+            ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
+                1024,
+                DEFAULT_RESERVE_FRACTION,
+                DefaultHashBuilder::default(),
+                Global,
+            );
+        let mut insertion_count = 0;
+        while insertion_count < table.max_insertions
+            && !table.levels.iter().skip(1).any(|level| level.len > 0)
+        {
+            let key = insertion_count;
+            table.insert_unique(key, key ^ 0xa5a5);
+            insertion_count += 1;
+        }
+        assert!(
+            table.levels.iter().skip(1).any(|level| level.len > 0),
+            "test must exercise lookup beyond level 0"
+        );
+
+        for key in 0..insertion_count {
+            let hash = table.hash_key(&key);
+            let fingerprint = control::control_fingerprint(hash);
+            let location = table
+                .find_slot_indices_with_hash(&key, hash, fingerprint)
+                .expect("inserted key must have a location");
+            let direct = table
+                .find_entry_with_hash(&key, hash, fingerprint)
+                .expect("inserted key must have an entry reference");
+            let resolved = unsafe { table.slot_ref(location.0, location.1) };
+            assert!(ptr::eq(direct, resolved), "key {key} returned a new slot");
+        }
+
+        let missing = usize::MAX;
+        let hash = table.hash_key(&missing);
+        let fingerprint = control::control_fingerprint(hash);
+        assert!(
+            table
+                .find_entry_with_hash(&missing, hash, fingerprint)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn delete_below_cleanup_threshold_preserves_survivor_locations() {
+        let mut map: ElasticHashMap<usize, usize> = ElasticHashMap::with_capacity(512);
+        for key in 0..100 {
+            map.insert(key, key);
+        }
+        let before: Vec<_> = (1..100)
+            .map(|key| {
+                let hash = map.table().hash_key(&key);
+                let fingerprint = control::control_fingerprint(hash);
+                map.table()
+                    .find_slot_indices_with_hash(&key, hash, fingerprint)
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(map.remove(&0), Some(0));
+
+        let after: Vec<_> = (1..100)
+            .map(|key| {
+                let hash = map.table().hash_key(&key);
+                let fingerprint = control::control_fingerprint(hash);
+                map.table()
+                    .find_slot_indices_with_hash(&key, hash, fingerprint)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -1509,8 +2549,6 @@ mod tests {
 
     #[test]
     fn retain_does_not_trigger_mid_iter_resize_with_clustered_tombstones() {
-        // `retain` cleans up only on iterator Drop, at the same capacity —
-        // slot count must not change.
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(256);
         let cap = i32::try_from(map.capacity()).expect("test capacity fits i32");
         let n = cap * 2 / 3;
@@ -1532,7 +2570,7 @@ mod tests {
         assert_eq!(
             map.capacity(),
             initial_capacity,
-            "retain must not change the slot count, only rehash in place"
+            "retain cannot resize while its scan is active"
         );
     }
 
@@ -1549,9 +2587,8 @@ mod tests {
             map.insert(i, i);
         }
         assert!(
-            map.table().max_populated_level > 0,
-            "expected spill into deeper level; max_populated_level = {}",
-            map.table().max_populated_level
+            map.table().levels.iter().skip(1).any(|level| level.len > 0),
+            "expected the exact batch schedule to populate a deeper level"
         );
         for i in 0..max {
             assert_eq!(map.get(&i), Some(&i));
@@ -1559,22 +2596,16 @@ mod tests {
     }
 
     #[test]
-    fn max_populated_level_shrinks_when_deepest_levels_emptied() {
+    fn removing_every_entry_empties_every_level() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(512);
         let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
         for i in 0..max {
             map.insert(i, i);
         }
-        let high_water = map.table().max_populated_level;
-        assert!(high_water > 0, "need a multi-level state to test shrinkage");
         for i in 0..max {
             map.remove(&i);
         }
         assert_eq!(map.len(), 0);
-        assert_eq!(
-            map.table().max_populated_level,
-            0,
-            "max_populated_level should walk back to 0 once every level empties"
-        );
+        assert!(map.table().levels.iter().all(|level| level.len == 0));
     }
 }

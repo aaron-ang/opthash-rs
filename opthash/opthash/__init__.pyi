@@ -53,6 +53,7 @@ class ElasticHashMap(MutableMapping[K, V]):
         cls,
         capacity: int = 0,
         reserve_fraction: float | None = None,
+        delta_log2: int | None = None,
     ) -> ElasticHashMap[K, V]: ...
     @overload
     @classmethod
@@ -148,6 +149,7 @@ class FunnelHashMap(MutableMapping[K, V]):
         cls,
         capacity: int = 0,
         reserve_fraction: float | None = None,
+        delta_log2: int | None = None,
     ) -> FunnelHashMap[K, V]: ...
     @overload
     @classmethod
@@ -216,6 +218,7 @@ class ElasticHashSet(MutableSet[K]):
         cls,
         capacity: int = 0,
         reserve_fraction: float | None = None,
+        delta_log2: int | None = None,
     ) -> ElasticHashSet[K]: ...
     @property
     def capacity(self) -> int: ...
@@ -245,6 +248,7 @@ class FunnelHashSet(MutableSet[K]):
         cls,
         capacity: int = 0,
         reserve_fraction: float | None = None,
+        delta_log2: int | None = None,
     ) -> FunnelHashSet[K]: ...
     @property
     def capacity(self) -> int: ...

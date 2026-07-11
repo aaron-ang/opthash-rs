@@ -737,14 +737,20 @@ macro_rules! parity_suite {
                     panic!("isize::MAX should trigger an overflow!");
                 }
 
-                if let Err(AllocError) = empty_bytes.try_reserve(MAX_ISIZE / 5) {
+                if matches!(
+                    empty_bytes.try_reserve(MAX_ISIZE / 5),
+                    Err(AllocError | CapacityOverflow)
+                ) {
                 } else {
                     let mut empty_bytes2: HashMap<u8, u8> = HashMap::new();
                     let _ = empty_bytes2.try_reserve(MAX_ISIZE / 5);
                     let mut empty_bytes3: HashMap<u8, u8> = HashMap::new();
                     let _ = empty_bytes3.try_reserve(MAX_ISIZE / 5);
                     let mut empty_bytes4: HashMap<u8, u8> = HashMap::new();
-                    if let Err(AllocError) = empty_bytes4.try_reserve(MAX_ISIZE / 5) {
+                    if matches!(
+                        empty_bytes4.try_reserve(MAX_ISIZE / 5),
+                        Err(AllocError | CapacityOverflow)
+                    ) {
                     } else {
                         panic!("isize::MAX / 5 should trigger an OOM!");
                     }

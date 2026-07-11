@@ -13,8 +13,6 @@ fn main() {
         "opthash_neon_group",
         "opthash_x86_16_group",
         "opthash_scalar_group",
-        "opthash_avx2",
-        "opthash_eq_bits_16",
     ] {
         println!("cargo:rustc-check-cfg=cfg({cfg})");
     }
@@ -27,7 +25,6 @@ fn main() {
     // Only nightly AVX-512 builds use the 64-byte control-group layout.
     let avx512_group =
         nightly && arch == "x86_64" && has_feature("avx512f") && has_feature("avx512bw");
-    let avx2 = arch == "x86_64" && has_feature("avx2");
     // Portable SWAR-8 fallback for targets without a NEON/SSE control scan.
     let scalar = arch != "x86_64" && arch != "aarch64";
 
@@ -40,14 +37,6 @@ fn main() {
     }
     if arch == "x86_64" && !avx512_group {
         println!("cargo:rustc-cfg=opthash_x86_16_group");
-    }
-    // AVX2 only widens the cold linear scan to 32 bytes.
-    if avx2 {
-        println!("cargo:rustc-cfg=opthash_avx2");
-    }
-    // The 16-byte cold scan is unused by the SWAR (scalar) backend.
-    if !(scalar || avx512_group && avx2) {
-        println!("cargo:rustc-cfg=opthash_eq_bits_16");
     }
     if scalar {
         println!("cargo:rustc-cfg=opthash_scalar_group");

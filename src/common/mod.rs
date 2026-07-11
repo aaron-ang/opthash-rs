@@ -3,10 +3,11 @@ pub(crate) mod bitmask;
 pub(crate) mod config;
 pub(crate) mod control;
 pub(crate) mod error;
-#[cfg(not(feature = "std"))]
-pub(crate) mod float;
+// The exact finite placement core is private library infrastructure.
+pub(crate) mod exact;
 pub(crate) mod iter;
 pub(crate) mod math;
+pub(crate) mod reserve;
 pub(crate) mod simd;
 
 /// Default `BuildHasher` for the maps' `S` type parameter.

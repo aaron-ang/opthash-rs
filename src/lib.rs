@@ -15,6 +15,7 @@ extern crate alloc;
 
 mod common;
 mod elastic;
+mod epoch;
 mod funnel;
 mod macros;
 mod map;
@@ -26,7 +27,9 @@ mod python;
 pub use equivalent::Equivalent;
 
 pub use common::DefaultHashBuilder;
-pub use common::error::TryReserveError;
+pub use common::error::{TryBuildError, TryReserveError};
+pub use common::reserve::{ReserveFraction, ReserveFractionError};
+pub use epoch::{EpochSnapshot, EpochTransition};
 
 pub use elastic::{
     ElasticDifference, ElasticDrain, ElasticEntry, ElasticExtractIf, ElasticHashMap,

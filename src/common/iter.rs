@@ -3,8 +3,9 @@ use core::iter::FusedIterator;
 use core::ptr;
 
 use super::arena::ArenaSlots;
-use super::bitmask::BitMask;
+use super::bitmask::{BITMASK_STRIDE, BitMask};
 use super::config::GROUP_SIZE;
+use super::control::ControlByte;
 use super::simd;
 
 /// Projects the `K` from a borrowing `(&K, &V)` iterator.
@@ -243,9 +244,23 @@ impl OccupiedSlots {
                 return None;
             }
             self.current_group_slot = self.current_group_slot.wrapping_add(GROUP_SIZE);
-            // SAFETY: `next_ctrl < end_ctrl` ⇒ within the region's ctrl bytes.
-            self.current_mask = unsafe { simd::occupied_mask_group(self.next_ctrl) };
-            self.next_ctrl = unsafe { self.next_ctrl.add(GROUP_SIZE) };
+            let remaining = usize::try_from(unsafe { self.end_ctrl.offset_from(self.next_ctrl) })
+                .expect("iterator control pointers remain ordered");
+            if remaining >= GROUP_SIZE {
+                self.current_mask = unsafe { simd::occupied_mask_group(self.next_ctrl) };
+                self.next_ctrl = unsafe { self.next_ctrl.add(GROUP_SIZE) };
+            } else {
+                let mut mask = 0_u64;
+                for index in 0..remaining {
+                    let control = unsafe { *self.next_ctrl.add(index) };
+                    if control.is_occupied() {
+                        let lane = u32::try_from(index).expect("control-group lane fits u32");
+                        mask |= 1_u64 << (lane * BITMASK_STRIDE);
+                    }
+                }
+                self.current_mask = BitMask(mask);
+                self.next_ctrl = self.end_ctrl;
+            }
         }
     }
 }
