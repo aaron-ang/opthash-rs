@@ -1,5 +1,5 @@
-import os
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -135,11 +135,16 @@ def test_bench_script_can_lock_a_read_only_shared_core_directory(
     )
     _write_executable(
         bin_dir / "cargo",
-        '#!/bin/sh\nenv > "$CAPTURE_ENV"\n: > "$CARGO_MARKER"\n',
+        """#!/bin/sh
+env > "$CAPTURE_ENV"
+: > "$CARGO_MARKER"
+printf 'cargo\n' >> "$EVENT_LOG"
+""",
     )
-    manifest_log = tmp_path / "manifest-log"
-    transaction = tmp_path / "transaction"
-    _write_fake_manifest_helper(tmp_path / "manifest-helper", transaction)
+    metadata_log = tmp_path / "metadata-log"
+    event_log = tmp_path / "event-log"
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
 
     environment = os.environ.copy()
     environment.update(
@@ -151,9 +156,10 @@ def test_bench_script_can_lock_a_read_only_shared_core_directory(
             "SAVE": "lock-smoke",
             "CARGO_MARKER": str(marker),
             "CAPTURE_ENV": str(tmp_path / "cargo-environment"),
-            "MANIFEST_LOG": str(manifest_log),
+            "METADATA_LOG": str(metadata_log),
+            "EVENT_LOG": str(event_log),
             "LAUNCH_LOG": str(tmp_path / "launcher-log"),
-            "OPTHASH_CRITERION_MANIFEST_HELPER": str(tmp_path / "manifest-helper"),
+            "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
         }
     )
 
@@ -174,17 +180,25 @@ def test_bench_script_can_lock_a_read_only_shared_core_directory(
         for line in (tmp_path / "cargo-environment").read_text().splitlines()
         if "=" in line
     )
-    assert captured["CRITERION_HOME"] == str(transaction)
-    commands = [json.loads(line) for line in manifest_log.read_text().splitlines()]
-    assert [command[0] for command in commands] == ["prepare-save", "publish-save"]
+    assert "CRITERION_HOME" not in captured
+    assert captured["OPTHASH_BENCH_SAVE_BASELINE"] == "lock-smoke"
+    commands = [json.loads(line) for line in metadata_log.read_text().splitlines()]
+    assert [command[0] for command in commands] == ["begin", "publish"]
+    assert event_log.read_text().splitlines() == ["begin", "cargo", "publish"]
+    begin, publish = commands
+    assert begin[begin.index("--target") + 1] == "speedup"
+    assert begin[begin.index("--baseline") + 1] == "lock-smoke"
+    assert publish[publish.index("--source-before") + 1] == "source-before"
+    assert publish[publish.index("--requested-bench") + 1] == "speedup"
+    assert publish[publish.index("--core") + 1] == "5"
     launches = (tmp_path / "launcher-log").read_text().splitlines()
     assert len(launches) == 3
-    assert "manifest-helper prepare-save" in launches[0]
+    assert "metadata-helper begin" in launches[0]
     assert "taskset -c 5" in launches[1]
-    assert "manifest-helper publish-save" in launches[2]
+    assert "metadata-helper publish" in launches[2]
 
 
-def test_bench_script_routes_named_speedup_modes_through_manifest_transactions(
+def test_bench_script_routes_named_speedup_modes_through_metadata_sidecars(
     tmp_path: Path,
 ) -> None:
     bin_dir = tmp_path / "bin"
@@ -197,24 +211,28 @@ def test_bench_script_routes_named_speedup_modes_through_manifest_transactions(
         )
     _write_executable(
         bin_dir / "cargo",
-        '#!/bin/sh\nenv > "$CAPTURE_ENV"\nprintf \'%s\\n\' "$@" > "$CAPTURE_ARGS"\n',
+        """#!/bin/sh
+env > "$CAPTURE_ENV"
+printf '%s\n' "$@" > "$CAPTURE_ARGS"
+printf 'cargo\n' >> "$EVENT_LOG"
+""",
     )
-    transaction = tmp_path / "transaction"
-    helper = tmp_path / "manifest-helper"
-    _write_fake_manifest_helper(helper, transaction)
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
 
     cases = [
-        ({"SAVE": "candidate"}, ["prepare-save", "publish-save"]),
-        ({"BASELINE": "anchor"}, ["hydrate", "discard"]),
+        ({"SAVE": "candidate"}, ["begin", "publish"]),
+        ({"BASELINE": "anchor"}, ["verify"]),
         (
             {"LOAD": "candidate", "BASELINE": "anchor"},
-            ["hydrate", "discard"],
+            ["verify"],
         ),
     ]
     for index, (overrides, expected_commands) in enumerate(cases):
         capture_env = tmp_path / f"environment-{index}"
         capture_args = tmp_path / f"arguments-{index}"
-        manifest_log = tmp_path / f"manifest-{index}"
+        metadata_log = tmp_path / f"metadata-{index}"
+        event_log = tmp_path / f"events-{index}"
         environment = os.environ.copy()
         environment.update(
             {
@@ -224,8 +242,9 @@ def test_bench_script_routes_named_speedup_modes_through_manifest_transactions(
                 "BENCH": "speedup",
                 "CAPTURE_ENV": str(capture_env),
                 "CAPTURE_ARGS": str(capture_args),
-                "MANIFEST_LOG": str(manifest_log),
-                "OPTHASH_CRITERION_MANIFEST_HELPER": str(helper),
+                "METADATA_LOG": str(metadata_log),
+                "EVENT_LOG": str(event_log),
+                "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
             }
         )
         for name in ("SAVE", "LOAD", "BASELINE"):
@@ -247,30 +266,156 @@ def test_bench_script_routes_named_speedup_modes_through_manifest_transactions(
             for line in capture_env.read_text().splitlines()
             if "=" in line
         )
-        assert captured["CRITERION_HOME"] == str(transaction)
-        commands = [json.loads(line) for line in manifest_log.read_text().splitlines()]
+        assert "CRITERION_HOME" not in captured
+        commands = [json.loads(line) for line in metadata_log.read_text().splitlines()]
         assert [command[0] for command in commands] == expected_commands
+        assert event_log.read_text().splitlines() == [
+            *expected_commands[:1],
+            "cargo",
+            *expected_commands[1:],
+        ]
         first = commands[0]
         assert "--target" in first and first[first.index("--target") + 1] == "speedup"
-        if first[0] == "prepare-save":
+        if first[0] == "begin":
             assert first[first.index("--baseline") + 1] == "candidate"
-            assert first[first.index("--core") + 1] == "5"
-            assert "--forwarded-arg=--measurement-time" in first
-            assert "--forwarded-arg=10" in first
+            publish = commands[1]
+            assert publish[publish.index("--source-before") + 1] == "source-before"
+            assert publish[publish.index("--core") + 1] == "5"
+            assert publish[publish.index("--requested-bench") + 1] == "speedup"
+            assert publish[publish.index("--forwarded-arg") + 1] == "--measurement-time"
+            assert (
+                publish[
+                    publish.index(
+                        "--forwarded-arg", publish.index("--forwarded-arg") + 1
+                    )
+                    + 1
+                ]
+                == "10"
+            )
         elif "LOAD" in overrides:
             assert first[first.index("--baseline") + 1] == "candidate"
             assert first[first.index("--compare") + 1] == "anchor"
         else:
             assert first[first.index("--baseline") + 1] == "anchor"
-        if first[0] == "hydrate":
-            assert "--strict-measured" in first
-            assert first[first.index("--source-root") + 1] == str(REPO_ROOT)
-            assert first[first.index("--core") + 1] == "5"
-            assert "--forwarded-arg=--measurement-time" in first
-            assert "--forwarded-arg=10" in first
+            assert "--compare" not in first
+        assert capture_args.read_text().splitlines()[-2:] == [
+            "--measurement-time",
+            "10",
+        ]
 
 
-def _write_fake_manifest_helper(path: Path, transaction: Path) -> None:
+def test_bench_script_does_not_publish_metadata_when_cargo_fails(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Linux\n")
+    for name, shift in (("taskset", 2), ("setarch", 1), ("chrt", 2), ("numactl", 1)):
+        _write_executable(
+            bin_dir / name,
+            f'#!/bin/sh\nshift {shift}\nexec "$@"\n',
+        )
+    _write_executable(
+        bin_dir / "cargo",
+        "#!/bin/sh\nprintf 'cargo\n' >> \"$EVENT_LOG\"\nexit 23\n",
+    )
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
+    metadata_log = tmp_path / "metadata-log"
+    event_log = tmp_path / "event-log"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+            "CORE": "5",
+            "LOCK_DIR": str(tmp_path / "locks"),
+            "BENCH": "speedup",
+            "SAVE": "candidate",
+            "METADATA_LOG": str(metadata_log),
+            "EVENT_LOG": str(event_log),
+            "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "scripts/bench.sh"],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 23
+    commands = [json.loads(line) for line in metadata_log.read_text().splitlines()]
+    assert [command[0] for command in commands] == ["begin"]
+    assert event_log.read_text().splitlines() == ["begin", "cargo"]
+
+
+def test_bench_script_saves_all_sidecars_without_linux_pinning(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Darwin\n")
+    _write_executable(
+        bin_dir / "cargo",
+        "#!/bin/sh\nprintf 'cargo\\n' >> \"$EVENT_LOG\"\n",
+    )
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
+    metadata_log = tmp_path / "metadata-log"
+    event_log = tmp_path / "event-log"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+            "BENCH": "all",
+            "SAVE": "candidate",
+            "METADATA_LOG": str(metadata_log),
+            "EVENT_LOG": str(event_log),
+            "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
+        }
+    )
+    environment.pop("CORE", None)
+
+    result = subprocess.run(
+        ["bash", "scripts/bench.sh"],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    commands = [json.loads(line) for line in metadata_log.read_text().splitlines()]
+    assert [command[0] for command in commands] == [
+        "begin",
+        "publish",
+        "begin",
+        "publish",
+    ]
+    assert event_log.read_text().splitlines() == [
+        "begin",
+        "cargo",
+        "publish",
+        "begin",
+        "cargo",
+        "publish",
+    ]
+    assert [command[command.index("--target") + 1] for command in commands] == [
+        "speedup",
+        "speedup",
+        "mean_latency",
+        "mean_latency",
+    ]
+    assert [
+        command[command.index("--core") + 1]
+        for command in commands
+        if command[0] == "publish"
+    ] == ["0", "0"]
+
+
+def _write_fake_metadata_helper(path: Path) -> None:
     _write_executable(
         path,
         """#!/usr/bin/env python3
@@ -280,14 +425,13 @@ from pathlib import Path
 import sys
 
 args = sys.argv[1:]
-with Path(os.environ["MANIFEST_LOG"]).open("a") as stream:
+with Path(os.environ["METADATA_LOG"]).open("a") as stream:
     stream.write(json.dumps(args) + "\\n")
-if args[0] in {"prepare-save", "hydrate"}:
-    transaction = Path(%r)
-    transaction.mkdir(parents=True, exist_ok=True)
-    print(transaction)
-"""
-        % str(transaction),
+with Path(os.environ["EVENT_LOG"]).open("a") as stream:
+    stream.write(args[0] + "\\n")
+if args[0] == "begin":
+    print("source-before")
+""",
     )
 
 

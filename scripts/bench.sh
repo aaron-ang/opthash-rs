@@ -45,10 +45,10 @@ LOAD=${LOAD:-}
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$REPO_ROOT"
 CRITERION_ROOT=${OPTHASH_CRITERION_ROOT:-$REPO_ROOT/target/criterion}
-if [[ -n ${OPTHASH_CRITERION_MANIFEST_HELPER:-} ]]; then
-	manifest_helper=("$OPTHASH_CRITERION_MANIFEST_HELPER")
+if [[ -n ${OPTHASH_BENCHMARK_METADATA_HELPER:-} ]]; then
+	metadata_helper=("$OPTHASH_BENCHMARK_METADATA_HELPER")
 else
-	manifest_helper=(python3 "$REPO_ROOT/scripts/criterion_manifest.py")
+	metadata_helper=(python3 "$REPO_ROOT/scripts/benchmark_metadata.py")
 fi
 # Each per-core lock is a readable directory under this root. The default /tmp
 # sticky directory lets sudo and non-sudo invocations open the same inode
@@ -137,6 +137,7 @@ if ((IS_LINUX)); then
 	fi
 	claim_core_lock
 fi
+core=${CORE:-0}
 
 # sudo strips PATH/HOME; recover invoker's rustup so the shim resolves their
 # default toolchain.
@@ -237,52 +238,19 @@ echo "info: forwarding args: ${forward_args[*]}" >&2
 
 for target in "${bench_targets[@]}"; do
 	cargo_feature_args=()
-	transaction=
-	manifest_mode=
+	source_before=
 	if [[ "$target" == "speedup" || "$target" == "mean_latency" ]]; then
 		if [[ -n "$metadata_save" ]]; then
-			manifest_args=(prepare-save --root "$CRITERION_ROOT" --source-root "$REPO_ROOT"
-				--target "$target" --baseline "$metadata_save" --requested-bench "$BENCH")
-			if [[ -n ${CORE:-} ]]; then
-				manifest_args+=(--core "$CORE")
-			fi
-			for arg in "${criterion_args[@]}"; do
-				manifest_args+=("--criterion-arg=$arg")
-			done
-			for arg in "${forward_args[@]}"; do
-				manifest_args+=("--forwarded-arg=$arg")
-			done
-			transaction=$("${launcher[@]}" "${manifest_helper[@]}" "${manifest_args[@]}")
-			manifest_mode=save
-		elif [[ -n "$metadata_load" ]]; then
-			manifest_args=(hydrate --root "$CRITERION_ROOT" --target "$target"
-				--baseline "$metadata_load" --compare "$metadata_compare"
-				--strict-measured --source-root "$REPO_ROOT")
-			if [[ -n ${CORE:-} ]]; then
-				manifest_args+=(--core "$CORE")
-			fi
-			for arg in "${criterion_args[@]}"; do
-				manifest_args+=("--criterion-arg=$arg")
-			done
-			for arg in "${forward_args[@]}"; do
-				manifest_args+=("--forwarded-arg=$arg")
-			done
-			transaction=$("${launcher[@]}" "${manifest_helper[@]}" "${manifest_args[@]}")
-			manifest_mode=hydrate
+			begin_args=(begin --root "$CRITERION_ROOT" --source-root "$REPO_ROOT"
+				--target "$target" --baseline "$metadata_save")
+			source_before=$("${launcher[@]}" "${metadata_helper[@]}" "${begin_args[@]}")
 		elif [[ -n "$metadata_compare" ]]; then
-			manifest_args=(hydrate --root "$CRITERION_ROOT" --target "$target"
-				--baseline "$metadata_compare" --strict-measured --source-root "$REPO_ROOT")
-			if [[ -n ${CORE:-} ]]; then
-				manifest_args+=(--core "$CORE")
+			verify_args=(verify --root "$CRITERION_ROOT" --target "$target"
+				--baseline "${metadata_load:-$metadata_compare}")
+			if [[ -n "$metadata_load" ]]; then
+				verify_args+=(--compare "$metadata_compare")
 			fi
-			for arg in "${criterion_args[@]}"; do
-				manifest_args+=("--criterion-arg=$arg")
-			done
-			for arg in "${forward_args[@]}"; do
-				manifest_args+=("--forwarded-arg=$arg")
-			done
-			transaction=$("${launcher[@]}" "${manifest_helper[@]}" "${manifest_args[@]}")
-			manifest_mode=hydrate
+			"${launcher[@]}" "${metadata_helper[@]}" "${verify_args[@]}"
 		fi
 	fi
 
@@ -291,23 +259,21 @@ for target in "${bench_targets[@]}"; do
 		"OPTHASH_BENCH_LOAD_BASELINE=$metadata_load"
 		"OPTHASH_BENCH_COMPARE_BASELINE=$metadata_compare"
 	)
-	if [[ -n "$transaction" ]]; then
-		env_args+=("CRITERION_HOME=$transaction")
-	fi
 	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" env "${env_args[@]}"
 		cargo bench "${cargo_feature_args[@]}" --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
 	if "${launcher[@]}" "${cmd[@]}"; then
 		:
 	else
 		status=$?
-		if [[ "$manifest_mode" == "hydrate" ]]; then
-			"${launcher[@]}" "${manifest_helper[@]}" discard --root "$CRITERION_ROOT" --transaction "$transaction" || true
-		fi
 		exit "$status"
 	fi
-	if [[ "$manifest_mode" == "save" ]]; then
-		"${launcher[@]}" "${manifest_helper[@]}" publish-save --root "$CRITERION_ROOT" --transaction "$transaction" >/dev/null
-	elif [[ "$manifest_mode" == "hydrate" ]]; then
-		"${launcher[@]}" "${manifest_helper[@]}" discard --root "$CRITERION_ROOT" --transaction "$transaction"
+	if [[ -n "$source_before" ]]; then
+		publish_args=(publish --root "$CRITERION_ROOT" --source-root "$REPO_ROOT"
+			--target "$target" --baseline "$metadata_save" --source-before "$source_before"
+			--requested-bench "$BENCH" --core "$core")
+		for arg in "${forward_args[@]}"; do
+			publish_args+=(--forwarded-arg "$arg")
+		done
+		"${launcher[@]}" "${metadata_helper[@]}" "${publish_args[@]}"
 	fi
 done
