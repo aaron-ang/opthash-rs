@@ -13,12 +13,17 @@ def test_bench_script_runs_cargo_from_the_repository_root(tmp_path: Path) -> Non
     captured_cwd = tmp_path / "cargo-cwd"
     _write_executable(bin_dir / "uname", "#!/bin/sh\necho Darwin\n")
     _write_executable(bin_dir / "cargo", '#!/bin/sh\npwd > "$CAPTURE_CWD"\n')
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
     environment = os.environ.copy()
     environment.update(
         {
             "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
             "BENCH": "scaled_insert",
             "CAPTURE_CWD": str(captured_cwd),
+            "METADATA_LOG": str(tmp_path / "metadata-log"),
+            "EVENT_LOG": str(tmp_path / "event-log"),
+            "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
         }
     )
 
@@ -35,7 +40,7 @@ def test_bench_script_runs_cargo_from_the_repository_root(tmp_path: Path) -> Non
     assert Path(captured_cwd.read_text().strip()) == REPO_ROOT
 
 
-def test_bench_script_passes_named_metadata_to_unmanifested_targets(
+def test_bench_script_routes_explicit_targets_through_metadata_sidecars(
     tmp_path: Path,
 ) -> None:
     bin_dir = tmp_path / "bin"
@@ -45,63 +50,109 @@ def test_bench_script_passes_named_metadata_to_unmanifested_targets(
     _write_executable(bin_dir / "uname", "#!/bin/sh\necho Darwin\n")
     _write_executable(
         bin_dir / "cargo",
-        '#!/bin/sh\nenv > "$CAPTURE_ENV"\nprintf \'%s\\n\' "$@" > "$CAPTURE_ARGS"\n',
+        """#!/bin/sh
+env > "$CAPTURE_ENV"
+printf '%s\n' "$@" > "$CAPTURE_ARGS"
+printf 'cargo\n' >> "$EVENT_LOG"
+""",
     )
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
 
     cases = [
-        ({}, ("ref", "", ""), ["--save-baseline", "ref"]),
-        ({"SAVE": "opt1"}, ("opt1", "", ""), ["--save-baseline", "opt1"]),
-        ({"BASELINE": "anchor"}, ("", "", "anchor"), ["--baseline", "anchor"]),
         (
-            {"LOAD": "opt1", "BASELINE": "anchor"},
-            ("", "opt1", "anchor"),
-            ["--load-baseline", "opt1", "--baseline", "anchor"],
+            {"SAVE": "candidate"},
+            ("candidate", "", ""),
+            ["--save-baseline", "candidate"],
+            ["begin", "publish"],
+        ),
+        (
+            {"BASELINE": "anchor"},
+            ("", "", "anchor"),
+            ["--baseline", "anchor"],
+            ["verify"],
+        ),
+        (
+            {"LOAD": "candidate", "BASELINE": "anchor"},
+            ("", "candidate", "anchor"),
+            ["--load-baseline", "candidate", "--baseline", "anchor"],
+            ["verify"],
         ),
     ]
-    for overrides, expected_metadata, expected_criterion_args in cases:
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
-                "BENCH": "scaled_insert",
-                "CAPTURE_ENV": str(capture_env),
-                "CAPTURE_ARGS": str(capture_args),
-                "OPTHASH_BENCH_SAVE_BASELINE": "stale-save",
-                "OPTHASH_BENCH_LOAD_BASELINE": "stale-load",
-                "OPTHASH_BENCH_COMPARE_BASELINE": "stale-compare",
-            }
-        )
-        for name in ("SAVE", "LOAD", "BASELINE"):
-            environment.pop(name, None)
-        environment.update(overrides)
+    for target in ("scaled_insert", "map_api"):
+        for case_index, (
+            overrides,
+            expected_metadata,
+            expected_criterion_args,
+            expected_commands,
+        ) in enumerate(cases):
+            metadata_log = tmp_path / f"metadata-{target}-{case_index}"
+            event_log = tmp_path / f"events-{target}-{case_index}"
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+                    "BENCH": target,
+                    "CAPTURE_ENV": str(capture_env),
+                    "CAPTURE_ARGS": str(capture_args),
+                    "METADATA_LOG": str(metadata_log),
+                    "EVENT_LOG": str(event_log),
+                    "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
+                    "OPTHASH_BENCH_SAVE_BASELINE": "stale-save",
+                    "OPTHASH_BENCH_LOAD_BASELINE": "stale-load",
+                    "OPTHASH_BENCH_COMPARE_BASELINE": "stale-compare",
+                }
+            )
+            for name in ("SAVE", "LOAD", "BASELINE"):
+                environment.pop(name, None)
+            environment.update(overrides)
 
-        subprocess.run(
-            ["bash", "scripts/bench.sh"],
-            cwd=REPO_ROOT,
-            env=environment,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+            subprocess.run(
+                ["bash", "scripts/bench.sh"],
+                cwd=REPO_ROOT,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
-        captured = dict(
-            line.split("=", 1)
-            for line in capture_env.read_text(encoding="utf-8").splitlines()
-            if "=" in line
-        )
-        assert (
-            captured["OPTHASH_BENCH_SAVE_BASELINE"],
-            captured["OPTHASH_BENCH_LOAD_BASELINE"],
-            captured["OPTHASH_BENCH_COMPARE_BASELINE"],
-        ) == expected_metadata
-        arguments = capture_args.read_text(encoding="utf-8").splitlines()
-        assert arguments[:4] == [
-            "bench",
-            "--bench",
-            "scaled_insert",
-            "--",
-        ]
-        assert arguments[4:] == expected_criterion_args
+            captured = dict(
+                line.split("=", 1)
+                for line in capture_env.read_text(encoding="utf-8").splitlines()
+                if "=" in line
+            )
+            assert (
+                captured["OPTHASH_BENCH_SAVE_BASELINE"],
+                captured["OPTHASH_BENCH_LOAD_BASELINE"],
+                captured["OPTHASH_BENCH_COMPARE_BASELINE"],
+            ) == expected_metadata
+            arguments = capture_args.read_text(encoding="utf-8").splitlines()
+            assert arguments[:4] == ["bench", "--bench", target, "--"]
+            assert arguments[4:] == expected_criterion_args
+
+            commands = [
+                json.loads(line) for line in metadata_log.read_text().splitlines()
+            ]
+            assert [command[0] for command in commands] == expected_commands
+            assert event_log.read_text().splitlines() == [
+                *expected_commands[:1],
+                "cargo",
+                *expected_commands[1:],
+            ]
+            assert all(
+                command[command.index("--target") + 1] == target for command in commands
+            )
+            first = commands[0]
+            if first[0] == "begin":
+                assert first[first.index("--baseline") + 1] == "candidate"
+                publish = commands[1]
+                assert publish[publish.index("--requested-bench") + 1] == target
+            elif "LOAD" in overrides:
+                assert first[first.index("--baseline") + 1] == "candidate"
+                assert first[first.index("--compare") + 1] == "anchor"
+            else:
+                assert first[first.index("--baseline") + 1] == "anchor"
+                assert "--compare" not in first
 
 
 def test_bench_script_can_lock_a_read_only_shared_core_directory(
@@ -262,6 +313,56 @@ def test_bench_script_scrubs_stale_criterion_home_only_from_cargo(
     assert "env -u CRITERION_HOME" not in launches[2]
 
 
+def test_explicit_criterion_root_routes_cargo_and_metadata_together(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Darwin\n")
+    _write_executable(bin_dir / "cargo", '#!/bin/sh\nenv > "$CAPTURE_ENV"\n')
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
+    criterion_root = tmp_path / "isolated-criterion"
+    metadata_log = tmp_path / "metadata-log"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+            "BENCH": "scaled_insert",
+            "SAVE": "candidate",
+            "CRITERION_HOME": str(tmp_path / "stale-criterion-home"),
+            "OPTHASH_CRITERION_ROOT": str(criterion_root),
+            "CAPTURE_ENV": str(tmp_path / "cargo-environment"),
+            "METADATA_LOG": str(metadata_log),
+            "EVENT_LOG": str(tmp_path / "event-log"),
+            "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "scripts/bench.sh"],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    cargo_environment = dict(
+        line.split("=", 1)
+        for line in (tmp_path / "cargo-environment").read_text().splitlines()
+        if "=" in line
+    )
+    assert cargo_environment["CRITERION_HOME"] == str(criterion_root)
+    commands = [json.loads(line) for line in metadata_log.read_text().splitlines()]
+    assert [command[0] for command in commands] == ["begin", "publish"]
+    assert all(
+        command[command.index("--root") + 1] == str(criterion_root)
+        for command in commands
+    )
+
+
 def test_bench_script_routes_named_speedup_modes_through_metadata_sidecars(
     tmp_path: Path,
 ) -> None:
@@ -385,35 +486,37 @@ def test_bench_script_does_not_publish_metadata_when_cargo_fails(
     )
     helper = tmp_path / "metadata-helper"
     _write_fake_metadata_helper(helper)
-    metadata_log = tmp_path / "metadata-log"
-    event_log = tmp_path / "event-log"
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
-            "CORE": "5",
-            "LOCK_DIR": str(tmp_path / "locks"),
-            "BENCH": "speedup",
-            "SAVE": "candidate",
-            "METADATA_LOG": str(metadata_log),
-            "EVENT_LOG": str(event_log),
-            "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
-        }
-    )
+    for target in ("speedup", "scaled_insert", "map_api"):
+        metadata_log = tmp_path / f"metadata-{target}"
+        event_log = tmp_path / f"events-{target}"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+                "CORE": "5",
+                "LOCK_DIR": str(tmp_path / "locks"),
+                "BENCH": target,
+                "SAVE": "candidate",
+                "METADATA_LOG": str(metadata_log),
+                "EVENT_LOG": str(event_log),
+                "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
+            }
+        )
 
-    result = subprocess.run(
-        ["bash", "scripts/bench.sh"],
-        cwd=REPO_ROOT,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+        result = subprocess.run(
+            ["bash", "scripts/bench.sh"],
+            cwd=REPO_ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
-    assert result.returncode == 23
-    commands = [json.loads(line) for line in metadata_log.read_text().splitlines()]
-    assert [command[0] for command in commands] == ["begin"]
-    assert event_log.read_text().splitlines() == ["begin", "cargo"]
+        assert result.returncode == 23
+        commands = [json.loads(line) for line in metadata_log.read_text().splitlines()]
+        assert [command[0] for command in commands] == ["begin"]
+        assert commands[0][commands[0].index("--target") + 1] == target
+        assert event_log.read_text().splitlines() == ["begin", "cargo"]
 
 
 def test_bench_script_saves_all_sidecars_without_linux_pinning(tmp_path: Path) -> None:

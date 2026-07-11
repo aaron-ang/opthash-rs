@@ -11,6 +11,7 @@ from _plot_common import (
     apply_axis_style,
     load_criterion_mean_ns,
     provenance_text,
+    require_registrations,
     save_svg,
     verify_criterion_baseline,
 )
@@ -29,7 +30,13 @@ THROUGHPUT_WORKLOADS = (
 
 def plot_throughput_speedup(assets_dir: Path, *, baseline: str):
     """Single bar chart: all throughput workloads, speedup vs std."""
-    manifest = verify_criterion_baseline("speedup", baseline)
+    metadata = verify_criterion_baseline("speedup", baseline)
+    required = [
+        f"{workload}/{workload}_{implementation}"
+        for workload, _label in THROUGHPUT_WORKLOADS
+        for implementation in IMPLEMENTATIONS
+    ]
+    require_registrations(metadata, required)
     labels = []
     elastic_speedups = []
     funnel_speedups = []
@@ -85,7 +92,7 @@ def plot_throughput_speedup(assets_dir: Path, *, baseline: str):
         title="Throughput Speedup over std::HashMap",
         subtitle=(
             "Criterion throughput — std::HashMap is 1.0× · "
-            f"Selected baseline: {baseline}\n{provenance_text(manifest)}"
+            f"Selected baseline: {baseline}\n{provenance_text(metadata)}"
         ),
         xlabel="Workload",
         ylabel="Speedup (higher is better)",

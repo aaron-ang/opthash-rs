@@ -14,6 +14,7 @@ from _plot_common import (
     apply_axis_style,
     load_criterion_mean_ns,
     provenance_text,
+    require_registrations,
     save_svg,
     verify_criterion_baseline,
 )
@@ -48,15 +49,23 @@ def _errorbar(ax, x, estimates: list[CriterionEstimate], implementation: str):
 
 def plot_mean_latency_by_size(assets_dir: Path, *, baseline: str):
     """Plot randomized absolute latency and its ratio to sequential control."""
-    manifest = verify_criterion_baseline("mean_latency", baseline)
+    metadata = verify_criterion_baseline("mean_latency", baseline)
+    trace_prefixes = (
+        ("randomized", "get_hit_latency"),
+        ("sequential", "get_hit_sequential_latency"),
+    )
+    required = [
+        f"{prefix}_{size_label}/{prefix}_{size_label}_{implementation}"
+        for _trace, prefix in trace_prefixes
+        for size_label in LATENCY_SIZES
+        for implementation in IMPLEMENTATIONS
+    ]
+    require_registrations(metadata, required)
     traces: dict[str, dict[str, list[CriterionEstimate]]] = {
         trace: {implementation: [] for implementation in IMPLEMENTATIONS}
         for trace in ("randomized", "sequential")
     }
-    for trace, prefix in (
-        ("randomized", "get_hit_latency"),
-        ("sequential", "get_hit_sequential_latency"),
-    ):
+    for trace, prefix in trace_prefixes:
         for size_label in LATENCY_SIZES:
             group = f"{prefix}_{size_label}"
             for implementation in IMPLEMENTATIONS:
@@ -97,7 +106,7 @@ def plot_mean_latency_by_size(assets_dir: Path, *, baseline: str):
             "Seed 0xD1B54A32D192ED03 · "
             f"Selected baseline: {baseline} · 95% CI · "
             "lower is better for absolute latency\n"
-            f"{provenance_text(manifest)}"
+            f"{provenance_text(metadata)}"
         ),
         xlabel="",
         ylabel="Mean latency (ns/lookup)",

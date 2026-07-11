@@ -26,6 +26,8 @@
 #                    re-measuring. Use with BASELINE=other to compare two
 #                    stored baselines without rerunning. Implies a comparison
 #                    against BASELINE (defaults to ref).
+#   OPTHASH_CRITERION_ROOT=
+#                    overrides Criterion's output and metadata root together.
 #
 # Common workflows:
 #   scripts/bench.sh                      # save baseline "ref"
@@ -45,6 +47,10 @@ LOAD=${LOAD:-}
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$REPO_ROOT"
 CRITERION_ROOT=${OPTHASH_CRITERION_ROOT:-$REPO_ROOT/target/criterion}
+criterion_env_args=(-u CRITERION_HOME)
+if [[ -n ${OPTHASH_CRITERION_ROOT:-} ]]; then
+	criterion_env_args=("CRITERION_HOME=$CRITERION_ROOT")
+fi
 if [[ -n ${OPTHASH_BENCHMARK_METADATA_HELPER:-} ]]; then
 	metadata_helper=("$OPTHASH_BENCHMARK_METADATA_HELPER")
 else
@@ -239,19 +245,17 @@ echo "info: forwarding args: ${forward_args[*]}" >&2
 for target in "${bench_targets[@]}"; do
 	cargo_feature_args=()
 	source_before=
-	if [[ "$target" == "speedup" || "$target" == "mean_latency" ]]; then
-		if [[ -n "$metadata_save" ]]; then
-			begin_args=(begin --root "$CRITERION_ROOT" --source-root "$REPO_ROOT"
-				--target "$target" --baseline "$metadata_save")
-			source_before=$("${launcher[@]}" "${metadata_helper[@]}" "${begin_args[@]}")
-		elif [[ -n "$metadata_compare" ]]; then
-			verify_args=(verify --root "$CRITERION_ROOT" --target "$target"
-				--baseline "${metadata_load:-$metadata_compare}")
-			if [[ -n "$metadata_load" ]]; then
-				verify_args+=(--compare "$metadata_compare")
-			fi
-			"${launcher[@]}" "${metadata_helper[@]}" "${verify_args[@]}"
+	if [[ -n "$metadata_save" ]]; then
+		begin_args=(begin --root "$CRITERION_ROOT" --source-root "$REPO_ROOT"
+			--target "$target" --baseline "$metadata_save")
+		source_before=$("${launcher[@]}" "${metadata_helper[@]}" "${begin_args[@]}")
+	elif [[ -n "$metadata_compare" ]]; then
+		verify_args=(verify --root "$CRITERION_ROOT" --target "$target"
+			--baseline "${metadata_load:-$metadata_compare}")
+		if [[ -n "$metadata_load" ]]; then
+			verify_args+=(--compare "$metadata_compare")
 		fi
+		"${launcher[@]}" "${metadata_helper[@]}" "${verify_args[@]}"
 	fi
 
 	env_args=(
@@ -259,7 +263,7 @@ for target in "${bench_targets[@]}"; do
 		"OPTHASH_BENCH_LOAD_BASELINE=$metadata_load"
 		"OPTHASH_BENCH_COMPARE_BASELINE=$metadata_compare"
 	)
-	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" env -u CRITERION_HOME "${env_args[@]}"
+	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" env "${criterion_env_args[@]}" "${env_args[@]}"
 		cargo bench "${cargo_feature_args[@]}" --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
 	if "${launcher[@]}" "${cmd[@]}"; then
 		:

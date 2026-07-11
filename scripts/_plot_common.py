@@ -4,6 +4,7 @@ import io
 import json
 import math
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,10 +12,7 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
-try:
-    from criterion_manifest import require_complete_target, verify_manifest
-except ModuleNotFoundError:  # Imported as `scripts._plot_common`.
-    from scripts.criterion_manifest import require_complete_target, verify_manifest
+from scripts import benchmark_metadata
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,17 +50,21 @@ class CriterionEstimate:
 
 
 def verify_criterion_baseline(target: str, baseline: str) -> dict:
-    """Verify and return the content-bound manifest for a chart baseline."""
-    manifest = verify_manifest(CRITERION_DIR, target, baseline)
-    require_complete_target(manifest, target)
-    return manifest
+    """Verify and return clean metadata for a chart baseline."""
+    return benchmark_metadata.verify(
+        CRITERION_DIR, target, baseline, require_clean=True
+    )[0]
 
 
-def provenance_text(manifest: dict) -> str:
+def require_registrations(metadata: dict, required: Iterable[str]) -> None:
+    missing = sorted(set(required) - set(metadata["registrations"]))
+    if missing:
+        raise RuntimeError(f"missing Criterion registrations: {missing}")
+
+
+def provenance_text(metadata: dict) -> str:
     """Compact provenance label embedded in generated assets."""
-    kind = manifest["provenance"]["kind"]
-    source = manifest["source"]["sha256"][:12]
-    return f"Provenance: {kind} · Source: {source}"
+    return f"Source: {metadata['source']['after'][:12]} · measured"
 
 
 def load_criterion_mean_ns(

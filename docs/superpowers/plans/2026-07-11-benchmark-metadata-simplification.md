@@ -525,9 +525,10 @@ git commit -m "bench: reject incompatible named baselines"
 
 - [ ] **Step 1: Replace transaction expectations with sidecar expectations in tests**
 
-The fake helper must log `begin`, `verify`, and `publish`. Assert that
-Cargo never receives `CRITERION_HOME`, that `publish` follows a successful
-Cargo invocation, and that failed Cargo has no `publish` call.
+The fake helper must log `begin`, `verify`, and `publish`. Assert that Cargo
+does not inherit `CRITERION_HOME`, an explicit `OPTHASH_CRITERION_ROOT` routes
+Cargo and metadata together, `publish` follows a successful Cargo invocation,
+and failed Cargo has no `publish` call.
 
 ```python
 assert [command[0] for command in commands] == ["begin", "publish"]
@@ -575,10 +576,12 @@ done
 
 This `begin` call makes a failed or interrupted overwrite unusable and prevents
 a filtered rerun from inheriting stale registration directories. Remove
-`transaction`, `manifest_mode`, `CRITERION_HOME`, hydration, and discard
-branches. Rename the test override to `OPTHASH_BENCHMARK_METADATA_HELPER` and
-remove `OPTHASH_CRITERION_MANIFEST_HELPER`. Keep the launcher around metadata
-commands so user/core identity is consistent under sudo.
+`transaction`, `manifest_mode`, hydration, and discard branches. Scrub an
+inherited `CRITERION_HOME`, while mapping an explicit
+`OPTHASH_CRITERION_ROOT` to Criterion's `CRITERION_HOME`. Rename the test
+override to `OPTHASH_BENCHMARK_METADATA_HELPER` and remove
+`OPTHASH_CRITERION_MANIFEST_HELPER`. Keep the launcher around metadata commands
+so user/core identity is consistent under sudo.
 
 - [ ] **Step 4: Run shell runner tests**
 
@@ -596,9 +599,11 @@ git commit -m "bench: use metadata sidecars directly"
 ### Task 5: Switch charts and remove the old manifest subsystem
 
 **Files:**
+- Modify: `scripts/bench.sh`
 - Modify: `scripts/_plot_common.py`
 - Modify: `scripts/generate_speedup_chart.py`
 - Modify: `scripts/generate_latency_chart.py`
+- Modify: `tests/test_bench_run_metadata.py`
 - Modify: `tests/test_plot_common.py`
 - Delete: `scripts/criterion_manifest.py`
 - Delete: `tests/test_criterion_manifest.py`
@@ -609,6 +614,8 @@ git commit -m "bench: use metadata sidecars directly"
 - Each chart constructs required registration IDs from its existing workload,
   size, and implementation constants; the metadata schema does not duplicate
   benchmark registrations.
+- Every explicit Criterion target uses compact sidecars; `BENCH=all` remains
+  limited to `speedup` and `mean_latency`.
 
 - [ ] **Step 1: Update plot tests to expect compact metadata**
 
@@ -663,6 +670,10 @@ constructs both trace prefixes over every existing
 `LATENCY_SIZES`/`IMPLEMENTATIONS` pair. Both call `require_registrations`
 before loading estimates or replacing an asset.
 
+Remove the runner's `speedup`/`mean_latency` metadata gate so explicit targets
+such as `scaled_insert` and `map_api` also use `begin`, `publish`, and `verify`.
+Keep the `BENCH=all` target list unchanged.
+
 Delete the old helper and its test file only after all imports are gone.
 
 - [ ] **Step 4: Run the focused and full Python suites**
@@ -677,11 +688,13 @@ Expected: full Python suite passes with fewer manifest-specific tests.
 
 - [ ] **Step 5: Smoke named workflows**
 
-Run: `SCALED_INSERT_SIZES=1000 SAVE=metadata-smoke BENCH=scaled_insert scripts/bench.sh -- insert_scale_1K`
+Run: `SMOKE_ROOT=$(mktemp -d /tmp/opthash-metadata-smoke.XXXXXX)`
+
+Run: `OPTHASH_CRITERION_ROOT="$SMOKE_ROOT" SCALED_INSERT_SIZES=1000 SAVE=metadata-smoke BENCH=scaled_insert scripts/bench.sh -- insert_scale_1K`
 
 Expected: Criterion baseline and one atomic sidecar exist; no transaction directory exists.
 
-Run: `LOAD=metadata-smoke BASELINE=metadata-smoke BENCH=scaled_insert scripts/bench.sh -- insert_scale_1K`
+Run: `OPTHASH_CRITERION_ROOT="$SMOKE_ROOT" LOAD=metadata-smoke BASELINE=metadata-smoke BENCH=scaled_insert scripts/bench.sh -- insert_scale_1K`
 
 Expected: metadata compatibility succeeds and Criterion loads stored results.
 

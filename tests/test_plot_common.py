@@ -12,23 +12,32 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import _plot_common  # noqa: E402
-import criterion_manifest  # noqa: E402
 import generate_latency_chart  # noqa: E402
 import generate_speedup_chart  # noqa: E402
+from scripts import benchmark_metadata  # noqa: E402
 
 
-def _verified_manifest() -> dict[str, object]:
+def _speedup_registrations() -> list[str]:
+    return [
+        f"{workload}/{workload}_{implementation}"
+        for workload, _label in generate_speedup_chart.THROUGHPUT_WORKLOADS
+        for implementation in _plot_common.IMPLEMENTATIONS
+    ]
+
+
+def _latency_registrations() -> list[str]:
+    return [
+        f"{prefix}_{size}/{prefix}_{size}_{implementation}"
+        for prefix in ("get_hit_latency", "get_hit_sequential_latency")
+        for size in _plot_common.LATENCY_SIZES
+        for implementation in _plot_common.IMPLEMENTATIONS
+    ]
+
+
+def _verified_metadata(registrations: list[str]) -> dict[str, object]:
     return {
-        "provenance": {"kind": "measured"},
-        "source": {"sha256": "1" * 64},
-        "criterion": {
-            "registrations": [
-                {"full_id": full_id}
-                for full_id in criterion_manifest.expected_registration_ids(
-                    "mean_latency"
-                )
-            ]
-        },
+        "source": {"after": "1" * 64, "dirty": False},
+        "registrations": registrations,
     }
 
 
@@ -177,6 +186,86 @@ def test_ratio_estimate_uses_conservative_propagated_interval() -> None:
     assert ratio.upper_bound == 2.8
 
 
+def test_chart_verification_requires_clean_complete_metadata(monkeypatch) -> None:
+    expected = ["get_hit/get_hit_elastic"]
+    calls = []
+
+    def verify(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [_verified_metadata(expected)]
+
+    monkeypatch.setattr(benchmark_metadata, "verify", verify)
+
+    metadata = _plot_common.verify_criterion_baseline("speedup", "anchor")
+    _plot_common.require_registrations(metadata, expected)
+
+    assert calls == [
+        ((_plot_common.CRITERION_DIR, "speedup", "anchor"), {"require_clean": True})
+    ]
+
+
+def test_chart_verification_rejects_one_missing_registration() -> None:
+    expected = ["get_hit/get_hit_elastic", "get_hit/get_hit_funnel"]
+
+    with pytest.raises(RuntimeError, match="missing Criterion registrations"):
+        _plot_common.require_registrations(_verified_metadata(expected[:-1]), expected)
+
+
+@pytest.mark.parametrize(
+    "module,function_name,output_name,registrations",
+    [
+        (
+            generate_speedup_chart,
+            "plot_throughput_speedup",
+            "benchmark-speedup.svg",
+            _speedup_registrations(),
+        ),
+        (
+            generate_latency_chart,
+            "plot_mean_latency_by_size",
+            "benchmark-latency.svg",
+            _latency_registrations(),
+        ),
+    ],
+)
+def test_charts_require_every_registered_cell_before_loading_estimates(
+    tmp_path: Path,
+    monkeypatch,
+    module,
+    function_name: str,
+    output_name: str,
+    registrations: list[str],
+) -> None:
+    output = tmp_path / output_name
+    output.write_text("previous chart")
+    required_calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        module,
+        "verify_criterion_baseline",
+        lambda *_args, **_kwargs: _verified_metadata(registrations[:-1]),
+    )
+
+    def require(metadata: dict, required) -> None:
+        required_calls.append(list(required))
+        _plot_common.require_registrations(metadata, required)
+
+    monkeypatch.setattr(module, "require_registrations", require)
+    monkeypatch.setattr(
+        module,
+        "load_criterion_mean_ns",
+        lambda *_args, **_kwargs: pytest.fail(
+            "loaded estimates before registration check"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="missing Criterion registrations"):
+        getattr(module, function_name)(tmp_path, baseline="ref")
+
+    assert required_calls == [registrations]
+    assert output.read_text() == "previous chart"
+
+
 @pytest.mark.parametrize(
     "module,function_name,output_name",
     [
@@ -205,7 +294,11 @@ def test_named_baseline_chart_generation_fails_closed_when_an_artifact_is_missin
     monkeypatch.setattr(
         module,
         "verify_criterion_baseline",
-        lambda *_args, **_kwargs: _verified_manifest(),
+        lambda *_args, **_kwargs: _verified_metadata(
+            _speedup_registrations()
+            if module is generate_speedup_chart
+            else _latency_registrations()
+        ),
     )
 
     with pytest.raises(FileNotFoundError, match="named-baseline"):
@@ -231,7 +324,7 @@ def test_latency_chart_loads_all_40_cells_before_writing_output(
     monkeypatch.setattr(
         generate_latency_chart,
         "verify_criterion_baseline",
-        lambda *_args, **_kwargs: _verified_manifest(),
+        lambda *_args, **_kwargs: _verified_metadata(_latency_registrations()),
     )
 
     with pytest.raises(FileNotFoundError, match="final named-baseline"):
@@ -277,7 +370,7 @@ def test_latency_chart_is_two_panel_labeled_and_byte_deterministic(
     monkeypatch.setattr(
         generate_latency_chart,
         "verify_criterion_baseline",
-        lambda *_args, **_kwargs: _verified_manifest(),
+        lambda *_args, **_kwargs: _verified_metadata(_latency_registrations()),
     )
     output = tmp_path / "benchmark-latency.svg"
 
@@ -297,8 +390,7 @@ def test_latency_chart_is_two_panel_labeled_and_byte_deterministic(
         "Sequential locality control",
         "lower is better for absolute latency",
         "95% CI",
-        "Provenance: measured",
-        "Source: 111111111111",
+        "Source: 111111111111 · measured",
     ):
         assert label in svg
 
@@ -308,5 +400,5 @@ def test_chart_verifier_rejects_an_unbound_named_baseline(
 ) -> None:
     monkeypatch.setattr(_plot_common, "CRITERION_DIR", tmp_path)
 
-    with pytest.raises(Exception, match="manifest|JSON"):
+    with pytest.raises(Exception, match="metadata|JSON"):
         _plot_common.verify_criterion_baseline("mean_latency", "ref")
