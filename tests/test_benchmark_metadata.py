@@ -28,6 +28,23 @@ def make_source_tree(root: Path) -> Path:
     }
     for relative, contents in files.items():
         (root / relative).write_text(contents)
+    subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+        cwd=root,
+        check=True,
+    )
     return root
 
 
@@ -43,10 +60,16 @@ def make_criterion_registration(root: Path, registration: str, baseline: str) ->
     return root
 
 
-def write_metadata(root: Path, name: str, value: dict[str, object]) -> None:
-    path = benchmark_metadata.metadata_path(root, "speedup", name)
+def write_target_metadata(
+    root: Path, target: str, name: str, value: dict[str, object]
+) -> None:
+    path = benchmark_metadata.metadata_path(root, target, name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value))
+
+
+def write_metadata(root: Path, name: str, value: dict[str, object]) -> None:
+    write_target_metadata(root, "speedup", name, value)
 
 
 def fixture_cpu_identity(model: str) -> dict[str, object]:
@@ -108,6 +131,45 @@ def incompatible_value(field: str) -> object:
         "forwarded_args": ["get_miss"],
         "registrations": ["get_miss/get_miss_elastic"],
     }[field]
+
+
+def copy_metadata(value: dict[str, object]) -> dict[str, object]:
+    return json.loads(json.dumps(value))
+
+
+def other_target_metadata(value: dict[str, object]) -> dict[str, object]:
+    other = copy_metadata(value)
+    other["target"] = "mean_latency"
+    other["registrations"] = ["get_hit/get_hit_elastic"]
+    return other
+
+
+def malformed_other_target_metadata(
+    value: dict[str, object], malformed: str
+) -> dict[str, object]:
+    other = other_target_metadata(value)
+    if malformed == "boolean-schema":
+        other["schema"] = True
+    elif malformed == "partial":
+        other = {
+            "schema": 1,
+            "target": "mean_latency",
+            "registrations": ["get_hit/get_hit_elastic"],
+        }
+    else:
+        other["forwarded_args"] = {"filter": "get_hit"}
+    return other
+
+
+def metadata_pair_with_hidden_registration(
+    root: Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    anchor, candidate = compatible_metadata_pair(root)
+    for name, value in (("anchor", anchor), ("candidate", candidate)):
+        make_criterion_registration(root, "insert/insert_elastic", name)
+        value["registrations"] = ["insert/insert_elastic"]
+        write_metadata(root, name, value)
+    return anchor, candidate
 
 
 def test_metadata_path_is_target_and_baseline_scoped(tmp_path: Path) -> None:
@@ -202,6 +264,106 @@ def test_publish_records_measured_registrations_atomically(tmp_path: Path) -> No
     assert result["registrations"] == ["get_hit/get_hit_elastic"]
     assert result["source"]["before"] == result["source"]["after"]
     assert benchmark_metadata.metadata_path(criterion, "speedup", "anchor").exists()
+    assert benchmark_metadata.verify(criterion, "speedup", "anchor") == [result]
+
+
+@pytest.mark.parametrize(
+    ("failure", "field"),
+    [
+        ("git-commit", "source.commit"),
+        ("git-dirty", "source.dirty"),
+        ("rustc", "rustc_vv"),
+        ("cpu", "cpu_identity"),
+        ("timestamp", "measured_at_utc"),
+        ("os", "os"),
+    ],
+)
+def test_publish_rejects_invalid_identity_without_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    field: str,
+) -> None:
+    repo = make_source_tree(tmp_path / "repo")
+    criterion = make_criterion_baseline(tmp_path / "criterion", "anchor")
+    before = benchmark_metadata.source_fingerprint(repo)
+    original_command_output = benchmark_metadata.command_output
+
+    def command_output(argv: list[str], cwd: Path | None = None) -> str | None:
+        if failure == "git-commit" and argv == ["git", "rev-parse", "HEAD"]:
+            return None
+        if failure == "git-dirty" and argv == ["git", "status", "--porcelain"]:
+            return None
+        if failure == "rustc" and argv == ["rustc", "-Vv"]:
+            return None
+        return original_command_output(argv, cwd)
+
+    monkeypatch.setattr(benchmark_metadata, "command_output", command_output)
+    if failure == "cpu":
+        monkeypatch.setattr(benchmark_metadata, "cpu_identity", lambda: None)
+    elif failure == "timestamp":
+
+        class InvalidDateTime:
+            @classmethod
+            def now(cls, tz: object) -> object:
+                class InvalidTimestamp:
+                    @staticmethod
+                    def isoformat() -> str:
+                        return "not-a-timestamp"
+
+                return InvalidTimestamp()
+
+        monkeypatch.setattr(benchmark_metadata, "datetime", InvalidDateTime)
+    elif failure == "os":
+        monkeypatch.setattr(benchmark_metadata.platform, "platform", lambda: "")
+
+    with pytest.raises(benchmark_metadata.MetadataError, match=field):
+        benchmark_metadata.publish(
+            root=criterion,
+            source_root=repo,
+            target="speedup",
+            baseline="anchor",
+            source_before=before,
+            core=5,
+            requested_bench="speedup",
+            forwarded_args=[],
+        )
+
+    assert not benchmark_metadata.metadata_path(criterion, "speedup", "anchor").exists()
+
+
+def test_failed_publish_keeps_invalidated_baseline_without_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_source_tree(tmp_path / "repo")
+    criterion = make_criterion_baseline(tmp_path / "criterion", "anchor")
+    sidecar = benchmark_metadata.metadata_path(criterion, "speedup", "anchor")
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text("stale")
+    before = benchmark_metadata.begin(criterion, repo, "speedup", "anchor")
+    make_criterion_baseline(criterion, "anchor")
+    original_command_output = benchmark_metadata.command_output
+
+    def command_output(argv: list[str], cwd: Path | None = None) -> str | None:
+        if argv == ["git", "status", "--porcelain"]:
+            return None
+        return original_command_output(argv, cwd)
+
+    monkeypatch.setattr(benchmark_metadata, "command_output", command_output)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="source.dirty"):
+        benchmark_metadata.publish(
+            root=criterion,
+            source_root=repo,
+            target="speedup",
+            baseline="anchor",
+            source_before=before,
+            core=5,
+            requested_bench="speedup",
+            forwarded_args=[],
+        )
+
+    assert not sidecar.exists()
 
 
 def test_publish_rejects_source_change_without_sidecar(tmp_path: Path) -> None:
@@ -405,6 +567,44 @@ def test_begin_fails_closed_when_other_target_sidecar_disappears(
 
     assert missing_sidecar.is_symlink()
     assert (criterion / "get_hit/get_hit_elastic/anchor").exists()
+
+
+@pytest.mark.parametrize("malformed", ["boolean-schema", "partial", "bad-field-type"])
+def test_verify_rejects_malformed_other_target_before_it_hides_registration(
+    tmp_path: Path, malformed: str
+) -> None:
+    anchor, _ = metadata_pair_with_hidden_registration(tmp_path)
+    write_target_metadata(
+        tmp_path,
+        "mean_latency",
+        "anchor",
+        malformed_other_target_metadata(anchor, malformed),
+    )
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="ownership metadata"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+@pytest.mark.parametrize("malformed", ["boolean-schema", "partial", "bad-field-type"])
+def test_paired_verify_rejects_malformed_other_target_before_comparison(
+    tmp_path: Path, malformed: str
+) -> None:
+    anchor, candidate = metadata_pair_with_hidden_registration(tmp_path)
+    write_target_metadata(
+        tmp_path,
+        "mean_latency",
+        "anchor",
+        other_target_metadata(anchor),
+    )
+    write_target_metadata(
+        tmp_path,
+        "mean_latency",
+        "candidate",
+        malformed_other_target_metadata(candidate, malformed),
+    )
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="ownership metadata"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor", "candidate")
 
 
 @pytest.mark.parametrize(

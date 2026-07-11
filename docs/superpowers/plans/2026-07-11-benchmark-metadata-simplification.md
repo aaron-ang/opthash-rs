@@ -372,7 +372,11 @@ hex formats; booleans and integers reject Python's bool/int equivalence;
 argument and registration collections have exact element types; registrations
 are nonempty, sorted, and unique; CPU identity binds its canonical field hash;
 and the measurement timestamp is the UTC ISO format emitted by publication.
-Every named sidecar is validated independently before a pair is compared.
+Every named sidecar is validated independently before a pair is compared. The
+same validator applies to dynamically discovered other-target ownership
+sidecars before their registrations are trusted. Publication validates its
+fully constructed object before the atomic sidecar write, so unavailable or
+invalid identity data leaves an invalidated baseline without metadata.
 
 - [ ] **Step 1: Write compatibility tests**
 

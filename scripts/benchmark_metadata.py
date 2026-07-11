@@ -124,15 +124,6 @@ def methodology_fingerprint(source_root: Path, target: str) -> str:
     return hash_paths(source_root, paths)
 
 
-def _registration_name(value: object, sidecar: Path) -> str:
-    if not isinstance(value, str):
-        raise MetadataError(f"invalid ownership metadata in {sidecar}")
-    parts = value.split("/")
-    if len(parts) != 2 or any(part in {"", ".", ".."} for part in parts):
-        raise MetadataError(f"invalid ownership metadata in {sidecar}")
-    return value
-
-
 def other_target_registrations(root: Path, target: str, baseline: str) -> set[str]:
     current_sidecar = metadata_path(root, target, baseline)
     metadata_root = current_sidecar.parent.parent
@@ -147,18 +138,15 @@ def other_target_registrations(root: Path, target: str, baseline: str) -> set[st
                 f"cannot read ownership metadata from {sidecar}"
             ) from error
         sidecar_target = sidecar.parent.name
-        if (
-            not isinstance(value, dict)
-            or value.get("schema") != SCHEMA_VERSION
-            or value.get("target") != sidecar_target
-            or not isinstance(value.get("registrations"), list)
-            or not value["registrations"]
-        ):
+        try:
+            _validate_metadata(value, str(sidecar))
+        except MetadataError as error:
+            raise MetadataError(
+                f"invalid ownership metadata in {sidecar}: {error}"
+            ) from error
+        if value["target"] != sidecar_target:
             raise MetadataError(f"invalid ownership metadata in {sidecar}")
-        registrations.update(
-            _registration_name(registration, sidecar)
-            for registration in value["registrations"]
-        )
+        registrations.update(value["registrations"])
     return registrations
 
 
@@ -219,7 +207,9 @@ def _invalid_metadata(name: str, field: str) -> None:
     raise MetadataError(f"invalid benchmark metadata for {name!r}: {field}")
 
 
-def _validate_metadata(value: dict[str, object], name: str) -> None:
+def _validate_metadata(value: object, name: str) -> None:
+    if not isinstance(value, dict):
+        _invalid_metadata(name, "fields")
     if set(value) != METADATA_FIELDS:
         _invalid_metadata(name, "fields")
     schema = value["schema"]
@@ -431,6 +421,7 @@ def publish(
         "rustc_vv": command_output(["rustc", "-Vv"]),
         "measured_at_utc": datetime.now(timezone.utc).isoformat(),
     }
+    _validate_metadata(value, baseline)
     write_json_atomic(sidecar, value)
     return value
 
