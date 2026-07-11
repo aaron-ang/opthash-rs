@@ -363,6 +363,7 @@ git commit -m "bench: publish atomic baseline metadata"
 
 **Interfaces:**
 - Produces: `verify(root, target, baseline, compare=None, require_clean=False) -> list[dict]`.
+- Produces: CLI command `verify --root --target --baseline [--compare] [--require-clean]`.
 
 - [ ] **Step 1: Write compatibility tests**
 
@@ -429,6 +430,7 @@ def test_verify_rejects_incompatible_metadata(tmp_path: Path, field: str) -> Non
 
 def test_verify_allows_different_source_fingerprints(tmp_path: Path) -> None:
     anchor, candidate = compatible_metadata_pair(tmp_path)
+    candidate["source"]["before"] = "f" * 64
     candidate["source"]["after"] = "f" * 64
     write_metadata(tmp_path, "candidate", candidate)
     benchmark_metadata.verify(tmp_path, "speedup", "anchor", "candidate")
@@ -473,7 +475,9 @@ def verify(root: Path, target: str, baseline: str, compare: str | None = None, *
         registrations = target_registrations(root, target, name)
         if registrations != value["registrations"]:
             raise MetadataError(f"Criterion registrations differ for {name!r}")
-    if require_clean and any(value["source"]["dirty"] for value in values):
+    if require_clean and any(
+        value["source"]["dirty"] is not False for value in values
+    ):
         raise MetadataError("final evidence requires clean source metadata")
     for field in COMPATIBILITY_FIELDS:
         if any(value[field] != values[0][field] for value in values[1:]):

@@ -43,6 +43,15 @@ COMMON_METHODOLOGY_FILES = (
     "scripts/bench.sh",
     "scripts/benchmark_metadata.py",
 )
+COMPATIBILITY_FIELDS = (
+    "methodology",
+    "core",
+    "cpu_identity",
+    "os",
+    "rustc_vv",
+    "forwarded_args",
+    "registrations",
+)
 
 
 class MetadataError(Exception):
@@ -176,6 +185,62 @@ def write_json_atomic(path: Path, value: object) -> None:
     os.replace(temporary, path)
 
 
+def read_metadata(root: Path, target: str, baseline: str) -> dict[str, object]:
+    path = metadata_path(root, target, baseline)
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise MetadataError(f"cannot read benchmark metadata from {path}") from error
+    if not isinstance(value, dict):
+        raise MetadataError(f"invalid benchmark metadata in {path}")
+    return value
+
+
+def verify(
+    root: Path,
+    target: str,
+    baseline: str,
+    compare: str | None = None,
+    *,
+    require_clean: bool = False,
+) -> list[dict[str, object]]:
+    names = [baseline] if compare is None else [baseline, compare]
+    values = [read_metadata(root, target, name) for name in names]
+    for name, value in zip(names, values, strict=True):
+        if value.get("schema") != SCHEMA_VERSION or value.get("target") != target:
+            raise MetadataError(f"invalid metadata schema or target for {name!r}")
+        source = value.get("source")
+        if not isinstance(source, dict):
+            raise MetadataError(f"invalid source metadata for {name!r}")
+        try:
+            source_changed = source["before"] != source["after"]
+            dirty = source["dirty"]
+            recorded_registrations = value["registrations"]
+        except KeyError as error:
+            raise MetadataError(f"invalid benchmark metadata for {name!r}") from error
+        if source_changed:
+            raise MetadataError(f"source changed during baseline {name!r}")
+        try:
+            registrations = target_registrations(root, target, name)
+        except MetadataError as error:
+            raise MetadataError(
+                f"Criterion registrations differ for {name!r}: {error}"
+            ) from error
+        if registrations != recorded_registrations:
+            raise MetadataError(f"Criterion registrations differ for {name!r}")
+        if require_clean and dirty is not False:
+            raise MetadataError("final evidence requires clean source metadata")
+    for field in COMPATIBILITY_FIELDS:
+        try:
+            reference = values[0][field]
+            incompatible = any(value[field] != reference for value in values[1:])
+        except KeyError as error:
+            raise MetadataError(f"invalid benchmark metadata field: {field}") from error
+        if incompatible:
+            raise MetadataError(f"incompatible benchmark metadata field: {field}")
+    return values
+
+
 def command_output(argv: list[str], cwd: Path | None = None) -> str | None:
     try:
         completed = subprocess.run(
@@ -297,6 +362,12 @@ def _build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument("--core", type=int, required=True)
     publish_parser.add_argument("--requested-bench", required=True)
     publish_parser.add_argument("--forwarded-arg", action="append", default=[])
+    verify_parser = subparsers.add_parser("verify")
+    verify_parser.add_argument("--root", type=Path, required=True)
+    verify_parser.add_argument("--target", required=True)
+    verify_parser.add_argument("--baseline", required=True)
+    verify_parser.add_argument("--compare")
+    verify_parser.add_argument("--require-clean", action="store_true")
     return parser
 
 
@@ -319,6 +390,15 @@ def main(argv: list[str] | None = None) -> int:
             forwarded_args=args.forwarded_arg,
         )
         print(json.dumps(value, sort_keys=True))
+    elif args.command == "verify":
+        values = verify(
+            args.root,
+            args.target,
+            args.baseline,
+            args.compare,
+            require_clean=args.require_clean,
+        )
+        print(json.dumps(values, sort_keys=True))
     return 0
 
 

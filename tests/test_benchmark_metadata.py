@@ -42,6 +42,63 @@ def make_criterion_registration(root: Path, registration: str, baseline: str) ->
     return root
 
 
+def write_metadata(root: Path, name: str, value: dict[str, object]) -> None:
+    path = benchmark_metadata.metadata_path(root, "speedup", name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value))
+
+
+def compatible_metadata_pair(
+    root: Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    common = {
+        "schema": 1,
+        "methodology": "a" * 64,
+        "target": "speedup",
+        "requested_bench": "speedup",
+        "forwarded_args": ["--measurement-time", "10", "get_hit"],
+        "registrations": ["get_hit/get_hit_elastic"],
+        "cpu_identity": "fixture-cpu",
+        "core": 5,
+        "os": "fixture-os",
+        "rustc_vv": "rustc fixture",
+        "measured_at_utc": "2026-07-11T00:00:00+00:00",
+    }
+    anchor = common | {
+        "source": {
+            "before": "a" * 64,
+            "after": "a" * 64,
+            "commit": "1" * 40,
+            "dirty": False,
+        }
+    }
+    candidate = common | {
+        "source": {
+            "before": "b" * 64,
+            "after": "b" * 64,
+            "commit": "2" * 40,
+            "dirty": False,
+        }
+    }
+    write_metadata(root, "anchor", anchor)
+    write_metadata(root, "candidate", candidate)
+    make_criterion_baseline(root, "anchor")
+    make_criterion_baseline(root, "candidate")
+    return anchor, candidate
+
+
+def incompatible_value(field: str) -> object:
+    return {
+        "methodology": "c" * 64,
+        "core": 6,
+        "cpu_identity": "other-cpu",
+        "os": "other-os",
+        "rustc_vv": "other-rustc",
+        "forwarded_args": ["get_miss"],
+        "registrations": ["get_miss/get_miss_elastic"],
+    }[field]
+
+
 def test_metadata_path_is_target_and_baseline_scoped(tmp_path: Path) -> None:
     assert benchmark_metadata.metadata_path(tmp_path, "speedup", "anchor") == (
         tmp_path / ".opthash" / "metadata" / "speedup" / "anchor.json"
@@ -337,3 +394,105 @@ def test_begin_fails_closed_when_other_target_sidecar_disappears(
 
     assert missing_sidecar.is_symlink()
     assert (criterion / "get_hit/get_hit_elastic/anchor").exists()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "methodology",
+        "core",
+        "cpu_identity",
+        "os",
+        "rustc_vv",
+        "forwarded_args",
+        "registrations",
+    ],
+)
+def test_verify_rejects_incompatible_metadata(tmp_path: Path, field: str) -> None:
+    _, candidate = compatible_metadata_pair(tmp_path)
+    candidate[field] = incompatible_value(field)
+    if field == "registrations":
+        (tmp_path / "get_hit/get_hit_elastic/candidate/estimates.json").unlink()
+        make_criterion_registration(tmp_path, "get_miss/get_miss_elastic", "candidate")
+    write_metadata(tmp_path, "candidate", candidate)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match=field):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor", "candidate")
+
+
+def test_verify_allows_different_source_fingerprints(tmp_path: Path) -> None:
+    _, candidate = compatible_metadata_pair(tmp_path)
+    candidate["source"]["before"] = "f" * 64
+    candidate["source"]["after"] = "f" * 64
+    write_metadata(tmp_path, "candidate", candidate)
+
+    values = benchmark_metadata.verify(tmp_path, "speedup", "anchor", "candidate")
+
+    assert [value["source"]["after"] for value in values] == ["a" * 64, "f" * 64]
+
+
+def test_verify_rejects_source_change_during_baseline(tmp_path: Path) -> None:
+    _, candidate = compatible_metadata_pair(tmp_path)
+    candidate["source"]["after"] = "f" * 64
+    write_metadata(tmp_path, "candidate", candidate)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="source changed"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor", "candidate")
+
+
+def test_verify_rejects_missing_criterion_baseline(tmp_path: Path) -> None:
+    compatible_metadata_pair(tmp_path)
+    (tmp_path / "get_hit/get_hit_elastic/anchor/estimates.json").unlink()
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="registrations"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+def test_verify_requires_clean_source_only_for_final_evidence(tmp_path: Path) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    anchor["source"]["dirty"] = True
+    write_metadata(tmp_path, "anchor", anchor)
+
+    benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+    with pytest.raises(benchmark_metadata.MetadataError, match="requires clean"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor", require_clean=True)
+
+
+def test_verify_rejects_unknown_cleanliness_for_final_evidence(tmp_path: Path) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    anchor["source"]["dirty"] = None
+    write_metadata(tmp_path, "anchor", anchor)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="requires clean"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor", require_clean=True)
+
+
+def test_verify_cli_prints_compatible_metadata(tmp_path: Path) -> None:
+    compatible_metadata_pair(tmp_path)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(benchmark_metadata.__file__)),
+            "verify",
+            "--root",
+            str(tmp_path),
+            "--target",
+            "speedup",
+            "--baseline",
+            "anchor",
+            "--compare",
+            "candidate",
+            "--require-clean",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert [value["source"]["after"] for value in json.loads(completed.stdout)] == [
+        "a" * 64,
+        "b" * 64,
+    ]
+    assert completed.stderr == ""
