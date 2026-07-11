@@ -1,8 +1,8 @@
-//! Exact finite geometry and configuration shared by production and scalar tests.
+//! Exact finite geometry and configuration shared by the library and scalar tests.
 
 use core::iter::FusedIterator;
 
-/// Exact fixed-size inputs shared by production placement and scalar tests.
+/// Exact fixed-size inputs shared by library placement and scalar tests.
 ///
 /// `delta` is represented as `1 / 2^delta_log2`; no floating-point value is
 /// constructed or sanitized.

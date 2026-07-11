@@ -332,7 +332,7 @@ unsafe fn scan_clean_funnel_bucket<T>(
 
 /// Paper-exact Funnel hashing with dynamic allocation epochs for the ordinary
 /// map API. Deletion, growth, and exceptional collision recovery are explicit
-/// production extensions around each fixed-size insertion epoch.
+/// library API extensions around each fixed-size insertion epoch.
 pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     shape: FunnelShape,
     storage: FlatStorage<SlotEntry<K, V>>,
@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn production_locations_match_the_independent_scalar_oracle() {
+    fn funnel_locations_match_the_independent_scalar_oracle() {
         for &(n, d) in &[(144, 3), (344, 4), (1_372, 6), (5_472, 8), (21_856, 10)] {
             let config = PaperConfig::new(n, d).unwrap();
             let mut scalar = ScalarFunnel::new(
@@ -1298,7 +1298,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn production_search_reaches_primary_and_alternating_fallback_in_order() {
+    fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
         fn sample(identity: u64, domain: ProbeDomain, logical: u64, upper: usize) -> usize {
             unbiased_probe_index(
                 &FunnelPrf::new(FUNNEL_PROBE_SEED),

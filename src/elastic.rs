@@ -527,7 +527,7 @@ impl ElasticGeometry {
         }
 
         let config = PaperConfig::new(total_slots, reserve_fraction.delta_log2())
-            .expect("validated Elastic production geometry");
+            .expect("validated Elastic library geometry");
         let plan = config.elastic_plan();
         let level_capacities = plan.level_lengths().collect();
         let batch_plan = plan.batch_quotas().collect::<Vec<_>>().into_boxed_slice();
@@ -1857,7 +1857,7 @@ mod tests {
         }
     }
 
-    fn production_case(case: ScalarElasticCase) -> ExactInsertionCase {
+    fn exact_case(case: ScalarElasticCase) -> ExactInsertionCase {
         match case {
             ScalarElasticCase::Batch0 { level } => ExactInsertionCase::Batch0 { level },
             ScalarElasticCase::Case1 {
@@ -1953,7 +1953,7 @@ mod tests {
                 .sum::<usize>()
                 + placement.slot;
 
-            assert_eq!(placement.case, production_case(expected.case));
+            assert_eq!(placement.case, exact_case(expected.case));
             assert_eq!(placement.level, expected.location.level);
             assert_eq!(placement.slot, expected.location.slot_in_level);
             assert_eq!(global_slot, expected.location.global_slot);
@@ -1981,7 +1981,7 @@ mod tests {
     }
 
     #[test]
-    fn production_placement_matches_the_scalar_paper_model() {
+    fn elastic_placement_matches_the_scalar_paper_model() {
         assert_exact_trace(8, 3, [0, 1, 2, 1523, 2540, 2541, 2542]);
         for &(n, delta_log2) in &[(31, 4), (65, 6), (257, 8)] {
             let target = PaperConfig::new(n, delta_log2).unwrap().target_insertions();

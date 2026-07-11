@@ -1,4 +1,4 @@
-//! Exact finite geometry and probe primitives used by the production maps.
+//! Exact finite geometry and probe primitives used by the library maps.
 
 mod geometry;
 mod probe;

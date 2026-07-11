@@ -77,7 +77,7 @@ pub(crate) struct CounterPrf {
     seed: u64,
 }
 
-/// A production-only, domain-separated Funnel counter permutation.
+/// A library-only, domain-separated Funnel counter permutation.
 ///
 /// The packed counter preserves the paper algorithm's distinct ordinary,
 /// primary, and two fallback choices. The construction is deterministic and
@@ -198,7 +198,7 @@ impl ProbeOracle for FunnelPrf {
         rejection_index: u32,
     ) -> u64 {
         let counter = try_pack_funnel_counter(domain, logical_probe_index, rejection_index)
-            .expect("Funnel counter tuple exceeds its checked production encoding");
+            .expect("Funnel counter tuple exceeds its checked library encoding");
         self.prepare(key_hash).word_from_counter(counter)
     }
 }
@@ -298,7 +298,7 @@ impl PreparedFastFunnelDomainProbe {
     }
 }
 
-/// Packs one Funnel request into a collision-free production counter.
+/// Packs one Funnel request into a collision-free library counter.
 ///
 /// The encoding reserves two high bits for the four Funnel domains, 46 bits
 /// for an ordinary level, and eight bits each for the logical probe and exact

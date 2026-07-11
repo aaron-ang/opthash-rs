@@ -26,7 +26,7 @@ The public `HashMap` API also supports updates, negative lookup, deletion,
 tombstone reuse and cleanup, growth, and rare placement recovery. Cleanup,
 growth, and recovery begin a new observable epoch and may reinsert entries.
 Those behaviors, the finite `c=8` Elastic convention, finite caps, and the
-concrete deterministic probe generators are production extensions, so the
+concrete deterministic probe generators are library API extensions, so the
 crate does not claim that its concrete runs prove the paper's expected or
 high-probability bounds.
 
