@@ -520,17 +520,17 @@ git commit -m "bench: reject incompatible named baselines"
 - Modify: `tests/test_bench_run_metadata.py`
 
 **Interfaces:**
-- Consumes: `benchmark_metadata.py fingerprint|publish|verify`.
+- Consumes: `benchmark_metadata.py begin|publish|verify`.
 - Preserves: existing Criterion and `OPTHASH_BENCH_*` environment arguments.
 
 - [ ] **Step 1: Replace transaction expectations with sidecar expectations in tests**
 
-The fake helper must log `fingerprint`, `verify`, and `publish`. Assert that
+The fake helper must log `begin`, `verify`, and `publish`. Assert that
 Cargo never receives `CRITERION_HOME`, that `publish` follows a successful
 Cargo invocation, and that failed Cargo has no `publish` call.
 
 ```python
-assert [command[0] for command in commands] == ["fingerprint", "publish"]
+assert [command[0] for command in commands] == ["begin", "publish"]
 assert "CRITERION_HOME" not in captured
 assert captured["OPTHASH_BENCH_SAVE_BASELINE"] == "candidate"
 ```

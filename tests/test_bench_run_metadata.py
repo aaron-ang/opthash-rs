@@ -198,6 +198,70 @@ printf 'cargo\n' >> "$EVENT_LOG"
     assert "metadata-helper publish" in launches[2]
 
 
+def test_bench_script_scrubs_stale_criterion_home_only_from_cargo(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Linux\n")
+    _write_executable(bin_dir / "taskset", '#!/bin/sh\nshift 2\nexec "$@"\n')
+    _write_executable(bin_dir / "setarch", '#!/bin/sh\nshift\nexec "$@"\n')
+    _write_executable(
+        bin_dir / "chrt",
+        '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$LAUNCH_LOG"\nshift 2\nexec "$@"\n',
+    )
+    _write_executable(bin_dir / "numactl", '#!/bin/sh\nshift\nexec "$@"\n')
+    _write_executable(bin_dir / "cargo", '#!/bin/sh\nenv > "$CAPTURE_ENV"\n')
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
+    stale_home = tmp_path / "stale-criterion-home"
+    metadata_environment_log = tmp_path / "metadata-environment-log"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+            "CORE": "5",
+            "LOCK_DIR": str(tmp_path / "locks"),
+            "BENCH": "speedup",
+            "SAVE": "candidate",
+            "CAPTURE_ENV": str(tmp_path / "cargo-environment"),
+            "CRITERION_HOME": str(stale_home),
+            "METADATA_LOG": str(tmp_path / "metadata-log"),
+            "METADATA_ENVIRONMENT_LOG": str(metadata_environment_log),
+            "EVENT_LOG": str(tmp_path / "event-log"),
+            "LAUNCH_LOG": str(tmp_path / "launcher-log"),
+            "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "scripts/bench.sh"],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    cargo_environment = dict(
+        line.split("=", 1)
+        for line in (tmp_path / "cargo-environment").read_text().splitlines()
+        if "=" in line
+    )
+    assert "CRITERION_HOME" not in cargo_environment
+    assert metadata_environment_log.read_text().splitlines() == [
+        str(stale_home),
+        str(stale_home),
+    ]
+    launches = (tmp_path / "launcher-log").read_text().splitlines()
+    assert len(launches) == 3
+    assert "env -u CRITERION_HOME" not in launches[0]
+    assert "taskset -c 5" in launches[1]
+    assert "env -u CRITERION_HOME" in launches[1]
+    assert "env -u CRITERION_HOME" not in launches[2]
+
+
 def test_bench_script_routes_named_speedup_modes_through_metadata_sidecars(
     tmp_path: Path,
 ) -> None:
@@ -429,6 +493,9 @@ with Path(os.environ["METADATA_LOG"]).open("a") as stream:
     stream.write(json.dumps(args) + "\\n")
 with Path(os.environ["EVENT_LOG"]).open("a") as stream:
     stream.write(args[0] + "\\n")
+if environment_log := os.environ.get("METADATA_ENVIRONMENT_LOG"):
+    with Path(environment_log).open("a") as stream:
+        stream.write(os.environ.get("CRITERION_HOME", "<unset>") + "\\n")
 if args[0] == "begin":
     print("source-before")
 """,

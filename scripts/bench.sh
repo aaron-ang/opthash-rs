@@ -259,7 +259,7 @@ for target in "${bench_targets[@]}"; do
 		"OPTHASH_BENCH_LOAD_BASELINE=$metadata_load"
 		"OPTHASH_BENCH_COMPARE_BASELINE=$metadata_compare"
 	)
-	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" env "${env_args[@]}"
+	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" env -u CRITERION_HOME "${env_args[@]}"
 		cargo bench "${cargo_feature_args[@]}" --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
 	if "${launcher[@]}" "${cmd[@]}"; then
 		:
