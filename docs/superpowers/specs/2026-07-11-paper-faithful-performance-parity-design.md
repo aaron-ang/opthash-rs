@@ -178,6 +178,13 @@ reported explicitly.
 `DEFAULT_RESERVE_FRACTION` is removed, and the three Elastic tests use
 `ReserveFraction::DEFAULT` with the exact reserve constructor.
 
+The repository has no separately named "production" algorithm or mode. The
+optimized exact path is the library implementation. Comments, helper names,
+test names, and documentation use "library", "exact", or the concrete
+algorithm name instead of "production". The independent scalar oracle remains
+under `#[cfg(test)]` because it supplies fidelity evidence; it is not a public
+validator, selectable backend, feature, or alternate library implementation.
+
 The README replaces the long fidelity discussion with a compact scope note and
 restores an accurate text layout:
 
