@@ -28,7 +28,7 @@
 - Produces: `source_fingerprint(source_root: Path) -> str`
 - Produces: `methodology_fingerprint(source_root: Path, target: str) -> str`
 - Produces: `metadata_path(criterion_root: Path, target: str, baseline: str) -> Path`
-- Produces: CLI commands `fingerprint`, `begin`, `publish`, and `verify`.
+- Produces: CLI command `fingerprint`.
 
 - [ ] **Step 1: Write failing path and fingerprint tests**
 

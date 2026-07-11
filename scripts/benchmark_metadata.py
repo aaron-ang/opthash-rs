@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import re
 from pathlib import Path
@@ -73,3 +74,21 @@ def methodology_fingerprint(source_root: Path, target: str) -> str:
     paths = [source_root / path for path in relative]
     paths += sorted((source_root / "benches" / "support").rglob("*.rs"))
     return hash_paths(source_root, paths)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    fingerprint = subparsers.add_parser("fingerprint")
+    fingerprint.add_argument("--source-root", type=Path, required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    print(source_fingerprint(args.source_root))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

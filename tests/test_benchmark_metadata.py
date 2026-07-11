@@ -1,4 +1,8 @@
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from scripts import benchmark_metadata
 
@@ -42,3 +46,43 @@ def test_source_and_methodology_fingerprints_are_separate(tmp_path: Path) -> Non
     (repo / "benches/speedup.rs").write_text("// changed fixture\n")
     assert benchmark_metadata.source_fingerprint(repo) != source_after_library_change
     assert benchmark_metadata.methodology_fingerprint(repo, "speedup") != method_before
+
+
+@pytest.mark.parametrize("unsafe", ["../anchor", "/anchor", "new", "REPORT"])
+@pytest.mark.parametrize("position", ["target", "baseline"])
+def test_metadata_path_rejects_unsafe_or_reserved_names(
+    tmp_path: Path, unsafe: str, position: str
+) -> None:
+    target = unsafe if position == "target" else "speedup"
+    baseline = unsafe if position == "baseline" else "anchor"
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="unsafe or reserved"):
+        benchmark_metadata.metadata_path(tmp_path, target, baseline)
+
+
+def test_methodology_fingerprint_rejects_unsupported_target(tmp_path: Path) -> None:
+    repo = make_source_tree(tmp_path)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="unsupported benchmark"):
+        benchmark_metadata.methodology_fingerprint(repo, "unknown")
+
+
+def test_fingerprint_cli_prints_source_fingerprint(tmp_path: Path) -> None:
+    repo = make_source_tree(tmp_path)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(benchmark_metadata.__file__)),
+            "fingerprint",
+            "--source-root",
+            str(repo),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == benchmark_metadata.source_fingerprint(repo)
+    assert completed.stderr == ""
