@@ -1,9 +1,9 @@
 # Benchmarks
 
 Use [`scripts/bench.sh`](../scripts/bench.sh) for evidence. It pins and locks
-one CPU, disables ASLR on Linux, records source/environment manifests for
-`speedup` and `mean_latency`, and rejects incompatible stored comparisons.
-Raw `cargo bench` is for smoke iteration only.
+one CPU, disables ASLR on Linux, records compact metadata sidecars for every
+explicit Criterion target, and rejects incompatible stored comparisons. Raw
+`cargo bench` is for smoke iteration only.
 
 ## Named runs
 
@@ -15,7 +15,9 @@ LOAD=candidate BASELINE=anchor scripts/bench.sh
 
 `BENCH=all` runs `speedup` followed by `mean_latency`. Select one target with
 `BENCH=speedup`, `BENCH=mean_latency`, or `BENCH=scaled_insert`. Pass Criterion
-filters and options after `--`.
+filters and options after `--`. Charts require clean, complete metadata for
+`speedup` and `mean_latency`; `scaled_insert` is sidecar-tracked but remains
+outside `BENCH=all`.
 
 Criterion IDs use `<workload>_<implementation>`, where implementation is one
 of `std`, `hashbrown`, `elastic`, or `funnel`. Renaming an ID resets CodSpeed
@@ -46,8 +48,7 @@ BENCH=scaled_insert scripts/bench.sh
 One preflight fill verifies all keys, values, length, and unchanged capacity.
 Timed samples exclude `clear()` and post-fill assertions. The 100K and 1M
 groups use 100 samples; 10M uses Criterion's minimum 10 because exact Elastic
-fills take seconds. The policy is fixed in source and fixture-tested, but
-scaled-insert results currently have no source manifest.
+fills take seconds. The policy is fixed in source and fixture-tested.
 
 For smoke runs only:
 
@@ -80,4 +81,4 @@ uv run scripts/generate_python_chart.py
 
 Do not publish the Python SVG as current evidence without binding its input to
 the reported source. Python pytest-benchmark JSON is not covered by the Rust
-manifest.
+metadata sidecars.

@@ -106,10 +106,10 @@ f["key"] = 42
 
 Use `scripts/bench.sh` for pinned, serialized wall-clock evidence; raw
 `cargo bench` is intended only for smoke iteration. The harness locks its CPU,
-binds headline-throughput and mean-latency runs to schema-4 source/environment
-manifests, and keeps randomized hit traces separate from sequential locality
-controls. Scaled insert remains a named, unmanifested diagnostic for explicitly
-preallocated maps.
+writes compact metadata sidecars for every explicit Criterion target, and keeps
+randomized hit traces separate from sequential locality controls. Charts require
+clean, complete `speedup` and `mean_latency` metadata. `scaled_insert` is
+sidecar-tracked but remains outside `BENCH=all`.
 
 See the [benchmark guide](https://github.com/aaron-ang/opthash-rs/blob/main/benches/README.md)
 for the throughput, latency, and scaled-insert workflows.
