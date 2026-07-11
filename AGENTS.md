@@ -70,11 +70,11 @@ preallocated for the insertion count. A one-time fill verifies distinct
 inserts, every key/value, exact length, and unchanged capacity, then clears the
 map. Sampling excludes clear and post-fill length/capacity assertions from the
 elapsed interval. Results are reported as `insert_scale_<size-label>_<impl>` under group
-`insert_scale_<size-label>` (for example `insert_scale_1M_elastic`). Keep this
-target out of `BENCH=all`.
+`insert_scale_<size-label>` (for example `insert_scale_1M_elastic`).
 The 100K/1M groups use 100 samples; the 10M group uses Criterion's minimum 10
 because an exact Elastic fill is multi-second. This policy is fixed in source
-and covered by a fixture test; scaled insert currently has no source manifest.
+and covered by a fixture test; scaled insert is source-bound and sidecar-tracked
+but remains outside `BENCH=all`.
 
 For smoke runs only, override the default positive sizes with a comma-separated
 `SCALED_INSERT_SIZES` list, for example
