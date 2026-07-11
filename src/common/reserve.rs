@@ -137,3 +137,18 @@ const fn floor_div_pow2(value: usize, exponent: u64) -> usize {
         value >> exponent
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_exactly_one_eighth() {
+        assert_eq!(ReserveFraction::DEFAULT.delta_log2(), 3);
+        assert_eq!(ReserveFraction::DEFAULT.as_f64(), Some(0.125));
+        assert_eq!(
+            ReserveFraction::try_from(0.125),
+            Ok(ReserveFraction::DEFAULT)
+        );
+    }
+}

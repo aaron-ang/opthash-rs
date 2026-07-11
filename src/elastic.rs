@@ -1775,7 +1775,6 @@ mod tests {
     use core::ptr::NonNull;
     use core::sync::atomic::{AtomicBool, Ordering};
 
-    use crate::common::config::DEFAULT_RESERVE_FRACTION;
     use crate::common::exact::reference::{ScalarElastic, ScalarElasticCase, ScalarElasticLimits};
     use alloc::sync::Arc;
     use allocator_api2::alloc::AllocError as RawAllocError;
@@ -2399,9 +2398,9 @@ mod tests {
     #[test]
     fn direct_lookup_returns_the_compared_slot_reference() {
         let mut table: ElasticTable<usize, usize> =
-            ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
+            ElasticTable::with_capacity_and_reserve_and_hasher_in(
                 1024,
-                DEFAULT_RESERVE_FRACTION,
+                ReserveFraction::DEFAULT,
                 DefaultHashBuilder::default(),
                 Global,
             );
@@ -2474,9 +2473,9 @@ mod tests {
     #[test]
     fn rebuild_inserts_advance_batch_scheduler() {
         let mut table: ElasticTable<usize, usize> =
-            ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
+            ElasticTable::with_capacity_and_reserve_and_hasher_in(
                 1024,
-                DEFAULT_RESERVE_FRACTION,
+                ReserveFraction::DEFAULT,
                 DefaultHashBuilder::default(),
                 Global,
             );
@@ -2497,9 +2496,9 @@ mod tests {
     #[test]
     fn insert_after_rebuild_advances_exhausted_batch() {
         let mut table: ElasticTable<usize, usize> =
-            ElasticTable::with_capacity_and_reserve_fraction_and_hasher_in(
+            ElasticTable::with_capacity_and_reserve_and_hasher_in(
                 1024,
-                DEFAULT_RESERVE_FRACTION,
+                ReserveFraction::DEFAULT,
                 DefaultHashBuilder::default(),
                 Global,
             );
