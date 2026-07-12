@@ -96,17 +96,17 @@ f["key"] = 42
 Use `scripts/bench.sh` for pinned, serialized wall-clock evidence; raw
 `cargo bench` is intended only for smoke iteration. The harness locks its CPU,
 writes compact metadata sidecars for every explicit Criterion target, and keeps
-randomized hit traces separate from sequential locality controls. Charts require
-clean, complete `speedup` and `mean_latency` metadata. `scaled_insert` is
+randomized hit traces separate from sequential locality controls. Save named
+baselines and inspect their raw Criterion JSON directly; `scaled_insert` is
 sidecar-tracked but remains outside `BENCH=all`.
 
 See the [benchmark guide](https://github.com/aaron-ang/opthash-rs/blob/main/benches/README.md)
 for the throughput, latency, and scaled-insert workflows.
 
-The source-bound charts report both randomized hits and sequential locality
-controls. Their gap shows the cache cost of the paper-faithful scattered probe
-order at scale; these host-specific results do not claim parity with
-SwissTable.
+The raw results include randomized hits and sequential locality controls so
+their host-specific behavior can be compared without treating one trace as the
+other. Python benchmark runs likewise write pytest-benchmark JSON for direct
+inspection.
 
 ## References
 

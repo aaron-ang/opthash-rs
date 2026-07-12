@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove legacy implementation terminology and duplicated configuration, then restore a concise and accurate library README and fresh Python chart.
+**Goal:** Keep a concise paper-truthful library, retain raw reproducible benchmark methodology, and remove presentation-only plotting machinery.
 
 **Architecture:** `ReserveFraction::DEFAULT` is the sole reserve default. The exact optimized code is called the library implementation; the independent scalar oracle remains test-only. Documentation explains physical layout and algorithm shape without describing removed triangular behavior.
 
@@ -16,7 +16,8 @@
 - Remove every use of “production” as an implementation-mode distinction.
 - Do not add public APIs or change runtime behavior in this plan.
 - Keep the README concise and library-oriented.
-- Retain only fresh generated benchmark assets and exclude workflow documents from the published crate.
+- Retain benchmark harnesses, compact sidecars, and raw JSON methodology; remove plots and plotting code.
+- Performance parity is incremental follow-up work, not a gate for this cleanup.
 
 ---
 
@@ -213,62 +214,72 @@ git add README.md
 git commit -m "docs: restore concise layout and references"
 ```
 
-### Task 4: Clean the package after final performance evidence
+### Task 4: Remove plots and presentation-only dependencies
 
 **Files:**
 - Delete: `CHANGELOG.md`
+- Delete: `assets/benchmark-speedup.svg`
+- Delete: `assets/benchmark-latency.svg`
+- Delete: `scripts/_plot_common.py`
+- Delete: `scripts/generate_speedup_chart.py`
+- Delete: `scripts/generate_latency_chart.py`
+- Delete: `scripts/generate_python_chart.py`
+- Delete: `tests/test_plot_common.py`
+- Modify: `README.md`
 - Modify: `benches/README.md`
-- Create or update: `assets/benchmark-python-speedup.svg`
-- Modify: `Cargo.toml`
+- Modify: `AGENTS.md`
+- Modify: `pyproject.toml`
+- Modify: `uv.lock`
 
 **Interfaces:** None.
 
-- [ ] **Step 1: Ensure workflow documents are excluded from packaging**
+- [ ] **Step 1: Establish the retained reproducibility boundary**
 
-Add to the existing `exclude` list:
+Keep `scripts/bench.sh`, `scripts/benchmark_metadata.py`, Criterion JSON,
+pytest-benchmark JSON, deterministic fixtures, and benchmark documentation.
+They are the reproducibility surface. Plot rendering is not.
 
-```toml
-    "/docs/",
-```
+- [ ] **Step 2: Remove plot code, tests, and assets**
 
-- [ ] **Step 2: Verify final evidence was generated from the accepted library**
+Delete every file listed above. Remove `matplotlib` from the dev dependency
+group and regenerate `uv.lock`. Remove NumPy only if the new lock proves it has
+no remaining consumer; do not edit the lockfile manually.
 
-Inspect the clean-source identifiers recorded by the exact performance plan,
-then run:
+- [ ] **Step 3: Make active documentation raw-results-only**
+
+Remove chart generation commands, image links, source-bound-chart claims, and
+plot helper descriptions from `README.md`, `benches/README.md`, and `AGENTS.md`.
+Keep the commands that produce Criterion and pytest-benchmark JSON and explain
+that consumers inspect the raw named baselines/JSON directly.
+
+- [ ] **Step 4: Verify plot absence and benchmark retention**
+
+Run:
 
 ```bash
-test -s assets/benchmark-python-speedup.svg
-rg -n "benchmark-python-speedup.svg" benches/README.md
+test -f scripts/bench.sh
+test -f scripts/benchmark_metadata.py
+test -f benches/speedup.rs
+test -f benches/python/throughput.py
+! rg -n -i "matplotlib|generate_.*chart|_plot_common|benchmark-.*\\.svg|speedup chart|latency chart" \
+  README.md benches/README.md AGENTS.md pyproject.toml scripts tests assets
 ```
 
-Expected: the final Python chart exists and its benchmark README link resolves.
-Do not regenerate it here; the exact performance plan already benchmarks and
-hash-checks the accepted implementation.
+Expected: retained benchmark/methodology files exist and no plot reference remains.
 
-- [ ] **Step 3: Keep one README reference and remove stale warnings**
-
-`benches/README.md` must contain:
-
-```markdown
-![Python speedup chart](../assets/benchmark-python-speedup.svg)
-```
-
-It must state that a fresh benchmark run is required after implementation or
-fixture changes.
-
-- [ ] **Step 4: Verify package contents**
+- [ ] **Step 5: Verify package contents and tests**
 
 Run: `cargo package --allow-dirty --list`
 
 Expected: no `CHANGELOG.md`, `docs/`, `assets/`, benches, scripts, or tests; the
 remaining package consists only of library sources and crate metadata.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add Cargo.toml benches/README.md assets/benchmark-python-speedup.svg
-git rm CHANGELOG.md
-git commit -m "docs: retain current reproducible evidence"
+git add README.md benches/README.md AGENTS.md pyproject.toml uv.lock
+git rm CHANGELOG.md assets scripts/_plot_common.py scripts/generate_*_chart.py tests/test_plot_common.py
+git commit -m "chore: remove benchmark plotting machinery"
 ```
 
 ### Task 5: Remove workflow documents after implementation completes
@@ -281,12 +292,11 @@ git commit -m "docs: retain current reproducible evidence"
 
 **Interfaces:** None.
 
-- [ ] **Step 1: Confirm implementation and evidence gates are complete**
+- [ ] **Step 1: Confirm the narrowed library cleanup is complete**
 
-Review the commits produced by the metadata, hygiene, and exact-performance
-plans. Confirm every accepted optimization has its recorded pinned A/B result,
-every rejected experiment is absent from the tree, and Task 9 of the exact
-performance plan has passed. Do not delete the plans while any gate remains.
+Confirm compact metadata and hygiene Tasks 1-4 are reviewed, plotting is absent,
+and no experimental performance code entered the library. The abandoned
+full-parity plan and its diagnostic `/tmp` results are not release gates.
 
 - [ ] **Step 2: Remove workflow-only documents**
 

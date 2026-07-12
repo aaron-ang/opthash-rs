@@ -73,7 +73,7 @@ elapsed interval. Results are reported as `insert_scale_<size-label>_<impl>` und
 `insert_scale_<size-label>` (for example `insert_scale_1M_elastic`).
 The 100K/1M groups use 100 samples; the 10M group uses Criterion's minimum 10
 because an exact Elastic fill is multi-second. This policy is fixed in source
-and covered by a fixture test; scaled insert is source-bound and sidecar-tracked
+and covered by a fixture test; scaled insert is sidecar-tracked
 but remains outside `BENCH=all`.
 
 For smoke runs only, override the default positive sizes with a comma-separated
@@ -82,7 +82,7 @@ For smoke runs only, override the default positive sizes with a comma-separated
 Empty, zero, duplicate, and non-integer values are errors. Default-size results used as
 evidence must go through the pinned `scripts/bench.sh` workflow.
 
-### Latency-chart harness
+### Mean-latency harness
 
 - `BENCH=mean_latency scripts/bench.sh` — Criterion sweep of randomized
   `get_hit` plus its ordered control over `LATENCY_SIZES` (1K → 10M).
@@ -93,8 +93,6 @@ evidence must go through the pinned `scripts/bench.sh` workflow.
 
 ```bash
 pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
-
-uv run scripts/generate_python_chart.py
 ```
 
 ### CodSpeed CI
@@ -106,13 +104,13 @@ uv run scripts/generate_python_chart.py
 
 `mean_latency.rs` is local-only. Sim counts instructions, not wallclock — `scripts/bench.sh` stays the local ground truth.
 
-### Charts
+### Raw results
 
-- `uv run scripts/generate_speedup_chart.py --baseline ref` — throughput speedup bar chart from a named Criterion baseline
-- `uv run scripts/generate_latency_chart.py --baseline ref` — Criterion mean-latency line from a named baseline (`target/criterion/get_hit_latency_<size>`; sizes from `LATENCY_SIZES` in `benches/support/common.rs`).
-- `uv run scripts/generate_python_chart.py` — Python-side dict-vs-opthash speedup (reads `.benchmarks/python.json`)
-
-Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loaders, axis styling) live in `scripts/_plot_common.py`.
+- Inspect the named Criterion files under `target/criterion/` directly. Absolute
+  results are in `<baseline>/estimates.json`; comparison deltas are in
+  `change/estimates.json`.
+- Inspect `.benchmarks/python.json` directly for Python-side pytest-benchmark
+  results.
 
 ### Methodology
 

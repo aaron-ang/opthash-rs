@@ -36,7 +36,6 @@ Issues = "https://github.com/aaron-ang/opthash-rs/issues"
 [dependency-groups]
 dev = [
     "hypothesis>=6",
-    "matplotlib>=3.9",
     "pytest>=8",
     "pytest-benchmark>=5",
     "pytest-codspeed>=4",

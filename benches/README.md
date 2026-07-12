@@ -15,14 +15,13 @@ LOAD=candidate BASELINE=anchor scripts/bench.sh
 
 `BENCH=all` runs `speedup` followed by `mean_latency`. Select one target with
 `BENCH=speedup`, `BENCH=mean_latency`, or `BENCH=scaled_insert`. Pass Criterion
-filters and options after `--`. Charts require clean, complete metadata for
-`speedup` and `mean_latency`; `scaled_insert` is sidecar-tracked but remains
-outside `BENCH=all`.
+filters and options after `--`. Each named run keeps raw Criterion estimates and
+compact metadata; `scaled_insert` remains outside `BENCH=all`.
 
 Criterion IDs use `<workload>_<implementation>`, where implementation is one
 of `std`, `hashbrown`, `elastic`, or `funnel`. Renaming an ID resets CodSpeed
-history. Add new headline workloads to `THROUGHPUT_WORKLOADS` in
-[`generate_speedup_chart.py`](../scripts/generate_speedup_chart.py).
+history. The registered headline workloads live in
+[`speedup.rs`](speedup.rs).
 
 ## Hit-query methodology
 
@@ -56,29 +55,26 @@ For smoke runs only:
 SCALED_INSERT_SIZES=1000 cargo bench --bench scaled_insert -- insert_scale_1K
 ```
 
-## Charts
+## Raw results
 
-Generate each verified Rust chart explicitly from a complete named baseline:
+Inspect the named Criterion estimates directly:
 
 ```bash
-uv run scripts/generate_speedup_chart.py --baseline ref
-uv run scripts/generate_latency_chart.py --baseline ref
+cat target/criterion/get_hit/get_hit_funnel/ref/estimates.json
+cat target/criterion/get_hit/get_hit_funnel/change/estimates.json
 ```
 
-![Throughput speedup chart](../assets/benchmark-speedup.svg)
-
-![Latency chart](../assets/benchmark-latency.svg)
+The `ref/estimates.json` file contains the saved absolute estimates. The
+`change/estimates.json` file is created by a named comparison and contains the
+fractional change from its selected baseline.
 
 ## Python
 
 Python-side operations cross the GIL, `HashedAny::hash()`, and Python bytecode.
-Run a fresh benchmark before rendering its local chart:
+Write a fresh pytest-benchmark result for direct inspection:
 
 ```bash
 pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
-uv run scripts/generate_python_chart.py
 ```
 
-Do not publish the Python SVG as current evidence without binding its input to
-the reported source. Python pytest-benchmark JSON is not covered by the Rust
-metadata sidecars.
+Python pytest-benchmark JSON is not covered by the Rust metadata sidecars.
