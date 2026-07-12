@@ -56,11 +56,8 @@ pyo3 = { version = "0.29", features = [
 ], optional = true }
 
 [dev-dependencies]
-criterion = { package = "codspeed-criterion-compat", version = "4", features = [
-    "html_reports",
-] }
+criterion = { version = "4", package = "codspeed-criterion-compat", default-features = false, features = ["cargo_bench_support", "rayon"] }
 hashbrown = "0.17"
-pprof = { version = "0.15", features = ["flamegraph"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

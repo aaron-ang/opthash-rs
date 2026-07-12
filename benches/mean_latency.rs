@@ -1,11 +1,12 @@
-//! Mean per-lookup latency across `LATENCY_SIZES`. Feeds the
-//! cache-hierarchy chart at `assets/benchmark-latency.svg` via
-//! `scripts/generate_latency_chart.py`.
+//! Mean per-lookup latency across `LATENCY_SIZES`.
 //!
 //! ```sh
 //! SAVE=ref BENCH=mean_latency scripts/bench.sh
-//! uv run scripts/generate_latency_chart.py --baseline ref
 //! ```
+//!
+//! The pinned run stores named Criterion estimates under `target/criterion/`
+//! and a matching metadata sidecar under
+//! `target/criterion/.opthash/metadata/mean_latency/`.
 
 #[path = "support/common.rs"]
 mod common;

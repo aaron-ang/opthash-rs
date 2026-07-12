@@ -178,7 +178,7 @@ fn bench_extend(c: &mut Criterion) {
 
 criterion_group!(
     name = benches;
-    config = Criterion::default().with_profiler(throughput::FlamegraphProfiler::new());
+    config = Criterion::default();
     targets =
         bench_iter,
         bench_iter_mut,

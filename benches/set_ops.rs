@@ -99,7 +99,7 @@ fn bench_set_algebra(c: &mut Criterion) {
 
 criterion_group!(
     name = benches;
-    config = Criterion::default().with_profiler(throughput::FlamegraphProfiler::new());
+    config = Criterion::default();
     targets = bench_set_extract_if, bench_set_algebra
 );
 criterion_main!(benches);

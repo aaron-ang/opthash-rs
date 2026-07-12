@@ -225,9 +225,18 @@ git commit -m "docs: restore concise layout and references"
 - Delete: `scripts/generate_latency_chart.py`
 - Delete: `scripts/generate_python_chart.py`
 - Delete: `tests/test_plot_common.py`
+- Modify: `benches/support/throughput.rs`
+- Modify: `benches/speedup.rs`
+- Modify: `benches/set_ops.rs`
+- Modify: `benches/map_api.rs`
+- Modify: `benches/payload_size.rs`
+- Modify: `benches/mean_latency.rs`
+- Modify: `benches/python/throughput.py`
 - Modify: `README.md`
 - Modify: `benches/README.md`
 - Modify: `AGENTS.md`
+- Modify: `Cargo.toml`
+- Modify: `Cargo.lock`
 - Modify: `pyproject.toml`
 - Modify: `uv.lock`
 
@@ -241,9 +250,16 @@ They are the reproducibility surface. Plot rendering is not.
 
 - [ ] **Step 2: Remove plot code, tests, and assets**
 
-Delete every file listed above. Remove `matplotlib` from the dev dependency
-group and regenerate `uv.lock`. Remove NumPy only if the new lock proves it has
-no remaining consumer; do not edit the lockfile manually.
+Delete every file listed above. Remove the Criterion flamegraph profiler and
+its wiring from every benchmark target, then remove `pprof` and Criterion's
+`html_reports` and default `plotters` features from Cargo's dev dependencies
+and regenerate `Cargo.lock`. Retain the compatibility crate's
+`cargo_bench_support` and `rayon` defaults explicitly. If `criterion-plot`
+remains an unconditional dependency of `codspeed-criterion-compat-walltime`,
+document that exact edge rather than replacing the CodSpeed compatibility
+crate. Remove `matplotlib` from the Python dev dependency group and regenerate
+`uv.lock`. Remove NumPy only if the new lock proves it has no remaining
+consumer; do not edit either lockfile manually.
 
 - [ ] **Step 3: Make active documentation raw-results-only**
 
@@ -261,11 +277,14 @@ test -f scripts/bench.sh
 test -f scripts/benchmark_metadata.py
 test -f benches/speedup.rs
 test -f benches/python/throughput.py
-! rg -n -i "matplotlib|generate_.*chart|_plot_common|benchmark-.*\\.svg|speedup chart|latency chart" \
-  README.md benches/README.md AGENTS.md pyproject.toml scripts tests assets
+! rg -n -i "matplotlib|generate_.*chart|_plot_common|benchmark-.*\\.svg|speedup chart|latency chart|flamegraph|pprof|html_reports" \
+  README.md benches AGENTS.md Cargo.toml Cargo.lock pyproject.toml scripts tests assets
+! rg -n '^name = "plotters(-backend|-svg)?"' Cargo.lock
 ```
 
-Expected: retained benchmark/methodology files exist and no plot reference remains.
+Expected: retained benchmark/methodology files exist; repository plot code,
+plotter feature packages, and stale references are absent. `criterion-plot`
+may remain only through the documented unconditional compatibility-crate edge.
 
 - [ ] **Step 5: Verify package contents and tests**
 
@@ -277,7 +296,7 @@ remaining package consists only of library sources and crate metadata.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add README.md benches/README.md AGENTS.md pyproject.toml uv.lock
+git add README.md benches/README.md AGENTS.md Cargo.toml Cargo.lock pyproject.toml uv.lock benches
 git rm CHANGELOG.md assets scripts/_plot_common.py scripts/generate_*_chart.py tests/test_plot_common.py
 git commit -m "chore: remove benchmark plotting machinery"
 ```
