@@ -8,17 +8,19 @@ use core::ops::Index;
 use allocator_api2::alloc::{Allocator, Global};
 use equivalent::Equivalent;
 
+use crate::ReserveFraction;
 #[cfg(feature = "default-hasher")]
 use crate::common::DefaultHashBuilder;
 use crate::common::arena::{self, SlotEntry};
-use crate::common::config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY};
+use crate::common::config::INITIAL_CAPACITY;
 use crate::common::control;
-use crate::common::error::TryReserveError;
+use crate::common::error::{TryBuildError, TryReserveError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     Values as CommonValues,
 };
 use crate::common::math::capacity;
+use crate::epoch::EpochSnapshot;
 
 /// The backend contract behind [`HashMap`]: storage, lookup, insert, iteration,
 /// and lifecycle, grouped into sections below.
@@ -59,8 +61,11 @@ pub trait TableBackend<K, V>: Sized {
     /// Return the backing slot count, including reserved slots.
     fn total_slots(&self) -> usize;
 
-    /// Return the configured reserve fraction.
-    fn reserve_fraction(&self) -> f64;
+    /// Return the exact reserve fraction fixed for this allocation epoch.
+    fn reserve_config(&self) -> ReserveFraction;
+
+    /// Return the current allocation epoch.
+    fn epoch_snapshot(&self) -> EpochSnapshot;
 
     /// Borrow the slot at `loc`.
     ///
@@ -83,6 +88,21 @@ pub trait TableBackend<K, V>: Sized {
     /// Find the slot for `key` by precomputed hash and fingerprint; the
     /// location is valid per [`Location`](TableBackend::Location).
     fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<Self::Location>
+    where
+        Q: Hash + Equivalent<K> + ?Sized;
+
+    /// Find and borrow the occupied slot for `key` by precomputed hash and
+    /// fingerprint. This interface lets backends retain the slot reference
+    /// formed while comparing the key, avoiding a second location-to-slot
+    /// dispatch on hot read hits. The reference is tied to `self`; its shared
+    /// borrow prevents the structural mutation that could otherwise invalidate
+    /// the backing allocation.
+    fn find_entry<'a, Q>(
+        &'a self,
+        key: &Q,
+        hash: u64,
+        fingerprint: u8,
+    ) -> Option<&'a SlotEntry<K, V>>
     where
         Q: Hash + Equivalent<K> + ?Sized;
 
@@ -119,6 +139,9 @@ pub trait TableBackend<K, V>: Sized {
     /// a tombstone and update counters without resizing.
     fn extract_finish(&mut self, loc: Self::Location);
 
+    /// Complete maintenance deferred while a bulk-removal scan was active.
+    fn finish_deferred_removals(&mut self);
+
     // -- Iterate: scan occupied slots without retaining pointers --
 
     /// Track scan progress by index so a consumed table can move safely.
@@ -136,22 +159,30 @@ pub trait TableBackend<K, V>: Sized {
 
     // -- Lifecycle: construct, resize, clean up, clone --
 
-    /// Construct storage for the public `with_capacity_*` family.
-    fn with_capacity_and_reserve_fraction_and_hasher_in(
+    /// Construct storage for the public exact-reserve constructor family.
+    fn with_capacity_and_reserve_and_hasher_in(
         capacity: usize,
-        reserve_fraction: f64,
+        reserve: ReserveFraction,
         hash_builder: Self::Hasher,
         alloc: Self::Alloc,
     ) -> Self;
 
+    /// Fallible construction for the public exact-reserve constructor family.
+    fn try_with_capacity_and_reserve_and_hasher_in(
+        capacity: usize,
+        reserve: ReserveFraction,
+        hash_builder: Self::Hasher,
+        alloc: Self::Alloc,
+    ) -> Result<Self, TryBuildError>;
+
     /// Compute the slot count for `needed` live entries, or `None` if none is
     /// representable. Round up from `total_slots()` (min `INITIAL_CAPACITY`) by
-    /// `reserve_fraction()`.
+    /// the current exact reserve.
     fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
         capacity::capacity_for(
             self.total_slots().max(INITIAL_CAPACITY),
             needed,
-            self.reserve_fraction(),
+            self.reserve_config(),
         )
     }
 
@@ -200,7 +231,7 @@ pub trait TableBackend<K, V>: Sized {
             return;
         }
         let lower = self.len().max(min_capacity).max(INITIAL_CAPACITY);
-        let new_capacity = capacity::capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction())
+        let new_capacity = capacity::capacity_for(INITIAL_CAPACITY, lower, self.reserve_config())
             .expect("capacity overflow");
         if new_capacity >= self.total_slots() {
             return;
@@ -248,7 +279,47 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
         &self.table
     }
 
-    /// Full constructor: capacity, reserve fraction, hasher, and allocator.
+    /// Full exact constructor: capacity, reserve, hasher, and allocator.
+    ///
+    /// # Panics
+    /// Panics if the backend rejects the reserve/capacity or allocation fails.
+    #[must_use]
+    pub fn with_capacity_and_reserve_and_hasher_in(
+        capacity: usize,
+        reserve: ReserveFraction,
+        hash_builder: P::Hasher,
+        alloc: P::Alloc,
+    ) -> Self {
+        Self::from_table(P::with_capacity_and_reserve_and_hasher_in(
+            capacity,
+            reserve,
+            hash_builder,
+            alloc,
+        ))
+    }
+
+    /// Fallible full exact constructor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TryBuildError`] for an unsupported reserve, capacity
+    /// overflow, or allocator failure.
+    pub fn try_with_capacity_and_reserve_and_hasher_in(
+        capacity: usize,
+        reserve: ReserveFraction,
+        hash_builder: P::Hasher,
+        alloc: P::Alloc,
+    ) -> Result<Self, TryBuildError> {
+        P::try_with_capacity_and_reserve_and_hasher_in(capacity, reserve, hash_builder, alloc)
+            .map(Self::from_table)
+    }
+
+    /// Compatibility constructor accepting an exact dyadic `f64` reserve.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `reserve_fraction` is not exactly `1 / 2^d` for positive
+    /// `d`, or when construction otherwise fails.
     #[must_use]
     pub fn with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
@@ -256,12 +327,30 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
         hash_builder: P::Hasher,
         alloc: P::Alloc,
     ) -> Self {
-        Self::from_table(P::with_capacity_and_reserve_fraction_and_hasher_in(
+        Self::try_with_capacity_and_reserve_fraction_and_hasher_in(
             capacity,
             reserve_fraction,
             hash_builder,
             alloc,
-        ))
+        )
+        .unwrap_or_else(|error| panic!("invalid map construction: {error}"))
+    }
+
+    /// Fallible compatibility constructor accepting an exact dyadic `f64`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TryBuildError::InvalidReserveFraction`] for non-dyadic input,
+    /// or the backend construction error.
+    pub fn try_with_capacity_and_reserve_fraction_and_hasher_in(
+        capacity: usize,
+        reserve_fraction: f64,
+        hash_builder: P::Hasher,
+        alloc: P::Alloc,
+    ) -> Result<Self, TryBuildError> {
+        let reserve = ReserveFraction::try_from(reserve_fraction)
+            .map_err(TryBuildError::InvalidReserveFraction)?;
+        Self::try_with_capacity_and_reserve_and_hasher_in(capacity, reserve, hash_builder, alloc)
     }
 
     /// Reference to the map's allocator.
@@ -287,6 +376,18 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     /// Maximum entries before the next automatic resize.
     pub fn capacity(&self) -> usize {
         self.table.capacity()
+    }
+
+    /// Returns the exact reserve fraction fixed for the current epoch.
+    #[must_use]
+    pub fn reserve_fraction(&self) -> ReserveFraction {
+        self.table.reserve_config()
+    }
+
+    /// Returns the current allocation epoch.
+    #[must_use]
+    pub fn epoch(&self) -> EpochSnapshot {
+        self.table.epoch_snapshot()
     }
 
     /// Reserves room for at least `additional` more entries.
@@ -360,8 +461,8 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_location(key)
-            .map(|loc| unsafe { self.slot_entry(loc) })
+        let hash = self.table.hash(key);
+        self.table.find_entry(key, hash, fingerprint(hash))
     }
 
     /// Inserts `key`/`value`. Returns the previous value for `key`, if any.
@@ -809,15 +910,55 @@ where
     /// Creates an empty map with at least `capacity` slots.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+        Self::with_capacity_and_reserve_and_hasher_in(
             capacity,
-            DEFAULT_RESERVE_FRACTION,
+            ReserveFraction::DEFAULT,
             DefaultHashBuilder::default(),
             Global,
         )
     }
 
-    /// Creates an empty map with the given reserve fraction.
+    /// Creates an empty map with the exact dyadic `reserve`.
+    ///
+    /// # Panics
+    /// Panics if the backend rejects `reserve` or allocation fails.
+    #[must_use]
+    pub fn with_reserve(reserve: ReserveFraction) -> Self {
+        Self::with_capacity_and_reserve(0, reserve)
+    }
+
+    /// Creates an empty map with `capacity` and the exact dyadic `reserve`.
+    ///
+    /// # Panics
+    /// Panics if the backend rejects the inputs or allocation fails.
+    #[must_use]
+    pub fn with_capacity_and_reserve(capacity: usize, reserve: ReserveFraction) -> Self {
+        Self::try_with_capacity_and_reserve(capacity, reserve)
+            .unwrap_or_else(|error| panic!("invalid map construction: {error}"))
+    }
+
+    /// Fallible exact-reserve constructor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TryBuildError`] for backend policy, capacity, or allocation
+    /// failures.
+    pub fn try_with_capacity_and_reserve(
+        capacity: usize,
+        reserve: ReserveFraction,
+    ) -> Result<Self, TryBuildError> {
+        Self::try_with_capacity_and_reserve_and_hasher_in(
+            capacity,
+            reserve,
+            DefaultHashBuilder::default(),
+            Global,
+        )
+    }
+
+    /// Compatibility constructor for an exact dyadic `f64` reserve.
+    ///
+    /// # Panics
+    /// Panics for non-dyadic input, unsupported reserve, or allocation failure.
     #[must_use]
     pub fn with_reserve_fraction(reserve_fraction: f64) -> Self {
         Self::with_capacity_and_reserve_fraction_and_hasher_in(
@@ -828,10 +969,30 @@ where
         )
     }
 
-    /// Creates an empty map with the given capacity and reserve fraction.
+    /// Compatibility constructor for capacity and an exact dyadic `f64` reserve.
+    ///
+    /// # Panics
+    /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
     pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self {
         Self::with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity,
+            reserve_fraction,
+            DefaultHashBuilder::default(),
+            Global,
+        )
+    }
+
+    /// Fallible compatibility constructor for an exact dyadic `f64` reserve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TryBuildError`] for invalid input or construction failure.
+    pub fn try_with_capacity_and_reserve_fraction(
+        capacity: usize,
+        reserve_fraction: f64,
+    ) -> Result<Self, TryBuildError> {
+        Self::try_with_capacity_and_reserve_fraction_and_hasher_in(
             capacity,
             reserve_fraction,
             DefaultHashBuilder::default(),
@@ -847,9 +1008,9 @@ where
     /// Creates an empty map that uses `hash_builder`.
     #[must_use]
     pub fn with_hasher(hash_builder: P::Hasher) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+        Self::with_capacity_and_reserve_and_hasher_in(
             0,
-            DEFAULT_RESERVE_FRACTION,
+            ReserveFraction::DEFAULT,
             hash_builder,
             Global,
         )
@@ -858,15 +1019,31 @@ where
     /// Creates an empty map with the given capacity and hasher.
     #[must_use]
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: P::Hasher) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+        Self::with_capacity_and_reserve_and_hasher_in(
             capacity,
-            DEFAULT_RESERVE_FRACTION,
+            ReserveFraction::DEFAULT,
             hash_builder,
             Global,
         )
     }
 
-    /// Creates an empty map with the given reserve fraction and hasher.
+    /// Creates an empty map with an exact reserve and custom hasher.
+    ///
+    /// # Panics
+    /// Panics if the backend rejects the inputs or allocation fails.
+    #[must_use]
+    pub fn with_capacity_and_reserve_and_hasher(
+        capacity: usize,
+        reserve: ReserveFraction,
+        hash_builder: P::Hasher,
+    ) -> Self {
+        Self::with_capacity_and_reserve_and_hasher_in(capacity, reserve, hash_builder, Global)
+    }
+
+    /// Compatibility constructor for an exact dyadic `f64` reserve and hasher.
+    ///
+    /// # Panics
+    /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
     pub fn with_reserve_fraction_and_hasher(
         reserve_fraction: f64,
@@ -880,7 +1057,10 @@ where
         )
     }
 
-    /// Creates an empty map with the given capacity, reserve fraction, and hasher.
+    /// Compatibility constructor for capacity, exact dyadic reserve, and hasher.
+    ///
+    /// # Panics
+    /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
     pub fn with_capacity_and_reserve_fraction_and_hasher(
         capacity: usize,
@@ -904,9 +1084,9 @@ where
     /// Creates an empty map in the given allocator.
     #[must_use]
     pub fn new_in(alloc: P::Alloc) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+        Self::with_capacity_and_reserve_and_hasher_in(
             0,
-            DEFAULT_RESERVE_FRACTION,
+            ReserveFraction::DEFAULT,
             DefaultHashBuilder::default(),
             alloc,
         )
@@ -915,9 +1095,9 @@ where
     /// Creates an empty map with the given capacity in the given allocator.
     #[must_use]
     pub fn with_capacity_in(capacity: usize, alloc: P::Alloc) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+        Self::with_capacity_and_reserve_and_hasher_in(
             capacity,
-            DEFAULT_RESERVE_FRACTION,
+            ReserveFraction::DEFAULT,
             DefaultHashBuilder::default(),
             alloc,
         )
@@ -998,6 +1178,7 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
             table: core::ptr::from_mut(&mut self.table),
             scan,
             pred: f,
+            finished: false,
             _marker: PhantomData,
         }
     }
@@ -1164,11 +1345,13 @@ impl<K, V, P: TableBackend<K, V>> Drop for Drain<'_, K, V, P> {
 }
 
 /// Iterator yielding entries removed by [`HashMap::extract_if`]. Unyielded
-/// non-matching entries are retained; its `Drop` is a no-op.
+/// non-matching entries are retained. Exhausting the iterator may clean
+/// accumulated tombstones after the scan is finished.
 pub struct ExtractIf<'a, K, V, P: TableBackend<K, V>, F> {
     table: *mut P,
     scan: P::Scan,
     pred: F,
+    finished: bool,
     _marker: PhantomData<&'a mut P>,
 }
 
@@ -1179,9 +1362,18 @@ where
 {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
+        if self.finished {
+            return None;
+        }
         loop {
             // SAFETY: `table` points to the borrowed map for the iterator's life.
-            let (ptr, loc) = unsafe { (*self.table).scan_next(&mut self.scan) }?;
+            let Some((ptr, loc)) = (unsafe { (*self.table).scan_next(&mut self.scan) }) else {
+                self.finished = true;
+                // SAFETY: the scan is exhausted and the iterator still owns the
+                // map's exclusive borrow, so a same-size cleanup is now safe.
+                unsafe { (*self.table).finish_deferred_removals() };
+                return None;
+            };
             // SAFETY: live slot; exclusive via the `&mut` map borrow.
             let slot = unsafe { &mut *ptr };
             if (self.pred)(&slot.key, &mut slot.value) {

@@ -4,10 +4,8 @@ use core::arch::aarch64;
 use core::arch::aarch64::uint8x16_t;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64;
-#[cfg(all(target_arch = "x86_64", opthash_eq_bits_16))]
+#[cfg(opthash_x86_16_group)]
 use core::arch::x86_64::__m128i;
-#[cfg(opthash_avx2)]
-use core::arch::x86_64::__m256i;
 #[cfg(opthash_avx512_group)]
 use core::arch::x86_64::__m512i;
 
@@ -64,53 +62,6 @@ fn swar_free_mask(word: u64) -> u64 {
     swar_occupied_mask(word) ^ SWAR_HI
 }
 
-// Fixed 16-byte equality scan used by 16-byte groups and non-AVX2 cold scans.
-#[inline]
-#[cfg(opthash_eq_bits_16)]
-unsafe fn eq_bits_16(ptr: *const u8, target: u8) -> u64 {
-    // _mm_loadu_si128 is unaligned despite taking `*const __m128i`.
-    #[allow(clippy::cast_ptr_alignment)]
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
-        let cmp = x86_64::_mm_cmpeq_epi8(data, x86_64::_mm_set1_epi8(target.cast_signed()));
-        u64::from(x86_64::_mm_movemask_epi8(cmp).cast_unsigned() & 0xFFFF)
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let mut m = 0u64;
-        for i in 0..16 {
-            if unsafe { *ptr.add(i) } == target {
-                m |= 1 << i;
-            }
-        }
-        m
-    }
-}
-
-/// # Safety
-///
-/// `ptr` must be valid to read `GROUP_SIZE` bytes.
-#[inline]
-pub(super) unsafe fn eq_bits_group(ptr: *const u8, target: u8) -> u64 {
-    #[cfg(opthash_avx512_group)]
-    let bits = unsafe { eq_mask_64_avx512(ptr, target).0 };
-    // Cold scan wants a stride-1 bit-per-byte mask, unlike the hot stride-8 SWAR.
-    #[cfg(opthash_scalar_group)]
-    let bits = {
-        let mut m = 0u64;
-        for i in 0..GROUP_SIZE {
-            if unsafe { *ptr.add(i) } == target {
-                m |= 1 << i;
-            }
-        }
-        m
-    };
-    #[cfg(any(opthash_neon_group, opthash_x86_16_group))]
-    let bits = unsafe { eq_bits_16(ptr, target) };
-    bits
-}
-
 /// # Safety
 ///
 /// `ptr` must be valid to read `GROUP_SIZE` bytes.
@@ -162,35 +113,6 @@ pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
     #[cfg(opthash_scalar_group)]
     let mask = unsafe { BitMask(swar_occupied_mask(swar_word(ptr))) };
     mask
-}
-
-/// # Safety
-///
-/// `ptr` must be valid to read 32 bytes.
-#[inline]
-#[must_use]
-pub(crate) unsafe fn eq_bits_32(ptr: *const u8, target: u8) -> u64 {
-    #[cfg(opthash_avx2)]
-    let bits = unsafe { eq_bits_32_avx2(ptr, target) };
-    #[cfg(all(opthash_eq_bits_16, not(opthash_avx2)))]
-    let bits = unsafe {
-        let lo = eq_bits_16(ptr, target);
-        let hi = eq_bits_16(ptr.add(16), target);
-        lo | (hi << 16)
-    };
-    // SWAR never widens the cold scan past GROUP_SIZE (8), so this is unreachable;
-    // a self-contained loop keeps it compiling without eq_bits_16.
-    #[cfg(opthash_scalar_group)]
-    let bits = {
-        let mut m = 0u64;
-        for i in 0..32 {
-            if unsafe { *ptr.add(i) } == target {
-                m |= 1 << i;
-            }
-        }
-        m
-    };
-    bits
 }
 
 // Backend helpers. Numeric suffixes are the number of control bytes scanned.
@@ -311,18 +233,6 @@ unsafe fn occupied_mask_16_sse2(ptr: *const u8) -> BitMask {
         let occ = x86_64::_mm_cmpgt_epi8(masked, x86_64::_mm_setzero_si128());
         let bits = x86_64::_mm_movemask_epi8(occ).cast_unsigned() & 0xFFFF;
         BitMask(u64::from(bits))
-    }
-}
-
-#[allow(clippy::cast_ptr_alignment)]
-#[cfg(opthash_avx2)]
-#[inline]
-unsafe fn eq_bits_32_avx2(ptr: *const u8, target: u8) -> u64 {
-    unsafe {
-        let data = x86_64::_mm256_loadu_si256(ptr.cast::<__m256i>());
-        let target_vec = x86_64::_mm256_set1_epi8(target.cast_signed());
-        let cmp = x86_64::_mm256_cmpeq_epi8(data, target_vec);
-        u64::from(x86_64::_mm256_movemask_epi8(cmp).cast_unsigned())
     }
 }
 

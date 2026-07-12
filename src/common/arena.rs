@@ -4,7 +4,6 @@ use core::ptr;
 
 use allocator_api2::alloc::{Allocator, Layout};
 
-use super::bitmask::BitMask;
 use super::config::{CACHE_LINE, GROUP_SIZE};
 use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use super::error::TryReserveError;
@@ -55,6 +54,12 @@ impl Arena {
         self.ptr.as_ptr()
     }
 
+    /// Size of the already-stored allocator layout backing this arena.
+    #[inline]
+    pub(crate) fn layout_size(&self) -> usize {
+        self.layout.size()
+    }
+
     /// Frees the backing allocation. Caller must have already run any
     /// destructors for values living inside.
     pub(crate) fn deallocate<A: Allocator>(self, alloc: &A) {
@@ -80,14 +85,22 @@ impl Arena {
 /// `total_ctrl` bytes and data section holds `total_ctrl` slots.
 /// Returns `(layout, data_offset_within_arena)`.
 pub(crate) fn layout_for<K, V>(total_ctrl: usize) -> Result<(Layout, usize), TryReserveError> {
-    if total_ctrl == 0 {
+    layout_for_extents::<K, V>(total_ctrl, total_ctrl)
+}
+
+/// Combined ctrl+data layout with independently sized control and slot extents.
+pub(crate) fn layout_for_extents<K, V>(
+    ctrl_bytes: usize,
+    data_slots: usize,
+) -> Result<(Layout, usize), TryReserveError> {
+    if ctrl_bytes == 0 && data_slots == 0 {
         let layout = unsafe { Layout::from_size_align_unchecked(0, CACHE_LINE) };
         return Ok((layout, 0));
     }
     let ctrl_layout =
-        Layout::from_size_align(total_ctrl, CACHE_LINE).map_err(|_| TryReserveError::AllocError)?;
+        Layout::from_size_align(ctrl_bytes, CACHE_LINE).map_err(|_| TryReserveError::AllocError)?;
     let data_layout =
-        Layout::array::<SlotEntry<K, V>>(total_ctrl).map_err(|_| TryReserveError::AllocError)?;
+        Layout::array::<SlotEntry<K, V>>(data_slots).map_err(|_| TryReserveError::AllocError)?;
     let (arena_layout, data_base_off) = ctrl_layout
         .extend(data_layout)
         .map_err(|_| TryReserveError::AllocError)?;
@@ -267,33 +280,6 @@ impl<K: Clone, V: Clone> Clone for SlotEntry<K, V> {
     }
 }
 
-/// A borrowed control-byte group: its `ctrl` pointer resolved once,
-/// so every mask read reuses the same load.
-#[derive(Clone, Copy)]
-pub(crate) struct GroupRef {
-    ctrl: *const u8,
-}
-
-impl GroupRef {
-    /// Match the slots whose fingerprint equals `fp`.
-    #[inline]
-    pub(crate) fn match_mask(self, fp: u8) -> BitMask {
-        unsafe { simd::eq_mask_group(self.ctrl, fp) }
-    }
-
-    /// Match the slots free for insertion (empty or tombstone).
-    #[inline]
-    pub(crate) fn free_mask(self) -> BitMask {
-        unsafe { simd::free_mask_group(self.ctrl) }
-    }
-
-    /// Report whether any slot is empty, which ends a probe chain.
-    #[inline]
-    pub(crate) fn has_empty(self) -> bool {
-        unsafe { simd::eq_mask_group(self.ctrl, CTRL_EMPTY).any() }
-    }
-}
-
 /// Per-region view of a map's arena. Descriptors borrow into the arena
 /// allocation, parameterized by slot type `T`.
 pub(crate) trait ArenaSlots<T> {
@@ -305,19 +291,6 @@ pub(crate) trait ArenaSlots<T> {
     fn slot_ptr(&self, idx: usize) -> *mut T {
         debug_assert!(idx < self.capacity());
         unsafe { self.data_ptr().add(idx).cast::<T>() }
-    }
-
-    #[inline]
-    fn group_ctrl(&self, group_idx: usize) -> *const u8 {
-        debug_assert!(group_idx * GROUP_SIZE < self.capacity());
-        unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) }
-    }
-
-    #[inline]
-    fn group(&self, group_idx: usize) -> GroupRef {
-        GroupRef {
-            ctrl: self.group_ctrl(group_idx),
-        }
     }
 
     #[inline]
@@ -335,21 +308,6 @@ pub(crate) trait ArenaSlots<T> {
     #[inline]
     fn mark_tombstone(&mut self, idx: usize) {
         self.set_control(idx, CTRL_TOMBSTONE);
-    }
-
-    /// Erase the slot at `idx`: reset to `CTRL_EMPTY` if its SIMD group still
-    /// holds an EMPTY byte (probe chain terminates here, no tombstone needed),
-    /// else write `CTRL_TOMBSTONE`. Return whether a tombstone was written.
-    #[inline]
-    fn erase(&mut self, idx: usize) -> bool {
-        let group_idx = idx / GROUP_SIZE;
-        if self.group_match_mask(group_idx, CTRL_EMPTY).any() {
-            self.set_control(idx, CTRL_EMPTY);
-            false
-        } else {
-            self.set_control(idx, CTRL_TOMBSTONE);
-            true
-        }
     }
 
     /// Wipe every ctrl byte in this region to FREE.
@@ -395,27 +353,6 @@ pub(crate) trait ArenaSlots<T> {
         debug_assert!(idx < self.capacity());
         debug_assert!(self.control_at(idx).is_occupied());
         unsafe { self.slot_ptr(idx).read() }
-    }
-
-    #[inline]
-    fn group_match_mask(&self, group_idx: usize, target: u8) -> BitMask {
-        unsafe { simd::eq_mask_group(self.group_ctrl(group_idx), target) }
-    }
-
-    #[inline]
-    fn group_free_mask(&self, group_idx: usize) -> BitMask {
-        unsafe { simd::free_mask_group(self.group_ctrl(group_idx)) }
-    }
-
-    #[inline]
-    fn first_free_in_group(&self, group_idx: usize) -> Option<usize> {
-        let offset = self.group_free_mask(group_idx).lowest()?;
-        let slot_idx = group_idx * GROUP_SIZE + offset;
-        if slot_idx < self.capacity() {
-            Some(slot_idx)
-        } else {
-            None
-        }
     }
 
     /// Drop every value in occupied slots. Call before [`Arena::deallocate`].
@@ -492,13 +429,6 @@ pub(crate) trait ArenaSlots<T> {
                 }
             }
         }
-    }
-
-    /// Drop every value + reset all ctrls to FREE in one pass. Clears each
-    /// ctrl *before* the drop so a panicking `Drop` leaves no OCCUPIED
-    /// behind to double-drop. Tombstones cleared too.
-    fn drop_values_and_clear(&mut self) {
-        self.clear_occupied_slots_with(|slot| unsafe { ptr::drop_in_place(slot) });
     }
 
     /// Move every occupied value out and reset all controls to EMPTY.
