@@ -303,7 +303,7 @@ macro_rules! set_suite {
             }
 
             #[test]
-            #[cfg_attr(miri, ignore)] // Repetitive drain parity loop is slow under Miri.
+            #[cfg_attr(miri, ignore = "repetitive drain parity loop is too slow")]
             fn test_drain() {
                 let mut s: HashSet<_> = (1..100).collect();
 

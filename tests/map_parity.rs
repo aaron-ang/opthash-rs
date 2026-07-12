@@ -256,7 +256,7 @@ macro_rules! parity_suite {
             }
 
             #[test]
-            #[cfg_attr(miri, ignore)] // FIXME: takes too long
+            #[cfg_attr(miri, ignore = "quadratic insertion stress test is too slow")]
             fn test_lots_of_insertions() {
                 let mut m = HashMap::new();
 
@@ -719,7 +719,7 @@ macro_rules! parity_suite {
             }
 
             #[test]
-            #[cfg_attr(miri, ignore)] // FIXME: no OOM signalling
+            #[cfg_attr(miri, ignore = "Miri does not provide useful OOM signaling")]
             fn test_try_reserve() {
                 use opthash::TryReserveError::{AllocError, CapacityOverflow};
 

@@ -209,7 +209,7 @@ macro_rules! common_suite {
             }
 
             #[test]
-            #[cfg_attr(miri, ignore)] // FIXME: takes too long
+            #[cfg_attr(miri, ignore = "large-map stress test is too slow")]
             fn large_map_correctness() {
                 let n = 10_000;
                 let mut map = HashMap::with_capacity(n * 2);
@@ -601,7 +601,7 @@ macro_rules! common_suite {
             }
 
             #[test]
-            #[cfg_attr(miri, ignore)] // Broad resize/drop workload is slow under Miri.
+            #[cfg_attr(miri, ignore = "broad resize and drop workload is too slow")]
             fn shrink_to_fit_reduces_capacity_when_sparse() {
                 let mut map: HashMap<i32, i32> = HashMap::with_capacity(4096);
                 for i in 0..2000 {
@@ -660,7 +660,7 @@ macro_rules! common_suite {
             }
 
             #[test]
-            #[cfg_attr(miri, ignore)] // Broad delete/reinsert workload is slow under Miri.
+            #[cfg_attr(miri, ignore = "broad delete and reinsert workload is too slow")]
             fn delete_heavy_preserves_correctness() {
                 let n = if cfg!(miri) { 200 } else { 5_000 };
                 let trials = if cfg!(miri) { 5 } else { 10 };
