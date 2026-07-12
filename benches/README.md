@@ -26,8 +26,9 @@ An explicit name is also required when rerunning one commit with different
 Criterion options; otherwise the shared commit-hash baseline would be replaced.
 
 `BENCH=all` runs `speedup` followed by `mean_latency`. Select one target with
-`BENCH=speedup`, `BENCH=mean_latency`, or `BENCH=scaled_insert`. Pass Criterion
-filters and options after `--`. `scaled_insert` remains outside `BENCH=all`.
+`BENCH=speedup`, `BENCH=mean_latency`, `BENCH=map_api`, or
+`BENCH=scaled_insert`. Pass Criterion filters and options after `--`.
+`map_api` and `scaled_insert` remain outside `BENCH=all`.
 
 Criterion IDs use `<workload>_<implementation>`, where implementation is one
 of `std`, `hashbrown`, `elastic`, or `funnel`. Renaming an ID resets CodSpeed
@@ -41,6 +42,18 @@ by local SplitMix64 with seed `0xD1B54A32D192ED03`. Ordered controls use the
 same populated keys in input order and have `get_hit_sequential` in their IDs.
 Old baselines from before this fixture change are incompatible even though the
 headline IDs did not change.
+
+## Deletion maintenance
+
+The explicit `map_api` target includes three deletion-maintenance controls at
+20K entries: `remove_burst` removes three fifths of a populated map,
+`post_delete_lookup` queries a deterministic shuffle of all original keys after that burst, and
+`post_delete_insert` reinserts the removed keys. Criterion setup constructs the
+post-delete state outside the timed region. Run only these groups with:
+
+```bash
+BENCH=map_api scripts/bench.sh -- 'remove_burst|post_delete'
+```
 
 `mean_latency` covers 1K, 10K, 100K, 1M, and 10M entries. Maps are built once
 per size outside Criterion's sampled callback. Results are batch mean

@@ -174,6 +174,79 @@ fn bench_extend(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_remove_burst(c: &mut Criterion) {
+    let pairs = harness::make_pairs(MAP_SIZE);
+    let keep = MAP_SIZE * 2 / 5;
+    let mut group = c.benchmark_group("remove_burst");
+    group.throughput(Throughput::Elements((MAP_SIZE - keep) as u64));
+
+    bench_populated!(
+        group,
+        "remove_burst",
+        BatchSize::PerIteration,
+        &pairs,
+        |map| {
+            let mut removed = 0;
+            for (key, _) in pairs.iter().skip(keep) {
+                removed += usize::from(map.remove(black_box(key)).is_some());
+            }
+            black_box(removed)
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_post_delete_lookup(c: &mut Criterion) {
+    let pairs = harness::make_pairs(MAP_SIZE);
+    let query_keys = harness::shuffled_hit_keys(&pairs, MAP_SIZE);
+    let keep = MAP_SIZE * 2 / 5;
+    let mut group = c.benchmark_group("post_delete_lookup");
+    group.throughput(Throughput::Elements(MAP_SIZE as u64));
+
+    bench_all_impls!(
+        group,
+        "post_delete_lookup",
+        BatchSize::LargeInput,
+        sparse_setup!(harness::build_std_map, &pairs, keep),
+        sparse_setup!(harness::build_hashbrown_map, &pairs, keep),
+        sparse_setup!(harness::build_elastic_map, &pairs, keep),
+        sparse_setup!(harness::build_funnel_map, &pairs, keep),
+        |map| {
+            for key in &query_keys {
+                black_box(map.get(black_box(key)));
+            }
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_post_delete_insert(c: &mut Criterion) {
+    let pairs = harness::make_pairs(MAP_SIZE);
+    let keep = MAP_SIZE * 2 / 5;
+    let mut group = c.benchmark_group("post_delete_insert");
+    group.throughput(Throughput::Elements((MAP_SIZE - keep) as u64));
+
+    bench_all_impls!(
+        group,
+        "post_delete_insert",
+        BatchSize::PerIteration,
+        sparse_setup!(harness::build_std_map, &pairs, keep),
+        sparse_setup!(harness::build_hashbrown_map, &pairs, keep),
+        sparse_setup!(harness::build_elastic_map, &pairs, keep),
+        sparse_setup!(harness::build_funnel_map, &pairs, keep),
+        |map| {
+            for &(key, value) in pairs.iter().skip(keep) {
+                black_box(map.insert(black_box(key), black_box(value)));
+            }
+            black_box(map.len())
+        },
+    );
+
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default();
@@ -186,6 +259,9 @@ criterion_group!(
         bench_entry_or_insert,
         bench_shrink_to_fit,
         bench_replace,
-        bench_extend
+        bench_extend,
+        bench_remove_burst,
+        bench_post_delete_lookup,
+        bench_post_delete_insert
 );
 criterion_main!(benches);
