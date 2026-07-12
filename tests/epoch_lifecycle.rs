@@ -196,6 +196,37 @@ fn bulk_removal_cleans_tombstones_after_iteration_finishes() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
+fn partial_extract_drop_finishes_deferred_tombstone_cleanup() {
+    macro_rules! check {
+        ($map:expr) => {{
+            let mut map = $map;
+            let capacity = map.capacity();
+            for key in 0..capacity {
+                map.insert(key, key);
+            }
+            let before = map.epoch();
+
+            {
+                let mut extracted = map.extract_if(|_, _| true);
+                for _ in 0..capacity - 1 {
+                    assert!(extracted.next().is_some());
+                }
+            }
+
+            let after = map.epoch();
+            assert_eq!(map.len(), 1);
+            assert_eq!(map.capacity(), capacity);
+            assert_eq!(after.generation, before.generation + 1);
+            assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
+        }};
+    }
+
+    check!(ElasticHashMap::<usize, usize>::with_capacity(512));
+    check!(FunnelHashMap::<usize, usize>::with_capacity(512));
+}
+
+#[test]
 fn clear_starts_a_fresh_epoch_in_the_same_allocation() {
     let mut map = FunnelHashMap::<usize, usize>::with_capacity(64);
     map.insert(1, 1);

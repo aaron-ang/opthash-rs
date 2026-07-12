@@ -1397,6 +1397,15 @@ where
 {
 }
 
+impl<K, V, P: TableBackend<K, V>, F> Drop for ExtractIf<'_, K, V, P, F> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // SAFETY: the iterator still owns the map's exclusive borrow.
+            unsafe { (*self.table).finish_deferred_removals() };
+        }
+    }
+}
+
 /// Iterator over `&K`.
 pub(crate) type Keys<'a, K, V, P> = CommonKeys<Iter<'a, K, V, P>>;
 /// Iterator over `&V`.
