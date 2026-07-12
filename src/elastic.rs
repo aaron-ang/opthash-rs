@@ -41,7 +41,12 @@ const MAX_ELASTIC_SLOTS: usize = match 1_usize.checked_shl(u32::BITS) {
 };
 const MEMBERSHIP_BITS_PER_SLOT: usize = 8;
 const MEMBERSHIP_SLOTS_PER_WORD: usize = u64::BITS as usize / MEMBERSHIP_BITS_PER_SLOT;
+// The salt reuses wyrand's state increment as a fixed domain separator. The
+// multipliers are SplitMix64's Stafford Mix13 finalizer constants: odd values
+// selected for avalanche quality. These are filter choices, not paper parameters.
 const MEMBERSHIP_SALT: u64 = 0xA076_1D64_78BD_642F;
+const MEMBERSHIP_MIX_MULTIPLIER_1: u64 = 0xBF58_476D_1CE4_E5B9;
+const MEMBERSHIP_MIX_MULTIPLIER_2: u64 = 0x94D0_49BB_1331_11EB;
 const ELASTIC_LEVEL_LANES: [u64; u32::BITS as usize] = elastic_level_lanes();
 const ELASTIC_QUERY_PROBE_LANES: [u64; QUERY_PROBE_LANE_COUNT] = elastic_query_probe_lanes();
 
@@ -334,8 +339,8 @@ fn membership_tail_span<K, V>(total_slots: usize) -> usize {
 #[inline]
 fn membership_mix(hash: u64, salt: u64) -> u64 {
     let mut mixed = hash ^ salt;
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(MEMBERSHIP_MIX_MULTIPLIER_1);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(MEMBERSHIP_MIX_MULTIPLIER_2);
     mixed ^ (mixed >> 31)
 }
 

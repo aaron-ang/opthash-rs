@@ -42,9 +42,11 @@ FunnelHashMap
 
 Elastic uses geometrically halving arrays, paper batches and Case 1/2/3
 placement, and the paper's `phi` query order. Its arena tail holds an
-epoch-scoped membership filter for definite-negative checks. Funnel scans one
-ordinary bucket per level to its first empty slot, then tries B in order and
-alternates the two C choices.[^fkk2025]
+epoch-scoped membership filter for definite-negative checks. The filter applies
+the SplitMix64 finalizer as a stateless avalanche mixer; it does not instantiate
+the stateful generator.[^splitmix64] Funnel scans one ordinary bucket per level
+to its first empty slot, then tries B in order and alternates the two C
+choices.[^fkk2025]
 
 `capacity()` is the live insertion limit for the current epoch, not the number
 of arena slots or allocated bytes. Reserve is configured exactly as
@@ -121,3 +123,9 @@ See [benches/README.md](benches/README.md) for the benchmark methodology.
 
 [^foldhash]: [`foldhash`](https://docs.rs/foldhash/0.2.0/foldhash/), wrapped by
     the default `BuildHasher` when the `default-hasher` feature is enabled.
+
+[^splitmix64]: Guy L. Steele Jr., Doug Lea, and Christine H. Flood. [*Fast
+    Splittable Pseudorandom Number
+    Generators*](https://doi.org/10.1145/2660193.2660195) (2014). The finalizer
+    constants follow Sebastiano Vigna's public-domain [`splitmix64.c` reference
+    implementation](https://prng.di.unimi.it/splitmix64.c).
