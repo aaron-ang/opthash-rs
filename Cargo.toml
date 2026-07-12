@@ -94,3 +94,7 @@ harness = false
 [[bench]]
 name = "mean_latency"
 harness = false
+
+[[bench]]
+name = "scaled_insert"
+harness = false

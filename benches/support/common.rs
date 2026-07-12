@@ -6,7 +6,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{BuildHasherDefault, Hash};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Fixed-seed foldhash — opthash's production hasher, shared with hashbrown — so
+/// Fixed-seed foldhash — opthash's default hasher, shared with hashbrown — so
 /// their comparison is apples-to-apples and key layout is stable run to run
 /// (`DefaultHashBuilder` reseeds per process).
 pub type BenchHasher = foldhash::fast::FixedState;

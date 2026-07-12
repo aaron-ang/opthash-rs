@@ -36,7 +36,7 @@ fn bench_load_factor(c: &mut Criterion) {
                 group.bench_function(format!("{workload}_{}", $impl), |b| {
                     let mut map = <$Map>::with_capacity(CAP_HINT);
                     // Fill to `frac` of this map's resize threshold so the load
-                    // axis is stable across `DEFAULT_RESERVE_FRACTION` changes.
+                    // axis is stable across reserve-policy changes.
                     // `frac < 1`, so no arm rehashes mid-fill.
                     let fill = ((map.capacity() as f64 * frac) as usize).min(pairs.len());
                     for &(key, value) in &pairs[..fill] {

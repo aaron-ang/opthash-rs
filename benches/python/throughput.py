@@ -1,8 +1,9 @@
-"""Python-side benchmarks: opthash maps vs builtin dict.
+"""Python-side pytest-benchmark suite: opthash maps vs builtin dict.
 
 Run:
     uv run pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 
+The raw benchmark result is written to .benchmarks/python.json.
 """
 
 import random
