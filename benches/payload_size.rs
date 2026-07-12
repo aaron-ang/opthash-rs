@@ -1,17 +1,14 @@
-#[path = "support/common.rs"]
-mod common;
 #[macro_use]
-#[path = "support/throughput.rs"]
-mod throughput;
+mod harness;
 
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use throughput::{MAP_SIZE, OP_COUNT};
+use harness::{MAP_SIZE, OP_COUNT};
 
 /// [`bench_insert`] equivalent with `BigVal` payload (32B).
 fn bench_insert_big(c: &mut Criterion) {
-    let pairs = common::make_big_pairs(OP_COUNT);
+    let pairs = harness::make_big_pairs(OP_COUNT);
     let mut group = c.benchmark_group("insert_big");
     group.throughput(Throughput::Elements(OP_COUNT as u64));
     bench_insert_reuse!(group, "insert_big", OP_COUNT, &pairs);
@@ -19,7 +16,7 @@ fn bench_insert_big(c: &mut Criterion) {
 }
 
 fn bench_get_hit_big(c: &mut Criterion) {
-    let pairs = common::make_big_pairs(MAP_SIZE);
+    let pairs = harness::make_big_pairs(MAP_SIZE);
     let hit_keys: Vec<u64> = (0..OP_COUNT).map(|idx| pairs[idx % MAP_SIZE].0).collect();
 
     let mut group = c.benchmark_group("get_hit_big");
@@ -35,7 +32,7 @@ fn bench_get_hit_big(c: &mut Criterion) {
 }
 
 fn bench_drain_big(c: &mut Criterion) {
-    let pairs = common::make_big_pairs(MAP_SIZE);
+    let pairs = harness::make_big_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("drain_big");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 

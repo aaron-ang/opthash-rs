@@ -6,41 +6,38 @@
 //!
 //! The pinned run stores named Criterion estimates under `target/criterion/`.
 
-#[path = "support/common.rs"]
-mod common;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+mod harness;
 
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
 struct LatencyMaps {
-    std: common::StdHashMap<u64, u64>,
-    hashbrown: common::HashbrownMap<u64, u64>,
-    elastic: common::ElasticHashMap<u64, u64>,
-    funnel: common::FunnelHashMap<u64, u64>,
+    std: harness::StdHashMap<u64, u64>,
+    hashbrown: harness::HashbrownMap<u64, u64>,
+    elastic: harness::ElasticHashMap<u64, u64>,
+    funnel: harness::FunnelHashMap<u64, u64>,
 }
 
 impl LatencyMaps {
     fn new(pairs: &[(u64, u64)]) -> Self {
         Self {
-            std: common::build_std_map(pairs),
-            hashbrown: common::build_hashbrown_map(pairs),
-            elastic: common::build_elastic_map(pairs),
-            funnel: common::build_funnel_map(pairs),
+            std: harness::build_std_map(pairs),
+            hashbrown: harness::build_hashbrown_map(pairs),
+            elastic: harness::build_elastic_map(pairs),
+            funnel: harness::build_funnel_map(pairs),
         }
     }
 }
 
 fn bench_get_hit_latency(c: &mut Criterion) {
-    for &size in common::LATENCY_SIZES {
-        let pairs = common::make_pairs(size);
-        let query_keys = fixtures::shuffled_hit_keys(&pairs, size);
-        let sequential_query_keys = fixtures::sequential_hit_keys(&pairs, size);
+    for &size in harness::LATENCY_SIZES {
+        let pairs = harness::make_pairs(size);
+        let query_keys = harness::shuffled_hit_keys(&pairs, size);
+        let sequential_query_keys = harness::sequential_hit_keys(&pairs, size);
         let maps = LatencyMaps::new(&pairs);
 
-        let label = common::size_label(size);
+        let label = harness::size_label(size);
         let workload = format!("get_hit_latency_{label}");
         bench_latency_group(c, &workload, &maps, &query_keys);
 

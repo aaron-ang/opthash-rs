@@ -1,16 +1,13 @@
-#[path = "support/common.rs"]
-mod common;
 #[macro_use]
-#[path = "support/throughput.rs"]
-mod throughput;
+mod harness;
 
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use throughput::MAP_SIZE;
+use harness::MAP_SIZE;
 
 fn bench_iter(c: &mut Criterion) {
-    let pairs = common::make_pairs(MAP_SIZE);
+    let pairs = harness::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("iter");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -25,7 +22,7 @@ fn bench_iter(c: &mut Criterion) {
 
 #[allow(clippy::for_kv_map)]
 fn bench_iter_mut(c: &mut Criterion) {
-    let pairs = common::make_pairs(MAP_SIZE);
+    let pairs = harness::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("iter_mut");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -39,7 +36,7 @@ fn bench_iter_mut(c: &mut Criterion) {
 }
 
 fn bench_drain(c: &mut Criterion) {
-    let pairs = common::make_pairs(MAP_SIZE);
+    let pairs = harness::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("drain");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -53,7 +50,7 @@ fn bench_drain(c: &mut Criterion) {
 }
 
 fn bench_extract_if(c: &mut Criterion) {
-    let pairs = common::make_pairs(MAP_SIZE);
+    let pairs = harness::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("extract_if");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -82,21 +79,21 @@ fn bench_clear_drop(c: &mut Criterion) {
         group,
         "clear",
         BatchSize::PerIteration,
-        || common::build_std_drop_map(MAP_SIZE),
-        || common::build_hashbrown_drop_map(MAP_SIZE),
-        || common::build_elastic_drop_map(MAP_SIZE),
-        || common::build_funnel_drop_map(MAP_SIZE),
+        || harness::build_std_drop_map(MAP_SIZE),
+        || harness::build_hashbrown_drop_map(MAP_SIZE),
+        || harness::build_elastic_drop_map(MAP_SIZE),
+        || harness::build_funnel_drop_map(MAP_SIZE),
         |map| map.clear(),
     );
     // Touch the sink so the drop side-effects can't be optimized out at
     // module scope.
-    black_box(common::drop_sink_value());
+    black_box(harness::drop_sink_value());
 
     group.finish();
 }
 
 fn bench_entry_or_insert(c: &mut Criterion) {
-    let pairs = common::make_pairs(MAP_SIZE);
+    let pairs = harness::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("entry_or_insert");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -125,7 +122,7 @@ macro_rules! sparse_setup {
 }
 
 fn bench_shrink_to_fit(c: &mut Criterion) {
-    let pairs = common::make_pairs(MAP_SIZE);
+    let pairs = harness::make_pairs(MAP_SIZE);
     let keep: usize = MAP_SIZE / 10;
     let mut group = c.benchmark_group("shrink_to_fit");
     group.throughput(Throughput::Elements(keep as u64));
@@ -134,10 +131,10 @@ fn bench_shrink_to_fit(c: &mut Criterion) {
         group,
         "shrink_to_fit",
         BatchSize::PerIteration,
-        sparse_setup!(common::build_std_map, &pairs, keep),
-        sparse_setup!(common::build_hashbrown_map, &pairs, keep),
-        sparse_setup!(common::build_elastic_map, &pairs, keep),
-        sparse_setup!(common::build_funnel_map, &pairs, keep),
+        sparse_setup!(harness::build_std_map, &pairs, keep),
+        sparse_setup!(harness::build_hashbrown_map, &pairs, keep),
+        sparse_setup!(harness::build_elastic_map, &pairs, keep),
+        sparse_setup!(harness::build_funnel_map, &pairs, keep),
         |map| {
             map.shrink_to_fit();
             black_box(map.capacity())
@@ -150,7 +147,7 @@ fn bench_shrink_to_fit(c: &mut Criterion) {
 /// Re-insert all keys with new values - hits the update-existing branch
 /// in `insert` codegen, distinct from the vacant-slot path covered by `insert`.
 fn bench_replace(c: &mut Criterion) {
-    let pairs = common::make_pairs(MAP_SIZE);
+    let pairs = harness::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("replace");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
@@ -165,7 +162,7 @@ fn bench_replace(c: &mut Criterion) {
 }
 
 fn bench_extend(c: &mut Criterion) {
-    let pairs = common::make_pairs(MAP_SIZE);
+    let pairs = harness::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("extend");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 

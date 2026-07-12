@@ -1,9 +1,9 @@
-#[path = "../benches/support/fixtures.rs"]
-mod fixtures;
+#[path = "../benches/harness/mod.rs"]
+mod harness;
 
 use std::collections::HashSet;
 
-use fixtures::{
+use harness::{
     DEFAULT_HIT_QUERY_SEED, exact_size_label, parse_positive_sizes, scaled_insert_sample_size,
     sequential_hit_keys, shuffled_hit_keys, shuffled_hit_keys_with_seed,
 };
@@ -139,7 +139,7 @@ fn mean_latency_builds_each_map_once_per_size_not_once_per_sample() {
     );
     assert!(
         !source.contains("let map = $build(&pairs);")
-            && !source.contains("latency_arm!(\"std\", common::build_std_map)"),
+            && !source.contains("latency_arm!(\"std\", harness::build_std_map)"),
         "a builder inside bench_function is repeated for every Criterion sample"
     );
 }

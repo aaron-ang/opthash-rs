@@ -1,7 +1,4 @@
-#[path = "support/common.rs"]
-mod common;
-#[path = "support/throughput.rs"]
-mod throughput;
+mod harness;
 
 use std::collections::HashSet as StdHashSet;
 use std::hint::black_box;
@@ -13,9 +10,9 @@ use opthash::{ElasticHashSet, FunnelHashSet};
 /// Elements per set in the set-wrapper benches.
 const SET_SIZE: usize = 20_000;
 
-/// `count` distinct keys from `common::key_at`, starting at `offset`.
+/// `count` distinct keys from `harness::key_at`, starting at `offset`.
 fn set_keys(count: usize, offset: usize) -> Vec<u64> {
-    (offset..offset + count).map(common::key_at).collect()
+    (offset..offset + count).map(harness::key_at).collect()
 }
 
 /// Builds a set of `$ty` pre-sized to `$keys`.

@@ -3,8 +3,7 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-#[path = "support/common.rs"]
-mod common;
+mod harness;
 
 use std::hint::black_box;
 
@@ -23,7 +22,7 @@ fn bench_load_factor(c: &mut Criterion) {
 
     // Generous pool: the largest fill is the top fraction of the largest
     // `capacity()`, which stays well under this even at high reserve fractions.
-    let pairs = common::make_pairs(CAP_HINT * 2);
+    let pairs = harness::make_pairs(CAP_HINT * 2);
 
     for &frac in LOAD_FRACTIONS {
         let pct = (frac * 100.0).round() as u32;

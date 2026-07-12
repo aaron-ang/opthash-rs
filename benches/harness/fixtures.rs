@@ -1,5 +1,4 @@
-// `mod common;` is included by each bench binary; items unused in one binary
-// may be used in another, so `dead_code` has to be suppressed module-wide.
+// Each benchmark uses only part of the shared fixture set.
 #![allow(dead_code)]
 
 use std::collections::hash_map::DefaultHasher;

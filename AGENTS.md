@@ -135,9 +135,8 @@ pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 - `src/python.rs` — pyo3 bindings, `#[cfg(feature = "python")]`
 - `src/common/exact/` — paper geometry, probe primitives, and test-only scalar oracle
 - `src/common/` — shared arena, reserve, control-byte SIMD, layout math, config, and errors
-- `benches/support/common.rs` — benchmark constants and aliases;
-  `benches/support/fixtures.rs` — deterministic fixtures; the remaining
-  `benches/support/` modules hold shared harness code
+- `benches/harness/` — shared workload constants, deterministic fixtures,
+  map constructors, and Criterion comparison helpers
 
 Don't duplicate primitives across `src/` and `benches/`.
 

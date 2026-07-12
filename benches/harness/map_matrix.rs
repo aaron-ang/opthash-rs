@@ -2,18 +2,7 @@
 
 use criterion::{Criterion, Throughput};
 
-use crate::common::{ElasticHashMap, FunnelHashMap, HashbrownMap, StdHashMap};
-
-/// Pre-populated map size for the throughput benches.
-pub const MAP_SIZE: usize = 20_000;
-/// Ops per iteration for throughput benches.
-pub const OP_COUNT: usize = 100_000;
-/// Tiny map size - fits comfortably in L1.
-pub const TINY_MAP_SIZE: usize = 32;
-/// Tiny map bench lookups per iteration.
-pub const TINY_OP_COUNT: usize = 500_000;
-/// Inserts per iteration of `resize_heavy`; triggers multiple resizes.
-pub const RESIZE_INSERT_COUNT: usize = 8_000;
+use super::{ElasticHashMap, FunnelHashMap, HashbrownMap, StdHashMap};
 
 #[allow(clippy::too_many_arguments)]
 pub fn bench_one_lookup_group(
@@ -84,10 +73,10 @@ macro_rules! bench_populated {
             $group,
             $op,
             $batch,
-            || common::build_std_map($pairs),
-            || common::build_hashbrown_map($pairs),
-            || common::build_elastic_map($pairs),
-            || common::build_funnel_map($pairs),
+            || $crate::harness::build_std_map($pairs),
+            || $crate::harness::build_hashbrown_map($pairs),
+            || $crate::harness::build_elastic_map($pairs),
+            || $crate::harness::build_funnel_map($pairs),
             $body,
         )
     };
@@ -100,10 +89,10 @@ macro_rules! bench_populated_big {
             $group,
             $op,
             $batch,
-            || common::build_std_big_map($pairs),
-            || common::build_hashbrown_big_map($pairs),
-            || common::build_elastic_big_map($pairs),
-            || common::build_funnel_big_map($pairs),
+            || $crate::harness::build_std_big_map($pairs),
+            || $crate::harness::build_hashbrown_big_map($pairs),
+            || $crate::harness::build_elastic_big_map($pairs),
+            || $crate::harness::build_funnel_big_map($pairs),
             $body,
         )
     };
@@ -116,10 +105,10 @@ macro_rules! bench_empty {
             $group,
             $op,
             $batch,
-            || common::std_map_cap(0),
-            || common::hashbrown_map_cap(0),
-            || common::elastic_map_cap(0),
-            || common::funnel_map_cap(0),
+            || $crate::harness::std_map_cap(0),
+            || $crate::harness::hashbrown_map_cap(0),
+            || $crate::harness::elastic_map_cap(0),
+            || $crate::harness::funnel_map_cap(0),
             $body,
         )
     };
@@ -132,10 +121,10 @@ macro_rules! bench_with_cap {
             $group,
             $op,
             $batch,
-            || common::std_map_cap($cap),
-            || common::hashbrown_map_cap($cap),
-            || common::elastic_map_cap($cap),
-            || common::funnel_map_cap($cap),
+            || $crate::harness::std_map_cap($cap),
+            || $crate::harness::hashbrown_map_cap($cap),
+            || $crate::harness::elastic_map_cap($cap),
+            || $crate::harness::funnel_map_cap($cap),
             $body,
         )
     };
@@ -149,25 +138,25 @@ macro_rules! bench_insert_reuse {
         bench_insert_reuse_one!(
             $group,
             concat!($op, "_std"),
-            common::std_map_cap($cap),
+            $crate::harness::std_map_cap($cap),
             $pairs
         );
         bench_insert_reuse_one!(
             $group,
             concat!($op, "_hashbrown"),
-            common::hashbrown_map_cap($cap),
+            $crate::harness::hashbrown_map_cap($cap),
             $pairs
         );
         bench_insert_reuse_one!(
             $group,
             concat!($op, "_elastic"),
-            common::elastic_map_cap($cap),
+            $crate::harness::elastic_map_cap($cap),
             $pairs
         );
         bench_insert_reuse_one!(
             $group,
             concat!($op, "_funnel"),
-            common::funnel_map_cap($cap),
+            $crate::harness::funnel_map_cap($cap),
             $pairs
         );
     }};
@@ -179,25 +168,25 @@ macro_rules! bench_insert_reuse_named {
         bench_insert_reuse_one!(
             $group,
             format!("{}_std", $op),
-            common::std_map_cap($cap),
+            $crate::harness::std_map_cap($cap),
             $pairs
         );
         bench_insert_reuse_one!(
             $group,
             format!("{}_hashbrown", $op),
-            common::hashbrown_map_cap($cap),
+            $crate::harness::hashbrown_map_cap($cap),
             $pairs
         );
         bench_insert_reuse_one!(
             $group,
             format!("{}_elastic", $op),
-            common::elastic_map_cap($cap),
+            $crate::harness::elastic_map_cap($cap),
             $pairs
         );
         bench_insert_reuse_one!(
             $group,
             format!("{}_funnel", $op),
-            common::funnel_map_cap($cap),
+            $crate::harness::funnel_map_cap($cap),
             $pairs
         );
     }};

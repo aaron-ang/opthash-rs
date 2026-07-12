@@ -1,10 +1,5 @@
-#[path = "support/common.rs"]
-mod common;
-#[path = "support/fixtures.rs"]
-mod fixtures;
 #[macro_use]
-#[path = "support/throughput.rs"]
-mod throughput;
+mod harness;
 
 use std::env;
 
@@ -14,7 +9,7 @@ const DEFAULT_SIZES: &[usize] = &[100_000, 1_000_000, 10_000_000];
 
 fn configured_sizes() -> Vec<usize> {
     match env::var("SCALED_INSERT_SIZES") {
-        Ok(raw) => fixtures::parse_positive_sizes("SCALED_INSERT_SIZES", &raw)
+        Ok(raw) => harness::parse_positive_sizes("SCALED_INSERT_SIZES", &raw)
             .unwrap_or_else(|error| panic!("{error}")),
         Err(env::VarError::NotPresent) => DEFAULT_SIZES.to_vec(),
         Err(env::VarError::NotUnicode(_)) => {
@@ -25,11 +20,11 @@ fn configured_sizes() -> Vec<usize> {
 
 fn bench_scaled_insert(c: &mut Criterion) {
     for size in configured_sizes() {
-        let pairs = common::make_pairs(size);
-        let label = fixtures::exact_size_label(size);
+        let pairs = harness::make_pairs(size);
+        let label = harness::exact_size_label(size);
         let workload = format!("insert_scale_{label}");
         let mut group = c.benchmark_group(&workload);
-        group.sample_size(fixtures::scaled_insert_sample_size(size));
+        group.sample_size(harness::scaled_insert_sample_size(size));
         group.throughput(Throughput::Elements(size as u64));
         bench_insert_reuse_named!(group, &workload, size, &pairs);
         group.finish();
