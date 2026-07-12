@@ -38,12 +38,8 @@ def test_unhashable_elements_raise_type_error(set_cls):
 def test_options_validation(set_cls):
     assert len(set_cls.with_options(capacity=8)) == 0
     assert len(set_cls.with_options(reserve_exponent=4)) == 0
-    with pytest.raises(ValueError):
-        set_cls.with_options(reserve_fraction=0.0)
-    with pytest.raises(ValueError):
-        set_cls.with_options(reserve_fraction=1.5)
-    with pytest.raises(ValueError):
-        set_cls.with_options(reserve_fraction=0.125, reserve_exponent=3)
+    with pytest.raises(TypeError, match="reserve_fraction"):
+        set_cls.with_options(reserve_fraction=0.125)
 
 
 def test_add_discard_remove_membership(set_cls):

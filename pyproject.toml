@@ -54,7 +54,7 @@ trusted-publishing = true
 publishing-environment = "pypi"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests/python"]
 addopts = [
     "--benchmark-disable-gc",
     "--benchmark-warmup=on",

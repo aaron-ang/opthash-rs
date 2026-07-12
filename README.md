@@ -50,8 +50,8 @@ alternates the two C choices.[^fkk2025]
 of arena slots or allocated bytes. Reserve is configured exactly as
 `delta = 2^-d` with `ReserveFraction::from_exponent(d)` in Rust or
 `reserve_exponent=d` in Python; the default is `d=3`. Funnel requires `d >= 3`.
-Float compatibility inputs accept only exact inverse powers of two; all other
-values are rejected rather than clamped.
+Rust float compatibility inputs accept only exact inverse powers of two; all
+other values are rejected rather than clamped.
 
 ## Rust usage
 

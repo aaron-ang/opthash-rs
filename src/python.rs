@@ -22,38 +22,20 @@ use crate::map::{HashMap, TableBackend};
 use crate::set::HashSet;
 use crate::{ElasticHashMap, ElasticHashSet, FunnelHashMap, FunnelHashSet, ReserveFraction};
 
-fn parse_reserve(
-    reserve_fraction: Option<f64>,
-    reserve_exponent: Option<u32>,
-) -> PyResult<ReserveFraction> {
-    if reserve_fraction.is_some() && reserve_exponent.is_some() {
-        return Err(PyValueError::new_err(
-            "reserve_fraction and reserve_exponent are mutually exclusive",
-        ));
-    }
+fn parse_reserve(reserve_exponent: Option<u32>) -> PyResult<ReserveFraction> {
     if let Some(reserve_exponent) = reserve_exponent {
         return ReserveFraction::from_exponent(reserve_exponent)
-            .map_err(|error| PyValueError::new_err(error.to_string()));
-    }
-    if let Some(reserve_fraction) = reserve_fraction {
-        return ReserveFraction::try_from(reserve_fraction)
             .map_err(|error| PyValueError::new_err(error.to_string()));
     }
     Ok(ReserveFraction::DEFAULT)
 }
 
-fn validate_elastic_reserve_fraction(
-    reserve_fraction: Option<f64>,
-    reserve_exponent: Option<u32>,
-) -> PyResult<ReserveFraction> {
-    parse_reserve(reserve_fraction, reserve_exponent)
+fn validate_elastic_reserve(reserve_exponent: Option<u32>) -> PyResult<ReserveFraction> {
+    parse_reserve(reserve_exponent)
 }
 
-fn validate_funnel_reserve_fraction(
-    reserve_fraction: Option<f64>,
-    reserve_exponent: Option<u32>,
-) -> PyResult<ReserveFraction> {
-    let reserve = parse_reserve(reserve_fraction, reserve_exponent)?;
+fn validate_funnel_reserve(reserve_exponent: Option<u32>) -> PyResult<ReserveFraction> {
+    let reserve = parse_reserve(reserve_exponent)?;
     if reserve.exponent() < 3 {
         return Err(PyValueError::new_err(
             "Funnel reserve must be at most 1/8 (reserve_exponent >= 3)",
@@ -663,14 +645,13 @@ macro_rules! define_map_classes {
             }
 
             #[classmethod]
-            #[pyo3(signature = (capacity = 0, reserve_fraction = None, reserve_exponent = None))]
+            #[pyo3(signature = (capacity = 0, reserve_exponent = None))]
             fn with_options(
                 _cls: &Bound<PyType>,
                 capacity: usize,
-                reserve_fraction: Option<f64>,
                 reserve_exponent: Option<u32>,
             ) -> PyResult<Self> {
-                let reserve = $validate_rf(reserve_fraction, reserve_exponent)?;
+                let reserve = $validate_rf(reserve_exponent)?;
                 Ok(Self {
                     inner: $Inner::with_capacity_and_reserve(capacity, reserve),
                     generation: 0,
@@ -1491,14 +1472,13 @@ macro_rules! define_set_classes {
             }
 
             #[classmethod]
-            #[pyo3(signature = (capacity = 0, reserve_fraction = None, reserve_exponent = None))]
+            #[pyo3(signature = (capacity = 0, reserve_exponent = None))]
             fn with_options(
                 _cls: &Bound<PyType>,
                 capacity: usize,
-                reserve_fraction: Option<f64>,
                 reserve_exponent: Option<u32>,
             ) -> PyResult<Self> {
-                let reserve = $validate_rf(reserve_fraction, reserve_exponent)?;
+                let reserve = $validate_rf(reserve_exponent)?;
                 Ok(Self {
                     inner: $Inner::with_capacity_and_reserve(capacity, reserve),
                     generation: 0,
@@ -1773,7 +1753,7 @@ define_set_classes! {
     py_set = PyElasticHashSet,
     py_set_name = "ElasticHashSet",
     inner = ElasticHashSet,
-    validate_rf = validate_elastic_reserve_fraction,
+    validate_rf = validate_elastic_reserve,
     key_iter = PyElasticSetIter,
     key_iter_name = "_ElasticSetIter",
 }
@@ -1782,7 +1762,7 @@ define_set_classes! {
     py_set = PyFunnelHashSet,
     py_set_name = "FunnelHashSet",
     inner = FunnelHashSet,
-    validate_rf = validate_funnel_reserve_fraction,
+    validate_rf = validate_funnel_reserve,
     key_iter = PyFunnelSetIter,
     key_iter_name = "_FunnelSetIter",
 }
@@ -1791,7 +1771,7 @@ define_map_classes! {
     py_map = PyElasticHashMap,
     py_map_name = "ElasticHashMap",
     inner = ElasticHashMap,
-    validate_rf = validate_elastic_reserve_fraction,
+    validate_rf = validate_elastic_reserve,
     key_iter = PyElasticKeyIter,
     key_iter_name = "_ElasticKeyIter",
     value_iter = PyElasticValueIter,
@@ -1810,7 +1790,7 @@ define_map_classes! {
     py_map = PyFunnelHashMap,
     py_map_name = "FunnelHashMap",
     inner = FunnelHashMap,
-    validate_rf = validate_funnel_reserve_fraction,
+    validate_rf = validate_funnel_reserve,
     key_iter = PyFunnelKeyIter,
     key_iter_name = "_FunnelKeyIter",
     value_iter = PyFunnelValueIter,

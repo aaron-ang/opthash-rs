@@ -95,7 +95,7 @@ jobs:
         run: |
           uv venv
           uv pip install dist/*.whl pytest hypothesis pytest-benchmark
-          uv run pytest tests/
+          uv run pytest tests/python/
 
   miri:
     needs: rust-test
