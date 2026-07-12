@@ -1,7 +1,5 @@
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64;
-#[cfg(opthash_neon_group)]
-use core::arch::aarch64::uint8x16_t;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64;
 #[cfg(opthash_x86_16_group)]
@@ -69,7 +67,7 @@ fn swar_free_mask(word: u64) -> u64 {
 #[must_use]
 pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
     #[cfg(opthash_neon_group)]
-    let mask = unsafe { eq_mask_16_neon(ptr, target) };
+    let mask = unsafe { eq_mask_8_neon(ptr, target) };
     #[cfg(opthash_avx512_group)]
     let mask = unsafe { eq_mask_64_avx512(ptr, target) };
     #[cfg(opthash_x86_16_group)]
@@ -86,7 +84,7 @@ pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
 #[must_use]
 pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
     #[cfg(opthash_neon_group)]
-    let mask = unsafe { free_mask_16_neon(ptr) };
+    let mask = unsafe { free_mask_8_neon(ptr) };
     #[cfg(opthash_avx512_group)]
     let mask = unsafe { free_mask_64_avx512(ptr) };
     #[cfg(opthash_x86_16_group)]
@@ -105,7 +103,7 @@ pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
 #[must_use]
 pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
     #[cfg(opthash_neon_group)]
-    let mask = unsafe { occupied_mask_16_neon(ptr) };
+    let mask = unsafe { occupied_mask_8_neon(ptr) };
     #[cfg(opthash_avx512_group)]
     let mask = unsafe { occupied_mask_64_avx512(ptr) };
     #[cfg(opthash_x86_16_group)]
@@ -119,12 +117,23 @@ pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
 
 #[cfg(opthash_neon_group)]
 #[inline]
-unsafe fn nibble_mask_from_cmp(cmp: uint8x16_t) -> BitMask {
-    // NEON narrows compare bytes into one nibble per slot.
+unsafe fn eq_mask_8_neon(ptr: *const u8, target: u8) -> BitMask {
     unsafe {
-        let narrowed = aarch64::vshrn_n_u16(aarch64::vreinterpretq_u16_u8(cmp), 4);
+        let bytes = aarch64::vld1_u8(ptr);
+        let cmp = aarch64::vceq_u8(bytes, aarch64::vdup_n_u8(target));
+        BitMask(aarch64::vget_lane_u64(aarch64::vreinterpret_u64_u8(cmp), 0))
+    }
+}
+
+#[cfg(opthash_neon_group)]
+#[inline]
+unsafe fn free_mask_8_neon(ptr: *const u8) -> BitMask {
+    unsafe {
+        let bytes = aarch64::vld1_u8(ptr);
+        let masked = aarch64::vand_u8(bytes, aarch64::vdup_n_u8(FINGERPRINT_MASK));
+        let free_cmp = aarch64::vceq_u8(masked, aarch64::vdup_n_u8(0));
         BitMask(aarch64::vget_lane_u64(
-            aarch64::vreinterpret_u64_u8(narrowed),
+            aarch64::vreinterpret_u64_u8(free_cmp),
             0,
         ))
     }
@@ -132,32 +141,14 @@ unsafe fn nibble_mask_from_cmp(cmp: uint8x16_t) -> BitMask {
 
 #[cfg(opthash_neon_group)]
 #[inline]
-unsafe fn eq_mask_16_neon(ptr: *const u8, target: u8) -> BitMask {
+unsafe fn occupied_mask_8_neon(ptr: *const u8) -> BitMask {
     unsafe {
-        let bytes = aarch64::vld1q_u8(ptr);
-        let cmp = aarch64::vceqq_u8(bytes, aarch64::vdupq_n_u8(target));
-        nibble_mask_from_cmp(cmp)
-    }
-}
-
-#[cfg(opthash_neon_group)]
-#[inline]
-unsafe fn free_mask_16_neon(ptr: *const u8) -> BitMask {
-    unsafe {
-        let bytes = aarch64::vld1q_u8(ptr);
-        let masked = aarch64::vandq_u8(bytes, aarch64::vdupq_n_u8(FINGERPRINT_MASK));
-        let free_cmp = aarch64::vceqq_u8(masked, aarch64::vdupq_n_u8(0));
-        nibble_mask_from_cmp(free_cmp)
-    }
-}
-
-#[cfg(opthash_neon_group)]
-#[inline]
-unsafe fn occupied_mask_16_neon(ptr: *const u8) -> BitMask {
-    unsafe {
-        let bytes = aarch64::vld1q_u8(ptr);
-        let occ_cmp = aarch64::vtstq_u8(bytes, aarch64::vdupq_n_u8(FINGERPRINT_MASK));
-        nibble_mask_from_cmp(occ_cmp)
+        let bytes = aarch64::vld1_u8(ptr);
+        let occ_cmp = aarch64::vtst_u8(bytes, aarch64::vdup_n_u8(FINGERPRINT_MASK));
+        BitMask(aarch64::vget_lane_u64(
+            aarch64::vreinterpret_u64_u8(occ_cmp),
+            0,
+        ))
     }
 }
 
@@ -233,6 +224,35 @@ unsafe fn occupied_mask_16_sse2(ptr: *const u8) -> BitMask {
         let occ = x86_64::_mm_cmpgt_epi8(masked, x86_64::_mm_setzero_si128());
         let bits = x86_64::_mm_movemask_epi8(occ).cast_unsigned() & 0xFFFF;
         BitMask(u64::from(bits))
+    }
+}
+
+#[cfg(all(test, opthash_neon_group))]
+mod neon_tests {
+    use super::*;
+    use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
+
+    #[test]
+    fn eight_lane_masks_preserve_control_order() {
+        let controls = [
+            CTRL_EMPTY,
+            CTRL_TOMBSTONE,
+            1,
+            7,
+            CTRL_EMPTY,
+            7,
+            CTRL_TOMBSTONE,
+            2,
+        ];
+
+        let matches: alloc::vec::Vec<_> = unsafe { eq_mask_8_neon(controls.as_ptr(), 7) }.collect();
+        let free: alloc::vec::Vec<_> = unsafe { free_mask_8_neon(controls.as_ptr()) }.collect();
+        let occupied: alloc::vec::Vec<_> =
+            unsafe { occupied_mask_8_neon(controls.as_ptr()) }.collect();
+
+        assert_eq!(matches, [3, 5]);
+        assert_eq!(free, [0, 1, 4, 6]);
+        assert_eq!(occupied, [2, 3, 5, 7]);
     }
 }
 

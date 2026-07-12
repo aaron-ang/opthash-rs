@@ -1,10 +1,7 @@
 pub(crate) type BitMaskWord = u64;
 
-/// Bits per slot in [`BitMask`]: 4 for NEON's nibble mask, 8 for the SWAR-8
-/// fallback (one `0x80` sentinel per control byte), 1 elsewhere.
-#[cfg(opthash_neon_group)]
-pub(crate) const BITMASK_STRIDE: u32 = 4;
-#[cfg(opthash_scalar_group)]
+/// Bits per slot in [`BitMask`]: 8 for NEON/SWAR-8, 1 elsewhere.
+#[cfg(any(opthash_neon_group, opthash_scalar_group))]
 pub(crate) const BITMASK_STRIDE: u32 = 8;
 #[cfg(any(opthash_x86_16_group, opthash_avx512_group))]
 pub(crate) const BITMASK_STRIDE: u32 = 1;
@@ -24,11 +21,11 @@ impl Iterator for BitMask {
         }
         let bit = self.0.trailing_zeros();
         let slot = (bit / BITMASK_STRIDE) as usize;
-        // NEON stores each set slot as a full nibble.
+        // NEON stores each set slot as a full byte.
         #[cfg(opthash_neon_group)]
         {
-            let nibble = (0xFu64).wrapping_shl(bit);
-            self.0 &= !nibble;
+            let byte = (0xFFu64).wrapping_shl(bit);
+            self.0 &= !byte;
         }
         #[cfg(not(opthash_neon_group))]
         {
