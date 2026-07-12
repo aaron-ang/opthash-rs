@@ -5,7 +5,6 @@ __pycache__/
 *.so
 *.pyd
 /dist
-/wheels
 .pytest_cache/
 .hypothesis/
 .benchmarks/
