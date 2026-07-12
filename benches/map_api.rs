@@ -23,6 +23,7 @@ fn bench_iter(c: &mut Criterion) {
     group.finish();
 }
 
+#[allow(clippy::for_kv_map)]
 fn bench_iter_mut(c: &mut Criterion) {
     let pairs = common::make_pairs(MAP_SIZE);
     let mut group = c.benchmark_group("iter_mut");

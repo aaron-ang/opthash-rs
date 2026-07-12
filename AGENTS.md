@@ -63,7 +63,6 @@ Run shape and options:
 
 ```bash
 pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
-
 ```
 
 ### CodSpeed CI
