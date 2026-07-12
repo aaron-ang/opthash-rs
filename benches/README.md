@@ -1,29 +1,76 @@
 # Benchmarks
 
-Methodology + commands in [AGENTS.md](../AGENTS.md), and at the top of each benchmark file.
+Use [`scripts/bench.sh`](../scripts/bench.sh) for evidence. On Linux it pins and
+locks one CPU and disables ASLR; non-Linux keeps the plain-Cargo fallback. Raw
+`cargo bench` is for smoke iteration only.
 
-## Naming convention
+## Named runs
 
-CodSpeed keys each benchmark by its Criterion URI and shows the last segment:
-
+```bash
+SAVE=anchor scripts/bench.sh
+SAVE=candidate scripts/bench.sh
+LOAD=candidate BASELINE=anchor scripts/bench.sh
 ```
-benches/<file>.rs::<group-const>::<bench-fn>::<benchmark_group>::<bench-id>
+
+`BENCH=all` runs `speedup` followed by `mean_latency`. Select one target with
+`BENCH=speedup`, `BENCH=mean_latency`, or `BENCH=scaled_insert`. Pass Criterion
+filters and options after `--`. `scaled_insert` remains outside `BENCH=all`.
+
+Criterion IDs use `<workload>_<implementation>`, where implementation is one
+of `std`, `hashbrown`, `elastic`, or `funnel`. Renaming an ID resets CodSpeed
+history. The registered headline workloads live in
+[`speedup.rs`](speedup.rs).
+
+## Hit-query methodology
+
+Randomized `get_hit` workloads cycle a full Fisher-Yates permutation generated
+by local SplitMix64 with seed `0xD1B54A32D192ED03`. Ordered controls use the
+same populated keys in input order and have `get_hit_sequential` in their IDs.
+Old baselines from before this fixture change are incompatible even though the
+headline IDs did not change.
+
+`mean_latency` covers 1K, 10K, 100K, 1M, and 10M entries. Maps are built once
+per size outside Criterion's sampled callback. Results are batch mean
+nanoseconds per lookup, not single-operation tail percentiles.
+
+## Scaled insert
+
+The local-only scaled target measures reused, preallocated maps at 100K, 1M,
+and 10M entries:
+
+```bash
+BENCH=scaled_insert scripts/bench.sh
 ```
 
-Renaming any segment orphans the old benchmark — history resets, but CI still
-passes (only benchmarks in both base and PR are diffed). Keep changes additive.
+One preflight fill verifies all keys, values, length, and unchanged capacity.
+Timed samples exclude `clear()` and post-fill assertions. The 100K and 1M
+groups use 100 samples; 10M uses Criterion's minimum 10 because exact Elastic
+fills take seconds. The policy is fixed in source and fixture-tested.
 
-For the CodSpeed-tracked suite (`speedup.rs`):
+For smoke runs only:
 
-- **Bench id `<workload>_<impl>`**, globally unique,
-  `impl ∈ {std, hashbrown, elastic, funnel}` (e.g. `get_hit_elastic`).
-  Fold variants into the workload so ids don't collide:
-  `get_hit_load_50_elastic`, `get_hit_big_elastic`.
-- **`benchmark_group` = `<workload>`, bench fn = `bench_<workload>`** — no
-  `_throughput` suffix.
-- **New workload**: add a `bench_<workload>` fn (via `bench_all_impls!`) to the
-  `benches` group; never rename an existing one.
+```bash
+SCALED_INSERT_SIZES=1000 cargo bench --bench scaled_insert -- insert_scale_1K
+```
 
-The local-only `mean_latency.rs` suite isn't uploaded to CodSpeed but uses the
-same tokens: it emits `get_hit_latency_<size>_<impl>` Criterion ids. No CodSpeed
-history here, so renaming is free.
+## Raw results
+
+Inspect the named Criterion estimates directly:
+
+```bash
+cat target/criterion/get_hit/get_hit_funnel/ref/estimates.json
+cat target/criterion/get_hit/get_hit_funnel/change/estimates.json
+```
+
+The `ref/estimates.json` file contains the saved absolute estimates. The
+`change/estimates.json` file is created by a named comparison and contains the
+fractional change from its selected baseline.
+
+## Python
+
+Python-side operations cross the GIL, `HashedAny::hash()`, and Python bytecode.
+Write a fresh pytest-benchmark result for direct inspection:
+
+```bash
+pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
+```
