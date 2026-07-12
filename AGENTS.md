@@ -148,6 +148,9 @@ When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-
 
 ### Design Priorities
 
+- Import types and traits, but call free functions through their owning module
+  (for example, `probe::elastic_phi`). Do not flatten internal functions through
+  `mod.rs`; keep crate-root re-exports limited to the curated public interface.
 - Prefer layout and locality wins before adding more metadata. Keep hot metadata contiguous — if fields are read together, store them together.
 - Cache routing state that's reused in hot paths; never recompute it per probe.
 - Preserve SIMD-friendly control-byte scans: contiguous groups, cheap bitmask iteration, early rejection before touching payloads.

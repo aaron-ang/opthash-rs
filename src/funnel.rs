@@ -14,9 +14,9 @@ use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::GROUP_SIZE;
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{TryBuildError, TryReserveError};
-use crate::common::exact::{
-    FunnelPrf, PaperConfig, PreparedFastFunnelDomainProbe, PreparedProbeRange, ProbeDomain,
-    unbiased_prepared_funnel_probe_index_in_range,
+use crate::common::exact::geometry::PaperConfig;
+use crate::common::exact::probe::{
+    self, FunnelPrf, PreparedFastFunnelDomainProbe, PreparedProbeRange, ProbeDomain,
 };
 use crate::common::math::capacity;
 use crate::common::simd;
@@ -448,13 +448,18 @@ where
 
     #[inline]
     fn sample(
-        probe: &PreparedFastFunnelDomainProbe,
+        prepared: &PreparedFastFunnelDomainProbe,
         logical_probe: u64,
         range: PreparedProbeRange,
     ) -> Option<usize> {
-        unbiased_prepared_funnel_probe_index_in_range(probe, logical_probe, range, RANGE_WORD_CAP)
-            .ok()
-            .map(|probe| probe.index)
+        probe::unbiased_prepared_funnel_probe_index_in_range(
+            prepared,
+            logical_probe,
+            range,
+            RANGE_WORD_CAP,
+        )
+        .ok()
+        .map(|probe| probe.index)
     }
 
     #[inline]
@@ -1073,8 +1078,8 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::*;
+    use crate::common::exact::probe;
     use crate::common::exact::reference::{ScalarFunnel, ScalarFunnelInsert};
-    use crate::common::exact::unbiased_probe_index;
 
     #[derive(Clone, Copy, Default)]
     struct IdentityBuildHasher;
@@ -1303,7 +1308,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
         fn sample(identity: u64, domain: ProbeDomain, logical: u64, upper: usize) -> usize {
-            unbiased_probe_index(
+            probe::unbiased_probe_index(
                 &FunnelPrf::new(FUNNEL_PROBE_SEED),
                 identity,
                 domain,

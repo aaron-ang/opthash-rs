@@ -2,10 +2,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::num::{NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
 
-use super::{
-    FunnelPlan, PaperConfig, ProbeDomain, ProbeOracle, RangeReductionError,
-    elastic_dyadic_probe_budget, elastic_phi, elastic_phi_inverse, unbiased_probe_index,
-};
+use super::geometry::{FunnelPlan, PaperConfig};
+use super::probe::{self, ProbeDomain, ProbeOracle, RangeReductionError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ScalarElasticLimits {
@@ -188,7 +186,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
                     probe,
                 )
             } else {
-                let budget = elastic_dyadic_probe_budget(
+                let budget = probe::elastic_dyadic_probe_budget(
                     free_current,
                     self.levels[current],
                     self.config.reserve_exponent(),
@@ -220,7 +218,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
 
         let global_slot = self.offsets[level] + slot_in_level;
         assert!(self.slots[global_slot].is_none());
-        let phi = elastic_phi(level as u128 + 1, u128::from(paper_probe))
+        let phi = probe::elastic_phi(level as u128 + 1, u128::from(paper_probe))
             .expect("scalar Elastic selection must have a representable phi");
         assert!(phi <= self.limits.hit_query_position_cap.get());
         self.slots[global_slot] = Some(identity);
@@ -240,7 +238,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
         let mut mapped_positions = 0_u128;
         let mut gap_positions = 0_u128;
         for position in 1..=self.limits.hit_query_position_cap.get() {
-            let (level, logical_index, is_h11) = match elastic_phi_inverse(position) {
+            let (level, logical_index, is_h11) = match probe::elastic_phi_inverse(position) {
                 Some((paper_i, paper_j)) if paper_i <= self.levels.len() as u128 => {
                     mapped_positions += 1;
                     let level = usize::try_from(paper_i - 1).unwrap();
@@ -313,7 +311,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
     }
 
     fn route(&self, level: usize, identity: u64, logical_index: u64) -> (usize, u32) {
-        let sampled = unbiased_probe_index(
+        let sampled = probe::unbiased_probe_index(
             &self.oracle,
             identity,
             ProbeDomain::ElasticOrdinary {
@@ -423,7 +421,7 @@ impl<O: ProbeOracle> ScalarFunnel<O> {
         logical_index: u64,
         upper: usize,
     ) -> Result<usize, RangeReductionError> {
-        unbiased_probe_index(
+        probe::unbiased_probe_index(
             &self.oracle,
             identity,
             domain,
@@ -637,7 +635,8 @@ mod tests {
         ScalarElasticLocation, ScalarElasticQuery, ScalarFunnel, ScalarFunnelInsert,
         ScalarFunnelLocation, ScalarFunnelSearch,
     };
-    use crate::common::exact::{PaperConfig, ProbeDomain, ProbeOracle};
+    use crate::common::exact::geometry::PaperConfig;
+    use crate::common::exact::probe::{ProbeDomain, ProbeOracle};
 
     #[derive(Debug)]
     struct ElasticCycleOracle {

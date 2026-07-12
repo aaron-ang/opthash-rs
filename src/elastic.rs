@@ -14,9 +14,9 @@ use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::{CACHE_LINE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{TryBuildError, TryReserveError};
-use crate::common::exact::{
-    CounterPrf, PaperConfig, PreparedElasticLevelProbe, PreparedElasticProbe,
-    elastic_dyadic_probe_budget, elastic_phi, unbiased_prepared_elastic_probe_index,
+use crate::common::exact::geometry::PaperConfig;
+use crate::common::exact::probe::{
+    self, CounterPrf, PreparedElasticLevelProbe, PreparedElasticProbe,
 };
 use crate::common::iter::RegionCursor;
 use crate::common::math::capacity;
@@ -355,8 +355,8 @@ fn probe_schedule_capacity(level_count: usize) -> usize {
     for level in 0..level_count {
         let paper_level = level as u128 + 1;
         for paper_probe in 1..=u128::from(UNIFORM_SEARCH_CAP) {
-            let phi =
-                elastic_phi(paper_level, paper_probe).expect("bounded Elastic query coordinate");
+            let phi = probe::elastic_phi(paper_level, paper_probe)
+                .expect("bounded Elastic query coordinate");
             if phi > QUERY_POSITION_CAP {
                 break;
             }
@@ -932,7 +932,7 @@ where
             let mut paper_probe =
                 first_paper_probe_after(paper_level, u128::from(prior_high_water));
             while paper_probe <= u128::from(UNIFORM_SEARCH_CAP) {
-                let phi = elastic_phi(paper_level, paper_probe)
+                let phi = probe::elastic_phi(paper_level, paper_probe)
                     .expect("bounded Elastic query coordinate");
                 if phi > high_water {
                     break;
@@ -1492,7 +1492,7 @@ where
                         paper_probe,
                     )
                 } else {
-                    let budget = elastic_dyadic_probe_budget(
+                    let budget = probe::elastic_dyadic_probe_budget(
                         free_current,
                         current_level.capacity(),
                         self.reserve_fraction.exponent(),
@@ -1522,7 +1522,7 @@ where
                 }
             }
         };
-        let phi = elastic_phi(level as u128 + 1, u128::from(paper_probe)).ok()?;
+        let phi = probe::elastic_phi(level as u128 + 1, u128::from(paper_probe)).ok()?;
         if phi > QUERY_POSITION_CAP {
             return None;
         }
@@ -1592,13 +1592,18 @@ where
 
     #[inline(always)]
     fn route_prepared_lane_for_upper(
-        probe: &PreparedElasticLevelProbe,
+        prepared: &PreparedElasticLevelProbe,
         logical_probe_lane: u64,
         upper: usize,
     ) -> Option<usize> {
-        unbiased_prepared_elastic_probe_index(probe, logical_probe_lane, upper, RANGE_WORD_CAP)
-            .ok()
-            .map(|probe| probe.index)
+        probe::unbiased_prepared_elastic_probe_index(
+            prepared,
+            logical_probe_lane,
+            upper,
+            RANGE_WORD_CAP,
+        )
+        .ok()
+        .map(|probe| probe.index)
     }
 
     /// SAFETY: `level_idx` < `self.levels.len()` and `slot_idx` references an
@@ -1755,7 +1760,8 @@ fn first_paper_probe_after(paper_level: u128, position: u128) -> u128 {
     let mut upper = u128::from(UNIFORM_SEARCH_CAP) + 1;
     while lower < upper {
         let middle = lower + (upper - lower) / 2;
-        let phi = elastic_phi(paper_level, middle).expect("bounded Elastic query coordinate");
+        let phi =
+            probe::elastic_phi(paper_level, middle).expect("bounded Elastic query coordinate");
         if phi <= position {
             lower = middle + 1;
         } else {
@@ -2025,11 +2031,11 @@ mod tests {
                 );
             assert!(matches!(result, Err(TryReserveError::CapacityOverflow)));
         }
-        assert!(elastic_phi(1, 383).unwrap() <= QUERY_POSITION_CAP);
-        assert!(elastic_phi(1, 384).unwrap() > QUERY_POSITION_CAP);
+        assert!(probe::elastic_phi(1, 383).unwrap() <= QUERY_POSITION_CAP);
+        assert!(probe::elastic_phi(1, 384).unwrap() > QUERY_POSITION_CAP);
         for level in 1..=u128::from(u64::BITS) {
             let mut paper_probe = 1_u128;
-            while elastic_phi(level, paper_probe).unwrap() <= QUERY_POSITION_CAP {
+            while probe::elastic_phi(level, paper_probe).unwrap() <= QUERY_POSITION_CAP {
                 assert!(usize::try_from(paper_probe - 1).unwrap() < QUERY_PROBE_LANE_COUNT);
                 paper_probe += 1;
             }
@@ -2363,7 +2369,7 @@ mod tests {
 
         for logical_index in 0..UNIFORM_SEARCH_CAP {
             let paper_probe = u128::from(logical_index) + 1;
-            if elastic_phi(1, paper_probe).unwrap() > QUERY_POSITION_CAP {
+            if probe::elastic_phi(1, paper_probe).unwrap() > QUERY_POSITION_CAP {
                 break;
             }
             let slot = table.route_exact(0, 0, logical_index).unwrap();
