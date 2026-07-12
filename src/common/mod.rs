@@ -3,7 +3,6 @@ pub(crate) mod bitmask;
 pub(crate) mod config;
 pub(crate) mod control;
 pub(crate) mod error;
-// The exact finite placement core is private library infrastructure.
 pub(crate) mod exact;
 pub(crate) mod iter;
 pub(crate) mod math;
