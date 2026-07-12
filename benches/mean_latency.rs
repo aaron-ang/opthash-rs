@@ -1,10 +1,7 @@
-//! Mean per-lookup latency across `LATENCY_SIZES`. Feeds the
-//! cache-hierarchy chart at `assets/benchmark-latency.svg` via
-//! `scripts/generate_latency_chart.py`.
+//! Mean per-lookup latency across `LATENCY_SIZES`.
 //!
 //! ```sh
 //! cargo bench --bench mean_latency
-//! uv run scripts/generate_latency_chart.py
 //! ```
 
 #[path = "support/common.rs"]

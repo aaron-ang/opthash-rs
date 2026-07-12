@@ -134,7 +134,7 @@ fn bench_resize_heavy(c: &mut Criterion) {
 
 criterion_group!(
     name = benches;
-    config = Criterion::default().with_profiler(throughput::FlamegraphProfiler::new());
+    config = Criterion::default();
     targets =
         bench_insert,
         bench_lookups,

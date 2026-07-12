@@ -1,9 +1,6 @@
 #![allow(dead_code, unused_macros)]
 
-use std::path::Path;
-
-use criterion::{Criterion, Throughput, profiler::Profiler};
-use pprof::{ProfilerGuard, flamegraph::Options as FlamegraphOptions};
+use criterion::{Criterion, Throughput};
 
 use crate::common::{ElasticHashMap, FunnelHashMap, HashbrownMap, StdHashMap};
 
@@ -17,38 +14,6 @@ pub const TINY_MAP_SIZE: usize = 32;
 pub const TINY_OP_COUNT: usize = 500_000;
 /// Inserts per iteration of `resize_heavy`; triggers multiple resizes.
 pub const RESIZE_INSERT_COUNT: usize = 8_000;
-
-pub struct FlamegraphProfiler {
-    frequency: i32,
-    active: Option<ProfilerGuard<'static>>,
-}
-
-impl FlamegraphProfiler {
-    pub fn new() -> Self {
-        Self {
-            frequency: 997,
-            active: None,
-        }
-    }
-}
-
-impl Profiler for FlamegraphProfiler {
-    fn start_profiling(&mut self, _benchmark_id: &str, _benchmark_dir: &Path) {
-        self.active = Some(ProfilerGuard::new(self.frequency).unwrap());
-    }
-
-    fn stop_profiling(&mut self, _benchmark_id: &str, benchmark_dir: &Path) {
-        if let Some(guard) = self.active.take() {
-            let report = guard.report().build().unwrap();
-            let mut opts = FlamegraphOptions::default();
-            opts.deterministic = true;
-            std::fs::create_dir_all(benchmark_dir).unwrap();
-            let path = benchmark_dir.join("flamegraph.svg");
-            let file = std::fs::File::create(&path).unwrap();
-            report.flamegraph_with_options(file, &mut opts).unwrap();
-        }
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn bench_one_lookup_group(

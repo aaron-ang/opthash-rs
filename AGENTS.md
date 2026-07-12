@@ -51,9 +51,11 @@ Run shape and options:
 - Pass through Criterion flags with `--`: `SAVE=opt1 scripts/bench.sh -- --measurement-time 10`.
 - Filter by Criterion name: `SAVE=opt1 scripts/bench.sh -- "get_hit_latency"`. The script strips a leading `--`, so both forms work.
 
-### Latency-chart harness
+### Latency harness
 
-- `BENCH=mean_latency scripts/bench.sh` — Criterion sweep of `get_hit` over `LATENCY_SIZES` (1K → 10M); feeds the cache-cliff line chart. Output: `target/criterion/get_hit_latency_<size>/get_hit_latency_<size>_<impl>/`.
+- `BENCH=mean_latency scripts/bench.sh` — Criterion sweep of `get_hit` over
+  `LATENCY_SIZES` (1K → 10M). Output:
+  `target/criterion/get_hit_latency_<size>/get_hit_latency_<size>_<impl>/`.
 
 ### Python-side benchmarks
 
@@ -62,7 +64,6 @@ Run shape and options:
 ```bash
 pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 
-uv run scripts/generate_python_chart.py
 ```
 
 ### CodSpeed CI
@@ -73,15 +74,6 @@ uv run scripts/generate_python_chart.py
 - **python** — `pytest benches/python/throughput.py --codspeed`. `pytest-codspeed` is drop-in for `pytest-benchmark`.
 
 `mean_latency.rs` is local-only. Sim counts instructions, not wallclock — `scripts/bench.sh` stays the local ground truth.
-
-### Charts
-
-- `uv run scripts/generate_speedup_chart.py` — throughput speedup bar chart
-- `uv run scripts/generate_latency_chart.py` — Criterion mean-latency line (`target/criterion/get_hit_latency_<size>`; sizes from `LATENCY_SIZES` in `benches/common.rs`).
-- `uv run scripts/generate_all_charts.py` — regenerate everything
-- `uv run scripts/generate_python_chart.py` — Python-side dict-vs-opthash speedup (reads `.benchmarks/python.json`)
-
-Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loaders, axis styling) live in `scripts/_plot_common.py`.
 
 ### Methodology
 

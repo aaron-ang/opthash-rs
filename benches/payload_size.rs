@@ -48,7 +48,7 @@ fn bench_drain_big(c: &mut Criterion) {
 
 criterion_group!(
     name = benches;
-    config = Criterion::default().with_profiler(throughput::FlamegraphProfiler::new());
+    config = Criterion::default();
     targets = bench_insert_big, bench_get_hit_big, bench_drain_big
 );
 criterion_main!(benches);

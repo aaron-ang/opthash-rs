@@ -122,7 +122,7 @@ FunnelHashMap — fixed-width buckets, overflow down the funnel
 
 ## Benchmarks
 
-See [benches/README.md](benches/README.md) for comparison charts.
+See [benches/README.md](benches/README.md) for the benchmark methodology.
 
 ## References
 
