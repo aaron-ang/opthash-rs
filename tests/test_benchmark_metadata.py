@@ -607,6 +607,23 @@ def test_paired_verify_rejects_malformed_other_target_before_comparison(
         benchmark_metadata.verify(tmp_path, "speedup", "anchor", "candidate")
 
 
+def test_verify_rejects_duplicate_registration_claims_by_other_targets(
+    tmp_path: Path,
+) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    anchor["registrations"] = ["insert/insert_elastic"]
+    make_criterion_registration(tmp_path, "insert/insert_elastic", "anchor")
+    write_metadata(tmp_path, "anchor", anchor)
+    for target in ("mean_latency", "map_api"):
+        other = other_target_metadata(anchor)
+        other["target"] = target
+        other["registrations"] = ["get_hit/get_hit_elastic"]
+        write_target_metadata(tmp_path, target, "anchor", other)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="duplicate.*ownership"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -640,6 +657,138 @@ def test_verify_allows_different_source_fingerprints(tmp_path: Path) -> None:
     values = benchmark_metadata.verify(tmp_path, "speedup", "anchor", "candidate")
 
     assert [value["source"]["after"] for value in values] == ["a" * 64, "f" * 64]
+
+
+def test_verify_current_allows_different_source_with_matching_live_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_source_tree(tmp_path / "repo")
+    criterion = tmp_path / "criterion"
+    anchor, _ = compatible_metadata_pair(criterion)
+    anchor["methodology"] = benchmark_metadata.methodology_fingerprint(repo, "speedup")
+    write_metadata(criterion, "anchor", anchor)
+    live_cpu = copy_metadata(anchor["cpu_identity"])
+    live_os = str(anchor["os"])
+    live_rustc = str(anchor["rustc_vv"])
+    monkeypatch.setattr(benchmark_metadata, "cpu_identity", lambda: live_cpu)
+    monkeypatch.setattr(benchmark_metadata.platform, "platform", lambda: live_os)
+    original_command_output = benchmark_metadata.command_output
+
+    def live_command_output(argv: list[str], cwd: Path | None = None) -> str | None:
+        if argv[:2] == ["git", "status"]:
+            return ""
+        if argv[:2] == ["rustc", "-Vv"]:
+            return live_rustc
+        return original_command_output(argv, cwd)
+
+    monkeypatch.setattr(benchmark_metadata, "command_output", live_command_output)
+
+    fingerprint = benchmark_metadata.verify_current(
+        root=criterion,
+        source_root=repo,
+        target="speedup",
+        baseline="anchor",
+        core=5,
+        forwarded_args=["--measurement-time", "10", "get_hit"],
+    )
+
+    assert fingerprint == benchmark_metadata.source_fingerprint(repo)
+    assert fingerprint != anchor["source"]["after"]
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["methodology", "core", "cpu_identity", "os", "rustc_vv", "forwarded_args"],
+)
+def test_verify_current_rejects_incompatible_live_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    repo = make_source_tree(tmp_path / "repo")
+    criterion = tmp_path / "criterion"
+    anchor, _ = compatible_metadata_pair(criterion)
+    anchor["methodology"] = benchmark_metadata.methodology_fingerprint(repo, "speedup")
+    write_metadata(criterion, "anchor", anchor)
+    live_cpu = copy_metadata(anchor["cpu_identity"])
+    live_os = str(anchor["os"])
+    live_rustc = str(anchor["rustc_vv"])
+    monkeypatch.setattr(benchmark_metadata, "cpu_identity", lambda: live_cpu)
+    monkeypatch.setattr(benchmark_metadata.platform, "platform", lambda: live_os)
+
+    def live_command_output(argv: list[str], cwd: Path | None = None) -> str | None:
+        if argv[:2] == ["git", "status"]:
+            return ""
+        if argv[:2] == ["rustc", "-Vv"]:
+            return live_rustc
+        return None
+
+    monkeypatch.setattr(benchmark_metadata, "command_output", live_command_output)
+    if field == "methodology":
+        anchor["methodology"] = "f" * 64
+    elif field == "core":
+        anchor["core"] = 7
+    elif field == "cpu_identity":
+        anchor["cpu_identity"] = fixture_cpu_identity("other-cpu")
+    elif field == "os":
+        anchor["os"] = "other-os"
+    elif field == "rustc_vv":
+        anchor["rustc_vv"] = "other-rustc"
+    else:
+        anchor["forwarded_args"] = ["get_miss"]
+    write_metadata(criterion, "anchor", anchor)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match=field):
+        benchmark_metadata.verify_current(
+            root=criterion,
+            source_root=repo,
+            target="speedup",
+            baseline="anchor",
+            core=5,
+            forwarded_args=["--measurement-time", "10", "get_hit"],
+        )
+
+
+def test_verify_current_rejects_dirty_live_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_source_tree(tmp_path / "repo")
+    criterion = tmp_path / "criterion"
+    anchor, _ = compatible_metadata_pair(criterion)
+    anchor["methodology"] = benchmark_metadata.methodology_fingerprint(repo, "speedup")
+    write_metadata(criterion, "anchor", anchor)
+    monkeypatch.setattr(
+        benchmark_metadata, "cpu_identity", lambda: anchor["cpu_identity"]
+    )
+    monkeypatch.setattr(benchmark_metadata.platform, "platform", lambda: anchor["os"])
+
+    def live_command_output(argv: list[str], cwd: Path | None = None) -> str | None:
+        if argv[:2] == ["git", "status"]:
+            return " M src/lib.rs"
+        if argv[:2] == ["rustc", "-Vv"]:
+            return str(anchor["rustc_vv"])
+        return None
+
+    monkeypatch.setattr(benchmark_metadata, "command_output", live_command_output)
+
+    with pytest.raises(
+        benchmark_metadata.MetadataError, match="live comparison requires clean"
+    ):
+        benchmark_metadata.verify_current(
+            root=criterion,
+            source_root=repo,
+            target="speedup",
+            baseline="anchor",
+            core=5,
+            forwarded_args=list(anchor["forwarded_args"]),
+        )
+
+
+def test_verify_source_rejects_change_after_live_comparison(tmp_path: Path) -> None:
+    repo = make_source_tree(tmp_path / "repo")
+    before = benchmark_metadata.source_fingerprint(repo)
+    (repo / "src/lib.rs").write_text("// changed during run\n")
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="source changed"):
+        benchmark_metadata.verify_source(repo, before)
 
 
 def test_verify_rejects_source_change_during_baseline(tmp_path: Path) -> None:
@@ -792,6 +941,32 @@ def test_verify_rejects_incomplete_or_extended_sidecar_shape(
 def test_verify_rejects_malformed_cpu_identity(tmp_path: Path) -> None:
     anchor, _ = compatible_metadata_pair(tmp_path)
     anchor["cpu_identity"]["sha256"] = "0" * 64
+    write_metadata(tmp_path, "anchor", anchor)
+
+    with pytest.raises(benchmark_metadata.MetadataError, match="anchor.*cpu_identity"):
+        benchmark_metadata.verify(tmp_path, "speedup", "anchor")
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"Architecture": "x86_64"},
+        {"Model name": "fixture-cpu"},
+        {"Architecture": "", "Model name": "fixture-cpu"},
+        {"Architecture": "x86_64", "Model name": "   "},
+        {"Architecture": "aarch64", "Processor": ""},
+    ],
+)
+def test_verify_rejects_partial_or_empty_cpu_identity_fields(
+    tmp_path: Path, fields: dict[str, str]
+) -> None:
+    anchor, _ = compatible_metadata_pair(tmp_path)
+    canonical = json.dumps(fields, separators=(",", ":"), sort_keys=True).encode()
+    anchor["cpu_identity"] = {
+        "algorithm": "sha256_canonical_cpu_fields_v1",
+        "fields": fields,
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+    }
     write_metadata(tmp_path, "anchor", anchor)
 
     with pytest.raises(benchmark_metadata.MetadataError, match="anchor.*cpu_identity"):

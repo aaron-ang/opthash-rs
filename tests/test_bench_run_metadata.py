@@ -3,6 +3,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -70,7 +72,7 @@ printf 'cargo\n' >> "$EVENT_LOG"
             {"BASELINE": "anchor"},
             ("", "", "anchor"),
             ["--baseline", "anchor"],
-            ["verify"],
+            ["verify-current", "verify-source"],
         ),
         (
             {"LOAD": "candidate", "BASELINE": "anchor"},
@@ -140,7 +142,9 @@ printf 'cargo\n' >> "$EVENT_LOG"
                 *expected_commands[1:],
             ]
             assert all(
-                command[command.index("--target") + 1] == target for command in commands
+                command[command.index("--target") + 1] == target
+                for command in commands
+                if "--target" in command
             )
             first = commands[0]
             if first[0] == "begin":
@@ -150,9 +154,15 @@ printf 'cargo\n' >> "$EVENT_LOG"
             elif "LOAD" in overrides:
                 assert first[first.index("--baseline") + 1] == "candidate"
                 assert first[first.index("--compare") + 1] == "anchor"
+                assert "--require-clean" in first
             else:
                 assert first[first.index("--baseline") + 1] == "anchor"
                 assert "--compare" not in first
+                assert first[first.index("--core") + 1] == "0"
+                assert commands[1][0] == "verify-source"
+                assert commands[1][commands[1].index("--source-before") + 1] == (
+                    "source-before"
+                )
 
 
 def test_bench_script_can_lock_a_read_only_shared_core_directory(
@@ -387,7 +397,7 @@ printf 'cargo\n' >> "$EVENT_LOG"
 
     cases = [
         ({"SAVE": "candidate"}, ["begin", "publish"]),
-        ({"BASELINE": "anchor"}, ["verify"]),
+        ({"BASELINE": "anchor"}, ["verify-current", "verify-source"]),
         (
             {"LOAD": "candidate", "BASELINE": "anchor"},
             ["verify"],
@@ -460,9 +470,13 @@ printf 'cargo\n' >> "$EVENT_LOG"
         elif "LOAD" in overrides:
             assert first[first.index("--baseline") + 1] == "candidate"
             assert first[first.index("--compare") + 1] == "anchor"
+            assert "--require-clean" in first
         else:
             assert first[first.index("--baseline") + 1] == "anchor"
             assert "--compare" not in first
+            assert first[first.index("--core") + 1] == "5"
+            assert first[first.index("--forwarded-arg") + 1] == ("--measurement-time")
+            assert commands[1][0] == "verify-source"
         assert capture_args.read_text().splitlines()[-2:] == [
             "--measurement-time",
             "10",
@@ -582,6 +596,147 @@ def test_bench_script_saves_all_sidecars_without_linux_pinning(tmp_path: Path) -
     ] == ["0", "0"]
 
 
+def test_live_baseline_validation_failure_prevents_cargo(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "cargo-ran"
+    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Darwin\n")
+    _write_executable(bin_dir / "cargo", '#!/bin/sh\n: > "$CARGO_MARKER"\n')
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+            "BENCH": "speedup",
+            "BASELINE": "anchor",
+            "CARGO_MARKER": str(marker),
+            "METADATA_LOG": str(tmp_path / "metadata-log"),
+            "EVENT_LOG": str(tmp_path / "event-log"),
+            "FAIL_METADATA_COMMAND": "verify-current",
+            "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "scripts/bench.sh"],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 19
+    assert not marker.exists()
+    commands = [
+        json.loads(line)
+        for line in (tmp_path / "metadata-log").read_text().splitlines()
+    ]
+    assert [command[0] for command in commands] == ["verify-current"]
+
+
+def test_bench_script_rejects_symlinked_criterion_root_lock(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "cargo-ran"
+    criterion_root = tmp_path / "criterion"
+    lock_parent = criterion_root / ".opthash"
+    lock_parent.mkdir(parents=True)
+    (lock_parent / "benchmark-root.lock").symlink_to(tmp_path / "elsewhere")
+    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Darwin\n")
+    _write_executable(bin_dir / "cargo", '#!/bin/sh\n: > "$CARGO_MARKER"\n')
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+            "BENCH": "speedup",
+            "SAVE": "candidate",
+            "OPTHASH_CRITERION_ROOT": str(criterion_root),
+            "CARGO_MARKER": str(marker),
+            "METADATA_LOG": str(tmp_path / "metadata-log"),
+            "EVENT_LOG": str(tmp_path / "event-log"),
+            "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "scripts/bench.sh"],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "unsafe Criterion root lock" in result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX flock semantics")
+def test_criterion_root_lock_serializes_different_core_runs(tmp_path: Path) -> None:
+    import fcntl
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "cargo-ran"
+    criterion_root = tmp_path / "criterion"
+    lock_parent = criterion_root / ".opthash"
+    lock_parent.mkdir(parents=True)
+    root_lock = lock_parent / "benchmark-root.lock"
+    root_lock.mkdir()
+    lock_fd = os.open(root_lock, os.O_RDONLY)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Darwin\n")
+    _write_executable(bin_dir / "cargo", '#!/bin/sh\n: > "$CARGO_MARKER"\n')
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+            "BENCH": "speedup",
+            "SAVE": "candidate",
+            "OPTHASH_CRITERION_ROOT": str(criterion_root),
+            "CARGO_MARKER": str(marker),
+            "METADATA_LOG": str(tmp_path / "metadata-log"),
+            "EVENT_LOG": str(tmp_path / "event-log"),
+            "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
+        }
+    )
+
+    process = subprocess.Popen(
+        ["bash", "scripts/bench.sh"],
+        cwd=REPO_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stderr is not None
+        saw_wait = False
+        for line in process.stderr:
+            if "waiting for Criterion root lock" in line:
+                saw_wait = True
+                break
+        assert saw_wait
+        assert process.poll() is None
+        assert not marker.exists()
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        _, stderr = process.communicate(timeout=5)
+        assert process.returncode == 0, stderr
+        assert marker.exists()
+    finally:
+        os.close(lock_fd)
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
 def _write_fake_metadata_helper(path: Path) -> None:
     _write_executable(
         path,
@@ -599,8 +754,10 @@ with Path(os.environ["EVENT_LOG"]).open("a") as stream:
 if environment_log := os.environ.get("METADATA_ENVIRONMENT_LOG"):
     with Path(environment_log).open("a") as stream:
         stream.write(os.environ.get("CRITERION_HOME", "<unset>") + "\\n")
-if args[0] == "begin":
+if args[0] in {"begin", "verify-current"}:
     print("source-before")
+if args[0] == os.environ.get("FAIL_METADATA_COMMAND"):
+    raise SystemExit(19)
 """,
     )
 

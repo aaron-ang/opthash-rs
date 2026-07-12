@@ -94,11 +94,13 @@ f["key"] = 42
 ## Benchmarks
 
 Use `scripts/bench.sh` for pinned, serialized wall-clock evidence; raw
-`cargo bench` is intended only for smoke iteration. The harness locks its CPU,
-writes compact metadata sidecars for every explicit Criterion target, and keeps
-randomized hit traces separate from sequential locality controls. Save named
-baselines and inspect their raw Criterion JSON directly; `scaled_insert` is
-sidecar-tracked but remains outside `BENCH=all`.
+`cargo bench` is intended only for smoke iteration. The harness locks its CPU
+and Criterion root, writes compact metadata sidecars for every explicit target,
+and keeps randomized hit traces separate from sequential locality controls.
+Comparisons require clean, compatible evidence; live comparisons validate the
+current environment before Cargo and reject source changes during it. Save
+named baselines and inspect their raw Criterion JSON directly; `scaled_insert`
+is sidecar-tracked but remains outside `BENCH=all`.
 
 See the [benchmark guide](https://github.com/aaron-ang/opthash-rs/blob/main/benches/README.md)
 for the throughput, latency, and scaled-insert workflows.

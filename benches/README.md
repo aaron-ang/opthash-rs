@@ -1,9 +1,12 @@
 # Benchmarks
 
 Use [`scripts/bench.sh`](../scripts/bench.sh) for evidence. It pins and locks
-one CPU, disables ASLR on Linux, records compact metadata sidecars for every
-explicit Criterion target, and rejects incompatible stored comparisons. Raw
-`cargo bench` is for smoke iteration only.
+one CPU, locks the shared Criterion root, disables ASLR on Linux, records compact
+metadata sidecars for every explicit Criterion target, and rejects dirty or
+incompatible comparisons. A live `BASELINE` comparison validates current
+methodology, arguments, CPU/core, OS, rustc, and source cleanliness before
+Cargo, then confirms that the source fingerprint did not change. Raw `cargo
+bench` is for smoke iteration only.
 
 ## Named runs
 

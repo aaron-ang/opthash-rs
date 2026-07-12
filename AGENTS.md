@@ -26,7 +26,7 @@ Criterion suite comparing `ElasticHashMap`, `FunnelHashMap`, `std::HashMap`, `ha
 
 Use `scripts/bench.sh` for benchmark results you will act on. Raw `cargo bench` is unpinned; wall-clock noise can swing and flip the sign of real changes. Use raw cargo only for smoke runs or single-filter iteration.
 
-For A/B comparisons, save a known anchor, save each changed tree as a named variant, then compare stored runs offline with `LOAD` and `BASELINE`. Refresh `ref` when intentionally updating the default anchor after environment or benchmark-fixture changes.
+For A/B comparisons, save a known anchor, save each changed tree as a named variant, then compare stored runs offline with `LOAD` and `BASELINE`. Comparisons require clean stored sidecars. A live `BASELINE` run additionally requires a clean source tree, validates its methodology, forwarded arguments, CPU/core, OS, and rustc before Cargo, and rejects source changes during Cargo. Refresh `ref` when intentionally updating the default anchor after environment or benchmark-fixture changes.
 
 ```bash
 SAVE=anchor scripts/bench.sh                # measure known baseline
@@ -55,6 +55,7 @@ Run shape and options:
 
 - Wraps `cargo bench` with `taskset` (core pin), `setarch -R` (ASLR off), `chrt -b` (scheduler batch), and `numactl` (NUMA bind, multi-node only) — no privileges. `sudo` adds `nice -20`, `prlimit` memlock; drops back to invoking user for cargo.
 - Every Linux run acquires `/tmp/opthash-bench-core-<n>.lock`, including when `CORE=<n>` is explicit. `CORE` must name one CPU; concurrent runs targeting it block instead of contaminating each other.
+- Every run also holds a lock under its Criterion root for the script's lifetime, so different-core runs cannot race shared registrations or metadata.
 - `BENCH=all` (default) runs `speedup`, then `mean_latency`; set `BENCH=speedup|mean_latency` for one target.
 - Other `[[bench]]` targets are not in `all`; run explicitly via
   `BENCH=<name>`: `set_ops`, `map_api`, `load_factor`, `payload_size`, and

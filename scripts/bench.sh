@@ -28,6 +28,7 @@
 #                    against BASELINE (defaults to ref).
 #   OPTHASH_CRITERION_ROOT=
 #                    overrides Criterion's output and metadata root together.
+#                    The root is globally locked for the script's lifetime.
 #
 # Common workflows:
 #   scripts/bench.sh                      # save baseline "ref"
@@ -60,6 +61,44 @@ fi
 # sticky directory lets sudo and non-sudo invocations open the same inode
 # without requiring a shared writable file.
 LOCK_DIR=${LOCK_DIR:-/tmp}
+
+# Criterion registrations and their ownership sidecars share one mutable root.
+# Hold one root-wide lock for the entire script so runs on different CPU locks
+# cannot concurrently invalidate, measure, or verify the same stored state.
+claim_criterion_root_lock() {
+	local lock_parent="$CRITERION_ROOT/.opthash"
+	local lock="$lock_parent/benchmark-root.lock"
+	if [[ -L "$lock_parent" ]]; then
+		echo "error: unsafe Criterion metadata directory $lock_parent" >&2
+		exit 1
+	fi
+	if ! mkdir -p "$lock_parent" 2>/dev/null && [[ ! -d "$lock_parent" ]]; then
+		echo "error: cannot create Criterion metadata directory $lock_parent" >&2
+		exit 1
+	fi
+	if [[ -L "$lock" ]]; then
+		echo "error: unsafe Criterion root lock $lock" >&2
+		exit 1
+	fi
+	if [[ ! -e "$lock" ]] && ! mkdir -m 0755 "$lock" 2>/dev/null && [[ ! -e "$lock" ]]; then
+		echo "error: cannot create Criterion root lock $lock" >&2
+		exit 1
+	fi
+	if [[ -L "$lock" || ! -d "$lock" ]]; then
+		echo "error: unsafe Criterion root lock $lock" >&2
+		exit 1
+	fi
+	if ! (exec {fd}<"$lock") 2>/dev/null; then
+		echo "error: cannot open Criterion root lock $lock" >&2
+		exit 1
+	fi
+	exec {CRITERION_LOCK_FD}<"$lock"
+	echo "info: waiting for Criterion root lock..." >&2
+	flock "$CRITERION_LOCK_FD"
+	echo "info: acquired Criterion root lock" >&2
+}
+
+claim_criterion_root_lock
 
 # Low-noise primitives below are Linux-only; elsewhere we fall through to
 # plain `cargo bench`.
@@ -249,13 +288,17 @@ for target in "${bench_targets[@]}"; do
 		begin_args=(begin --root "$CRITERION_ROOT" --source-root "$REPO_ROOT"
 			--target "$target" --baseline "$metadata_save")
 		source_before=$("${launcher[@]}" "${metadata_helper[@]}" "${begin_args[@]}")
-	elif [[ -n "$metadata_compare" ]]; then
+	elif [[ -n "$metadata_load" ]]; then
 		verify_args=(verify --root "$CRITERION_ROOT" --target "$target"
-			--baseline "${metadata_load:-$metadata_compare}")
-		if [[ -n "$metadata_load" ]]; then
-			verify_args+=(--compare "$metadata_compare")
-		fi
+			--baseline "$metadata_load" --compare "$metadata_compare" --require-clean)
 		"${launcher[@]}" "${metadata_helper[@]}" "${verify_args[@]}"
+	elif [[ -n "$metadata_compare" ]]; then
+		verify_args=(verify-current --root "$CRITERION_ROOT" --source-root "$REPO_ROOT"
+			--target "$target" --baseline "$metadata_compare" --core "$core")
+		for arg in "${forward_args[@]}"; do
+			verify_args+=(--forwarded-arg "$arg")
+		done
+		source_before=$("${launcher[@]}" "${metadata_helper[@]}" "${verify_args[@]}")
 	fi
 
 	env_args=(
@@ -272,12 +315,18 @@ for target in "${bench_targets[@]}"; do
 		exit "$status"
 	fi
 	if [[ -n "$source_before" ]]; then
-		publish_args=(publish --root "$CRITERION_ROOT" --source-root "$REPO_ROOT"
-			--target "$target" --baseline "$metadata_save" --source-before "$source_before"
-			--requested-bench "$BENCH" --core "$core")
-		for arg in "${forward_args[@]}"; do
-			publish_args+=(--forwarded-arg "$arg")
-		done
-		"${launcher[@]}" "${metadata_helper[@]}" "${publish_args[@]}"
+		if [[ -n "$metadata_save" ]]; then
+			publish_args=(publish --root "$CRITERION_ROOT" --source-root "$REPO_ROOT"
+				--target "$target" --baseline "$metadata_save" --source-before "$source_before"
+				--requested-bench "$BENCH" --core "$core")
+			for arg in "${forward_args[@]}"; do
+				publish_args+=(--forwarded-arg "$arg")
+			done
+			"${launcher[@]}" "${metadata_helper[@]}" "${publish_args[@]}"
+		else
+			verify_source_args=(verify-source --source-root "$REPO_ROOT"
+				--source-before "$source_before")
+			"${launcher[@]}" "${metadata_helper[@]}" "${verify_source_args[@]}"
+		fi
 	fi
 done

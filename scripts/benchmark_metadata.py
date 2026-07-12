@@ -30,6 +30,7 @@ CPU_IDENTITY_FIELDS = {
     "Thread(s) per core",
     "NUMA node(s)",
 }
+CPU_DISCRIMINATOR_FIELDS = {"Model name", "Processor"}
 TARGET_FILES = {
     "speedup": ("benches/speedup.rs",),
     "mean_latency": ("benches/mean_latency.rs",),
@@ -124,10 +125,12 @@ def methodology_fingerprint(source_root: Path, target: str) -> str:
     return hash_paths(source_root, paths)
 
 
-def other_target_registrations(root: Path, target: str, baseline: str) -> set[str]:
+def other_target_registration_owners(
+    root: Path, target: str, baseline: str
+) -> dict[str, str]:
     current_sidecar = metadata_path(root, target, baseline)
     metadata_root = current_sidecar.parent.parent
-    registrations: set[str] = set()
+    owners: dict[str, str] = {}
     for sidecar in sorted(metadata_root.glob(f"*/{baseline}.json")):
         if sidecar == current_sidecar:
             continue
@@ -146,14 +149,21 @@ def other_target_registrations(root: Path, target: str, baseline: str) -> set[st
             ) from error
         if value["target"] != sidecar_target:
             raise MetadataError(f"invalid ownership metadata in {sidecar}")
-        registrations.update(value["registrations"])
-    return registrations
+        for registration in value["registrations"]:
+            previous = owners.get(registration)
+            if previous is not None:
+                raise MetadataError(
+                    "duplicate registration ownership for "
+                    f"{registration!r}: {previous!r} and {sidecar_target!r}"
+                )
+            owners[registration] = sidecar_target
+    return owners
 
 
 def begin(root: Path, source_root: Path, target: str, baseline: str) -> str:
     root = root.resolve()
     sidecar = metadata_path(root, target, baseline)
-    protected = other_target_registrations(root, target, baseline)
+    protected = other_target_registration_owners(root, target, baseline)
     sidecar.unlink(missing_ok=True)
     for directory in root.glob(f"*/*/{baseline}"):
         registration = "/".join(directory.relative_to(root).parts[:2])
@@ -181,7 +191,7 @@ def target_registrations(root: Path, target: str, baseline: str) -> list[str]:
     return measured_registrations(
         root,
         baseline,
-        exclude=other_target_registrations(root, target, baseline),
+        exclude=set(other_target_registration_owners(root, target, baseline)),
     )
 
 
@@ -260,27 +270,7 @@ def _validate_metadata(value: object, name: str) -> None:
         _invalid_metadata(name, "registrations")
 
     cpu = value["cpu_identity"]
-    if not isinstance(cpu, dict) or set(cpu) != CPU_IDENTITY_METADATA_FIELDS:
-        _invalid_metadata(name, "cpu_identity")
-    fields = cpu["fields"]
-    if (
-        cpu["algorithm"] != "sha256_canonical_cpu_fields_v1"
-        or not isinstance(fields, dict)
-        or not fields
-        or any(
-            not isinstance(field, str)
-            or not field
-            or field not in CPU_IDENTITY_FIELDS | {"Processor"}
-            or not isinstance(field_value, str)
-            for field, field_value in fields.items()
-        )
-        or not isinstance(cpu["sha256"], str)
-        or SHA256.fullmatch(cpu["sha256"]) is None
-    ):
-        _invalid_metadata(name, "cpu_identity")
-    canonical_cpu = json.dumps(fields, separators=(",", ":"), sort_keys=True).encode()
-    if cpu["sha256"] != hashlib.sha256(canonical_cpu).hexdigest():
-        _invalid_metadata(name, "cpu_identity")
+    _validate_cpu_identity(cpu, name)
 
     core = value["core"]
     if type(core) is not int or core < 0:
@@ -299,6 +289,37 @@ def _validate_metadata(value: object, name: str) -> None:
         _invalid_metadata(name, "measured_at_utc")
     if measured_datetime.utcoffset() != timezone.utc.utcoffset(measured_datetime):
         _invalid_metadata(name, "measured_at_utc")
+
+
+def _validate_cpu_identity(cpu: object, name: str) -> None:
+    if not isinstance(cpu, dict) or set(cpu) != CPU_IDENTITY_METADATA_FIELDS:
+        _invalid_metadata(name, "cpu_identity")
+    fields = cpu["fields"]
+    if (
+        cpu["algorithm"] != "sha256_canonical_cpu_fields_v1"
+        or not isinstance(fields, dict)
+        or not fields
+        or any(
+            type(field) is not str
+            or not field
+            or field not in CPU_IDENTITY_FIELDS | {"Processor"}
+            or type(field_value) is not str
+            or not field_value.strip()
+            for field, field_value in fields.items()
+        )
+        or type(fields.get("Architecture")) is not str
+        or not fields["Architecture"].strip()
+        or not any(
+            type(fields.get(field)) is str and fields[field].strip()
+            for field in CPU_DISCRIMINATOR_FIELDS
+        )
+        or not isinstance(cpu["sha256"], str)
+        or SHA256.fullmatch(cpu["sha256"]) is None
+    ):
+        _invalid_metadata(name, "cpu_identity")
+    canonical_cpu = json.dumps(fields, separators=(",", ":"), sort_keys=True).encode()
+    if cpu["sha256"] != hashlib.sha256(canonical_cpu).hexdigest():
+        _invalid_metadata(name, "cpu_identity")
 
 
 def verify(
@@ -337,6 +358,49 @@ def verify(
     return values
 
 
+def verify_current(
+    *,
+    root: Path,
+    source_root: Path,
+    target: str,
+    baseline: str,
+    core: int,
+    forwarded_args: list[str],
+) -> str:
+    stored = verify(root, target, baseline, require_clean=True)[0]
+    git_status = command_output(["git", "status", "--porcelain"], source_root)
+    if git_status is None:
+        raise MetadataError("cannot determine live source cleanliness")
+    if git_status:
+        raise MetadataError("live comparison requires clean source")
+    current: dict[str, object] = {
+        "methodology": methodology_fingerprint(source_root, target),
+        "core": core,
+        "cpu_identity": cpu_identity(),
+        "os": platform.platform(),
+        "rustc_vv": command_output(["rustc", "-Vv"]),
+        "forwarded_args": list(forwarded_args),
+    }
+    _validate_cpu_identity(current["cpu_identity"], "live source")
+    for field in ("os", "rustc_vv"):
+        field_value = current[field]
+        if not isinstance(field_value, str) or not field_value:
+            raise MetadataError(f"invalid live benchmark context field: {field}")
+    for field, field_value in current.items():
+        if stored[field] != field_value:
+            raise MetadataError(f"incompatible live benchmark metadata field: {field}")
+    return source_fingerprint(source_root)
+
+
+def verify_source(source_root: Path, source_before: str) -> str:
+    if SHA256.fullmatch(source_before) is None:
+        raise MetadataError("invalid pre-run source fingerprint")
+    source_after = source_fingerprint(source_root)
+    if source_before != source_after:
+        raise MetadataError("source changed during benchmark run")
+    return source_after
+
+
 def command_output(argv: list[str], cwd: Path | None = None) -> str | None:
     try:
         completed = subprocess.run(
@@ -370,12 +434,15 @@ def cpu_identity() -> dict[str, object]:
                     continue
                 field = field.rstrip(":")
                 if field in CPU_IDENTITY_FIELDS:
-                    fields[field] = data.strip()
-    if not fields:
-        fields = {
-            "Architecture": platform.machine().lower(),
-            "Processor": platform.processor(),
-        }
+                    data = data.strip()
+                    if data:
+                        fields[field] = data
+    architecture = platform.machine().lower().strip()
+    processor = platform.processor().strip()
+    if "Architecture" not in fields and architecture:
+        fields["Architecture"] = architecture
+    if not CPU_DISCRIMINATOR_FIELDS.intersection(fields) and processor:
+        fields["Processor"] = processor
     canonical = json.dumps(fields, separators=(",", ":"), sort_keys=True).encode()
     return {
         "algorithm": "sha256_canonical_cpu_fields_v1",
@@ -465,6 +532,13 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--baseline", required=True)
     verify_parser.add_argument("--compare")
     verify_parser.add_argument("--require-clean", action="store_true")
+    verify_current_parser = subparsers.add_parser("verify-current")
+    _add_baseline_arguments(verify_current_parser)
+    verify_current_parser.add_argument("--core", type=int, required=True)
+    verify_current_parser.add_argument("--forwarded-arg", action="append", default=[])
+    verify_source_parser = subparsers.add_parser("verify-source")
+    verify_source_parser.add_argument("--source-root", type=Path, required=True)
+    verify_source_parser.add_argument("--source-before", required=True)
     return parser
 
 
@@ -496,6 +570,19 @@ def main(argv: list[str] | None = None) -> int:
             require_clean=args.require_clean,
         )
         print(json.dumps(values, sort_keys=True))
+    elif args.command == "verify-current":
+        print(
+            verify_current(
+                root=args.root,
+                source_root=args.source_root,
+                target=args.target,
+                baseline=args.baseline,
+                core=args.core,
+                forwarded_args=args.forwarded_arg,
+            )
+        )
+    elif args.command == "verify-source":
+        print(verify_source(args.source_root, args.source_before))
     return 0
 
 
