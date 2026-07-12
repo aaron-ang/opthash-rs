@@ -24,15 +24,15 @@ use crate::{ElasticHashMap, ElasticHashSet, FunnelHashMap, FunnelHashSet, Reserv
 
 fn parse_reserve(
     reserve_fraction: Option<f64>,
-    delta_log2: Option<u32>,
+    reserve_exponent: Option<u32>,
 ) -> PyResult<ReserveFraction> {
-    if reserve_fraction.is_some() && delta_log2.is_some() {
+    if reserve_fraction.is_some() && reserve_exponent.is_some() {
         return Err(PyValueError::new_err(
-            "reserve_fraction and delta_log2 are mutually exclusive",
+            "reserve_fraction and reserve_exponent are mutually exclusive",
         ));
     }
-    if let Some(delta_log2) = delta_log2 {
-        return ReserveFraction::from_delta_log2(delta_log2)
+    if let Some(reserve_exponent) = reserve_exponent {
+        return ReserveFraction::from_exponent(reserve_exponent)
             .map_err(|error| PyValueError::new_err(error.to_string()));
     }
     if let Some(reserve_fraction) = reserve_fraction {
@@ -44,19 +44,19 @@ fn parse_reserve(
 
 fn validate_elastic_reserve_fraction(
     reserve_fraction: Option<f64>,
-    delta_log2: Option<u32>,
+    reserve_exponent: Option<u32>,
 ) -> PyResult<ReserveFraction> {
-    parse_reserve(reserve_fraction, delta_log2)
+    parse_reserve(reserve_fraction, reserve_exponent)
 }
 
 fn validate_funnel_reserve_fraction(
     reserve_fraction: Option<f64>,
-    delta_log2: Option<u32>,
+    reserve_exponent: Option<u32>,
 ) -> PyResult<ReserveFraction> {
-    let reserve = parse_reserve(reserve_fraction, delta_log2)?;
-    if reserve.delta_log2() < 3 {
+    let reserve = parse_reserve(reserve_fraction, reserve_exponent)?;
+    if reserve.exponent() < 3 {
         return Err(PyValueError::new_err(
-            "Funnel reserve must be at most 1/8 (delta_log2 >= 3)",
+            "Funnel reserve must be at most 1/8 (reserve_exponent >= 3)",
         ));
     }
     Ok(reserve)
@@ -663,14 +663,14 @@ macro_rules! define_map_classes {
             }
 
             #[classmethod]
-            #[pyo3(signature = (capacity = 0, reserve_fraction = None, delta_log2 = None))]
+            #[pyo3(signature = (capacity = 0, reserve_fraction = None, reserve_exponent = None))]
             fn with_options(
                 _cls: &Bound<PyType>,
                 capacity: usize,
                 reserve_fraction: Option<f64>,
-                delta_log2: Option<u32>,
+                reserve_exponent: Option<u32>,
             ) -> PyResult<Self> {
-                let reserve = $validate_rf(reserve_fraction, delta_log2)?;
+                let reserve = $validate_rf(reserve_fraction, reserve_exponent)?;
                 Ok(Self {
                     inner: $Inner::with_capacity_and_reserve(capacity, reserve),
                     generation: 0,
@@ -1491,14 +1491,14 @@ macro_rules! define_set_classes {
             }
 
             #[classmethod]
-            #[pyo3(signature = (capacity = 0, reserve_fraction = None, delta_log2 = None))]
+            #[pyo3(signature = (capacity = 0, reserve_fraction = None, reserve_exponent = None))]
             fn with_options(
                 _cls: &Bound<PyType>,
                 capacity: usize,
                 reserve_fraction: Option<f64>,
-                delta_log2: Option<u32>,
+                reserve_exponent: Option<u32>,
             ) -> PyResult<Self> {
-                let reserve = $validate_rf(reserve_fraction, delta_log2)?;
+                let reserve = $validate_rf(reserve_fraction, reserve_exponent)?;
                 Ok(Self {
                     inner: $Inner::with_capacity_and_reserve(capacity, reserve),
                     generation: 0,

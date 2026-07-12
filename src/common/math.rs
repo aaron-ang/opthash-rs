@@ -35,8 +35,8 @@ pub(crate) mod capacity {
 mod tests {
     use super::*;
 
-    const fn reserve(delta_log2: u32) -> crate::ReserveFraction {
-        match crate::ReserveFraction::from_delta_log2(delta_log2) {
+    const fn reserve(reserve_exponent: u32) -> crate::ReserveFraction {
+        match crate::ReserveFraction::from_exponent(reserve_exponent) {
             Ok(reserve) => reserve,
             Err(_) => panic!("test exponent must be positive"),
         }

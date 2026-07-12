@@ -62,8 +62,8 @@ def test_funnel_with_options_accept_max_reserve_fraction():
 
 
 @pytest.mark.parametrize("map_cls", [opthash.ElasticHashMap, opthash.FunnelHashMap])
-def test_with_options_accepts_exact_delta_log2(map_cls):
-    m = map_cls.with_options(capacity=64, delta_log2=4)
+def test_with_options_accepts_exact_reserve_exponent(map_cls):
+    m = map_cls.with_options(capacity=64, reserve_exponent=4)
     m["x"] = 1
     assert m["x"] == 1
 
@@ -71,4 +71,4 @@ def test_with_options_accepts_exact_delta_log2(map_cls):
 @pytest.mark.parametrize("map_cls", [opthash.ElasticHashMap, opthash.FunnelHashMap])
 def test_with_options_rejects_two_reserve_representations(map_cls):
     with pytest.raises(ValueError):
-        map_cls.with_options(reserve_fraction=0.125, delta_log2=3)
+        map_cls.with_options(reserve_fraction=0.125, reserve_exponent=3)

@@ -150,7 +150,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
             let free_next = self.levels[next] - self.occupancy[next];
             let current_threshold = scalar_floor_div_pow2(
                 self.levels[current],
-                self.config.delta_log2().saturating_add(1),
+                self.config.reserve_exponent().saturating_add(1),
             );
             let next_threshold = self.levels[next] / 4;
             let current_low = free_current <= current_threshold;
@@ -191,7 +191,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
                 let budget = elastic_dyadic_probe_budget(
                     free_current,
                     self.levels[current],
-                    self.config.delta_log2(),
+                    self.config.reserve_exponent(),
                     self.limits.probe_budget_c.get(),
                 )
                 .expect("scalar Elastic probe budget must be representable");

@@ -9,9 +9,9 @@ pub enum TryBuildError {
     /// A floating-point compatibility input was not an exact dyadic fraction.
     InvalidReserveFraction(ReserveFractionError),
     /// Funnel Hashing requires `delta <= 1/8`.
-    FunnelDeltaLog2BelowMinimum {
+    FunnelExponentBelowMinimum {
         /// Rejected exponent in `delta = 1 / 2^d`.
-        delta_log2: u32,
+        reserve_exponent: u32,
         /// Smallest exponent supported by Funnel Hashing.
         minimum: u32,
     },
@@ -25,12 +25,12 @@ impl fmt::Display for TryBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidReserveFraction(error) => error.fmt(f),
-            Self::FunnelDeltaLog2BelowMinimum {
-                delta_log2,
+            Self::FunnelExponentBelowMinimum {
+                reserve_exponent,
                 minimum,
             } => write!(
                 f,
-                "Funnel reserve exponent {delta_log2} is below the minimum {minimum}"
+                "Funnel reserve exponent {reserve_exponent} is below the minimum {minimum}"
             ),
             Self::CapacityOverflow => f.write_str("capacity overflow"),
             Self::AllocError => f.write_str("memory allocation failed"),

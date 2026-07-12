@@ -668,7 +668,7 @@ pub(crate) enum ElasticProbeBudgetError {
 /// Computes the conservative dyadic Elastic probe-budget convention.
 ///
 /// Let `k = ceil(log2(level_slots / free_slots))`, computed without floating
-/// point. This function returns `c * min(k^2, delta_log2)`. In particular, the
+/// point. This function returns `c * min(k^2, reserve_exponent)`. In particular, the
 /// ceiling is taken before squaring. Thus `k^2` is generally not
 /// `ceil(log2(level_slots / free_slots)^2)`, and this API does not claim to be
 /// the exact ceiling of the paper's real-valued formula. The paper leaves its
@@ -678,7 +678,7 @@ pub(crate) enum ElasticProbeBudgetError {
 ///
 /// More precisely, let `L = log2(level_slots / free_slots)`. The dyadic term is
 /// always conservative because
-/// `min(L^2, delta_log2) <= min(ceil(L)^2, delta_log2)`. On an actual Elastic
+/// `min(L^2, reserve_exponent) <= min(ceil(L)^2, reserve_exponent)`. On an actual Elastic
 /// state satisfying `L >= 2`, `ceil(L) <= 3*L/2`, so the capped dyadic term is
 /// between `1` and `9/4` times the capped real term. There is no global
 /// constant-factor relation over every valid free-slot count: as positive `L`
@@ -701,7 +701,7 @@ pub(crate) enum ElasticProbeBudgetError {
 pub(crate) const fn elastic_dyadic_probe_budget(
     free_slots: usize,
     level_slots: usize,
-    delta_log2: u32,
+    reserve_exponent: u32,
     c: usize,
 ) -> Result<usize, ElasticProbeBudgetError> {
     if free_slots == 0 || free_slots > level_slots {
@@ -727,10 +727,10 @@ pub(crate) const fn elastic_dyadic_probe_budget(
     let Some(log_squared) = log_ceiling.checked_mul(log_ceiling) else {
         return Err(ElasticProbeBudgetError::Overflow);
     };
-    let capped = if log_squared < delta_log2 as usize {
+    let capped = if log_squared < reserve_exponent as usize {
         log_squared
     } else {
-        delta_log2 as usize
+        reserve_exponent as usize
     };
     let Some(budget) = c.checked_mul(capped) else {
         return Err(ElasticProbeBudgetError::Overflow);

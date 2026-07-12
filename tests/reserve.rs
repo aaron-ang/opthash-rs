@@ -6,7 +6,7 @@ use opthash::{
 fn default_is_exactly_one_eighth() {
     let reserve = ReserveFraction::DEFAULT;
 
-    assert_eq!(reserve.delta_log2(), 3);
+    assert_eq!(reserve.exponent(), 3);
     assert_eq!(reserve.as_f64(), Some(0.125));
     assert_eq!(reserve.floor_reserved(17), 2);
     assert_eq!(reserve.floor_half_reserved(17), 1);
@@ -15,12 +15,12 @@ fn default_is_exactly_one_eighth() {
 #[test]
 fn exponent_constructor_rejects_zero_and_handles_unrepresentable_floats() {
     assert_eq!(
-        ReserveFraction::from_delta_log2(0),
-        Err(ReserveFractionError::DeltaLog2Zero)
+        ReserveFraction::from_exponent(0),
+        Err(ReserveFractionError::ExponentZero)
     );
 
-    let reserve = ReserveFraction::from_delta_log2(u32::MAX).unwrap();
-    assert_eq!(reserve.delta_log2(), u32::MAX);
+    let reserve = ReserveFraction::from_exponent(u32::MAX).unwrap();
+    assert_eq!(reserve.exponent(), u32::MAX);
     assert_eq!(reserve.as_f64(), None);
     assert_eq!(reserve.floor_reserved(usize::MAX), 0);
     assert_eq!(reserve.floor_half_reserved(usize::MAX), 0);
@@ -36,7 +36,7 @@ fn float_constructor_accepts_exact_inverse_powers_of_two() {
         (f64::from_bits(1), 1_074),
     ] {
         let reserve = ReserveFraction::try_from(value).unwrap();
-        assert_eq!(reserve.delta_log2(), exponent);
+        assert_eq!(reserve.exponent(), exponent);
         assert_eq!(reserve.as_f64(), Some(value));
     }
 }
@@ -69,11 +69,11 @@ fn float_constructor_rejects_non_inverse_powers_of_two() {
 
 #[test]
 fn integer_reserve_rounding_is_exact_at_word_boundaries() {
-    let one_half = ReserveFraction::from_delta_log2(1).unwrap();
+    let one_half = ReserveFraction::from_exponent(1).unwrap();
     assert_eq!(one_half.floor_reserved(usize::MAX), usize::MAX >> 1);
     assert_eq!(one_half.floor_half_reserved(usize::MAX), usize::MAX >> 2);
 
-    let last_nonzero = ReserveFraction::from_delta_log2(usize::BITS - 1).unwrap();
+    let last_nonzero = ReserveFraction::from_exponent(usize::BITS - 1).unwrap();
     assert_eq!(last_nonzero.floor_reserved(usize::MAX), 1);
     assert_eq!(last_nonzero.floor_half_reserved(usize::MAX), 0);
 }
@@ -85,7 +85,7 @@ fn maps_report_the_configured_reserve() {
     assert_eq!(default_elastic.reserve_fraction(), ReserveFraction::DEFAULT);
     assert_eq!(default_funnel.reserve_fraction(), ReserveFraction::DEFAULT);
 
-    let reserve = ReserveFraction::from_delta_log2(4).unwrap();
+    let reserve = ReserveFraction::from_exponent(4).unwrap();
     let elastic = ElasticHashMap::<u64, u64>::with_capacity_and_reserve(64, reserve);
     let funnel = FunnelHashMap::<u64, u64>::with_capacity_and_reserve(64, reserve);
     assert_eq!(elastic.reserve_fraction(), reserve);
@@ -106,13 +106,13 @@ fn fallible_float_compatibility_constructor_rejects_non_dyadic_input() {
 
 #[test]
 fn funnel_fallible_constructor_rejects_reserve_above_one_eighth() {
-    let reserve = ReserveFraction::from_delta_log2(2).unwrap();
+    let reserve = ReserveFraction::from_exponent(2).unwrap();
     let result = FunnelHashMap::<u64, u64>::try_with_capacity_and_reserve(64, reserve);
 
     assert!(matches!(
         result,
-        Err(TryBuildError::FunnelDeltaLog2BelowMinimum {
-            delta_log2: 2,
+        Err(TryBuildError::FunnelExponentBelowMinimum {
+            reserve_exponent: 2,
             minimum: 3
         })
     ));

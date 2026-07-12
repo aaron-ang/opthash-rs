@@ -526,7 +526,7 @@ impl ElasticGeometry {
             };
         }
 
-        let config = PaperConfig::new(total_slots, reserve_fraction.delta_log2())
+        let config = PaperConfig::new(total_slots, reserve_fraction.exponent())
             .expect("validated Elastic library geometry");
         let plan = config.elastic_plan();
         let level_capacities = plan.level_lengths().collect();
@@ -1495,7 +1495,7 @@ where
                     let budget = elastic_dyadic_probe_budget(
                         free_current,
                         current_level.capacity(),
-                        self.reserve_fraction.delta_log2(),
+                        self.reserve_fraction.exponent(),
                         ELASTIC_PROBE_BUDGET_C,
                     )
                     .ok()?;
@@ -1904,9 +1904,13 @@ mod tests {
         }
     }
 
-    fn assert_exact_trace(n: usize, delta_log2: u32, identities: impl IntoIterator<Item = u64>) {
-        let reserve = ReserveFraction::from_delta_log2(delta_log2).unwrap();
-        let config = PaperConfig::new(n, delta_log2).unwrap();
+    fn assert_exact_trace(
+        n: usize,
+        reserve_exponent: u32,
+        identities: impl IntoIterator<Item = u64>,
+    ) {
+        let reserve = ReserveFraction::from_exponent(reserve_exponent).unwrap();
+        let config = PaperConfig::new(n, reserve_exponent).unwrap();
         let plan = config.elastic_plan();
         let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
             try_with_slots_and_reserve_fraction_and_hasher_in(
@@ -1983,9 +1987,15 @@ mod tests {
     #[test]
     fn elastic_placement_matches_the_scalar_paper_model() {
         assert_exact_trace(8, 3, [0, 1, 2, 1523, 2540, 2541, 2542]);
-        for &(n, delta_log2) in &[(31, 4), (65, 6), (257, 8)] {
-            let target = PaperConfig::new(n, delta_log2).unwrap().target_insertions();
-            assert_exact_trace(n, delta_log2, (0..target).map(|identity| identity as u64));
+        for &(n, reserve_exponent) in &[(31, 4), (65, 6), (257, 8)] {
+            let target = PaperConfig::new(n, reserve_exponent)
+                .unwrap()
+                .target_insertions();
+            assert_exact_trace(
+                n,
+                reserve_exponent,
+                (0..target).map(|identity| identity as u64),
+            );
         }
     }
 
@@ -1993,7 +2003,7 @@ mod tests {
     fn compact_query_lane_tables_cover_every_supported_geometry() {
         assert_eq!(ELASTIC_LEVEL_LANES.len(), u32::BITS as usize);
         assert_eq!(
-            PaperConfig::new(MAX_ELASTIC_SLOTS, ReserveFraction::DEFAULT.delta_log2())
+            PaperConfig::new(MAX_ELASTIC_SLOTS, ReserveFraction::DEFAULT.exponent())
                 .unwrap()
                 .elastic_plan()
                 .level_count(),
@@ -2027,7 +2037,7 @@ mod tests {
         let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
             try_with_slots_and_reserve_fraction_and_hasher_in(
                 31,
-                ReserveFraction::from_delta_log2(4).unwrap(),
+                ReserveFraction::from_exponent(4).unwrap(),
                 IdentityBuildHasher,
                 Global,
             )
@@ -2102,7 +2112,7 @@ mod tests {
             );
             if geometry.total_slots >= 2 {
                 let config =
-                    PaperConfig::new(geometry.total_slots, reserve_fraction.delta_log2()).unwrap();
+                    PaperConfig::new(geometry.total_slots, reserve_fraction.exponent()).unwrap();
                 let plan = config.elastic_plan();
                 assert_eq!(
                     geometry.level_capacities,

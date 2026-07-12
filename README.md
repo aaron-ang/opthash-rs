@@ -65,7 +65,7 @@ let mut elastic = ElasticHashMap::new();
 elastic.insert("key", 42);
 assert_eq!(elastic.get("key"), Some(&42));
 
-let reserve = ReserveFraction::from_delta_log2(4).unwrap(); // delta = 1/16
+let reserve = ReserveFraction::from_exponent(4).unwrap(); // delta = 1/16
 let mut funnel = FunnelHashMap::with_capacity_and_reserve(1024, reserve);
 funnel.insert("key", 42);
 assert_eq!(funnel.remove("key"), Some(42));
@@ -83,11 +83,11 @@ pip install opthash
 ```python
 from opthash import ElasticHashMap, FunnelHashMap
 
-m = ElasticHashMap.with_options(capacity=1024, delta_log2=4)
+m = ElasticHashMap.with_options(capacity=1024, reserve_exponent=4)
 m["key"] = 42
 assert m["key"] == 42
 
-f = FunnelHashMap.with_options(capacity=1024, delta_log2=4)
+f = FunnelHashMap.with_options(capacity=1024, reserve_exponent=4)
 f["key"] = 42
 ```
 

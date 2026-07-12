@@ -67,7 +67,7 @@ impl FunnelShape {
         if n == 0 {
             return Ok(Self::empty());
         }
-        let config = PaperConfig::new(n, reserve.delta_log2())
+        let config = PaperConfig::new(n, reserve.exponent())
             .map_err(|_| TryReserveError::CapacityOverflow)?;
         let plan = config
             .funnel_plan()
@@ -130,7 +130,7 @@ impl FunnelShape {
         if requested == 0 {
             return Ok(Self::empty());
         }
-        let d = reserve.delta_log2();
+        let d = reserve.exponent();
         if !(3..usize::BITS).contains(&d) {
             return Err(TryReserveError::CapacityOverflow);
         }
@@ -436,9 +436,9 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryBuildError> {
-        if reserve_fraction.delta_log2() < 3 {
-            return Err(TryBuildError::FunnelDeltaLog2BelowMinimum {
-                delta_log2: reserve_fraction.delta_log2(),
+        if reserve_fraction.exponent() < 3 {
+            return Err(TryBuildError::FunnelExponentBelowMinimum {
+                reserve_exponent: reserve_fraction.exponent(),
                 minimum: 3,
             });
         }
@@ -1172,7 +1172,7 @@ mod tests {
     }
 
     fn raw_table(n: usize, d: u32) -> FunnelTable<u64, u64, IdentityBuildHasher> {
-        let reserve = ReserveFraction::from_delta_log2(d).unwrap();
+        let reserve = ReserveFraction::from_exponent(d).unwrap();
         FunnelTable::try_from_shape(
             FunnelShape::from_slots(n, reserve).unwrap(),
             reserve,
@@ -1192,7 +1192,7 @@ mod tests {
             (9, 10_924),
             (10, 21_856),
         ] {
-            let reserve = ReserveFraction::from_delta_log2(d).unwrap();
+            let reserve = ReserveFraction::from_exponent(d).unwrap();
             let shape = FunnelShape::for_insert_budget(1, reserve).unwrap();
             assert_eq!(shape.n, expected, "d={d}");
             assert!(PaperConfig::new(shape.n, d).unwrap().funnel_plan().is_ok());
@@ -1201,7 +1201,7 @@ mod tests {
 
     #[test]
     fn selector_reuses_a_geometry_at_its_reported_capacity() {
-        let reserve = ReserveFraction::from_delta_log2(3).unwrap();
+        let reserve = ReserveFraction::from_exponent(3).unwrap();
         for requested in 1..512 {
             let selected = FunnelShape::for_insert_budget(requested, reserve).unwrap();
             let at_capacity =
@@ -1509,7 +1509,7 @@ mod tests {
     #[test]
     fn clear_marks_each_slot_empty_before_dropping_its_value() {
         let drops = Box::leak(Box::new(AtomicUsize::new(0)));
-        let reserve = ReserveFraction::from_delta_log2(3).unwrap();
+        let reserve = ReserveFraction::from_exponent(3).unwrap();
         let shape = FunnelShape::from_slots(144, reserve).unwrap();
         let mut table = ManuallyDrop::new(
             FunnelTable::<u64, PanicOnFirstDrop, IdentityBuildHasher>::try_from_shape(
@@ -1549,7 +1549,7 @@ mod tests {
     fn failed_fallible_resize_leaves_a_valid_table() {
         let armed = Box::leak(Box::new(AtomicBool::new(false)));
         let drops = Box::leak(Box::new(AtomicUsize::new(0)));
-        let reserve = ReserveFraction::from_delta_log2(3).unwrap();
+        let reserve = ReserveFraction::from_exponent(3).unwrap();
         let shape = FunnelShape::from_slots(144, reserve).unwrap();
         let mut table = FunnelTable::<PanicHashKey, u64, IdentityBuildHasher>::try_from_shape(
             shape,
@@ -1617,7 +1617,7 @@ mod tests {
             allocations: allocations.clone(),
             deallocations: deallocations.clone(),
         };
-        let reserve = ReserveFraction::from_delta_log2(3).unwrap();
+        let reserve = ReserveFraction::from_exponent(3).unwrap();
         let shape = FunnelShape::from_slots(144, reserve).unwrap();
         assert!(matches!(
             FunnelTable::<u64, u64, IdentityBuildHasher, _>::try_from_shape(

@@ -4,12 +4,12 @@ use core::iter::FusedIterator;
 
 /// Exact fixed-size inputs shared by library placement and scalar tests.
 ///
-/// `delta` is represented as `1 / 2^delta_log2`; no floating-point value is
+/// `delta` is represented as `1 / 2^reserve_exponent`; no floating-point value is
 /// constructed or sanitized.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PaperConfig {
     n: usize,
-    delta_log2: u32,
+    reserve_exponent: u32,
 }
 
 impl PaperConfig {
@@ -18,15 +18,18 @@ impl PaperConfig {
     /// # Errors
     ///
     /// Returns [`ConfigError::NTooSmall`] when `n < 2` and
-    /// [`ConfigError::DeltaLog2Zero`] when `delta_log2 == 0`.
-    pub(crate) const fn new(n: usize, delta_log2: u32) -> Result<Self, ConfigError> {
+    /// [`ConfigError::ExponentZero`] when `reserve_exponent == 0`.
+    pub(crate) const fn new(n: usize, reserve_exponent: u32) -> Result<Self, ConfigError> {
         if n < 2 {
             return Err(ConfigError::NTooSmall { n });
         }
-        if delta_log2 == 0 {
-            return Err(ConfigError::DeltaLog2Zero);
+        if reserve_exponent == 0 {
+            return Err(ConfigError::ExponentZero);
         }
-        Ok(Self { n, delta_log2 })
+        Ok(Self {
+            n,
+            reserve_exponent,
+        })
     }
 
     /// Returns the paper array size `n`.
@@ -39,14 +42,14 @@ impl PaperConfig {
     /// Returns the exponent in the exact representation `delta = 1 / 2^d`.
     #[must_use]
     #[cfg(test)]
-    pub(crate) const fn delta_log2(&self) -> u32 {
-        self.delta_log2
+    pub(crate) const fn reserve_exponent(&self) -> u32 {
+        self.reserve_exponent
     }
 
     /// Returns `floor(delta * n)` using exact integer arithmetic.
     #[must_use]
     pub(crate) const fn floor_delta_n(&self) -> usize {
-        floor_div_pow2(self.n, self.delta_log2)
+        floor_div_pow2(self.n, self.reserve_exponent)
     }
 
     /// Returns the paper experiment's exact insertion count.
@@ -72,14 +75,14 @@ impl PaperConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`FunnelDomainError::DeltaLog2BelowMinimum`] when
-    /// `delta_log2 < 3`.
+    /// Returns [`FunnelDomainError::ExponentBelowMinimum`] when
+    /// `reserve_exponent < 3`.
     pub(crate) const fn funnel_domain_status(
         &self,
     ) -> Result<TheoremDomainStatus, FunnelDomainError> {
-        if self.delta_log2 < 3 {
-            return Err(FunnelDomainError::DeltaLog2BelowMinimum {
-                delta_log2: self.delta_log2,
+        if self.reserve_exponent < 3 {
+            return Err(FunnelDomainError::ExponentBelowMinimum {
+                reserve_exponent: self.reserve_exponent,
                 minimum: 3,
             });
         }
@@ -98,24 +101,24 @@ impl PaperConfig {
         self.funnel_domain_status()
             .map_err(FunnelPlanError::Domain)?;
 
-        let delta_log2 = u128::from(self.delta_log2);
-        let alpha = delta_log2
+        let reserve_exponent = u128::from(self.reserve_exponent);
+        let alpha = reserve_exponent
             .checked_mul(4)
             .and_then(|value| value.checked_add(10))
             .and_then(|value| usize::try_from(value).ok())
             .ok_or(FunnelPlanError::DerivedParameterOverflow {
                 parameter: FunnelPlanParameter::Alpha,
-                delta_log2: self.delta_log2,
+                reserve_exponent: self.reserve_exponent,
             })?;
-        let beta = delta_log2
+        let beta = reserve_exponent
             .checked_mul(2)
             .and_then(|value| usize::try_from(value).ok())
             .ok_or(FunnelPlanError::DerivedParameterOverflow {
                 parameter: FunnelPlanParameter::Beta,
-                delta_log2: self.delta_log2,
+                reserve_exponent: self.reserve_exponent,
             })?;
 
-        let bound_exponent = u64::from(self.delta_log2);
+        let bound_exponent = u64::from(self.reserve_exponent);
         let lower = ceil_div_pow2(self.n, bound_exponent + 1);
         let upper = floor_three_div_pow2(self.n, bound_exponent + 2);
         let loglog_ceiling = base_two_loglog_ceiling(self.n);
@@ -164,16 +167,16 @@ pub(crate) enum ConfigError {
         n: usize,
     },
     /// `delta = 1 / 2^d` was given the invalid exponent `d = 0`.
-    DeltaLog2Zero,
+    ExponentZero,
 }
 
 /// A concrete Funnel-domain restriction failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FunnelDomainError {
-    /// Funnel requires `delta <= 1/8`, or equivalently `delta_log2 >= 3`.
-    DeltaLog2BelowMinimum {
+    /// Funnel requires `delta <= 1/8`, or equivalently `reserve_exponent >= 3`.
+    ExponentBelowMinimum {
         /// The rejected exponent.
-        delta_log2: u32,
+        reserve_exponent: u32,
         /// The smallest accepted exponent.
         minimum: u32,
     },
@@ -182,9 +185,9 @@ pub(crate) enum FunnelDomainError {
 /// A derived Funnel geometry parameter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FunnelPlanParameter {
-    /// The ordinary-level count `alpha = 4 * delta_log2 + 10`.
+    /// The ordinary-level count `alpha = 4 * reserve_exponent + 10`.
     Alpha,
-    /// The ordinary bucket length `beta = 2 * delta_log2`.
+    /// The ordinary bucket length `beta = 2 * reserve_exponent`.
     Beta,
 }
 
@@ -198,7 +201,7 @@ pub(crate) enum FunnelPlanError {
         /// The parameter whose checked derivation failed.
         parameter: FunnelPlanParameter,
         /// The input exponent used by the failed derivation.
-        delta_log2: u32,
+        reserve_exponent: u32,
     },
     /// No special length supports the complete finite logical layout.
     ///
@@ -262,14 +265,14 @@ impl FunnelPlan {
         self.config
     }
 
-    /// Returns the ordinary-level count `alpha = 4 * delta_log2 + 10`.
+    /// Returns the ordinary-level count `alpha = 4 * reserve_exponent + 10`.
     #[must_use]
     pub(crate) const fn alpha(&self) -> usize {
         self.alpha
     }
 
     /// Returns the logical slots per ordinary bucket,
-    /// `beta = 2 * delta_log2`.
+    /// `beta = 2 * reserve_exponent`.
     #[must_use]
     pub(crate) const fn beta(&self) -> usize {
         self.beta
@@ -379,7 +382,7 @@ impl ElasticPlan {
             },
             previous_level: None,
             remaining_insertions: self.config.target_insertions(),
-            delta_log2: self.config.delta_log2,
+            reserve_exponent: self.config.reserve_exponent,
         }
     }
 }
@@ -454,7 +457,7 @@ struct BatchQuotas {
     levels: LevelLengths,
     previous_level: Option<usize>,
     remaining_insertions: usize,
-    delta_log2: u32,
+    reserve_exponent: u32,
 }
 
 impl Iterator for BatchQuotas {
@@ -464,7 +467,7 @@ impl Iterator for BatchQuotas {
         let level = self.levels.next()?;
         let raw_quota = if let Some(previous) = self.previous_level {
             previous
-                - floor_div_pow2(previous, self.delta_log2.saturating_add(1))
+                - floor_div_pow2(previous, self.reserve_exponent.saturating_add(1))
                 - ceil_three_quarters(previous)
                 + ceil_three_quarters(level)
         } else {
@@ -734,7 +737,7 @@ mod tests {
     #[test]
     fn rejects_invalid_configuration_inputs() {
         assert_eq!(PaperConfig::new(1, 3), Err(ConfigError::NTooSmall { n: 1 }));
-        assert_eq!(PaperConfig::new(2, 0), Err(ConfigError::DeltaLog2Zero));
+        assert_eq!(PaperConfig::new(2, 0), Err(ConfigError::ExponentZero));
     }
 
     #[test]
@@ -742,15 +745,15 @@ mod tests {
         let config = PaperConfig::new(32_768, 3).unwrap();
 
         assert_eq!(config.n(), 32_768);
-        assert_eq!(config.delta_log2(), 3);
+        assert_eq!(config.reserve_exponent(), 3);
         assert_eq!(config.floor_delta_n(), 4_096);
         assert_eq!(config.target_insertions(), 28_672);
     }
 
     #[test]
     fn exponents_at_least_as_wide_as_usize_reserve_no_slots() {
-        for delta_log2 in [usize::BITS, usize::BITS.saturating_add(1), u32::MAX] {
-            let config = PaperConfig::new(32_768, delta_log2).unwrap();
+        for reserve_exponent in [usize::BITS, usize::BITS.saturating_add(1), u32::MAX] {
+            let config = PaperConfig::new(32_768, reserve_exponent).unwrap();
 
             assert_eq!(config.floor_delta_n(), 0);
             assert_eq!(config.target_insertions(), 32_768);
@@ -766,8 +769,8 @@ mod tests {
         );
         assert_eq!(
             below_funnel_domain.funnel_domain_status(),
-            Err(FunnelDomainError::DeltaLog2BelowMinimum {
-                delta_log2: 2,
+            Err(FunnelDomainError::ExponentBelowMinimum {
+                reserve_exponent: 2,
                 minimum: 3,
             })
         );
@@ -802,12 +805,12 @@ mod tests {
 
     #[test]
     fn elastic_batches_use_exact_formula_and_cap_at_target() {
-        const DELTA_LOG2_VALUES: [u32; 4] = [3, 4, 6, 8];
+        const RESERVE_EXPONENT_VALUES: [u32; 4] = [3, 4, 6, 8];
         const NON_POWER_OF_TWO_N_VALUES: [usize; 10] = [3, 5, 6, 7, 10, 17, 31, 33, 1_001, 4_095];
 
-        for delta_log2 in DELTA_LOG2_VALUES {
+        for reserve_exponent in RESERVE_EXPONENT_VALUES {
             for n in NON_POWER_OF_TWO_N_VALUES {
-                let config = PaperConfig::new(n, delta_log2).unwrap();
+                let config = PaperConfig::new(n, reserve_exponent).unwrap();
                 let plan = config.elastic_plan();
                 let levels: Vec<_> = plan.level_lengths().collect();
                 let actual: Vec<_> = plan.batch_quotas().collect();
@@ -818,7 +821,7 @@ mod tests {
                     let next = adjacent[1];
                     raw.push(
                         current
-                            - floor_div_pow2(current, delta_log2.saturating_add(1))
+                            - floor_div_pow2(current, reserve_exponent.saturating_add(1))
                             - ceil_three_quarters(current)
                             + ceil_three_quarters(next),
                     );
@@ -834,11 +837,14 @@ mod tests {
                     })
                     .collect();
 
-                assert_eq!(actual, expected, "n={n}, delta_log2={delta_log2}");
+                assert_eq!(
+                    actual, expected,
+                    "n={n}, reserve_exponent={reserve_exponent}"
+                );
                 assert_eq!(
                     actual.iter().sum::<usize>(),
                     config.target_insertions(),
-                    "n={n}, delta_log2={delta_log2}"
+                    "n={n}, reserve_exponent={reserve_exponent}"
                 );
             }
         }
@@ -876,25 +882,25 @@ mod tests {
 
     #[test]
     fn funnel_geometry_obeys_exact_formulas_across_a_grid() {
-        const DELTA_LOG2_VALUES: [u32; 4] = [3, 4, 6, 8];
+        const RESERVE_EXPONENT_VALUES: [u32; 4] = [3, 4, 6, 8];
         const N_VALUES: [usize; 4] = [32_768, 65_537, 100_000, 131_072];
 
-        for delta_log2 in DELTA_LOG2_VALUES {
+        for reserve_exponent in RESERVE_EXPONENT_VALUES {
             for n in N_VALUES {
-                assert_funnel_invariants(n, delta_log2);
+                assert_funnel_invariants(n, reserve_exponent);
             }
         }
     }
 
     #[test]
     fn funnel_special_length_is_the_largest_compatible_choice() {
-        for (n, delta_log2) in [(32_768, 3), (50_000, 4), (131_072, 8)] {
-            let plan = PaperConfig::new(n, delta_log2)
+        for (n, reserve_exponent) in [(32_768, 3), (50_000, 4), (131_072, 8)] {
+            let plan = PaperConfig::new(n, reserve_exponent)
                 .unwrap()
                 .funnel_plan()
                 .unwrap();
-            let (_, upper) = independent_special_bounds(n, delta_log2);
-            let alpha = usize::try_from(4_u128 * u128::from(delta_log2) + 10).unwrap();
+            let (_, upper) = independent_special_bounds(n, reserve_exponent);
+            let alpha = usize::try_from(4_u128 * u128::from(reserve_exponent) + 10).unwrap();
 
             assert!((plan.special_len() + 1..=upper).all(|candidate| {
                 !independent_special_is_compatible(
@@ -929,8 +935,8 @@ mod tests {
         assert_eq!(
             config.funnel_plan(),
             Err(FunnelPlanError::Domain(
-                FunnelDomainError::DeltaLog2BelowMinimum {
-                    delta_log2: 2,
+                FunnelDomainError::ExponentBelowMinimum {
+                    reserve_exponent: 2,
                     minimum: 3,
                 }
             ))
@@ -982,7 +988,7 @@ mod tests {
                 extreme_exponent,
                 Err(FunnelPlanError::DerivedParameterOverflow {
                     parameter: FunnelPlanParameter::Alpha,
-                    delta_log2: u32::MAX,
+                    reserve_exponent: u32::MAX,
                 })
             );
         }
@@ -1038,23 +1044,29 @@ mod tests {
     fn funnel_special_selector_matches_an_exhaustive_small_reference() {
         const MAX_TOTAL_BUCKETS: usize = 400;
 
-        for delta_log2 in 3..=6 {
-            let alpha = 4 * delta_log2 as usize + 10;
-            let beta = 2 * delta_log2 as usize;
+        for reserve_exponent in 3..=6 {
+            let alpha = 4 * reserve_exponent as usize + 10;
+            let beta = 2 * reserve_exponent as usize;
             let reachable = independent_reachable_totals(alpha, MAX_TOTAL_BUCKETS);
 
             for n in 2..=2_000 {
-                let expected = brute_force_special_len(n, delta_log2, beta, &reachable);
+                let expected = brute_force_special_len(n, reserve_exponent, beta, &reachable);
                 match (
-                    PaperConfig::new(n, delta_log2).unwrap().funnel_plan(),
+                    PaperConfig::new(n, reserve_exponent).unwrap().funnel_plan(),
                     expected,
                 ) {
                     (Ok(plan), Some(special_len)) => {
-                        assert_eq!(plan.special_len(), special_len, "n={n}, d={delta_log2}");
+                        assert_eq!(
+                            plan.special_len(),
+                            special_len,
+                            "n={n}, d={reserve_exponent}"
+                        );
                     }
                     (Err(FunnelPlanError::NoCompatibleSpecialLayout { .. }), None) => {}
                     (actual, expected) => {
-                        panic!("n={n}, d={delta_log2}, actual={actual:?}, expected={expected:?}")
+                        panic!(
+                            "n={n}, d={reserve_exponent}, actual={actual:?}, expected={expected:?}"
+                        )
                     }
                 }
             }
@@ -1112,62 +1124,70 @@ mod tests {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn assert_funnel_invariants(n: usize, delta_log2: u32) {
-        let config = PaperConfig::new(n, delta_log2).unwrap();
+    fn assert_funnel_invariants(n: usize, reserve_exponent: u32) {
+        let config = PaperConfig::new(n, reserve_exponent).unwrap();
         let plan = config.funnel_plan().unwrap();
         let counts: Vec<_> = plan.ordinary_bucket_counts().collect();
         let lengths: Vec<_> = plan.ordinary_level_lengths().collect();
-        let (lower, upper) = independent_special_bounds(n, delta_log2);
-        let expected_alpha = usize::try_from(4_u128 * u128::from(delta_log2) + 10).unwrap();
-        let expected_beta = usize::try_from(2_u128 * u128::from(delta_log2)).unwrap();
+        let (lower, upper) = independent_special_bounds(n, reserve_exponent);
+        let expected_alpha = usize::try_from(4_u128 * u128::from(reserve_exponent) + 10).unwrap();
+        let expected_beta = usize::try_from(2_u128 * u128::from(reserve_exponent)).unwrap();
         let expected_loglog_ceiling = independent_loglog_ceiling(n);
         let expected_fallback_width = 2 * expected_loglog_ceiling;
-        let expected_target = n - n / usize::try_from(1_u128 << delta_log2).unwrap();
+        let expected_target = n - n / usize::try_from(1_u128 << reserve_exponent).unwrap();
 
-        assert_eq!(plan.config(), config, "n={n}, delta_log2={delta_log2}");
+        assert_eq!(
+            plan.config(),
+            config,
+            "n={n}, reserve_exponent={reserve_exponent}"
+        );
         assert_eq!(
             plan.alpha(),
             expected_alpha,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
-        assert_eq!(plan.beta(), expected_beta, "n={n}, delta_log2={delta_log2}");
+        assert_eq!(
+            plan.beta(),
+            expected_beta,
+            "n={n}, reserve_exponent={reserve_exponent}"
+        );
         assert_eq!(
             plan.loglog_ceiling(),
             expected_loglog_ceiling,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert_eq!(
             plan.fallback_bucket_width(),
             expected_fallback_width,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert_eq!(
             config.target_insertions(),
             expected_target,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert!(
             (lower..=upper).contains(&plan.special_len()),
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert_eq!(
             (n - plan.special_len()) % expected_beta,
             0,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert_eq!(
             counts.len(),
             expected_alpha,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert!(
             counts.iter().all(|&count| count > 0),
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert_eq!(
             counts.iter().sum::<usize>(),
             (n - plan.special_len()) / expected_beta,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert_eq!(
             lengths,
@@ -1175,54 +1195,57 @@ mod tests {
                 .iter()
                 .map(|&count| count * expected_beta)
                 .collect::<Vec<_>>(),
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert_eq!(
             lengths.iter().sum::<usize>() + plan.special_len(),
             n,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         for adjacent in counts.windows(2) {
             let current = adjacent[0] as u128;
             let next = adjacent[1] as u128;
-            assert!(next <= current, "n={n}, delta_log2={delta_log2}");
+            assert!(
+                next <= current,
+                "n={n}, reserve_exponent={reserve_exponent}"
+            );
             assert!(
                 (4_u128 * next).abs_diff(3_u128 * current) <= 4,
-                "n={n}, delta_log2={delta_log2}, current={current}, next={next}"
+                "n={n}, reserve_exponent={reserve_exponent}, current={current}, next={next}"
             );
         }
         assert_eq!(
             plan.special_primary_len() + plan.special_fallback_len(),
             plan.special_len(),
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert!(
             plan.special_primary_len() >= plan.special_fallback_len(),
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert!(
             plan.special_primary_len()
                 .abs_diff(plan.special_fallback_len())
                 <= 1,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert!(
             plan.special_fallback_len() >= expected_fallback_width,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert_eq!(
             plan.special_fallback_len() % expected_fallback_width,
             0,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert_eq!(
             plan.fallback_bucket_count() * expected_fallback_width,
             plan.special_fallback_len(),
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert!(
             plan.fallback_bucket_count() > 0,
-            "n={n}, delta_log2={delta_log2}"
+            "n={n}, reserve_exponent={reserve_exponent}"
         );
     }
 
@@ -1246,11 +1269,11 @@ mod tests {
 
     fn brute_force_special_len(
         n: usize,
-        delta_log2: u32,
+        reserve_exponent: u32,
         beta: usize,
         reachable_totals: &std::collections::BTreeSet<usize>,
     ) -> Option<usize> {
-        let (lower, upper) = independent_special_bounds(n, delta_log2);
+        let (lower, upper) = independent_special_bounds(n, reserve_exponent);
         if lower > upper {
             return None;
         }
@@ -1317,9 +1340,9 @@ mod tests {
         exponent
     }
 
-    fn independent_special_bounds(n: usize, delta_log2: u32) -> (usize, usize) {
-        let lower_denominator = 1_u128 << (delta_log2 + 1);
-        let upper_denominator = 1_u128 << (delta_log2 + 2);
+    fn independent_special_bounds(n: usize, reserve_exponent: u32) -> (usize, usize) {
+        let lower_denominator = 1_u128 << (reserve_exponent + 1);
+        let upper_denominator = 1_u128 << (reserve_exponent + 2);
         let n = n as u128;
         let lower = n / lower_denominator + u128::from(!n.is_multiple_of(lower_denominator));
         let upper = (3 * n) / upper_denominator;
