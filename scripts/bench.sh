@@ -7,25 +7,29 @@
 # All settings are process-local — die with the bench process.
 #
 # Hardware-aware:
-# - CORE unset: pins to the lowest-numbered max-cpufreq core and blocks on its
-#   flock, so concurrent runs serialize on one core instead of contending.
+# - CORE unset: pins to the lowest-numbered max-cpufreq core.
+# - Explicit and detected cores are locked, so concurrent runs serialize.
 # - Multi-node NUMA: binds memory to the pinned core's node via numactl
 #   --membind so cache misses don't traverse the inter-socket interconnect.
 #
 # Env knobs:
+#   CORE=5           pin to and lock one explicit CPU.
+#   LOCK_DIR=/tmp     Linux-only external root/core lock namespace.
 #   BENCH=all        cargo bench --bench target (default all = speedup + latency)
 #   SAVE=            --save-baseline <name>; runs the bench and stores results
-#                    under <name>. Default: ref (only when neither BASELINE nor
-#                    LOAD is set).
+#                    under <name>. With no mode, a clean HEAD is saved under
+#                    its 12-character commit hash.
 #   BASELINE=        --baseline <name>; compares against an existing baseline
 #                    without overwriting it.
 #   LOAD=            --load-baseline <name>; loads stored samples instead of
 #                    re-measuring. Use with BASELINE=other to compare two
 #                    stored baselines without rerunning. Implies a comparison
 #                    against BASELINE (defaults to ref).
+#   OPTHASH_CRITERION_ROOT=
+#                    override Criterion output; its canonical path is locked.
 #
 # Common workflows:
-#   scripts/bench.sh                      # save baseline "ref"
+#   scripts/bench.sh                      # save clean HEAD under its commit stamp
 #   SAVE=attempt-a scripts/bench.sh       # store this run as "attempt-a"
 #   LOAD=attempt-a scripts/bench.sh       # compare attempt-a vs ref (no rerun)
 #   LOAD=attempt-a BASELINE=attempt-b scripts/bench.sh  # a vs b (no rerun)
@@ -39,12 +43,40 @@ BENCH=${BENCH:-all}
 SAVE=${SAVE:-}
 BASELINE=${BASELINE:-}
 LOAD=${LOAD:-}
-LOCK_DIR=${LOCK_DIR:-/tmp/opthash-bench-locks}
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+cd "$REPO_ROOT"
+CRITERION_ROOT=${OPTHASH_CRITERION_ROOT:-$REPO_ROOT/target/criterion}
+criterion_env_args=(-u CRITERION_HOME)
+if [[ -n ${OPTHASH_CRITERION_ROOT:-} ]]; then
+	criterion_env_args=("CRITERION_HOME=$CRITERION_ROOT")
+fi
+LOCK_DIR=${LOCK_DIR:-/tmp}
 
 # Low-noise primitives below are Linux-only; elsewhere we fall through to
 # plain `cargo bench`.
 IS_LINUX=0
 [[ $(uname) == Linux ]] && IS_LINUX=1
+
+claim_criterion_root_lock() {
+	local canonical_root root_key lock
+	canonical_root=$(realpath -m -- "$CRITERION_ROOT")
+	root_key=$(printf '%s' "$canonical_root" | sha256sum)
+	root_key=${root_key%% *}
+	mkdir -p "$LOCK_DIR" 2>/dev/null || true
+	lock="$LOCK_DIR/opthash-bench-root-${root_key}.lock"
+	if [[ -L "$lock" ]] || { [[ -e "$lock" ]] && [[ ! -d "$lock" && ! -f "$lock" ]]; }; then
+		echo "error: unsafe Criterion root lock $lock" >&2
+		exit 1
+	fi
+	if [[ ! -e "$lock" ]] && ! mkdir -m 0755 "$lock" 2>/dev/null && [[ ! -e "$lock" ]]; then
+		echo "error: cannot create Criterion root lock $lock" >&2
+		exit 1
+	fi
+	exec {CRITERION_LOCK_FD}<"$lock"
+	echo "info: waiting for Criterion root lock..." >&2
+	flock "$CRITERION_LOCK_FD"
+	echo "info: acquired Criterion root lock" >&2
+}
 
 # Cores at the system's max cpufreq — perf cluster on hybrid SoCs, every
 # core on homogeneous CPUs.
@@ -66,8 +98,7 @@ detect_perf_cores() {
 }
 
 # Lock fd is held for the script's lifetime; the kernel releases it on exit.
-claim_perf_core() {
-	mkdir -p "$LOCK_DIR" 2>/dev/null || true
+select_perf_core() {
 	local perf_cores=()
 	while IFS= read -r c; do perf_cores+=("$c"); done < <(detect_perf_cores)
 	if ((${#perf_cores[@]} == 0)); then
@@ -81,22 +112,35 @@ claim_perf_core() {
 		((c < min)) && min=$c
 	done
 	CORE=$min
-	local lock="$LOCK_DIR/core-${CORE}.lock"
-	# Subshell contains a failed exec redirect (a bare one would kill the shell
-	# under set -e). Unopenable (e.g. foreign owner) => exit, don't run
-	# unserialized; set CORE=<n> to bypass locking entirely.
-	if ! (exec {fd}>"$lock") 2>/dev/null; then
-		echo "error: cannot open $lock; set CORE=<n> to bypass locking" >&2
+}
+
+claim_core_lock() {
+	if [[ ! $CORE =~ ^[0-9]+$ ]]; then
+		echo "error: CORE must be one CPU number" >&2
 		exit 1
 	fi
-	exec {LOCK_FD}>"$lock"
+	mkdir -p "$LOCK_DIR" 2>/dev/null || true
+	local lock="$LOCK_DIR/opthash-bench-core-${CORE}.lock"
+	if [[ -L "$lock" ]] || { [[ -e "$lock" ]] && [[ ! -d "$lock" && ! -f "$lock" ]]; }; then
+		echo "error: unsafe benchmark lock $lock" >&2
+		exit 1
+	fi
+	if [[ ! -e "$lock" ]] && ! mkdir -m 0755 "$lock" 2>/dev/null && [[ ! -e "$lock" ]]; then
+		echo "error: cannot create benchmark lock $lock" >&2
+		exit 1
+	fi
+	exec {LOCK_FD}<"$lock"
 	echo "info: waiting for perf core $CORE lock..." >&2
-	flock "$LOCK_FD" # blocks until free -> runs serialize on this core
+	flock "$LOCK_FD"
 	echo "info: acquired perf core $CORE" >&2
 }
 
-if ((IS_LINUX)) && [[ -z ${CORE:-} ]]; then
-	claim_perf_core
+if ((IS_LINUX)); then
+	if [[ -z ${CORE:-} ]]; then
+		select_perf_core
+	fi
+	claim_criterion_root_lock
+	claim_core_lock
 fi
 
 # sudo strips PATH/HOME; recover invoker's rustup so the shim resolves their
@@ -173,7 +217,12 @@ elif [[ -n "$BASELINE" ]]; then
 elif [[ -n "$SAVE" ]]; then
 	criterion_args=(--save-baseline "$SAVE")
 else
-	criterion_args=(--save-baseline ref)
+	if [[ -n $(git status --porcelain --untracked-files=normal) ]]; then
+		echo "error: commit changes before benchmarking without an explicit SAVE name" >&2
+		exit 1
+	fi
+	commit_stamp=$(git rev-parse --short=12 HEAD)
+	criterion_args=(--save-baseline "$commit_stamp")
 fi
 echo "info: Criterion args: ${criterion_args[*]}" >&2
 
@@ -185,6 +234,7 @@ fi
 echo "info: forwarding args: ${forward_args[*]}" >&2
 
 for target in "${bench_targets[@]}"; do
-	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" cargo bench --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
+	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" env "${criterion_env_args[@]}"
+		cargo bench --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
 	"${launcher[@]}" "${cmd[@]}"
 done

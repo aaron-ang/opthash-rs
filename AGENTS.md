@@ -31,6 +31,9 @@ variant, then compare stored runs offline with `LOAD` and `BASELINE`. Refresh
 `ref` when intentionally updating the default anchor after environment or
 benchmark-fixture changes.
 
+With no mode selected, the harness requires a clean tree and saves HEAD under
+its 12-character commit hash. Use an explicit `SAVE` name for exploratory runs.
+
 ```bash
 SAVE=anchor scripts/bench.sh                # measure known baseline
 SAVE=opt1 scripts/bench.sh                  # measure changed tree
