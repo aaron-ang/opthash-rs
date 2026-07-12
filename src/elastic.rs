@@ -41,8 +41,7 @@ const MAX_ELASTIC_SLOTS: usize = match 1_usize.checked_shl(u32::BITS) {
 };
 const MEMBERSHIP_BITS_PER_SLOT: usize = 8;
 const MEMBERSHIP_SLOTS_PER_WORD: usize = u64::BITS as usize / MEMBERSHIP_BITS_PER_SLOT;
-const MEMBERSHIP_SALT_1: u64 = 0xA076_1D64_78BD_642F;
-const MEMBERSHIP_SALT_2: u64 = 0xE703_7ED1_A0B4_28DB;
+const MEMBERSHIP_SALT: u64 = 0xA076_1D64_78BD_642F;
 const ELASTIC_LEVEL_LANES: [u64; u32::BITS as usize] = elastic_level_lanes();
 const ELASTIC_QUERY_PROBE_LANES: [u64; QUERY_PROBE_LANE_COUNT] = elastic_query_probe_lanes();
 
@@ -341,13 +340,15 @@ fn membership_mix(hash: u64, salt: u64) -> u64 {
 }
 
 #[inline]
-fn membership_location(hash: u64, salt: u64, word_count: usize) -> (usize, u64) {
-    let mixed = membership_mix(hash, salt);
+fn membership_location(hash: u64, word_count: usize) -> (usize, u64) {
+    let mixed = membership_mix(hash, MEMBERSHIP_SALT);
     let product =
         u128::from(mixed) * u128::try_from(word_count).expect("usize is representable as u128");
     let word = usize::try_from(product >> 64).expect("multiply-high index is below word count");
-    let bit = 1_u64 << (mixed.rotate_left(17) & 63);
-    (word, bit)
+    let first_shift = mixed & 63;
+    let second_shift = (first_shift + 1 + ((mixed >> 32) & 31)) & 63;
+    let bits = (1_u64 << first_shift) | (1_u64 << second_shift);
+    (word, bits)
 }
 
 fn probe_schedule_capacity(level_count: usize) -> usize {
@@ -728,31 +729,25 @@ where
         }
     }
 
-    #[inline]
+    #[inline(never)]
     fn membership_maybe_contains(&self, hash: u64) -> bool {
         let words = self.membership_words();
         if words == 0 {
             return false;
         }
-        let (first_word, first_bit) = membership_location(hash, MEMBERSHIP_SALT_1, words);
-        let (second_word, second_bit) = membership_location(hash, MEMBERSHIP_SALT_2, words);
-        unsafe {
-            (*self.membership_ptr().add(first_word) & first_bit) != 0
-                && (*self.membership_ptr().add(second_word) & second_bit) != 0
-        }
+        let (word, bits) = membership_location(hash, words);
+        unsafe { *self.membership_ptr().add(word) & bits == bits }
     }
 
-    #[inline]
+    #[inline(never)]
     fn record_membership(&mut self, hash: u64) {
         let words = self.membership_words();
         if words == 0 {
             return;
         }
-        let (first_word, first_bit) = membership_location(hash, MEMBERSHIP_SALT_1, words);
-        let (second_word, second_bit) = membership_location(hash, MEMBERSHIP_SALT_2, words);
+        let (word, bits) = membership_location(hash, words);
         unsafe {
-            *self.membership_ptr().add(first_word) |= first_bit;
-            *self.membership_ptr().add(second_word) |= second_bit;
+            *self.membership_ptr().add(word) |= bits;
         }
     }
 
@@ -2226,6 +2221,28 @@ mod tests {
         assert!(map.table().membership_maybe_contains(inserted_hash));
         assert_eq!(map.insert(7, 17), None);
         assert_eq!(map.get(&7), Some(&17));
+    }
+
+    #[test]
+    fn membership_record_sets_two_bits_in_one_word() {
+        let mut table =
+            ElasticTable::<u64, u64, IdentityBuildHasher>::with_capacity_and_reserve_and_hasher_in(
+                1_024,
+                ReserveFraction::DEFAULT,
+                IdentityBuildHasher,
+                Global,
+            );
+
+        table.record_membership(0);
+
+        let membership = unsafe {
+            core::slice::from_raw_parts(table.membership_ptr(), table.membership_words())
+        };
+        assert_eq!(membership.iter().filter(|&&word| word != 0).count(), 1);
+        assert_eq!(
+            membership.iter().map(|word| word.count_ones()).sum::<u32>(),
+            2
+        );
     }
 
     #[test]
