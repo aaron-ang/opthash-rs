@@ -55,7 +55,7 @@ Run shape and options:
 
 - Wraps `cargo bench` with `taskset` (core pin), `setarch -R` (ASLR off), `chrt -b` (scheduler batch), and `numactl` (NUMA bind, multi-node only) — no privileges. `sudo` adds `nice -20`, `prlimit` memlock; drops back to invoking user for cargo.
 - Every Linux run acquires `/tmp/opthash-bench-core-<n>.lock`, including when `CORE=<n>` is explicit. `CORE` must name one CPU; concurrent runs targeting it block instead of contaminating each other.
-- Every run also holds a lock under its Criterion root for the script's lifetime, so different-core runs cannot race shared registrations or metadata.
+- Every Linux run also holds a lock under `LOCK_DIR` (default `/tmp`) keyed by its canonical Criterion root for the script's lifetime, so different-core runs cannot race shared registrations or metadata without creating the Criterion root as the wrong user. Non-Linux runs retain the plain-Cargo fallback without Linux locking.
 - `BENCH=all` (default) runs `speedup`, then `mean_latency`; set `BENCH=speedup|mean_latency` for one target.
 - Other `[[bench]]` targets are not in `all`; run explicitly via
   `BENCH=<name>`: `set_ops`, `map_api`, `load_factor`, `payload_size`, and

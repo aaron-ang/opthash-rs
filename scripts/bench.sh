@@ -8,14 +8,15 @@
 #
 # Hardware-aware:
 # - CORE unset: pins to the lowest-numbered max-cpufreq core.
-# - CORE set or detected: blocks on that core's flock, so concurrent runs
-#   serialize instead of contending.
+# - On Linux, CORE set or detected blocks on that core's flock, so concurrent
+#   runs serialize instead of contending.
 # - Multi-node NUMA: binds memory to the pinned core's node via numactl
 #   --membind so cache misses don't traverse the inter-socket interconnect.
 #
 # Env knobs:
-#   CORE=5           pin to one explicit CPU; detected or explicit CPUs are
-#                    always locked for the script's lifetime.
+#   CORE=5           pin to one explicit CPU; on Linux, detected or explicit
+#                    CPUs are always locked for the script's lifetime.
+#   LOCK_DIR=/tmp     Linux-only external root/core lock namespace.
 #   BENCH=all        cargo bench --bench target (default all = speedup + latency)
 #   SAVE=            --save-baseline <name>; runs the bench and stores results
 #                    under <name>. Default: ref (only when neither BASELINE nor
@@ -28,7 +29,8 @@
 #                    against BASELINE (defaults to ref).
 #   OPTHASH_CRITERION_ROOT=
 #                    overrides Criterion's output and metadata root together.
-#                    The root is globally locked for the script's lifetime.
+#                    On Linux, the canonical root selects a global lock under
+#                    LOCK_DIR that is held for the script's lifetime.
 #
 # Common workflows:
 #   scripts/bench.sh                      # save baseline "ref"
@@ -62,20 +64,28 @@ fi
 # without requiring a shared writable file.
 LOCK_DIR=${LOCK_DIR:-/tmp}
 
-# Criterion registrations and their ownership sidecars share one mutable root.
-# Hold one root-wide lock for the entire script so runs on different CPU locks
-# cannot concurrently invalidate, measure, or verify the same stored state.
+# Low-noise primitives and locks below are Linux-only; elsewhere we fall through
+# to plain `cargo bench` without invoking flock or creating lock paths.
+IS_LINUX=0
+[[ $(uname) == Linux ]] && IS_LINUX=1
+
+# Criterion registrations and ownership sidecars share one mutable root. Map
+# its canonical path to a shared external lock so sudo never creates anything
+# under a fresh Criterion root before Cargo is launched as the invoking user.
 claim_criterion_root_lock() {
-	local lock_parent="$CRITERION_ROOT/.opthash"
-	local lock="$lock_parent/benchmark-root.lock"
-	if [[ -L "$lock_parent" ]]; then
-		echo "error: unsafe Criterion metadata directory $lock_parent" >&2
+	local canonical_root root_key lock
+	if ! canonical_root=$(realpath -m -- "$CRITERION_ROOT"); then
+		echo "error: cannot canonicalize Criterion root $CRITERION_ROOT" >&2
 		exit 1
 	fi
-	if ! mkdir -p "$lock_parent" 2>/dev/null && [[ ! -d "$lock_parent" ]]; then
-		echo "error: cannot create Criterion metadata directory $lock_parent" >&2
+	root_key=$(printf '%s' "$canonical_root" | sha256sum)
+	root_key=${root_key%% *}
+	if [[ ! $root_key =~ ^[0-9a-f]{64}$ ]]; then
+		echo "error: cannot derive Criterion root lock key" >&2
 		exit 1
 	fi
+	mkdir -p "$LOCK_DIR" 2>/dev/null || true
+	lock="$LOCK_DIR/opthash-bench-root-${root_key}.lock"
 	if [[ -L "$lock" ]]; then
 		echo "error: unsafe Criterion root lock $lock" >&2
 		exit 1
@@ -84,7 +94,9 @@ claim_criterion_root_lock() {
 		echo "error: cannot create Criterion root lock $lock" >&2
 		exit 1
 	fi
-	if [[ -L "$lock" || ! -d "$lock" ]]; then
+	# Accept a regular file created by an older release, matching the core-lock
+	# safety contract, but reject links and every other inode type.
+	if [[ -L "$lock" || (! -d "$lock" && ! -f "$lock") ]]; then
 		echo "error: unsafe Criterion root lock $lock" >&2
 		exit 1
 	fi
@@ -97,13 +109,6 @@ claim_criterion_root_lock() {
 	flock "$CRITERION_LOCK_FD"
 	echo "info: acquired Criterion root lock" >&2
 }
-
-claim_criterion_root_lock
-
-# Low-noise primitives below are Linux-only; elsewhere we fall through to
-# plain `cargo bench`.
-IS_LINUX=0
-[[ $(uname) == Linux ]] && IS_LINUX=1
 
 # Cores at the system's max cpufreq — perf cluster on hybrid SoCs, every
 # core on homogeneous CPUs.
@@ -180,6 +185,8 @@ if ((IS_LINUX)); then
 	if [[ -z ${CORE:-} ]]; then
 		select_perf_core
 	fi
+	# One consistent order prevents cross-run lock-order cycles.
+	claim_criterion_root_lock
 	claim_core_lock
 fi
 core=${CORE:-0}

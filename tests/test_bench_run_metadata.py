@@ -1,5 +1,8 @@
+import hashlib
 import json
 import os
+import selectors
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -7,6 +10,12 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _criterion_root_lock_path(lock_root: Path, criterion_root: Path) -> Path:
+    canonical = str(criterion_root.resolve()).encode()
+    digest = hashlib.sha256(canonical).hexdigest()
+    return lock_root / f"opthash-bench-root-{digest}.lock"
 
 
 def test_bench_script_runs_cargo_from_the_repository_root(tmp_path: Path) -> None:
@@ -636,15 +645,22 @@ def test_live_baseline_validation_failure_prevents_cargo(tmp_path: Path) -> None
     assert [command[0] for command in commands] == ["verify-current"]
 
 
-def test_bench_script_rejects_symlinked_criterion_root_lock(tmp_path: Path) -> None:
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "fifo"])
+def test_bench_script_rejects_unsafe_criterion_root_lock(
+    tmp_path: Path, unsafe_kind: str
+) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     marker = tmp_path / "cargo-ran"
     criterion_root = tmp_path / "criterion"
-    lock_parent = criterion_root / ".opthash"
-    lock_parent.mkdir(parents=True)
-    (lock_parent / "benchmark-root.lock").symlink_to(tmp_path / "elsewhere")
-    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Darwin\n")
+    lock_root = tmp_path / "locks"
+    lock_root.mkdir()
+    root_lock = _criterion_root_lock_path(lock_root, criterion_root)
+    if unsafe_kind == "symlink":
+        root_lock.symlink_to(tmp_path / "elsewhere")
+    else:
+        os.mkfifo(root_lock)
+    _write_linux_wrappers(bin_dir)
     _write_executable(bin_dir / "cargo", '#!/bin/sh\n: > "$CARGO_MARKER"\n')
     helper = tmp_path / "metadata-helper"
     _write_fake_metadata_helper(helper)
@@ -654,10 +670,13 @@ def test_bench_script_rejects_symlinked_criterion_root_lock(tmp_path: Path) -> N
             "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
             "BENCH": "speedup",
             "SAVE": "candidate",
+            "CORE": "5",
+            "LOCK_DIR": str(lock_root),
             "OPTHASH_CRITERION_ROOT": str(criterion_root),
             "CARGO_MARKER": str(marker),
             "METADATA_LOG": str(tmp_path / "metadata-log"),
             "EVENT_LOG": str(tmp_path / "event-log"),
+            "LAUNCH_LOG": str(tmp_path / "launch-log"),
             "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
         }
     )
@@ -684,13 +703,13 @@ def test_criterion_root_lock_serializes_different_core_runs(tmp_path: Path) -> N
     bin_dir.mkdir()
     marker = tmp_path / "cargo-ran"
     criterion_root = tmp_path / "criterion"
-    lock_parent = criterion_root / ".opthash"
-    lock_parent.mkdir(parents=True)
-    root_lock = lock_parent / "benchmark-root.lock"
+    lock_root = tmp_path / "locks"
+    lock_root.mkdir()
+    root_lock = _criterion_root_lock_path(lock_root, criterion_root)
     root_lock.mkdir()
     lock_fd = os.open(root_lock, os.O_RDONLY)
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Darwin\n")
+    _write_linux_wrappers(bin_dir)
     _write_executable(bin_dir / "cargo", '#!/bin/sh\n: > "$CARGO_MARKER"\n')
     helper = tmp_path / "metadata-helper"
     _write_fake_metadata_helper(helper)
@@ -700,10 +719,13 @@ def test_criterion_root_lock_serializes_different_core_runs(tmp_path: Path) -> N
             "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
             "BENCH": "speedup",
             "SAVE": "candidate",
+            "CORE": "5",
+            "LOCK_DIR": str(lock_root),
             "OPTHASH_CRITERION_ROOT": str(criterion_root),
             "CARGO_MARKER": str(marker),
             "METADATA_LOG": str(tmp_path / "metadata-log"),
             "EVENT_LOG": str(tmp_path / "event-log"),
+            "LAUNCH_LOG": str(tmp_path / "launch-log"),
             "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
         }
     )
@@ -724,6 +746,10 @@ def test_criterion_root_lock_serializes_different_core_runs(tmp_path: Path) -> N
                 saw_wait = True
                 break
         assert saw_wait
+        selector = selectors.DefaultSelector()
+        selector.register(process.stderr, selectors.EVENT_READ)
+        assert selector.select(timeout=0.1) == []
+        selector.close()
         assert process.poll() is None
         assert not marker.exists()
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -735,6 +761,138 @@ def test_criterion_root_lock_serializes_different_core_runs(tmp_path: Path) -> N
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+def test_linux_fresh_root_locks_outside_criterion_before_user_commands(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    lock_root = tmp_path / "locks"
+    lock_root.mkdir()
+    criterion_root = tmp_path / "fresh-criterion"
+    event_log = tmp_path / "events"
+    launch_log = tmp_path / "launches"
+    fake_home = tmp_path / "fixture-home"
+    user_cargo = fake_home / ".cargo/bin/cargo"
+    user_cargo.parent.mkdir(parents=True)
+    _write_linux_wrappers(bin_dir)
+    _write_executable(
+        bin_dir / "getent",
+        '#!/bin/sh\necho "fixture:x:1000:1000::$FAKE_HOME:/bin/sh"\n',
+    )
+    _write_executable(bin_dir / "cargo", "#!/bin/sh\nexit 42\n")
+    _write_executable(
+        user_cargo,
+        """#!/bin/sh
+if [ -e "$CRITERION_HOME" ]; then
+    printf 'criterion existed before cargo\n' >&2
+    exit 41
+fi
+mkdir -p "$CRITERION_HOME"
+printf 'cargo\n' >> "$EVENT_LOG"
+""",
+    )
+    helper = tmp_path / "metadata-helper"
+    _write_fake_metadata_helper(helper)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+            "SUDO_USER": "fixture",
+            "FAKE_HOME": str(fake_home),
+            "CORE": "5",
+            "LOCK_DIR": str(lock_root),
+            "BENCH": "speedup",
+            "SAVE": "candidate",
+            "OPTHASH_CRITERION_ROOT": str(criterion_root),
+            "METADATA_LOG": str(tmp_path / "metadata-log"),
+            "EVENT_LOG": str(event_log),
+            "LAUNCH_LOG": str(launch_log),
+            "PUBLISH_MARKER": str(criterion_root / ".opthash/published"),
+            "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "scripts/bench.sh"],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert event_log.read_text().splitlines() == ["begin", "cargo", "publish"]
+    assert criterion_root.is_dir()
+    assert (criterion_root / ".opthash/published").exists()
+    assert list(criterion_root.rglob("*.lock")) == []
+    root_lock = _criterion_root_lock_path(lock_root, criterion_root)
+    assert root_lock.is_dir()
+    assert (lock_root / "opthash-bench-core-5.lock").is_dir()
+    assert sorted(path.name for path in lock_root.iterdir()) == sorted(
+        [root_lock.name, "opthash-bench-core-5.lock"]
+    )
+    launches = launch_log.read_text().splitlines()
+    assert len(launches) == 3
+    assert "metadata-helper begin" in launches[0]
+    assert "cargo bench" in launches[1]
+    assert "metadata-helper publish" in launches[2]
+
+
+def test_non_linux_without_flock_runs_plain_cargo_without_lock_paths(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "isolated-bin"
+    bin_dir.mkdir()
+    for name in ("dirname", "env"):
+        (bin_dir / name).symlink_to(Path("/usr/bin") / name)
+    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Darwin\n")
+    _write_executable(
+        bin_dir / "cargo",
+        '#!/bin/sh\nprintf "cargo\\n" >> "$EVENT_LOG"\n: > "$CARGO_MARKER"\n',
+    )
+    helper = tmp_path / "metadata-helper"
+    _write_executable(
+        helper,
+        """#!/bin/sh
+printf '%s\n' "$1" >> "$EVENT_LOG"
+if [ "$1" = begin ]; then printf 'source-before\n'; fi
+""",
+    )
+    lock_root = tmp_path / "locks-must-not-exist"
+    criterion_root = tmp_path / "criterion-must-not-be-locked"
+    environment = {
+        "PATH": str(bin_dir),
+        "BENCH": "speedup",
+        "SAVE": "candidate",
+        "LOCK_DIR": str(lock_root),
+        "OPTHASH_CRITERION_ROOT": str(criterion_root),
+        "CARGO_MARKER": str(tmp_path / "cargo-ran"),
+        "EVENT_LOG": str(tmp_path / "events"),
+        "OPTHASH_BENCHMARK_METADATA_HELPER": str(helper),
+    }
+    assert shutil.which("flock", path=environment["PATH"]) is None
+
+    result = subprocess.run(
+        ["/bin/bash", "scripts/bench.sh"],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "cargo-ran").exists()
+    assert (tmp_path / "events").read_text().splitlines() == [
+        "begin",
+        "cargo",
+        "publish",
+    ]
+    assert not lock_root.exists()
+    assert not criterion_root.exists()
 
 
 def _write_fake_metadata_helper(path: Path) -> None:
@@ -756,6 +914,9 @@ if environment_log := os.environ.get("METADATA_ENVIRONMENT_LOG"):
         stream.write(os.environ.get("CRITERION_HOME", "<unset>") + "\\n")
 if args[0] in {"begin", "verify-current"}:
     print("source-before")
+if args[0] == "publish" and (marker := os.environ.get("PUBLISH_MARKER")):
+    Path(marker).parent.mkdir(parents=True, exist_ok=True)
+    Path(marker).touch()
 if args[0] == os.environ.get("FAIL_METADATA_COMMAND"):
     raise SystemExit(19)
 """,
@@ -765,3 +926,16 @@ if args[0] == os.environ.get("FAIL_METADATA_COMMAND"):
 def _write_executable(path: Path, contents: str) -> None:
     path.write_text(contents, encoding="utf-8")
     path.chmod(0o755)
+
+
+def _write_linux_wrappers(bin_dir: Path) -> None:
+    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Linux\n")
+    for name, shift in (("taskset", 2), ("setarch", 1), ("numactl", 1)):
+        _write_executable(
+            bin_dir / name,
+            f'#!/bin/sh\nshift {shift}\nexec "$@"\n',
+        )
+    _write_executable(
+        bin_dir / "chrt",
+        '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$LAUNCH_LOG"\nshift 2\nexec "$@"\n',
+    )
