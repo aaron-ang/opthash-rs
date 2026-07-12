@@ -1985,6 +1985,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn elastic_placement_matches_the_scalar_paper_model() {
         assert_exact_trace(8, 3, [0, 1, 2, 1523, 2540, 2541, 2542]);
         for &(n, reserve_exponent) in &[(31, 4), (65, 6), (257, 8)] {
@@ -2329,6 +2330,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn colliding_hashes_remain_distinguishable_through_delete_and_reuse() {
         let mut map: ElasticHashMap<u64, u64, ConstHashBuilder> =
             ElasticHashMap::with_capacity_and_hasher(512, ConstHashBuilder);
@@ -2345,6 +2347,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
         let reserve = ReserveFraction::DEFAULT;
         let mut table = ElasticTable::<u64, u64, ConstHashBuilder>::
@@ -2504,6 +2507,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn insert_after_rebuild_advances_exhausted_batch() {
         let mut table: ElasticTable<usize, usize> =
             ElasticTable::with_capacity_and_reserve_and_hasher_in(
@@ -2530,6 +2534,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn clone_and_clear_preserve_elastic_lookups() {
         let mut map: ElasticHashMap<u64, u64> = ElasticHashMap::with_capacity(512);
         for i in 0..384 {
@@ -2605,6 +2610,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn removing_every_entry_empties_every_level() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(512);
         let max = i32::try_from(map.capacity()).expect("test capacity fits i32");

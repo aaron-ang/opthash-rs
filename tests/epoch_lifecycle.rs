@@ -141,6 +141,7 @@ fn insert_after_a_full_epoch_reuses_space_without_an_eager_rebuild() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn tombstone_cleanup_is_an_observable_same_size_epoch_boundary() {
     let mut map = ElasticHashMap::<usize, usize>::with_capacity(512);
     let capacity = map.capacity();
@@ -168,6 +169,7 @@ fn tombstone_cleanup_is_an_observable_same_size_epoch_boundary() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn bulk_removal_cleans_tombstones_after_iteration_finishes() {
     macro_rules! check {
         ($map:expr) => {{
@@ -210,6 +212,7 @@ fn clear_starts_a_fresh_epoch_in_the_same_allocation() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn below_capacity_funnel_placement_recovery_is_observable() {
     const FOLLOW_UP_INSERTS: usize = 32;
 

@@ -980,6 +980,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn fast_funnel_fixed_seed_distribution_smoke() {
         const SAMPLES: u64 = 1 << 18;
         let oracle = FunnelPrf::new(0x1234_5678_9abc_def0);
@@ -1049,6 +1050,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn fast_funnel_awkward_ranges_have_no_large_fixed_seed_skew() {
         const EXPECTED_PER_BUCKET: usize = 512;
         let oracle = FunnelPrf::new(0x1234_5678_9abc_def0);

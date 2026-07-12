@@ -1082,13 +1082,13 @@ mod tests {
     struct IdentityHasher(u64);
 
     struct PanicOnFirstDrop {
-        drops: &'static AtomicUsize,
+        drops: Arc<AtomicUsize>,
     }
 
     struct PanicHashKey {
         id: u64,
-        armed: &'static AtomicBool,
-        drops: &'static AtomicUsize,
+        armed: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
     }
 
     #[derive(Clone)]
@@ -1183,6 +1183,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn selector_finds_known_minimum_exact_geometries() {
         for &(d, expected) in &[
             (3, 144),
@@ -1200,6 +1201,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn selector_reuses_a_geometry_at_its_reported_capacity() {
         let reserve = ReserveFraction::from_exponent(3).unwrap();
         for requested in 1..512 {
@@ -1215,6 +1217,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn funnel_locations_match_the_independent_scalar_oracle() {
         for &(n, d) in &[(144, 3), (344, 4), (1_372, 6), (5_472, 8), (21_856, 10)] {
             let config = PaperConfig::new(n, d).unwrap();
@@ -1508,7 +1511,7 @@ mod tests {
 
     #[test]
     fn clear_marks_each_slot_empty_before_dropping_its_value() {
-        let drops = Box::leak(Box::new(AtomicUsize::new(0)));
+        let drops = Arc::new(AtomicUsize::new(0));
         let reserve = ReserveFraction::from_exponent(3).unwrap();
         let shape = FunnelShape::from_slots(144, reserve).unwrap();
         let mut table = ManuallyDrop::new(
@@ -1521,7 +1524,13 @@ mod tests {
             .unwrap(),
         );
         for key in 0..3 {
-            table.insert_for_vacant_entry(key, PanicOnFirstDrop { drops }, key);
+            table.insert_for_vacant_entry(
+                key,
+                PanicOnFirstDrop {
+                    drops: drops.clone(),
+                },
+                key,
+            );
         }
         let first_occupied = (0..table.shape.n)
             .find(|&slot| table.storage.control_at(slot).is_occupied())
@@ -1547,8 +1556,8 @@ mod tests {
 
     #[test]
     fn failed_fallible_resize_leaves_a_valid_table() {
-        let armed = Box::leak(Box::new(AtomicBool::new(false)));
-        let drops = Box::leak(Box::new(AtomicUsize::new(0)));
+        let armed = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
         let reserve = ReserveFraction::from_exponent(3).unwrap();
         let shape = FunnelShape::from_slots(144, reserve).unwrap();
         let mut table = FunnelTable::<PanicHashKey, u64, IdentityBuildHasher>::try_from_shape(
@@ -1559,7 +1568,11 @@ mod tests {
         )
         .unwrap();
         for id in 0..3 {
-            let key = PanicHashKey { id, armed, drops };
+            let key = PanicHashKey {
+                id,
+                armed: armed.clone(),
+                drops: drops.clone(),
+            };
             let hash = id;
             assert_eq!(
                 <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::insert(
@@ -1585,8 +1598,8 @@ mod tests {
         armed.store(false, Ordering::SeqCst);
         let replacement = PanicHashKey {
             id: 99,
-            armed,
-            drops,
+            armed: armed.clone(),
+            drops: drops.clone(),
         };
         assert_eq!(
             <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::insert(
@@ -1680,6 +1693,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn vector_bucket_scan_matches_scalar_order_for_every_default_pattern() {
         const FP: u8 = 7;
         const OTHER: u8 = 1;

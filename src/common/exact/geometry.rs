@@ -783,6 +783,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn elastic_level_geometry_obeys_paper_invariants() {
         for n in 2..=4_096 {
             let plan = PaperConfig::new(n, 3).unwrap().elastic_plan();
@@ -1041,6 +1042,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn funnel_special_selector_matches_an_exhaustive_small_reference() {
         const MAX_TOTAL_BUCKETS: usize = 400;
 
@@ -1096,6 +1098,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn funnel_reachable_path_sums_are_contiguous_in_a_small_reference_model() {
         for first in 1_usize..=64 {
             let mut states = std::collections::BTreeSet::from([(first, first)]);
