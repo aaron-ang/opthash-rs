@@ -10,16 +10,23 @@ license = "Apache-2.0"
 keywords = ["hashmap", "open_addressing", "elastic_hashing", "funnel_hashing", "no_std"]
 categories = ["algorithms", "data-structures", "no-std"]
 exclude = [
+    "/.github/",
+    "/assets/",
     "/benches/",
+    "/ci/",
     "/opthash/",
     "/paper/",
     "/scripts/",
     "/tests/",
     "/.gitattributes",
     "/.gitignore",
+    "/.pre-commit-config.yaml",
+    "/.vscode/",
     "/AGENTS.md",
     "/CLAUDE.md",
+    "/pyproject.toml",
     "/requirements.txt",
+    "/uv.lock",
 ]
 
 [lib]
