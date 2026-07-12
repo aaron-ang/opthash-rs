@@ -14,11 +14,14 @@ Reordering* (Farach-Colton, Krapivin, and Kuszmaul, 2025).[^fkk2025]
 
 ## Scope
 
-Within a fixed allocation epoch, the maps use the paper's exact finite geometry
-and placement rules.[^fkk2025] Deletion, growth, tombstone cleanup, and rare
-placement recovery are library API extensions around those epochs. The
-deterministic mixers instantiate the construction but do not prove the paper's
-randomness assumptions.[^cw1979]
+Within a fixed table epoch, the maps use the paper's exact finite geometry and
+placement rules.[^fkk2025] Deletion is supported in place. Growth, tombstone
+cleanup, clearing, and rare placement recovery are built-in map behavior that
+begin a new observable epoch; these operations extend the paper's fixed-table,
+insertion-only model. The deterministic mixers instantiate the construction but
+do not prove the paper's randomness assumptions.[^cw1979] Their fixed seeds and
+domain-separation lanes pin current upstream wyhash parameters, and bounded
+indices use exact multiply-high rejection.[^wyrand][^lemire2019]
 
 ## Layout
 
@@ -43,10 +46,10 @@ FunnelHashMap
 Elastic uses geometrically halving arrays, paper batches and Case 1/2/3
 placement, and the paper's `phi` query order. Its arena tail holds an
 epoch-scoped membership filter for definite-negative checks. The filter applies
-the SplitMix64 finalizer as a stateless avalanche mixer; it does not instantiate
-the stateful generator.[^splitmix64] Funnel scans one ordinary bucket per level
-to its first empty slot, then tries B in order and alternates the two C
-choices.[^fkk2025]
+the SplitMix64 finalizer with wyrand's current state increment as a fixed salt;
+it instantiates neither stateful generator.[^splitmix64][^wyrand] Funnel
+scans one ordinary bucket per level to its first empty slot, then tries B in
+order and alternates the two C choices.[^fkk2025]
 
 `capacity()` is the live insertion limit for the current epoch, not the number
 of arena slots or allocated bytes. Reserve is configured exactly as
@@ -113,6 +116,20 @@ See [benches/README.md](benches/README.md) for the benchmark methodology.
     Functions*](https://doi.org/10.1016/0022-0000(79)90044-8), for universal
     hashing context; the deterministic mixers here are not claimed to form a
     universal family.
+
+[^wyrand]: Yi Wang, Diego Barrios Romero, Daniel Lemire, and Li Jin. [*Modern
+    Non-Cryptographic Hash Function and Pseudorandom Number
+    Generator*](https://github.com/wangyi-fudan/wyhash/blob/e4764a0b637d34d3421a7760affada9288b625a8/Modern%20Non-Cryptographic%20Hash%20Function%20and%20Pseudorandom%20Number%20Generator.pdf).
+    The construction seeds, fixed lanes, and membership salt pin the [wyhash 4.3
+    defaults and current wyrand/w1rand
+    increments](https://github.com/wangyi-fudan/wyhash/blob/e4764a0b637d34d3421a7760affada9288b625a8/wyhash.h#L145-L153).
+    Elastic's construction and membership paths reuse one value under separate
+    mixers; opthash otherwise uses these only as constants and does not implement
+    those algorithms.
+
+[^lemire2019]: Daniel Lemire. [*Fast Random Integer Generation in an
+    Interval*](https://doi.org/10.1145/3230636), *ACM Transactions on Modeling
+    and Computer Simulation* 29(1), 2019.
 
 [^swisstable]: Abseil. [SwissTable design
     notes](https://abseil.io/about/design/swisstables), background for the

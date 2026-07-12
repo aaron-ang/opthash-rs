@@ -7,10 +7,23 @@ locks one CPU and disables ASLR; non-Linux keeps the plain-Cargo fallback. Raw
 ## Named runs
 
 ```bash
-SAVE=anchor scripts/bench.sh
-SAVE=candidate scripts/bench.sh
-LOAD=candidate BASELINE=anchor scripts/bench.sh
+# On each clean commit, save under its 12-character commit hash.
+scripts/bench.sh
+
+# Compare two stored commits without rerunning.
+LOAD=<candidate-hash> BASELINE=<baseline-hash> scripts/bench.sh
 ```
+
+Commit hashes are the reproducible default. The script rejects an unnamed run
+from a dirty tree because its results would not identify the measured source.
+Use an explicit name for dirty experiments or multiple variants of one commit:
+
+```bash
+SAVE=membership-v2 scripts/bench.sh
+```
+
+An explicit name is also required when rerunning one commit with different
+Criterion options; otherwise the shared commit-hash baseline would be replaced.
 
 `BENCH=all` runs `speedup` followed by `mean_latency`. Select one target with
 `BENCH=speedup`, `BENCH=mean_latency`, or `BENCH=scaled_insert`. Pass Criterion

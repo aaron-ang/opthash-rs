@@ -274,11 +274,6 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn table(&self) -> &P {
-        &self.table
-    }
-
     /// Full exact constructor: capacity, reserve, hasher, and allocator.
     ///
     /// # Panics
@@ -419,6 +414,13 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     /// Removes all entries, keeping allocated capacity.
     pub fn clear(&mut self) {
         self.table.clear();
+    }
+}
+
+#[cfg(test)]
+impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
+    pub(crate) fn table(&self) -> &P {
+        &self.table
     }
 }
 

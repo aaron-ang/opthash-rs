@@ -12,7 +12,6 @@ macro_rules! parity_suite {
             #![allow(
                 clippy::cognitive_complexity,
                 clippy::needless_range_loop,
-                clippy::should_panic_without_expect,
                 clippy::items_after_statements
             )]
 
@@ -526,7 +525,7 @@ macro_rules! parity_suite {
             }
 
             #[test]
-            #[should_panic]
+            #[should_panic(expected = "no entry found for key")]
             fn test_index_nonexistent() {
                 let mut map = HashMap::new();
 

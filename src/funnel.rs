@@ -1,6 +1,4 @@
 //! Paper-exact Funnel placement with explicit dynamic-map epoch extensions.
-#![allow(clippy::similar_names)]
-
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
 
@@ -23,7 +21,7 @@ use crate::common::simd;
 use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
 use crate::{macros, map};
 
-const FUNNEL_PROBE_SEED: u64 = 0x8A5C_7D31_6E29_B4F0;
+const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
 const RANGE_WORD_CAP: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -330,9 +328,9 @@ unsafe fn scan_clean_funnel_bucket<T>(
     BucketScanResult::Full
 }
 
-/// Paper-exact Funnel hashing with dynamic allocation epochs for the ordinary
-/// map API. Deletion, growth, and exceptional collision recovery are explicit
-/// library API extensions around each fixed-size insertion epoch.
+/// Paper-exact Funnel hashing within each table epoch. Deletion, growth, and
+/// exceptional collision recovery are built-in dynamic-map behavior beyond
+/// the paper's fixed-size insertion model.
 pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     shape: FunnelShape,
     storage: FlatStorage<SlotEntry<K, V>>,
@@ -579,22 +577,22 @@ where
             }
         }
 
-        let fallback_a_probe = probe
+        let first_probe = probe
             .prepare_domain(ProbeDomain::FunnelSpecialFallbackChoiceA)
             .expect("fixed Funnel fallback-A domain must fit its counter encoding");
-        let Some(bucket_a) = Self::sample(&fallback_a_probe, 0, self.shape.fallback_bucket_range)
+        let Some(first_bucket) = Self::sample(&first_probe, 0, self.shape.fallback_bucket_range)
         else {
             return SearchResult::RangeFailure;
         };
-        let fallback_b_probe = probe
+        let second_probe = probe
             .prepare_domain(ProbeDomain::FunnelSpecialFallbackChoiceB)
             .expect("fixed Funnel fallback-B domain must fit its counter encoding");
-        let Some(bucket_b) = Self::sample(&fallback_b_probe, 0, self.shape.fallback_bucket_range)
+        let Some(second_bucket) = Self::sample(&second_probe, 0, self.shape.fallback_bucket_range)
         else {
             return SearchResult::RangeFailure;
         };
         for slot_in_bucket in 0..self.shape.fallback_bucket_width {
-            for bucket in [bucket_a, bucket_b] {
+            for bucket in [first_bucket, second_bucket] {
                 let slot = self.shape.fallback_offset
                     + bucket * self.shape.fallback_bucket_width
                     + slot_in_bucket;
@@ -1396,48 +1394,66 @@ mod tests {
             occupy(&mut table, slot, u64::MAX - local as u64, dummy_fingerprint);
         }
 
-        let bucket_a = sample(
+        let first_fallback_bucket = sample(
             identity,
             ProbeDomain::FunnelSpecialFallbackChoiceA,
             0,
             fallback_count,
         );
-        let bucket_b = sample(
+        let second_fallback_bucket = sample(
             identity,
             ProbeDomain::FunnelSpecialFallbackChoiceB,
             0,
             fallback_count,
         );
-        assert_ne!(bucket_a, bucket_b);
+        assert_ne!(first_fallback_bucket, second_fallback_bucket);
         let width = table.shape.fallback_bucket_width;
-        let slot_a0 = table.shape.fallback_offset + bucket_a * width;
-        let slot_b0 = table.shape.fallback_offset + bucket_b * width;
+        let first_bucket_slot_zero = table.shape.fallback_offset + first_fallback_bucket * width;
+        let second_bucket_slot_zero = table.shape.fallback_offset + second_fallback_bucket * width;
         assert_eq!(
             table.search_exact_for_insert(&identity, identity, fingerprint),
-            SearchResult::Vacant(slot_a0)
+            SearchResult::Vacant(first_bucket_slot_zero)
         );
 
-        occupy(&mut table, slot_a0, u64::MAX - 1, dummy_fingerprint);
-        occupy(&mut table, slot_b0, u64::MAX - 2, dummy_fingerprint);
-        let slot_a1 = slot_a0 + 1;
-        let slot_b1 = slot_b0 + 1;
-        assert_eq!(
-            table.search_exact_for_insert(&identity, identity, fingerprint),
-            SearchResult::Vacant(slot_a1)
+        occupy(
+            &mut table,
+            first_bucket_slot_zero,
+            u64::MAX - 1,
+            dummy_fingerprint,
         );
-        occupy(&mut table, slot_a1, u64::MAX - 3, dummy_fingerprint);
+        occupy(
+            &mut table,
+            second_bucket_slot_zero,
+            u64::MAX - 2,
+            dummy_fingerprint,
+        );
+        let first_bucket_slot_one = first_bucket_slot_zero + 1;
+        let second_bucket_slot_one = second_bucket_slot_zero + 1;
         assert_eq!(
             table.search_exact_for_insert(&identity, identity, fingerprint),
-            SearchResult::Vacant(slot_b1)
+            SearchResult::Vacant(first_bucket_slot_one)
+        );
+        occupy(
+            &mut table,
+            first_bucket_slot_one,
+            u64::MAX - 3,
+            dummy_fingerprint,
+        );
+        assert_eq!(
+            table.search_exact_for_insert(&identity, identity, fingerprint),
+            SearchResult::Vacant(second_bucket_slot_one)
         );
 
-        occupy(&mut table, slot_b1, identity, fingerprint);
+        occupy(&mut table, second_bucket_slot_one, identity, fingerprint);
         let direct = core::ptr::from_ref(
             table
                 .find_entry_ref(&identity, identity, fingerprint)
                 .unwrap(),
         );
-        assert_eq!(direct, table.storage.slot_ptr(slot_b1).cast_const());
+        assert_eq!(
+            direct,
+            table.storage.slot_ptr(second_bucket_slot_one).cast_const()
+        );
     }
 
     #[test]

@@ -32,20 +32,6 @@ impl PaperConfig {
         })
     }
 
-    /// Returns the paper array size `n`.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) const fn n(&self) -> usize {
-        self.n
-    }
-
-    /// Returns the exponent in the exact representation `delta = 1 / 2^d`.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) const fn reserve_exponent(&self) -> u32 {
-        self.reserve_exponent
-    }
-
     /// Returns `floor(delta * n)` using exact integer arithmetic.
     #[must_use]
     pub(crate) const fn floor_delta_n(&self) -> usize {
@@ -56,18 +42,6 @@ impl PaperConfig {
     #[must_use]
     pub(crate) const fn target_insertions(&self) -> usize {
         self.n - self.floor_delta_n()
-    }
-
-    /// Reports the Elastic theorem's unquantified asymptotic precondition.
-    ///
-    /// The exact inverse-power-of-two representation is accepted, but the
-    /// paper's `delta > O(1/n)` precondition does not specify a concrete
-    /// constant, so this method deliberately does not claim applicability.
-    #[must_use]
-    #[cfg(test)]
-    #[allow(clippy::unused_self)]
-    pub(crate) const fn elastic_domain_status(&self) -> TheoremDomainStatus {
-        TheoremDomainStatus::UnquantifiedAsymptoticPrecondition
     }
 
     /// Checks Funnel's concrete `delta <= 1/8` restriction and reports the
@@ -258,13 +232,6 @@ pub(crate) struct FunnelPlan {
 }
 
 impl FunnelPlan {
-    /// Returns the validated inputs used by this plan.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) const fn config(&self) -> PaperConfig {
-        self.config
-    }
-
     /// Returns the ordinary-level count `alpha = 4 * reserve_exponent + 10`.
     #[must_use]
     pub(crate) const fn alpha(&self) -> usize {
@@ -290,13 +257,6 @@ impl FunnelPlan {
     #[must_use]
     pub(crate) const fn fallback_bucket_width(&self) -> usize {
         self.fallback_bucket_width
-    }
-
-    /// Returns the logical length of special array `A_(alpha + 1)`.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) const fn special_len(&self) -> usize {
-        self.special_len
     }
 
     /// Returns `B = ceil(special_len / 2)`, the special primary length.
@@ -331,14 +291,6 @@ impl FunnelPlan {
             remaining_sum: (self.config.n - self.special_len) / self.beta,
             remaining_levels: self.alpha,
         }
-    }
-
-    /// Iterates over each ordinary level's exact logical slot length.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn ordinary_level_lengths(&self) -> impl ExactSizeIterator<Item = usize> + Clone {
-        let beta = self.beta;
-        self.ordinary_bucket_counts().map(move |count| count * beta)
     }
 }
 
@@ -728,6 +680,33 @@ pub(crate) const fn ceil_three_quarters(value: usize) -> usize {
 }
 
 #[cfg(test)]
+impl PaperConfig {
+    pub(crate) const fn n(&self) -> usize {
+        self.n
+    }
+
+    pub(crate) const fn reserve_exponent(&self) -> u32 {
+        self.reserve_exponent
+    }
+}
+
+#[cfg(test)]
+impl FunnelPlan {
+    pub(crate) const fn config(&self) -> PaperConfig {
+        self.config
+    }
+
+    pub(crate) const fn special_len(&self) -> usize {
+        self.special_len
+    }
+
+    pub(crate) fn ordinary_level_lengths(&self) -> impl ExactSizeIterator<Item = usize> + Clone {
+        let beta = self.beta;
+        self.ordinary_bucket_counts().map(move |count| count * beta)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         ConfigError, FunnelDomainError, FunnelPlanError, FunnelPlanParameter, PaperConfig,
@@ -761,12 +740,8 @@ mod tests {
     }
 
     #[test]
-    fn algorithm_domain_checks_do_not_claim_a_theorem_applies() {
+    fn funnel_domain_checks_do_not_claim_the_theorem_applies() {
         let below_funnel_domain = PaperConfig::new(32_768, 2).unwrap();
-        assert_eq!(
-            below_funnel_domain.elastic_domain_status(),
-            TheoremDomainStatus::UnquantifiedAsymptoticPrecondition
-        );
         assert_eq!(
             below_funnel_domain.funnel_domain_status(),
             Err(FunnelDomainError::ExponentBelowMinimum {

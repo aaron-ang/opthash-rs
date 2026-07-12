@@ -1,8 +1,3 @@
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
 mod harness;
 
 use std::hint::black_box;
@@ -16,6 +11,11 @@ const CAP_HINT: usize = 100_000;
 /// Fill targets as a fraction of each map's resize threshold (`capacity()`).
 const LOAD_FRACTIONS: &[f64] = &[0.45, 0.55, 0.65, 0.75, 0.85];
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn bench_load_factor(c: &mut Criterion) {
     use hashbrown::HashMap as HashbrownMap;
     use opthash::{ElasticHashMap, FunnelHashMap};

@@ -1,10 +1,4 @@
 //! Reproducible probe randomness and exact discrete formula primitives.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::inline_always,
-    clippy::similar_names,
-    clippy::trivially_copy_pass_by_ref
-)]
 
 /// A domain in which one exact finite probe word is requested.
 ///
@@ -116,12 +110,24 @@ pub(crate) struct PreparedProbeRange {
     rejection_threshold: u64,
 }
 
+// Pinned to wyhash final 4.3's default secrets:
+// https://github.com/wangyi-fudan/wyhash/blob/e4764a0b637d34d3421a7760affada9288b625a8/wyhash.h#L144-L145
+pub(crate) const WYHASH_DEFAULT_SECRET: [u64; 4] = [
+    0x2D35_8DCC_AA6C_78A5,
+    0x8BB8_4B93_962E_ACC9,
+    0x4B33_A62E_D433_D4A3,
+    0x4D5A_2DA5_1DE1_AA47,
+];
+pub(crate) const W1RAND_INCREMENT: u64 = 0xD07E_BC63_2746_54C7;
+
+// Fixed separators from SplitMix64's increment and current upstream constants;
+// they do not instantiate either generator.
 const INITIAL_LANE: u64 = 0x9e37_79b9_7f4a_7c15;
-const KEY_LANE: u64 = 0xa076_1d64_78bd_642f;
-const DOMAIN_KIND_LANE: u64 = 0xe703_7ed1_a0b4_28db;
-const DOMAIN_LEVEL_LANE: u64 = 0x8ebc_6af0_9c88_c6e3;
-const PROBE_LANE: u64 = 0x5899_65cc_7537_4cc3;
-const REJECTION_LANE: u64 = 0x1d8e_4e27_c47d_124f;
+const KEY_LANE: u64 = WYHASH_DEFAULT_SECRET[0];
+const DOMAIN_KIND_LANE: u64 = WYHASH_DEFAULT_SECRET[1];
+const DOMAIN_LEVEL_LANE: u64 = WYHASH_DEFAULT_SECRET[2];
+const PROBE_LANE: u64 = WYHASH_DEFAULT_SECRET[3];
+const REJECTION_LANE: u64 = W1RAND_INCREMENT;
 const FUNNEL_LEVEL_LIMIT: u64 = 1 << 46;
 const FUNNEL_LOGICAL_LIMIT: u64 = 1 << 8;
 const FUNNEL_REJECTION_LIMIT: u32 = 1 << 8;
@@ -133,7 +139,7 @@ impl CounterPrf {
         Self { seed }
     }
 
-    pub(crate) fn prepare_elastic(&self, key_hash: u64) -> PreparedElasticProbe {
+    pub(crate) fn prepare_elastic(self, key_hash: u64) -> PreparedElasticProbe {
         let state = mix64(self.seed.wrapping_add(INITIAL_LANE));
         let state = absorb_counter_lane(state, key_hash, KEY_LANE);
         let domain_state = absorb_counter_lane(state, 1, DOMAIN_KIND_LANE);
@@ -149,7 +155,7 @@ impl FunnelPrf {
     }
 
     #[inline]
-    pub(crate) fn prepare(&self, key_hash: u64) -> PreparedFastFunnelProbe {
+    pub(crate) fn prepare(self, key_hash: u64) -> PreparedFastFunnelProbe {
         let keyed = key_hash.wrapping_add(self.seed);
         PreparedFastFunnelProbe {
             key_in: mix64(keyed.wrapping_add(KEY_LANE)),
@@ -233,7 +239,7 @@ impl PreparedElasticProbe {
     }
 
     #[inline]
-    pub(crate) fn prepare_level_lane(&self, level_lane: u64) -> PreparedElasticLevelProbe {
+    pub(crate) fn prepare_level_lane(self, level_lane: u64) -> PreparedElasticLevelProbe {
         PreparedElasticLevelProbe {
             level_state: mix64(self.domain_state.wrapping_add(level_lane)),
         }
@@ -241,8 +247,9 @@ impl PreparedElasticProbe {
 }
 
 impl PreparedElasticLevelProbe {
+    #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn word_from_probe_lane(&self, logical_probe_lane: u64, rejection_index: u32) -> u64 {
+    fn word_from_probe_lane(self, logical_probe_lane: u64, rejection_index: u32) -> u64 {
         let state = mix64(self.level_state.wrapping_add(logical_probe_lane));
         let rejection_lane = if rejection_index == 0 {
             mix64(REJECTION_LANE)
@@ -254,12 +261,6 @@ impl PreparedElasticLevelProbe {
 }
 
 impl PreparedFastFunnelProbe {
-    #[inline(always)]
-    #[cfg(test)]
-    fn word_from_counter(self, counter: u64) -> u64 {
-        mix64(counter ^ self.key_in) ^ self.key_out
-    }
-
     #[inline]
     pub(crate) fn prepare_domain(
         self,
@@ -269,6 +270,7 @@ impl PreparedFastFunnelProbe {
         Some(self.prepare_counter_base(counter_base))
     }
 
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     pub(crate) const fn prepare_counter_base(
         self,
@@ -283,6 +285,7 @@ impl PreparedFastFunnelProbe {
 }
 
 impl PreparedFastFunnelDomainProbe {
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     fn word(self, logical_probe_index: u64, rejection_index: u32) -> u64 {
         assert!(
@@ -341,12 +344,6 @@ impl PreparedProbeRange {
             upper,
             rejection_threshold: upper_word.wrapping_neg() % upper_word,
         })
-    }
-
-    #[inline(always)]
-    #[cfg(test)]
-    pub(crate) const fn upper(self) -> usize {
-        self.upper
     }
 }
 
@@ -415,9 +412,10 @@ pub(crate) fn unbiased_probe_index<O: ProbeOracle + ?Sized>(
     })
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::inline_always)]
 #[inline(always)]
 pub(crate) fn unbiased_prepared_elastic_probe_index(
-    probe: &PreparedElasticLevelProbe,
+    probe: PreparedElasticLevelProbe,
     logical_probe_lane: u64,
     upper: usize,
     max_random_words: u32,
@@ -443,6 +441,7 @@ pub(crate) fn unbiased_prepared_elastic_probe_index(
     reduce_prepared_elastic_non_power(probe, logical_probe_lane, upper, max_random_words)
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::inline_always)]
 #[inline(always)]
 pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
     probe: &PreparedFastFunnelDomainProbe,
@@ -469,6 +468,7 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
 
 #[cold]
 #[inline(never)]
+#[allow(clippy::cast_possible_truncation)]
 fn reduce_prepared_funnel_retries(
     probe: &PreparedFastFunnelDomainProbe,
     logical_probe_index: u64,
@@ -494,7 +494,7 @@ fn reduce_prepared_funnel_retries(
 #[cold]
 #[inline(never)]
 fn reduce_prepared_elastic_non_power(
-    probe: &PreparedElasticLevelProbe,
+    probe: PreparedElasticLevelProbe,
     logical_probe_lane: u64,
     upper: usize,
     max_random_words: u32,
@@ -504,8 +504,8 @@ fn reduce_prepared_elastic_non_power(
     })
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::inline_always)]
 #[inline(always)]
-#[allow(clippy::cast_possible_truncation)]
 fn reduce_probe_words(
     upper: usize,
     max_random_words: u32,
@@ -755,6 +755,22 @@ fn append_bit(prefix: u128, bit: u128) -> Option<u128> {
 }
 
 #[cfg(test)]
+impl PreparedFastFunnelProbe {
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn word_from_counter(self, counter: u64) -> u64 {
+        mix64(counter ^ self.key_in) ^ self.key_out
+    }
+}
+
+#[cfg(test)]
+impl PreparedProbeRange {
+    pub(crate) const fn upper(self) -> usize {
+        self.upper
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -791,7 +807,7 @@ mod tests {
                     for upper in [1, 2, 4, 16, 1 << 20] {
                         assert_eq!(
                             unbiased_prepared_elastic_probe_index(
-                                &prepared_level,
+                                prepared_level,
                                 probe_lane,
                                 upper,
                                 8,
@@ -877,7 +893,7 @@ mod tests {
                 0,
                 0,
                 0x0000_0000_0000_0000,
-                0x584f_bd8c_cfbf_e67c,
+                0x0104_24b6_88a0_31f9,
             ),
             (
                 1,
@@ -887,7 +903,7 @@ mod tests {
                 255,
                 255,
                 0x3fff_ffff_ffff_ffff,
-                0x25aa_bb0a_07b2_074f,
+                0x18ff_a236_490d_cfe7,
             ),
             (
                 u64::MAX,
@@ -895,7 +911,7 @@ mod tests {
                 255,
                 255,
                 0x4000_0000_0000_ffff,
-                0x6b27_15b8_99c2_d843,
+                0x459b_2025_172f_a8b0,
             ),
             (
                 0xd1b5_4a32_d192_ed03,
@@ -903,7 +919,7 @@ mod tests {
                 7,
                 1,
                 0x8000_0000_0000_0701,
-                0xcbcd_0c5b_e9c2_0453,
+                0x7e31_645c_eb87_f9f4,
             ),
             (
                 0x0123_4567_89ab_cdef,
@@ -911,7 +927,7 @@ mod tests {
                 0,
                 0,
                 0xc000_0000_0000_0000,
-                0xf0ef_9ef3_0ac2_58f3,
+                0xa73b_4f56_b7b9_6d11,
             ),
         ];
         for (key, domain, logical, retry, counter, word) in cases {
@@ -933,6 +949,7 @@ mod tests {
 
     #[cfg(target_pointer_width = "64")]
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn fast_funnel_retries_and_exhaustion_use_distinct_checked_counters() {
         let oracle = FunnelPrf::new(0x1234_5678_9abc_def0);
         let range = PreparedProbeRange::new((1_usize << 63) + 1).unwrap();
@@ -989,8 +1006,8 @@ mod tests {
         let mut cross_level_equal_bits = 0_u64;
         let mut fallback_same_bucket = 0_u64;
         let fallback_range = PreparedProbeRange::new(257).unwrap();
-        let mut fallback_a_counts = alloc::vec![0_u32; fallback_range.upper()];
-        let mut fallback_b_counts = alloc::vec![0_u32; fallback_range.upper()];
+        let mut first_fallback_counts = alloc::vec![0_u32; fallback_range.upper()];
+        let mut second_fallback_counts = alloc::vec![0_u32; fallback_range.upper()];
 
         for key in 0..SAMPLES {
             let ordinary = oracle.word(key, ProbeDomain::FunnelOrdinary { level: 7 }, 0, 0);
@@ -1029,8 +1046,8 @@ mod tests {
             )
             .unwrap()
             .index;
-            fallback_a_counts[a] += 1;
-            fallback_b_counts[b] += 1;
+            first_fallback_counts[a] += 1;
+            second_fallback_counts[b] += 1;
             fallback_same_bucket += u64::from(a == b);
         }
 
@@ -1044,7 +1061,10 @@ mod tests {
         let bucket_min = expected_bucket_count * 3 / 4;
         let bucket_max = expected_bucket_count * 5 / 4;
         assert!((bucket_min..=bucket_max).contains(&fallback_same_bucket));
-        for count in fallback_a_counts.into_iter().chain(fallback_b_counts) {
+        for count in first_fallback_counts
+            .into_iter()
+            .chain(second_fallback_counts)
+        {
             assert!((bucket_min..=bucket_max).contains(&u64::from(count)));
         }
     }
