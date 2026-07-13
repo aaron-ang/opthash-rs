@@ -19,6 +19,13 @@ placement rules.[^fkk2025] The paper considers a fixed-size, insertion-only
 table; opthash adds deletion, growth, tombstone cleanup, and clearing, with each
 rebuild or reset beginning a new observable epoch.
 
+The paper's amortized probe-complexity objective concerns successful queries for
+stored keys.[^fkk2025] Funnel's greedy negative query follows its insertion path,
+but Elastic negative lookup is not the paper's primary optimized quantity.
+Deletion over an unbounded update history is a separate model; tombstones and
+cleanup epochs here are correctness-preserving library extensions rather than
+claims of the insertion-only bounds.[^fkk2025]
+
 Placement recovery handles the unusual case where the prescribed candidates
 are full while the map is still below its insertion limit. Elastic first
 rebuilds at the same size; if needed, either map can use another free slot and
@@ -49,8 +56,9 @@ FunnelHashMap
 ```
 
 Elastic batches insertions over geometrically smaller levels, normally choosing
-between the current level and the next. Its membership filter rejects definite
-misses before probing the levels.
+between the current level and the next. Elastic's membership filter avoids exact
+duplicate-search work when an inserted hash is definitely new; ordinary queries
+follow the paper-derived exact probe schedule.
 
 Funnel tries one key-selected bucket per ordinary level. If they are full, `B`
 offers a short sequence of individual slots; `C` alternates between matching

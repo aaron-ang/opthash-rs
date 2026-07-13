@@ -35,6 +35,20 @@ of `std`, `hashbrown`, `elastic`, or `funnel`. Renaming an ID resets CodSpeed
 history. The registered headline workloads live in
 [`speedup.rs`](speedup.rs).
 
+## Interpreting comparisons
+
+- `hashbrown` shares the fixed foldhash fixture with Elastic and Funnel and is
+  the SIMD SwissTable throughput ceiling, not a claim that paper-faithful probe
+  algorithms should match its constant factors.
+- `std` uses its own fixed `DefaultHasher`; Funnel parity with `std` is a useful
+  engineering target but is not a same-table-design comparison.
+- `get_hit` is the benchmark closest to the paper's positive-query objective.
+- `get_miss` measures a different regime: Funnel negatives follow insertion-like
+  routing, while ordinary Elastic negatives exhaust the paper-derived exact
+  schedule.
+- `delete_heavy`, `remove_burst`, and `post_delete_*` measure the library's
+  tombstone and epoch extensions, not the paper's insertion-only theorem.
+
 ## Hit-query methodology
 
 Randomized `get_hit` workloads cycle a full Fisher-Yates permutation generated
