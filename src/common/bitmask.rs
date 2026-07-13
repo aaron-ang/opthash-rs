@@ -3,7 +3,7 @@ pub(crate) type BitMaskWord = u64;
 /// Bits per slot in [`BitMask`]: 8 for NEON/SWAR-8, 1 elsewhere.
 #[cfg(any(opthash_neon_group, opthash_scalar_group))]
 pub(crate) const BITMASK_STRIDE: u32 = 8;
-#[cfg(any(opthash_x86_16_group, opthash_avx512_group))]
+#[cfg(opthash_x86_16_group)]
 pub(crate) const BITMASK_STRIDE: u32 = 1;
 
 /// Per-slot match mask over a control group.

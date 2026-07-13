@@ -5,8 +5,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
 
     for cfg in [
-        "opthash_avx512_group",
-        "opthash_wide_group",
         "opthash_neon_group",
         "opthash_x86_16_group",
         "opthash_scalar_group",
