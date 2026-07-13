@@ -398,8 +398,6 @@ pub(crate) struct BatchScheduler {
     batch_plan: Box<[usize]>,
     current_batch_index: usize,
     batch_remaining: usize,
-    total_slots: usize,
-    max_insertions: usize,
 }
 
 /// Direct the structural work required before insertion.
@@ -417,21 +415,25 @@ enum BatchTarget {
 }
 
 impl BatchScheduler {
-    pub(crate) fn new(batch_plan: Box<[usize]>, total_slots: usize, max_insertions: usize) -> Self {
+    pub(crate) fn new(batch_plan: Box<[usize]>) -> Self {
         let initial_remaining = batch_plan.first().copied().unwrap_or(0);
         Self {
             batch_plan,
             current_batch_index: 0,
             batch_remaining: initial_remaining,
-            total_slots,
-            max_insertions,
         }
     }
 
     /// Select structural work for the next insert.
     #[inline]
-    pub(crate) fn on_insert(&mut self, current_len: usize) -> InsertAction {
-        let structural_action = self.structural_action_for_next_insert(current_len);
+    pub(crate) fn on_insert(
+        &mut self,
+        current_len: usize,
+        total_slots: usize,
+        max_insertions: usize,
+    ) -> InsertAction {
+        let structural_action =
+            Self::structural_action_for_next_insert(current_len, total_slots, max_insertions);
         if let Some(action) = structural_action {
             return action;
         }
@@ -440,12 +442,16 @@ impl BatchScheduler {
     }
 
     #[inline]
-    fn structural_action_for_next_insert(&self, current_len: usize) -> Option<InsertAction> {
-        if current_len >= self.max_insertions {
-            let new_cap = if self.total_slots == 0 {
+    fn structural_action_for_next_insert(
+        current_len: usize,
+        total_slots: usize,
+        max_insertions: usize,
+    ) -> Option<InsertAction> {
+        if current_len >= max_insertions {
+            let new_cap = if total_slots == 0 {
                 INITIAL_CAPACITY
             } else {
-                self.total_slots.saturating_mul(2)
+                total_slots.saturating_mul(2)
             };
             return Some(InsertAction::Resize(new_cap));
         }
@@ -670,11 +676,7 @@ where
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(
-                geometry.batch_plan,
-                geometry.total_slots,
-                geometry.max_insertions,
-            ),
+            scheduler: BatchScheduler::new(geometry.batch_plan),
             hash_builder,
             alloc,
             arena,
@@ -702,11 +704,7 @@ where
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(
-                geometry.batch_plan,
-                geometry.total_slots,
-                geometry.max_insertions,
-            ),
+            scheduler: BatchScheduler::new(geometry.batch_plan),
             hash_builder,
             alloc,
             arena,
@@ -794,7 +792,10 @@ where
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let key_fingerprint = control::control_fingerprint(key_hash);
 
-        match self.scheduler.on_insert(self.len) {
+        match self
+            .scheduler
+            .on_insert(self.len, self.total_slots, self.max_insertions)
+        {
             InsertAction::Resize(cap) => {
                 self.resize_with_transition(cap, EpochTransition::Growth);
                 self.scheduler.advance_batch_window();
@@ -1311,11 +1312,7 @@ where
         let old_levels = mem::replace(&mut self.levels, new_levels);
         self.total_slots = geometry.total_slots;
         self.max_insertions = geometry.max_insertions;
-        self.scheduler = BatchScheduler::new(
-            geometry.batch_plan,
-            geometry.total_slots,
-            geometry.max_insertions,
-        );
+        self.scheduler = BatchScheduler::new(geometry.batch_plan);
         self.len = 0;
         self.probe_high_water = 0;
         self.probe_schedule.clear();
@@ -1406,11 +1403,7 @@ where
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(
-                geometry.batch_plan,
-                geometry.total_slots,
-                geometry.max_insertions,
-            ),
+            scheduler: BatchScheduler::new(geometry.batch_plan),
             hash_builder,
             alloc,
             arena,
@@ -1959,7 +1952,9 @@ mod tests {
         for identity in identities {
             assert_eq!(table.hash_key(&identity), identity);
             assert!(matches!(
-                table.scheduler.on_insert(table.len),
+                table
+                    .scheduler
+                    .on_insert(table.len, table.total_slots, table.max_insertions,),
                 InsertAction::Continue
             ));
             let placement = table
@@ -2545,7 +2540,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn insert_after_rebuild_advances_exhausted_batch() {
+    fn vacant_insert_uses_the_table_insertion_limit() {
         let mut table: ElasticTable<usize, usize> =
             ElasticTable::with_capacity_and_reserve_and_hasher_in(
                 1024,
@@ -2560,12 +2555,14 @@ mod tests {
         for key in 0..bootstrap_quota {
             table.insert_unique(key, key);
         }
-        table.scheduler.max_insertions = table.len;
+        table.max_insertions = table.len;
+        let previous_slots = table.total_slots;
 
         let key = bootstrap_quota;
         let hash = table.hash_key(&key);
         table.insert_for_vacant_entry(key, key, hash);
 
+        assert!(table.total_slots > previous_slots);
         assert!(table.scheduler.current_batch_index > 0);
         assert_eq!(table.scheduler.target(), BatchTarget::LevelPair(0));
     }
