@@ -228,11 +228,28 @@ unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
 unsafe fn occupied_mask_16_sse2(ptr: *const u8) -> BitMask {
     unsafe {
         let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
-        let masked =
-            x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()));
-        let occ = x86_64::_mm_cmpgt_epi8(masked, x86_64::_mm_setzero_si128());
+        let occ = x86_64::_mm_cmpgt_epi8(data, x86_64::_mm_setzero_si128());
         let bits = x86_64::_mm_movemask_epi8(occ).cast_unsigned() & 0xFFFF;
         BitMask(u64::from(bits))
+    }
+}
+
+#[cfg(all(test, opthash_x86_16_group))]
+mod sse2_tests {
+    use super::*;
+    use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, FINGERPRINT_MASK};
+
+    #[test]
+    fn direct_signed_compare_classifies_every_valid_control() {
+        for control in core::iter::once(CTRL_EMPTY)
+            .chain(core::iter::once(CTRL_TOMBSTONE))
+            .chain(1..=FINGERPRINT_MASK)
+        {
+            let controls = [control; 16];
+            let occupied = unsafe { occupied_mask_16_sse2(controls.as_ptr()) };
+            let expected = if control.is_occupied() { 0xFFFF } else { 0 };
+            assert_eq!(occupied.0, expected, "control={control:#04x}");
+        }
     }
 }
 
