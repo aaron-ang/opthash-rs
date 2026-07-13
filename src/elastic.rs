@@ -742,17 +742,6 @@ where
         unsafe { *self.membership_ptr().add(word) & bits == bits }
     }
 
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
-    fn lookup_membership_maybe_contains(&self, hash: u64) -> bool {
-        let words = self.membership_words();
-        if words == 0 {
-            return false;
-        }
-        let (word, bits) = membership_location(hash, words);
-        unsafe { *self.membership_ptr().add(word) & bits == bits }
-    }
-
     #[inline(never)]
     fn record_membership(&mut self, hash: u64) {
         let words = self.membership_words();
@@ -1065,9 +1054,6 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        if !self.lookup_membership_maybe_contains(hash) {
-            return None;
-        }
         self.find_slot_indices_with_hash(key, hash, fingerprint)
     }
 
@@ -1081,9 +1067,6 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        if !self.lookup_membership_maybe_contains(hash) {
-            return None;
-        }
         self.find_entry_with_hash(key, hash, fingerprint)
     }
 
@@ -1794,7 +1777,6 @@ where
 mod tests {
     use super::*;
 
-    use core::cell::Cell;
     use core::hash::{BuildHasher, Hasher};
     use core::num::{NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
     use core::ptr;
@@ -2248,69 +2230,6 @@ mod tests {
         assert!(map.table().membership_maybe_contains(inserted_hash));
         assert_eq!(map.insert(7, 17), None);
         assert_eq!(map.get(&7), Some(&17));
-    }
-
-    #[test]
-    fn definite_negative_lookup_skips_exact_schedule() {
-        struct CountingQuery<'a> {
-            hash: u64,
-            comparisons: &'a Cell<usize>,
-        }
-
-        impl Hash for CountingQuery<'_> {
-            fn hash<H: Hasher>(&self, state: &mut H) {
-                state.write_u64(self.hash);
-            }
-        }
-
-        impl Equivalent<u64> for CountingQuery<'_> {
-            fn equivalent(&self, _key: &u64) -> bool {
-                self.comparisons.set(self.comparisons.get() + 1);
-                false
-            }
-        }
-
-        let mut table =
-            ElasticTable::<u64, u64, IdentityBuildHasher>::with_capacity_and_reserve_and_hasher_in(
-                128,
-                ReserveFraction::DEFAULT,
-                IdentityBuildHasher,
-                Global,
-            );
-        for key in 0_u64..96 {
-            table.insert_for_vacant_entry(key, key, key);
-        }
-
-        let candidate = (1_000_000_u64..2_000_000)
-            .find(|&candidate| {
-                if table.membership_maybe_contains(candidate) {
-                    return false;
-                }
-                let fingerprint = control::control_fingerprint(candidate);
-                let Some(slot) = table.route_exact(0, candidate, 0) else {
-                    return false;
-                };
-                table.levels[0].control_at(slot) == fingerprint
-            })
-            .expect(
-                "deterministic fixture must expose a membership-negative fingerprint collision",
-            );
-        let fingerprint = control::control_fingerprint(candidate);
-        let comparisons = Cell::new(0);
-        let query = CountingQuery {
-            hash: candidate,
-            comparisons: &comparisons,
-        };
-
-        assert_eq!(
-            map::TableBackend::find_entry(&table, &query, candidate, fingerprint).map(|_| ()),
-            None,
-        );
-        assert_eq!(
-            comparisons.get(),
-            0,
-            "definite negative reached payload equality"
-        );
     }
 
     #[test]
