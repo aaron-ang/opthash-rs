@@ -44,8 +44,8 @@ history. The registered headline workloads live in
   engineering target but is not a same-table-design comparison.
 - `get_hit` is the benchmark closest to the paper's positive-query objective.
 - `get_miss` measures a different regime: Funnel negatives follow insertion-like
-  routing, while Elastic rejects membership-definite negatives immediately and
-  exhausts the paper-derived exact schedule for filter false positives.
+  routing, while ordinary Elastic negatives exhaust the paper-derived exact
+  schedule.
 - `delete_heavy`, `remove_burst`, and `post_delete_*` measure the library's
   tombstone and epoch extensions, not the paper's insertion-only theorem.
 
