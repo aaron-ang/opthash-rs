@@ -650,13 +650,6 @@ where
         (0..self.shape.n).find(|&slot| self.storage.control_at(slot).is_free())
     }
 
-    #[cold]
-    #[inline(never)]
-    fn exceptional_free_slot(&self) -> usize {
-        self.first_free_global()
-            .expect("Funnel insertion limit reserves a free slot")
-    }
-
     fn place_new_entry(
         &mut self,
         slot: usize,
@@ -684,7 +677,11 @@ where
         let exact = self.search_exact_for_insert(&key, key_hash, key_fingerprint);
         let (slot, exceptional) = match exact {
             SearchResult::Vacant(slot) => (slot, false),
-            SearchResult::Full | SearchResult::RangeFailure => (self.exceptional_free_slot(), true),
+            SearchResult::Full | SearchResult::RangeFailure => (
+                self.first_free_global()
+                    .expect("Funnel rebuild has enough logical capacity"),
+                true,
+            ),
             SearchResult::Hit(_) => unreachable!("rebuild input contains duplicate keys"),
         };
         self.place_new_entry(slot, key, value, key_fingerprint, exceptional);
@@ -723,7 +720,11 @@ where
         let (slot, exceptional) = match exact {
             SearchResult::Vacant(slot) => (slot, false),
             SearchResult::Hit(_) => unreachable!("known-absent Funnel insertion found a key"),
-            SearchResult::Full | SearchResult::RangeFailure => (self.exceptional_free_slot(), true),
+            SearchResult::Full | SearchResult::RangeFailure => (
+                self.first_free_global()
+                    .expect("Funnel insertion limit reserves a free slot"),
+                true,
+            ),
         };
         let location = self.place_new_entry(slot, key, value, key_fingerprint, exceptional);
         if exceptional {
