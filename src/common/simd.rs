@@ -70,6 +70,7 @@ fn swar_free_mask(word: u64) -> u64 {
 /// # Safety
 ///
 /// `ptr` must be valid to read `GROUP_SIZE` bytes.
+#[cfg(not(opthash_x86_16_group))]
 #[inline]
 #[must_use]
 pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
@@ -77,8 +78,6 @@ pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
     let mask = unsafe { eq_mask_16_neon(ptr, target) };
     #[cfg(opthash_avx512_group)]
     let mask = unsafe { eq_mask_64_avx512(ptr, target) };
-    #[cfg(opthash_x86_16_group)]
-    let mask = unsafe { eq_mask_16_sse2(ptr, target) };
     #[cfg(opthash_scalar_group)]
     let mask = unsafe { BitMask(swar_eq_mask(swar_word(ptr), target)) };
     mask
@@ -87,6 +86,7 @@ pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
 /// # Safety
 ///
 /// `ptr` must be valid to read `GROUP_SIZE` bytes.
+#[cfg(not(opthash_x86_16_group))]
 #[inline]
 #[must_use]
 pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
@@ -94,8 +94,6 @@ pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
     let mask = unsafe { free_mask_16_neon(ptr) };
     #[cfg(opthash_avx512_group)]
     let mask = unsafe { free_mask_64_avx512(ptr) };
-    #[cfg(opthash_x86_16_group)]
-    let mask = unsafe { free_mask_16_sse2(ptr) };
     #[cfg(opthash_scalar_group)]
     let mask = unsafe { BitMask(swar_free_mask(swar_word(ptr))) };
     mask
@@ -189,19 +187,6 @@ unsafe fn occupied_mask_16_neon(ptr: *const u8) -> BitMask {
 #[allow(clippy::cast_ptr_alignment)]
 #[cfg(opthash_x86_16_group)]
 #[inline]
-unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> BitMask {
-    unsafe {
-        let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
-        let target_vec = x86_64::_mm_set1_epi8(target.cast_signed());
-        let cmp = x86_64::_mm_cmpeq_epi8(data, target_vec);
-        let bits = x86_64::_mm_movemask_epi8(cmp).cast_unsigned() & 0xFFFF;
-        BitMask(u64::from(bits))
-    }
-}
-
-#[allow(clippy::cast_ptr_alignment)]
-#[cfg(opthash_x86_16_group)]
-#[inline]
 unsafe fn event_mask_8_sse2(ptr: *const u8, target: u8) -> BitMask {
     unsafe {
         let data = x86_64::_mm_loadl_epi64(ptr.cast::<__m128i>());
@@ -246,20 +231,6 @@ unsafe fn occupied_mask_64_avx512(ptr: *const u8) -> BitMask {
         let data = x86_64::_mm512_loadu_si512(ptr.cast::<__m512i>());
         let fingerprint_bits = x86_64::_mm512_set1_epi8(FINGERPRINT_MASK.cast_signed());
         BitMask(x86_64::_mm512_test_epi8_mask(data, fingerprint_bits))
-    }
-}
-
-#[allow(clippy::cast_ptr_alignment)]
-#[cfg(opthash_x86_16_group)]
-#[inline]
-unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
-    unsafe {
-        let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
-        let masked =
-            x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()));
-        let free = x86_64::_mm_cmpeq_epi8(masked, x86_64::_mm_setzero_si128());
-        let bits = x86_64::_mm_movemask_epi8(free).cast_unsigned() & 0xFFFF;
-        BitMask(u64::from(bits))
     }
 }
 

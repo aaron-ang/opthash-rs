@@ -290,8 +290,9 @@ unsafe fn scan_funnel_bucket<T>(
 ///
 /// # Safety
 ///
-/// The bounds requirements are identical to [`scan_funnel_bucket`], and the
-/// logical table must contain no tombstones.
+/// `ctrl_ptr.add(start)` must be readable through
+/// `length + FUNNEL_SCAN_WIDTH - 1` bytes, and the logical table must contain
+/// no tombstones.
 unsafe fn scan_clean_funnel_bucket<T>(
     ctrl_ptr: *const u8,
     start: usize,
@@ -302,25 +303,20 @@ unsafe fn scan_clean_funnel_bucket<T>(
     let end = start + length;
     let mut position = start;
     while position < end {
-        let logical_lanes = GROUP_SIZE.min(end - position);
+        let logical_lanes = simd::FUNNEL_SCAN_WIDTH.min(end - position);
         let group = unsafe { ctrl_ptr.add(position) };
-        let matches = unsafe { simd::eq_mask_group(group, fingerprint) };
-        let first_empty = unsafe { simd::free_mask_group(group) }
-            .into_iter()
-            .find(|&lane| lane < logical_lanes);
-        let semantic_lanes = first_empty.unwrap_or(logical_lanes);
-
-        for lane in matches {
-            if lane >= semantic_lanes {
+        let events = unsafe { simd::funnel_event_mask(group, fingerprint) };
+        for lane in events {
+            if lane >= logical_lanes {
                 break;
             }
             let slot = position + lane;
+            if unsafe { *ctrl_ptr.add(slot) } == CTRL_EMPTY {
+                return BucketScanResult::Empty(slot);
+            }
             if let Some(hit) = inspect_match(slot) {
                 return BucketScanResult::Hit(hit);
             }
-        }
-        if let Some(empty_lane) = first_empty {
-            return BucketScanResult::Empty(position + empty_lane);
         }
         position += logical_lanes;
     }
