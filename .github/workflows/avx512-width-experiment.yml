@@ -1,0 +1,43 @@
+name: AVX-512 width experiment
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  paired-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Detect AVX-512BW
+        id: cpu
+        run: |
+          if grep -qwm1 avx512bw /proc/cpuinfo; then
+            echo "supported=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "supported=false" >> "$GITHUB_OUTPUT"
+          fi
+          lscpu
+      - uses: dtolnay/rust-toolchain@nightly
+        if: steps.cpu.outputs.supported == 'true'
+      - name: Compare 64- and 16-lane layouts
+        if: steps.cpu.outputs.supported == 'true'
+        env:
+          RUSTFLAGS: -C target-feature=+avx512f,+avx512bw,+avx512vl
+          CARGO_TARGET_DIR: ${{ runner.temp }}/opthash-avx512-target
+        run: |
+          filter='(insert|get_hit|get_miss|mixed)/(insert|get_hit|get_miss|mixed)_(elastic|funnel)'
+          git worktree add "${RUNNER_TEMP}/opthash-base" "${{ github.event.pull_request.base.sha }}"
+          cd "${RUNNER_TEMP}/opthash-base"
+          cargo +nightly test --features nightly
+          cargo +nightly bench --features nightly --bench speedup -- "$filter" \
+            --save-baseline avx64 --warm-up-time 1 --measurement-time 2 --sample-size 20
+          cd "$GITHUB_WORKSPACE"
+          cargo +nightly test --features nightly
+          cargo +nightly bench --features nightly --bench speedup -- "$filter" \
+            --baseline avx64 --warm-up-time 1 --measurement-time 2 --sample-size 20

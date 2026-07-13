@@ -29,8 +29,7 @@ fn main() {
     let scalar = arch != "x86_64" && arch != "aarch64";
 
     if avx512_group {
-        println!("cargo:rustc-cfg=opthash_avx512_group");
-        println!("cargo:rustc-cfg=opthash_wide_group");
+        println!("cargo:rustc-cfg=opthash_x86_16_group");
     }
     if arch == "aarch64" {
         println!("cargo:rustc-cfg=opthash_neon_group");
