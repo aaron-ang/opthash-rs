@@ -10,10 +10,15 @@ use core::arch::x86_64::__m128i;
 use core::arch::x86_64::__m512i;
 
 use super::bitmask::BitMask;
-#[cfg(opthash_scalar_group)]
+#[cfg(not(opthash_x86_16_group))]
 use super::config::GROUP_SIZE;
 #[cfg(any(opthash_neon_group, opthash_x86_16_group, opthash_avx512_group))]
 use super::control::FINGERPRINT_MASK;
+
+#[cfg(opthash_x86_16_group)]
+pub(crate) const FUNNEL_SCAN_WIDTH: usize = 8;
+#[cfg(not(opthash_x86_16_group))]
+pub(crate) const FUNNEL_SCAN_WIDTH: usize = GROUP_SIZE;
 
 // Portable SWAR-8 control scan (hashbrown's "generic" backend): 8 control bytes
 // packed into one u64, matched with exact borrow-free masks. Lane `i`'s match is
@@ -115,6 +120,25 @@ pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
     mask
 }
 
+/// Merged free-or-fingerprint events for one Funnel bucket scan.
+///
+/// # Safety
+///
+/// `ptr` must be valid to read [`FUNNEL_SCAN_WIDTH`] bytes.
+#[inline]
+#[must_use]
+pub(crate) unsafe fn funnel_event_mask(ptr: *const u8, target: u8) -> BitMask {
+    #[cfg(opthash_x86_16_group)]
+    let mask = unsafe { event_mask_8_sse2(ptr, target) };
+    #[cfg(not(opthash_x86_16_group))]
+    let mask = unsafe {
+        let mut events = free_mask_group(ptr);
+        events.0 |= eq_mask_group(ptr, target).0;
+        events
+    };
+    mask
+}
+
 // Backend helpers. Numeric suffixes are the number of control bytes scanned.
 
 #[cfg(opthash_neon_group)]
@@ -171,6 +195,23 @@ unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> BitMask {
         let target_vec = x86_64::_mm_set1_epi8(target.cast_signed());
         let cmp = x86_64::_mm_cmpeq_epi8(data, target_vec);
         let bits = x86_64::_mm_movemask_epi8(cmp).cast_unsigned() & 0xFFFF;
+        BitMask(u64::from(bits))
+    }
+}
+
+#[allow(clippy::cast_ptr_alignment)]
+#[cfg(opthash_x86_16_group)]
+#[inline]
+unsafe fn event_mask_8_sse2(ptr: *const u8, target: u8) -> BitMask {
+    unsafe {
+        let data = x86_64::_mm_loadl_epi64(ptr.cast::<__m128i>());
+        let target_vec = x86_64::_mm_set1_epi8(target.cast_signed());
+        let matches = x86_64::_mm_cmpeq_epi8(data, target_vec);
+        let masked =
+            x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()));
+        let free = x86_64::_mm_cmpeq_epi8(masked, x86_64::_mm_setzero_si128());
+        let events = x86_64::_mm_or_si128(matches, free);
+        let bits = x86_64::_mm_movemask_epi8(events).cast_unsigned() & 0xFF;
         BitMask(u64::from(bits))
     }
 }

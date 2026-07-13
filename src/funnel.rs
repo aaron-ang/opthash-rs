@@ -249,7 +249,7 @@ enum BucketScanResult<T> {
 ///
 /// # Safety
 ///
-/// `ctrl_ptr.add(start)` must be readable through `length + GROUP_SIZE - 1`
+/// `ctrl_ptr.add(start)` must be readable through `length + FUNNEL_SCAN_WIDTH - 1`
 /// bytes, and every slot passed to `inspect_match` must be a valid logical
 /// slot for the corresponding data arena.
 unsafe fn scan_funnel_bucket<T>(
@@ -263,10 +263,9 @@ unsafe fn scan_funnel_bucket<T>(
     let end = start + length;
     let mut position = start;
     while position < end {
-        let logical_lanes = GROUP_SIZE.min(end - position);
+        let logical_lanes = simd::FUNNEL_SCAN_WIDTH.min(end - position);
         let group = unsafe { ctrl_ptr.add(position) };
-        let mut events = unsafe { simd::free_mask_group(group) };
-        events.0 |= unsafe { simd::eq_mask_group(group, fingerprint) }.0;
+        let events = unsafe { simd::funnel_event_mask(group, fingerprint) };
         for lane in events {
             if lane >= logical_lanes {
                 break;
