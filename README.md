@@ -57,8 +57,10 @@ FunnelHashMap
 
 Elastic batches insertions over geometrically smaller levels, normally choosing
 between the current level and the next. Elastic's membership filter avoids exact
-duplicate-search work when an inserted hash is definitely new; ordinary queries
-follow the paper-derived exact probe schedule.
+duplicate-search work when an inserted hash is definitely new and rejects
+definite-negative queries before probing the levels. Possible matches,
+including every live key and filter false positive, follow the paper-derived
+exact probe schedule.
 
 Funnel tries one key-selected bucket per ordinary level. If they are full, `B`
 offers a short sequence of individual slots; `C` alternates between matching
