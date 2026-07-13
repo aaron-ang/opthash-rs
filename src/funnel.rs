@@ -205,7 +205,7 @@ fn try_allocate_storage<K, V, A: Allocator>(
     alloc: &A,
 ) -> Result<(Arena, FlatStorage<SlotEntry<K, V>>), TryReserveError> {
     let (layout, data_offset, control_bytes) = funnel_layout::<K, V>(n)?;
-    let arena = Arena::try_allocate_with_ctrl_zeroed(layout, control_bytes, alloc)?;
+    let arena = Arena::try_allocate_with_ctrl_initialized(layout, control_bytes, alloc)?;
     let storage = FlatStorage {
         ctrl_ptr: arena.as_ptr(),
         data_ptr: unsafe {

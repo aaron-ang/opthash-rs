@@ -578,7 +578,7 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
         arena_layout.membership_offset,
         arena_layout.layout.size() - membership_tail_span::<K, V>(total_ctrl)
     );
-    let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout.layout, total_ctrl, alloc)?;
+    let arena = Arena::try_allocate_with_ctrl_initialized(arena_layout.layout, total_ctrl, alloc)?;
     if arena_layout.membership_words != 0 {
         unsafe {
             ptr::write_bytes(

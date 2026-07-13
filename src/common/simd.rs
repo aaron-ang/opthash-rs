@@ -12,8 +12,6 @@ use core::arch::x86_64::__m512i;
 use super::bitmask::BitMask;
 #[cfg(opthash_scalar_group)]
 use super::config::GROUP_SIZE;
-#[cfg(any(opthash_neon_group, opthash_x86_16_group, opthash_avx512_group))]
-use super::control::FINGERPRINT_MASK;
 
 // Portable SWAR-8 control scan (hashbrown's "generic" backend): 8 control bytes
 // packed into one u64, matched with exact borrow-free masks. Lane `i`'s match is
@@ -38,7 +36,7 @@ unsafe fn swar_word(ptr: *const u8) -> u64 {
     raw.to_le()
 }
 
-/// 0x80 in each lane equal to `target`. Exact: matching `CTRL_EMPTY` (0x00) never
+/// 0x80 in each lane equal to `target`. Exact: matching `CTRL_EMPTY` never
 /// flags a tombstone (0x80) or an occupied byte.
 #[cfg(opthash_scalar_group)]
 #[inline]
@@ -48,18 +46,18 @@ fn swar_eq_mask(word: u64, target: u8) -> u64 {
     ne ^ SWAR_HI
 }
 
-/// 0x80 in each occupied lane (fingerprint bits nonzero).
+/// 0x80 in each occupied lane (high bit clear).
 #[cfg(opthash_scalar_group)]
 #[inline]
 fn swar_occupied_mask(word: u64) -> u64 {
-    ((word & SWAR_LO7).wrapping_add(SWAR_LO7)) & SWAR_HI
+    (word & SWAR_HI) ^ SWAR_HI
 }
 
 /// 0x80 in each EMPTY|TOMBSTONE lane.
 #[cfg(opthash_scalar_group)]
 #[inline]
 fn swar_free_mask(word: u64) -> u64 {
-    swar_occupied_mask(word) ^ SWAR_HI
+    word & SWAR_HI
 }
 
 /// # Safety
@@ -145,8 +143,7 @@ unsafe fn eq_mask_16_neon(ptr: *const u8, target: u8) -> BitMask {
 unsafe fn free_mask_16_neon(ptr: *const u8) -> BitMask {
     unsafe {
         let bytes = aarch64::vld1q_u8(ptr);
-        let masked = aarch64::vandq_u8(bytes, aarch64::vdupq_n_u8(FINGERPRINT_MASK));
-        let free_cmp = aarch64::vceqq_u8(masked, aarch64::vdupq_n_u8(0));
+        let free_cmp = aarch64::vtstq_u8(bytes, aarch64::vdupq_n_u8(0x80));
         nibble_mask_from_cmp(free_cmp)
     }
 }
@@ -156,7 +153,8 @@ unsafe fn free_mask_16_neon(ptr: *const u8) -> BitMask {
 unsafe fn occupied_mask_16_neon(ptr: *const u8) -> BitMask {
     unsafe {
         let bytes = aarch64::vld1q_u8(ptr);
-        let occ_cmp = aarch64::vtstq_u8(bytes, aarch64::vdupq_n_u8(FINGERPRINT_MASK));
+        let free_cmp = aarch64::vtstq_u8(bytes, aarch64::vdupq_n_u8(0x80));
+        let occ_cmp = aarch64::vmvnq_u8(free_cmp);
         nibble_mask_from_cmp(occ_cmp)
     }
 }
@@ -192,8 +190,7 @@ unsafe fn eq_mask_64_avx512(ptr: *const u8, target: u8) -> BitMask {
 unsafe fn free_mask_64_avx512(ptr: *const u8) -> BitMask {
     unsafe {
         let data = x86_64::_mm512_loadu_si512(ptr.cast::<__m512i>());
-        let fingerprint_bits = x86_64::_mm512_set1_epi8(FINGERPRINT_MASK.cast_signed());
-        BitMask(x86_64::_mm512_testn_epi8_mask(data, fingerprint_bits))
+        BitMask(x86_64::_mm512_movepi8_mask(data))
     }
 }
 
@@ -203,8 +200,7 @@ unsafe fn free_mask_64_avx512(ptr: *const u8) -> BitMask {
 unsafe fn occupied_mask_64_avx512(ptr: *const u8) -> BitMask {
     unsafe {
         let data = x86_64::_mm512_loadu_si512(ptr.cast::<__m512i>());
-        let fingerprint_bits = x86_64::_mm512_set1_epi8(FINGERPRINT_MASK.cast_signed());
-        BitMask(x86_64::_mm512_test_epi8_mask(data, fingerprint_bits))
+        BitMask(!x86_64::_mm512_movepi8_mask(data))
     }
 }
 
@@ -214,10 +210,7 @@ unsafe fn occupied_mask_64_avx512(ptr: *const u8) -> BitMask {
 unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
     unsafe {
         let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
-        let masked =
-            x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()));
-        let free = x86_64::_mm_cmpeq_epi8(masked, x86_64::_mm_setzero_si128());
-        let bits = x86_64::_mm_movemask_epi8(free).cast_unsigned() & 0xFFFF;
+        let bits = x86_64::_mm_movemask_epi8(data).cast_unsigned() & 0xFFFF;
         BitMask(u64::from(bits))
     }
 }
@@ -228,10 +221,7 @@ unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
 unsafe fn occupied_mask_16_sse2(ptr: *const u8) -> BitMask {
     unsafe {
         let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
-        let masked =
-            x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()));
-        let occ = x86_64::_mm_cmpgt_epi8(masked, x86_64::_mm_setzero_si128());
-        let bits = x86_64::_mm_movemask_epi8(occ).cast_unsigned() & 0xFFFF;
+        let bits = !x86_64::_mm_movemask_epi8(data).cast_unsigned() & 0xFFFF;
         BitMask(u64::from(bits))
     }
 }
@@ -258,7 +248,7 @@ mod swar_tests {
     fn ref_occupied(bytes: [u8; 8]) -> u64 {
         let mut m = 0u64;
         for (i, &b) in bytes.iter().enumerate() {
-            if b & FINGERPRINT_MASK != 0 {
+            if b & 0x80 == 0 {
                 m |= 0x80u64 << (8 * i);
             }
         }

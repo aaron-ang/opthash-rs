@@ -28,10 +28,10 @@ impl Arena {
         }
     }
 
-    /// Allocates uninit memory, zeroing only the first `ctrl_bytes`. Slots
+    /// Allocates uninit memory, initializing only the first `ctrl_bytes`. Slots
     /// past that are written-then-read, so skipping their memset cuts
     /// setup work + cache pollution. Size-0 layouts return dangling.
-    pub(crate) fn try_allocate_with_ctrl_zeroed<A: Allocator>(
+    pub(crate) fn try_allocate_with_ctrl_initialized<A: Allocator>(
         layout: Layout,
         ctrl_bytes: usize,
         alloc: &A,
@@ -44,7 +44,7 @@ impl Arena {
             .map_err(|_| TryReserveError::AllocError)?
             .cast::<u8>();
         if ctrl_bytes > 0 {
-            unsafe { ptr::write_bytes(ptr.as_ptr(), 0, ctrl_bytes) };
+            unsafe { ptr::write_bytes(ptr.as_ptr(), CTRL_EMPTY, ctrl_bytes) };
         }
         Ok(Self { ptr, layout })
     }
@@ -317,7 +317,7 @@ pub(crate) trait ArenaSlots<T> {
         if self.capacity() == 0 {
             return;
         }
-        unsafe { ptr::write_bytes(self.ctrl_ptr(), 0, self.capacity()) }
+        unsafe { ptr::write_bytes(self.ctrl_ptr(), CTRL_EMPTY, self.capacity()) }
     }
 
     #[inline]
@@ -444,7 +444,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zero_ctrl_layout_does_not_allocate() {
+    fn empty_ctrl_layout_does_not_allocate() {
         let (layout, data_offset) = layout_for::<u64, u64>(0).unwrap();
         assert_eq!(layout.size(), 0);
         assert_eq!(data_offset, 0);
