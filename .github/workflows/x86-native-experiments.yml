@@ -14,18 +14,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: high-bit
-            branch: experiment/x86-high-bit-controls
-            bench: speedup
-            filter: (insert|get_hit|get_miss|mixed|delete_heavy)/(insert|get_hit|get_miss|mixed|delete_heavy)_(std|hashbrown|elastic|funnel)
-          - name: direct-occupied
-            branch: experiment/x86-direct-occupied
-            bench: map_api
-            filter: (iter|drain|clear_drop)/(iter|drain|clear)_(std|hashbrown|elastic|funnel)
-          - name: funnel-eight-byte
+          - name: funnel-eight-byte-clean
             branch: experiment/x86-funnel-eight-byte
             bench: speedup
-            filter: (insert|get_hit|get_miss|mixed)/(insert|get_hit|get_miss|mixed)_(hashbrown|funnel)
+            filter: (insert|get_hit|get_miss|mixed)/(insert|get_hit|get_miss|mixed)_(std|hashbrown|elastic|funnel)
     steps:
       - uses: actions/checkout@v6
         with:
