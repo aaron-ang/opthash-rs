@@ -22,7 +22,7 @@ use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
 use crate::{macros, map};
 
 const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
-const RANGE_WORD_CAP: u32 = 8;
+const RANGE_WORD_CAP: u8 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LevelShape {
@@ -58,6 +58,18 @@ impl FunnelShape {
             fallback_offset: 0,
             fallback_bucket_width: 0,
             fallback_bucket_range: PreparedProbeRange::empty(),
+        }
+    }
+
+    #[inline]
+    fn encode_logical_probe(&self, logical_probe: usize) -> u8 {
+        debug_assert!(logical_probe < self.loglog_ceiling);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "shape construction validates the counter lane"
+        )]
+        {
+            logical_probe as u8
         }
     }
 
@@ -111,7 +123,10 @@ impl FunnelShape {
             max_insertions: config.target_insertions(),
             levels: levels.into_boxed_slice(),
             beta: plan.beta(),
-            loglog_ceiling: plan.loglog_ceiling(),
+            loglog_ceiling: usize::from(
+                u8::try_from(plan.loglog_ceiling())
+                    .map_err(|_| TryReserveError::CapacityOverflow)?,
+            ),
             primary_offset,
             primary_range,
             fallback_offset,
@@ -447,7 +462,7 @@ where
     #[inline]
     fn sample(
         prepared: &PreparedFastFunnelDomainProbe,
-        logical_probe: u64,
+        logical_probe: u8,
         range: PreparedProbeRange,
     ) -> Option<usize> {
         probe::unbiased_prepared_funnel_probe_index_in_range(
@@ -560,7 +575,7 @@ where
         for logical_probe in 0..self.shape.loglog_ceiling {
             let Some(local) = Self::sample(
                 &primary_probe,
-                logical_probe as u64,
+                self.shape.encode_logical_probe(logical_probe),
                 self.shape.primary_range,
             ) else {
                 return SearchResult::RangeFailure;
@@ -1227,7 +1242,7 @@ mod tests {
             let mut scalar = ScalarFunnel::new(
                 config,
                 FunnelPrf::new(FUNNEL_PROBE_SEED),
-                NonZeroU32::new(RANGE_WORD_CAP).unwrap(),
+                NonZeroU32::new(u32::from(RANGE_WORD_CAP)).unwrap(),
             );
             let mut table = raw_table(n, d);
             let mut locations = Vec::with_capacity(config.target_insertions());
@@ -1312,7 +1327,7 @@ mod tests {
                 domain,
                 logical,
                 upper,
-                RANGE_WORD_CAP,
+                u32::from(RANGE_WORD_CAP),
             )
             .unwrap()
             .index
@@ -1387,7 +1402,7 @@ mod tests {
             let local = sample(
                 identity,
                 ProbeDomain::FunnelSpecialPrimary,
-                logical as u64,
+                u64::try_from(logical).unwrap(),
                 table.shape.primary_range.upper(),
             );
             let slot = table.shape.primary_offset + local;
