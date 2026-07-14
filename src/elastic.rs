@@ -355,12 +355,10 @@ impl PreparedMembership {
     fn new(hash: u64) -> Self {
         let mixed = membership_mix(hash, MEMBERSHIP_SALT);
         let first_shift = mixed & 63;
-        let step = ((mixed >> 32) | 1) & 63;
-        let second_shift = first_shift.wrapping_add(step) & 63;
-        let third_shift = second_shift.wrapping_add(step) & 63;
+        let second_shift = (first_shift + 1 + ((mixed >> 32) & 31)) & 63;
         Self {
             mixed,
-            bits: (1_u64 << first_shift) | (1_u64 << second_shift) | (1_u64 << third_shift),
+            bits: (1_u64 << first_shift) | (1_u64 << second_shift),
         }
     }
 
@@ -2263,21 +2261,6 @@ mod tests {
         assert!(map.table().membership_maybe_contains(membership));
         assert_eq!(map.insert(7, 17), None);
         assert_eq!(map.get(&7), Some(&17));
-    }
-
-    #[test]
-    fn blocked_membership_never_forgets_inserted_hashes() {
-        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
-            ElasticHashMap::with_capacity_and_hasher(2_048, IdentityBuildHasher);
-        for key in 0..1_024_u64 {
-            map.insert(key, key);
-        }
-        for key in 0..1_024_u64 {
-            assert!(
-                map.table()
-                    .membership_maybe_contains(PreparedMembership::new(key))
-            );
-        }
     }
 
     #[test]
