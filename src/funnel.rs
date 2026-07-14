@@ -118,15 +118,14 @@ impl FunnelShape {
         {
             return Err(TryReserveError::CapacityOverflow);
         }
+        let loglog_ceiling =
+            u8::try_from(plan.loglog_ceiling()).map_err(|_| TryReserveError::CapacityOverflow)?;
         Ok(Self {
             n,
             max_insertions: config.target_insertions(),
             levels: levels.into_boxed_slice(),
             beta: plan.beta(),
-            loglog_ceiling: usize::from(
-                u8::try_from(plan.loglog_ceiling())
-                    .map_err(|_| TryReserveError::CapacityOverflow)?,
-            ),
+            loglog_ceiling: usize::from(loglog_ceiling),
             primary_offset,
             primary_range,
             fallback_offset,
