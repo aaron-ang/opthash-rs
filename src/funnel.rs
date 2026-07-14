@@ -259,13 +259,6 @@ enum BucketScanResult<T> {
     Full,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BucketLookupResult<T> {
-    Hit(T),
-    Empty,
-    Full,
-}
-
 /// Scans exactly `length` logical controls in order using masked SIMD groups.
 ///
 /// # Safety
@@ -347,46 +340,6 @@ unsafe fn scan_clean_funnel_bucket<T>(
         position += logical_lanes;
     }
     BucketScanResult::Full
-}
-
-/// Scans a lookup bucket through its first real EMPTY control without tracking
-/// insertion vacancies. Tombstones do not terminate lookup.
-///
-/// # Safety
-///
-/// The bounds requirements are identical to [`scan_funnel_bucket`].
-unsafe fn scan_funnel_lookup_bucket<T>(
-    ctrl_ptr: *const u8,
-    start: usize,
-    length: usize,
-    fingerprint: u8,
-    mut inspect_match: impl FnMut(usize) -> Option<T>,
-) -> BucketLookupResult<T> {
-    let end = start + length;
-    let mut position = start;
-    while position < end {
-        let logical_lanes = GROUP_SIZE.min(end - position);
-        let group = unsafe { ctrl_ptr.add(position) };
-        let matches = unsafe { simd::eq_mask_group(group, fingerprint) };
-        let first_empty = unsafe { simd::eq_mask_group(group, CTRL_EMPTY) }
-            .into_iter()
-            .find(|&lane| lane < logical_lanes);
-        let semantic_lanes = first_empty.unwrap_or(logical_lanes);
-
-        for lane in matches {
-            if lane >= semantic_lanes {
-                break;
-            }
-            if let Some(hit) = inspect_match(position + lane) {
-                return BucketLookupResult::Hit(hit);
-            }
-        }
-        if first_empty.is_some() {
-            return BucketLookupResult::Empty;
-        }
-        position += logical_lanes;
-    }
-    BucketLookupResult::Full
 }
 
 /// Paper-exact Funnel hashing within each table epoch. Deletion, growth, and
@@ -539,69 +492,11 @@ where
         None
     }
 
-    fn lookup_exact<Q>(&self, key: &Q, key_hash: u64, key_fingerprint: u8) -> Option<usize>
+    fn search_exact<Q>(&self, key: &Q, key_hash: u64, key_fingerprint: u8) -> SearchResult
     where
         Q: Equivalent<K> + ?Sized,
     {
-        if self.shape.n == 0 {
-            return None;
-        }
-        let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
-
-        for level in &self.shape.levels {
-            let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
-            let bucket = Self::sample(&level_probe, 0, level.bucket_range)?;
-            let start = level.offset + bucket * self.shape.beta;
-            match unsafe {
-                scan_funnel_lookup_bucket(
-                    self.storage.ctrl_ptr(),
-                    start,
-                    self.shape.beta,
-                    key_fingerprint,
-                    |slot| {
-                        let entry = self.storage.get_ref(slot);
-                        key.equivalent(&entry.key).then_some(slot)
-                    },
-                )
-            } {
-                BucketLookupResult::Hit(slot) => return Some(slot),
-                BucketLookupResult::Empty => return None,
-                BucketLookupResult::Full => {}
-            }
-        }
-
-        let primary_probe = probe.prepare_domain(ProbeDomain::FunnelSpecialPrimary)?;
-        for logical_probe in 0..self.shape.loglog_ceiling {
-            let local = Self::sample(
-                &primary_probe,
-                self.shape.encode_logical_probe(logical_probe),
-                self.shape.primary_range,
-            )?;
-            let slot = self.shape.primary_offset + local;
-            match self.inspect_slot(slot, key_fingerprint, key) {
-                Some(true) => return Some(slot),
-                Some(false) => return None,
-                None => {}
-            }
-        }
-
-        let first_probe = probe.prepare_domain(ProbeDomain::FunnelSpecialFallbackChoiceA)?;
-        let first_bucket = Self::sample(&first_probe, 0, self.shape.fallback_bucket_range)?;
-        let second_probe = probe.prepare_domain(ProbeDomain::FunnelSpecialFallbackChoiceB)?;
-        let second_bucket = Self::sample(&second_probe, 0, self.shape.fallback_bucket_range)?;
-        for slot_in_bucket in 0..self.shape.fallback_bucket_width {
-            for bucket in [first_bucket, second_bucket] {
-                let slot = self.shape.fallback_offset
-                    + bucket * self.shape.fallback_bucket_width
-                    + slot_in_bucket;
-                match self.inspect_slot(slot, key_fingerprint, key) {
-                    Some(true) => return Some(slot),
-                    Some(false) => return None,
-                    None => {}
-                }
-            }
-        }
-        None
+        self.search_exact_with_clean_scan(key, key_hash, key_fingerprint, false)
     }
 
     fn search_exact_for_insert<Q>(
@@ -745,12 +640,11 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.lookup_exact(key, key_hash, key_fingerprint)
-            .or_else(|| {
-                self.exceptional_placement
-                    .then(|| self.find_by_full_scan(key, key_fingerprint))
-                    .flatten()
-            })
+        match self.search_exact(key, key_hash, key_fingerprint) {
+            SearchResult::Hit(slot) => Some(slot),
+            _ if self.exceptional_placement => self.find_by_full_scan(key, key_fingerprint),
+            _ => None,
+        }
     }
 
     fn find_entry_ref<'a, Q>(
@@ -1598,30 +1492,6 @@ mod tests {
     }
 
     #[test]
-    fn lookup_kernel_matches_exact_insert_search_after_tombstones() {
-        let mut map: FunnelHashMap<u64, u64, IdentityBuildHasher> =
-            FunnelHashMap::with_capacity_and_hasher(512, IdentityBuildHasher);
-        let keys: Vec<u64> = (0..256_u64)
-            .map(|value| value.wrapping_mul(0x9E37_79B9_7F4A_7C15))
-            .collect();
-        for &key in &keys {
-            map.insert(key, key ^ 7);
-        }
-        for &key in keys.iter().step_by(3) {
-            map.remove(&key);
-        }
-
-        for key in keys.iter().copied().chain(10_000..10_256) {
-            let fingerprint = control::control_fingerprint(key);
-            let expected = match map.table().search_exact_for_insert(&key, key, fingerprint) {
-                SearchResult::Hit(slot) => Some(slot),
-                SearchResult::Vacant(_) | SearchResult::Full | SearchResult::RangeFailure => None,
-            };
-            assert_eq!(map.table().lookup_exact(&key, key, fingerprint), expected);
-        }
-    }
-
-    #[test]
     fn tombstones_never_hide_survivors_and_are_reused() {
         let mut table = raw_table(512, 3);
         for key in 0..200_u64 {
@@ -1859,7 +1729,6 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    #[allow(clippy::too_many_lines)]
     fn vector_bucket_scan_matches_scalar_order_for_every_default_pattern() {
         const FP: u8 = 7;
         const OTHER: u8 = 1;
@@ -1876,38 +1745,6 @@ mod tests {
             }
             for hit_lane in 0..=WIDTH {
                 let expected_hit = (hit_lane < WIDTH).then_some(hit_lane);
-                let mut expected_lookup_compared = Vec::new();
-                let mut expected_lookup = BucketLookupResult::Full;
-                for (lane, &control) in controls[..WIDTH].iter().enumerate() {
-                    if control == CTRL_EMPTY {
-                        expected_lookup = BucketLookupResult::Empty;
-                        break;
-                    }
-                    if control == FP {
-                        expected_lookup_compared.push(lane);
-                        if Some(lane) == expected_hit {
-                            expected_lookup = BucketLookupResult::Hit(lane);
-                            break;
-                        }
-                    }
-                }
-
-                let mut actual_lookup_compared = Vec::new();
-                let actual_lookup = unsafe {
-                    scan_funnel_lookup_bucket(controls.as_ptr(), 0, WIDTH, FP, |slot| {
-                        actual_lookup_compared.push(slot);
-                        (Some(slot) == expected_hit).then_some(slot)
-                    })
-                };
-                assert_eq!(
-                    actual_lookup, expected_lookup,
-                    "lookup pattern={encoded} hit={hit_lane}"
-                );
-                assert_eq!(
-                    actual_lookup_compared, expected_lookup_compared,
-                    "lookup pattern={encoded} hit={hit_lane}"
-                );
-
                 let mut expected_first_tombstone = None;
                 let mut expected_compared = Vec::new();
                 let mut expected = BucketScanResult::Full;
