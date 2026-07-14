@@ -14,7 +14,8 @@ use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{TryBuildError, TryReserveError};
 use crate::common::exact::geometry::PaperConfig;
 use crate::common::exact::probe::{
-    self, FunnelPrf, PreparedFastFunnelDomainProbe, PreparedProbeRange, ProbeDomain,
+    self, FunnelPrf, PreparedFastFunnelDomainProbe, PreparedFastFunnelProbe, PreparedProbeRange,
+    ProbeDomain,
 };
 use crate::common::math::capacity;
 use crate::common::simd;
@@ -512,6 +513,82 @@ where
         self.search_exact_with_clean_scan(key, key_hash, key_fingerprint, self.tombstones == 0)
     }
 
+    #[inline]
+    fn search_clean_ordinary_levels<Q>(
+        &self,
+        key: &Q,
+        key_fingerprint: u8,
+        probe: PreparedFastFunnelProbe,
+    ) -> Option<SearchResult>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        for level in &self.shape.levels {
+            let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
+            let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) else {
+                return Some(SearchResult::RangeFailure);
+            };
+            let start = level.offset + bucket * self.shape.beta;
+            let scan = unsafe {
+                scan_clean_funnel_bucket(
+                    self.storage.ctrl_ptr(),
+                    start,
+                    self.shape.beta,
+                    key_fingerprint,
+                    |slot| {
+                        let entry = self.storage.get_ref(slot);
+                        key.equivalent(&entry.key).then_some(slot)
+                    },
+                )
+            };
+            match scan {
+                BucketScanResult::Hit(slot) => return Some(SearchResult::Hit(slot)),
+                BucketScanResult::Empty(slot) => return Some(SearchResult::Vacant(slot)),
+                BucketScanResult::Full => {}
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn search_dirty_ordinary_levels<Q>(
+        &self,
+        key: &Q,
+        key_fingerprint: u8,
+        probe: PreparedFastFunnelProbe,
+        first_tombstone: &mut Option<usize>,
+    ) -> Option<SearchResult>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        for level in &self.shape.levels {
+            let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
+            let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) else {
+                return Some(SearchResult::RangeFailure);
+            };
+            let start = level.offset + bucket * self.shape.beta;
+            let scan = unsafe {
+                scan_funnel_bucket(
+                    self.storage.ctrl_ptr(),
+                    start,
+                    self.shape.beta,
+                    key_fingerprint,
+                    first_tombstone,
+                    |slot| {
+                        let entry = self.storage.get_ref(slot);
+                        key.equivalent(&entry.key).then_some(slot)
+                    },
+                )
+            };
+            match scan {
+                BucketScanResult::Hit(slot) => return Some(SearchResult::Hit(slot)),
+                BucketScanResult::Empty(slot) => return Some(SearchResult::Vacant(slot)),
+                BucketScanResult::Full => {}
+            }
+        }
+        None
+    }
+
     fn search_exact_with_clean_scan<Q>(
         &self,
         key: &Q,
@@ -527,46 +604,13 @@ where
         }
         let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
         let mut first_tombstone = None;
-
-        for level in &self.shape.levels {
-            let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
-            let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) else {
-                return SearchResult::RangeFailure;
-            };
-            let start = level.offset + bucket * self.shape.beta;
-            let scan = if clean_epoch {
-                unsafe {
-                    scan_clean_funnel_bucket(
-                        self.storage.ctrl_ptr(),
-                        start,
-                        self.shape.beta,
-                        key_fingerprint,
-                        |slot| {
-                            let entry = self.storage.get_ref(slot);
-                            key.equivalent(&entry.key).then_some(slot)
-                        },
-                    )
-                }
-            } else {
-                unsafe {
-                    scan_funnel_bucket(
-                        self.storage.ctrl_ptr(),
-                        start,
-                        self.shape.beta,
-                        key_fingerprint,
-                        &mut first_tombstone,
-                        |slot| {
-                            let entry = self.storage.get_ref(slot);
-                            key.equivalent(&entry.key).then_some(slot)
-                        },
-                    )
-                }
-            };
-            match scan {
-                BucketScanResult::Hit(slot) => return SearchResult::Hit(slot),
-                BucketScanResult::Empty(slot) => return SearchResult::Vacant(slot),
-                BucketScanResult::Full => {}
-            }
+        let ordinary_result = if clean_epoch {
+            self.search_clean_ordinary_levels(key, key_fingerprint, probe)
+        } else {
+            self.search_dirty_ordinary_levels(key, key_fingerprint, probe, &mut first_tombstone)
+        };
+        if let Some(result) = ordinary_result {
+            return result;
         }
 
         let primary_probe = probe
@@ -1726,6 +1770,52 @@ mod tests {
         drop(table);
         assert_eq!(allocations.load(Ordering::SeqCst), 1);
         assert_eq!(deallocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn clean_insert_search_matches_dirty_search_before_deletion() {
+        let reserve = ReserveFraction::from_exponent(3).unwrap();
+        let shape = FunnelShape::for_insert_budget(512, reserve).unwrap();
+        let mut table = FunnelTable::<u64, u64, IdentityBuildHasher>::try_from_shape(
+            shape,
+            reserve,
+            IdentityBuildHasher,
+            Global,
+        )
+        .unwrap();
+        let keys: Vec<u64> = (0..64_u64)
+            .map(|value| value.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        for &key in &keys {
+            table.insert_for_vacant_entry(key, key, key);
+        }
+
+        assert_eq!(table.tombstones, 0);
+        for key in keys.iter().copied().chain([u64::MAX - 1]) {
+            let fingerprint = control::control_fingerprint(key);
+            let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key);
+            assert_eq!(
+                table.search_clean_ordinary_levels(&key, fingerprint, probe),
+                Some(table.search_exact_with_clean_scan(&key, key, fingerprint, false)),
+            );
+        }
+
+        let removed = keys[17];
+        let removed_slot = table
+            .find_location(&removed, removed, control::control_fingerprint(removed))
+            .unwrap();
+        map::TableBackend::remove(&mut table, removed_slot);
+        assert_eq!(table.tombstones, 1);
+        assert_eq!(
+            table
+                .search_exact_for_insert(&removed, removed, control::control_fingerprint(removed),),
+            table.search_exact_with_clean_scan(
+                &removed,
+                removed,
+                control::control_fingerprint(removed),
+                false,
+            ),
+        );
     }
 
     #[test]
