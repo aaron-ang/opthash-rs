@@ -1034,26 +1034,44 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn fast_funnel_reducer_accepts_the_full_rejection_index_lane() {
+        const KEY: u64 = 0x105;
+        const LOGICAL_PROBE_INDEX: u8 = u8::MAX;
+        const UPPER: usize = 2;
+        const REJECTION_THRESHOLD: u64 = 0xff84_5d7d_b7be_f760;
         let prepared = FunnelPrf::new(0x1234_5678_9abc_def0)
-            .prepare(0xd1b5_4a32_d192_ed03)
+            .prepare(KEY)
             .prepare_domain(ProbeDomain::FunnelSpecialPrimary)
             .unwrap();
-        // A doubled word has an even low half, so this test-only threshold
-        // forces every encoded rejection index, including 255, to be used.
-        let forced_rejection = PreparedProbeRange {
-            upper: 2,
-            rejection_threshold: u64::MAX,
-        };
+        let upper_word = u64::try_from(UPPER).unwrap();
+
+        for rejection_index in 0..u8::MAX {
+            let product =
+                u128::from(prepared.word_from_indices(LOGICAL_PROBE_INDEX, rejection_index))
+                    * u128::from(upper_word);
+            assert!(
+                (product as u64) < REJECTION_THRESHOLD,
+                "rejection index {rejection_index} must reject"
+            );
+        }
+        let endpoint_product = u128::from(prepared.word_from_indices(LOGICAL_PROBE_INDEX, u8::MAX))
+            * u128::from(upper_word);
+        assert!((endpoint_product as u64) >= REJECTION_THRESHOLD);
+        let expected_index = usize::try_from(endpoint_product >> u64::BITS).unwrap();
 
         assert_eq!(
             unbiased_prepared_funnel_probe_index_in_range(
                 &prepared,
-                u8::MAX,
-                forced_rejection,
+                LOGICAL_PROBE_INDEX,
+                PreparedProbeRange {
+                    upper: UPPER,
+                    rejection_threshold: REJECTION_THRESHOLD,
+                },
                 256,
             ),
-            Err(RangeReductionError::RejectionLimitExceeded {
+            Ok(ProbeIndex {
+                index: expected_index,
                 random_word_count: 256
             })
         );
