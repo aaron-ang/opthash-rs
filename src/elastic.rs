@@ -10,7 +10,7 @@ use crate::ReserveFraction;
 use crate::common::DefaultHashBuilder;
 use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::{CACHE_LINE, INITIAL_CAPACITY};
-use crate::common::control::{self, CTRL_TOMBSTONE, ControlByte};
+use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{TryBuildError, TryReserveError};
 use crate::common::exact::geometry::PaperConfig;
 use crate::common::exact::probe::{
@@ -26,8 +26,7 @@ use crate::map;
 /// by iterators, the `(level, slot)` location backs removal.
 type ElasticScanItem<K, V> = (*mut SlotEntry<K, V>, (usize, usize));
 
-// Fixed construction seed shared by placement and lookup. The membership path
-// reuses the value under a separate mixer.
+// Fixed construction seed shared by placement, lookup, and membership.
 const ELASTIC_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[0];
 const ELASTIC_PROBE_BUDGET_C: usize = 8;
 const RANGE_WORD_CAP: u32 = 8;
@@ -40,12 +39,7 @@ const MAX_ELASTIC_SLOTS: usize = match 1_usize.checked_shl(u32::BITS) {
     None => usize::MAX,
 };
 const MEMBERSHIP_SLOTS_PER_WORD: usize = 10;
-// The salt uses wyrand's current state increment as a fixed domain separator. The
-// multipliers are SplitMix64's Stafford Mix13 finalizer constants: odd values
-// selected for avalanche quality. These are filter choices, not paper parameters.
-const MEMBERSHIP_SALT: u64 = probe::WYHASH_DEFAULT_SECRET[0];
-const MEMBERSHIP_MIX_MULTIPLIER_1: u64 = 0xBF58_476D_1CE4_E5B9;
-const MEMBERSHIP_MIX_MULTIPLIER_2: u64 = 0x94D0_49BB_1331_11EB;
+const ROUTE_SUMMARY_LEVELS: usize = u16::BITS as usize;
 const ELASTIC_LEVEL_LANES: [u64; u32::BITS as usize] = elastic_level_lanes();
 const ELASTIC_QUERY_PROBE_LANES: [u64; QUERY_PROBE_LANE_COUNT] = elastic_query_probe_lanes();
 
@@ -283,6 +277,15 @@ macros::declare_backend_aliases! {
 type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
 type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>);
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ElasticMetadataWord {
+    membership: u64,
+    route_bins: [u16; 4],
+}
+
+const _: () = assert!(mem::size_of::<ElasticMetadataWord>() == 16);
+
 struct ElasticArenaLayout {
     layout: Layout,
     data_base_off: usize,
@@ -306,9 +309,8 @@ fn elastic_arena_layout<K, V>(total_slots: usize) -> Result<ElasticArenaLayout, 
             membership_words: 0,
         });
     }
-
-    let membership_layout =
-        Layout::array::<u64>(membership_words).map_err(|_| TryReserveError::AllocError)?;
+    let membership_layout = Layout::array::<ElasticMetadataWord>(membership_words)
+        .map_err(|_| TryReserveError::AllocError)?;
     let (layout, membership_offset) = base_layout
         .extend(membership_layout)
         .map_err(|_| TryReserveError::AllocError)?;
@@ -323,7 +325,7 @@ fn elastic_arena_layout<K, V>(total_slots: usize) -> Result<ElasticArenaLayout, 
 #[inline]
 fn membership_tail_span<K, V>(total_slots: usize) -> usize {
     let bytes = membership_word_count(total_slots)
-        .checked_mul(mem::size_of::<u64>())
+        .checked_mul(mem::size_of::<ElasticMetadataWord>())
         .expect("constructed Elastic membership size");
     if bytes == 0 {
         return 0;
@@ -335,43 +337,82 @@ fn membership_tail_span<K, V>(total_slots: usize) -> usize {
         & !(alignment - 1)
 }
 
-#[inline]
-fn membership_mix(hash: u64, salt: u64) -> u64 {
-    let mut mixed = hash ^ salt;
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(MEMBERSHIP_MIX_MULTIPLIER_1);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(MEMBERSHIP_MIX_MULTIPLIER_2);
-    mixed ^ (mixed >> 31)
+#[derive(Clone, Copy)]
+struct PreparedElasticRoute {
+    probe: PreparedElasticProbe,
+}
+
+impl PreparedElasticRoute {
+    #[inline]
+    fn new(hash: u64) -> Self {
+        Self {
+            probe: CounterPrf::new(ELASTIC_PROBE_SEED).prepare_elastic(hash),
+        }
+    }
+
+    #[inline]
+    const fn signature(self) -> u64 {
+        self.probe.routing_signature()
+    }
+
+    #[inline]
+    fn summary_bin(self) -> usize {
+        (self.signature() & 3) as usize
+    }
 }
 
 #[derive(Clone, Copy)]
 struct PreparedMembership {
-    mixed: u64,
     bits: u64,
 }
 
 impl PreparedMembership {
     #[inline]
-    fn new(hash: u64) -> Self {
-        let mixed = membership_mix(hash, MEMBERSHIP_SALT);
-        let first_shift = mixed & 63;
-        let step = ((mixed >> 32) | 1) & 63;
-        let second_shift = first_shift.wrapping_add(step) & 63;
-        let third_shift = second_shift.wrapping_add(step) & 63;
-        let fourth_shift = third_shift.wrapping_add(step) & 63;
+    fn from_signature(signature: u64) -> Self {
+        let first = signature & 63;
+        let step = ((signature >> 32) | 1) & 63;
+        let second = first.wrapping_add(step) & 63;
+        let third = second.wrapping_add(step) & 63;
+        let fourth = third.wrapping_add(step) & 63;
         Self {
-            mixed,
-            bits: (1_u64 << first_shift)
-                | (1_u64 << second_shift)
-                | (1_u64 << third_shift)
-                | (1_u64 << fourth_shift),
+            bits: (1_u64 << first) | (1_u64 << second) | (1_u64 << third) | (1_u64 << fourth),
         }
     }
 
     #[inline]
-    fn word(self, word_count: usize) -> usize {
-        let product = u128::from(self.mixed)
+    fn word(signature: u64, word_count: usize) -> usize {
+        let product = u128::from(signature)
             * u128::try_from(word_count).expect("usize is representable as u128");
         usize::try_from(product >> 64).expect("multiply-high index is below word count")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreparedElasticKey {
+    route: PreparedElasticRoute,
+    membership: PreparedMembership,
+}
+
+impl PreparedElasticKey {
+    #[inline]
+    fn new(hash: u64) -> Self {
+        let route = PreparedElasticRoute::new(hash);
+        Self {
+            membership: PreparedMembership::from_signature(route.signature()),
+            route,
+        }
+    }
+}
+
+const _: () = assert!(mem::size_of::<PreparedElasticRoute>() == 8);
+const _: () = assert!(mem::size_of::<PreparedElasticKey>() == 16);
+
+#[inline]
+const fn expand_summary_level_mask(mask: u16, level_count: usize) -> u32 {
+    if level_count > ROUTE_SUMMARY_LEVELS {
+        u32::MAX
+    } else {
+        mask as u32
     }
 }
 
@@ -597,7 +638,10 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     level_capacities: &[usize],
     alloc: &A,
 ) -> Result<ElasticArenaBuild<K, V>, TryReserveError> {
-    let total_ctrl: usize = level_capacities.iter().sum();
+    let total_ctrl = level_capacities
+        .iter()
+        .try_fold(0_usize, |total, &capacity| total.checked_add(capacity));
+    let total_ctrl = total_ctrl.ok_or(TryReserveError::CapacityOverflow)?;
     let arena_layout = elastic_arena_layout::<K, V>(total_ctrl)?;
     debug_assert_eq!(
         arena_layout.membership_offset,
@@ -610,7 +654,7 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
                 arena
                     .as_ptr()
                     .add(arena_layout.membership_offset)
-                    .cast::<u64>(),
+                    .cast::<ElasticMetadataWord>(),
                 0,
                 arena_layout.membership_words,
             );
@@ -634,11 +678,15 @@ fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
     alloc: &A,
 ) -> ElasticArenaBuild<K, V> {
     try_alloc_elastic_arena(level_capacities, alloc).unwrap_or_else(|_| {
-        let total_ctrl: usize = level_capacities.iter().sum();
-        let layout = match elastic_arena_layout::<K, V>(total_ctrl) {
-            Ok(layout) => layout.layout,
-            Err(_) => Layout::from_size_align(1, 1).unwrap(),
-        };
+        let layout = level_capacities
+            .iter()
+            .try_fold(0_usize, |total, &capacity| total.checked_add(capacity))
+            .and_then(|total_ctrl| {
+                elastic_arena_layout::<K, V>(total_ctrl)
+                    .ok()
+                    .map(|layout| layout.layout)
+            })
+            .unwrap_or_else(|| Layout::from_size_align(1, 1).unwrap());
         allocator_api2::alloc::handle_alloc_error(layout)
     })
 }
@@ -740,34 +788,64 @@ where
 
     #[inline]
     #[allow(clippy::cast_ptr_alignment)]
-    fn membership_ptr(&self) -> *mut u64 {
+    fn membership_ptr(&self) -> *mut ElasticMetadataWord {
         let tail_span = membership_tail_span::<K, V>(self.total_slots);
         debug_assert!(tail_span <= self.arena.layout_size());
         unsafe {
             self.arena
                 .as_ptr()
                 .add(self.arena.layout_size() - tail_span)
-                .cast::<u64>()
+                .cast::<ElasticMetadataWord>()
         }
     }
 
     #[inline(never)]
-    fn membership_maybe_contains(&self, prepared: PreparedMembership) -> bool {
+    fn membership_maybe_contains(
+        &self,
+        route: PreparedElasticRoute,
+        membership: PreparedMembership,
+    ) -> bool {
         let words = self.membership_words();
         if words == 0 {
             return false;
         }
-        unsafe { *self.membership_ptr().add(prepared.word(words)) & prepared.bits == prepared.bits }
+        let word = PreparedMembership::word(route.signature(), words);
+        unsafe {
+            (*self.membership_ptr().add(word)).membership & membership.bits == membership.bits
+        }
     }
 
     #[inline(never)]
-    fn record_membership(&mut self, prepared: PreparedMembership) {
+    fn record_membership(
+        &mut self,
+        route: PreparedElasticRoute,
+        membership: PreparedMembership,
+        level: usize,
+    ) {
         let words = self.membership_words();
         if words != 0 {
-            unsafe {
-                *self.membership_ptr().add(prepared.word(words)) |= prepared.bits;
+            let word = PreparedMembership::word(route.signature(), words);
+            let metadata = unsafe { &mut *self.membership_ptr().add(word) };
+            metadata.membership |= membership.bits;
+            if self.levels.len() <= ROUTE_SUMMARY_LEVELS {
+                metadata.route_bins[route.summary_bin()] |= 1_u16 << level;
             }
         }
+    }
+
+    #[inline]
+    fn summary_level_mask(&self, route: PreparedElasticRoute) -> u32 {
+        let level_count = self.levels.len();
+        if level_count > ROUTE_SUMMARY_LEVELS {
+            return expand_summary_level_mask(0, level_count);
+        }
+        let words = self.membership_words();
+        if words == 0 {
+            return 0;
+        }
+        let word = PreparedMembership::word(route.signature(), words);
+        let metadata = unsafe { &*self.membership_ptr().add(word) };
+        expand_summary_level_mask(metadata.route_bins[route.summary_bin()], level_count)
     }
 
     fn clear_membership(&mut self) {
@@ -790,12 +868,24 @@ where
     /// Removes all entries, keeping allocated capacity.
     fn clear(&mut self) {
         for level in &mut self.levels {
-            level.drop_values();
-            level.clear_all_controls();
-            level.len = 0;
-            level.tombstones = 0;
+            for slot in 0..level.capacity() {
+                let control = level.control_at(slot);
+                if control == CTRL_TOMBSTONE {
+                    level.set_control(slot, CTRL_EMPTY);
+                    level.tombstones -= 1;
+                    continue;
+                }
+                if !control.is_occupied() {
+                    continue;
+                }
+                let entry = level.slot_ptr(slot);
+                level.set_control(slot, CTRL_EMPTY);
+                level.len -= 1;
+                self.len -= 1;
+                unsafe { ptr::drop_in_place(entry) };
+            }
         }
-        self.len = 0;
+        debug_assert_eq!(self.len, 0);
         self.scheduler.reset();
         self.probe_high_water = 0;
         self.probe_schedule.clear();
@@ -806,19 +896,18 @@ where
     /// Post-lookup insert for a key known to be absent. Returns the chosen
     /// slot so the caller can borrow into it without re-probing.
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
-        let membership = PreparedMembership::new(key_hash);
-        self.insert_for_vacant_entry_prepared(key, value, key_hash, membership)
+        let prepared = PreparedElasticKey::new(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
+        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint)
     }
 
     fn insert_for_vacant_entry_prepared(
         &mut self,
         key: K,
         value: V,
-        key_hash: u64,
-        membership: PreparedMembership,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
     ) -> (usize, usize) {
-        let key_fingerprint = control::control_fingerprint(key_hash);
-
         match self
             .scheduler
             .on_insert(self.len, self.total_slots, self.max_insertions)
@@ -830,16 +919,20 @@ where
             InsertAction::Continue => {}
         }
 
-        if let Some(placement) = self.choose_slot_for_new_key(key_hash, self.scheduler.target()) {
-            return self.place_new_entry(key, value, membership, key_fingerprint, placement);
+        if let Some(placement) =
+            self.choose_slot_for_new_key(prepared.route.probe, self.scheduler.target())
+        {
+            return self.place_new_entry(key, value, prepared, key_fingerprint, placement);
         }
 
         self.resize_with_transition(self.total_slots, EpochTransition::PlacementRecovery);
         self.scheduler.advance_batch_window();
-        if let Some(placement) = self.choose_slot_for_new_key(key_hash, self.scheduler.target()) {
-            self.place_new_entry(key, value, membership, key_fingerprint, placement)
+        if let Some(placement) =
+            self.choose_slot_for_new_key(prepared.route.probe, self.scheduler.target())
+        {
+            self.place_new_entry(key, value, prepared, key_fingerprint, placement)
         } else {
-            self.place_exceptional_entry(key, value, membership, key_fingerprint)
+            self.place_exceptional_entry(key, value, prepared, key_fingerprint)
         }
     }
 
@@ -849,7 +942,7 @@ where
         &mut self,
         key: K,
         value: V,
-        membership: PreparedMembership,
+        prepared: PreparedElasticKey,
         key_fingerprint: u8,
         placement: ExactPlacement,
     ) -> (usize, usize) {
@@ -857,7 +950,7 @@ where
         self.write_new_entry(
             key,
             value,
-            membership,
+            prepared,
             key_fingerprint,
             placement.level,
             placement.slot,
@@ -869,14 +962,14 @@ where
         &mut self,
         key: K,
         value: V,
-        membership: PreparedMembership,
+        prepared: PreparedElasticKey,
         key_fingerprint: u8,
     ) -> (usize, usize) {
         let (level, slot) = self
             .first_free_slot()
             .expect("Elastic insertion limit must leave a free slot");
         self.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG;
-        self.write_new_entry(key, value, membership, key_fingerprint, level, slot)
+        self.write_new_entry(key, value, prepared, key_fingerprint, level, slot)
     }
 
     fn first_free_slot(&self) -> Option<(usize, usize)> {
@@ -895,7 +988,7 @@ where
         &mut self,
         key: K,
         value: V,
-        membership: PreparedMembership,
+        prepared: PreparedElasticKey,
         key_fingerprint: u8,
         level_idx: usize,
         slot_idx: usize,
@@ -909,7 +1002,7 @@ where
                 level.tombstones -= 1;
             }
         }
-        self.record_membership(membership);
+        self.record_membership(prepared.route, prepared.membership, level_idx);
         self.len += 1;
         self.scheduler.complete_insert();
         (level_idx, slot_idx)
@@ -1081,7 +1174,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_slot_indices_with_hash(key, hash, fingerprint)
+        self.find_slot_indices_prepared(key, PreparedElasticRoute::new(hash), fingerprint)
     }
 
     #[inline]
@@ -1094,7 +1187,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_entry_with_hash(key, hash, fingerprint)
+        self.find_entry_prepared(key, PreparedElasticRoute::new(hash), fingerprint)
     }
 
     // -- Insert / remove --
@@ -1109,14 +1202,15 @@ where
     where
         K: Hash + Eq,
     {
-        let membership = PreparedMembership::new(hash);
-        if self.membership_maybe_contains(membership) {
-            let fingerprint = control::control_fingerprint(hash);
-            if let Some(location) = self.find_slot_indices_with_hash(&key, hash, fingerprint) {
-                return Some(self.replace_value(location, value));
-            }
+        let prepared = PreparedElasticKey::new(hash);
+        let key_fingerprint = control::control_fingerprint(hash);
+        if self.membership_maybe_contains(prepared.route, prepared.membership)
+            && let Some(location) =
+                self.find_slot_indices_prepared(&key, prepared.route, key_fingerprint)
+        {
+            return Some(self.replace_value(location, value));
         }
-        self.insert_for_vacant_entry_prepared(key, value, hash, membership);
+        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
         None
     }
 
@@ -1136,10 +1230,12 @@ where
 
     #[inline]
     fn extract_finish(&mut self, (level_idx, slot_idx): (usize, usize)) {
-        let level = &mut self.levels[level_idx];
-        level.mark_tombstone(slot_idx);
-        level.len -= 1;
-        level.tombstones += 1;
+        {
+            let level = &mut self.levels[level_idx];
+            level.mark_tombstone(slot_idx);
+            level.len -= 1;
+            level.tombstones += 1;
+        }
         self.len -= 1;
         self.epoch.note_delete();
     }
@@ -1305,16 +1401,16 @@ where
     #[inline]
     fn insert_unique(&mut self, key: K, value: V) -> bool {
         let key_hash = self.hash_key(&key);
-        let membership = PreparedMembership::new(key_hash);
+        let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
 
         self.scheduler.advance_batch_window();
         let target = self.scheduler.target();
-        if let Some(placement) = self.choose_slot_for_new_key(key_hash, target) {
-            self.place_new_entry(key, value, membership, key_fingerprint, placement);
+        if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
+            self.place_new_entry(key, value, prepared, key_fingerprint, placement);
             false
         } else {
-            self.place_exceptional_entry(key, value, membership, key_fingerprint);
+            self.place_exceptional_entry(key, value, prepared, key_fingerprint);
             true
         }
     }
@@ -1392,12 +1488,30 @@ where
         // already-moved ones are EMPTY, so both `self.drop_values` and
         // `new_map.drop_values` are sound on unwind.
         let mut used_exceptional_placement = false;
-        for level in &mut self.levels {
-            level.drain_values_and_clear(|entry| {
+        for level_index in 0..self.levels.len() {
+            let capacity = self.levels[level_index].capacity();
+            for slot in 0..capacity {
+                let control = self.levels[level_index].control_at(slot);
+                if control == CTRL_TOMBSTONE {
+                    self.levels[level_index].set_control(slot, CTRL_EMPTY);
+                    self.levels[level_index].tombstones -= 1;
+                    continue;
+                }
+                if !control.is_occupied() {
+                    continue;
+                }
+                let entry = {
+                    let level = &mut self.levels[level_index];
+                    let entry = unsafe { level.take(slot) };
+                    level.set_control(slot, CTRL_EMPTY);
+                    level.len -= 1;
+                    entry
+                };
+                self.len -= 1;
                 used_exceptional_placement |= new_map.insert_unique(entry.key, entry.value);
-            });
+            }
         }
-        self.len = 0;
+        debug_assert_eq!(self.len, 0);
         *self = new_map;
         self.epoch = prior_epoch;
         if used_exceptional_placement {
@@ -1452,14 +1566,12 @@ where
 
     fn choose_slot_for_new_key(
         &self,
-        key_hash: u64,
+        probe: PreparedElasticProbe,
         target: BatchTarget,
     ) -> Option<ExactPlacement> {
         if self.levels.is_empty() {
             return None;
         }
-        let probe = CounterPrf::new(ELASTIC_PROBE_SEED).prepare_elastic(key_hash);
-
         let (case, level, slot, paper_probe) = match target {
             BatchTarget::Bootstrap => {
                 let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[0]);
@@ -1544,7 +1656,8 @@ where
                 }
             }
         };
-        let phi = probe::elastic_phi(level as u128 + 1, u128::from(paper_probe)).ok()?;
+        let paper_level = u32::try_from(level.checked_add(1)?).ok()?;
+        let phi = u128::from(probe::elastic_phi_bounded(paper_level, paper_probe)?);
         if phi > QUERY_POSITION_CAP {
             return None;
         }
@@ -1636,37 +1749,37 @@ where
     }
 
     #[inline]
-    fn find_slot_indices_with_hash<Q>(
+    fn find_slot_indices_prepared<Q>(
         &self,
         key: &Q,
-        key_hash: u64,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
     ) -> Option<(usize, usize)>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.find_by_exact_schedule(key, key_hash, key_fingerprint, |level, slot, _entry| {
+        self.find_by_exact_schedule(key, prepared, key_fingerprint, |level, slot, _entry| {
             (level, slot)
         })
     }
 
     #[inline]
-    fn find_entry_with_hash<'a, Q>(
+    fn find_entry_prepared<'a, Q>(
         &'a self,
         key: &Q,
-        key_hash: u64,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
     ) -> Option<&'a SlotEntry<K, V>>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.find_by_exact_schedule(key, key_hash, key_fingerprint, |_level, _slot, entry| entry)
+        self.find_by_exact_schedule(key, prepared, key_fingerprint, |_level, _slot, entry| entry)
     }
 
     fn find_by_exact_schedule<'a, Q, R>(
         &'a self,
         key: &Q,
-        key_hash: u64,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
         mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
     ) -> Option<R>
@@ -1676,10 +1789,9 @@ where
         if self.len == 0 || self.levels.is_empty() {
             return None;
         }
-        let probe = CounterPrf::new(ELASTIC_PROBE_SEED).prepare_elastic(key_hash);
         let mut level_probes =
             [MaybeUninit::<PreparedElasticLevelProbe>::uninit(); u32::BITS as usize];
-        let level_zero_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[0]);
+        let level_zero_probe = prepared.probe.prepare_level_lane(ELASTIC_LEVEL_LANES[0]);
         level_probes[0].write(level_zero_probe);
         let mut prepared_levels = 1_u32;
 
@@ -1694,18 +1806,22 @@ where
             return Some(on_hit(0, h11_slot, entry));
         }
 
+        let summary_level_mask = self.summary_level_mask(prepared);
         for route in &self.probe_schedule {
             let level = usize::from(route.level);
-            let logical_probe = usize::from(route.logical_probe_index);
             let level_bit = 1_u32 << level;
+            if summary_level_mask & level_bit == 0 {
+                continue;
+            }
+            let logical_probe = usize::from(route.logical_probe_index);
             let level_probe = if prepared_levels & level_bit == 0 {
                 // SAFETY: this path is selected only for geometries with at
                 // most 32 levels, and routes come from that level slice.
                 let level_lane = unsafe { *ELASTIC_LEVEL_LANES.get_unchecked(level) };
-                let prepared = probe.prepare_level_lane(level_lane);
-                unsafe { level_probes.get_unchecked_mut(level) }.write(prepared);
+                let level_probe = prepared.probe.prepare_level_lane(level_lane);
+                unsafe { level_probes.get_unchecked_mut(level) }.write(level_probe);
                 prepared_levels |= level_bit;
-                prepared
+                level_probe
             } else {
                 // SAFETY: the bit is set only after this slot is written.
                 unsafe { level_probes.get_unchecked(level).assume_init() }
@@ -1807,14 +1923,16 @@ mod tests {
     use super::*;
 
     use core::hash::{BuildHasher, Hasher};
+    use core::mem::ManuallyDrop;
     use core::num::{NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
     use core::ptr;
     use core::ptr::NonNull;
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::common::exact::reference::{ScalarElastic, ScalarElasticCase, ScalarElasticLimits};
     use alloc::sync::Arc;
     use allocator_api2::alloc::AllocError as RawAllocError;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[derive(Clone, Copy)]
     struct ConstHashBuilder;
@@ -1979,6 +2097,7 @@ mod tests {
         let mut scalar = ScalarElastic::new(config, CounterPrf::new(ELASTIC_PROBE_SEED), limits);
 
         for identity in identities {
+            let prepared = PreparedElasticKey::new(identity);
             assert_eq!(table.hash_key(&identity), identity);
             assert!(matches!(
                 table
@@ -1987,7 +2106,7 @@ mod tests {
                 InsertAction::Continue
             ));
             let placement = table
-                .choose_slot_for_new_key(identity, table.scheduler.target())
+                .choose_slot_for_new_key(prepared.route.probe, table.scheduler.target())
                 .unwrap();
             let expected = scalar.insert(identity);
             let global_slot = table.levels[..placement.level]
@@ -2003,13 +2122,12 @@ mod tests {
             assert_eq!(placement.paper_probe, expected.paper_probe);
             assert_eq!(placement.phi, expected.phi);
 
-            let fingerprint = control::control_fingerprint(identity);
             assert_eq!(
                 table.place_new_entry(
                     identity,
                     identity,
-                    PreparedMembership::new(identity),
-                    fingerprint,
+                    prepared,
+                    control::control_fingerprint(identity),
                     placement,
                 ),
                 (placement.level, placement.slot)
@@ -2023,7 +2141,11 @@ mod tests {
                 scalar.level_occupancy()
             );
             assert_eq!(
-                table.find_slot_indices_with_hash(&identity, identity, fingerprint),
+                table.find_slot_indices_prepared(
+                    &identity,
+                    prepared.route,
+                    control::control_fingerprint(identity),
+                ),
                 Some((placement.level, placement.slot))
             );
         }
@@ -2172,8 +2294,158 @@ mod tests {
         }
     }
 
+    struct ElasticPanicHashKey {
+        value: u64,
+        panic: Arc<AtomicBool>,
+    }
+
+    impl PartialEq for ElasticPanicHashKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.value == other.value
+        }
+    }
+
+    impl Eq for ElasticPanicHashKey {}
+
+    impl Hash for ElasticPanicHashKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            assert!(
+                !self.panic.load(Ordering::SeqCst),
+                "Elastic test hash panic"
+            );
+            self.value.hash(state);
+        }
+    }
+
+    struct ElasticCountDrop(Arc<AtomicUsize>);
+
+    impl Drop for ElasticCountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ElasticPanicOnFirstDrop(Arc<AtomicUsize>);
+
+    impl Drop for ElasticPanicOnFirstDrop {
+        fn drop(&mut self) {
+            assert!(
+                self.0.fetch_add(1, Ordering::SeqCst) != 0,
+                "first value drop"
+            );
+        }
+    }
+
     #[test]
-    fn membership_filter_is_appended_without_moving_control_or_data() {
+    fn clear_marks_each_slot_empty_before_dropping_its_value() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut map =
+            ManuallyDrop::new(ElasticHashMap::<u64, ElasticPanicOnFirstDrop>::with_capacity(32));
+        for key in 0..3 {
+            map.insert(key, ElasticPanicOnFirstDrop(drops.clone()));
+        }
+        let first_occupied = map
+            .table()
+            .levels
+            .iter()
+            .enumerate()
+            .find_map(|(level_index, level)| {
+                (0..level.capacity())
+                    .find(|&slot| level.control_at(slot).is_occupied())
+                    .map(|slot| (level_index, slot))
+            })
+            .unwrap();
+
+        let result = catch_unwind(AssertUnwindSafe(|| map.clear()));
+        assert!(result.is_err());
+        assert_eq!(
+            map.table().levels[first_occupied.0].control_at(first_occupied.1),
+            CTRL_EMPTY
+        );
+        let live_controls = map
+            .table()
+            .levels
+            .iter()
+            .map(|level| {
+                (0..level.capacity())
+                    .filter(|&slot| level.control_at(slot).is_occupied())
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(map.len(), live_controls);
+        assert!(map.table().levels.iter().all(|level| {
+            level.len as usize
+                == (0..level.capacity())
+                    .filter(|&slot| level.control_at(slot).is_occupied())
+                    .count()
+        }));
+
+        map.clear();
+        assert!(map.is_empty());
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+        unsafe { ManuallyDrop::drop(&mut map) };
+    }
+
+    #[test]
+    fn caught_hash_panic_during_try_resize_leaves_counters_valid() {
+        let panic = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut map = ElasticHashMap::<ElasticPanicHashKey, ElasticCountDrop>::with_capacity(32);
+        for value in 0..16_u64 {
+            map.insert(
+                ElasticPanicHashKey {
+                    value,
+                    panic: panic.clone(),
+                },
+                ElasticCountDrop(drops.clone()),
+            );
+        }
+
+        panic.store(true, Ordering::SeqCst);
+        let result = catch_unwind(AssertUnwindSafe(|| map.try_reserve(4_096)));
+        assert!(result.is_err());
+        panic.store(false, Ordering::SeqCst);
+
+        let live_controls = map
+            .table()
+            .levels
+            .iter()
+            .map(|level| {
+                (0..level.capacity())
+                    .filter(|&slot| level.control_at(slot).is_occupied())
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(map.len(), live_controls);
+        assert!(map.table().levels.iter().all(|level| {
+            level.len as usize
+                == (0..level.capacity())
+                    .filter(|&slot| level.control_at(slot).is_occupied())
+                    .count()
+        }));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let live_keys = map.keys().map(|key| key.value).collect::<Vec<_>>();
+        map.insert(
+            ElasticPanicHashKey {
+                value: 100,
+                panic: panic.clone(),
+            },
+            ElasticCountDrop(drops.clone()),
+        );
+        map.try_reserve(4_096).unwrap();
+        for value in live_keys.into_iter().chain([100]) {
+            assert!(map.contains_key(&ElasticPanicHashKey {
+                value,
+                panic: panic.clone(),
+            }));
+        }
+        drop(map);
+        assert_eq!(drops.load(Ordering::SeqCst), 17);
+    }
+
+    #[test]
+    fn elastic_metadata_is_appended_without_moving_control_or_data() {
         fn assert_layout<K, V>() {
             for &slots in &[0, 1, 7, 8, 31, 256] {
                 let (base, data_offset) = arena::layout_for::<K, V>(slots).unwrap();
@@ -2196,6 +2468,7 @@ mod tests {
         assert_layout::<u64, u64>();
         assert_layout::<Zst, Zst>();
         assert_layout::<OverAligned, OverAligned>();
+        assert!(mem::size_of::<ElasticMetadataWord>() <= 2 * MEMBERSHIP_SLOTS_PER_WORD);
 
         let table =
             ElasticTable::<OverAligned, OverAligned>::with_capacity_and_reserve_and_hasher_in(
@@ -2209,7 +2482,15 @@ mod tests {
             table.membership_ptr().addr(),
             unsafe { table.arena.as_ptr().add(layout.membership_offset) }.addr()
         );
-        assert_eq!(table.membership_ptr().addr() % mem::align_of::<u64>(), 0);
+        assert_eq!(
+            table.membership_ptr().addr() % mem::align_of::<ElasticMetadataWord>(),
+            0
+        );
+        for word in 0..table.membership_words() {
+            let metadata = unsafe { &*table.membership_ptr().add(word) };
+            assert_eq!(metadata.membership, 0);
+            assert_eq!(metadata.route_bins, [0; 4]);
+        }
         assert_eq!(
             table.levels[0].data_ptr().addr() % mem::align_of::<OverAligned>(),
             0
@@ -2247,23 +2528,182 @@ mod tests {
         assert_eq!(map.get(&7), Some(&13));
     }
 
+    fn membership_bits_from_signature(signature: u64) -> u64 {
+        let first = signature & 63;
+        let step = ((signature >> 32) | 1) & 63;
+        let second = first.wrapping_add(step) & 63;
+        let third = second.wrapping_add(step) & 63;
+        let fourth = third.wrapping_add(step) & 63;
+        (1_u64 << first) | (1_u64 << second) | (1_u64 << third) | (1_u64 << fourth)
+    }
+
+    fn membership_maybe_contains_prepared<K, V, S, A>(
+        table: &ElasticTable<K, V, S, A>,
+        prepared: PreparedElasticKey,
+    ) -> bool
+    where
+        K: Eq + Hash,
+        S: BuildHasher,
+        A: Allocator + Clone,
+    {
+        table.membership_maybe_contains(prepared.route, prepared.membership)
+    }
+
+    #[test]
+    fn compact_prepared_elastic_state_is_register_sized() {
+        assert_eq!(mem::size_of::<PreparedElasticRoute>(), 8);
+        assert_eq!(mem::align_of::<PreparedElasticRoute>(), 8);
+        assert_eq!(mem::size_of::<PreparedElasticKey>(), 16);
+        assert_eq!(mem::align_of::<PreparedElasticKey>(), 8);
+    }
+
+    #[test]
+    fn route_summary_filter_disables_above_its_sixteen_level_encoding() {
+        assert_eq!(expand_summary_level_mask(0x1234, 16), 0x1234);
+        assert_eq!(expand_summary_level_mask(0, 17), u32::MAX);
+        assert_eq!(expand_summary_level_mask(0, 32), u32::MAX);
+    }
+
+    #[test]
+    fn prepared_route_keeps_the_geometry_independent_signature() {
+        for hash in (0..65_536_u64).map(|value| value.wrapping_mul(0x9e37_79b9_7f4a_7c15)) {
+            let route = PreparedElasticRoute::new(hash);
+            let signature = route.signature();
+            assert_eq!(signature, route.probe.routing_signature());
+        }
+    }
+
+    #[test]
+    fn compact_membership_matches_the_existing_signature_formula() {
+        for hash in (0..16_384_u64).map(|value| value.rotate_left(19)) {
+            let prepared = PreparedElasticKey::new(hash);
+            let signature = prepared.route.signature();
+            let expected = membership_bits_from_signature(signature);
+            assert_eq!(prepared.membership.bits, expected);
+            for words in [1_usize, 3, 17, 257] {
+                let product = u128::from(signature) * u128::try_from(words).unwrap();
+                assert_eq!(
+                    PreparedMembership::word(signature, words),
+                    usize::try_from(product >> 64).unwrap(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_elastic_key_uses_the_exact_probe_signature() {
+        let hash = 0xd1b5_4a32_d192_ed03;
+        let prepared = PreparedElasticKey::new(hash);
+        assert_eq!(
+            prepared.route.signature(),
+            prepared.route.probe.routing_signature()
+        );
+    }
+
+    #[test]
+    fn elastic_controls_keep_the_public_hash_fingerprint() {
+        let hash = 1_u64;
+        assert_ne!(
+            control::control_fingerprint(hash),
+            control::control_fingerprint(PreparedElasticRoute::new(hash).signature())
+        );
+        let prepared = PreparedElasticKey::new(hash);
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
+
+        map.insert(hash, 7);
+        let location = map
+            .table()
+            .find_slot_indices_prepared(&hash, prepared.route, control::control_fingerprint(hash))
+            .unwrap();
+
+        assert_eq!(
+            map.table().levels[location.0].control_at(location.1),
+            control::control_fingerprint(hash)
+        );
+    }
+
+    #[test]
+    fn route_summary_conservatively_records_every_live_level() {
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(4_096, IdentityBuildHasher);
+        for key in 0..2_000_u64 {
+            map.insert(key, key ^ 0x55);
+        }
+
+        for key in 0..2_000_u64 {
+            let location = map
+                .table()
+                .levels
+                .iter()
+                .enumerate()
+                .find_map(|(level_index, level)| {
+                    (0..level.capacity()).find_map(|slot| {
+                        (level.control_at(slot).is_occupied()
+                            && unsafe { level.get_ref(slot) }.key == key)
+                            .then_some((level_index, slot))
+                    })
+                })
+                .unwrap();
+            let route = PreparedElasticRoute::new(key);
+            assert_ne!(
+                map.table().summary_level_mask(route) & (1_u32 << location.0),
+                0,
+                "key {key} at level {}",
+                location.0
+            );
+            assert_eq!(map.get(&key), Some(&(key ^ 0x55)));
+        }
+
+        let cloned = map.clone();
+        for key in 0..2_000_u64 {
+            assert_eq!(cloned.get(&key), Some(&(key ^ 0x55)));
+        }
+
+        map.reserve(20_000);
+        for key in 0..2_000_u64 {
+            assert_eq!(map.get(&key), Some(&(key ^ 0x55)));
+        }
+
+        map.clear();
+        assert!(map.table().levels.len() <= ROUTE_SUMMARY_LEVELS);
+        for word in 0..map.table().membership_words() {
+            assert_eq!(
+                unsafe { (*map.table().membership_ptr().add(word)).route_bins },
+                [0; 4]
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_elastic_key_remains_geometry_independent_across_growth() {
+        let hash = 0x9e37_79b9_7f4a_7c15;
+        let prepared = PreparedElasticKey::new(hash);
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(1, IdentityBuildHasher);
+        map.insert(hash, 7);
+        map.reserve(4_096);
+        assert!(membership_maybe_contains_prepared(map.table(), prepared));
+        assert_eq!(map.get(&hash), Some(&7));
+    }
+
     #[test]
     fn membership_filter_never_forgets_live_or_deleted_hashes() {
         let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
             ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
         let inserted_hash = map.table().hash_key(&7_u64);
-        let membership = PreparedMembership::new(inserted_hash);
-        assert!(!map.table().membership_maybe_contains(membership));
+        let prepared = PreparedElasticKey::new(inserted_hash);
+        assert!(!membership_maybe_contains_prepared(map.table(), prepared));
 
         assert_eq!(map.insert(7, 11), None);
-        assert!(map.table().membership_maybe_contains(membership));
+        assert!(membership_maybe_contains_prepared(map.table(), prepared));
 
         assert_eq!(map.insert(7, 13), Some(11));
         assert_eq!(map.len(), 1);
-        assert!(map.table().membership_maybe_contains(membership));
+        assert!(membership_maybe_contains_prepared(map.table(), prepared));
 
         assert_eq!(map.remove(&7), Some(13));
-        assert!(map.table().membership_maybe_contains(membership));
+        assert!(membership_maybe_contains_prepared(map.table(), prepared));
         assert_eq!(map.insert(7, 17), None);
         assert_eq!(map.get(&7), Some(&17));
     }
@@ -2276,27 +2716,27 @@ mod tests {
             map.insert(key, key);
         }
         for key in 0..1_024_u64 {
-            assert!(
-                map.table()
-                    .membership_maybe_contains(PreparedMembership::new(key))
-            );
+            assert!(membership_maybe_contains_prepared(
+                map.table(),
+                PreparedElasticKey::new(key)
+            ));
         }
     }
 
     #[test]
     fn prepared_membership_remains_valid_across_growth() {
         let key = 0xD1B5_4A32_D192_ED03_u64;
-        let prepared = PreparedMembership::new(key);
+        let prepared = PreparedElasticKey::new(key);
         let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
             ElasticHashMap::with_capacity_and_hasher(1, IdentityBuildHasher);
 
         map.insert(key, 7);
-        assert!(map.table().membership_maybe_contains(prepared));
+        assert!(membership_maybe_contains_prepared(map.table(), prepared));
         let old_slots = map.table().total_slots;
 
         map.reserve(1_024);
         assert!(map.table().total_slots > old_slots);
-        assert!(map.table().membership_maybe_contains(prepared));
+        assert!(membership_maybe_contains_prepared(map.table(), prepared));
         assert_eq!(map.get(&key), Some(&7));
     }
 
@@ -2311,22 +2751,20 @@ mod tests {
         let mut cloned = map.clone();
         for key in 0_u64..96 {
             let hash = cloned.table().hash_key(&key);
-            assert!(
-                cloned
-                    .table()
-                    .membership_maybe_contains(PreparedMembership::new(hash))
-            );
+            assert!(membership_maybe_contains_prepared(
+                cloned.table(),
+                PreparedElasticKey::new(hash),
+            ));
             assert_eq!(cloned.get(&key), Some(&(key ^ 0x55)));
         }
 
         cloned.clear();
         for key in 0_u64..96 {
             let hash = cloned.table().hash_key(&key);
-            assert!(
-                !cloned
-                    .table()
-                    .membership_maybe_contains(PreparedMembership::new(hash))
-            );
+            assert!(!membership_maybe_contains_prepared(
+                cloned.table(),
+                PreparedElasticKey::new(hash),
+            ));
         }
 
         for key in 256_u64..384 {
@@ -2335,11 +2773,10 @@ mod tests {
         cloned.reserve(512);
         for key in 256_u64..384 {
             let hash = cloned.table().hash_key(&key);
-            assert!(
-                cloned
-                    .table()
-                    .membership_maybe_contains(PreparedMembership::new(hash))
-            );
+            assert!(membership_maybe_contains_prepared(
+                cloned.table(),
+                PreparedElasticKey::new(hash),
+            ));
             assert_eq!(cloned.get(&key), Some(&key));
         }
     }
@@ -2355,10 +2792,10 @@ mod tests {
 
         for key in [11_u64, 22, 33] {
             let hash = map.table().hash_key(&key);
-            assert!(
-                map.table()
-                    .membership_maybe_contains(PreparedMembership::new(hash))
-            );
+            assert!(membership_maybe_contains_prepared(
+                map.table(),
+                PreparedElasticKey::new(hash)
+            ));
             assert!(map.contains_key(&key));
         }
     }
@@ -2373,10 +2810,10 @@ mod tests {
         assert!(map.try_reserve(usize::MAX).is_err());
         for key in 0_u64..64 {
             let hash = map.table().hash_key(&key);
-            assert!(
-                map.table()
-                    .membership_maybe_contains(PreparedMembership::new(hash))
-            );
+            assert!(membership_maybe_contains_prepared(
+                map.table(),
+                PreparedElasticKey::new(hash)
+            ));
             assert_eq!(map.get(&key), Some(&key));
         }
 
@@ -2384,10 +2821,10 @@ mod tests {
         assert!(map.is_empty());
         for key in 0_u64..64 {
             let hash = map.table().hash_key(&key);
-            assert!(
-                !map.table()
-                    .membership_maybe_contains(PreparedMembership::new(hash))
-            );
+            assert!(!membership_maybe_contains_prepared(
+                map.table(),
+                PreparedElasticKey::new(hash)
+            ));
         }
     }
 
@@ -2423,10 +2860,10 @@ mod tests {
         assert_eq!(map.try_reserve(4_096), Err(TryReserveError::AllocError));
         for key in 0_u64..64 {
             let hash = map.table().hash_key(&key);
-            assert!(
-                map.table()
-                    .membership_maybe_contains(PreparedMembership::new(hash))
-            );
+            assert!(membership_maybe_contains_prepared(
+                map.table(),
+                PreparedElasticKey::new(hash)
+            ));
             assert_eq!(map.get(&key), Some(&(key ^ 0x5a)));
         }
     }
@@ -2461,6 +2898,7 @@ mod tests {
             )
             .unwrap();
         let fingerprint = control::control_fingerprint(0);
+        let prepared = PreparedElasticKey::new(0);
         let mut next_key = 0_u64;
 
         for logical_index in 0..UNIFORM_SEARCH_CAP {
@@ -2485,7 +2923,7 @@ mod tests {
         }
         assert!(
             table
-                .choose_slot_for_new_key(0, BatchTarget::Bootstrap)
+                .choose_slot_for_new_key(prepared.route.probe, BatchTarget::Bootstrap)
                 .is_none()
         );
 
@@ -2496,15 +2934,15 @@ mod tests {
         assert_eq!(after.placement_recoveries, before.placement_recoveries + 1);
         assert_eq!(after.transition, EpochTransition::PlacementRecovery);
         assert_ne!(table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
-        assert!(table.membership_maybe_contains(PreparedMembership::new(0)));
+        assert!(membership_maybe_contains_prepared(&table, prepared));
         assert_eq!(
-            table.find_slot_indices_with_hash(&u64::MAX, 0, fingerprint),
+            table.find_slot_indices_prepared(&u64::MAX, prepared.route, fingerprint),
             Some(location)
         );
         for key in 0..next_key {
             assert!(
                 table
-                    .find_slot_indices_with_hash(&key, 0, fingerprint)
+                    .find_slot_indices_prepared(&key, prepared.route, fingerprint)
                     .is_some()
             );
         }
@@ -2534,12 +2972,13 @@ mod tests {
 
         for key in 0..insertion_count {
             let hash = table.hash_key(&key);
+            let prepared = PreparedElasticKey::new(hash);
             let fingerprint = control::control_fingerprint(hash);
             let location = table
-                .find_slot_indices_with_hash(&key, hash, fingerprint)
+                .find_slot_indices_prepared(&key, prepared.route, fingerprint)
                 .expect("inserted key must have a location");
             let direct = table
-                .find_entry_with_hash(&key, hash, fingerprint)
+                .find_entry_prepared(&key, prepared.route, fingerprint)
                 .expect("inserted key must have an entry reference");
             let resolved = unsafe { table.slot_ref(location.0, location.1) };
             assert!(ptr::eq(direct, resolved), "key {key} returned a new slot");
@@ -2547,10 +2986,11 @@ mod tests {
 
         let missing = usize::MAX;
         let hash = table.hash_key(&missing);
+        let prepared = PreparedElasticKey::new(hash);
         let fingerprint = control::control_fingerprint(hash);
         assert!(
             table
-                .find_entry_with_hash(&missing, hash, fingerprint)
+                .find_entry_prepared(&missing, prepared.route, fingerprint)
                 .is_none()
         );
     }
@@ -2564,9 +3004,12 @@ mod tests {
         let before: Vec<_> = (1..100)
             .map(|key| {
                 let hash = map.table().hash_key(&key);
-                let fingerprint = control::control_fingerprint(hash);
                 map.table()
-                    .find_slot_indices_with_hash(&key, hash, fingerprint)
+                    .find_slot_indices_prepared(
+                        &key,
+                        PreparedElasticRoute::new(hash),
+                        control::control_fingerprint(hash),
+                    )
                     .unwrap()
             })
             .collect();
@@ -2576,9 +3019,12 @@ mod tests {
         let after: Vec<_> = (1..100)
             .map(|key| {
                 let hash = map.table().hash_key(&key);
-                let fingerprint = control::control_fingerprint(hash);
                 map.table()
-                    .find_slot_indices_with_hash(&key, hash, fingerprint)
+                    .find_slot_indices_prepared(
+                        &key,
+                        PreparedElasticRoute::new(hash),
+                        control::control_fingerprint(hash),
+                    )
                     .unwrap()
             })
             .collect();

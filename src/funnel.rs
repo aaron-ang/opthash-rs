@@ -259,6 +259,43 @@ enum BucketScanResult<T> {
     Full,
 }
 
+/// Scans one masked SIMD group containing `logical_lanes` controls.
+///
+/// # Safety
+///
+/// `ctrl_ptr.add(start)` must be readable for `GROUP_SIZE` bytes,
+/// `logical_lanes <= GROUP_SIZE`, and every slot passed to `inspect_match`
+/// must be valid for the corresponding data arena.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+unsafe fn scan_funnel_group<T>(
+    ctrl_ptr: *const u8,
+    start: usize,
+    logical_lanes: usize,
+    fingerprint: u8,
+    first_tombstone: &mut Option<usize>,
+    inspect_match: &mut impl FnMut(usize) -> Option<T>,
+) -> BucketScanResult<T> {
+    let group = unsafe { ctrl_ptr.add(start) };
+    let mut events = unsafe { simd::free_mask_group(group) };
+    events.0 |= unsafe { simd::eq_mask_group(group, fingerprint) }.0;
+    for lane in events {
+        if lane >= logical_lanes {
+            break;
+        }
+        let slot = start + lane;
+        let control = unsafe { *ctrl_ptr.add(slot) };
+        if control == CTRL_TOMBSTONE {
+            first_tombstone.get_or_insert(slot);
+        } else if control == CTRL_EMPTY {
+            return BucketScanResult::Empty(first_tombstone.unwrap_or(slot));
+        } else if let Some(hit) = inspect_match(slot) {
+            return BucketScanResult::Hit(hit);
+        }
+    }
+    BucketScanResult::Full
+}
+
 /// Scans exactly `length` logical controls in order using masked SIMD groups.
 ///
 /// # Safety
@@ -274,34 +311,106 @@ unsafe fn scan_funnel_bucket<T>(
     first_tombstone: &mut Option<usize>,
     mut inspect_match: impl FnMut(usize) -> Option<T>,
 ) -> BucketScanResult<T> {
+    if length <= GROUP_SIZE {
+        return unsafe {
+            scan_funnel_group(
+                ctrl_ptr,
+                start,
+                length,
+                fingerprint,
+                first_tombstone,
+                &mut inspect_match,
+            )
+        };
+    }
+    unsafe {
+        scan_funnel_bucket_multi_group(
+            ctrl_ptr,
+            start,
+            length,
+            fingerprint,
+            first_tombstone,
+            inspect_match,
+        )
+    }
+}
+
+/// Keeps the configurable multi-group case out of the default one-group path.
+///
+/// # Safety
+///
+/// The bounds requirements are identical to [`scan_funnel_bucket`], and
+/// `length` must be greater than `GROUP_SIZE`.
+#[inline(never)]
+unsafe fn scan_funnel_bucket_multi_group<T>(
+    ctrl_ptr: *const u8,
+    start: usize,
+    length: usize,
+    fingerprint: u8,
+    first_tombstone: &mut Option<usize>,
+    mut inspect_match: impl FnMut(usize) -> Option<T>,
+) -> BucketScanResult<T> {
+    debug_assert!(length > GROUP_SIZE);
     let end = start + length;
     let mut position = start;
     while position < end {
         let logical_lanes = GROUP_SIZE.min(end - position);
-        let group = unsafe { ctrl_ptr.add(position) };
-        let mut events = unsafe { simd::free_mask_group(group) };
-        events.0 |= unsafe { simd::eq_mask_group(group, fingerprint) }.0;
-        for lane in events {
-            if lane >= logical_lanes {
-                break;
-            }
-            let slot = position + lane;
-            let control = unsafe { *ctrl_ptr.add(slot) };
-            if control == CTRL_TOMBSTONE {
-                first_tombstone.get_or_insert(slot);
-            } else if control == CTRL_EMPTY {
-                return BucketScanResult::Empty(first_tombstone.unwrap_or(slot));
-            } else if let Some(hit) = inspect_match(slot) {
-                return BucketScanResult::Hit(hit);
-            }
+        match unsafe {
+            scan_funnel_group(
+                ctrl_ptr,
+                position,
+                logical_lanes,
+                fingerprint,
+                first_tombstone,
+                &mut inspect_match,
+            )
+        } {
+            BucketScanResult::Full => {}
+            result => return result,
         }
         position += logical_lanes;
     }
     BucketScanResult::Full
 }
 
-/// Clean-epoch specialization: without tombstones, the first free lane is the
-/// paper's terminating EMPTY lane.
+/// Clean-epoch scan of one group: the first free lane is the terminating EMPTY.
+///
+/// # Safety
+///
+/// The bounds requirements are identical to [`scan_funnel_group`], and the
+/// logical group must contain no tombstones.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+unsafe fn scan_clean_funnel_group<T>(
+    ctrl_ptr: *const u8,
+    start: usize,
+    logical_lanes: usize,
+    fingerprint: u8,
+    inspect_match: &mut impl FnMut(usize) -> Option<T>,
+) -> BucketScanResult<T> {
+    let group = unsafe { ctrl_ptr.add(start) };
+    let matches = unsafe { simd::eq_mask_group(group, fingerprint) };
+    let first_empty = unsafe { simd::free_mask_group(group) }
+        .into_iter()
+        .find(|&lane| lane < logical_lanes);
+    let semantic_lanes = first_empty.unwrap_or(logical_lanes);
+
+    for lane in matches {
+        if lane >= semantic_lanes {
+            break;
+        }
+        let slot = start + lane;
+        if let Some(hit) = inspect_match(slot) {
+            return BucketScanResult::Hit(hit);
+        }
+    }
+    if let Some(empty_lane) = first_empty {
+        return BucketScanResult::Empty(start + empty_lane);
+    }
+    BucketScanResult::Full
+}
+
+/// Clean-epoch specialization over `length` logical controls.
 ///
 /// # Safety
 ///
@@ -314,28 +423,26 @@ unsafe fn scan_clean_funnel_bucket<T>(
     fingerprint: u8,
     mut inspect_match: impl FnMut(usize) -> Option<T>,
 ) -> BucketScanResult<T> {
+    if length <= GROUP_SIZE {
+        return unsafe {
+            scan_clean_funnel_group(ctrl_ptr, start, length, fingerprint, &mut inspect_match)
+        };
+    }
     let end = start + length;
     let mut position = start;
     while position < end {
         let logical_lanes = GROUP_SIZE.min(end - position);
-        let group = unsafe { ctrl_ptr.add(position) };
-        let matches = unsafe { simd::eq_mask_group(group, fingerprint) };
-        let first_empty = unsafe { simd::free_mask_group(group) }
-            .into_iter()
-            .find(|&lane| lane < logical_lanes);
-        let semantic_lanes = first_empty.unwrap_or(logical_lanes);
-
-        for lane in matches {
-            if lane >= semantic_lanes {
-                break;
-            }
-            let slot = position + lane;
-            if let Some(hit) = inspect_match(slot) {
-                return BucketScanResult::Hit(hit);
-            }
-        }
-        if let Some(empty_lane) = first_empty {
-            return BucketScanResult::Empty(position + empty_lane);
+        match unsafe {
+            scan_clean_funnel_group(
+                ctrl_ptr,
+                position,
+                logical_lanes,
+                fingerprint,
+                &mut inspect_match,
+            )
+        } {
+            BucketScanResult::Full => {}
+            result => return result,
         }
         position += logical_lanes;
     }
@@ -496,7 +603,7 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.search_exact_with_clean_scan(key, key_hash, key_fingerprint, false)
+        self.search_exact_mode::<Q, false>(key, key_hash, key_fingerprint)
     }
 
     fn search_exact_for_insert<Q>(
@@ -508,15 +615,18 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.search_exact_with_clean_scan(key, key_hash, key_fingerprint, self.tombstones == 0)
+        if self.tombstones == 0 {
+            self.search_exact_mode::<Q, true>(key, key_hash, key_fingerprint)
+        } else {
+            self.search_exact_mode::<Q, false>(key, key_hash, key_fingerprint)
+        }
     }
 
-    fn search_exact_with_clean_scan<Q>(
+    fn search_exact_mode<Q, const CLEAN_EPOCH: bool>(
         &self,
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
-        clean_epoch: bool,
     ) -> SearchResult
     where
         Q: Equivalent<K> + ?Sized,
@@ -533,7 +643,7 @@ where
                 return SearchResult::RangeFailure;
             };
             let start = level.offset + bucket * self.shape.beta;
-            let scan = if clean_epoch {
+            let scan = if CLEAN_EPOCH {
                 unsafe {
                     scan_clean_funnel_bucket(
                         self.storage.ctrl_ptr(),
@@ -1197,6 +1307,24 @@ mod tests {
             Global,
         )
         .unwrap()
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn clean_and_dirty_search_modes_agree_without_tombstones() {
+        let mut table = raw_table(344, 4);
+        for key in 0..128_u64 {
+            assert!(!table.insert_unique(key, key));
+        }
+        assert_eq!(table.tombstones, 0);
+
+        for key in 0..256_u64 {
+            let hash = table.hash_builder.hash_one(key);
+            let fingerprint = control::control_fingerprint(hash);
+            let clean = table.search_exact_mode::<_, true>(&key, hash, fingerprint);
+            let dirty = table.search_exact_mode::<_, false>(&key, hash, fingerprint);
+            assert_eq!(clean, dirty, "key={key}");
+        }
     }
 
     #[test]

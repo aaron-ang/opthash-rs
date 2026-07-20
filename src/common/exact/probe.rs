@@ -230,6 +230,11 @@ impl ProbeOracle for PreparedElasticProbe {
 }
 
 impl PreparedElasticProbe {
+    #[inline]
+    pub(crate) const fn routing_signature(self) -> u64 {
+        self.domain_state
+    }
+
     pub(crate) const fn level_lane(level: u64) -> u64 {
         mix64(level.wrapping_add(DOMAIN_LEVEL_LANE))
     }
@@ -616,6 +621,37 @@ pub(crate) fn elastic_phi(i: u128, j: u128) -> Result<u128, PhiError> {
     Ok(encoded)
 }
 
+#[inline]
+fn spread_low_16(mut value: u32) -> u32 {
+    value = (value | value << 8) & 0x00ff_00ff;
+    value = (value | value << 4) & 0x0f0f_0f0f;
+    value = (value | value << 2) & 0x3333_3333;
+    (value | value << 1) & 0x5555_5555
+}
+
+/// Constant-time encoder for Elastic's reachable production coordinates.
+#[inline]
+pub(crate) fn elastic_phi_bounded(i: u32, j: u64) -> Option<u64> {
+    if i == 0 || j == 0 {
+        return None;
+    }
+    let j = u16::try_from(j).ok()?;
+    let j_bits = u16::BITS - j.leading_zeros();
+    let i_bits = u32::BITS - i.leading_zeros();
+    let pair_bits = j_bits.checked_mul(2)?;
+    let encoded_bits = pair_bits.checked_add(1)?.checked_add(i_bits)?;
+    if encoded_bits > u64::BITS {
+        return None;
+    }
+    let pair_mask = (1_u64 << pair_bits).wrapping_sub(1);
+    let data = u64::from(spread_low_16(u32::from(j)));
+    let markers = 0xaaaa_aaaa_u64 & pair_mask;
+    let pairs = data | markers;
+    pairs
+        .checked_shl(i_bits.checked_add(1)?)
+        .map(|prefix| prefix | u64::from(i))
+}
+
 /// Inverts the exact self-delimiting image produced by [`elastic_phi`].
 ///
 /// Values outside that image return `None`. A syntactically decoded candidate
@@ -788,6 +824,25 @@ impl PreparedProbeRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_elastic_phi_matches_checked_encoder_for_every_hot_coordinate() {
+        for i in 1..=u32::BITS {
+            for j in 1..=4_096_u64 {
+                let expected =
+                    u64::try_from(elastic_phi(u128::from(i), u128::from(j)).unwrap()).ok();
+                assert_eq!(elastic_phi_bounded(i, j), expected, "i={i}, j={j}");
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_elastic_phi_rejects_zero_and_unrepresentable_coordinates() {
+        assert_eq!(elastic_phi_bounded(0, 1), None);
+        assert_eq!(elastic_phi_bounded(1, 0), None);
+        assert_eq!(elastic_phi_bounded(u32::MAX, u64::from(u16::MAX)), None);
+        assert_eq!(elastic_phi_bounded(1, u64::from(u16::MAX) + 1), None);
+    }
 
     #[test]
     fn prepared_elastic_probe_is_bit_identical_to_the_full_counter_prf() {
