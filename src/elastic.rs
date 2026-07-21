@@ -1,6 +1,5 @@
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
-use core::num::NonZeroU128;
 use core::ptr;
 
 use alloc::{boxed::Box, vec::Vec};
@@ -64,7 +63,6 @@ const fn elastic_query_probe_lanes() -> [u64; QUERY_PROBE_LANE_COUNT] {
     lanes
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExactInsertionCase {
     Batch0 {
@@ -94,93 +92,13 @@ enum ExactInsertionCase {
     },
 }
 
-#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExactPlacement {
-    level: u32,
-    slot: u32,
-    phi: u32,
-}
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PackedExactPlacement(NonZeroU128);
-
-impl PackedExactPlacement {
-    #[inline]
-    fn new(placement: ExactPlacement) -> Option<Self> {
-        let packed = u128::from(placement.level)
-            | (u128::from(placement.slot) << u32::BITS)
-            | (u128::from(placement.phi) << (u32::BITS * 2));
-        Some(Self(NonZeroU128::new(packed)?))
-    }
-
-    #[inline]
-    fn placement(self) -> ExactPlacement {
-        let packed = self.0.get();
-        let word_mask = u128::from(u32::MAX);
-        ExactPlacement {
-            level: u32::try_from(packed & word_mask).expect("packed Elastic level fits u32"),
-            slot: u32::try_from((packed >> u32::BITS) & word_mask)
-                .expect("packed Elastic slot fits u32"),
-            phi: u32::try_from((packed >> (u32::BITS * 2)) & word_mask)
-                .expect("packed Elastic phi fits u32"),
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ExactPlacementDiagnostics {
     case: ExactInsertionCase,
+    level: usize,
+    slot: usize,
     paper_probe: u64,
-}
-
-#[cfg_attr(not(test), repr(transparent))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PlacementChoice {
-    packed: PackedExactPlacement,
-    #[cfg(test)]
-    diagnostics: ExactPlacementDiagnostics,
-}
-
-impl PlacementChoice {
-    #[inline]
-    fn new(
-        placement: ExactPlacement,
-        #[cfg(test)] diagnostics: ExactPlacementDiagnostics,
-    ) -> Option<Self> {
-        Some(Self {
-            packed: PackedExactPlacement::new(placement)?,
-            #[cfg(test)]
-            diagnostics,
-        })
-    }
-
-    #[inline]
-    fn placement(self) -> ExactPlacement {
-        self.packed.placement()
-    }
-}
-
-const _: () = assert!(mem::size_of::<ExactPlacement>() == 12);
-const _: () = assert!(mem::size_of::<PackedExactPlacement>() == 16);
-const _: () = assert!(mem::size_of::<Option<PackedExactPlacement>>() == 16);
-#[cfg(not(test))]
-const _: () = assert!(mem::size_of::<PlacementChoice>() == 16);
-#[cfg(not(test))]
-const _: () = assert!(mem::size_of::<Option<PlacementChoice>>() == 16);
-
-#[cfg(test)]
-macro_rules! record_exact_insertion_case {
-    ($slot:ident, $case:expr) => {
-        $slot = Some($case);
-    };
-}
-
-#[cfg(not(test))]
-macro_rules! record_exact_insertion_case {
-    ($slot:ident, $case:expr) => {};
+    phi: u128,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1026,13 +944,17 @@ where
         value: V,
         prepared: PreparedElasticKey,
         key_fingerprint: u8,
-        placement: PlacementChoice,
+        placement: ExactPlacement,
     ) -> (usize, usize) {
-        let ExactPlacement { level, slot, phi } = placement.placement();
-        let level = usize::try_from(level).expect("checked Elastic level fits usize");
-        let slot = usize::try_from(slot).expect("checked Elastic slot fits usize");
-        self.extend_probe_schedule(u128::from(phi));
-        self.write_new_entry(key, value, prepared, key_fingerprint, level, slot)
+        self.extend_probe_schedule(placement.phi);
+        self.write_new_entry(
+            key,
+            value,
+            prepared,
+            key_fingerprint,
+            placement.level,
+            placement.slot,
+        )
     }
 
     #[cold]
@@ -1642,28 +1564,24 @@ where
         self.hash_builder.hash_one(key)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn choose_slot_for_new_key(
         &self,
         probe: PreparedElasticProbe,
         target: BatchTarget,
-    ) -> Option<PlacementChoice> {
+    ) -> Option<ExactPlacement> {
         if self.levels.is_empty() {
             return None;
         }
-        #[cfg(test)]
-        #[allow(unused_assignments)]
-        let mut diagnostics_case = None;
-
-        let (level, slot, paper_probe) = match target {
+        let (case, level, slot, paper_probe) = match target {
             BatchTarget::Bootstrap => {
                 let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[0]);
                 let (slot, paper_probe) = self.uniform_vacancy(level_probe, 0)?;
-                record_exact_insertion_case!(
-                    diagnostics_case,
-                    ExactInsertionCase::Batch0 { level: 0 }
-                );
-                (0, slot, paper_probe)
+                (
+                    ExactInsertionCase::Batch0 { level: 0 },
+                    0,
+                    slot,
+                    paper_probe,
+                )
             }
             BatchTarget::LevelPair(current) => {
                 let next = current.checked_add(1)?;
@@ -1678,33 +1596,35 @@ where
                 let next_low = free_next.saturating_mul(4) <= next_level.capacity();
 
                 if current_low {
-                    record_exact_insertion_case!(
-                        diagnostics_case,
+                    let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[next]);
+                    let (slot, paper_probe) = self.uniform_vacancy(level_probe, next)?;
+                    (
                         ExactInsertionCase::Case2 {
                             batch: next,
                             current_level: current,
                             next_level: next,
                             free_current,
                             free_next,
-                        }
-                    );
-                    let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[next]);
-                    let (slot, paper_probe) = self.uniform_vacancy(level_probe, next)?;
-                    (next, slot, paper_probe)
+                        },
+                        next,
+                        slot,
+                        paper_probe,
+                    )
                 } else if next_low {
-                    record_exact_insertion_case!(
-                        diagnostics_case,
+                    let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[current]);
+                    let (slot, paper_probe) = self.uniform_vacancy(level_probe, current)?;
+                    (
                         ExactInsertionCase::Case3 {
                             batch: next,
                             current_level: current,
                             next_level: next,
                             free_current,
                             free_next,
-                        }
-                    );
-                    let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[current]);
-                    let (slot, paper_probe) = self.uniform_vacancy(level_probe, current)?;
-                    (current, slot, paper_probe)
+                        },
+                        current,
+                        slot,
+                        paper_probe,
+                    )
                 } else {
                     let budget = probe::elastic_dyadic_probe_budget(
                         free_current,
@@ -1713,50 +1633,41 @@ where
                         ELASTIC_PROBE_BUDGET_C,
                     )
                     .ok()?;
-                    record_exact_insertion_case!(
-                        diagnostics_case,
-                        ExactInsertionCase::Case1 {
-                            batch: next,
-                            current_level: current,
-                            next_level: next,
-                            free_current,
-                            free_next,
-                            budget,
-                        }
-                    );
+                    let case = ExactInsertionCase::Case1 {
+                        batch: next,
+                        current_level: current,
+                        next_level: next,
+                        free_current,
+                        free_next,
+                        budget,
+                    };
                     let current_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[current]);
-                    if let Some((slot, paper_probe)) = (0..budget).find_map(|logical_index| {
+                    if let Some((slot, probe)) = (0..budget).find_map(|logical_index| {
                         let logical_index = u64::try_from(logical_index).ok()?;
                         self.vacancy(current, current_probe, logical_index)
                             .map(|slot| (slot, logical_index + 1))
                     }) {
-                        (current, slot, paper_probe)
+                        (case, current, slot, probe)
                     } else {
                         let next_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[next]);
                         let (slot, paper_probe) = self.uniform_vacancy(next_probe, next)?;
-                        (next, slot, paper_probe)
+                        (case, next, slot, paper_probe)
                     }
                 }
             }
         };
-
         let paper_level = u32::try_from(level.checked_add(1)?).ok()?;
-        let phi = probe::elastic_phi_bounded(paper_level, paper_probe)?;
-        if u128::from(phi) > QUERY_POSITION_CAP {
+        let phi = u128::from(probe::elastic_phi_bounded(paper_level, paper_probe)?);
+        if phi > QUERY_POSITION_CAP {
             return None;
         }
-        PlacementChoice::new(
-            ExactPlacement {
-                level: u32::try_from(level).ok()?,
-                slot: u32::try_from(slot).ok()?,
-                phi: u32::try_from(phi).ok()?,
-            },
-            #[cfg(test)]
-            ExactPlacementDiagnostics {
-                case: diagnostics_case.expect("every placement branch records its case"),
-                paper_probe,
-            },
-        )
+        Some(ExactPlacement {
+            case,
+            level,
+            slot,
+            paper_probe,
+            phi,
+        })
     }
 
     fn uniform_vacancy(
@@ -2198,28 +2109,18 @@ mod tests {
                 .choose_slot_for_new_key(prepared.route.probe, table.scheduler.target())
                 .unwrap();
             let expected = scalar.insert(identity);
-            let actual = placement.placement();
-            assert_eq!(placement.diagnostics.case, exact_case(expected.case));
-            assert_eq!(
-                usize::try_from(actual.level).unwrap(),
-                expected.location.level
-            );
-            assert_eq!(
-                usize::try_from(actual.slot).unwrap(),
-                expected.location.slot_in_level
-            );
-            assert_eq!(placement.diagnostics.paper_probe, expected.paper_probe);
-            assert_eq!(u128::from(actual.phi), expected.phi);
-
-            let level = usize::try_from(actual.level).unwrap();
-            let slot = usize::try_from(actual.slot).unwrap();
-            let global_slot = table.levels[..level]
+            let global_slot = table.levels[..placement.level]
                 .iter()
                 .map(ArenaSlots::capacity)
                 .sum::<usize>()
-                + slot;
+                + placement.slot;
 
+            assert_eq!(placement.case, exact_case(expected.case));
+            assert_eq!(placement.level, expected.location.level);
+            assert_eq!(placement.slot, expected.location.slot_in_level);
             assert_eq!(global_slot, expected.location.global_slot);
+            assert_eq!(placement.paper_probe, expected.paper_probe);
+            assert_eq!(placement.phi, expected.phi);
 
             assert_eq!(
                 table.place_new_entry(
@@ -2229,7 +2130,7 @@ mod tests {
                     control::control_fingerprint(identity),
                     placement,
                 ),
-                (level, slot)
+                (placement.level, placement.slot)
             );
             assert_eq!(
                 table
@@ -2245,7 +2146,7 @@ mod tests {
                     prepared.route,
                     control::control_fingerprint(identity),
                 ),
-                Some((level, slot))
+                Some((placement.level, placement.slot))
             );
         }
     }
@@ -2654,68 +2555,6 @@ mod tests {
         assert_eq!(mem::align_of::<PreparedElasticRoute>(), 8);
         assert_eq!(mem::size_of::<PreparedElasticKey>(), 16);
         assert_eq!(mem::align_of::<PreparedElasticKey>(), 8);
-    }
-
-    #[test]
-    fn exact_placement_release_payload_is_three_words() {
-        assert_eq!(mem::size_of::<ExactPlacement>(), 12);
-        assert_eq!(mem::align_of::<ExactPlacement>(), mem::align_of::<u32>());
-    }
-
-    #[test]
-    fn packed_exact_placement_round_trips_each_word() {
-        let placements = [
-            ExactPlacement {
-                level: 0,
-                slot: 0,
-                phi: 1,
-            },
-            ExactPlacement {
-                level: u32::MAX,
-                slot: 0,
-                phi: 1,
-            },
-            ExactPlacement {
-                level: 0,
-                slot: u32::MAX,
-                phi: 1,
-            },
-            ExactPlacement {
-                level: 0,
-                slot: 0,
-                phi: u32::MAX,
-            },
-            ExactPlacement {
-                level: u32::MAX,
-                slot: u32::MAX,
-                phi: u32::MAX,
-            },
-        ];
-
-        for placement in placements {
-            let packed = PackedExactPlacement::new(placement).unwrap();
-            assert_eq!(packed.placement(), placement);
-        }
-    }
-
-    #[test]
-    fn packed_exact_placement_preserves_option_niche() {
-        assert_eq!(
-            mem::size_of::<PackedExactPlacement>(),
-            mem::size_of::<u128>()
-        );
-        assert_eq!(
-            mem::size_of::<Option<PackedExactPlacement>>(),
-            mem::size_of::<PackedExactPlacement>()
-        );
-        assert!(
-            PackedExactPlacement::new(ExactPlacement {
-                level: 0,
-                slot: 0,
-                phi: 0,
-            })
-            .is_none()
-        );
     }
 
     #[test]
