@@ -111,17 +111,29 @@ It remains useful as a statistical and performance control.
 
 ### Decision
 
-Implement trace-neutral cleanup first, then run an internal bakeoff between the
-current PRF, guarded `wyhash64`, Philox2x64-6, and Philox2x64-10. Exact upstream
-`wyhash64` and ad-hoc single-fold compositions are rejected at design time
-because valid key values can produce a zero first factor and a constant stream.
-Only a candidate that passes correctness, quality, and performance gates may
-replace the current PRF. Do not ship runtime PRF selection or experimental
-feature flags.
+The original decision was to implement trace-neutral cleanup first, then run an
+internal bakeoff between the current PRF, guarded `wyhash64`, Philox2x64-6, and
+Philox2x64-10. Exact upstream `wyhash64` and ad-hoc single-fold compositions
+remain rejected because valid key values can produce a zero first factor and a
+constant stream. Only a candidate that passes correctness, quality, and
+performance gates may replace the current PRF. Do not ship runtime PRF
+selection or experimental feature flags.
+
+Phase 1 was implemented, reviewed, measured, rejected at its predeclared
+unchanged-control gate, and reverted. All nine AArch64 comparisons were invalid
+for attribution because candidate-dependent binary layout moved fixed
+std/hashbrown controls by more than 5%; no Phase-1 speed or regression claim was
+accepted. The retained production tree is the original current implementation.
+Before PRF candidate work, the candidate-specific replacement is an approved
+compile-time one-shot Elastic insert-signature cache: current policy stores its
+existing prepared Bloom bits, while guarded/Philox policy stores one full
+geometry-independent metadata signature in the same 16-byte insert-only
+carrier. That replacement must pass fixed-control/stable-layout, lifecycle,
+assembly, and pinned AArch64/x86-64 gates before Phase 2 proceeds.
 
 ## Design
 
-### Phase 1: compact Elastic placement
+### Phase 1: compact Elastic placement (historical, rejected and reverted)
 
 The production placement value will contain only:
 
@@ -140,7 +152,7 @@ placement recovery. This keeps resize error handling and panic safety
 unchanged while allowing the compiler to keep the compact placement in
 registers.
 
-### Phase 1: prepare Elastic metadata once
+### Phase 1: prepare Elastic metadata once (historical, rejected and reverted)
 
 For one table shape, derive the metadata word index, membership bits, and route
 bin from the prepared routing signature once. The insert path may retain an
@@ -152,6 +164,15 @@ A single metadata load should provide both the membership result and, when an
 exact duplicate search is required, the route-summary mask. The final record
 uses the prepared index on the no-growth path. This preserves conservative
 false-positive behavior and all clear, clone, delete, and rebuild semantics.
+
+This table-dependent `PreparedMetadataWrite` design is no longer a Phase-2
+precondition. Its focused unit and assembly checks passed, but its timing
+campaign failed the measurement-validity gate and the code was reverted. The
+candidate-specific replacement stores no sidecar index or snapshot: a
+compile-time policy selects whether the second word of `PreparedElasticKey`
+contains current prepared Bloom bits or a candidate's full metadata signature.
+Precheck and record derive the word index from current geometry independently;
+ordinary get remains route-only and lazy after H(1,1).
 
 ### Phase 2: checked counter encoding
 
@@ -265,8 +286,10 @@ For a normal insert:
 
 1. The public map hashes the key once.
 2. The backend prepares routing state once.
-3. Elastic prepares one sidecar metadata location and conditionally performs
-   duplicate search; Funnel performs its combined hit/vacancy bucket scan.
+3. Elastic prepares candidate-selected key-local insert metadata, derives the
+   sidecar location from current geometry for duplicate precheck, and derives
+   it again after any growth/recovery for record; Funnel performs its combined
+   hit/vacancy bucket scan.
 4. The scheduler selects the same paper target as before.
 5. The PRF maps each required logical tuple to a word.
 6. The unchanged range reducer introduces no additional range bias,
@@ -292,6 +315,22 @@ cold recovery paths.
 - Existing exact range-reduction and rejection accounting tests unchanged.
 - Map/set parity, entry APIs, clone, clear, resize, tombstones, exceptional
   placement, and panic-safety tests.
+- For every guarded/Philox selector composition, the active production path
+  must pass the named growth transition, same-size exceptional recovery,
+  allocator-failure, complete metadata/summary lifecycle matrix, full
+  `cargo test`, and focused growth/recovery Miri tests before benchmarking.
+  Candidate vectors or generic forced-policy helpers are insufficient.
+- Target-aware module-local snapshots use `size_of`, `align_of`, and
+  `offset_of!` for every field of `ElasticTable`, `Level`,
+  `ElasticMetadataWord`, `FunnelTable`, `FunnelShape`, `LevelShape`, and
+  `FlatStorage`, plus both prepared carriers. Carrier alignment is compared
+  with `align_of::<u64>()`, not assumed to be eight on every target.
+  `BucketLevel` is explicitly absent in the current tree; if later introduced,
+  it receives the same complete snapshot gate.
+- Native AArch64/x86-64 tests and ABI evidence are supplemented by Rust 1.88
+  `i686-unknown-linux-gnu` `cargo check --lib --no-default-features` and
+  test-build (`cargo test --lib --no-run`) evidence. Missing required target
+  infrastructure produces `HOLD`, not an inferred pass.
 - `cargo test`, Miri, and `pre-commit run --all-files`.
 
 ### Statistical quality
@@ -340,37 +379,83 @@ an engineering PRF model.
 
 ## Performance Evaluation
 
-Save a fresh pinned anchor from merged main. Measure variants independently:
+Save a fresh pinned original-current anchor. Phase-1 compact-placement and
+table-dependent metadata variants remain archived as rejected/reverted
+evidence, not candidate foundations. Before PRF variants, measure independently:
 
-1. compact placement only;
-2. compact placement plus prepared metadata reuse;
-3. each PRF candidate on top of the accepted trace-neutral work.
+1. harness-only `cache-off-current`, whose production source is original;
+2. codegen-neutral `cache-policy-current`, with current policy false;
+3. forced `cache-on-current`, isolating the 16-byte full-signature carrier and
+   second Bloom derivation;
+4. each PRF candidate on the accepted policy scaffold, compared directly with
+   `cache-off-current`.
+
+The fixed std/hashbrown control executable must be independent of the candidate
+crate, built once from immutable cache-off original, and byte-identical across
+commits. Its absolute path is passed explicitly to every manifest and timing
+command. Separate stable-layout Elastic and Funnel targets expose unique
+`#[inline(never)]` insert/get kernels. A checked extractor requires exactly one
+symbol, validates bounds, canonicalizes only understood PC/RIP-relative
+operands, and records raw/normalized hashes, address, page offset, alignment,
+calls, frame, and spills. For every compared variant, corresponding stable
+kernel address, page offset, alignment, and link-map predecessor must equal
+original current; unexplained drift rejects before timing. Both stable targets
+run for combined candidates, and the Funnel target is mandatory for Funnel-only
+compositions. Do not reuse Phase 1's binary-layout-sensitive A/B shape or use
+cache-on current as the sole candidate baseline.
 
 For each retained variant:
 
 - run the full `speedup` suite;
 - inspect exact Callgrind instruction counts for Elastic and Funnel insert/get;
-- run pinned `perf stat` for cycles, instructions, cache misses, and branch
-  misses;
+- run pinned `perf stat -x,` through already-manifested no-build profiling
+  binaries, separately for Elastic insert/get and Funnel insert/get, with
+  identical fixed iteration counts and all setup before counters are enabled;
 - inspect hot-function assembly and struct sizes;
 - run randomized and ordered mean-latency sweeps from 1K through 10M;
 - run the default 100K, 1M, and 10M scaled-insert suite for the final candidate.
 
 Run three interleaved anchor/candidate pairs on pinned AArch64 and x86-64 hosts.
-Discard and rerun a pair if either unchanged std or hashbrown control moves by
-more than 5%; never subtract control movement from a candidate result. On each
-architecture, all three insert point estimates must improve, at least two
-Criterion 95% change intervals must exclude zero, and the median raw change
-must be at most -10% for Elastic and -5% for Funnel. For randomized and ordered
-`get`, the median raw change and the upper confidence bound in at least two
-pairs must remain at or below +2%.
+Immediately after every adjacent pair—fixed control, stable Elastic, stable
+Funnel, full suite, and scaled insert—run an explicit
+`LOAD=<candidate> BASELINE=<anchor>` comparison. Before any later comparison
+can overwrite Criterion's live `change/`, atomically snapshot all matching
+`change/estimates.json`, both named absolute `estimates.json` trees, both build
+manifests/link maps, commit and run names, target, command, executable hashes,
+and a verified SHA-256 inventory into a unique architecture/composition/pair
+directory. Acceptance reads only these immutable snapshots. Discard and rerun
+a pair under a new name if either independent fixed std or hashbrown control
+moves by more than 5%; preserve the rejected snapshot and never subtract
+control movement from a candidate result.
+
+On each architecture, all three changed-backend insert point estimates must
+improve, at least two Criterion 95% change intervals must exclude zero, and the
+median raw change must be at most -10% for Elastic and -5% for Funnel. For every
+regression gate, each point estimate must be `<= +0.02`, the declared median
+must be `<= +0.02` (or the stricter `<= +0.01` for an unchanged backend), and
+at least two 95% upper bounds must be `<= +0.02`; a favorable negative lower
+bound is never grounds for rejection. Apply those gates independently to
+randomized/ordered get, every other public operation, every latency size, and
+each scaled size. If a backend remains current—especially Funnel in an
+Elastic-only composition—also require exact named Callgrind counts and
+byte-identical normalized stable insert/get bodies against original current.
 
 Callgrind instruction counts on x86-64 and pinned hardware counters on AArch64
 must corroborate the wall-clock direction. Inspect release assembly on both
 architectures for spills, helper calls, and multiply lowering. Any public suite
 regression outside these predeclared gates rejects the candidate. If no PRF
-candidate passes on both architectures, retain only independently successful
-trace-neutral cleanup and leave the current PRF in production.
+candidate passes on both architectures, retain the accepted policy-false
+signature-cache scaffold and leave the current PRF in production; the rejected
+Phase-1 cleanup remains reverted.
+
+Before Phase 2 starts, the checked-out signature-cache evidence blob must equal
+the uniquely accepted evidence commit's blob. Parse exactly one original-source,
+cache-off, cache-policy, cache-on, cache-on production-diff hash, and `ACCEPT`
+field from that committed blob; verify every commit exists, the required
+ancestry graph, original/cache-off production identity, false policy in the
+accepted tree, and a true-policy cache-on tree differing only by the declared
+force-true production diff. A string match in a mutable working-tree document
+is not evidence.
 
 ## Documentation and Compatibility
 
@@ -382,12 +467,16 @@ or stable layout is added.
 
 ## Rollout
 
-1. Commit and benchmark trace-neutral Elastic cleanup.
-2. Implement PRF candidates as short-lived internal variants.
-3. Run correctness and statistical gates before expensive full benchmarks.
-4. Run the full pinned performance gate on surviving candidates.
-5. Delete losing variants and all runtime selection machinery.
-6. Re-run complete verification and independent review on the single final
+1. Preserve Phase-1 rejection/reversion evidence and original-current source.
+2. Implement and benchmark the compile-time candidate signature cache against
+   original current with fixed controls and stable layout; proceed only after
+   cross-architecture evidence and fresh approval.
+3. Implement PRF candidates as short-lived internal variants.
+4. Run correctness and statistical gates before expensive full benchmarks.
+5. Run the full pinned performance gate on surviving candidates, comparing
+   each directly with original current.
+6. Delete losing variants and all runtime selection machinery.
+7. Re-run complete verification and independent review on the single final
    implementation.
 
 ## Primary References
