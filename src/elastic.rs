@@ -436,11 +436,6 @@ impl PreparedElasticRoute {
     const fn signature(self) -> u64 {
         self.probe.routing_signature()
     }
-
-    #[inline]
-    fn summary_bin(self) -> usize {
-        (self.signature() & 3) as usize
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -472,22 +467,52 @@ impl PreparedMembership {
 #[derive(Clone, Copy)]
 struct PreparedElasticKey {
     route: PreparedElasticRoute,
-    membership: PreparedMembership,
 }
 
 impl PreparedElasticKey {
     #[inline]
     fn new(hash: u64) -> Self {
-        let route = PreparedElasticRoute::new(hash);
         Self {
-            membership: PreparedMembership::from_signature(route.signature()),
-            route,
+            route: PreparedElasticRoute::new(hash),
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetadataWordIndex(core::num::NonZeroUsize);
+
+impl MetadataWordIndex {
+    #[inline]
+    fn new(index: usize) -> Option<Self> {
+        index
+            .checked_add(1)
+            .and_then(core::num::NonZeroUsize::new)
+            .map(Self)
+    }
+
+    #[inline]
+    const fn get(self) -> usize {
+        self.0.get() - 1
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedMetadataWrite {
+    signature: u64,
+    index: Option<MetadataWordIndex>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedInsertMetadata {
+    summary_level_mask: u32,
+    membership_maybe_contains: bool,
+}
+
 const _: () = assert!(mem::size_of::<PreparedElasticRoute>() == 8);
-const _: () = assert!(mem::size_of::<PreparedElasticKey>() == 16);
+const _: () = assert!(mem::size_of::<PreparedElasticKey>() == 8);
+const _: () = assert!(mem::size_of::<MetadataWordIndex>() == mem::size_of::<usize>());
+const _: () = assert!(mem::size_of::<PreparedMetadataWrite>() <= 16);
+const _: () = assert!(mem::size_of::<PreparedInsertMetadata>() == 8);
 
 #[inline]
 const fn expand_summary_level_mask(mask: u16, level_count: usize) -> u32 {
@@ -881,37 +906,64 @@ where
         }
     }
 
-    #[inline(never)]
-    fn membership_maybe_contains(
-        &self,
-        route: PreparedElasticRoute,
-        membership: PreparedMembership,
-    ) -> bool {
+    #[inline]
+    fn metadata_word_index_from_signature(&self, signature: u64) -> Option<MetadataWordIndex> {
         let words = self.membership_words();
         if words == 0 {
-            return false;
-        }
-        let word = PreparedMembership::word(route.signature(), words);
-        unsafe {
-            (*self.membership_ptr().add(word)).membership & membership.bits == membership.bits
+            None
+        } else {
+            MetadataWordIndex::new(PreparedMembership::word(signature, words))
         }
     }
 
-    #[inline(never)]
-    fn record_membership(
-        &mut self,
-        route: PreparedElasticRoute,
-        membership: PreparedMembership,
-        level: usize,
-    ) {
-        let words = self.membership_words();
-        if words != 0 {
-            let word = PreparedMembership::word(route.signature(), words);
-            let metadata = unsafe { &mut *self.membership_ptr().add(word) };
-            metadata.membership |= membership.bits;
-            if self.levels.len() <= ROUTE_SUMMARY_LEVELS {
-                metadata.route_bins[route.summary_bin()] |= 1_u16 << level;
-            }
+    #[inline]
+    fn prepare_metadata_write(&self, route: PreparedElasticRoute) -> PreparedMetadataWrite {
+        let signature = route.signature();
+        PreparedMetadataWrite {
+            signature,
+            index: self.metadata_word_index_from_signature(signature),
+        }
+    }
+
+    #[inline]
+    fn reindex_metadata_write(&self, write: PreparedMetadataWrite) -> PreparedMetadataWrite {
+        PreparedMetadataWrite {
+            signature: write.signature,
+            index: self.metadata_word_index_from_signature(write.signature),
+        }
+    }
+
+    #[inline]
+    fn prepare_insert_metadata(&self, write: PreparedMetadataWrite) -> PreparedInsertMetadata {
+        let Some(index) = write.index else {
+            return PreparedInsertMetadata {
+                summary_level_mask: 0,
+                membership_maybe_contains: false,
+            };
+        };
+        let metadata = unsafe { *self.membership_ptr().add(index.get()) };
+        let membership = PreparedMembership::from_signature(write.signature);
+        PreparedInsertMetadata {
+            summary_level_mask: expand_summary_level_mask(
+                metadata.route_bins[(write.signature & 3) as usize],
+                self.levels.len(),
+            ),
+            membership_maybe_contains: metadata.membership & membership.bits == membership.bits,
+        }
+    }
+
+    #[inline]
+    fn record_metadata_at(&mut self, write: PreparedMetadataWrite, level: usize) {
+        debug_assert_eq!(
+            write.index,
+            self.metadata_word_index_from_signature(write.signature)
+        );
+        let Some(index) = write.index else { return };
+        let membership = PreparedMembership::from_signature(write.signature);
+        let metadata = unsafe { &mut *self.membership_ptr().add(index.get()) };
+        metadata.membership |= membership.bits;
+        if self.levels.len() <= ROUTE_SUMMARY_LEVELS {
+            metadata.route_bins[(write.signature & 3) as usize] |= 1_u16 << level;
         }
     }
 
@@ -925,9 +977,10 @@ where
         if words == 0 {
             return 0;
         }
-        let word = PreparedMembership::word(route.signature(), words);
+        let signature = route.signature();
+        let word = PreparedMembership::word(signature, words);
         let metadata = unsafe { &*self.membership_ptr().add(word) };
-        expand_summary_level_mask(metadata.route_bins[route.summary_bin()], level_count)
+        expand_summary_level_mask(metadata.route_bins[(signature & 3) as usize], level_count)
     }
 
     fn clear_membership(&mut self) {
@@ -980,7 +1033,8 @@ where
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
-        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint)
+        let metadata_write = self.prepare_metadata_write(prepared.route);
+        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint, metadata_write)
     }
 
     fn insert_for_vacant_entry_prepared(
@@ -989,6 +1043,7 @@ where
         value: V,
         prepared: PreparedElasticKey,
         key_fingerprint: u8,
+        mut metadata_write: PreparedMetadataWrite,
     ) -> (usize, usize) {
         match self
             .scheduler
@@ -997,6 +1052,7 @@ where
             InsertAction::Resize(cap) => {
                 self.resize_with_transition(cap, EpochTransition::Growth);
                 self.scheduler.advance_batch_window();
+                metadata_write = self.reindex_metadata_write(metadata_write);
             }
             InsertAction::Continue => {}
         }
@@ -1004,17 +1060,18 @@ where
         if let Some(placement) =
             self.choose_slot_for_new_key(prepared.route.probe, self.scheduler.target())
         {
-            return self.place_new_entry(key, value, prepared, key_fingerprint, placement);
+            return self.place_new_entry(key, value, key_fingerprint, metadata_write, placement);
         }
 
         self.resize_with_transition(self.total_slots, EpochTransition::PlacementRecovery);
         self.scheduler.advance_batch_window();
+        metadata_write = self.reindex_metadata_write(metadata_write);
         if let Some(placement) =
             self.choose_slot_for_new_key(prepared.route.probe, self.scheduler.target())
         {
-            self.place_new_entry(key, value, prepared, key_fingerprint, placement)
+            self.place_new_entry(key, value, key_fingerprint, metadata_write, placement)
         } else {
-            self.place_exceptional_entry(key, value, prepared, key_fingerprint)
+            self.place_exceptional_entry(key, value, key_fingerprint, metadata_write)
         }
     }
 
@@ -1024,15 +1081,15 @@ where
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
         key_fingerprint: u8,
+        metadata_write: PreparedMetadataWrite,
         placement: PlacementChoice,
     ) -> (usize, usize) {
         let ExactPlacement { level, slot, phi } = placement.placement();
         let level = usize::try_from(level).expect("checked Elastic level fits usize");
         let slot = usize::try_from(slot).expect("checked Elastic slot fits usize");
         self.extend_probe_schedule(u128::from(phi));
-        self.write_new_entry(key, value, prepared, key_fingerprint, level, slot)
+        self.write_new_entry(key, value, key_fingerprint, metadata_write, level, slot)
     }
 
     #[cold]
@@ -1040,14 +1097,14 @@ where
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
         key_fingerprint: u8,
+        metadata_write: PreparedMetadataWrite,
     ) -> (usize, usize) {
         let (level, slot) = self
             .first_free_slot()
             .expect("Elastic insertion limit must leave a free slot");
         self.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG;
-        self.write_new_entry(key, value, prepared, key_fingerprint, level, slot)
+        self.write_new_entry(key, value, key_fingerprint, metadata_write, level, slot)
     }
 
     fn first_free_slot(&self) -> Option<(usize, usize)> {
@@ -1066,11 +1123,15 @@ where
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
         key_fingerprint: u8,
+        metadata_write: PreparedMetadataWrite,
         level_idx: usize,
         slot_idx: usize,
     ) -> (usize, usize) {
+        debug_assert_eq!(
+            metadata_write.index,
+            self.metadata_word_index_from_signature(metadata_write.signature),
+        );
         {
             let level = &mut self.levels[level_idx];
             let prev_ctrl = level.control_at(slot_idx);
@@ -1080,7 +1141,7 @@ where
                 level.tombstones -= 1;
             }
         }
-        self.record_membership(prepared.route, prepared.membership, level_idx);
+        self.record_metadata_at(metadata_write, level_idx);
         self.len += 1;
         self.scheduler.complete_insert();
         (level_idx, slot_idx)
@@ -1282,13 +1343,25 @@ where
     {
         let prepared = PreparedElasticKey::new(hash);
         let key_fingerprint = control::control_fingerprint(hash);
-        if self.membership_maybe_contains(prepared.route, prepared.membership)
-            && let Some(location) =
-                self.find_slot_indices_prepared(&key, prepared.route, key_fingerprint)
+        let metadata_write = self.prepare_metadata_write(prepared.route);
+        let metadata = self.prepare_insert_metadata(metadata_write);
+        if metadata.membership_maybe_contains
+            && let Some(location) = self.find_slot_indices_prepared_with_summary(
+                &key,
+                prepared.route,
+                key_fingerprint,
+                metadata.summary_level_mask,
+            )
         {
             return Some(self.replace_value(location, value));
         }
-        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
+        self.insert_for_vacant_entry_prepared(
+            key,
+            value,
+            prepared,
+            key_fingerprint,
+            metadata_write,
+        );
         None
     }
 
@@ -1481,14 +1554,15 @@ where
         let key_hash = self.hash_key(&key);
         let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
+        let metadata_write = self.prepare_metadata_write(prepared.route);
 
         self.scheduler.advance_batch_window();
         let target = self.scheduler.target();
         if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
-            self.place_new_entry(key, value, prepared, key_fingerprint, placement);
+            self.place_new_entry(key, value, key_fingerprint, metadata_write, placement);
             false
         } else {
-            self.place_exceptional_entry(key, value, prepared, key_fingerprint);
+            self.place_exceptional_entry(key, value, key_fingerprint, metadata_write);
             true
         }
     }
@@ -1847,9 +1921,33 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.find_by_exact_schedule(key, prepared, key_fingerprint, |level, slot, _entry| {
-            (level, slot)
-        })
+        self.find_by_exact_schedule(
+            key,
+            prepared,
+            key_fingerprint,
+            || self.summary_level_mask(prepared),
+            |level, slot, _entry| (level, slot),
+        )
+    }
+
+    #[inline]
+    fn find_slot_indices_prepared_with_summary<Q>(
+        &self,
+        key: &Q,
+        prepared: PreparedElasticRoute,
+        key_fingerprint: u8,
+        summary_level_mask: u32,
+    ) -> Option<(usize, usize)>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        self.find_by_exact_schedule(
+            key,
+            prepared,
+            key_fingerprint,
+            || summary_level_mask,
+            |level, slot, _entry| (level, slot),
+        )
     }
 
     #[inline]
@@ -1862,18 +1960,27 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.find_by_exact_schedule(key, prepared, key_fingerprint, |_level, _slot, entry| entry)
+        self.find_by_exact_schedule(
+            key,
+            prepared,
+            key_fingerprint,
+            || self.summary_level_mask(prepared),
+            |_level, _slot, entry| entry,
+        )
     }
 
-    fn find_by_exact_schedule<'a, Q, R>(
+    #[inline]
+    fn find_by_exact_schedule<'a, Q, R, F>(
         &'a self,
         key: &Q,
         prepared: PreparedElasticRoute,
         key_fingerprint: u8,
+        summary_level_mask: F,
         mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
     ) -> Option<R>
     where
         Q: Equivalent<K> + ?Sized,
+        F: FnOnce() -> u32,
     {
         if self.len == 0 || self.levels.is_empty() {
             return None;
@@ -1895,7 +2002,7 @@ where
             return Some(on_hit(0, h11_slot, entry));
         }
 
-        let summary_level_mask = self.summary_level_mask(prepared);
+        let summary_level_mask = summary_level_mask();
         for route in &self.probe_schedule {
             let level = usize::from(route.level);
             let level_bit = 1_u32 << level;
@@ -2220,13 +2327,14 @@ mod tests {
                 + slot;
 
             assert_eq!(global_slot, expected.location.global_slot);
+            let metadata_write = table.prepare_metadata_write(prepared.route);
 
             assert_eq!(
                 table.place_new_entry(
                     identity,
                     identity,
-                    prepared,
                     control::control_fingerprint(identity),
+                    metadata_write,
                     placement,
                 ),
                 (level, slot)
@@ -2645,15 +2753,88 @@ mod tests {
         S: BuildHasher,
         A: Allocator + Clone,
     {
-        table.membership_maybe_contains(prepared.route, prepared.membership)
+        let write = table.prepare_metadata_write(prepared.route);
+        table
+            .prepare_insert_metadata(write)
+            .membership_maybe_contains
+    }
+
+    #[test]
+    fn prepared_insert_metadata_matches_the_sidecar_word() {
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(256, IdentityBuildHasher);
+        for key in 0..128_u64 {
+            map.insert(key, key);
+        }
+        for key in 0..128_u64 {
+            let route = PreparedElasticRoute::new(key);
+            let write = map.table().prepare_metadata_write(route);
+            let actual = map.table().prepare_insert_metadata(write);
+            let index = write.index.unwrap().get();
+            let word = unsafe { *map.table().membership_ptr().add(index) };
+            let membership = PreparedMembership::from_signature(write.signature);
+            assert_eq!(
+                actual.membership_maybe_contains,
+                word.membership & membership.bits == membership.bits
+            );
+            assert_eq!(
+                actual.summary_level_mask,
+                expand_summary_level_mask(
+                    word.route_bins[(write.signature & 3) as usize],
+                    map.table().levels.len(),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_index_is_recomputed_after_growth() {
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(16, IdentityBuildHasher);
+        let old_words = map.table().membership_words();
+        map.reserve(4_096);
+        let new_words = map.table().membership_words();
+        assert_ne!(old_words, new_words);
+        let key = (0_u64..u64::MAX)
+            .find(|&candidate| {
+                let route = PreparedElasticRoute::new(candidate);
+                let old = PreparedMembership::word(route.signature(), old_words);
+                let new = PreparedMembership::word(route.signature(), new_words);
+                old != new
+            })
+            .unwrap();
+        let route = PreparedElasticRoute::new(key);
+        let signature = route.signature();
+        let stale = PreparedMetadataWrite {
+            signature,
+            index: MetadataWordIndex::new(PreparedMembership::word(signature, old_words)),
+        };
+        let fresh = map.table().reindex_metadata_write(stale);
+        assert_eq!(fresh.signature, stale.signature);
+        assert_ne!(stale.index, fresh.index);
+        assert_eq!(map.insert(key, 7), None);
+        let write = map.table().prepare_metadata_write(route);
+        assert!(
+            map.table()
+                .prepare_insert_metadata(write)
+                .membership_maybe_contains
+        );
+        assert_eq!(map.get(&key), Some(&7));
     }
 
     #[test]
     fn compact_prepared_elastic_state_is_register_sized() {
         assert_eq!(mem::size_of::<PreparedElasticRoute>(), 8);
         assert_eq!(mem::align_of::<PreparedElasticRoute>(), 8);
-        assert_eq!(mem::size_of::<PreparedElasticKey>(), 16);
+        assert_eq!(mem::size_of::<PreparedElasticKey>(), 8);
         assert_eq!(mem::align_of::<PreparedElasticKey>(), 8);
+        assert_eq!(mem::size_of::<MetadataWordIndex>(), mem::size_of::<usize>());
+        assert_eq!(
+            mem::size_of::<Option<MetadataWordIndex>>(),
+            mem::size_of::<usize>()
+        );
+        assert!(mem::size_of::<PreparedMetadataWrite>() <= 16);
+        assert_eq!(mem::size_of::<PreparedInsertMetadata>(), 8);
     }
 
     #[test]
@@ -2740,7 +2921,7 @@ mod tests {
             let prepared = PreparedElasticKey::new(hash);
             let signature = prepared.route.signature();
             let expected = membership_bits_from_signature(signature);
-            assert_eq!(prepared.membership.bits, expected);
+            assert_eq!(PreparedMembership::from_signature(signature).bits, expected);
             for words in [1_usize, 3, 17, 257] {
                 let product = u128::from(signature) * u128::try_from(words).unwrap();
                 assert_eq!(
