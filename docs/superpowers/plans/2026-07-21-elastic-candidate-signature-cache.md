@@ -1180,10 +1180,21 @@ repetitions each:
 
 ```bash
 CACHE_GATE_PERF_BIN=/absolute/path/from/manifest
+CACHE_GATE_CAMPAIGN_ROOT=/absolute/shared/cache-gate-campaign-contracts
+CACHE_GATE_CAMPAIGN_KEY=elastic-signature-cache-cache-off-vs-on
 for op in elastic-insert elastic-get funnel-insert funnel-get; do
-    CACHE_GATE_PERF_BIN="$CACHE_GATE_PERF_BIN" scripts/cache-gate-perf.sh --manifest /absolute/manifest.json --operation "$op" --iterations 100
+    for repetition in 1 2 3; do
+        CACHE_GATE_PERF_BIN="$CACHE_GATE_PERF_BIN" \
+        CACHE_GATE_CAMPAIGN_ROOT="$CACHE_GATE_CAMPAIGN_ROOT" \
+        CACHE_GATE_CAMPAIGN_KEY="$CACHE_GATE_CAMPAIGN_KEY" \
+            scripts/cache-gate-perf.sh --manifest /absolute/manifest.json \
+            --operation "$op" --iterations 100 --repetition "$repetition"
+    done
 done
 ```
+
+Use this one absolute campaign root and key unchanged in both immutable
+anchor/candidate worktrees; a different comparison campaign requires a new key.
 
 Require cache-on Elastic median cycles and instructions `<= +0.02` versus
 cache-off and unchanged Funnel exact direction/count gates; no adverse cache-/

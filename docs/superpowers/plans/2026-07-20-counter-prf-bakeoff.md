@@ -1596,17 +1596,29 @@ accepted manifest. Run the no-build launcher separately for all four operations
 and retain three raw repetitions per operation/tree:
 
 ```bash
+CACHE_GATE_CAMPAIGN_ROOT=/absolute/shared/cache-gate-campaign-contracts
+CACHE_GATE_CAMPAIGN_KEY="counter-prf-$prf_candidate-vs-original-current"
 for tree in "$prf_anchor_tree" "$prf_candidate_tree"; do
     manifest="$tree/target/cache-gate/$prf_arch/$(test "$tree" = "$prf_anchor_tree" && echo prf-original-current || echo prf-$prf_candidate)/manifest.json"
     profile_bin=$(jq -er '.executables.cache_gate_profile.absolute_path' "$manifest")
     test -x "$profile_bin"
     for operation in elastic-insert elastic-get funnel-insert funnel-get; do
         for repetition in 1 2 3; do
-            (cd "$tree" && CACHE_GATE_PERF_BIN="$profile_bin" scripts/cache-gate-perf.sh --manifest "$manifest" --operation "$operation" --iterations 100 --repetition "$repetition")
+            (cd "$tree" && \
+                CACHE_GATE_PERF_BIN="$profile_bin" \
+                CACHE_GATE_CAMPAIGN_ROOT="$CACHE_GATE_CAMPAIGN_ROOT" \
+                CACHE_GATE_CAMPAIGN_KEY="$CACHE_GATE_CAMPAIGN_KEY" \
+                scripts/cache-gate-perf.sh --manifest "$manifest" \
+                --operation "$operation" --iterations 100 \
+                --repetition "$repetition")
         done
     done
 done
 ```
+
+The absolute campaign root and key above are one shared contract namespace for
+both immutable worktrees and all repetitions 1–3. Change the key only when
+starting a different anchor/candidate campaign.
 
 `cache-gate-perf.sh` verifies the manifested binary hash, performs all setup
 before `READY`, enables `perf stat -x,` counters only around the one named

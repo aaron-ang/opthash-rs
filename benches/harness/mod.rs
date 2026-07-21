@@ -1,10 +1,17 @@
 #![allow(dead_code, unused_imports)]
 
+mod cache_gate;
 mod fixtures;
 #[macro_use]
 mod map_matrix;
 mod queries;
 
+pub use cache_gate::{
+    CACHE_GATE_MAX_INSERT_PROFILE_ITERATIONS, CACHE_GATE_OP_COUNT, cache_gate_pairs,
+    cache_gate_profile_ready_message, elastic_cache_gate_map, funnel_cache_gate_map,
+    validate_cache_gate_fill, validate_cache_gate_profile_fds,
+    validate_cache_gate_profile_iterations, validate_funnel_cache_gate_fill,
+};
 pub use fixtures::*;
 pub use map_matrix::bench_one_lookup_group;
 pub use queries::*;

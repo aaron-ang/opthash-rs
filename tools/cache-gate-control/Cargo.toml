@@ -1,0 +1,10 @@
+[package]
+name = "opthash-cache-gate-control"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+criterion = { version = "4", package = "codspeed-criterion-compat", default-features = false, features = ["cargo_bench_support"] }
+foldhash = { version = "0.2", default-features = false, features = ["std"] }
+hashbrown = "0.17"

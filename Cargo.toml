@@ -18,6 +18,7 @@ exclude = [
     "/paper/",
     "/scripts/",
     "/tests/",
+    "/tools/",
     "/.gitattributes",
     "/.gitignore",
     "/.pre-commit-config.yaml",
@@ -95,4 +96,16 @@ harness = false
 
 [[bench]]
 name = "scaled_insert"
+harness = false
+
+[[bench]]
+name = "elastic_cache_gate"
+harness = false
+
+[[bench]]
+name = "funnel_cache_gate"
+harness = false
+
+[[bench]]
+name = "cache_gate_profile"
 harness = false
