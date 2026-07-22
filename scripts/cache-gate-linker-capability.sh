@@ -5,6 +5,12 @@ set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$REPO_ROOT"
+[[ -z $(git status --porcelain --untracked-files=normal) ]] || {
+	echo "HOLD: capability producer worktree must be clean" >&2
+	exit 3
+}
+producer_commit=$(git rev-parse HEAD)
+producer_tree=$(git rev-parse 'HEAD^{tree}')
 
 hold() {
 	echo "HOLD: $*" >&2
@@ -114,16 +120,10 @@ if ! RUSTFLAGS="$actual_flags" CARGO_TARGET_DIR="$actual_target_root" cargo rust
 	-C codegen-units=1 --print link-args >"$actual_args" 2>"$probe_root/actual-bootstrap.cargo.stderr"; then
 	hold "actual Cargo-configured linker does not support --print link-args/augmentation"
 fi
-actual_driver=$(python3 - "$actual_args" <<'PY'
-import shlex,shutil,sys
-line=open(sys.argv[1],encoding="utf-8").read().strip().splitlines()[-1]
-tokens=shlex.split(line)
-command=next((token for token in tokens if "=" not in token), "")
-resolved=shutil.which(command) if command else None
-if not resolved: raise SystemExit(1)
-print(resolved)
-PY
-) || hold "cannot resolve actual Cargo linker command"
+actual_driver=$("$REPO_ROOT/scripts/cache-gate-elf-layout.py" resolve-cargo-linker \
+	--link-args "$actual_args") || hold "cannot resolve actual Cargo linker command"
+actual_driver=$(realpath -e -- "$actual_driver")
+[[ -f $actual_driver && ! -L $actual_driver && -x $actual_driver ]] || hold "actual Cargo linker is not canonical"
 actual_version=$("$actual_driver" -Wl,--version 2>&1 | rg -m1 'GNU ld|LLD|lld' || true)
 case "$actual_version" in
 *"GNU ld"*) actual_flavor="GNU ld" ;;
@@ -158,11 +158,13 @@ for target in elastic funnel profile; do run_shape lld "$target" "$lld" lld; don
 
 python3 - "$probe_root/capability.json" "$REPO_ROOT" "$probe_root" "$arch" "$target_triple" \
 	"$actual_driver" "$actual_flavor" "$actual_version" "$gnu_ld" "$gnu_version" "$lld" "$lld_version" \
-	"$max_page_size" "$elastic_sha" "$funnel_sha" "$profile_sha" "$fragment_set_sha" <<'PY'
+	"$max_page_size" "$elastic_sha" "$funnel_sha" "$profile_sha" "$fragment_set_sha" \
+	"$producer_commit" "$producer_tree" <<'PY'
 import hashlib,json,subprocess,sys
 from pathlib import Path
 (output,repo,probe,arch,triple,actual_driver,actual_flavor,actual_version,gnu,gnu_version,
- lld,lld_version,max_page,elastic_sha,funnel_sha,profile_sha,set_sha)=sys.argv[1:]
+ lld,lld_version,max_page,elastic_sha,funnel_sha,profile_sha,set_sha,producer_commit,
+ producer_tree)=sys.argv[1:]
 root=Path(probe)
 def record(path):
     path=Path(path).resolve()
@@ -182,6 +184,8 @@ for flavor in ("actual","gnu","lld"):
         if execution.exists(): shapes[flavor][target]["linker_execution"]=record(execution)
 payload={
  "accepted":True,"arch":arch,"target_triple":triple,"max_page_size":int(max_page),
+ "producer":{"runner_root":str(Path(repo).resolve()),"commit":producer_commit,
+   "tree":producer_tree,"empty_diff_assertion":True,"artifact_root":str(root.resolve())},
  "rustc_version":subprocess.check_output(["rustc","-vV"],text=True).strip(),
  "cargo_version":subprocess.check_output(["cargo","-V"],text=True).strip(),
  "linker":{"absolute_path":actual_driver,"sha256":hashlib.sha256(Path(actual_driver).read_bytes()).hexdigest(),"flavor":actual_flavor,"version":actual_version},

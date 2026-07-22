@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -737,6 +738,61 @@ def replay_link_command(
     }
 
 
+def _validate_capability_producer(
+    producer: Any, tool_records: dict[str, Any]
+) -> tuple[Path, Path]:
+    _exact_keys(
+        producer,
+        {"runner_root", "commit", "tree", "empty_diff_assertion", "artifact_root"},
+        "capability producer",
+    )
+    root = Path(producer["runner_root"])
+    _require(
+        root.is_absolute() and root.is_dir() and not root.is_symlink(),
+        "capability producer root is invalid",
+    )
+    root = root.resolve()
+    _require(
+        producer["runner_root"] == str(root),
+        "capability producer root is not canonical",
+    )
+    _require(
+        Path(
+            run("git", "-C", str(root), "rev-parse", "--show-toplevel").strip()
+        ).resolve()
+        == root,
+        "capability producer root is not an exact Git worktree",
+    )
+    head = run("git", "-C", str(root), "rev-parse", "HEAD").strip()
+    tree = run("git", "-C", str(root), "rev-parse", "HEAD^{tree}").strip()
+    status = run(
+        "git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"
+    )
+    reviewed = tool_records["elf_layout"]
+    _require(
+        producer["commit"] == head == reviewed["reviewed_commit"]
+        and producer["tree"] == tree == reviewed["reviewed_tree"]
+        and producer["empty_diff_assertion"] is True
+        and Path(reviewed["reviewed_root"]).resolve() == root
+        and not status.strip(),
+        "capability producer revision differs from reviewed harness",
+    )
+    artifact_root = Path(producer["artifact_root"])
+    _require(
+        artifact_root.is_absolute()
+        and artifact_root.is_dir()
+        and not artifact_root.is_symlink(),
+        "capability artifact root is invalid",
+    )
+    artifact_root = artifact_root.resolve()
+    _require(
+        producer["artifact_root"] == str(artifact_root)
+        and _is_contained((root / "target").resolve(), artifact_root),
+        "capability artifact root is outside producer target",
+    )
+    return root, artifact_root
+
+
 def _validate_capability(
     manifest: dict[str, Any],
     manifest_path: Path,
@@ -758,6 +814,7 @@ def _validate_capability(
             "fragments",
             "fragment_set_sha256",
             "shapes",
+            "producer",
             "copy",
         },
         "linker capability",
@@ -793,6 +850,9 @@ def _validate_capability(
         and capability["max_page_size"] > 0,
         "invalid capability MAXPAGESIZE",
     )
+    producer_root, artifact_root = _validate_capability_producer(
+        capability["producer"], manifest["tools"]
+    )
     _validate_linker_record(capability["linker"], "capability linker")
     _exact_keys(capability["required_linkers"], {"gnu", "lld"}, "required linker set")
     for flavor, record in capability["required_linkers"].items():
@@ -810,9 +870,27 @@ def _validate_capability(
     fragment_lines: list[str] = []
     for target, record in sorted(capability["fragments"].items()):
         path = _file_record(record, f"capability fragment {target}")
+        expected = (producer_root / f"benches/cache-gate-{target}-layout.ld").resolve()
         _require(
-            _is_contained(runner, path),
-            f"capability fragment {target} is outside runner",
+            path == expected,
+            f"capability fragment {target} is outside producer",
+        )
+        relative = path.relative_to(producer_root)
+        blob = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(producer_root),
+                "show",
+                f"{capability['producer']['commit']}:{relative}",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        _require(
+            blob.returncode == 0
+            and hashlib.sha256(blob.stdout).hexdigest() == record["sha256"],
+            f"capability fragment {target} differs from producer Git blob",
         )
         fragments[target] = path
         fragment_lines.append(f"{target}:{record['sha256']}")
@@ -821,7 +899,6 @@ def _validate_capability(
         "capability fragment-set hash mismatch",
     )
     _exact_keys(capability["shapes"], {"actual", "gnu", "lld"}, "capability shape set")
-    runner_target = (runner / "target").resolve()
     readelf_text = shutil.which("readelf")
     _require(bool(readelf_text), "readelf is required to rederive capability shapes")
     readelf = Path(readelf_text).resolve()
@@ -858,8 +935,8 @@ def _validate_capability(
                     )
                 }
                 _require(
-                    all(_is_contained(runner_target, path) for path in paths.values()),
-                    f"{flavor}/{target} capability artifact is outside runner target",
+                    all(_is_contained(artifact_root, path) for path in paths.values()),
+                    f"{flavor}/{target} capability artifact is outside producer artifact root",
                 )
                 layout = _json_file(paths["layout"], f"{flavor}/{target} layout")
                 link_argv_text = paths["link_argv"].read_text(errors="replace")
@@ -926,23 +1003,23 @@ def _validate_capability(
                         shape["linker_execution"], f"{flavor}/{target} linker execution"
                     )
                     _require(
-                        _is_contained(runner_target, execution_path),
-                        f"{flavor}/{target} execution proof is outside runner target",
+                        _is_contained(artifact_root, execution_path),
+                        f"{flavor}/{target} execution proof is outside producer artifact root",
                     )
                     observed = _json_file(
                         execution_path, f"{flavor}/{target} linker execution"
                     )
                     _require_output_contained(
                         observed.get("argv", []),
-                        runner_target,
-                        f"{flavor}/{target} linker output is outside runner target",
+                        artifact_root,
+                        f"{flavor}/{target} linker output is outside producer artifact root",
                     )
                     linker_record = capability["required_linkers"][flavor]
                     trace = observed.get("trace", {})
                     trace_path = _trace_record(trace, f"{flavor}/{target} linker trace")
                     _require(
-                        _is_contained(runner_target, trace_path),
-                        f"{flavor}/{target} linker trace is outside runner target",
+                        _is_contained(artifact_root, trace_path),
+                        f"{flavor}/{target} linker trace is outside producer artifact root",
                     )
                     regenerated = replay_linker_execution(
                         trace_path,
@@ -2297,6 +2374,29 @@ def select_cargo_executable(args: argparse.Namespace) -> Path:
     return executable
 
 
+def resolve_cargo_linker(args: argparse.Namespace) -> Path:
+    _require(
+        args.link_args.is_absolute()
+        and args.link_args.is_file()
+        and not args.link_args.is_symlink(),
+        "--link-args must be an absolute regular file",
+    )
+    lines = [
+        line.strip() for line in args.link_args.read_text().splitlines() if line.strip()
+    ]
+    _require(bool(lines), "Cargo link arguments are empty")
+    tokens = shlex.split(lines[-1])
+    command = next((token for token in tokens if "=" not in token), "")
+    resolved = shutil.which(command) if command else None
+    _require(bool(resolved), "cannot resolve actual Cargo linker command")
+    driver = Path(resolved).resolve(strict=True)
+    _require(
+        driver.is_file() and not driver.is_symlink() and os.access(driver, os.X_OK),
+        "resolved Cargo linker is not a canonical executable",
+    )
+    return driver
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2334,6 +2434,8 @@ def main() -> int:
     cargo_parser = subparsers.add_parser("select-cargo-executable")
     cargo_parser.add_argument("--cargo-output", type=Path, required=True)
     cargo_parser.add_argument("--bench", required=True)
+    cargo_linker_parser = subparsers.add_parser("resolve-cargo-linker")
+    cargo_linker_parser.add_argument("--link-args", type=Path, required=True)
     args = parser.parse_args()
     try:
         if args.command == "validate":
@@ -2369,8 +2471,10 @@ def main() -> int:
             if not args.output.is_absolute():
                 raise LayoutError("--output must be absolute")
             _write_json_atomic(args.output, validate_linker_execution(args))
-        else:
+        elif args.command == "select-cargo-executable":
             print(select_cargo_executable(args))
+        else:
+            print(resolve_cargo_linker(args))
     except (KeyError, OSError, json.JSONDecodeError, LayoutError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

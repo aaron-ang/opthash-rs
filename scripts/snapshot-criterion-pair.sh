@@ -3,6 +3,13 @@
 
 set -euo pipefail
 
+CACHE_GATE_REALPATH_TOOL=/usr/bin/realpath
+CACHE_GATE_STAT_TOOL=/usr/bin/stat
+CACHE_GATE_SHA256_TOOL=/usr/bin/sha256sum
+for bootstrap_tool in "$CACHE_GATE_REALPATH_TOOL" "$CACHE_GATE_STAT_TOOL" "$CACHE_GATE_SHA256_TOOL"; do
+	[[ -f $bootstrap_tool && -x $bootstrap_tool && ! -L $bootstrap_tool ]] || { echo "error: trusted bootstrap tool is unavailable: $bootstrap_tool" >&2; exit 1; }
+done
+
 LOCK_DIR=${LOCK_DIR:-/tmp}
 original_command=$(printf '%q ' "$0" "$@")
 criterion_root= snapshot_root= arch= comparison= pair= target=
@@ -22,15 +29,15 @@ for name in runner_root criterion_root snapshot_root arch comparison pair target
 	[[ -n ${!name} ]] || { echo "error: --${name//_/-} is required" >&2; exit 2; }
 done
 [[ $runner_root == /* ]] || { echo "error: --runner-root must be absolute" >&2; exit 2; }
-runner_root=$(realpath -e -- "$runner_root")
+runner_root=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$runner_root")
 REPO_ROOT=$(git -C "$runner_root" rev-parse --show-toplevel 2>/dev/null) || { echo "error: runner root is not a Git worktree" >&2; exit 2; }
-REPO_ROOT=$(realpath -e -- "$REPO_ROOT")
+REPO_ROOT=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$REPO_ROOT")
 [[ $REPO_ROOT == "$runner_root" ]] || { echo "error: runner root must be exact Git worktree top level" >&2; exit 2; }
-snapshot_tool=$(realpath -e -- "${BASH_SOURCE[0]}")
+snapshot_tool=$("$CACHE_GATE_REALPATH_TOOL" -e -- "${BASH_SOURCE[0]}")
 HARNESS_ROOT=$(git -C "$(dirname "$snapshot_tool")" rev-parse --show-toplevel 2>/dev/null) || { echo "error: snapshot executor is not in a reviewed Git worktree" >&2; exit 2; }
-HARNESS_ROOT=$(realpath -e -- "$HARNESS_ROOT")
+HARNESS_ROOT=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$HARNESS_ROOT")
 [[ $snapshot_tool == "$HARNESS_ROOT"/* ]] || { echo "error: snapshot executor is outside reviewed harness root" >&2; exit 2; }
-elf_layout_tool=$(realpath -e -- "$HARNESS_ROOT/scripts/cache-gate-elf-layout.py")
+elf_layout_tool=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$HARNESS_ROOT/scripts/cache-gate-elf-layout.py")
 verify_reviewed_tool_blob() {
 	local tool=$1 relative expected actual
 	relative=${tool#"$HARNESS_ROOT/"}
@@ -58,6 +65,17 @@ if (Path(record.get("absolute_path", "")).resolve()!=Path(tool) or record.get("s
     raise SystemExit(f"error: manifested {name} is not the executing reviewed tool")
 PY
 }
+resolve_trusted_system_tool() {
+	local name=$1 path owner mode
+	path=$(type -P -- "$name") || { echo "error: required system tool is unavailable: $name" >&2; exit 1; }
+	path=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$path")
+	[[ $path == /* && -f $path && -x $path && ! -L $path ]] || { echo "error: invalid system tool: $name" >&2; exit 1; }
+	owner=$("$CACHE_GATE_STAT_TOOL" -Lc '%u' -- "$path")
+	mode=$("$CACHE_GATE_STAT_TOOL" -Lc '%a' -- "$path")
+	[[ $owner == 0 && $mode =~ ^[0-7]{3,4}$ ]] || { echo "error: untrusted system tool ownership/mode: $path" >&2; exit 1; }
+	(( (8#$mode & 8#022) == 0 )) || { echo "error: writable system tool is not trusted: $path" >&2; exit 1; }
+	printf '%s\n' "$path"
+}
 safe_component() {
 	[[ $2 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $2 != . && $2 != .. ]] || {
 		echo "error: unsafe component for $1: $2" >&2
@@ -69,25 +87,35 @@ safe_component anchor-run "$anchor_run"
 safe_component candidate-run "$candidate_run"
 [[ $arch == aarch64 || $arch == x86_64 ]] || { echo "error: unsupported architecture: $arch" >&2; exit 2; }
 [[ $pair =~ ^[1-9][0-9]*$ ]] || { echo "error: --pair must be positive" >&2; exit 2; }
-case "$target" in control | elastic_cache_gate | funnel_cache_gate | scaled_insert | all) ;; *) echo "error: unsupported target: $target" >&2; exit 2 ;; esac
+case "$target" in
+control | elastic_cache_gate | funnel_cache_gate) ;;
+scaled_insert | all)
+	echo "error: authenticated SAVE provenance is unavailable for target: $target" >&2
+	exit 2
+	;;
+*) echo "error: unsupported target: $target" >&2; exit 2 ;;
+esac
 
-criterion_root=$(realpath -- "$criterion_root")
+[[ $criterion_root == /* ]] || { echo "error: --criterion-root must be absolute" >&2; exit 2; }
+criterion_root=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$criterion_root")
 if [[ $snapshot_root == /* ]]; then
-	snapshot_root=$(realpath -m -- "$snapshot_root")
+	snapshot_root=$("$CACHE_GATE_REALPATH_TOOL" -m -- "$snapshot_root")
 else
-	snapshot_root=$(realpath -m -- "$REPO_ROOT/$snapshot_root")
+	snapshot_root=$("$CACHE_GATE_REALPATH_TOOL" -m -- "$REPO_ROOT/$snapshot_root")
 fi
-target_root=$(realpath -m -- "$REPO_ROOT/target")
+target_root=$("$CACHE_GATE_REALPATH_TOOL" -m -- "$REPO_ROOT/target")
 [[ $snapshot_root == "$target_root" || $snapshot_root == "$target_root"/* ]] || { echo "error: snapshot root must stay below runner root target" >&2; exit 2; }
 [[ -f $anchor_manifest && ! -L $anchor_manifest ]] || { echo "error: anchor manifest must be a regular non-symlink file" >&2; exit 2; }
 [[ -f $candidate_manifest && ! -L $candidate_manifest ]] || { echo "error: candidate manifest must be a regular non-symlink file" >&2; exit 2; }
-anchor_manifest=$(realpath -e -- "$anchor_manifest")
-candidate_manifest=$(realpath -e -- "$candidate_manifest")
+anchor_manifest=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$anchor_manifest")
+candidate_manifest=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$candidate_manifest")
 destination="$snapshot_root/$arch/$comparison/pair-$pair"
 [[ ! -e $destination ]] || { echo "error: destination already exists: $destination" >&2; exit 1; }
 mkdir -p -- "$(dirname "$destination")" "$LOCK_DIR"
 
-root_key=$(printf '%s' "$criterion_root" | sha256sum); root_key=${root_key%% *}
+root_key=$(printf '%s' "$criterion_root" | "$CACHE_GATE_SHA256_TOOL"); root_key=${root_key%% *}
+snapshot_flock_tool=$(resolve_trusted_system_tool flock)
+snapshot_flock_tool_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$snapshot_flock_tool"); snapshot_flock_tool_hash=${snapshot_flock_tool_hash%% *}
 root_lock="$LOCK_DIR/opthash-bench-root-$root_key.lock"
 if [[ -L $root_lock ]] || { [[ -e $root_lock ]] && [[ ! -d $root_lock && ! -f $root_lock ]]; }; then
 	echo "error: unsafe Criterion root lock $root_lock" >&2; exit 1
@@ -96,7 +124,7 @@ if [[ ! -e $root_lock ]] && ! mkdir -m 0755 "$root_lock" 2>/dev/null && [[ ! -e 
 	echo "error: cannot create Criterion root lock $root_lock" >&2; exit 1
 fi
 exec {criterion_lock_fd}<"$root_lock"
-flock "$criterion_lock_fd"
+"$snapshot_flock_tool" "$criterion_lock_fd"
 
 temporary=$(mktemp -d "$(dirname "$destination")/.pair-$pair.tmp.XXXXXX")
 stale=$(mktemp -d "$(dirname "$destination")/.pair-$pair.stale.XXXXXX")
@@ -238,6 +266,195 @@ esac
 case "$target" in control | elastic_cache_gate | funnel_cache_gate) expected_count=2 ;; scaled_insert) expected_count=12 ;; all) expected_count=72 ;; esac
 ((${#expected_ids[@]} == expected_count)) || { echo "error: internal expected-ID count mismatch" >&2; exit 1; }
 
+validate_saved_runs() {
+	local output=$1
+	python3 - "$output" "$anchor_manifest" "$candidate_manifest" "$anchor_run" \
+		"$candidate_run" "$target" "$criterion_root" "${expected_ids[@]}" <<'PY'
+import hashlib,json,os,subprocess,sys
+from pathlib import Path
+
+(output,anchor_manifest,candidate_manifest,anchor_run,candidate_run,target,
+ criterion_root,*expected_ids)=sys.argv[1:]
+criterion_root=Path(criterion_root).resolve(strict=True)
+schema={"schema","runner_root","commit","tree","empty_diff_assertion","mode",
+        "run","criterion_evidence_root","build_manifest","control_provenance","executable",
+        "producer_launcher","measurement","expected_benchmark_ids","results"}
+result_schema={"absolute_path","relative_path","sha256","size"}
+tool_schema={"absolute_path","sha256","git_blob","git_blob_sha256","reviewed_root",
+             "reviewed_commit","reviewed_tree"}
+measurement_schema={"core","launcher_prefix","numa_wrapper","pin_wrapper",
+                    "criterion_environment","system_tools","executable_argv","executed_argv"}
+system_tool_schema={"absolute_path","sha256"}
+def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def load_manifest(path):
+    raw=Path(path).read_bytes()
+    return json.loads(raw),hashlib.sha256(raw).hexdigest(),Path(path).resolve()
+def inventory(run):
+    records=[]
+    for benchmark in expected_ids:
+        benchmark_records=[]
+        baseline_path=criterion_root/benchmark/run
+        cursor=criterion_root
+        for part in baseline_path.relative_to(criterion_root).parts:
+            cursor=cursor/part
+            if cursor.is_symlink():
+                raise SystemExit(f"error: saved run baseline path contains symlink: {cursor}")
+        baseline=baseline_path.resolve()
+        try: baseline.relative_to(criterion_root)
+        except ValueError: raise SystemExit(f"error: saved run baseline escapes Criterion root: {baseline}")
+        if not baseline.is_dir():
+            raise SystemExit(f"error: missing saved run baseline: {baseline}")
+        for current,directories,files in os.walk(baseline,followlinks=False):
+            current_path=Path(current)
+            for name in directories:
+                path=current_path/name
+                if path.is_symlink(): raise SystemExit(f"error: saved run contains symlink: {path}")
+            for name in files:
+                path=current_path/name
+                if path.is_symlink() or not path.is_file():
+                    raise SystemExit(f"error: invalid saved run result: {path}")
+                relative=path.relative_to(criterion_root).as_posix()
+                benchmark_records.append({"absolute_path":str(path.resolve()),"relative_path":relative,
+                                          "sha256":digest(path),"size":path.stat().st_size})
+        if not any(item["relative_path"]==f"{benchmark}/{run}/estimates.json" for item in benchmark_records):
+            raise SystemExit(f"error: saved run lacks estimates.json: {benchmark}")
+        records.extend(sorted(benchmark_records,key=lambda item:item["relative_path"]))
+    return records
+def validate(label,manifest_path,run):
+    manifest,manifest_hash,canonical_manifest=load_manifest(manifest_path)
+    runner=Path(manifest["runner_root"]).resolve()
+    if target=="control":
+        evidence=runner/"target/cache-gate-runs/control"/f"{run}.json"
+        expected_mode="CONTROL"
+        expected_manifest=None
+        expected_control={"absolute_path":manifest["control"]["provenance_path"],
+                          "sha256":manifest["control"]["provenance_sha256"]}
+        expected_executable=manifest["control"]["binary"]
+    else:
+        evidence=(runner/"target/cache-gate-runs"/manifest["variant"]/
+                  f"{target}-{run}.json")
+        expected_mode=target
+        expected_manifest={"absolute_path":str(canonical_manifest),"sha256":manifest_hash}
+        expected_control=None
+        item=manifest["executables"][target]
+        expected_executable={"absolute_path":item["absolute_path"],"sha256":item["sha256"]}
+    runner_target=(runner/"target").resolve()
+    evidence_path=evidence
+    cursor=runner_target
+    try: relative_evidence=evidence_path.relative_to(runner_target)
+    except ValueError: raise SystemExit(f"error: {label} run evidence escapes runner target")
+    for part in relative_evidence.parts:
+        cursor=cursor/part
+        if cursor.is_symlink():
+            raise SystemExit(f"error: {label} run evidence path contains symlink")
+    evidence=evidence_path.resolve()
+    try: evidence.relative_to(runner_target)
+    except ValueError: raise SystemExit(f"error: {label} run evidence escapes runner target")
+    if not evidence.is_file():
+        raise SystemExit(f"error: missing {label} saved run evidence: {evidence}")
+    raw=evidence.read_bytes(); record=json.loads(raw)
+    if set(record)!=schema:
+        raise SystemExit(f"error: exact {label} saved run evidence schema mismatch")
+    if (record["schema"]!="opthash-criterion-run-v2" or
+        record["runner_root"]!=str(runner) or record["commit"]!=manifest["commit"] or
+        record["tree"]!=manifest["tree"] or record["empty_diff_assertion"] is not True or
+        record["mode"]!=expected_mode or record["run"]!=run or
+        record["criterion_evidence_root"]!=str(criterion_root) or
+        record["expected_benchmark_ids"]!=expected_ids):
+        raise SystemExit(f"error: {label} saved run identity mismatch")
+    if record["build_manifest"]!=expected_manifest:
+        raise SystemExit(f"error: {label} saved run build manifest mismatch")
+    if record["control_provenance"]!=expected_control:
+        raise SystemExit(f"error: {label} saved run control provenance mismatch")
+    if record["executable"]!=expected_executable:
+        raise SystemExit(f"error: {label} saved run executable mismatch")
+    if (set(record["producer_launcher"])!=tool_schema or
+        record["producer_launcher"]!=manifest["tools"]["launcher"]):
+        raise SystemExit(f"error: {label} saved run producer launcher mismatch")
+    measurement=record["measurement"]
+    if set(measurement)!=measurement_schema:
+        raise SystemExit(f"error: exact {label} saved run measurement schema mismatch")
+    array_names=("launcher_prefix","numa_wrapper","pin_wrapper",
+                 "criterion_environment","executable_argv","executed_argv")
+    if any(not isinstance(measurement[name],list) or
+           any(not isinstance(value,str) for value in measurement[name])
+           for name in array_names):
+        raise SystemExit(f"error: invalid {label} saved run measurement argv")
+    executable_argv=measurement["executable_argv"]
+    if (len(executable_argv)<4 or executable_argv[:4]!=[
+            expected_executable["absolute_path"],"--bench","--save-baseline",run]):
+        raise SystemExit(f"error: {label} saved run measurement executable argv mismatch")
+    criterion_environment=measurement["criterion_environment"]
+    if (not criterion_environment or not Path(criterion_environment[0]).is_absolute() or
+        Path(criterion_environment[0]).name!="env"):
+        raise SystemExit(f"error: {label} saved run Criterion wrapper mismatch")
+    valid_criterion_environments=(
+        [criterion_environment[0],"-u","CRITERION_HOME"],
+        [criterion_environment[0],f"CRITERION_HOME={criterion_root}"],
+    )
+    if criterion_environment not in valid_criterion_environments:
+        raise SystemExit(f"error: {label} saved run Criterion environment mismatch")
+    core=measurement["core"]
+    pin=measurement["pin_wrapper"]
+    if (not isinstance(core,str) or not core.isdigit() or len(pin)!=5 or
+        not Path(pin[0]).is_absolute() or Path(pin[0]).name!="taskset" or
+        pin[1:3]!=["-c",core] or not Path(pin[3]).is_absolute() or
+        Path(pin[3]).name!="setarch" or pin[4]!="-R"):
+        raise SystemExit(f"error: {label} saved run pin/core mismatch")
+    numa=measurement["numa_wrapper"]
+    if numa and (len(numa)!=2 or not Path(numa[0]).is_absolute() or
+                 Path(numa[0]).name!="numactl" or not numa[1].startswith("--membind=")):
+        raise SystemExit(f"error: {label} saved run NUMA wrapper mismatch")
+    system_tools=measurement["system_tools"]
+    if (not isinstance(system_tools,list) or
+        any(set(item)!=system_tool_schema for item in system_tools)):
+        raise SystemExit(f"error: exact {label} saved run system tool schema mismatch")
+    used_system_tools={value for name in ("launcher_prefix","numa_wrapper","pin_wrapper",
+                                           "criterion_environment")
+                       for value in measurement[name] if value.startswith("/")}
+    recorded_system_tools={item["absolute_path"] for item in system_tools}
+    setup_system_tools={path for path in recorded_system_tools if Path(path).name=="flock"}
+    if (len(recorded_system_tools)!=len(system_tools) or len(setup_system_tools)!=1 or
+        recorded_system_tools!=used_system_tools|setup_system_tools):
+        raise SystemExit(f"error: {label} saved run system tool set mismatch")
+    for item in system_tools:
+        path=Path(item["absolute_path"])
+        if (not path.is_absolute() or path.is_symlink() or not path.is_file() or
+            str(path.resolve())!=item["absolute_path"] or path.stat().st_uid!=0 or
+            path.stat().st_mode & 0o022 or digest(path)!=item["sha256"]):
+            raise SystemExit(f"error: {label} saved run system tool mismatch: {path}")
+    executed=(measurement["launcher_prefix"]+numa+measurement["pin_wrapper"]+
+              measurement["criterion_environment"]+executable_argv)
+    if measurement["executed_argv"]!=executed:
+        raise SystemExit(f"error: {label} saved run executed argv mismatch")
+    if any(set(item)!=result_schema for item in record["results"]):
+        raise SystemExit(f"error: exact {label} saved run result schema mismatch")
+    if record["results"]!=inventory(run):
+        raise SystemExit(f"error: {label} saved run result inventory mismatch")
+    return {"absolute_path":str(evidence),"sha256":hashlib.sha256(raw).hexdigest(),
+            "record":record}
+payload={"anchor":validate("anchor",anchor_manifest,anchor_run),
+         "candidate":validate("candidate",candidate_manifest,candidate_run)}
+def measurement_invariant(record):
+    measurement=record["measurement"]
+    return {
+        "core":measurement["core"],
+        "launcher_prefix":measurement["launcher_prefix"],
+        "numa_wrapper":measurement["numa_wrapper"],
+        "pin_wrapper":measurement["pin_wrapper"],
+        "criterion_environment":measurement["criterion_environment"],
+        "system_tools":measurement["system_tools"],
+        "forwarded_argv":measurement["executable_argv"][4:],
+    }
+if measurement_invariant(payload["anchor"]["record"])!=measurement_invariant(payload["candidate"]["record"]):
+    raise SystemExit("error: saved run measurement settings differ")
+Path(output).write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n")
+PY
+}
+
+run_validation="$temporary/validated-runs.json"
+validate_saved_runs "$run_validation"
+
 assert_contained() {
 	python3 - "$1" "$2" <<'PY'
 import os
@@ -273,10 +490,12 @@ verify_manifest_tool_binding "$candidate_manifest" elf_layout "$elf_layout_tool"
 "$elf_layout_tool" validate-manifest --manifest "$candidate_manifest"
 expected_anchor_manifest_hash=$(jq -er '.manifest_hashes.anchor' "$validation")
 expected_candidate_manifest_hash=$(jq -er '.manifest_hashes.candidate' "$validation")
-actual_anchor_manifest_hash=$(sha256sum -- "$anchor_manifest"); actual_anchor_manifest_hash=${actual_anchor_manifest_hash%% *}
-actual_candidate_manifest_hash=$(sha256sum -- "$candidate_manifest"); actual_candidate_manifest_hash=${actual_candidate_manifest_hash%% *}
+actual_anchor_manifest_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$anchor_manifest"); actual_anchor_manifest_hash=${actual_anchor_manifest_hash%% *}
+actual_candidate_manifest_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$candidate_manifest"); actual_candidate_manifest_hash=${actual_candidate_manifest_hash%% *}
 [[ $actual_anchor_manifest_hash == "$expected_anchor_manifest_hash" ]] || { echo "error: anchor manifest changed before execution" >&2; exit 1; }
 [[ $actual_candidate_manifest_hash == "$expected_candidate_manifest_hash" ]] || { echo "error: candidate manifest changed before execution" >&2; exit 1; }
+validate_saved_runs "$temporary/validated-runs.pre-exec.json"
+cmp --silent "$run_validation" "$temporary/validated-runs.pre-exec.json" || { echo "error: saved run evidence changed before execution" >&2; exit 1; }
 marker="$temporary/comparison-start.marker"
 touch "$marker"
 start_ns=$(python3 -c 'import time; print(time.time_ns())')
@@ -288,7 +507,7 @@ comparison_commands="$temporary/comparison-commands.json"
 case "$target" in
 control)
 	control_hash=$(jq -er '.control.binary.sha256' "$validation")
-	actual_control_hash=$(sha256sum -- "$control_binary"); actual_control_hash=${actual_control_hash%% *}
+	actual_control_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$control_binary"); actual_control_hash=${actual_control_hash%% *}
 	[[ $actual_control_hash == "$control_hash" ]] || { echo "error: control binary hash mismatch immediately before execution" >&2; exit 1; }
 	comparison_command=("$control_binary" --bench "${criterion_args[@]}")
 	CRITERION_HOME="$criterion_root" "${comparison_command[@]}" >"$comparison_stdout" 2>"$comparison_stderr"
@@ -300,7 +519,7 @@ PY
 elastic_cache_gate | funnel_cache_gate)
 	stable_binary=$(jq -er --arg target "$target" '.candidate_executables[$target].absolute_path' "$validation")
 	stable_hash=$(jq -er --arg target "$target" '.candidate_executables[$target].sha256' "$validation")
-	actual_stable_hash=$(sha256sum -- "$stable_binary"); actual_stable_hash=${actual_stable_hash%% *}
+	actual_stable_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$stable_binary"); actual_stable_hash=${actual_stable_hash%% *}
 	[[ $actual_stable_hash == "$stable_hash" ]] || { echo "error: candidate stable binary hash mismatch" >&2; exit 1; }
 	comparison_command=("$stable_binary" --bench "${criterion_args[@]}")
 	CRITERION_HOME="$criterion_root" "${comparison_command[@]}" >"$comparison_stdout" 2>"$comparison_stderr"
@@ -328,6 +547,8 @@ PY
 esac
 end_ns=$(python3 -c 'import time; print(time.time_ns())')
 end_iso=$(date --iso-8601=ns)
+validate_saved_runs "$temporary/validated-runs.post-exec.json"
+cmp --silent "$run_validation" "$temporary/validated-runs.post-exec.json" || { echo "error: saved run evidence changed during execution" >&2; exit 1; }
 
 for benchmark in "${expected_ids[@]}"; do
 	change="$criterion_root/$benchmark/change/estimates.json"
@@ -358,17 +579,29 @@ copy_verified() {
 	[[ -f $source && ! -L $source ]] || { echo "error: invalid copy source: $source" >&2; exit 1; }
 	[[ -z $source_root ]] || assert_contained "$source_root" "$source"
 	assert_contained "$temporary" "$output"
-	before=$(sha256sum -- "$source"); before=${before%% *}
+	before=$("$CACHE_GATE_SHA256_TOOL" -- "$source"); before=${before%% *}
 	[[ -z $expected || $before == "$expected" ]] || { echo "error: authenticated source hash mismatch: $source" >&2; exit 1; }
 	mkdir -p -- "$(dirname "$output")"; cp --preserve=mode,timestamps -- "$source" "$output"
-	after=$(sha256sum -- "$source"); after=${after%% *}; copied=$(sha256sum -- "$output"); copied=${copied%% *}
+	after=$("$CACHE_GATE_SHA256_TOOL" -- "$source"); after=${after%% *}; copied=$("$CACHE_GATE_SHA256_TOOL" -- "$output"); copied=${copied%% *}
 	[[ $before == "$after" && $before == "$copied" ]] || { echo "error: hash changed while copying $source" >&2; exit 1; }
 }
 for benchmark in "${expected_ids[@]}"; do
 	copy_verified "$criterion_root/$benchmark/change/estimates.json" "$temporary/change/$benchmark/change/estimates.json" "$criterion_root"
-	copy_verified "$criterion_root/$benchmark/$anchor_run/estimates.json" "$temporary/absolute/anchor/$benchmark/estimates.json" "$criterion_root"
-	copy_verified "$criterion_root/$benchmark/$candidate_run/estimates.json" "$temporary/absolute/candidate/$benchmark/estimates.json" "$criterion_root"
 done
+for label in anchor candidate; do
+	while IFS=$'\t' read -r source relative expected; do
+		case "$label" in
+		anchor) run=$anchor_run ;;
+		candidate) run=$candidate_run ;;
+		esac
+		copy_verified "$source" "$temporary/absolute/$label/${relative%/$run/*}/${relative#*/$run/}" "$criterion_root" "$expected"
+	done < <(jq -r --arg label "$label" '.[$label].record.results[] | [.absolute_path,.relative_path,.sha256] | @tsv' "$run_validation")
+	run_source=$(jq -er --arg label "$label" '.[$label].absolute_path' "$run_validation")
+	run_hash=$(jq -er --arg label "$label" '.[$label].sha256' "$run_validation")
+	copy_verified "$run_source" "$temporary/run-evidence/$label.json" "" "$run_hash"
+done
+validate_saved_runs "$temporary/validated-runs.post-copy.json"
+cmp --silent "$run_validation" "$temporary/validated-runs.post-copy.json" || { echo "error: saved run evidence changed during copy" >&2; exit 1; }
 
 copy_bundle() {
 	local label=$1 manifest=$2 expected_manifest_hash=$3 copied_manifest="$temporary/build/$1-manifest.json"
@@ -384,35 +617,36 @@ for name,item in sorted(m["executables"].items()): print(f'{name}\t{item["link_m
 PY
 	)
 }
-post_anchor_manifest_hash=$(sha256sum -- "$anchor_manifest"); post_anchor_manifest_hash=${post_anchor_manifest_hash%% *}
-post_candidate_manifest_hash=$(sha256sum -- "$candidate_manifest"); post_candidate_manifest_hash=${post_candidate_manifest_hash%% *}
+post_anchor_manifest_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$anchor_manifest"); post_anchor_manifest_hash=${post_anchor_manifest_hash%% *}
+post_candidate_manifest_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$candidate_manifest"); post_candidate_manifest_hash=${post_candidate_manifest_hash%% *}
 [[ $post_anchor_manifest_hash == "$expected_anchor_manifest_hash" ]] || { echo "error: anchor manifest changed during execution" >&2; exit 1; }
 [[ $post_candidate_manifest_hash == "$expected_candidate_manifest_hash" ]] || { echo "error: candidate manifest changed during execution" >&2; exit 1; }
 copy_bundle anchor "$anchor_manifest" "$expected_anchor_manifest_hash"
 copy_bundle candidate "$candidate_manifest" "$expected_candidate_manifest_hash"
 
-python3 - "$temporary/pair-manifest.json" "$temporary/build/anchor-manifest.json" "$temporary/build/candidate-manifest.json" "$validation" "$comparison_commands" "$original_command" "$start_ns" "$end_ns" "$start_iso" "$end_iso" "$target" "$anchor_run" "$candidate_run" "$REPO_ROOT" "$snapshot_tool" <<'PY'
+python3 - "$temporary/pair-manifest.json" "$temporary/build/anchor-manifest.json" "$temporary/build/candidate-manifest.json" "$validation" "$run_validation" "$comparison_commands" "$original_command" "$start_ns" "$end_ns" "$start_iso" "$end_iso" "$target" "$anchor_run" "$candidate_run" "$REPO_ROOT" "$snapshot_tool" "$snapshot_flock_tool" "$snapshot_flock_tool_hash" <<'PY'
 import json,platform,sys
-output, anchor_path, candidate_path, validation_path, commands_path, snapshot_command, start_ns, end_ns, start_iso, end_iso, target, anchor_run, candidate_run, runner_root, executor = sys.argv[1:]
-anchor=json.load(open(anchor_path)); candidate=json.load(open(candidate_path)); validation=json.load(open(validation_path)); commands=json.load(open(commands_path))
+output, anchor_path, candidate_path, validation_path, run_validation_path, commands_path, snapshot_command, start_ns, end_ns, start_iso, end_iso, target, anchor_run, candidate_run, runner_root, executor, flock_tool, flock_hash = sys.argv[1:]
+anchor=json.load(open(anchor_path)); candidate=json.load(open(candidate_path)); validation=json.load(open(validation_path)); run_validation=json.load(open(run_validation_path)); commands=json.load(open(commands_path))
 payload={
  "target":target, "host":platform.node(), "snapshot_command":snapshot_command.rstrip(),
  "comparison_command":commands[0], "comparison_commands":commands,
  "offline_execution_count":1,"runner_root":runner_root,
  "executor":{"absolute_path":executor,"sha256":validation["tools"]["snapshot"]["sha256"]},
+ "system_tools":{"flock":{"absolute_path":flock_tool,"sha256":flock_hash}},
  "comparison_started_ns":int(start_ns), "comparison_finished_ns":int(end_ns),
  "comparison_started_at":start_iso, "comparison_finished_at":end_iso,
  "control":validation["control"],
- "anchor":{"run":anchor_run,"commit":anchor["commit"],"tree":anchor["tree"],"manifest_sha256":validation["manifest_hashes"]["anchor"],"executable_hashes":{k:v["sha256"] for k,v in anchor["executables"].items()}},
- "candidate":{"run":candidate_run,"commit":candidate["commit"],"tree":candidate["tree"],"manifest_sha256":validation["manifest_hashes"]["candidate"],"executable_hashes":{k:v["sha256"] for k,v in candidate["executables"].items()}},
+ "anchor":{"run":anchor_run,"commit":anchor["commit"],"tree":anchor["tree"],"manifest_sha256":validation["manifest_hashes"]["anchor"],"executable_hashes":{k:v["sha256"] for k,v in anchor["executables"].items()},"run_evidence_sha256":run_validation["anchor"]["sha256"]},
+ "candidate":{"run":candidate_run,"commit":candidate["commit"],"tree":candidate["tree"],"manifest_sha256":validation["manifest_hashes"]["candidate"],"executable_hashes":{k:v["sha256"] for k,v in candidate["executables"].items()},"run_evidence_sha256":run_validation["candidate"]["sha256"]},
 }
 json.dump(payload,open(output,"w"),indent=2,sort_keys=True); open(output,"a").write("\n")
 PY
-rm -f "$marker" "$validation" "$comparison_commands"
+rm -f "$marker" "$validation" "$run_validation" "$temporary/validated-runs.pre-exec.json" "$temporary/validated-runs.post-exec.json" "$temporary/validated-runs.post-copy.json" "$comparison_commands"
 (
 	cd "$temporary"
-	find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS
-	sha256sum -c SHA256SUMS
+	find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 "$CACHE_GATE_SHA256_TOOL" >SHA256SUMS
+	"$CACHE_GATE_SHA256_TOOL" -c SHA256SUMS
 )
 python3 - "$temporary" <<'PY'
 import os,sys

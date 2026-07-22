@@ -3,25 +3,32 @@
 
 set -euo pipefail
 
+CACHE_GATE_REALPATH_TOOL=/usr/bin/realpath
+CACHE_GATE_STAT_TOOL=/usr/bin/stat
+CACHE_GATE_SHA256_TOOL=/usr/bin/sha256sum
+for bootstrap_tool in "$CACHE_GATE_REALPATH_TOOL" "$CACHE_GATE_STAT_TOOL" "$CACHE_GATE_SHA256_TOOL"; do
+	[[ -f $bootstrap_tool && -x $bootstrap_tool && ! -L $bootstrap_tool ]] || { echo "error: trusted bootstrap tool is unavailable: $bootstrap_tool" >&2; exit 1; }
+done
+
 [[ $# -ge 2 && $1 == --runner-root ]] || { echo "error: --runner-root ABS is required" >&2; exit 2; }
 runner_root=$2
 shift 2
 [[ $runner_root == /* ]] || { echo "error: runner root must be absolute" >&2; exit 2; }
-runner_root=$(realpath -e -- "$runner_root")
+runner_root=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$runner_root")
 REPO_ROOT=$(git -C "$runner_root" rev-parse --show-toplevel 2>/dev/null) || { echo "error: runner root is not a Git worktree" >&2; exit 2; }
-REPO_ROOT=$(realpath -e -- "$REPO_ROOT")
+REPO_ROOT=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$REPO_ROOT")
 [[ $REPO_ROOT == "$runner_root" ]] || { echo "error: runner root must be exact Git worktree top level" >&2; exit 2; }
 cd "$REPO_ROOT"
-CACHE_GATE_LAUNCHER_PATH=$(realpath -e -- "${BASH_SOURCE[0]}")
+CACHE_GATE_LAUNCHER_PATH=$("$CACHE_GATE_REALPATH_TOOL" -e -- "${BASH_SOURCE[0]}")
 HARNESS_ROOT=$(git -C "$(dirname "$CACHE_GATE_LAUNCHER_PATH")" rev-parse --show-toplevel 2>/dev/null) || { echo "error: cache-gate launcher is not in a reviewed Git worktree" >&2; exit 2; }
-HARNESS_ROOT=$(realpath -e -- "$HARNESS_ROOT")
+HARNESS_ROOT=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$HARNESS_ROOT")
 [[ $CACHE_GATE_LAUNCHER_PATH == "$HARNESS_ROOT/"* ]] || { echo "error: cache-gate launcher is outside reviewed harness root" >&2; exit 2; }
-CACHE_GATE_ELF_LAYOUT_TOOL=$(realpath -e -- "$HARNESS_ROOT/scripts/cache-gate-elf-layout.py")
-CACHE_GATE_SNAPSHOT_TOOL=$(realpath -e -- "$HARNESS_ROOT/scripts/snapshot-criterion-pair.sh")
-CACHE_GATE_PERF_TOOL=$(realpath -e -- "$HARNESS_ROOT/scripts/cache-gate-perf.sh")
-CACHE_GATE_PERF_SUPPORT_TOOL=$(realpath -e -- "$HARNESS_ROOT/scripts/cache-gate-perf-support.py")
-CACHE_GATE_EXTRACTOR_TOOL=$(realpath -e -- "$HARNESS_ROOT/scripts/extract-hot-symbols.py")
-CACHE_GATE_LINK_WRAPPER=$(realpath -e -- "$HARNESS_ROOT/scripts/cache-gate-link-wrapper.py")
+CACHE_GATE_ELF_LAYOUT_TOOL=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$HARNESS_ROOT/scripts/cache-gate-elf-layout.py")
+CACHE_GATE_SNAPSHOT_TOOL=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$HARNESS_ROOT/scripts/snapshot-criterion-pair.sh")
+CACHE_GATE_PERF_TOOL=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$HARNESS_ROOT/scripts/cache-gate-perf.sh")
+CACHE_GATE_PERF_SUPPORT_TOOL=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$HARNESS_ROOT/scripts/cache-gate-perf-support.py")
+CACHE_GATE_EXTRACTOR_TOOL=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$HARNESS_ROOT/scripts/extract-hot-symbols.py")
+CACHE_GATE_LINK_WRAPPER=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$HARNESS_ROOT/scripts/cache-gate-link-wrapper.py")
 for tool in "$CACHE_GATE_LAUNCHER_PATH" "$CACHE_GATE_ELF_LAYOUT_TOOL" "$CACHE_GATE_SNAPSHOT_TOOL" "$CACHE_GATE_PERF_TOOL" "$CACHE_GATE_PERF_SUPPORT_TOOL" "$CACHE_GATE_EXTRACTOR_TOOL" "$CACHE_GATE_LINK_WRAPPER"; do
 	[[ $tool == /* && -f $tool && ! -L $tool ]] || { echo "error: invalid authenticated harness tool: $tool" >&2; exit 2; }
 done
@@ -53,12 +60,19 @@ if (Path(record.get("absolute_path", "")).resolve()!=Path(tool) or record.get("s
 PY
 }
 LOCK_DIR=${LOCK_DIR:-/tmp}
+if [[ -n ${OPTHASH_CRITERION_ROOT:-} && $OPTHASH_CRITERION_ROOT != /* ]]; then
+	echo "error: OPTHASH_CRITERION_ROOT must be absolute" >&2
+	exit 2
+fi
 CRITERION_ROOT=${OPTHASH_CRITERION_ROOT:-$REPO_ROOT/target/criterion}
+CRITERION_ROOT=$("$CACHE_GATE_REALPATH_TOOL" -m -- "$CRITERION_ROOT")
 SAVE=${SAVE:-}
 LOAD=${LOAD:-}
 BASELINE=${BASELINE:-}
 IS_LINUX=0
-[[ $(uname) == Linux ]] && IS_LINUX=1
+kernel_ostype=
+[[ ! -r /proc/sys/kernel/ostype ]] || IFS= read -r kernel_ostype </proc/sys/kernel/ostype
+[[ $kernel_ostype == Linux ]] && IS_LINUX=1
 
 mode_count=0
 for name in BUILD_CONTROL CONTROL ELASTIC FUNNEL MANIFEST; do
@@ -79,7 +93,7 @@ if [[ ${ELASTIC:-0} == 1 || ${FUNNEL:-0} == 1 ]]; then
 	[[ -n ${CACHE_GATE_MANIFEST:-} ]] || { echo "error: CACHE_GATE_MANIFEST is required for stable timing" >&2; exit 2; }
 	[[ $CACHE_GATE_MANIFEST == /* ]] || { echo "error: CACHE_GATE_MANIFEST must be absolute" >&2; exit 2; }
 	[[ -f $CACHE_GATE_MANIFEST && ! -L $CACHE_GATE_MANIFEST ]] || { echo "error: CACHE_GATE_MANIFEST must be a regular non-symlink file" >&2; exit 2; }
-	CACHE_GATE_MANIFEST=$(realpath -e -- "$CACHE_GATE_MANIFEST")
+	CACHE_GATE_MANIFEST=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$CACHE_GATE_MANIFEST")
 	[[ $CACHE_GATE_MANIFEST == "$REPO_ROOT/target/"* ]] || { echo "error: manifest is outside runner root target" >&2; exit 2; }
 	verify_manifest_tool_binding "$CACHE_GATE_MANIFEST" launcher "$CACHE_GATE_LAUNCHER_PATH"
 	verify_manifest_tool_binding "$CACHE_GATE_MANIFEST" elf_layout "$CACHE_GATE_ELF_LAYOUT_TOOL"
@@ -142,10 +156,10 @@ require_control_binary() {
 	[[ -n ${CACHE_GATE_CONTROL_BIN:-} ]] || { echo "error: CACHE_GATE_CONTROL_BIN is required" >&2; exit 2; }
 	[[ $CACHE_GATE_CONTROL_BIN == /* ]] || { echo "error: CACHE_GATE_CONTROL_BIN must be absolute" >&2; exit 2; }
 	[[ -x $CACHE_GATE_CONTROL_BIN && -f $CACHE_GATE_CONTROL_BIN ]] || { echo "error: control binary is not executable: $CACHE_GATE_CONTROL_BIN" >&2; exit 2; }
-	CACHE_GATE_CONTROL_BIN=$(realpath -- "$CACHE_GATE_CONTROL_BIN")
+	CACHE_GATE_CONTROL_BIN=$("$CACHE_GATE_REALPATH_TOOL" -- "$CACHE_GATE_CONTROL_BIN")
 	CACHE_GATE_CONTROL_PROVENANCE=${CACHE_GATE_CONTROL_PROVENANCE:-$CACHE_GATE_CONTROL_BIN.provenance.json}
 	[[ -f $CACHE_GATE_CONTROL_PROVENANCE && ! -L $CACHE_GATE_CONTROL_PROVENANCE ]] || { echo "error: control provenance is missing" >&2; exit 2; }
-	CACHE_GATE_CONTROL_PROVENANCE=$(realpath -- "$CACHE_GATE_CONTROL_PROVENANCE")
+	CACHE_GATE_CONTROL_PROVENANCE=$("$CACHE_GATE_REALPATH_TOOL" -- "$CACHE_GATE_CONTROL_PROVENANCE")
 	python3 - "$CACHE_GATE_CONTROL_BIN" "$CACHE_GATE_CONTROL_PROVENANCE" "$REPO_ROOT" <<'PY'
 import hashlib,json,subprocess,sys
 from pathlib import Path
@@ -177,7 +191,7 @@ if [[ ${BUILD_CONTROL:-0} == 1 ]]; then
 	else
 		cargo build --release --locked --manifest-path tools/cache-gate-control/Cargo.toml
 	fi
-	control_bin=$(realpath -- tools/cache-gate-control/target/release/opthash-cache-gate-control)
+	control_bin=$("$CACHE_GATE_REALPATH_TOOL" -- tools/cache-gate-control/target/release/opthash-cache-gate-control)
 	[[ -x $control_bin ]] || { echo "error: control build produced no executable" >&2; exit 1; }
 	control_provenance="$control_bin.provenance.json"
 	python3 - "$control_provenance" "$control_bin" "$REPO_ROOT" "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" <<'PY'
@@ -214,6 +228,7 @@ fi
 
 criterion_args=()
 if [[ ${CONTROL:-0} == 1 || ${ELASTIC:-0} == 1 || ${FUNNEL:-0} == 1 ]]; then
+	[[ -z $SAVE || ( -z $LOAD && -z $BASELINE ) ]] || { echo "error: SAVE cannot be combined with LOAD or BASELINE" >&2; exit 2; }
 	if [[ -n $LOAD ]]; then
 		criterion_args=(--load-baseline "$LOAD" --baseline "${BASELINE:-ref}")
 	elif [[ -n $BASELINE ]]; then
@@ -232,7 +247,7 @@ fi
 
 claim_directory_lock() {
 	local name=$1 key_source=$2 lock key
-	if [[ $name == bench-root ]]; then key=$(printf '%s' "$key_source" | sha256sum); key=${key%% *}; lock="$LOCK_DIR/opthash-bench-root-$key.lock"; else lock="$LOCK_DIR/opthash-bench-core-$key_source.lock"; fi
+	if [[ $name == bench-root ]]; then key=$(printf '%s' "$key_source" | "$CACHE_GATE_SHA256_TOOL"); key=${key%% *}; lock="$LOCK_DIR/opthash-bench-root-$key.lock"; else lock="$LOCK_DIR/opthash-bench-core-$key_source.lock"; fi
 	mkdir -p "$LOCK_DIR" 2>/dev/null || true
 	if [[ -L $lock ]] || { [[ -e $lock ]] && [[ ! -d $lock && ! -f $lock ]]; }; then
 		echo "error: unsafe lock: $lock" >&2
@@ -243,7 +258,7 @@ claim_directory_lock() {
 		exit 1
 	fi
 	exec {lock_fd}<"$lock"
-	flock "$lock_fd"
+	"${CACHE_GATE_FLOCK_TOOL:?}" "$lock_fd"
 }
 
 detect_perf_core() {
@@ -265,81 +280,344 @@ detect_perf_core() {
 	return 0
 }
 
+resolve_trusted_system_tool() {
+	local name=$1 path owner mode
+	path=$(type -P -- "$name") || { echo "error: required system tool is unavailable: $name" >&2; exit 1; }
+	path=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$path")
+	[[ $path == /* && -f $path && -x $path && ! -L $path ]] || { echo "error: invalid system tool: $name" >&2; exit 1; }
+	owner=$("$CACHE_GATE_STAT_TOOL" -Lc '%u' -- "$path")
+	mode=$("$CACHE_GATE_STAT_TOOL" -Lc '%a' -- "$path")
+	[[ $owner == 0 && $mode =~ ^[0-7]{3,4}$ ]] || { echo "error: untrusted system tool ownership/mode: $path" >&2; exit 1; }
+	(( (8#$mode & 8#022) == 0 )) || { echo "error: writable system tool is not trusted: $path" >&2; exit 1; }
+	printf '%s\n' "$path"
+}
+
 prepare_launcher() {
+	local env_tool flock_tool taskset_tool setarch_tool numactl_tool nice_tool prlimit_tool sudo_tool chrt_tool node_dir candidate_node_dir
 	launcher=()
 	numa_wrapper=()
 	pin_wrapper=()
-	criterion_env=(env -u CRITERION_HOME)
-	if [[ -n ${OPTHASH_CRITERION_ROOT:-} ]]; then criterion_env=(env "CRITERION_HOME=$CRITERION_ROOT"); fi
+	measurement_system_tools=()
+	env_tool=$(resolve_trusted_system_tool env)
+	measurement_system_tools+=("$env_tool")
+	criterion_env=("$env_tool" -u CRITERION_HOME)
+	if [[ -n ${OPTHASH_CRITERION_ROOT:-} ]]; then criterion_env=("$env_tool" "CRITERION_HOME=$CRITERION_ROOT"); fi
 	if ((IS_LINUX)); then
 		[[ -n ${CORE:-} ]] || detect_perf_core
 		[[ $CORE =~ ^[0-9]+$ ]] || { echo "error: CORE must be one CPU number" >&2; exit 2; }
-		claim_directory_lock bench-root "$(realpath -m -- "$CRITERION_ROOT")"
+		flock_tool=$(resolve_trusted_system_tool flock)
+		CACHE_GATE_FLOCK_TOOL=$flock_tool
+		measurement_system_tools+=("$flock_tool")
+		claim_directory_lock bench-root "$("$CACHE_GATE_REALPATH_TOOL" -m -- "$CRITERION_ROOT")"
 		claim_directory_lock bench-core "$CORE"
-		pin_wrapper=(taskset -c "$CORE" setarch -R)
-		if command -v numactl >/dev/null 2>&1; then
-			node_count=$(find /sys/devices/system/node -maxdepth 1 -name 'node[0-9]*' -type d 2>/dev/null | wc -l)
+		taskset_tool=$(resolve_trusted_system_tool taskset)
+		setarch_tool=$(resolve_trusted_system_tool setarch)
+		measurement_system_tools+=("$taskset_tool" "$setarch_tool")
+		pin_wrapper=("$taskset_tool" -c "$CORE" "$setarch_tool" -R)
+		if type -P numactl >/dev/null 2>&1; then
+			numactl_tool=$(resolve_trusted_system_tool numactl)
+			node_count=0
+			for node_dir in /sys/devices/system/node/node[0-9]*; do
+				[[ -d $node_dir ]] && node_count=$((node_count + 1))
+			done
 			if ((node_count > 1)); then
-				node_dir=$(find "/sys/devices/system/cpu/cpu$CORE" -maxdepth 1 -name 'node[0-9]*' 2>/dev/null | head -1)
-				[[ -z $node_dir ]] || numa_wrapper=(numactl --membind="${node_dir##*/node}")
+				node_dir=
+				for candidate_node_dir in "/sys/devices/system/cpu/cpu$CORE"/node[0-9]*; do
+					[[ -d $candidate_node_dir ]] || continue
+					node_dir=$candidate_node_dir
+					break
+				done
+				if [[ -n $node_dir ]]; then
+					measurement_system_tools+=("$numactl_tool")
+					numa_wrapper=("$numactl_tool" --membind="${node_dir##*/node}")
+				fi
 			fi
 		fi
 		if [[ $EUID -eq 0 ]]; then
-			command -v nice >/dev/null 2>&1 && launcher+=(nice -n -20)
-			command -v prlimit >/dev/null 2>&1 && launcher+=(prlimit --memlock=unlimited --)
-			if [[ -n ${SUDO_USER:-} ]]; then
-				launcher+=(sudo -u "$SUDO_USER" --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME --)
+			if type -P nice >/dev/null 2>&1; then
+				nice_tool=$(resolve_trusted_system_tool nice)
+				measurement_system_tools+=("$nice_tool")
+				launcher+=("$nice_tool" -n -20)
 			fi
-		elif command -v chrt >/dev/null 2>&1; then
-			launcher=(chrt -b 0)
+			if type -P prlimit >/dev/null 2>&1; then
+				prlimit_tool=$(resolve_trusted_system_tool prlimit)
+				measurement_system_tools+=("$prlimit_tool")
+				launcher+=("$prlimit_tool" --memlock=unlimited --)
+			fi
+			if [[ -n ${SUDO_USER:-} ]]; then
+				sudo_tool=$(resolve_trusted_system_tool sudo)
+				measurement_system_tools+=("$sudo_tool")
+				launcher+=("$sudo_tool" -u "$SUDO_USER" --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME --)
+			fi
+		elif type -P chrt >/dev/null 2>&1; then
+			chrt_tool=$(resolve_trusted_system_tool chrt)
+			measurement_system_tools+=("$chrt_tool")
+			launcher=("$chrt_tool" -b 0)
 		fi
 	fi
 	return 0
 }
 
+write_save_evidence() {
+	local output=$1 mode=$2 manifest=$3 manifest_hash=$4 control_provenance=$5 control_provenance_hash=$6 binary=$7 binary_hash=$8
+	shift 8
+	python3 - "$output" "$REPO_ROOT" "$runner_head" "$runner_tree" "$mode" "$SAVE" \
+		"$CRITERION_ROOT" "$manifest" "$manifest_hash" "$control_provenance" \
+		"$control_provenance_hash" "$binary" "$binary_hash" "$@" <<'PY'
+import hashlib,json,os,subprocess,sys
+from pathlib import Path
+
+(output,root,commit,tree,mode,run,criterion_root,manifest,manifest_hash,
+ control_provenance,control_provenance_hash,binary,binary_hash,producer_launcher,
+ harness_root,core,*arguments)=sys.argv[1:]
+def take(values):
+    if not values: raise SystemExit("error: truncated SAVE measurement metadata")
+    try: count=int(values.pop(0))
+    except ValueError: raise SystemExit("error: invalid SAVE measurement count")
+    if count<0 or len(values)<count: raise SystemExit("error: truncated SAVE measurement argv")
+    result=values[:count]; del values[:count]
+    return result
+launcher_prefix=take(arguments)
+numa_wrapper=take(arguments)
+pin_wrapper=take(arguments)
+criterion_environment=take(arguments)
+system_tool_paths=take(arguments)
+executable_argv=take(arguments)
+benchmark_ids=take(arguments)
+if arguments: raise SystemExit("error: trailing SAVE measurement metadata")
+root=Path(root).resolve()
+actual_root=Path(subprocess.check_output(["git","-C",str(root),"rev-parse","--show-toplevel"],text=True).strip()).resolve()
+actual_commit=subprocess.check_output(["git","-C",str(root),"rev-parse","HEAD"],text=True).strip()
+actual_tree=subprocess.check_output(["git","-C",str(root),"rev-parse","HEAD^{tree}"],text=True).strip()
+status=subprocess.check_output(["git","-C",str(root),"status","--porcelain","--untracked-files=no"],text=True)
+if actual_root!=root or actual_commit!=commit or actual_tree!=tree or status.strip():
+    raise SystemExit("error: SAVE runner revision changed before evidence capture")
+producer_launcher_path=Path(producer_launcher)
+harness=Path(harness_root)
+if (not producer_launcher_path.is_absolute() or producer_launcher_path.is_symlink() or
+    not producer_launcher_path.is_file() or not harness.is_absolute() or harness.is_symlink()):
+    raise SystemExit("error: invalid SAVE producer launcher")
+producer_launcher_path=producer_launcher_path.resolve(strict=True)
+harness=harness.resolve(strict=True)
+actual_harness=Path(subprocess.check_output(
+    ["git","-C",str(harness),"rev-parse","--show-toplevel"],text=True).strip()).resolve()
+harness_commit=subprocess.check_output(["git","-C",str(harness),"rev-parse","HEAD"],text=True).strip()
+harness_tree=subprocess.check_output(["git","-C",str(harness),"rev-parse","HEAD^{tree}"],text=True).strip()
+harness_status=subprocess.check_output(
+    ["git","-C",str(harness),"status","--porcelain","--untracked-files=no"],text=True)
+if actual_harness!=harness or harness_status.strip():
+    raise SystemExit("error: SAVE producer harness is not an immutable reviewed worktree")
+try: launcher_relative=producer_launcher_path.relative_to(harness).as_posix()
+except ValueError: raise SystemExit("error: SAVE producer launcher is outside reviewed harness")
+launcher_blob=subprocess.check_output(
+    ["git","-C",str(harness),"rev-parse",f"HEAD:{launcher_relative}"],text=True).strip()
+launcher_blob_bytes=subprocess.check_output(
+    ["git","-C",str(harness),"show",f"HEAD:{launcher_relative}"])
+launcher_bytes=producer_launcher_path.read_bytes()
+launcher_hash=hashlib.sha256(launcher_bytes).hexdigest()
+if launcher_blob_bytes!=launcher_bytes:
+    raise SystemExit("error: SAVE producer launcher differs from reviewed Git blob")
+producer_launcher_record={
+    "absolute_path":str(producer_launcher_path),"sha256":launcher_hash,
+    "git_blob":launcher_blob,"git_blob_sha256":hashlib.sha256(launcher_blob_bytes).hexdigest(),
+    "reviewed_root":str(harness),"reviewed_commit":harness_commit,"reviewed_tree":harness_tree,
+}
+if len(system_tool_paths)!=len(set(system_tool_paths)):
+    raise SystemExit("error: duplicate SAVE system tool record")
+system_tools=[]
+for value in system_tool_paths:
+    path=Path(value)
+    if (not path.is_absolute() or path.is_symlink() or not path.is_file() or
+        not os.access(path,os.X_OK) or str(path.resolve(strict=True))!=value):
+        raise SystemExit(f"error: invalid SAVE system tool: {value}")
+    metadata=path.stat()
+    if metadata.st_uid!=0 or metadata.st_mode & 0o022:
+        raise SystemExit(f"error: mutable SAVE system tool: {value}")
+    system_tools.append({"absolute_path":value,"sha256":hashlib.sha256(path.read_bytes()).hexdigest()})
+criterion_root=Path(criterion_root).resolve(strict=True)
+output=Path(output)
+if output.exists() or output.is_symlink():
+    raise SystemExit(f"error: SAVE run evidence already exists: {output}")
+def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+binary_path=Path(binary).resolve(strict=True)
+if binary_path.is_symlink() or not binary_path.is_file() or digest(binary_path)!=binary_hash:
+    raise SystemExit("error: SAVE executable changed before evidence capture")
+if (len(executable_argv)<4 or executable_argv[:4]!=[
+        str(binary_path),"--bench","--save-baseline",run]):
+    raise SystemExit("error: SAVE executable argv does not match authenticated run")
+manifest_record=None
+control_record=None
+if manifest:
+    manifest_path=Path(manifest).resolve(strict=True)
+    if manifest_path.is_symlink() or digest(manifest_path)!=manifest_hash:
+        raise SystemExit("error: SAVE build manifest changed before evidence capture")
+    manifest_record={"absolute_path":str(manifest_path),"sha256":manifest_hash}
+if control_provenance:
+    control_path=Path(control_provenance).resolve(strict=True)
+    if control_path.is_symlink() or digest(control_path)!=control_provenance_hash:
+        raise SystemExit("error: SAVE control provenance changed before evidence capture")
+    control_record={"absolute_path":str(control_path),"sha256":control_provenance_hash}
+results=[]
+for benchmark in benchmark_ids:
+    baseline_path=criterion_root/benchmark/run
+    cursor=criterion_root
+    for part in baseline_path.relative_to(criterion_root).parts:
+        cursor=cursor/part
+        if cursor.is_symlink():
+            raise SystemExit(f"error: symlink in SAVE baseline path: {cursor}")
+    baseline=baseline_path.resolve()
+    try: baseline.relative_to(criterion_root)
+    except ValueError: raise SystemExit(f"error: SAVE baseline escapes Criterion root: {baseline}")
+    if not baseline.is_dir():
+        raise SystemExit(f"error: missing SAVE baseline directory: {baseline}")
+    baseline_files=[]
+    for current, directories, files in os.walk(baseline, followlinks=False):
+        current_path=Path(current)
+        for name in directories:
+            path=current_path/name
+            if path.is_symlink(): raise SystemExit(f"error: symlink in SAVE baseline: {path}")
+        for name in files:
+            path=current_path/name
+            if path.is_symlink() or not path.is_file():
+                raise SystemExit(f"error: invalid SAVE result file: {path}")
+            relative=path.relative_to(criterion_root).as_posix()
+            baseline_files.append({"absolute_path":str(path.resolve()),"relative_path":relative,
+                                   "sha256":digest(path),"size":path.stat().st_size})
+    if not any(item["relative_path"]==f"{benchmark}/{run}/estimates.json" for item in baseline_files):
+        raise SystemExit(f"error: SAVE baseline lacks estimates.json: {benchmark}")
+    results.extend(sorted(baseline_files,key=lambda item:item["relative_path"]))
+payload={
+ "schema":"opthash-criterion-run-v2","runner_root":str(root),"commit":commit,
+ "tree":tree,"empty_diff_assertion":True,"mode":mode,"run":run,
+ "criterion_evidence_root":str(criterion_root),"build_manifest":manifest_record,
+ "control_provenance":control_record,
+ "producer_launcher":producer_launcher_record,
+ "measurement":{
+  "core":core or None,"launcher_prefix":launcher_prefix,"numa_wrapper":numa_wrapper,
+  "pin_wrapper":pin_wrapper,"criterion_environment":criterion_environment,
+  "system_tools":system_tools,
+  "executable_argv":executable_argv,
+  "executed_argv":launcher_prefix+numa_wrapper+pin_wrapper+criterion_environment+executable_argv,
+ },
+ "executable":{"absolute_path":str(binary_path),"sha256":binary_hash},
+ "expected_benchmark_ids":benchmark_ids,"results":results,
+}
+output.parent.mkdir(parents=True,exist_ok=True)
+temporary=output.with_name(output.name+f".tmp.{os.getpid()}")
+with temporary.open("x",encoding="utf-8") as stream:
+    json.dump(payload,stream,indent=2,sort_keys=True); stream.write("\n")
+    stream.flush(); os.fsync(stream.fileno())
+temporary.replace(output)
+PY
+}
+
+prepare_save_evidence() {
+	expected_save_ids=()
+	if [[ ${CONTROL:-0} == 1 ]]; then
+		expected_save_ids=(cache_gate_insert/cache_gate_insert_std cache_gate_insert/cache_gate_insert_hashbrown)
+		save_mode=CONTROL
+		save_binary=$CACHE_GATE_CONTROL_BIN
+		save_binary_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$save_binary"); save_binary_hash=${save_binary_hash%% *}
+		save_manifest=
+		save_manifest_hash=
+		save_control_provenance=$CACHE_GATE_CONTROL_PROVENANCE
+		save_control_provenance_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$save_control_provenance"); save_control_provenance_hash=${save_control_provenance_hash%% *}
+		save_evidence="$REPO_ROOT/target/cache-gate-runs/control/$SAVE.json"
+	elif [[ ${ELASTIC:-0} == 1 ]]; then
+		expected_save_ids=(cache_gate_insert/cache_gate_insert_elastic cache_gate_get_hit_elastic)
+		save_mode=elastic_cache_gate
+		save_binary=$stable_manifest_binary
+		save_binary_hash=$stable_manifest_hash
+		save_manifest=$CACHE_GATE_MANIFEST
+		save_manifest_hash=$stable_build_manifest_hash
+		save_control_provenance=
+		save_control_provenance_hash=
+		save_evidence="$REPO_ROOT/target/cache-gate-runs/$stable_manifest_variant/elastic_cache_gate-$SAVE.json"
+	else
+		expected_save_ids=(cache_gate_insert/cache_gate_insert_funnel cache_gate_get_hit_funnel)
+		save_mode=funnel_cache_gate
+		save_binary=$stable_manifest_binary
+		save_binary_hash=$stable_manifest_hash
+		save_manifest=$CACHE_GATE_MANIFEST
+		save_manifest_hash=$stable_build_manifest_hash
+		save_control_provenance=
+		save_control_provenance_hash=
+		save_evidence="$REPO_ROOT/target/cache-gate-runs/$stable_manifest_variant/funnel_cache_gate-$SAVE.json"
+	fi
+	runner_target_root=$("$CACHE_GATE_REALPATH_TOOL" -m -- "$REPO_ROOT/target")
+	stable_runs_root=$("$CACHE_GATE_REALPATH_TOOL" -m -- "$REPO_ROOT/target/cache-gate-runs")
+	[[ $stable_runs_root == "$runner_target_root/"* ]] || { echo "error: stable run root escapes runner target" >&2; exit 1; }
+	save_evidence=$("$CACHE_GATE_REALPATH_TOOL" -m -- "$save_evidence")
+	[[ $save_evidence == "$stable_runs_root/"* ]] || { echo "error: stable run destination escapes runner target" >&2; exit 1; }
+	[[ -n $SAVE ]] || return 0
+	((IS_LINUX)) || { echo "error: authenticated SAVE evidence requires Linux pinning" >&2; exit 1; }
+	[[ $SAVE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $SAVE != . && $SAVE != .. ]] || { echo "error: unsafe SAVE evidence name" >&2; exit 2; }
+	[[ ! -e $save_evidence && ! -L $save_evidence ]] || { echo "error: SAVE run evidence already exists: $save_evidence" >&2; exit 1; }
+	python3 - "$CRITERION_ROOT" "$SAVE" "${expected_save_ids[@]}" <<'PY'
+import sys
+from pathlib import Path
+
+root=Path(sys.argv[1])
+run=sys.argv[2]
+root.mkdir(parents=True,exist_ok=True)
+root=root.resolve(strict=True)
+for benchmark in sys.argv[3:]:
+    cursor=root
+    for part in Path(benchmark).parts:
+        if part in {"", ".", ".."}:
+            raise SystemExit(f"error: unsafe SAVE benchmark component: {benchmark}")
+        cursor=cursor/part
+        if cursor.is_symlink():
+            raise SystemExit(f"error: symlink in SAVE benchmark path: {cursor}")
+        cursor.mkdir(exist_ok=True)
+        if not cursor.is_dir():
+            raise SystemExit(f"error: non-directory in SAVE benchmark path: {cursor}")
+    baseline=cursor/run
+    if baseline.exists() or baseline.is_symlink():
+        raise SystemExit(f"error: SAVE baseline already exists: {baseline}")
+PY
+	for benchmark in "${expected_save_ids[@]}"; do
+		baseline="$CRITERION_ROOT/$benchmark/$SAVE"
+		[[ ! -e $baseline && ! -L $baseline ]] || { echo "error: SAVE baseline already exists: $baseline" >&2; exit 1; }
+	done
+}
+
 if [[ ${CONTROL:-0} == 1 || ${ELASTIC:-0} == 1 || ${FUNNEL:-0} == 1 ]]; then
+	verify_reviewed_tool_blob "$CACHE_GATE_LAUNCHER_PATH"
 	prepare_launcher
 	if [[ ${CONTROL:-0} == 1 ]]; then
 		require_control_binary
-		command=("${numa_wrapper[@]}" "${pin_wrapper[@]}" "${criterion_env[@]}" "$CACHE_GATE_CONTROL_BIN" --bench "${criterion_args[@]}" "${forward_args[@]}")
+		executable_argv=("$CACHE_GATE_CONTROL_BIN" --bench "${criterion_args[@]}" "${forward_args[@]}")
 	else
 		verify_manifest_tool_binding "$CACHE_GATE_MANIFEST" launcher "$CACHE_GATE_LAUNCHER_PATH"
 		verify_manifest_tool_binding "$CACHE_GATE_MANIFEST" elf_layout "$CACHE_GATE_ELF_LAYOUT_TOOL"
 		"$CACHE_GATE_ELF_LAYOUT_TOOL" validate-manifest --manifest "$CACHE_GATE_MANIFEST"
-		pre_exec_manifest_hash=$(sha256sum -- "$CACHE_GATE_MANIFEST"); pre_exec_manifest_hash=${pre_exec_manifest_hash%% *}
+		pre_exec_manifest_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$CACHE_GATE_MANIFEST"); pre_exec_manifest_hash=${pre_exec_manifest_hash%% *}
 		[[ $pre_exec_manifest_hash == "$stable_build_manifest_hash" ]] || { echo "error: stable build manifest changed before execution" >&2; exit 1; }
-		actual_hash=$(sha256sum -- "$stable_manifest_binary"); actual_hash=${actual_hash%% *}
+		actual_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$stable_manifest_binary"); actual_hash=${actual_hash%% *}
 		[[ $actual_hash == "$stable_manifest_hash" ]] || { echo "error: stable binary hash mismatch immediately before execution" >&2; exit 1; }
-		command=("${numa_wrapper[@]}" "${pin_wrapper[@]}" "${criterion_env[@]}" "$stable_manifest_binary" --bench "${criterion_args[@]}" "${forward_args[@]}")
+		executable_argv=("$stable_manifest_binary" --bench "${criterion_args[@]}" "${forward_args[@]}")
 	fi
+	command=("${numa_wrapper[@]}" "${pin_wrapper[@]}" "${criterion_env[@]}" "${executable_argv[@]}")
+	measurement_core=
+	((${#pin_wrapper[@]} == 0)) || measurement_core=$CORE
+	prepare_save_evidence
 	"${launcher[@]}" "${command[@]}"
-	if [[ ${CONTROL:-0} == 1 ]]; then
-		run_name=${SAVE:-${LOAD:-${BASELINE:-comparison}}}
-		[[ $run_name =~ ^[A-Za-z0-9._-]+$ ]] || { echo "error: unsafe run metadata name" >&2; exit 2; }
-		run_dir="$REPO_ROOT/target/cache-gate-runs/control"
-		mkdir -p "$run_dir"
-		control_hash=$(sha256sum -- "$CACHE_GATE_CONTROL_BIN"); control_hash=${control_hash%% *}
-		python3 - "$run_dir/$run_name.json" "$REPO_ROOT" "$runner_head" "$runner_tree" "$CACHE_GATE_CONTROL_BIN" "$control_hash" "$run_name" "$CRITERION_ROOT" <<'PY'
-import json,sys
-output,root,commit,tree,binary,binary_hash,run,evidence_root=sys.argv[1:]
-json.dump({"runner_root":root,"commit":commit,"tree":tree,"mode":"CONTROL","run":run,"executable":{"absolute_path":binary,"sha256":binary_hash},"criterion_evidence_root":evidence_root,"build_commands":[]},open(output,"w"),indent=2,sort_keys=True);open(output,"a").write("\n")
-PY
-	elif [[ ${ELASTIC:-0} == 1 || ${FUNNEL:-0} == 1 ]]; then
-		run_name=${SAVE:-${LOAD:-${BASELINE:-comparison}}}
-		[[ $run_name =~ ^[A-Za-z0-9._-]+$ ]] || { echo "error: unsafe run metadata name" >&2; exit 2; }
-		runner_target_root=$(realpath -m -- "$REPO_ROOT/target")
-		stable_runs_root=$(realpath -m -- "$REPO_ROOT/target/cache-gate-runs")
-		[[ $stable_runs_root == "$runner_target_root/"* ]] || { echo "error: stable run root escapes runner target" >&2; exit 1; }
-		run_dir=$(realpath -m -- "$stable_runs_root/$stable_manifest_variant")
-		[[ $run_dir == "$stable_runs_root/"* ]] || { echo "error: stable run destination escapes runner target" >&2; exit 1; }
-		mkdir -p "$run_dir"
-		post_exec_manifest_hash=$(sha256sum -- "$CACHE_GATE_MANIFEST"); post_exec_manifest_hash=${post_exec_manifest_hash%% *}
+	if [[ -n $SAVE ]]; then
+		if [[ ${ELASTIC:-0} == 1 || ${FUNNEL:-0} == 1 ]]; then
+			post_exec_manifest_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$CACHE_GATE_MANIFEST"); post_exec_manifest_hash=${post_exec_manifest_hash%% *}
 		[[ $post_exec_manifest_hash == "$stable_build_manifest_hash" ]] || { echo "error: stable build manifest changed during execution" >&2; exit 1; }
-		python3 - "$run_dir/$stable_target-$run_name.json" "$REPO_ROOT" "$runner_head" "$runner_tree" "$CACHE_GATE_MANIFEST" "$stable_build_manifest_hash" "$stable_manifest_binary" "$stable_manifest_hash" "$stable_target" "$run_name" "$CRITERION_ROOT" <<'PY'
-import json,sys
-output,root,commit,tree,manifest,manifest_hash,binary,binary_hash,mode,run,evidence_root=sys.argv[1:]
-json.dump({"runner_root":root,"commit":commit,"tree":tree,"mode":mode,"run":run,"build_manifest":manifest,"build_manifest_sha256":manifest_hash,"executable":{"absolute_path":binary,"sha256":binary_hash},"criterion_evidence_root":evidence_root,"build_commands":[]},open(output,"w"),indent=2,sort_keys=True);open(output,"a").write("\n")
-PY
+		fi
+		write_save_evidence "$save_evidence" "$save_mode" "$save_manifest" "$save_manifest_hash" \
+			"$save_control_provenance" "$save_control_provenance_hash" \
+			"$save_binary" "$save_binary_hash" "$CACHE_GATE_LAUNCHER_PATH" "$HARNESS_ROOT" "$measurement_core" \
+			"${#launcher[@]}" "${launcher[@]}" \
+			"${#numa_wrapper[@]}" "${numa_wrapper[@]}" \
+			"${#pin_wrapper[@]}" "${pin_wrapper[@]}" \
+			"${#criterion_env[@]}" "${criterion_env[@]}" \
+			"${#measurement_system_tools[@]}" "${measurement_system_tools[@]}" \
+			"${#executable_argv[@]}" "${executable_argv[@]}" \
+			"${#expected_save_ids[@]}" "${expected_save_ids[@]}"
 	fi
 	exit 0
 fi
@@ -358,24 +636,65 @@ x86_64 | amd64) arch=x86_64 ;;
 *) echo "error: unsupported host architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 [[ -n ${CACHE_GATE_LINKER_CAPABILITY:-} && $CACHE_GATE_LINKER_CAPABILITY == /* ]] || { echo "error: absolute CACHE_GATE_LINKER_CAPABILITY is required" >&2; exit 2; }
-CACHE_GATE_LINKER_CAPABILITY=$(realpath -e -- "$CACHE_GATE_LINKER_CAPABILITY")
-CACHE_GATE_LINK_DRIVER=$(python3 - "$CACHE_GATE_LINKER_CAPABILITY" "$REPO_ROOT" "$arch" <<'PY'
-import hashlib,json,subprocess,sys
+CACHE_GATE_LINKER_CAPABILITY=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$CACHE_GATE_LINKER_CAPABILITY")
+CACHE_GATE_LINK_DRIVER=$(python3 - "$CACHE_GATE_LINKER_CAPABILITY" "$REPO_ROOT" "$arch" "$HARNESS_ROOT" <<'PY'
+import hashlib,json,os,subprocess,sys
 from pathlib import Path
-path,repo,arch=sys.argv[1:]
+path,repo,arch,harness_root=sys.argv[1:]
 capability=json.load(open(path,encoding="utf-8"))
 if capability.get("accepted") is not True or capability.get("arch")!=arch:
     raise SystemExit("error: linker capability is not accepted for this architecture")
 def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+producer=capability.get("producer",{})
+if set(producer)!={"runner_root","commit","tree","empty_diff_assertion","artifact_root"}:
+    raise SystemExit("error: exact capability producer schema mismatch")
+producer_root=Path(producer["runner_root"])
+if (not producer_root.is_absolute() or producer_root.is_symlink() or
+    producer["runner_root"]!=str(producer_root.resolve()) or producer_root.resolve()!=Path(harness_root)):
+    raise SystemExit("error: capability producer root differs from reviewed harness")
+git_root=Path(subprocess.check_output(["git","-C",str(producer_root),"rev-parse","--show-toplevel"],text=True).strip()).resolve()
+head=subprocess.check_output(["git","-C",str(producer_root),"rev-parse","HEAD"],text=True).strip()
+tree=subprocess.check_output(["git","-C",str(producer_root),"rev-parse","HEAD^{tree}"],text=True).strip()
+status=subprocess.check_output(["git","-C",str(producer_root),"status","--porcelain","--untracked-files=no"],text=True)
+if (git_root!=producer_root.resolve() or producer["commit"]!=head or producer["tree"]!=tree or
+    producer["empty_diff_assertion"] is not True or status.strip()):
+    raise SystemExit("error: capability producer revision is not immutable")
+artifact_root=Path(producer["artifact_root"])
+producer_target=(producer_root/"target").resolve()
+if (not artifact_root.is_absolute() or not artifact_root.is_dir() or artifact_root.is_symlink() or
+    os.path.commonpath([str(producer_target),str(artifact_root.resolve())])!=str(producer_target)):
+    raise SystemExit("error: capability artifact root is outside producer target")
+artifact_root=artifact_root.resolve()
 if set(capability.get("fragments",{}))!={"elastic","funnel","profile"}:
     raise SystemExit("error: linker fragment capability set mismatch")
 for target,record in capability["fragments"].items():
-    expected=(Path(repo)/f"benches/cache-gate-{target}-layout.ld").resolve()
+    expected=(producer_root/f"benches/cache-gate-{target}-layout.ld").resolve()
+    subject=(Path(repo)/f"benches/cache-gate-{target}-layout.ld").resolve()
     source=Path(record["absolute_path"])
-    if not source.is_absolute() or not source.is_file() or digest(source)!=record["sha256"] or digest(expected)!=record["sha256"]:
+    blob=subprocess.check_output(["git","-C",str(producer_root),"show",f'{producer["commit"]}:benches/cache-gate-{target}-layout.ld'])
+    if (not source.is_absolute() or source.resolve()!=expected or not source.is_file() or source.is_symlink() or
+        digest(source)!=record["sha256"] or digest(subject)!=record["sha256"] or
+        hashlib.sha256(blob).hexdigest()!=record["sha256"]):
         raise SystemExit(f"error: linker fragment capability mismatch: {target}")
+if set(capability.get("shapes",{}))!={"actual","gnu","lld"}:
+    raise SystemExit("error: linker capability shape set mismatch")
+for flavor,shapes in capability["shapes"].items():
+    if set(shapes)!={"elastic","funnel","profile"}:
+        raise SystemExit(f"error: linker capability target set mismatch: {flavor}")
+    for target,shape in shapes.items():
+        required={"binary","link_argv","link_map","symbols","layout"}
+        if flavor in {"gnu","lld"}: required.add("linker_execution")
+        if set(shape)!=required:
+            raise SystemExit(f"error: exact linker capability shape mismatch: {flavor}/{target}")
+        for name,record in shape.items():
+            artifact=Path(record["absolute_path"])
+            if (not artifact.is_absolute() or not artifact.is_file() or artifact.is_symlink() or
+                os.path.commonpath([str(artifact_root),str(artifact.resolve())])!=str(artifact_root) or
+                digest(artifact)!=record["sha256"]):
+                raise SystemExit(f"error: linker capability artifact mismatch: {flavor}/{target}/{name}")
 driver=Path(capability["linker"]["absolute_path"])
-if not driver.is_absolute() or not driver.is_file():
+if (not driver.is_absolute() or driver.is_symlink() or not driver.is_file() or
+    str(driver.resolve())!=str(driver) or digest(driver)!=capability["linker"]["sha256"]):
     raise SystemExit("error: capability linker path is invalid")
 version=next((line for line in subprocess.check_output([str(driver),"-Wl,--version"],stderr=subprocess.STDOUT,text=True).splitlines() if "GNU ld" in line or "LLD" in line or "lld" in line),"")
 if version!=capability["linker"]["version"]:
@@ -448,9 +767,9 @@ build_bench() {
 	rg -q -- 'codegen-units(=|[[:space:]]+)16' "$verbose_path" || { echo "error: captured rustc argv lacks -C codegen-units=16 for $bench" >&2; exit 1; }
 	executable=$("$CACHE_GATE_ELF_LAYOUT_TOOL" select-cargo-executable \
 		--cargo-output "$json_path" --bench "$bench")
-	executable=$(realpath -- "$executable")
+	executable=$("$CACHE_GATE_REALPATH_TOOL" -- "$executable")
 	[[ -x $executable && -s $map_path ]] || { echo "error: missing executable or link map for $bench" >&2; exit 1; }
-	(($(stat -c %Y "$executable") >= head_epoch)) || { echo "error: stale artifact for $bench" >&2; exit 1; }
+	(($("$CACHE_GATE_STAT_TOOL" -c %Y "$executable") >= head_epoch)) || { echo "error: stale artifact for $bench" >&2; exit 1; }
 	"$CACHE_GATE_ELF_LAYOUT_TOOL" validate-link-command \
 		--trace "$trace_path" --executable "$executable" \
 		--capability "$CACHE_GATE_LINKER_CAPABILITY" --fragment "$fragment" \

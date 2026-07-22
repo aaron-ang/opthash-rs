@@ -762,6 +762,94 @@ def test_capability_probe_traces_explicit_linker_executables():
     assert "-B" in source
 
 
+def test_cargo_linker_resolver_canonicalizes_path_symlink(tmp_path):
+    real_driver = tmp_path / "real-cc"
+    real_driver.write_text("#!/bin/sh\nexit 0\n")
+    real_driver.chmod(0o755)
+    path_dir = tmp_path / "path"
+    path_dir.mkdir()
+    (path_dir / "cc").symlink_to(real_driver)
+    link_args = tmp_path / "link-args.txt"
+    link_args.write_text("cc -Wl,--gc-sections -o /tmp/probe\n")
+    env = os.environ.copy()
+    env["PATH"] = f"{path_dir}:{env['PATH']}"
+
+    completed = subprocess.run(
+        [
+            str(SCRIPT),
+            "resolve-cargo-linker",
+            "--link-args",
+            str(link_args.resolve()),
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == str(real_driver.resolve())
+    assert not Path(completed.stdout.strip()).is_symlink()
+
+
+def test_capability_producer_may_differ_from_subject_but_authenticates_root(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    producer = tmp_path / "producer"
+    producer.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=producer, check=True)
+    write = producer / "reviewed.txt"
+    write.write_text("reviewed\n")
+    subprocess.run(["git", "add", "reviewed.txt"], cwd=producer, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "producer fixture",
+        ],
+        cwd=producer,
+        check=True,
+    )
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=producer, text=True
+    ).strip()
+    tree = subprocess.check_output(
+        ["git", "rev-parse", "HEAD^{tree}"], cwd=producer, text=True
+    ).strip()
+    artifact_root = producer / "target/cache-gate-linker/aarch64/.probe.fixture"
+    artifact_root.mkdir(parents=True)
+    record = {
+        "runner_root": str(producer.resolve()),
+        "commit": commit,
+        "tree": tree,
+        "empty_diff_assertion": True,
+        "artifact_root": str(artifact_root.resolve()),
+    }
+    tools = {
+        "elf_layout": {
+            "reviewed_root": str(producer.resolve()),
+            "reviewed_commit": commit,
+            "reviewed_tree": tree,
+        }
+    }
+    subject = tmp_path / "different-subject"
+    subject.mkdir()
+
+    root, artifacts = namespace["_validate_capability_producer"](record, tools)
+
+    assert root == producer.resolve()
+    assert artifacts == artifact_root.resolve()
+    assert root != subject.resolve()
+    escaped = tmp_path / "escaped-artifacts"
+    escaped.mkdir()
+    record["artifact_root"] = str(escaped.resolve())
+    with pytest.raises(ValueError, match="artifact root is outside producer target"):
+        namespace["_validate_capability_producer"](record, tools)
+
+
 def test_manifest_build_captures_and_authenticates_each_real_link_command():
     source = LAUNCHER.read_text()
     assert "cache-gate-link-wrapper.py" in source
@@ -927,14 +1015,14 @@ def test_supplied_manifest_validation_never_executes_build_toolchain():
     assert "replay_link_command" in link_records
 
 
-def test_explicit_linker_trace_is_contained_under_runner_target():
+def test_explicit_linker_trace_is_contained_under_producer_artifact_root():
     source = SCRIPT.read_text()
     capability = source[
         source.index("def _validate_capability(") : source.index(
             "def _validate_control("
         )
     ]
-    assert "linker trace is outside runner target" in capability
+    assert "linker trace is outside producer artifact root" in capability
 
 
 def test_main_link_trace_output_hardlink_cannot_escape_runner_target(tmp_path):
