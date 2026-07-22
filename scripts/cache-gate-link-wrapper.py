@@ -16,16 +16,20 @@ def fail(message: str) -> None:
     raise SystemExit(2)
 
 
-driver_text = os.environ.get("CACHE_GATE_LINK_DRIVER", "")
-trace_text = os.environ.get("CACHE_GATE_LINK_TRACE", "")
+inner = Path(sys.argv[0]).name in {"ld.bfd", "ld.lld"}
+prefix = "CACHE_GATE_INNER_LINK" if inner else "CACHE_GATE_LINK"
+driver_text = os.environ.get(f"{prefix}_DRIVER", "")
+trace_text = os.environ.get(f"{prefix}_TRACE", "")
+role = os.environ.get(f"{prefix}_ROLE", "")
+session = os.environ.get("CACHE_GATE_LINK_SESSION", "")
 driver = Path(driver_text)
 trace = Path(trace_text)
 if not driver.is_absolute() or not driver.is_file():
-    fail("CACHE_GATE_LINK_DRIVER must be an absolute file")
+    fail(f"{prefix}_DRIVER must be an absolute file")
 if not trace.is_absolute() or not trace.parent.is_dir() or trace.is_symlink():
-    fail(
-        "CACHE_GATE_LINK_TRACE must name a new or regular file in an existing directory"
-    )
+    fail(f"{prefix}_TRACE must name a new or regular file in an existing directory")
+if bool(role) != bool(session):
+    fail("link role and session must either both be set or both be empty")
 driver = driver.resolve()
 record = {
     "driver": str(driver),
@@ -34,6 +38,9 @@ record = {
     "cwd": str(Path.cwd().resolve()),
     "path": os.environ.get("PATH", ""),
 }
+if role:
+    record["role"] = role
+    record["session"] = session
 with trace.open("a", encoding="utf-8") as stream:
     fcntl.flock(stream, fcntl.LOCK_EX)
     stream.write(json.dumps(record, sort_keys=True) + "\n")

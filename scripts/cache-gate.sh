@@ -638,8 +638,9 @@ esac
 [[ -n ${CACHE_GATE_LINKER_CAPABILITY:-} && $CACHE_GATE_LINKER_CAPABILITY == /* ]] || { echo "error: absolute CACHE_GATE_LINKER_CAPABILITY is required" >&2; exit 2; }
 capability_input=$CACHE_GATE_LINKER_CAPABILITY
 [[ ${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16} == 16 ]] || { echo "error: conflicting CARGO_PROFILE_RELEASE_CODEGEN_UNITS" >&2; exit 2; }
-[[ ${RUSTFLAGS:-} != *codegen-units* && ${CARGO_ENCODED_RUSTFLAGS:-} != *codegen-units* ]] || { echo "error: conflicting rustc codegen-unit configuration" >&2; exit 2; }
+[[ -z ${RUSTFLAGS:-} ]] || { echo "error: RUSTFLAGS is unsupported for authenticated manifest builds" >&2; exit 2; }
 [[ -z ${CARGO_ENCODED_RUSTFLAGS:-} ]] || { echo "error: CARGO_ENCODED_RUSTFLAGS is unsupported for authenticated manifest builds" >&2; exit 2; }
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 manifest_dir="$REPO_ROOT/target/cache-gate/$arch/$CACHE_GATE_VARIANT"
 build_root="$REPO_ROOT/target/cache-gate-build/$CACHE_GATE_MANIFEST_INSTANCE"
@@ -676,19 +677,43 @@ mkdir -p "$manifest_dir/linker-fragments" "$manifest_dir/layout" "$manifest_dir/
 cp -- "$REPO_ROOT/benches/cache-gate-elastic-layout.ld" "$manifest_dir/linker-fragments/elastic.ld"
 cp -- "$REPO_ROOT/benches/cache-gate-funnel-layout.ld" "$manifest_dir/linker-fragments/funnel.ld"
 cp -- "$REPO_ROOT/benches/cache-gate-profile-layout.ld" "$manifest_dir/linker-fragments/profile.ld"
-mapfile -t staged_capability < <("$CACHE_GATE_ELF_LAYOUT_TOOL" stage-validate-capability --input "$capability_input" \
-	--output "$manifest_dir/linker-capability.json" --arch "$arch" --tools "$authenticated_tools")
-((${#staged_capability[@]} == 3)) || { echo "error: invalid staged capability result" >&2; exit 1; }
-CACHE_GATE_LINK_DRIVER=${staged_capability[0]}
-capability_identity=${staged_capability[1]}
-capability_document_b64=${staged_capability[2]}
-CACHE_GATE_LINKER_CAPABILITY="$manifest_dir/linker-capability.json"
-verify_staged_capability() {
-	"$CACHE_GATE_ELF_LAYOUT_TOOL" verify-staged-capability \
-		--path "$CACHE_GATE_LINKER_CAPABILITY" --identity "$capability_identity" || {
-		echo "error: staged capability identity changed" >&2
+coproc CAPABILITY_GUARD { "$CACHE_GATE_ELF_LAYOUT_TOOL" guard-capability --input "$capability_input" \
+	--output "$manifest_dir/linker-capability.json" --arch "$arch" --tools "$authenticated_tools"; }
+capability_guard_pid=$CAPABILITY_GUARD_PID
+capability_guard_read_fd=${CAPABILITY_GUARD[0]}
+capability_guard_write_fd=${CAPABILITY_GUARD[1]}
+read_guard_value() {
+	local -n result=$1
+	IFS= read -r result <&"$capability_guard_read_fd" || {
+		wait "$capability_guard_pid" || true
+		echo "error: capability guardian exited before READY" >&2
 		exit 1
 	}
+}
+read_guard_value CACHE_GATE_LINK_DRIVER
+read_guard_value capability_identity
+read_guard_value capability_document_b64
+read_guard_value capability_guard_ready
+[[ $capability_guard_ready == READY ]] || { echo "error: invalid capability guardian handshake" >&2; exit 1; }
+capability_guard_active=1
+cleanup_capability_guard() {
+	if [[ ${capability_guard_active:-0} == 1 ]]; then
+		printf 'ABORT\n' >&"$capability_guard_write_fd" 2>/dev/null || true
+		IFS= read -r _ <&"$capability_guard_read_fd" 2>/dev/null || true
+		wait "$capability_guard_pid" 2>/dev/null || true
+	fi
+}
+trap cleanup_capability_guard EXIT
+CACHE_GATE_LINKER_CAPABILITY="$manifest_dir/linker-capability.json"
+verify_staged_capability() {
+	local reply
+	printf 'CHECK\n' >&"$capability_guard_write_fd" || {
+		echo "error: capability guardian command channel closed" >&2; exit 1;
+	}
+	IFS= read -r reply <&"$capability_guard_read_fd" || {
+		echo "error: capability guardian exited before CHECK" >&2; exit 1;
+	}
+	[[ $reply == OK ]] || { echo "error: staged capability identity changed" >&2; exit 1; }
 }
 verify_staged_capability
 
@@ -697,7 +722,7 @@ build_bench() {
 	local bench=$2 target=$3 fragment="$manifest_dir/linker-fragments/$3.ld"
 	local map_path="$manifest_dir/link-maps/$bench.map" json_path="$manifest_dir/$bench.cargo.json" verbose_path="$manifest_dir/$bench.rustc.txt" executable
 	local trace_path="$manifest_dir/link-traces/$bench.jsonl" command_path="$manifest_dir/link-commands/$bench.json"
-	local rustflags="${RUSTFLAGS:-} -C codegen-units=16 -C link-arg=-Wl,-T,$fragment -C link-arg=-Wl,-Map,$map_path -C linker=$CACHE_GATE_LINK_WRAPPER"
+	local rustflags="-C codegen-units=16 -C link-arg=-Wl,-T,$fragment -C link-arg=-Wl,-Map,$map_path -C linker=$CACHE_GATE_LINK_WRAPPER"
 	verify_staged_capability
 	[[ ! -e $trace_path && ! -e $command_path ]] || { echo "error: link proof output already exists for $bench" >&2; exit 1; }
 	if [[ ${CACHE_GATE_LAYOUT_ADVERSARY:-0} == 1 ]]; then
@@ -724,7 +749,7 @@ build_bench() {
 	(($("$CACHE_GATE_STAT_TOOL" -c %Y "$executable") >= head_epoch)) || { echo "error: stale artifact for $bench" >&2; exit 1; }
 	"$CACHE_GATE_ELF_LAYOUT_TOOL" validate-link-command \
 		--trace "$trace_path" --executable "$executable" \
-		--capability "$CACHE_GATE_LINKER_CAPABILITY" --capability-identity "$capability_identity" --fragment "$fragment" \
+		--capability-document-b64 "$capability_document_b64" --fragment "$fragment" \
 		--link-map "$map_path" --output "$command_path" || return 1
 	verify_staged_capability
 	result=$executable
@@ -752,8 +777,7 @@ for executable in elastic_cache_gate funnel_cache_gate cache_gate_profile; do
 	cache_gate_profile) binary=$profile_bin; target=profile ;;
 	esac
 	verify_staged_capability
-	CACHE_GATE_LINKER_CAPABILITY="$manifest_dir/linker-capability.json" \
-		CACHE_GATE_LINKER_CAPABILITY_IDENTITY="$capability_identity" \
+	CACHE_GATE_LINKER_CAPABILITY_DOCUMENT_B64="$capability_document_b64" \
 		"$CACHE_GATE_ELF_LAYOUT_TOOL" validate --binary "$binary" \
 		--link-map "$manifest_dir/link-maps/$executable.map" \
 		--script "$manifest_dir/linker-fragments/$target.ld" \
@@ -889,6 +913,14 @@ for name,item in executables.items():
     all_reserved.extend(f"{name}:{value}" for value in reserved)
 
 tools=json.load(open(authenticated_tools_path,encoding="utf-8"))
+rustc_flags = [
+    "-C", "codegen-units=16",
+    "-C", "link-arg=-Wl,-T,<target-fragment>",
+    "-C", "link-arg=-Wl,-Map,<per-target-map>",
+    "-C", f"linker={tools['link_wrapper']['absolute_path']}",
+]
+if adversary_enabled:
+    rustc_flags.extend(["--cfg", "cache_gate_layout_adversary", "--check-cfg=cfg(cache_gate_layout_adversary)"])
 payload = {
     "commit": commit,
     "tree": tree,
@@ -902,7 +934,7 @@ payload = {
         "cargo_incremental": "0",
         "profile": "release",
         "locked": True,
-        "rustc_flags": ["-C", "codegen-units=16", "-C", "link-arg=-Wl,-T,<target-fragment>", "-C", "link-arg=-Wl,-Map,<per-target-map>"],
+        "rustc_flags": rustc_flags,
         "linker_flags": ["-Wl,-T,<target-fragment>", "-Wl,-Map,<per-target-map>"],
         "codegen_units": 16,
     },
@@ -936,4 +968,13 @@ verify_staged_capability
 symbol_count=$(jq '[.symbols[].symbols[]] | length' "$manifest_dir/manifest.json")
 [[ $symbol_count == 8 ]] || { echo "error: manifest resolved $symbol_count symbols, expected 8" >&2; exit 1; }
 verify_staged_capability
+"$CACHE_GATE_ELF_LAYOUT_TOOL" validate-manifest --manifest "$manifest_dir/manifest.json" \
+	--capability-document-b64 "$capability_document_b64"
+verify_staged_capability
+printf 'FINALIZE\n' >&"$capability_guard_write_fd" || { echo "error: capability guardian command channel closed" >&2; exit 1; }
+IFS= read -r capability_guard_final <&"$capability_guard_read_fd" || { echo "error: capability guardian exited before FINALIZE" >&2; exit 1; }
+[[ $capability_guard_final == COMMITTED ]] || { echo "error: capability guardian rejected FINALIZE" >&2; exit 1; }
+wait "$capability_guard_pid" || { echo "error: capability guardian failed after FINALIZE" >&2; exit 1; }
+capability_guard_active=0
+trap - EXIT
 echo "$manifest_dir/manifest.json"

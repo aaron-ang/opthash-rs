@@ -26,6 +26,10 @@ hold() {
 	exit 3
 }
 
+[[ -z ${RUSTFLAGS:-} ]] || hold "RUSTFLAGS is unsupported for authenticated capability builds"
+[[ -z ${CARGO_ENCODED_RUSTFLAGS:-} ]] || hold "CARGO_ENCODED_RUSTFLAGS is unsupported for authenticated capability builds"
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+
 [[ $(uname -s) == Linux ]] || hold "cache-gate linker capability requires native Linux ELF"
 case $(uname -m) in
 aarch64 | arm64) arch=aarch64 ;;
@@ -78,6 +82,9 @@ run_shape() {
 	local layout="$probe_root/$flavor/$target.layout.json" binary
 	local linker_trace="$probe_root/$flavor/$target.linker-trace.jsonl"
 	local linker_execution="$probe_root/$flavor/$target.linker-execution.json"
+	local cargo_trace="$probe_root/$flavor/$target.cargo-driver-trace.jsonl"
+	local cargo_execution="$probe_root/$flavor/$target.cargo-driver-execution.json"
+	local link_session="$flavor-$target-$$"
 	mkdir -p "$target_root"
 	local flags="--cfg cache_gate_probe_$target --check-cfg=cfg(cache_gate_probe_elastic) --check-cfg=cfg(cache_gate_probe_funnel) --check-cfg=cfg(cache_gate_probe_profile)"
 	if [[ $flavor == actual ]]; then
@@ -89,11 +96,21 @@ run_shape() {
 			cp -- "$REPO_ROOT/scripts/cache-gate-link-wrapper.py" "$wrapper"
 			chmod 0755 "$wrapper"
 		fi
-		flags+=" -C link-arg=-B$wrapper_dir -C link-arg=-fuse-ld=$fuse"
+		flags+=" -C linker=$REPO_ROOT/scripts/cache-gate-link-wrapper.py -C link-arg=-B$wrapper_dir -C link-arg=-fuse-ld=$fuse"
 	fi
 	flags+=" -C link-arg=-Wl,-T,${fragments[$target]} -C link-arg=-Wl,-Map,$map"
-	if [[ -n $explicit_linker ]]; then
+	if [[ $flavor == actual ]]; then
 		CACHE_GATE_LINK_DRIVER="$explicit_linker" CACHE_GATE_LINK_TRACE="$linker_trace" \
+			CACHE_GATE_LINK_ROLE=actual-driver CACHE_GATE_LINK_SESSION="$link_session" \
+			RUSTFLAGS="$flags" CARGO_TARGET_DIR="$target_root" cargo rustc --release --locked \
+			--manifest-path tools/cache-gate-link-probe/Cargo.toml --bin "$target" -- \
+			-C codegen-units=1 --print link-args >"$link_args" 2>"$probe_root/$flavor/$target.cargo.stderr" || \
+			hold "$flavor failed $target 2/2/4 capability link"
+	elif [[ -n $explicit_linker ]]; then
+		CACHE_GATE_LINK_DRIVER="$actual_driver" CACHE_GATE_LINK_TRACE="$cargo_trace" \
+			CACHE_GATE_LINK_ROLE=cargo-driver CACHE_GATE_LINK_SESSION="$link_session" \
+			CACHE_GATE_INNER_LINK_DRIVER="$explicit_linker" CACHE_GATE_INNER_LINK_TRACE="$linker_trace" \
+			CACHE_GATE_INNER_LINK_ROLE=explicit-linker \
 			RUSTFLAGS="$flags" CARGO_TARGET_DIR="$target_root" cargo rustc --release --locked \
 			--manifest-path tools/cache-gate-link-probe/Cargo.toml --bin "$target" -- \
 			-C codegen-units=1 --print link-args >"$link_args" 2>"$probe_root/$flavor/$target.cargo.stderr" || \
@@ -111,6 +128,13 @@ run_shape() {
 			--trace "$linker_trace" --linker "$explicit_linker" \
 			--executable "$binary" --flavor "$flavor" --output "$linker_execution" || \
 			hold "$flavor did not bind exact $target linker executable"
+		if [[ $flavor != actual ]]; then
+			[[ -s $cargo_trace ]] || hold "$flavor did not trace exact $target Cargo driver execution"
+			"$REPO_ROOT/scripts/cache-gate-elf-layout.py" validate-linker-execution \
+				--trace "$cargo_trace" --linker "$actual_driver" \
+				--executable "$binary" --flavor actual --output "$cargo_execution" || \
+				hold "$flavor did not bind exact $target Cargo driver execution"
+		fi
 	fi
 	file "$binary" | rg -q 'ELF' || hold "$flavor emitted non-ELF $target output"
 	case "$target" in
@@ -212,6 +236,8 @@ for flavor in ("actual","gnu","lld"):
         }
         execution=root/flavor/f"{target}.linker-execution.json"
         if execution.exists(): shapes[flavor][target]["linker_execution"]=record(execution)
+        cargo_execution=root/flavor/f"{target}.cargo-driver-execution.json"
+        if cargo_execution.exists(): shapes[flavor][target]["cargo_execution"]=record(cargo_execution)
 payload={
  "accepted":True,"arch":arch,"target_triple":triple,"max_page_size":int(max_page),
  "producer":{"runner_root":str(Path(repo).resolve()),"commit":producer_commit,

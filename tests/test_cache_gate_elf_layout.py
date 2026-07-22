@@ -778,6 +778,8 @@ def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
                 "argv": ["-o", str(raw_output.resolve())],
                 "cwd": str(tmp_path.resolve()),
                 "path": os.environ["PATH"],
+                "role": "explicit-linker",
+                "session": "fixture-session",
             }
         )
         + "\n"
@@ -808,6 +810,8 @@ def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
         "version": "GNU ld fixture 2.42",
     }
     assert record["trace"]["final_link_record_count"] == 1
+    assert record["role"] == "explicit-linker"
+    assert record["session"] == "fixture-session"
 
     wrong_linker = tmp_path / "other-ld"
     wrong_linker.write_text(linker.read_text())
@@ -816,6 +820,86 @@ def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
     rejected = subprocess.run(command, text=True, capture_output=True)
     assert rejected.returncode != 0
     assert "observed linker differs" in rejected.stderr
+
+
+def test_outer_and_inner_wrappers_produce_correlated_replayable_gnu_traces(tmp_path):
+    compiler = Path("/usr/bin/cc").resolve()
+    linker = Path("/usr/bin/ld.bfd").resolve()
+    if not compiler.is_file() or not linker.is_file():
+        pytest.skip("native compiler and GNU ld.bfd are required")
+    release = tmp_path / "probe/release"
+    deps = release / "deps"
+    wrapper_dir = tmp_path / "wrapper"
+    deps.mkdir(parents=True)
+    wrapper_dir.mkdir()
+    inner_wrapper = wrapper_dir / "ld.bfd"
+    inner_wrapper.write_bytes(LINK_WRAPPER.read_bytes())
+    inner_wrapper.chmod(0o755)
+    object_path = tmp_path / "input.o"
+    subprocess.run(
+        [str(compiler), "-x", "c", "-c", "/dev/null", "-o", str(object_path)],
+        check=True,
+    )
+    raw_output = deps / "probe-0123456789abcdef"
+    outer_trace = tmp_path / "outer.jsonl"
+    inner_trace = tmp_path / "inner.jsonl"
+    environment = {
+        **os.environ,
+        "CACHE_GATE_LINK_DRIVER": str(compiler),
+        "CACHE_GATE_LINK_TRACE": str(outer_trace),
+        "CACHE_GATE_LINK_ROLE": "cargo-driver",
+        "CACHE_GATE_LINK_SESSION": "integration-session",
+        "CACHE_GATE_INNER_LINK_DRIVER": str(linker),
+        "CACHE_GATE_INNER_LINK_TRACE": str(inner_trace),
+        "CACHE_GATE_INNER_LINK_ROLE": "explicit-linker",
+    }
+    completed = subprocess.run(
+        [
+            str(LINK_WRAPPER),
+            "-nostdlib",
+            "-Wl,-e,0",
+            f"-B{wrapper_dir}",
+            "-fuse-ld=bfd",
+            str(object_path),
+            "-o",
+            str(raw_output),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    binary = release / "probe"
+    os.link(raw_output, binary)
+
+    for trace, driver, flavor, role in (
+        (outer_trace, compiler, "actual", "cargo-driver"),
+        (inner_trace, linker, "gnu", "explicit-linker"),
+    ):
+        execution = tmp_path / f"{role}.json"
+        validated = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "validate-linker-execution",
+                "--trace",
+                str(trace),
+                "--linker",
+                str(driver),
+                "--executable",
+                str(binary),
+                "--flavor",
+                flavor,
+                "--output",
+                str(execution),
+            ],
+            text=True,
+            capture_output=True,
+        )
+        assert validated.returncode == 0, validated.stderr
+        record = json.loads(execution.read_text())
+        assert record["role"] == role
+        assert record["session"] == "integration-session"
 
 
 def test_actual_driver_execution_record_uses_forwarded_linker_version(tmp_path):
@@ -1221,7 +1305,7 @@ def test_stage_capability_rejects_input_inode_swap_during_validation(tmp_path):
         replacement.rename(source)
         return "validated"
 
-    with pytest.raises(ValueError, match="input.*changed"):
+    with pytest.raises(ValueError, match="(input.*changed|inode lifecycle event)"):
         namespace["_stage_capability_once"](source, destination, swap_input)
     assert not destination.exists()
     assert source.read_text() == '{"accepted":false}\n'
@@ -1243,7 +1327,9 @@ def test_stage_capability_rejects_staged_inode_swap_without_deleting_replacement
         staged.write_text('{"accepted":"forged"}\n')
         return "validated"
 
-    with pytest.raises(ValueError, match="staged capability changed"):
+    with pytest.raises(
+        ValueError, match="(staged capability changed|inode lifecycle event)"
+    ):
         namespace["_stage_capability_once"](source, destination, swap_stage)
     assert json.loads(destination.read_text()) == {"accepted": "forged"}
 
@@ -1270,7 +1356,9 @@ def test_stage_capability_rejects_parent_directory_replacement(
         replacement.write_text('{"accepted":true}\n')
         return "validated"
 
-    with pytest.raises(ValueError, match="directory ancestry changed"):
+    with pytest.raises(
+        ValueError, match="(directory ancestry changed|inode lifecycle event)"
+    ):
         namespace["_stage_capability_once"](source, destination, replace_parent)
     if swapped_parent == "destination":
         assert destination.read_text() == '{"accepted":true}\n'
@@ -1301,6 +1389,198 @@ def test_stage_capability_preserves_exact_input_bytes(tmp_path):
     destination.write_bytes(b'{"accepted": false}\n')
     with pytest.raises(ValueError, match="staged capability"):
         namespace["verify_staged_capability"](destination, identity)
+
+
+@pytest.mark.parametrize(
+    "renamed",
+    ("source-file", "stage-file", "source-parent", "stage-parent"),
+)
+def test_capability_guard_rejects_rename_away_restore_between_checks(tmp_path, renamed):
+    namespace = runpy.run_path(str(SCRIPT))
+    source_parent = tmp_path / "source-parent"
+    stage_parent = tmp_path / "stage-parent"
+    source_parent.mkdir()
+    stage_parent.mkdir()
+    source = source_parent / "capability.json"
+    destination = stage_parent / "linker-capability.json"
+    source.write_text('{"accepted": true}\n')
+    guard = namespace["_CapabilityGuard"].stage(
+        source.resolve(), destination.resolve(), lambda *_: "/usr/bin/cc"
+    )
+    try:
+        guard.checkpoint()
+        target = {
+            "source-file": source,
+            "stage-file": destination,
+            "source-parent": source_parent,
+            "stage-parent": stage_parent,
+        }[renamed]
+        detached = target.with_name(target.name + ".detached")
+        target.rename(detached)
+        detached.rename(target)
+
+        with pytest.raises(ValueError, match="inode lifecycle event"):
+            guard.checkpoint()
+    finally:
+        guard.close(remove_stage=True)
+
+
+def test_capability_guard_holds_descriptors_and_ignores_normal_child_creation(
+    tmp_path,
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    source_parent = tmp_path / "source"
+    stage_parent = tmp_path / "stage"
+    source_parent.mkdir()
+    stage_parent.mkdir()
+    source = source_parent / "capability.json"
+    destination = stage_parent / "linker-capability.json"
+    source.write_text('{"accepted": true}\n')
+    guard = namespace["_CapabilityGuard"].stage(
+        source.resolve(), destination.resolve(), lambda *_: "/usr/bin/cc"
+    )
+    try:
+        held = [
+            *guard.source_directories,
+            *guard.destination_directories,
+            guard.source_descriptor,
+            guard.staged_descriptor,
+        ]
+        assert all(Path(f"/proc/self/fd/{descriptor}").exists() for descriptor in held)
+        (stage_parent / "ordinary-build-output").write_text("ok\n")
+        guard.checkpoint()
+    finally:
+        guard.close(remove_stage=True)
+
+
+def test_capability_guard_treats_command_eof_as_failure(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    source_parent = tmp_path / "source"
+    stage_parent = tmp_path / "stage"
+    source_parent.mkdir()
+    stage_parent.mkdir()
+    source = source_parent / "capability.json"
+    destination = stage_parent / "linker-capability.json"
+    source.write_text('{"accepted": true}\n')
+    guard = namespace["_CapabilityGuard"].stage(
+        source.resolve(), destination.resolve(), lambda *_: "/usr/bin/cc"
+    )
+    read_descriptor, write_descriptor = os.pipe()
+    os.close(write_descriptor)
+    responses = tmp_path / "responses"
+    try:
+        with os.fdopen(read_descriptor) as commands, responses.open("w+") as output:
+            with pytest.raises(ValueError, match="command channel closed"):
+                namespace["_serve_capability_guard"](guard, commands, output)
+    finally:
+        guard.close(remove_stage=True)
+
+
+def test_capability_guard_finalizes_only_exact_held_manifest(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    source_parent = tmp_path / "source"
+    stage_parent = tmp_path / "stage"
+    source_parent.mkdir()
+    stage_parent.mkdir()
+    source = source_parent / "capability.json"
+    destination = stage_parent / "linker-capability.json"
+    payload = {"accepted": True}
+    source.write_text(json.dumps(payload) + "\n")
+    guard = namespace["_CapabilityGuard"].stage(
+        source.resolve(), destination.resolve(), lambda *_: "/usr/bin/cc"
+    )
+    try:
+        embedded = {
+            **payload,
+            "copy": {
+                "absolute_path": str(destination.resolve()),
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            },
+        }
+        temporary = stage_parent / "manifest.json.tmp"
+        temporary.write_text(json.dumps({"linker_capability": embedded}) + "\n")
+        temporary.replace(stage_parent / "manifest.json")
+
+        guard.finalize()
+
+        assert guard.committed is True
+    finally:
+        guard.close(remove_stage=False)
+
+
+def test_capability_guard_runs_full_validation_on_exact_manifest_bytes(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    source_parent = tmp_path / "source"
+    stage_parent = tmp_path / "stage"
+    source_parent.mkdir()
+    stage_parent.mkdir()
+    source = source_parent / "capability.json"
+    destination = stage_parent / "linker-capability.json"
+    payload = {"accepted": True}
+    source.write_text(json.dumps(payload) + "\n")
+    guard = namespace["_CapabilityGuard"].stage(
+        source.resolve(), destination.resolve(), lambda *_: "/usr/bin/cc"
+    )
+    embedded = {
+        **payload,
+        "copy": {
+            "absolute_path": str(destination.resolve()),
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        },
+    }
+    manifest_path = stage_parent / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"linker_capability": embedded, "proof": "forged"}) + "\n"
+    )
+    try:
+        with pytest.raises(ValueError, match="full manifest rejected"):
+            guard.finalize(
+                lambda manifest, *_: namespace["_require"](
+                    manifest.get("proof") == "authenticated",
+                    "full manifest rejected",
+                )
+            )
+        assert guard.committed is False
+    finally:
+        guard.close(remove_stage=True)
+
+
+def test_capability_guard_rejects_manifest_replacement_during_full_validation(
+    tmp_path,
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    source_parent = tmp_path / "source"
+    stage_parent = tmp_path / "stage"
+    source_parent.mkdir()
+    stage_parent.mkdir()
+    source = source_parent / "capability.json"
+    destination = stage_parent / "linker-capability.json"
+    payload = {"accepted": True}
+    source.write_text(json.dumps(payload) + "\n")
+    guard = namespace["_CapabilityGuard"].stage(
+        source.resolve(), destination.resolve(), lambda *_: "/usr/bin/cc"
+    )
+    embedded = {
+        **payload,
+        "copy": {
+            "absolute_path": str(destination.resolve()),
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        },
+    }
+    manifest_path = stage_parent / "manifest.json"
+    manifest_path.write_text(json.dumps({"linker_capability": embedded}) + "\n")
+
+    def replace_manifest(*_):
+        replacement = stage_parent / "replacement.json"
+        replacement.write_text(json.dumps({"linker_capability": embedded}) + "\n")
+        replacement.replace(manifest_path)
+
+    try:
+        with pytest.raises(ValueError, match="manifest changed during full validation"):
+            guard.finalize(replace_manifest)
+        assert guard.committed is False
+    finally:
+        guard.close(remove_stage=True)
 
 
 def test_staged_identity_holds_original_parent_ancestry_across_verifications(tmp_path):
@@ -1377,6 +1657,7 @@ def make_semantic_capability_fixture(tmp_path, namespace):
         shapes[flavor] = {}
         linker = drivers[flavor]
         for target in ("elastic", "funnel", "profile"):
+            session = f"fixture-{flavor}-{target}"
             expected = namespace["_expected_capability_shape_paths"](
                 artifact_root, flavor, target
             )
@@ -1398,7 +1679,16 @@ def make_semantic_capability_fixture(tmp_path, namespace):
                 )
                 + "\n"
             )
+            input_object = deps / f"{target}.fixture.rcgu.o"
+            input_object.write_bytes(b"object fixture\n")
+            library_dir = expected["binary"].parent / "native-library"
+            library_dir.mkdir()
             printed_argv = [
+                str(input_object),
+                "-lfixture",
+                "-Wl,--as-needed",
+                "-L",
+                str(library_dir),
                 "-o",
                 str(raw_output),
                 "-Wl,-Bstatic",
@@ -1421,7 +1711,7 @@ def make_semantic_capability_fixture(tmp_path, namespace):
                 if not explicit_wrapper.exists():
                     explicit_wrapper.write_bytes(wrapper.read_bytes())
                     explicit_wrapper.chmod(0o755)
-                printed_driver = Path(drivers["actual"]["absolute_path"])
+                printed_driver = wrapper
                 printed_argv.extend(
                     (
                         f"-B{wrapper_dir}",
@@ -1431,8 +1721,14 @@ def make_semantic_capability_fixture(tmp_path, namespace):
                     )
                 )
                 observed_argv = [
+                    str(input_object),
+                    "-lfixture",
+                    "--as-needed",
+                    f"-L{library_dir}",
                     "-o",
                     str(raw_output),
+                    "-Bstatic",
+                    "-Bdynamic",
                     "-T",
                     fragments[target]["absolute_path"],
                     "-Map",
@@ -1449,6 +1745,10 @@ def make_semantic_capability_fixture(tmp_path, namespace):
                         "driver": linker["absolute_path"],
                         "driver_sha256": linker["sha256"],
                         "argv": observed_argv,
+                        "role": (
+                            "actual-driver" if flavor == "actual" else "explicit-linker"
+                        ),
+                        "session": session,
                     }
                 )
                 + "\n"
@@ -1457,19 +1757,44 @@ def make_semantic_capability_fixture(tmp_path, namespace):
                 expected["linker_trace"], linker, expected["binary"], flavor
             )
             expected["linker_execution"].write_text(json.dumps(execution) + "\n")
+            if flavor != "actual":
+                expected["cargo_trace"].write_text(
+                    json.dumps(
+                        {
+                            "driver": drivers["actual"]["absolute_path"],
+                            "driver_sha256": drivers["actual"]["sha256"],
+                            "argv": printed_argv,
+                            "role": "cargo-driver",
+                            "session": session,
+                        }
+                    )
+                    + "\n"
+                )
+                cargo_execution = namespace["replay_linker_execution"](
+                    expected["cargo_trace"],
+                    drivers["actual"],
+                    expected["binary"],
+                    "actual",
+                )
+                expected["cargo_execution"].write_text(
+                    json.dumps(cargo_execution) + "\n"
+                )
+            shape_keys = [
+                "binary",
+                "link_argv",
+                "link_map",
+                "symbols",
+                "layout",
+                "linker_execution",
+            ]
+            if flavor != "actual":
+                shape_keys.append("cargo_execution")
             shapes[flavor][target] = {
                 key: {
                     "absolute_path": str(expected[key]),
                     "sha256": digest(expected[key]),
                 }
-                for key in (
-                    "binary",
-                    "link_argv",
-                    "link_map",
-                    "symbols",
-                    "layout",
-                    "linker_execution",
-                )
+                for key in shape_keys
             }
     payload = {
         "accepted": True,
@@ -1602,6 +1927,82 @@ def test_shared_capability_validator_rejects_forged_explicit_driver(tmp_path, fl
 
 
 @pytest.mark.parametrize("flavor", ["gnu", "lld"])
+@pytest.mark.parametrize("difference", ["object", "library", "flag"])
+def test_shared_capability_validator_binds_complete_explicit_link_argv(
+    tmp_path, flavor, difference
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    payload, refresh, _, manifest_root, tools, _ = make_semantic_capability_fixture(
+        tmp_path, namespace
+    )
+    target = "elastic"
+    shape = payload["shapes"][flavor][target]
+    execution_path = Path(shape["linker_execution"]["absolute_path"])
+    execution = json.loads(execution_path.read_text())
+    trace_path = Path(execution["trace"]["absolute_path"])
+    trace = json.loads(trace_path.read_text())
+    if difference == "object":
+        index = next(
+            index
+            for index, argument in enumerate(trace["argv"])
+            if argument.endswith(".fixture.rcgu.o")
+        )
+        replacement = trace_path.parent / "different.fixture.rcgu.o"
+        replacement.write_bytes(b"different object\n")
+        trace["argv"][index] = str(replacement)
+    elif difference == "library":
+        trace["argv"][trace["argv"].index("-lfixture")] = "-ldifferent"
+    else:
+        trace["argv"][trace["argv"].index("--as-needed")] = "--no-as-needed"
+    trace_path.write_text(json.dumps(trace) + "\n")
+    execution["argv"] = trace["argv"]
+    execution["trace"]["sha256"] = digest(trace_path)
+    execution_path.write_text(json.dumps(execution) + "\n")
+    shape["linker_execution"]["sha256"] = digest(execution_path)
+    manifest = refresh()
+
+    with pytest.raises(ValueError, match="normalized Cargo/linker argv differs"):
+        namespace["_validate_capability"](
+            manifest, manifest_root / "manifest.json", ROOT, tools
+        )
+
+
+@pytest.mark.parametrize("flavor", ["gnu", "lld"])
+@pytest.mark.parametrize("addition", ["object", "library", "flag"])
+def test_shared_capability_validator_rejects_extra_explicit_link_semantics(
+    tmp_path, flavor, addition
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    payload, refresh, _, manifest_root, tools, _ = make_semantic_capability_fixture(
+        tmp_path, namespace
+    )
+    shape = payload["shapes"][flavor]["elastic"]
+    execution_path = Path(shape["linker_execution"]["absolute_path"])
+    execution = json.loads(execution_path.read_text())
+    trace_path = Path(execution["trace"]["absolute_path"])
+    trace = json.loads(trace_path.read_text())
+    if addition == "object":
+        added = trace_path.parent / "appended-different.rcgu.o"
+        added.write_bytes(b"different object\n")
+        trace["argv"].append(str(added))
+    elif addition == "library":
+        trace["argv"].append("-ldifferent")
+    else:
+        trace["argv"].append("--no-as-needed")
+    trace_path.write_text(json.dumps(trace) + "\n")
+    execution["argv"] = trace["argv"]
+    execution["trace"]["sha256"] = digest(trace_path)
+    execution_path.write_text(json.dumps(execution) + "\n")
+    shape["linker_execution"]["sha256"] = digest(execution_path)
+    manifest = refresh()
+
+    with pytest.raises(ValueError, match="extra semantic inputs"):
+        namespace["_validate_capability"](
+            manifest, manifest_root / "manifest.json", ROOT, tools
+        )
+
+
+@pytest.mark.parametrize("flavor", ["gnu", "lld"])
 def test_shared_capability_validator_binds_explicit_trace_fragment_and_map(
     tmp_path, flavor
 ):
@@ -1616,7 +2017,17 @@ def test_shared_capability_validator_binds_explicit_trace_fragment_and_map(
     execution = json.loads(execution_path.read_text())
     trace_path = Path(execution["trace"]["absolute_path"])
     trace = json.loads(trace_path.read_text())
-    trace["argv"] = trace["argv"][:2]
+    trace["argv"] = [
+        argument
+        for argument in trace["argv"]
+        if argument
+        not in (
+            "-T",
+            str(Path(payload["fragments"][target]["absolute_path"])),
+            "-Map",
+            str(Path(payload["shapes"][flavor][target]["link_map"]["absolute_path"])),
+        )
+    ]
     trace_path.write_text(json.dumps(trace) + "\n")
     execution["argv"] = trace["argv"]
     execution["trace"]["sha256"] = digest(trace_path)
@@ -1672,6 +2083,17 @@ def test_shared_capability_validator_rejects_conflicting_linker_controls(
     execution["trace"]["sha256"] = digest(trace_path)
     execution_path.write_text(json.dumps(execution) + "\n")
     shape["linker_execution"]["sha256"] = digest(execution_path)
+    if flavor != "actual":
+        cargo_execution_path = Path(shape["cargo_execution"]["absolute_path"])
+        cargo_execution = json.loads(cargo_execution_path.read_text())
+        cargo_trace_path = Path(cargo_execution["trace"]["absolute_path"])
+        cargo_trace = json.loads(cargo_trace_path.read_text())
+        cargo_trace["argv"].extend(conflicting_printed)
+        cargo_trace_path.write_text(json.dumps(cargo_trace) + "\n")
+        cargo_execution["argv"] = cargo_trace["argv"]
+        cargo_execution["trace"]["sha256"] = digest(cargo_trace_path)
+        cargo_execution_path.write_text(json.dumps(cargo_execution) + "\n")
+        shape["cargo_execution"]["sha256"] = digest(cargo_execution_path)
     manifest = refresh()
 
     with pytest.raises(ValueError, match="linker controls are not exact"):
@@ -1707,6 +2129,17 @@ def test_shared_capability_validator_rejects_linker_response_files(tmp_path, fla
     execution["trace"]["sha256"] = digest(trace_path)
     execution_path.write_text(json.dumps(execution) + "\n")
     shape["linker_execution"]["sha256"] = digest(execution_path)
+    if flavor != "actual":
+        cargo_execution_path = Path(shape["cargo_execution"]["absolute_path"])
+        cargo_execution = json.loads(cargo_execution_path.read_text())
+        cargo_trace_path = Path(cargo_execution["trace"]["absolute_path"])
+        cargo_trace = json.loads(cargo_trace_path.read_text())
+        cargo_trace["argv"].append(printed_response)
+        cargo_trace_path.write_text(json.dumps(cargo_trace) + "\n")
+        cargo_execution["argv"] = cargo_trace["argv"]
+        cargo_execution["trace"]["sha256"] = digest(cargo_trace_path)
+        cargo_execution_path.write_text(json.dumps(cargo_execution) + "\n")
+        shape["cargo_execution"]["sha256"] = digest(cargo_execution_path)
     manifest = refresh()
 
     with pytest.raises(ValueError, match="linker response files are forbidden"):
@@ -1777,15 +2210,25 @@ def test_shared_capability_validator_rejects_copied_fragment_alias(
 
 def test_launcher_stages_then_fully_validates_capability_before_build():
     source = LAUNCHER.read_text()
-    stage = 'stage-validate-capability --input "$capability_input"'
+    stage = 'guard-capability --input "$capability_input"'
     assert stage in source
     assert source.index(stage) < source.index("cargo build -vv")
+    assert "coproc CAPABILITY_GUARD" in source
+    assert 'stage-validate-capability --input "$capability_input"' not in source
     assert 'cp -- "$CACHE_GATE_LINKER_CAPABILITY"' not in source
     assert "capability=json.load(open(capability_path" not in source
     assert (
         'CACHE_GATE_LINKER_CAPABILITY="$manifest_dir/linker-capability.json"' in source
     )
     assert source.count("verify_staged_capability") >= 10
+    manifest_publish = source.index('Path(output + ".tmp").replace(output)')
+    manifest_validate = source.index(
+        'validate-manifest --manifest "$manifest_dir/manifest.json"'
+    )
+    finalize = source.index("printf 'FINALIZE\\n'")
+    assert manifest_publish < manifest_validate < finalize
+    assert 'wait "$capability_guard_pid"' in source[finalize:]
+    assert "capability guardian exited before CHECK" in source
     assert "error: staged capability identity changed" in source
     assert "staged capability changed during manifest construction" in source
     assert "elastic_bin=$(build_bench" not in source
@@ -1805,6 +2248,28 @@ def test_launcher_stages_then_fully_validates_capability_before_build():
     assert '"$manifest_dir/link-traces/$bench.jsonl"' in build_bench
     assert '"$manifest_dir/link-commands/$bench.json"' in build_bench
     assert "$manifest_dir/link-maps/$1.map" not in build_bench
+
+
+def test_manifest_build_rejects_and_scrubs_caller_rustflags():
+    source = LAUNCHER.read_text()
+    manifest = source[source.index("require_control_binary\n") :]
+    build_bench = manifest[
+        manifest.index("build_bench() {") : manifest.index("build_bench elastic_bin")
+    ]
+    assert "[[ -z ${RUSTFLAGS:-} ]]" in manifest
+    assert "[[ -z ${CARGO_ENCODED_RUSTFLAGS:-} ]]" in manifest
+    assert "unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS" in manifest
+    assert "${RUSTFLAGS:-}" not in build_bench
+    assert 'local rustflags="-C codegen-units=16 ' in build_bench
+    assert "f\"linker={tools['link_wrapper']['absolute_path']}\"" in manifest
+    validator = SCRIPT.read_text()
+    assert 'build["rustc_flags"] == expected_rustc_flags' in validator
+    assert 'build["linker_flags"]' in validator
+    assert "build flag manifest is not the exact authenticated vector" in validator
+    producer = LINK_CAPABILITY.read_text()
+    assert "[[ -z ${RUSTFLAGS:-} ]]" in producer
+    assert "[[ -z ${CARGO_ENCODED_RUSTFLAGS:-} ]]" in producer
+    assert "unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS" in producer
 
 
 def test_manifest_build_captures_and_authenticates_each_real_link_command():
@@ -2210,6 +2675,62 @@ def test_capability_replay_rejects_lexical_output_alias(
         namespace["replay_linker_execution"](trace, linker, binary, flavor)
 
 
+@pytest.mark.parametrize(
+    "output_argv",
+    [
+        lambda path: ["-o", path],
+        lambda path: [f"-o{path}"],
+        lambda path: ["--output", path],
+        lambda path: [f"--output={path}"],
+        lambda path: [f"-Wl,-o,{path}"],
+        lambda path: [f"-Wl,-o{path}"],
+        lambda path: [f"-Wl,--output,{path}"],
+        lambda path: [f"-Wl,--output={path}"],
+        lambda path: ["-Xlinker", "-o", "-Xlinker", path],
+        lambda path: ["-Xlinker=-o", f"-Xlinker={path}"],
+    ],
+    ids=(
+        "short-pair",
+        "short-joined",
+        "long-pair",
+        "long-equals",
+        "wl-short-pair",
+        "wl-short-joined",
+        "wl-long-pair",
+        "wl-long-equals",
+        "xlinker-pair",
+        "xlinker-equals",
+    ),
+)
+def test_output_inventory_normalizes_all_driver_and_linker_forms(tmp_path, output_argv):
+    namespace = runpy.run_path(str(SCRIPT))
+    output = str((tmp_path / "output").resolve())
+
+    assert namespace["_raw_output_values"](output_argv(output)) == [output]
+
+
+@pytest.mark.parametrize(
+    "conflicting_argv",
+    [
+        lambda path: ["--output", path],
+        lambda path: [f"--output={path}"],
+        lambda path: [f"-Wl,-o,{path}"],
+        lambda path: ["-Xlinker", "-o", "-Xlinker", path],
+    ],
+    ids=("long", "long-equals", "wl", "xlinker"),
+)
+def test_output_inventory_rejects_mixed_duplicate_semantic_outputs(
+    tmp_path, conflicting_argv
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    expected = str((tmp_path / "expected").resolve())
+    outside = str((tmp_path / "outside").resolve())
+    argv = ["-o", expected, *conflicting_argv(outside)]
+
+    assert namespace["_raw_output_values"](argv) == [expected, outside]
+    assert not namespace["_raw_output_matches"](argv, Path(expected))
+
+
 @pytest.mark.parametrize("flavor", ["gnu", "lld"])
 def test_capability_replay_rejects_duplicate_output_selectors(tmp_path, flavor):
     namespace = runpy.run_path(str(SCRIPT))
@@ -2456,14 +2977,16 @@ def test_inline_capability_consumer_requires_exact_actual_wrapper_path():
 
 def test_launcher_rejects_capability_input_symlink_ancestry_before_read():
     source = SCRIPT.read_text()
-    start = source.index("def _stage_capability_once(")
-    validator = source[start : source.index("def _require(", start)]
+    start = source.index("    def _stage(self, validator:")
+    validator = source[start : source.index("    def _install_watches", start)]
     opened = validator.index("os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC")
-    read = validator.index("source_bytes = _read_descriptor(source_descriptor)")
-    parsed = validator.index("payload = json.loads(source_bytes)")
+    read = validator.index(
+        "self.source_bytes = _read_descriptor(self.source_descriptor)"
+    )
+    parsed = validator.index("self.payload = json.loads(self.source_bytes)")
     assert opened < read < parsed
-    assert "_open_directory_with_identity_chain(source.parent)" in validator
-    assert "_verify_directory_identity_chain(\n            source.parent" in validator
+    assert "_open_directory_chain_held(\n            self.source.parent" in validator
+    assert "self.source_directories" in validator
 
 
 def test_stable_launcher_rejects_corrupt_manifest_before_execution(tmp_path):

@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
+import ctypes
 import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import stat
@@ -249,173 +252,392 @@ def _read_descriptor(descriptor: int) -> bytes:
         chunks.append(chunk)
 
 
+def _open_directory_chain_held(
+    directory: Path,
+) -> tuple[list[int], tuple[tuple[int, int], ...]]:
+    _require(directory.is_absolute(), f"directory path must be absolute: {directory}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptors = [os.open("/", flags)]
+    try:
+        for component in directory.parts[1:]:
+            descriptors.append(os.open(component, flags, dir_fd=descriptors[-1]))
+        identities = tuple(
+            (metadata.st_dev, metadata.st_ino)
+            for metadata in (os.fstat(descriptor) for descriptor in descriptors)
+        )
+        return descriptors, identities
+    except Exception:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+class _CapabilityGuard:
+    _IN_MODIFY = 0x00000002
+    _IN_ATTRIB = 0x00000004
+    _IN_CLOSE_WRITE = 0x00000008
+    _IN_Q_OVERFLOW = 0x00004000
+    _IN_UNMOUNT = 0x00002000
+    _IN_MOVE_SELF = 0x00000800
+    _IN_DELETE_SELF = 0x00000400
+    _IN_IGNORED = 0x00008000
+
+    def __init__(self, source: Path, destination: Path) -> None:
+        self.source = source
+        self.destination = destination
+        self.source_directories: list[int] = []
+        self.destination_directories: list[int] = []
+        self.source_ancestry: tuple[tuple[int, int], ...] = ()
+        self.destination_ancestry: tuple[tuple[int, int], ...] = ()
+        self.source_descriptor: int | None = None
+        self.staged_descriptor: int | None = None
+        self.inotify_descriptor: int | None = None
+        self.source_identity: tuple[int, int, int, int, int, int] | None = None
+        self.staged_identity: tuple[int, int, int, int, int, int] | None = None
+        self.staged_inode: tuple[int, int] | None = None
+        self.source_bytes = b""
+        self.payload: dict[str, Any] = {}
+        self.result = ""
+        self.identity = ""
+        self.poisoned = False
+        self.committed = False
+
+    @property
+    def source_parent(self) -> int:
+        return self.source_directories[-1]
+
+    @property
+    def destination_parent(self) -> int:
+        return self.destination_directories[-1]
+
+    @classmethod
+    def stage(
+        cls,
+        source: Path,
+        destination: Path,
+        validator: Callable[[Path, dict[str, Any]], str],
+    ) -> _CapabilityGuard:
+        guard = cls(source, destination)
+        try:
+            guard._stage(validator)
+            return guard
+        except Exception:
+            guard.close(remove_stage=True)
+            raise
+
+    def _stage(self, validator: Callable[[Path, dict[str, Any]], str]) -> None:
+        _require(self.source.is_absolute(), "capability input must be absolute")
+        _require(
+            self.destination.is_absolute(), "staged capability path must be absolute"
+        )
+        _require(
+            self.source == self.source.resolve(strict=True),
+            "capability input path is not canonical",
+        )
+        _require(
+            self.destination.parent == self.destination.parent.resolve(strict=True),
+            "staged capability parent is not canonical",
+        )
+        self.source_directories, self.source_ancestry = _open_directory_chain_held(
+            self.source.parent
+        )
+        (
+            self.destination_directories,
+            self.destination_ancestry,
+        ) = _open_directory_chain_held(self.destination.parent)
+        self.source_descriptor = os.open(
+            self.source.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=self.source_parent,
+        )
+        source_stat = os.fstat(self.source_descriptor)
+        _require(
+            stat.S_ISREG(source_stat.st_mode) and source_stat.st_nlink == 1,
+            "capability input is not a private regular file",
+        )
+        self.source_identity = _stat_identity(source_stat)
+        _require(
+            _stat_identity(
+                os.stat(
+                    self.source.name, dir_fd=self.source_parent, follow_symlinks=False
+                )
+            )
+            == self.source_identity,
+            "capability input path changed before staging",
+        )
+        self.source_bytes = _read_descriptor(self.source_descriptor)
+        self.payload = json.loads(self.source_bytes)
+        self.staged_descriptor = os.open(
+            self.destination.name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=self.destination_parent,
+        )
+        view = memoryview(self.source_bytes)
+        while view:
+            written = os.write(self.staged_descriptor, view)
+            _require(written > 0, "short staged capability write")
+            view = view[written:]
+        os.fsync(self.staged_descriptor)
+        os.lseek(self.staged_descriptor, 0, os.SEEK_SET)
+        _require(
+            _read_descriptor(self.staged_descriptor) == self.source_bytes,
+            "staged capability bytes differ from input",
+        )
+        staged_stat = os.fstat(self.staged_descriptor)
+        _require(
+            stat.S_ISREG(staged_stat.st_mode) and staged_stat.st_nlink == 1,
+            "staged capability is not a private regular file",
+        )
+        self.staged_inode = (staged_stat.st_dev, staged_stat.st_ino)
+        os.fchmod(self.staged_descriptor, 0o444)
+        os.fsync(self.staged_descriptor)
+        os.fsync(self.destination_parent)
+        self.staged_identity = _stat_identity(os.fstat(self.staged_descriptor))
+        self._install_watches()
+        self.checkpoint()
+        self.result = validator(self.destination, self.payload)
+        self.checkpoint()
+        self.identity = ":".join(
+            (
+                _directory_identity_fingerprint(self.destination_ancestry),
+                str(self.staged_identity[0]),
+                str(self.staged_identity[1]),
+                str(self.staged_identity[3]),
+                hashlib.sha256(self.source_bytes).hexdigest(),
+            )
+        )
+
+    def _install_watches(self) -> None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        init = libc.inotify_init1
+        init.argtypes = (ctypes.c_int,)
+        init.restype = ctypes.c_int
+        add = libc.inotify_add_watch
+        add.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32)
+        add.restype = ctypes.c_int
+        descriptor = init(os.O_CLOEXEC | os.O_NONBLOCK)
+        if descriptor < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        self.inotify_descriptor = descriptor
+        directory_mask = (
+            self._IN_MOVE_SELF
+            | self._IN_DELETE_SELF
+            | self._IN_UNMOUNT
+            | self._IN_IGNORED
+        )
+        file_mask = (
+            directory_mask | self._IN_MODIFY | self._IN_ATTRIB | self._IN_CLOSE_WRITE
+        )
+        watched = [
+            *(descriptor for descriptor in self.source_directories),
+            *(descriptor for descriptor in self.destination_directories),
+        ]
+        watched.extend((self.source_descriptor, self.staged_descriptor))
+        for held in watched:
+            assert held is not None
+            mask = (
+                file_mask
+                if held in (self.source_descriptor, self.staged_descriptor)
+                else directory_mask
+            )
+            if add(descriptor, f"/proc/self/fd/{held}".encode(), mask) < 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+
+    def _drain_events(self) -> None:
+        if self.inotify_descriptor is None:
+            return
+        while True:
+            try:
+                events = os.read(self.inotify_descriptor, 1024 * 1024)
+            except BlockingIOError:
+                return
+            if not events:
+                return
+            self.poisoned = True
+
+    def checkpoint(self) -> None:
+        self._drain_events()
+        _require(
+            not self.poisoned, "capability guardian observed an inode lifecycle event"
+        )
+        assert self.source_descriptor is not None
+        assert self.staged_descriptor is not None
+        assert self.source_identity is not None
+        assert self.staged_identity is not None
+        _require(
+            _stat_identity(os.fstat(self.source_descriptor)) == self.source_identity
+            and _stat_identity(
+                os.stat(
+                    self.source.name, dir_fd=self.source_parent, follow_symlinks=False
+                )
+            )
+            == self.source_identity,
+            "capability input changed while guarded",
+        )
+        os.lseek(self.source_descriptor, 0, os.SEEK_SET)
+        _require(
+            _read_descriptor(self.source_descriptor) == self.source_bytes,
+            "capability input bytes changed while guarded",
+        )
+        _require(
+            _stat_identity(os.fstat(self.staged_descriptor)) == self.staged_identity
+            and _stat_identity(
+                os.stat(
+                    self.destination.name,
+                    dir_fd=self.destination_parent,
+                    follow_symlinks=False,
+                )
+            )
+            == self.staged_identity,
+            "staged capability changed while guarded",
+        )
+        os.lseek(self.staged_descriptor, 0, os.SEEK_SET)
+        _require(
+            _read_descriptor(self.staged_descriptor) == self.source_bytes,
+            "staged capability bytes changed while guarded",
+        )
+        _verify_directory_identity_chain(
+            self.source.parent, self.source_ancestry, "capability input"
+        )
+        _verify_directory_identity_chain(
+            self.destination.parent,
+            self.destination_ancestry,
+            "staged capability",
+        )
+        self._drain_events()
+        _require(
+            not self.poisoned, "capability guardian observed an inode lifecycle event"
+        )
+
+    def finalize(
+        self,
+        manifest_validator: Callable[[dict[str, Any], Path, bytes], None] | None = None,
+    ) -> None:
+        self.checkpoint()
+        manifest_descriptor = os.open(
+            "manifest.json",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=self.destination_parent,
+        )
+        try:
+            before = os.fstat(manifest_descriptor)
+            _require(
+                stat.S_ISREG(before.st_mode) and before.st_nlink == 1,
+                "guarded manifest is not a private regular file",
+            )
+            manifest_bytes = _read_descriptor(manifest_descriptor)
+            manifest = json.loads(manifest_bytes)
+            _require(
+                _stat_identity(
+                    os.stat(
+                        "manifest.json",
+                        dir_fd=self.destination_parent,
+                        follow_symlinks=False,
+                    )
+                )
+                == _stat_identity(before),
+                "guarded manifest path changed before validation",
+            )
+            if manifest_validator is not None:
+                manifest_validator(
+                    manifest,
+                    self.destination.parent / "manifest.json",
+                    self.source_bytes,
+                )
+            os.lseek(manifest_descriptor, 0, os.SEEK_SET)
+            after = os.fstat(manifest_descriptor)
+            _require(
+                _stat_identity(before)
+                == _stat_identity(after)
+                == _stat_identity(
+                    os.stat(
+                        "manifest.json",
+                        dir_fd=self.destination_parent,
+                        follow_symlinks=False,
+                    )
+                )
+                and _read_descriptor(manifest_descriptor) == manifest_bytes,
+                "guarded manifest changed during full validation",
+            )
+        finally:
+            os.close(manifest_descriptor)
+        embedded = manifest.get("linker_capability", {})
+        _require(
+            isinstance(embedded, dict)
+            and embedded.get("copy")
+            == {
+                "absolute_path": str(self.destination),
+                "sha256": hashlib.sha256(self.source_bytes).hexdigest(),
+            }
+            and {key: value for key, value in embedded.items() if key != "copy"}
+            == self.payload,
+            "guarded manifest capability differs from held bytes",
+        )
+        self.checkpoint()
+        self.committed = True
+
+    def close(self, *, remove_stage: bool) -> None:
+        checkpoint_error: Exception | None = None
+        if self.committed:
+            try:
+                self.checkpoint()
+            except Exception as error:  # preserve cleanup before surfacing final race
+                checkpoint_error = error
+        if remove_stage and not self.committed and self.destination_directories:
+            try:
+                current = os.stat(
+                    self.destination.name,
+                    dir_fd=self.destination_parent,
+                    follow_symlinks=False,
+                )
+                if (
+                    self.staged_inode is not None
+                    and (
+                        current.st_dev,
+                        current.st_ino,
+                    )
+                    == self.staged_inode
+                ):
+                    os.unlink(self.destination.name, dir_fd=self.destination_parent)
+                    os.fsync(self.destination_parent)
+            except OSError:
+                pass
+        if self.inotify_descriptor is not None:
+            os.close(self.inotify_descriptor)
+            self.inotify_descriptor = None
+        for descriptor_name in ("staged_descriptor", "source_descriptor"):
+            descriptor = getattr(self, descriptor_name)
+            if descriptor is not None:
+                os.close(descriptor)
+                setattr(self, descriptor_name, None)
+        for descriptors in (
+            self.destination_directories,
+            self.source_directories,
+        ):
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+            descriptors.clear()
+        if checkpoint_error is not None:
+            raise checkpoint_error
+
+
 def _stage_capability_once(
     source: Path,
     destination: Path,
     validator: Callable[[Path, dict[str, Any]], str],
 ) -> tuple[str, str, str]:
-    _require(source.is_absolute(), "capability input must be absolute")
-    _require(destination.is_absolute(), "staged capability path must be absolute")
-    _require(
-        source == source.resolve(strict=True),
-        "capability input path is not canonical",
-    )
-    _require(
-        destination.parent == destination.parent.resolve(strict=True),
-        "staged capability parent is not canonical",
-    )
-    source_parent, source_ancestry = _open_directory_with_identity_chain(source.parent)
-    destination_parent, destination_ancestry = _open_directory_with_identity_chain(
-        destination.parent
-    )
-    source_descriptor: int | None = None
-    staged_descriptor: int | None = None
-    staged_identity: tuple[int, int] | None = None
+    guard = _CapabilityGuard.stage(source, destination, validator)
     try:
-        source_descriptor = os.open(
-            source.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=source_parent,
+        return (
+            guard.result,
+            guard.identity,
+            base64.b64encode(guard.source_bytes).decode("ascii"),
         )
-        source_stat = os.fstat(source_descriptor)
-        _require(
-            stat.S_ISREG(source_stat.st_mode),
-            "capability input is not a regular file",
-        )
-        source_identity = _stat_identity(source_stat)
-        source_path_stat = os.stat(
-            source.name, dir_fd=source_parent, follow_symlinks=False
-        )
-        _require(
-            _stat_identity(source_path_stat) == source_identity,
-            "capability input path changed before staging",
-        )
-        source_bytes = _read_descriptor(source_descriptor)
-        _require(
-            _stat_identity(os.fstat(source_descriptor)) == source_identity
-            and _stat_identity(
-                os.stat(source.name, dir_fd=source_parent, follow_symlinks=False)
-            )
-            == source_identity,
-            "capability input changed during staging",
-        )
-        payload = json.loads(source_bytes)
-        staged_descriptor = os.open(
-            destination.name,
-            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-            dir_fd=destination_parent,
-        )
-        view = memoryview(source_bytes)
-        while view:
-            written = os.write(staged_descriptor, view)
-            _require(written > 0, "short staged capability write")
-            view = view[written:]
-        os.fsync(staged_descriptor)
-        os.lseek(staged_descriptor, 0, os.SEEK_SET)
-        _require(
-            _read_descriptor(staged_descriptor) == source_bytes,
-            "staged capability bytes differ from input",
-        )
-        staged_stat = os.fstat(staged_descriptor)
-        _require(
-            stat.S_ISREG(staged_stat.st_mode) and staged_stat.st_nlink == 1,
-            "staged capability is not a private regular file",
-        )
-        staged_identity = (staged_stat.st_dev, staged_stat.st_ino)
-        _require(
-            _stat_identity(
-                os.stat(
-                    destination.name, dir_fd=destination_parent, follow_symlinks=False
-                )
-            )
-            == _stat_identity(staged_stat),
-            "staged capability path changed before validation",
-        )
-        _verify_directory_identity_chain(
-            source.parent, source_ancestry, "capability input"
-        )
-        _verify_directory_identity_chain(
-            destination.parent, destination_ancestry, "staged capability"
-        )
-        result = validator(destination, payload)
-        _verify_directory_identity_chain(
-            source.parent, source_ancestry, "capability input"
-        )
-        _verify_directory_identity_chain(
-            destination.parent, destination_ancestry, "staged capability"
-        )
-        _require(
-            _stat_identity(os.fstat(source_descriptor)) == source_identity
-            and _stat_identity(
-                os.stat(source.name, dir_fd=source_parent, follow_symlinks=False)
-            )
-            == source_identity,
-            "capability input changed during validation",
-        )
-        os.lseek(staged_descriptor, 0, os.SEEK_SET)
-        final_staged_stat = os.fstat(staged_descriptor)
-        _require(
-            _stat_identity(final_staged_stat) == _stat_identity(staged_stat)
-            and _stat_identity(
-                os.stat(
-                    destination.name, dir_fd=destination_parent, follow_symlinks=False
-                )
-            )
-            == _stat_identity(staged_stat)
-            and _read_descriptor(staged_descriptor) == source_bytes,
-            "staged capability changed during validation",
-        )
-        os.fchmod(staged_descriptor, 0o444)
-        os.fsync(staged_descriptor)
-        os.fsync(destination_parent)
-        published_stat = os.fstat(staged_descriptor)
-        _require(
-            _stat_identity(
-                os.stat(
-                    destination.name, dir_fd=destination_parent, follow_symlinks=False
-                )
-            )
-            == _stat_identity(published_stat),
-            "staged capability changed during publication",
-        )
-        _verify_directory_identity_chain(
-            source.parent, source_ancestry, "capability input"
-        )
-        _verify_directory_identity_chain(
-            destination.parent, destination_ancestry, "staged capability"
-        )
-        identity = ":".join(
-            (
-                _directory_identity_fingerprint(destination_ancestry),
-                str(published_stat.st_dev),
-                str(published_stat.st_ino),
-                str(published_stat.st_size),
-                hashlib.sha256(source_bytes).hexdigest(),
-            )
-        )
-        return result, identity, base64.b64encode(source_bytes).decode("ascii")
-    except Exception:
-        if staged_identity is not None:
-            try:
-                current = os.stat(
-                    destination.name,
-                    dir_fd=destination_parent,
-                    follow_symlinks=False,
-                )
-                if (current.st_dev, current.st_ino) == staged_identity:
-                    os.unlink(destination.name, dir_fd=destination_parent)
-                    os.fsync(destination_parent)
-            except OSError:
-                pass
-        raise
     finally:
-        if staged_descriptor is not None:
-            os.close(staged_descriptor)
-        if source_descriptor is not None:
-            os.close(source_descriptor)
-        os.close(destination_parent)
-        os.close(source_parent)
+        guard.close(remove_stage=False)
 
 
 def _read_verified_staged_capability(path: Path, expected_identity: str) -> bytes:
@@ -983,7 +1205,19 @@ def replay_linker_execution(
         observed.get("driver_sha256") == linker_record["sha256"],
         f"observed {flavor} linker hash differs from recorded linker",
     )
-    return {
+    role = observed.get("role")
+    session = observed.get("session")
+    _require(
+        (role is None and session is None)
+        or (
+            isinstance(role, str)
+            and bool(role)
+            and isinstance(session, str)
+            and bool(session)
+        ),
+        f"observed {flavor} linker role/session is incomplete",
+    )
+    result = {
         "linker": linker_record,
         "argv": observed["argv"],
         "executable": str(executable),
@@ -995,6 +1229,10 @@ def replay_linker_execution(
             "final_link_record_count": len(matches),
         },
     }
+    if role is not None:
+        result["role"] = role
+        result["session"] = session
+    return result
 
 
 def _validate_actual_link_argv_trace(
@@ -1156,8 +1394,120 @@ def _raw_linker_controls(
     return scripts, maps
 
 
+def _normalize_raw_linker_semantics(argv: list[str]) -> list[str]:
+    normalized: list[str] = []
+    index = 0
+    paired = {
+        "-o": "output",
+        "--output": "output",
+        "-L": "library-path",
+        "-T": "script",
+        "--script": "script",
+        "-Map": "map",
+        "--Map": "map",
+    }
+    while index < len(argv):
+        argument = argv[index]
+        if argument in paired and index + 1 < len(argv):
+            normalized.append(f"{paired[argument]}:{argv[index + 1]}")
+            index += 2
+            continue
+        if argument.startswith("--output="):
+            normalized.append(f"output:{argument.split('=', 1)[1]}")
+        elif argument.startswith("-o") and len(argument) > 2:
+            normalized.append(f"output:{argument[2:]}")
+        elif argument.startswith("-L") and len(argument) > 2:
+            normalized.append(f"library-path:{argument[2:]}")
+        elif argument.startswith("-l") and len(argument) > 2:
+            normalized.append(f"library:{argument}")
+        elif argument.startswith("--script="):
+            normalized.append(f"script:{argument.split('=', 1)[1]}")
+        elif argument.startswith("-T") and len(argument) > 2:
+            normalized.append(f"script:{argument[2:]}")
+        elif argument.startswith("-Map=") or argument.startswith("--Map="):
+            normalized.append(f"map:{argument.split('=', 1)[1]}")
+        elif not argument.startswith("-"):
+            normalized.append(f"input:{argument}")
+        else:
+            normalized.append(f"flag:{argument}")
+        index += 1
+    return normalized
+
+
+def _normalize_cargo_linker_semantics(argv: list[str]) -> list[str]:
+    linker_argv: list[str] = []
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument.startswith("-Wl,"):
+            linker_argv.extend(argument.removeprefix("-Wl,").split(","))
+        elif argument == "-Xlinker" and index + 1 < len(argv):
+            linker_argv.append(argv[index + 1])
+            index += 1
+        elif argument.startswith("-Xlinker="):
+            linker_argv.append(argument.removeprefix("-Xlinker="))
+        elif argument in {"-o", "--output", "-L"} and index + 1 < len(argv):
+            linker_argv.extend((argument, argv[index + 1]))
+            index += 1
+        elif argument.startswith(
+            ("-o", "--output=", "-L", "-l")
+        ) or not argument.startswith("-"):
+            linker_argv.append(argument)
+        index += 1
+    return _normalize_raw_linker_semantics(linker_argv)
+
+
+def _is_ordered_subsequence(expected: list[str], observed: list[str]) -> bool:
+    cursor = iter(observed)
+    return all(any(candidate == value for candidate in cursor) for value in expected)
+
+
+def _unexpected_explicit_linker_semantics(
+    expected: list[str], observed: list[str]
+) -> list[str]:
+    matched: set[int] = set()
+    cursor = 0
+    for value in expected:
+        while cursor < len(observed) and observed[cursor] != value:
+            cursor += 1
+        if cursor == len(observed):
+            return ["missing:" + value]
+        matched.add(cursor)
+        cursor += 1
+    sensitive_flags = {
+        "flag:--as-needed",
+        "flag:--no-as-needed",
+        "flag:-Bstatic",
+        "flag:-Bdynamic",
+        "flag:--whole-archive",
+        "flag:--no-whole-archive",
+        "flag:-static",
+        "flag:-shared",
+        "flag:-pie",
+        "flag:-no-pie",
+    }
+    default_libraries = {"library:-lc", "library:-lgcc", "library:-lgcc_s"}
+    crt_object = re.compile(
+        r"^(?:[A-Za-z]*crt[0-9A-Za-z_]*|crt(?:begin|end)[0-9A-Za-z_]*)\.o$"
+    )
+    unexpected: list[str] = []
+    for index, value in enumerate(observed):
+        if index in matched:
+            continue
+        if value in sensitive_flags:
+            unexpected.append(value)
+        elif value.startswith("library:") and value not in default_libraries:
+            unexpected.append(value)
+        elif value.startswith("input:"):
+            name = Path(value.removeprefix("input:")).name
+            if name.endswith((".o", ".rlib", ".a")) and not crt_object.fullmatch(name):
+                unexpected.append(value)
+    return unexpected
+
+
 def _validate_explicit_link_argv_trace(
     link_argv: Path,
+    cargo_observed: dict[str, Any],
     observed: dict[str, Any],
     configured_driver: Path,
     reviewed_wrapper: Path,
@@ -1167,11 +1517,16 @@ def _validate_explicit_link_argv_trace(
     link_map: Path,
     label: str,
 ) -> None:
-    environment, printed_driver, printed_argv = _parse_cargo_link_argv(link_argv)
+    _, printed_driver, printed_argv = _parse_cargo_link_argv(link_argv)
     _require(
-        _resolve_printed_cargo_driver(environment, printed_driver, label)
-        == configured_driver,
-        f"{label} Cargo driver differs from configured linker",
+        printed_driver == str(reviewed_wrapper.resolve()),
+        f"{label} link argv did not execute reviewed wrapper",
+    )
+    _require(
+        printed_argv == cargo_observed.get("argv")
+        and cargo_observed.get("linker", {}).get("absolute_path")
+        == str(configured_driver),
+        f"{label} Cargo link argv differs from execution trace",
     )
     fuse = "bfd" if flavor == "gnu" else "lld"
     wrapper_dir = artifact_root / flavor / "linker-wrapper"
@@ -1187,6 +1542,7 @@ def _validate_explicit_link_argv_trace(
     selection, scripts, maps = _printed_linker_controls(printed_argv)
     _require(
         not _linker_response_files(printed_argv)
+        and not _linker_response_files(cargo_observed.get("argv", []))
         and not _linker_response_files(observed.get("argv", [])),
         f"{label} linker response files are forbidden",
     )
@@ -1194,7 +1550,8 @@ def _validate_explicit_link_argv_trace(
         selection == [f"-B{wrapper_dir}", f"-fuse-ld={fuse}"]
         and scripts == [f"-Wl,-T,{fragment}"]
         and maps == [f"-Wl,-Map,{link_map}"]
-        and _raw_output_values(printed_argv) == [observed.get("raw_output")],
+        and _raw_output_values(printed_argv) == [cargo_observed.get("raw_output")]
+        and cargo_observed.get("raw_output") == observed.get("raw_output"),
         f"{label} linker controls are not exact",
     )
     observed_argv = observed.get("argv", [])
@@ -1208,6 +1565,24 @@ def _validate_explicit_link_argv_trace(
         and observed_scripts == [("-T", str(fragment))]
         and observed_maps == [("-Map", str(link_map))],
         f"{label} observed linker controls are not exact",
+    )
+    _require(
+        cargo_observed.get("role") == "cargo-driver"
+        and observed.get("role") == "explicit-linker"
+        and cargo_observed.get("session") == observed.get("session")
+        and isinstance(observed.get("session"), str)
+        and bool(observed["session"]),
+        f"{label} Cargo/linker trace correlation differs",
+    )
+    normalized_cargo = _normalize_cargo_linker_semantics(printed_argv)
+    normalized_linker = _normalize_raw_linker_semantics(observed_argv)
+    _require(
+        _is_ordered_subsequence(normalized_cargo, normalized_linker),
+        f"{label} normalized Cargo/linker argv differs",
+    )
+    _require(
+        not _unexpected_explicit_linker_semantics(normalized_cargo, normalized_linker),
+        f"{label} normalized Cargo/linker argv has extra semantic inputs",
     )
 
 
@@ -1372,6 +1747,8 @@ def _expected_capability_shape_paths(
         "layout": flavor_root / f"{target}.layout.json",
         "linker_execution": flavor_root / f"{target}.linker-execution.json",
         "linker_trace": flavor_root / f"{target}.linker-trace.jsonl",
+        "cargo_execution": flavor_root / f"{target}.cargo-driver-execution.json",
+        "cargo_trace": flavor_root / f"{target}.cargo-driver-trace.jsonl",
     }
 
 
@@ -1380,6 +1757,7 @@ def _validate_capability(
     manifest_path: Path,
     runner: Path,
     tools: dict[str, Path],
+    capability_document: bytes | None = None,
 ) -> tuple[dict[str, Any], Path, dict[str, Path]]:
     embedded = manifest["linker_capability"]
     _exact_keys(
@@ -1402,12 +1780,25 @@ def _validate_capability(
         "linker capability",
     )
     _require(embedded["accepted"] is True, "linker capability is not accepted")
-    copy_path = _exact_capability_file_record(
-        embedded["copy"],
-        manifest_path.parent / "linker-capability.json",
-        "linker capability copy",
-    )
-    capability = _json_file(copy_path, "linker capability copy")
+    expected_copy = manifest_path.parent / "linker-capability.json"
+    if capability_document is None:
+        copy_path = _exact_capability_file_record(
+            embedded["copy"],
+            expected_copy,
+            "linker capability copy",
+        )
+        capability = _json_file(copy_path, "linker capability copy")
+    else:
+        copy_path = expected_copy
+        _require(
+            embedded.get("copy")
+            == {
+                "absolute_path": str(expected_copy),
+                "sha256": hashlib.sha256(capability_document).hexdigest(),
+            },
+            "linker capability copy record differs from held bytes",
+        )
+        capability = json.loads(capability_document)
     _require(
         capability == {key: value for key, value in embedded.items() if key != "copy"},
         "embedded linker capability differs from authenticated copy",
@@ -1511,6 +1902,8 @@ def _validate_capability(
                     "layout",
                     "linker_execution",
                 }
+                if flavor != "actual":
+                    expected_shape_keys.add("cargo_execution")
                 _exact_keys(
                     shape, expected_shape_keys, f"{flavor}/{target} capability shape"
                 )
@@ -1650,8 +2043,34 @@ def _validate_capability(
                         f"{flavor}/{target}",
                     )
                 else:
+                    cargo_execution_path = _exact_capability_file_record(
+                        shape["cargo_execution"],
+                        expected_paths["cargo_execution"],
+                        f"{flavor}/{target} Cargo driver execution",
+                    )
+                    cargo_observed = _json_file(
+                        cargo_execution_path,
+                        f"{flavor}/{target} Cargo driver execution",
+                    )
+                    cargo_trace_path = _exact_capability_file_record(
+                        cargo_observed.get("trace", {}),
+                        expected_paths["cargo_trace"],
+                        f"{flavor}/{target} Cargo driver trace",
+                        trace=True,
+                    )
+                    regenerated_cargo = replay_linker_execution(
+                        cargo_trace_path,
+                        capability["linker"],
+                        paths["binary"],
+                        "actual",
+                    )
+                    _require(
+                        regenerated_cargo == cargo_observed,
+                        f"{flavor}/{target} Cargo driver execution proof differs from trace",
+                    )
                     _validate_explicit_link_argv_trace(
                         paths["link_argv"],
+                        cargo_observed,
                         observed,
                         Path(capability["linker"]["absolute_path"]),
                         tools["link_wrapper"],
@@ -1800,6 +2219,33 @@ def _validate_main_link_records(
         and build["locked"] is True
         and build["codegen_units"] == 16,
         "build configuration mismatch",
+    )
+    expected_rustc_flags = [
+        "-C",
+        "codegen-units=16",
+        "-C",
+        "link-arg=-Wl,-T,<target-fragment>",
+        "-C",
+        "link-arg=-Wl,-Map,<per-target-map>",
+        "-C",
+        f"linker={manifest['tools']['link_wrapper']['absolute_path']}",
+    ]
+    if manifest.get("layout_adversary", {}).get("enabled") is True:
+        expected_rustc_flags.extend(
+            [
+                "--cfg",
+                "cache_gate_layout_adversary",
+                "--check-cfg=cfg(cache_gate_layout_adversary)",
+            ]
+        )
+    _require(
+        build["rustc_flags"] == expected_rustc_flags
+        and build["linker_flags"]
+        == [
+            "-Wl,-T,<target-fragment>",
+            "-Wl,-Map,<per-target-map>",
+        ],
+        "build flag manifest is not the exact authenticated vector",
     )
     proof = manifest["build_proof"]
     aggregate_fields = {
@@ -2051,7 +2497,11 @@ def rederive_manifest_layouts(
             )
 
 
-def validate_supplied_manifest(manifest: dict[str, Any], manifest_path: Path) -> None:
+def validate_supplied_manifest(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    capability_document: bytes | None = None,
+) -> None:
     _require(
         manifest_path.is_absolute()
         and manifest_path.is_file()
@@ -2075,7 +2525,11 @@ def validate_supplied_manifest(manifest: dict[str, Any], manifest_path: Path) ->
     runner_target = (runner / "target").resolve()
     tools = _validate_tools(manifest["tools"])
     capability, capability_path, fragments = _validate_capability(
-        manifest, manifest_path.resolve(), runner, tools
+        manifest,
+        manifest_path.resolve(),
+        runner,
+        tools,
+        capability_document,
     )
     _validate_control(manifest["control"])
     _exact_keys(manifest["symbols"], set(EXECUTABLE_TARGETS), "symbol executable set")
@@ -2484,7 +2938,17 @@ def parse_link_map(text: str) -> dict[str, Any]:
     }
 
 
+def _decode_capability_document(encoded: str, label: str) -> bytes:
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise LayoutError(f"invalid {label}") from error
+
+
 def _load_capability() -> dict[str, Any]:
+    encoded = os.environ.get("CACHE_GATE_LINKER_CAPABILITY_DOCUMENT_B64")
+    if encoded:
+        return json.loads(_decode_capability_document(encoded, "capability document"))
     path = os.environ.get("CACHE_GATE_LINKER_CAPABILITY")
     if not path:
         raise LayoutError("CACHE_GATE_LINKER_CAPABILITY is required for validate")
@@ -2864,17 +3328,30 @@ def validate_link_command(args: argparse.Namespace) -> dict[str, Any]:
     for path, label in (
         (args.trace, "trace"),
         (args.executable, "executable"),
-        (args.capability, "capability"),
         (args.fragment, "fragment"),
         (args.link_map, "link map"),
     ):
         _require(path.is_absolute(), f"--{label.replace(' ', '-')} must be absolute")
         _require(path.is_file() and not path.is_symlink(), f"invalid {label}: {path}")
-    capability_bytes = (
-        _read_verified_staged_capability(args.capability, args.capability_identity)
-        if args.capability_identity
-        else args.capability.read_bytes()
+    _require(
+        bool(args.capability) != bool(args.capability_document_b64),
+        "provide exactly one capability path or held capability document",
     )
+    if args.capability_document_b64:
+        capability_bytes = _decode_capability_document(
+            args.capability_document_b64, "held capability document"
+        )
+    else:
+        _require(args.capability.is_absolute(), "--capability must be absolute")
+        _require(
+            args.capability.is_file() and not args.capability.is_symlink(),
+            f"invalid capability: {args.capability}",
+        )
+        capability_bytes = (
+            _read_verified_staged_capability(args.capability, args.capability_identity)
+            if args.capability_identity
+            else args.capability.read_bytes()
+        )
     capability = json.loads(capability_bytes)
     linker = capability.get("linker", {})
     configured_driver = _validate_linker_record(linker, "capability linker")
@@ -2892,12 +3369,49 @@ def validate_link_command(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _raw_output_values(argv: list[str]) -> list[str]:
-    outputs: list[str] = []
-    for index, token in enumerate(argv):
-        if token == "-o" and index + 1 < len(argv):
-            outputs.append(argv[index + 1])
-        elif token.startswith("-o") and len(token) > 2:
-            outputs.append(token[2:])
+    def collect(tokens: list[str]) -> list[str]:
+        outputs: list[str] = []
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token in ("-o", "--output"):
+                if index + 1 < len(tokens):
+                    outputs.append(tokens[index + 1])
+                    index += 2
+                    continue
+            elif token.startswith("--output="):
+                outputs.append(token.removeprefix("--output="))
+            elif token.startswith("-o") and len(token) > 2:
+                outputs.append(token[2:])
+            index += 1
+        return outputs
+
+    direct: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "-Xlinker" and index + 1 < len(argv):
+            index += 2
+            continue
+        if token.startswith(("-Xlinker=", "-Wl,")):
+            index += 1
+            continue
+        direct.append(token)
+        index += 1
+    outputs = collect(direct)
+    forwarded: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token.startswith("-Wl,"):
+            forwarded.extend(token.removeprefix("-Wl,").split(","))
+        elif token == "-Xlinker" and index + 1 < len(argv):
+            forwarded.append(argv[index + 1])
+            index += 1
+        elif token.startswith("-Xlinker="):
+            forwarded.append(token.removeprefix("-Xlinker="))
+        index += 1
+    outputs.extend(collect(forwarded))
     return outputs
 
 
@@ -3010,7 +3524,19 @@ def validate_linker_execution(args: argparse.Namespace) -> dict[str, Any]:
         record.get("driver_sha256") == digest(linker),
         "observed linker hash differs from required explicit linker",
     )
-    return {
+    role = record.get("role")
+    session = record.get("session")
+    _require(
+        (role is None and session is None)
+        or (
+            isinstance(role, str)
+            and bool(role)
+            and isinstance(session, str)
+            and bool(session)
+        ),
+        "observed linker role/session is incomplete",
+    )
+    result = {
         "linker": {
             "absolute_path": str(linker),
             "sha256": digest(linker),
@@ -3027,6 +3553,10 @@ def validate_linker_execution(args: argparse.Namespace) -> dict[str, Any]:
             "final_link_record_count": len(matches),
         },
     }
+    if role is not None:
+        result["role"] = role
+        result["session"] = session
+    return result
 
 
 def select_cargo_executable(args: argparse.Namespace) -> Path:
@@ -3117,7 +3647,9 @@ def resolve_cargo_linker(args: argparse.Namespace) -> Path:
     return driver
 
 
-def stage_validate_capability(args: argparse.Namespace) -> tuple[str, str, str]:
+def _capability_stage_validator(
+    args: argparse.Namespace,
+) -> Callable[[Path, dict[str, Any]], str]:
     _require(args.tools.is_absolute(), "--tools must be absolute")
     _require(
         args.tools.is_file()
@@ -3152,7 +3684,79 @@ def stage_validate_capability(args: argparse.Namespace) -> tuple[str, str, str]:
         )
         return str(driver)
 
-    return _stage_capability_once(args.input, args.output, validate_staged)
+    return validate_staged
+
+
+def stage_validate_capability(args: argparse.Namespace) -> tuple[str, str, str]:
+    return _stage_capability_once(
+        args.input, args.output, _capability_stage_validator(args)
+    )
+
+
+def _serve_capability_guard(
+    guard: _CapabilityGuard,
+    command_stream: Any,
+    response_stream: Any,
+    manifest_validator: Callable[[dict[str, Any], Path, bytes], None] | None = None,
+) -> int:
+    print(guard.result, file=response_stream, flush=True)
+    print(guard.identity, file=response_stream, flush=True)
+    print(
+        base64.b64encode(guard.source_bytes).decode("ascii"),
+        file=response_stream,
+        flush=True,
+    )
+    print("READY", file=response_stream, flush=True)
+    poller = select.poll()
+    poller.register(
+        command_stream.fileno(), select.POLLIN | select.POLLHUP | select.POLLERR
+    )
+    assert guard.inotify_descriptor is not None
+    poller.register(
+        guard.inotify_descriptor,
+        select.POLLIN | select.POLLHUP | select.POLLERR,
+    )
+    while True:
+        for descriptor, event in poller.poll():
+            if descriptor == guard.inotify_descriptor:
+                guard._drain_events()
+                continue
+            if event & (select.POLLHUP | select.POLLERR):
+                raise LayoutError("capability guardian command channel closed")
+            command = command_stream.readline()
+            if not command:
+                raise LayoutError("capability guardian command channel reached EOF")
+            command = command.rstrip("\n")
+            if command == "CHECK":
+                guard.checkpoint()
+                print("OK", file=response_stream, flush=True)
+            elif command == "FINALIZE":
+                guard.finalize(manifest_validator)
+                print("COMMITTED", file=response_stream, flush=True)
+                return 0
+            elif command == "ABORT":
+                print("ABORTED", file=response_stream, flush=True)
+                return 0
+            else:
+                raise LayoutError("invalid capability guardian command")
+
+
+def guard_capability(args: argparse.Namespace) -> int:
+    guard = _CapabilityGuard.stage(
+        args.input, args.output, _capability_stage_validator(args)
+    )
+    remove_stage = True
+    try:
+        result = _serve_capability_guard(
+            guard,
+            sys.stdin,
+            sys.stdout,
+            validate_supplied_manifest,
+        )
+        remove_stage = not guard.committed
+        return result
+    finally:
+        guard.close(remove_stage=remove_stage)
 
 
 def main() -> int:
@@ -3171,13 +3775,15 @@ def main() -> int:
     compare_parser.add_argument("--allow-body-change", action="append", default=[])
     manifest_parser = subparsers.add_parser("validate-manifest")
     manifest_parser.add_argument("--manifest", type=Path, required=True)
+    manifest_parser.add_argument("--capability-document-b64")
     tools_parser = subparsers.add_parser("authenticate-tools")
     tools_parser.add_argument("--output", type=Path, required=True)
     tools_parser.add_argument("--tool", action="append", required=True)
     link_parser = subparsers.add_parser("validate-link-command")
     link_parser.add_argument("--trace", type=Path, required=True)
     link_parser.add_argument("--executable", type=Path, required=True)
-    link_parser.add_argument("--capability", type=Path, required=True)
+    link_parser.add_argument("--capability", type=Path)
+    link_parser.add_argument("--capability-document-b64")
     link_parser.add_argument("--capability-identity")
     link_parser.add_argument("--fragment", type=Path, required=True)
     link_parser.add_argument("--link-map", type=Path, required=True)
@@ -3202,6 +3808,13 @@ def main() -> int:
         "--arch", choices=("aarch64", "x86_64"), required=True
     )
     stage_capability_parser.add_argument("--tools", type=Path, required=True)
+    guard_capability_parser = subparsers.add_parser("guard-capability")
+    guard_capability_parser.add_argument("--input", type=Path, required=True)
+    guard_capability_parser.add_argument("--output", type=Path, required=True)
+    guard_capability_parser.add_argument(
+        "--arch", choices=("aarch64", "x86_64"), required=True
+    )
+    guard_capability_parser.add_argument("--tools", type=Path, required=True)
     verify_capability_parser = subparsers.add_parser("verify-staged-capability")
     verify_capability_parser.add_argument("--path", type=Path, required=True)
     verify_capability_parser.add_argument("--identity", required=True)
@@ -3226,7 +3839,16 @@ def main() -> int:
             if not args.manifest.is_absolute():
                 raise LayoutError("--manifest must be absolute")
             validate_supplied_manifest(
-                json.loads(args.manifest.read_text()), args.manifest
+                json.loads(args.manifest.read_text()),
+                args.manifest,
+                (
+                    _decode_capability_document(
+                        args.capability_document_b64,
+                        "held capability document",
+                    )
+                    if args.capability_document_b64
+                    else None
+                ),
             )
         elif args.command == "authenticate-tools":
             if not args.output.is_absolute():
@@ -3247,6 +3869,8 @@ def main() -> int:
             print(driver)
             print(identity)
             print(document)
+        elif args.command == "guard-capability":
+            return guard_capability(args)
         elif args.command == "verify-staged-capability":
             verify_staged_capability(args.path, args.identity)
         else:
