@@ -6,7 +6,7 @@
 
 **Architecture:** Put core-only checked encoders and candidate primitives behind temporary compile-time module aliases, with `probe.rs` retaining the map-facing wrappers. An excluded standalone quality package imports those exact source modules for deterministic statistics and raw PractRand/TestU01 streams; candidate worktrees change only compile-time aliases, and the final tree deletes selectors and losing implementations.
 
-**Tech Stack:** Rust 2024/core-only production primitives, standalone Cargo quality tool with `statrs 0.18`, Criterion/CodSpeed, PractRand 0.95+, TestU01 1.2.3, Linux `perf`, GNU `objdump`.
+**Tech Stack:** Rust 2024/core-only production primitives, standalone Cargo quality tool with `statrs 0.18`, Criterion/CodSpeed, PractRand 0.95+, TestU01 1.2.3, Linux ELF/PIE on native AArch64 and x86-64, GNU ld or LLD augmenting linker scripts, `readelf`, Linux `perf`, GNU `objdump`.
 
 ## Global Constraints
 
@@ -27,13 +27,31 @@
 - Keep only candidates that pass deterministic, statistical, cross-architecture, full-suite, and assembly/counter gates; otherwise production remains on the current PRF.
 - Preserve Rust 1.88, `no_std`, little-endian, and big-endian correctness.
 - Hard precondition: Phase 1's table-dependent metadata cache remains rejected
-  and reverted, and the accepted compile-time candidate signature-cache
-  evidence commit from
+  and reverted. The `1080c188a47f02202b6a0878830dbf2947629992`,
+  `b1cabb653cebc5922e84a26cb24db8b58903245d`, and
+  `f4a0d354239a8cf669bb240fcb17474693d7b56f` manifests remain rejected
+  diagnostics, while `5fb56a5e0e55cc093b5ac7035746178bcf023066`
+  remains the historical recoverable revert. Phase 2 is `HOLD` until the
+  accepted compile-time candidate signature-cache evidence commit from
   `docs/superpowers/plans/2026-07-21-elastic-candidate-signature-cache.md` is an
-  ancestor of this tree. Its evidence must record native AArch64 and x86-64
-  acceptance, immutable `cache-off-current`, codegen-neutral
-  `cache-policy-current`, and passing forced `cache-on-current` gates. Every
-  candidate and final tree is compared directly with `cache-off-current`.
+  ancestor of this tree and records the approved repaired graph: source-original
+  → replayed harness → replayed exact docs-remediation edge → immutable
+  `cache-off-v2` → fresh `policy-replay-v2` →
+  lifecycle-tested `cache-policy-v2`, with
+  `cache-on-v2` as its forced-true child and a separate recoverable
+  `policy-revert-v2` audit line from `f4a0d35` back to source-original.
+- The accepted evidence must prove native AArch64 and x86-64 GNU ld/LLD
+  capability on the exact Elastic/Funnel/profile 2/2/4 executable shapes; the
+  three checked augmenting `INSERT BEFORE .text` fragments; page-isolated RX
+  reservations with distinct reservation-start/body-end/reservation-end
+  sentinels; PIE, no RWX, overlap, or veneers; and
+  hash-authenticated execution of the exact manifested stable Criterion/profile
+  binaries with no Cargo invocation or relink. Unsupported linkers, non-ELF
+  hosts, either missing native architecture, or any incomplete structural field
+  keep Phase 2 on `HOLD`.
+- Every candidate and final tree is compared directly with `cache-off-v2` using
+  its exact linker capability/script contract. `cache-policy-v2` and
+  `cache-on-v2` are attribution controls, never acceptance baselines.
 - Before selecting a statistical survivor, benchmark survivor, backend winner, or revert, consult a fresh reviewer subagent; its approval is the user's delegated approval.
 
 ---
@@ -62,34 +80,214 @@ signature_cache_blob=$(mktemp)
 trap 'rm -f "$signature_cache_blob"' EXIT
 git show "$signature_cache_evidence_commit:$signature_cache_evidence_path" > "$signature_cache_blob"
 test "$(git hash-object "$signature_cache_evidence_path")" = "$(git rev-parse "$signature_cache_evidence_commit:$signature_cache_evidence_path")"
-test "$(rg -c '^- Original source commit: `[0-9a-f]{40}`$|^- Cache-off commit: `[0-9a-f]{40}`$|^- Cache-policy commit: `[0-9a-f]{40}`$|^- Cache-on commit: `[0-9a-f]{40}`$|^- Cache-on production diff SHA-256: `[0-9a-f]{64}`$|^- Decision: `ACCEPT`$' "$signature_cache_blob")" -eq 6
+evidence_schema_labels=(
+  'Original source commit'
+  'Rejected v1 harness commit'
+  'Rejected policy diagnostic commits'
+  'Historical policy revert commit'
+  'Docs-remediation-v2 commit'
+  'Docs-remediation-v2 patch SHA-256'
+  'Docs-remediation-v2 files'
+  'Docs bakeoff Git blob'
+  'Docs bakeoff content SHA-256'
+  'Docs signature-cache Git blob'
+  'Docs signature-cache content SHA-256'
+  'Docs counter-PRF spec Git blob'
+  'Docs counter-PRF spec content SHA-256'
+  'Policy-revert-v2 commit'
+  'Replayed harness-v1 commit'
+  'Replayed harness-v1 patch SHA-256'
+  'Replayed harness-v1 files'
+  'Replayed-docs-v2 commit'
+  'Cache-off-v2 commit'
+  'Policy-replay-v2 commit'
+  'Policy full patch SHA-256'
+  'Policy test-only patch SHA-256'
+  'Policy test-only files'
+  'Policy production patch SHA-256'
+  'Policy production files'
+  'Cache-policy-v2 commit'
+  'Cache-on-v2 commit'
+  'Cache-on-v2 production diff SHA-256'
+  'Elastic linker-fragment SHA-256'
+  'Funnel linker-fragment SHA-256'
+  'Profile linker-fragment SHA-256'
+  'Linker-fragment set SHA-256'
+  'ELF layout validator Git blob'
+  'ELF layout validator SHA-256'
+  'Snapshot helper Git blob'
+  'Snapshot helper SHA-256'
+  'Cache-gate launcher Git blob'
+  'Cache-gate launcher SHA-256'
+  'Cache-gate perf launcher Git blob'
+  'Cache-gate perf launcher SHA-256'
+  'AArch64 linker capability SHA-256'
+  'x86-64 linker capability SHA-256'
+  'AArch64 cache-off-v2 static variant'
+  'x86-64 cache-off-v2 static variant'
+  'AArch64 cache-off-v2 manifest SHA-256'
+  'x86-64 cache-off-v2 manifest SHA-256'
+  'Stable timing mode'
+  'Decision'
+)
+for label in "${evidence_schema_labels[@]}"; do
+  test "$(awk -v prefix="- $label: " 'index($0, prefix) == 1 { n++ } END { print n + 0 }' "$signature_cache_blob")" -eq 1
+done
+test "$(rg -Fxc -- '- Decision: `ACCEPT`' "$signature_cache_blob")" -eq 1
+test "$(rg -Fxc -- '- Stable timing mode: `manifested-no-build`' "$signature_cache_blob")" -eq 1
 cache_source_commit=$(sed -n 's/^- Original source commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
-cache_off_current_commit=$(sed -n 's/^- Cache-off commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
-cache_policy_current_commit=$(sed -n 's/^- Cache-policy commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
-cache_on_current_commit=$(sed -n 's/^- Cache-on commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
-cache_on_diff_sha=$(sed -n 's/^- Cache-on production diff SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
-for commit in "$cache_source_commit" "$cache_off_current_commit" "$cache_policy_current_commit" "$cache_on_current_commit"; do git cat-file -e "$commit^{commit}"; done
-git merge-base --is-ancestor "$cache_source_commit" "$cache_off_current_commit"
-git merge-base --is-ancestor "$cache_off_current_commit" "$cache_policy_current_commit"
-git merge-base --is-ancestor "$cache_policy_current_commit" "$cache_on_current_commit"
-git merge-base --is-ancestor "$cache_policy_current_commit" "$signature_cache_evidence_commit"
-git diff --quiet "$cache_source_commit" "$cache_off_current_commit" -- src
-git diff --quiet "$cache_policy_current_commit" "$signature_cache_evidence_commit" -- src
-test "$(git diff --name-only "$cache_policy_current_commit" "$cache_on_current_commit" -- src)" = "src/common/exact/probe.rs"
-test "$(git diff --binary "$cache_policy_current_commit" "$cache_on_current_commit" -- src | sha256sum | cut -d' ' -f1)" = "$cache_on_diff_sha"
-git show "$cache_policy_current_commit:src/common/exact/probe.rs" | rg "const CACHE_ELASTIC_INSERT_SIGNATURE: bool = false"
-git show "$cache_on_current_commit:src/common/exact/probe.rs" | rg "const CACHE_ELASTIC_INSERT_SIGNATURE: bool = true"
+rejected_v1_harness_commit=$(sed -n 's/^- Rejected v1 harness commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+rejected_policy_diagnostic_commits=$(sed -n 's/^- Rejected policy diagnostic commits: `\([0-9a-f]\{40\},[0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+historical_policy_revert_commit=$(sed -n 's/^- Historical policy revert commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+docs_remediation_v2_commit=$(sed -n 's/^- Docs-remediation-v2 commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+docs_remediation_v2_patch_sha=$(sed -n 's/^- Docs-remediation-v2 patch SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+docs_remediation_v2_files=$(sed -n 's/^- Docs-remediation-v2 files: `\([^`]*\)`$/\1/p' "$signature_cache_blob")
+docs_bakeoff_blob=$(sed -n 's/^- Docs bakeoff Git blob: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+docs_bakeoff_sha=$(sed -n 's/^- Docs bakeoff content SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+docs_signature_cache_blob=$(sed -n 's/^- Docs signature-cache Git blob: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+docs_signature_cache_sha=$(sed -n 's/^- Docs signature-cache content SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+docs_counter_prf_spec_blob=$(sed -n 's/^- Docs counter-PRF spec Git blob: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+docs_counter_prf_spec_sha=$(sed -n 's/^- Docs counter-PRF spec content SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+policy_revert_v2_commit=$(sed -n 's/^- Policy-revert-v2 commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+replayed_harness_v1_commit=$(sed -n 's/^- Replayed harness-v1 commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+replayed_harness_v1_patch_sha=$(sed -n 's/^- Replayed harness-v1 patch SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+replayed_harness_v1_files=$(sed -n 's/^- Replayed harness-v1 files: `\([^`]*\)`$/\1/p' "$signature_cache_blob")
+replayed_docs_v2_commit=$(sed -n 's/^- Replayed-docs-v2 commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+cache_off_current_v2_commit=$(sed -n 's/^- Cache-off-v2 commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+policy_replay_v2_commit=$(sed -n 's/^- Policy-replay-v2 commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+policy_full_patch_sha=$(sed -n 's/^- Policy full patch SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+policy_test_only_patch_sha=$(sed -n 's/^- Policy test-only patch SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+policy_test_only_files=$(sed -n 's/^- Policy test-only files: `\([^`]*\)`$/\1/p' "$signature_cache_blob")
+policy_production_patch_sha=$(sed -n 's/^- Policy production patch SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+policy_production_files=$(sed -n 's/^- Policy production files: `\([^`]*\)`$/\1/p' "$signature_cache_blob")
+cache_policy_current_v2_commit=$(sed -n 's/^- Cache-policy-v2 commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+cache_on_current_v2_commit=$(sed -n 's/^- Cache-on-v2 commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+cache_on_v2_diff_sha=$(sed -n 's/^- Cache-on-v2 production diff SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_elastic_linker_sha=$(sed -n 's/^- Elastic linker-fragment SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_funnel_linker_sha=$(sed -n 's/^- Funnel linker-fragment SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_profile_linker_sha=$(sed -n 's/^- Profile linker-fragment SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_linker_set_sha=$(sed -n 's/^- Linker-fragment set SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_elf_layout_blob=$(sed -n 's/^- ELF layout validator Git blob: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_elf_layout_sha=$(sed -n 's/^- ELF layout validator SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_snapshot_blob=$(sed -n 's/^- Snapshot helper Git blob: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_snapshot_sha=$(sed -n 's/^- Snapshot helper SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_launcher_blob=$(sed -n 's/^- Cache-gate launcher Git blob: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_launcher_sha=$(sed -n 's/^- Cache-gate launcher SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_perf_blob=$(sed -n 's/^- Cache-gate perf launcher Git blob: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_perf_sha=$(sed -n 's/^- Cache-gate perf launcher SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+aarch64_linker_capability_sha=$(sed -n 's/^- AArch64 linker capability SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+x86_64_linker_capability_sha=$(sed -n 's/^- x86-64 linker capability SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+aarch64_cache_off_static_variant=$(sed -n 's/^- AArch64 cache-off-v2 static variant: `\([A-Za-z0-9._-]\+\)`$/\1/p' "$signature_cache_blob")
+x86_64_cache_off_static_variant=$(sed -n 's/^- x86-64 cache-off-v2 static variant: `\([A-Za-z0-9._-]\+\)`$/\1/p' "$signature_cache_blob")
+aarch64_cache_off_v2_manifest_sha=$(sed -n 's/^- AArch64 cache-off-v2 manifest SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+x86_64_cache_off_v2_manifest_sha=$(sed -n 's/^- x86-64 cache-off-v2 manifest SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+stable_timing_mode=$(sed -n 's/^- Stable timing mode: `\(manifested-no-build\)`$/\1/p' "$signature_cache_blob")
+signature_cache_decision=$(sed -n 's/^- Decision: `\(ACCEPT\)`$/\1/p' "$signature_cache_blob")
+for value in "$cache_source_commit" "$rejected_v1_harness_commit" "$rejected_policy_diagnostic_commits" "$historical_policy_revert_commit" "$docs_remediation_v2_commit" "$docs_remediation_v2_patch_sha" "$docs_remediation_v2_files" "$docs_bakeoff_blob" "$docs_bakeoff_sha" "$docs_signature_cache_blob" "$docs_signature_cache_sha" "$docs_counter_prf_spec_blob" "$docs_counter_prf_spec_sha" "$policy_revert_v2_commit" "$replayed_harness_v1_commit" "$replayed_harness_v1_patch_sha" "$replayed_harness_v1_files" "$replayed_docs_v2_commit" "$cache_off_current_v2_commit" "$policy_replay_v2_commit" "$policy_full_patch_sha" "$policy_test_only_patch_sha" "$policy_test_only_files" "$policy_production_patch_sha" "$policy_production_files" "$cache_policy_current_v2_commit" "$cache_on_current_v2_commit" "$cache_on_v2_diff_sha" "$cache_gate_elastic_linker_sha" "$cache_gate_funnel_linker_sha" "$cache_gate_profile_linker_sha" "$cache_gate_linker_set_sha" "$cache_gate_elf_layout_blob" "$cache_gate_elf_layout_sha" "$cache_gate_snapshot_blob" "$cache_gate_snapshot_sha" "$cache_gate_launcher_blob" "$cache_gate_launcher_sha" "$cache_gate_perf_blob" "$cache_gate_perf_sha" "$aarch64_linker_capability_sha" "$x86_64_linker_capability_sha" "$aarch64_cache_off_static_variant" "$x86_64_cache_off_static_variant" "$aarch64_cache_off_v2_manifest_sha" "$x86_64_cache_off_v2_manifest_sha" "$stable_timing_mode" "$signature_cache_decision"; do test -n "$value"; test "$(printf %s "$value" | wc -l)" -eq 0; done
+for commit in "$cache_source_commit" "$docs_remediation_v2_commit" "$policy_revert_v2_commit" "$replayed_harness_v1_commit" "$replayed_docs_v2_commit" "$cache_off_current_v2_commit" "$policy_replay_v2_commit" "$cache_policy_current_v2_commit" "$cache_on_current_v2_commit" 1080c188a47f02202b6a0878830dbf2947629992 b1cabb653cebc5922e84a26cb24db8b58903245d 5fb56a5e0e55cc093b5ac7035746178bcf023066 f4a0d354239a8cf669bb240fcb17474693d7b56f; do git cat-file -e "$commit^{commit}"; done
+test "$cache_source_commit" = 47fc953b8b429cfdac29c13c313c28a21eb0ee4a
+test "$rejected_v1_harness_commit" = 1080c188a47f02202b6a0878830dbf2947629992
+test "$rejected_policy_diagnostic_commits" = b1cabb653cebc5922e84a26cb24db8b58903245d,f4a0d354239a8cf669bb240fcb17474693d7b56f
+test "$historical_policy_revert_commit" = 5fb56a5e0e55cc093b5ac7035746178bcf023066
+test "$policy_full_patch_sha" = 7e91eb3cad49651dd7d28aef45de17024143aa9104b82cba29615ea2b50fe472
+test "$policy_test_only_patch_sha" = 783c0f86b2dd2ee14d0e0a01b62dffa81d160e641def439eaf495448f0294aaf
+test "$policy_test_only_files" = src/elastic.rs
+test "$policy_production_patch_sha" = dd8e41055edb6055c8f1006a3bb32ae98b39091dc4f90af54fa4fb5b69ae60f9
+test "$policy_production_files" = src/common/exact/probe.rs,src/elastic.rs
+test "$stable_timing_mode" = manifested-no-build
+test "$signature_cache_decision" = ACCEPT
+test "$aarch64_cache_off_static_variant" = "aarch64-${cache_off_current_v2_commit:0:12}-static"
+test "$x86_64_cache_off_static_variant" = "x86_64-${cache_off_current_v2_commit:0:12}-static"
+test "$(git rev-parse 1080c188a47f02202b6a0878830dbf2947629992^)" = "$cache_source_commit"
+test "$(git rev-parse b1cabb653cebc5922e84a26cb24db8b58903245d^)" = 1080c188a47f02202b6a0878830dbf2947629992
+test "$(git rev-parse 5fb56a5e0e55cc093b5ac7035746178bcf023066^)" = b1cabb653cebc5922e84a26cb24db8b58903245d
+test "$(git rev-parse f4a0d354239a8cf669bb240fcb17474693d7b56f^)" = 5fb56a5e0e55cc093b5ac7035746178bcf023066
+git diff --quiet "$cache_source_commit" 5fb56a5e0e55cc093b5ac7035746178bcf023066 -- src
+test "$(git rev-parse "$docs_remediation_v2_commit^")" = f4a0d354239a8cf669bb240fcb17474693d7b56f
+test "$(git rev-parse "$policy_revert_v2_commit^")" = "$docs_remediation_v2_commit"
+test "$(git rev-parse "$replayed_harness_v1_commit^")" = "$cache_source_commit"
+test "$(git rev-parse "$replayed_docs_v2_commit^")" = "$replayed_harness_v1_commit"
+test "$(git rev-parse "$cache_off_current_v2_commit^")" = "$replayed_docs_v2_commit"
+test "$(git rev-parse "$policy_replay_v2_commit^")" = "$cache_off_current_v2_commit"
+test "$(git rev-parse "$cache_policy_current_v2_commit^")" = "$policy_replay_v2_commit"
+test "$(git rev-parse "$cache_on_current_v2_commit^")" = "$cache_policy_current_v2_commit"
+test "$(git rev-parse "$signature_cache_evidence_commit^")" = "$cache_policy_current_v2_commit"
+harness_v1_file_list=$'Cargo.toml\nbenches/cache_gate_profile.rs\nbenches/elastic_cache_gate.rs\nbenches/funnel_cache_gate.rs\nbenches/harness/cache_gate.rs\nbenches/harness/mod.rs\ndocs/superpowers/plans/2026-07-20-counter-prf-bakeoff.md\ndocs/superpowers/plans/2026-07-21-elastic-candidate-signature-cache.md\nscripts/cache-gate-perf-support.py\nscripts/cache-gate-perf.sh\nscripts/cache-gate.sh\nscripts/extract-hot-symbols.py\nscripts/snapshot-criterion-pair.sh\ntests/elastic_cache_gate_fixture.rs\ntests/test_cache_gate_perf_support.py\ntests/test_extract_hot_symbols.py\ntests/test_snapshot_criterion_pair.py\ntools/cache-gate-control/.gitignore\ntools/cache-gate-control/Cargo.lock\ntools/cache-gate-control/Cargo.toml\ntools/cache-gate-control/src/main.rs'
+docs_remediation_file_list=$'docs/superpowers/plans/2026-07-20-counter-prf-bakeoff.md\ndocs/superpowers/plans/2026-07-21-elastic-candidate-signature-cache.md\ndocs/superpowers/specs/2026-07-20-counter-prf-insert-design.md'
+test "$docs_remediation_v2_files" = docs/superpowers/plans/2026-07-20-counter-prf-bakeoff.md,docs/superpowers/plans/2026-07-21-elastic-candidate-signature-cache.md,docs/superpowers/specs/2026-07-20-counter-prf-insert-design.md
+test "$replayed_harness_v1_patch_sha" = 2e82ea3092bc1585c0845620b3748fb15fa12d97d53b9e14f71f0bf1e95231d1
+test "$replayed_harness_v1_files" = Cargo.toml,benches/cache_gate_profile.rs,benches/elastic_cache_gate.rs,benches/funnel_cache_gate.rs,benches/harness/cache_gate.rs,benches/harness/mod.rs,docs/superpowers/plans/2026-07-20-counter-prf-bakeoff.md,docs/superpowers/plans/2026-07-21-elastic-candidate-signature-cache.md,scripts/cache-gate-perf-support.py,scripts/cache-gate-perf.sh,scripts/cache-gate.sh,scripts/extract-hot-symbols.py,scripts/snapshot-criterion-pair.sh,tests/elastic_cache_gate_fixture.rs,tests/test_cache_gate_perf_support.py,tests/test_extract_hot_symbols.py,tests/test_snapshot_criterion_pair.py,tools/cache-gate-control/.gitignore,tools/cache-gate-control/Cargo.lock,tools/cache-gate-control/Cargo.toml,tools/cache-gate-control/src/main.rs
+test "$(git diff --name-only "$replayed_harness_v1_commit^" "$replayed_harness_v1_commit")" = "$harness_v1_file_list"
+test "$(git diff --binary "$replayed_harness_v1_commit^" "$replayed_harness_v1_commit" | sha256sum | cut -d' ' -f1)" = 2e82ea3092bc1585c0845620b3748fb15fa12d97d53b9e14f71f0bf1e95231d1
+test "$(git diff --name-only "$docs_remediation_v2_commit^" "$docs_remediation_v2_commit")" = "$docs_remediation_file_list"
+test "$(git diff --binary "$docs_remediation_v2_commit^" "$docs_remediation_v2_commit" | sha256sum | cut -d' ' -f1)" = "$docs_remediation_v2_patch_sha"
+test "$(git diff --name-only "$replayed_docs_v2_commit^" "$replayed_docs_v2_commit")" = "$docs_remediation_file_list"
+test "$(git diff --binary "$replayed_docs_v2_commit^" "$replayed_docs_v2_commit" | sha256sum | cut -d' ' -f1)" = "$docs_remediation_v2_patch_sha"
+test "$(git rev-parse "$docs_remediation_v2_commit:docs/superpowers/plans/2026-07-20-counter-prf-bakeoff.md")" = "$docs_bakeoff_blob"
+test "$(git rev-parse "$docs_remediation_v2_commit:docs/superpowers/plans/2026-07-21-elastic-candidate-signature-cache.md")" = "$docs_signature_cache_blob"
+test "$(git rev-parse "$docs_remediation_v2_commit:docs/superpowers/specs/2026-07-20-counter-prf-insert-design.md")" = "$docs_counter_prf_spec_blob"
+test "$(git show "$docs_remediation_v2_commit:docs/superpowers/plans/2026-07-20-counter-prf-bakeoff.md" | sha256sum | cut -d' ' -f1)" = "$docs_bakeoff_sha"
+test "$(git show "$docs_remediation_v2_commit:docs/superpowers/plans/2026-07-21-elastic-candidate-signature-cache.md" | sha256sum | cut -d' ' -f1)" = "$docs_signature_cache_sha"
+test "$(git show "$docs_remediation_v2_commit:docs/superpowers/specs/2026-07-20-counter-prf-insert-design.md" | sha256sum | cut -d' ' -f1)" = "$docs_counter_prf_spec_sha"
+for descendant in "$replayed_docs_v2_commit" "$cache_off_current_v2_commit" "$policy_replay_v2_commit" "$cache_policy_current_v2_commit" "$cache_on_current_v2_commit" "$signature_cache_evidence_commit"; do
+  test "$(git rev-parse "$descendant:docs/superpowers/plans/2026-07-20-counter-prf-bakeoff.md")" = "$docs_bakeoff_blob"
+  test "$(git rev-parse "$descendant:docs/superpowers/plans/2026-07-21-elastic-candidate-signature-cache.md")" = "$docs_signature_cache_blob"
+  test "$(git rev-parse "$descendant:docs/superpowers/specs/2026-07-20-counter-prf-insert-design.md")" = "$docs_counter_prf_spec_blob"
+  test "$(git show "$descendant:docs/superpowers/plans/2026-07-20-counter-prf-bakeoff.md" | sha256sum | cut -d' ' -f1)" = "$docs_bakeoff_sha"
+  test "$(git show "$descendant:docs/superpowers/plans/2026-07-21-elastic-candidate-signature-cache.md" | sha256sum | cut -d' ' -f1)" = "$docs_signature_cache_sha"
+  test "$(git show "$descendant:docs/superpowers/specs/2026-07-20-counter-prf-insert-design.md" | sha256sum | cut -d' ' -f1)" = "$docs_counter_prf_spec_sha"
+done
+test "$(git diff --name-only "$cache_off_current_v2_commit" "$policy_replay_v2_commit" -- src)" = $'src/common/exact/probe.rs\nsrc/elastic.rs'
+test "$(git diff --binary "$cache_off_current_v2_commit" "$policy_replay_v2_commit" -- src | sha256sum | cut -d' ' -f1)" = 7e91eb3cad49651dd7d28aef45de17024143aa9104b82cba29615ea2b50fe472
+policy_patch_dir=$(mktemp -d)
+git diff --binary 5fb56a5e0e55cc093b5ac7035746178bcf023066 f4a0d354239a8cf669bb240fcb17474693d7b56f -- src > "$policy_patch_dir/full.patch"
+awk '/^diff --git a\/src\/elastic.rs b\/src\/elastic.rs$/ { elastic=1; header=1 } !elastic { next } header { print; if (/^\+\+\+ /) header=0; next } /^@@ -2537,6 \+2591,76 @@ mod tests \{$/ { tests=1 } tests { print }' "$policy_patch_dir/full.patch" > "$policy_patch_dir/tests.patch"
+awk 'BEGIN { keep=1 } /^@@ -2537,6 \+2591,76 @@ mod tests \{$/ { keep=0 } keep != 0 { print }' "$policy_patch_dir/full.patch" > "$policy_patch_dir/production.patch"
+test "$(sha256sum "$policy_patch_dir/full.patch" | cut -d' ' -f1)" = "$policy_full_patch_sha"
+test "$(sha256sum "$policy_patch_dir/tests.patch" | cut -d' ' -f1)" = "$policy_test_only_patch_sha"
+test "$(sha256sum "$policy_patch_dir/production.patch" | cut -d' ' -f1)" = "$policy_production_patch_sha"
+test "$(git apply --numstat "$policy_patch_dir/tests.patch" | cut -f3-)" = src/elastic.rs
+test "$(git apply --numstat "$policy_patch_dir/production.patch" | cut -f3-)" = $'src/common/exact/probe.rs\nsrc/elastic.rs'
+rm -r "$policy_patch_dir"
+git diff --quiet "$cache_source_commit" "$policy_revert_v2_commit" -- src
+git diff --quiet "$cache_source_commit" "$replayed_harness_v1_commit" -- src
+git diff --quiet "$cache_source_commit" "$cache_off_current_v2_commit" -- src
+git diff --quiet f4a0d354239a8cf669bb240fcb17474693d7b56f "$policy_replay_v2_commit" -- src
+git diff --quiet "$cache_policy_current_v2_commit" "$signature_cache_evidence_commit" -- src
+test "$(git diff --name-only "$cache_policy_current_v2_commit" "$cache_on_current_v2_commit" -- src)" = "src/common/exact/probe.rs"
+test "$(git diff --binary "$cache_policy_current_v2_commit" "$cache_on_current_v2_commit" -- src | sha256sum | cut -d' ' -f1)" = "$cache_on_v2_diff_sha"
+test "$(git show "$cache_off_current_v2_commit:benches/cache-gate-elastic-layout.ld" | sha256sum | cut -d' ' -f1)" = "$cache_gate_elastic_linker_sha"
+test "$(git show "$cache_off_current_v2_commit:benches/cache-gate-funnel-layout.ld" | sha256sum | cut -d' ' -f1)" = "$cache_gate_funnel_linker_sha"
+test "$(git show "$cache_off_current_v2_commit:benches/cache-gate-profile-layout.ld" | sha256sum | cut -d' ' -f1)" = "$cache_gate_profile_linker_sha"
+test "$(printf 'elastic %s\nfunnel %s\nprofile %s\n' "$cache_gate_elastic_linker_sha" "$cache_gate_funnel_linker_sha" "$cache_gate_profile_linker_sha" | sha256sum | cut -d' ' -f1)" = "$cache_gate_linker_set_sha"
+test "$(git rev-parse "$cache_off_current_v2_commit:scripts/cache-gate-elf-layout.py")" = "$cache_gate_elf_layout_blob"
+test "$(git show "$cache_off_current_v2_commit:scripts/cache-gate-elf-layout.py" | sha256sum | cut -d' ' -f1)" = "$cache_gate_elf_layout_sha"
+test "$(git rev-parse "$cache_off_current_v2_commit:scripts/snapshot-criterion-pair.sh")" = "$cache_gate_snapshot_blob"
+test "$(git show "$cache_off_current_v2_commit:scripts/snapshot-criterion-pair.sh" | sha256sum | cut -d' ' -f1)" = "$cache_gate_snapshot_sha"
+test "$(git rev-parse "$cache_off_current_v2_commit:scripts/cache-gate.sh")" = "$cache_gate_launcher_blob"
+test "$(git show "$cache_off_current_v2_commit:scripts/cache-gate.sh" | sha256sum | cut -d' ' -f1)" = "$cache_gate_launcher_sha"
+test "$(git rev-parse "$cache_off_current_v2_commit:scripts/cache-gate-perf.sh")" = "$cache_gate_perf_blob"
+test "$(git show "$cache_off_current_v2_commit:scripts/cache-gate-perf.sh" | sha256sum | cut -d' ' -f1)" = "$cache_gate_perf_sha"
+git show "$cache_policy_current_v2_commit:src/common/exact/probe.rs" | rg "const CACHE_ELASTIC_INSERT_SIGNATURE: bool = false"
+git show "$cache_on_current_v2_commit:src/common/exact/probe.rs" | rg "const CACHE_ELASTIC_INSERT_SIGNATURE: bool = true"
+for pattern in AArch64 x86-64 output_section input_section reservation_start body_end reservation_end sentinel ET_DYN 'ALLOC|EXECINSTR' PT_LOAD no-veneer manifested-no-build codegen-units cgu_partition_fingerprint object_fingerprint link_order_fingerprint; do rg -F "$pattern" "$signature_cache_blob"; done
 rg -n "const CACHE_ELASTIC_INSERT_SIGNATURE: bool = false" src/common/exact/probe.rs
 rg -n "insert_metadata|fn signature\(|fn membership\(" src/elastic.rs
 cargo test elastic::tests::insert_growth_reindexes_cached_signature_in_production_path -- --exact
 cargo test elastic::tests::finite_probe_exhaustion_uses_observable_exceptional_recovery -- --exact
 ```
 
-Expected: accepted blob equals checked-out blob; every referenced commit exists;
-source→off→policy and policy→on/evidence graph is exact; cache-off production
-equals recorded original; accepted production equals policy false; cache-on has
-only the recorded force-true source diff; both production-path tests PASS.
-Otherwise stop; do not add encoders or resurrect `PreparedMetadataWrite`.
+Expected: accepted blob equals checked-out blob; all historical diagnostic and
+revert commits remain addressable; source→replayed-harness→replayed-docs→
+cache-off-v2→policy-replay-v2→cache-policy-v2 and
+policy→cache-on/evidence are exact; the
+separate policy-revert-v2 tree
+restores source-original; cache-off-v2 production equals source-original;
+accepted production is policy false; cache-on-v2 has only the recorded
+force-true source diff; both native ELF capability/layout records and the
+manifested-no-build contract are present; both production-path tests PASS.
+Otherwise stop with `HOLD`; do not add encoders, time anything, or resurrect
+`PreparedMetadataWrite`.
 
 - [ ] **Step 1: Write failing boundary and uniqueness tests**
 
@@ -475,8 +673,9 @@ objdump -d -C "$speedup_bin" > target/current-module-speedup.asm
 
 Compare against both the exact-binary assembly/rebuilt CodSpeed output captured
 for the accepted signature-cache commit immediately before Step 2 and the
-immutable `cache-off-current` original recorded in its evidence. Record
-exact per-operation instruction counts for Elastic/Funnel insert, randomized
+immutable repaired `cache-off-v2` source-original recorded in its evidence.
+Use its exact native linker capability and manifested stable/profile binaries.
+Record exact per-operation instruction counts for Elastic/Funnel insert, randomized
 get, ordered get, and controls. Whole binaries may differ in symbol ordering,
 so compare the corresponding hot symbol bodies; demand byte identity there and
 exactly ±0 Callgrind instructions for every named operation. Also require the
@@ -1280,43 +1479,100 @@ git commit -m "docs: record counter prf quality evidence"
 - Read: `target/criterion/`
 
 **Interfaces:**
-- Consumes: accepted signature-cache evidence, immutable cache-off original current, codegen-neutral current scaffold, and statistical survivors.
+- Consumes: accepted repaired-v2 signature-cache evidence, immutable
+  cache-off-v2 source-original, its exact linker capability/script contract,
+  codegen-neutral current scaffold, and statistical survivors.
 - Produces: fixed-control-valid current/guarded/Philox real-map runs, including mixed-backend isolation variants, all compared directly with original current.
 
 - [ ] **Step 1: Freeze original current and the accepted current-PRF scaffold**
 
-Resolve `cache_off_current_commit` from the accepted signature-cache evidence,
+Resolve `cache_off_current_v2_commit` from the immutable accepted
+signature-cache evidence blob,
 then freeze both it and the clean current-PRF composition after Task 5. The
 former is the only acceptance baseline; the latter is an attribution control
 containing codegen-neutral scaffolding and inactive candidates:
 
 ```bash
 prf_criterion_root=/home/aang/projects/opthash/.worktrees/perf/counter-prf-insert/target/criterion
-cache_off_current_commit=$(sed -n 's/^- Cache-off commit: `\([0-9a-f]\{40\}\)`$/\1/p' docs/performance/2026-07-21-elastic-candidate-signature-cache.md)
-test -n "$cache_off_current_commit"
-git cat-file -e "$cache_off_current_commit^{commit}"
+signature_cache_evidence_commit=$(git rev-list --all --grep='^docs: accept elastic candidate signature cache$' -1)
+signature_cache_blob=$(mktemp)
+trap 'rm -f "$signature_cache_blob"' EXIT
+git show "$signature_cache_evidence_commit:docs/performance/2026-07-21-elastic-candidate-signature-cache.md" > "$signature_cache_blob"
+cache_off_current_v2_commit=$(sed -n 's/^- Cache-off-v2 commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_elastic_linker_sha=$(sed -n 's/^- Elastic linker-fragment SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_funnel_linker_sha=$(sed -n 's/^- Funnel linker-fragment SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_profile_linker_sha=$(sed -n 's/^- Profile linker-fragment SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_elf_layout_sha=$(sed -n 's/^- ELF layout validator SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_snapshot_sha=$(sed -n 's/^- Snapshot helper SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_launcher_sha=$(sed -n 's/^- Cache-gate launcher SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_perf_blob=$(sed -n 's/^- Cache-gate perf launcher Git blob: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_perf_sha=$(sed -n 's/^- Cache-gate perf launcher SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+aarch64_linker_capability_sha=$(sed -n 's/^- AArch64 linker capability SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+x86_64_linker_capability_sha=$(sed -n 's/^- x86-64 linker capability SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+aarch64_cache_off_static_variant=$(sed -n 's/^- AArch64 cache-off-v2 static variant: `\([A-Za-z0-9._-]\+\)`$/\1/p' "$signature_cache_blob")
+x86_64_cache_off_static_variant=$(sed -n 's/^- x86-64 cache-off-v2 static variant: `\([A-Za-z0-9._-]\+\)`$/\1/p' "$signature_cache_blob")
+aarch64_cache_off_v2_manifest_sha=$(sed -n 's/^- AArch64 cache-off-v2 manifest SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+x86_64_cache_off_v2_manifest_sha=$(sed -n 's/^- x86-64 cache-off-v2 manifest SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+test -n "$cache_off_current_v2_commit"
+git cat-file -e "$cache_off_current_v2_commit^{commit}"
 prf_current_commit=$(git rev-parse HEAD)
-git worktree add --detach /home/aang/projects/opthash/.worktrees/perf/prf-original-current "$cache_off_current_commit"
+git worktree add --detach /home/aang/projects/opthash/.worktrees/perf/prf-original-current "$cache_off_current_v2_commit"
 git worktree add --detach /home/aang/projects/opthash/.worktrees/perf/prf-current-anchor "$prf_current_commit"
-(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && test "$(git rev-parse HEAD)" = "$cache_off_current_commit" && test -z "$(git status --porcelain -- src benches scripts Cargo.toml Cargo.lock)")
+(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && test "$(git rev-parse HEAD)" = "$cache_off_current_v2_commit" && test -z "$(git status --porcelain -- src benches scripts Cargo.toml Cargo.lock)")
 (cd /home/aang/projects/opthash/.worktrees/perf/prf-current-anchor && test "$(git rev-parse HEAD)" = "$prf_current_commit" && test -z "$(git status --porcelain -- src benches scripts Cargo.toml Cargo.lock)")
-(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE=prf-original-current scripts/bench.sh)
-(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE=prf-original-current-scale scripts/bench.sh)
-(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && BUILD_CONTROL=1 scripts/cache-gate.sh)
+cache_off_v2_evidence_tree=/home/aang/projects/opthash/.worktrees/perf/cache-off-v2
+CACHE_GATE_LAUNCHER="$cache_off_v2_evidence_tree/scripts/cache-gate.sh"
+test "$(sha256sum "$CACHE_GATE_LAUNCHER" | cut -d' ' -f1)" = "$cache_gate_launcher_sha"
+(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && BUILD_CONTROL=1 "$CACHE_GATE_LAUNCHER" --runner-root /home/aang/projects/opthash/.worktrees/perf/prf-original-current)
 CACHE_GATE_CONTROL_BIN=$(sed -n '1p' /home/aang/projects/opthash/.worktrees/perf/prf-original-current/target/cache-gate-control-bin.txt)
 test -x "$CACHE_GATE_CONTROL_BIN"
-(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE=prf-original-fixed-control scripts/cache-gate.sh)
-(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT=prf-original-current scripts/cache-gate.sh)
-(cd /home/aang/projects/opthash/.worktrees/perf/prf-current-anchor && CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT=prf-scaffold-current scripts/cache-gate.sh)
+prf_arch=$(uname -m)
+test "$(git -C "$cache_off_v2_evidence_tree" rev-parse HEAD)" = "$cache_off_current_v2_commit"
+case "$prf_arch" in
+    aarch64) cache_off_static_variant=$aarch64_cache_off_static_variant; expected_capability_sha=$aarch64_linker_capability_sha; expected_cache_off_manifest_sha=$aarch64_cache_off_v2_manifest_sha ;;
+    x86_64) cache_off_static_variant=$x86_64_cache_off_static_variant; expected_capability_sha=$x86_64_linker_capability_sha; expected_cache_off_manifest_sha=$x86_64_cache_off_v2_manifest_sha ;;
+    *) echo "HOLD: native Linux ELF AArch64/x86-64 proof required" >&2; exit 3 ;;
+esac
+test "$cache_off_static_variant" = "$prf_arch-${cache_off_current_v2_commit:0:12}-static"
+accepted_cache_off_v2_manifest="$cache_off_v2_evidence_tree/target/cache-gate/$prf_arch/$cache_off_static_variant/manifest.json"
+test "$(sha256sum "$accepted_cache_off_v2_manifest" | cut -d' ' -f1)" = "$expected_cache_off_manifest_sha"
+CACHE_GATE_LINKER_CAPABILITY=$(jq -er '.linker_capability.copy.absolute_path' "$accepted_cache_off_v2_manifest")
+test "$(realpath -e "$CACHE_GATE_LINKER_CAPABILITY")" = "$cache_off_v2_evidence_tree/target/cache-gate/$prf_arch/$cache_off_static_variant/linker-capability.json"
+test "$(sha256sum "$CACHE_GATE_LINKER_CAPABILITY" | cut -d' ' -f1)" = "$expected_capability_sha"
+test "$(sha256sum "$CACHE_GATE_LINKER_CAPABILITY" | cut -d' ' -f1)" = "$(jq -er '.linker_capability.copy.sha256' "$accepted_cache_off_v2_manifest")"
+test "$(sha256sum "$cache_off_v2_evidence_tree/benches/cache-gate-elastic-layout.ld" | cut -d' ' -f1)" = "$cache_gate_elastic_linker_sha"
+test "$(sha256sum "$cache_off_v2_evidence_tree/benches/cache-gate-funnel-layout.ld" | cut -d' ' -f1)" = "$cache_gate_funnel_linker_sha"
+test "$(sha256sum "$cache_off_v2_evidence_tree/benches/cache-gate-profile-layout.ld" | cut -d' ' -f1)" = "$cache_gate_profile_linker_sha"
+CACHE_GATE_ELF_LAYOUT_TOOL="$cache_off_v2_evidence_tree/scripts/cache-gate-elf-layout.py"
+CACHE_GATE_SNAPSHOT_TOOL="$cache_off_v2_evidence_tree/scripts/snapshot-criterion-pair.sh"
+test "$(sha256sum "$CACHE_GATE_ELF_LAYOUT_TOOL" | cut -d' ' -f1)" = "$cache_gate_elf_layout_sha"
+test "$(sha256sum "$CACHE_GATE_SNAPSHOT_TOOL" | cut -d' ' -f1)" = "$cache_gate_snapshot_sha"
+(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE=prf-original-fixed-control "$CACHE_GATE_LAUNCHER" --runner-root /home/aang/projects/opthash/.worktrees/perf/prf-original-current)
+(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && CACHE_GATE_MANIFEST_INSTANCE="$prf_arch-prf-original-current" CACHE_GATE_LINKER_CAPABILITY="$CACHE_GATE_LINKER_CAPABILITY" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT="$prf_arch-prf-original-current" "$CACHE_GATE_LAUNCHER" --runner-root /home/aang/projects/opthash/.worktrees/perf/prf-original-current)
+(cd /home/aang/projects/opthash/.worktrees/perf/prf-current-anchor && CACHE_GATE_MANIFEST_INSTANCE="$prf_arch-prf-scaffold-current" CACHE_GATE_LINKER_CAPABILITY="$CACHE_GATE_LINKER_CAPABILITY" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT="$prf_arch-prf-scaffold-current" "$CACHE_GATE_LAUNCHER" --runner-root /home/aang/projects/opthash/.worktrees/perf/prf-current-anchor)
+prf_anchor_manifest=/home/aang/projects/opthash/.worktrees/perf/prf-original-current/target/cache-gate/$prf_arch/$prf_arch-prf-original-current/manifest.json
+prf_scaffold_manifest=/home/aang/projects/opthash/.worktrees/perf/prf-current-anchor/target/cache-gate/$prf_arch/$prf_arch-prf-scaffold-current/manifest.json
+prf_anchor_manifest_sha=$(sha256sum "$prf_anchor_manifest" | cut -d' ' -f1)
+printf '%s\n' "$prf_anchor_manifest_sha" > "$prf_anchor_manifest.sha256"
+"$CACHE_GATE_ELF_LAYOUT_TOOL" compare --anchor "$prf_anchor_manifest" --candidate "$prf_scaffold_manifest"
+(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE=prf-original-current scripts/bench.sh)
+(cd /home/aang/projects/opthash/.worktrees/perf/prf-original-current && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE=prf-original-current-scale scripts/bench.sh)
 (cd /home/aang/projects/opthash/.worktrees/perf/prf-current-anchor && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE=prf-scaffold-current scripts/bench.sh)
 (cd /home/aang/projects/opthash/.worktrees/perf/prf-current-anchor && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE=prf-scaffold-current-scale scripts/bench.sh)
 ```
 
-Expected: original-current and scaffold-current JSON exists. Before any
-candidate run, corresponding current hot bodies must be byte-identical and
-named Callgrind counts exactly equal; their stable Elastic/Funnel kernel
-addresses, `start % 4096`, alignment, link-map predecessors, and target-aware
-layout snapshots must also match. Any scaffold timing is diagnostic only.
+Expected: original-current and scaffold-current JSON exists. The capability
+record matches the evidence's native-architecture hash, and the structural
+comparison passes for all eight output/input sections, exact starts/page
+offsets/alignments, reservation-start/body-end/reservation-end sentinels,
+reservations, raw/normalized
+hashes, calls/frames/spills, PIE/RX/load-segment state, and empty veneer/thunk
+inventories. Corresponding current hot bodies are byte-identical and named
+Callgrind counts exactly equal. Any scaffold timing is diagnostic only. A
+capability/layout mismatch is `HOLD`, not permission to time.
+The architecture-qualified original-current manifest is built exactly once in
+this step; all later survivor/final steps read its `.sha256` sidecar and reject
+a mismatch. They never invoke `MANIFEST=1` for that anchor again.
 
 - [ ] **Step 2: Create one isolated worktree per statistical survivor**
 
@@ -1382,22 +1638,37 @@ prf_scaffold_tree=/home/aang/projects/opthash/.worktrees/perf/prf-current-anchor
 prf_arch=$(uname -m)
 prf_candidate_commit=$(git -C "$prf_candidate_tree" rev-parse HEAD)
 prf_scaffold_commit=$(git -C "$prf_scaffold_tree" rev-parse HEAD)
-(cd "$prf_candidate_tree" && CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT="prf-$prf_candidate-diagnostic" scripts/cache-gate.sh)
-prf_candidate_manifest="$prf_candidate_tree/target/cache-gate/$prf_arch/prf-$prf_candidate-diagnostic/manifest.json"
-prf_scaffold_manifest="$prf_scaffold_tree/target/cache-gate/$prf_arch/prf-scaffold-current/manifest.json"
+test "${PRF_SURVIVOR_ATTEMPT:?set a positive, never-reused survivor attempt number}" -gt 0
+prf_campaign_id="$prf_arch-${prf_candidate_commit:0:12}-attempt-$PRF_SURVIVOR_ATTEMPT-$prf_candidate"
+prf_diagnostic_variant="$prf_campaign_id-diagnostic"
+(cd "$prf_candidate_tree" && CACHE_GATE_MANIFEST_INSTANCE="$prf_diagnostic_variant" CACHE_GATE_LINKER_CAPABILITY="$CACHE_GATE_LINKER_CAPABILITY" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT="$prf_diagnostic_variant" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_candidate_tree")
+prf_candidate_manifest="$prf_candidate_tree/target/cache-gate/$prf_arch/$prf_diagnostic_variant/manifest.json"
+prf_scaffold_manifest="$prf_scaffold_tree/target/cache-gate/$prf_arch/$prf_arch-prf-scaffold-current/manifest.json"
+"$CACHE_GATE_ELF_LAYOUT_TOOL" compare --anchor "$prf_scaffold_manifest" --candidate "$prf_candidate_manifest" \
+  --allow-body-change elastic_cache_gate_insert_kernel \
+  --allow-body-change elastic_cache_gate_get_kernel \
+  --allow-body-change elastic_profile_insert_kernel \
+  --allow-body-change elastic_profile_get_kernel \
+  --allow-body-change funnel_cache_gate_insert_kernel \
+  --allow-body-change funnel_cache_gate_get_kernel \
+  --allow-body-change funnel_profile_insert_kernel \
+  --allow-body-change funnel_profile_get_kernel
 
-(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="prf-$prf_candidate" scripts/bench.sh)
-(cd "$prf_scaffold_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" LOAD="prf-$prf_candidate" BASELINE=prf-scaffold-current scripts/bench.sh)
-(cd "$prf_scaffold_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "prf-$prf_candidate-diagnostic-full" --pair 1 --target all --anchor-run prf-scaffold-current --candidate-run "prf-$prf_candidate" --anchor-commit "$prf_scaffold_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_scaffold_manifest" --candidate-manifest "$prf_candidate_manifest")
+(cd "$prf_scaffold_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_campaign_id-diagnostic-scaffold-full" scripts/bench.sh)
+(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_campaign_id-diagnostic-candidate-full" scripts/bench.sh)
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_campaign_id-diagnostic-full" --pair 1 --target all --anchor-run "$prf_campaign_id-diagnostic-scaffold-full" --candidate-run "$prf_campaign_id-diagnostic-candidate-full" --anchor-commit "$prf_scaffold_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_scaffold_manifest" --candidate-manifest "$prf_candidate_manifest"
 
-(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="prf-$prf_candidate-scale" scripts/bench.sh)
-(cd "$prf_scaffold_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert LOAD="prf-$prf_candidate-scale" BASELINE=prf-scaffold-current-scale scripts/bench.sh)
-(cd "$prf_scaffold_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "prf-$prf_candidate-diagnostic-scale" --pair 1 --target scaled_insert --anchor-run prf-scaffold-current-scale --candidate-run "prf-$prf_candidate-scale" --anchor-commit "$prf_scaffold_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_scaffold_manifest" --candidate-manifest "$prf_candidate_manifest")
+(cd "$prf_scaffold_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_campaign_id-diagnostic-scaffold-scale" scripts/bench.sh)
+(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_campaign_id-diagnostic-candidate-scale" scripts/bench.sh)
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_campaign_id-diagnostic-scale" --pair 1 --target scaled_insert --anchor-run "$prf_campaign_id-diagnostic-scaffold-scale" --candidate-run "$prf_campaign_id-diagnostic-candidate-scale" --anchor-commit "$prf_scaffold_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_scaffold_manifest" --candidate-manifest "$prf_candidate_manifest"
 ```
 
 These results are diagnostic only: use them to detect broken selectors and
 estimate run time. They cannot decide isolation, accept, or exclude a quality
-survivor regardless of point estimate.
+survivor regardless of point estimate. Preserve the complete campaign root on
+failure. Any retry for this architecture, exact commit, and composition must
+increment `PRF_SURVIVOR_ATTEMPT`, derive a new `prf_campaign_id`, and repeat
+the diagnostic manifest and both snapshots without deleting the failed roots.
 
 - [ ] **Step 5: Create both backend-isolated compositions for every survivor**
 
@@ -1441,57 +1712,109 @@ prf_arch=$(uname -m)
 prf_candidate=guarded
 prf_candidate_tree=/home/aang/projects/opthash/.worktrees/perf/prf-guarded
 prf_anchor_tree=/home/aang/projects/opthash/.worktrees/perf/prf-original-current
+cache_off_v2_evidence_tree=/home/aang/projects/opthash/.worktrees/perf/cache-off-v2
 CACHE_GATE_CONTROL_BIN=$(sed -n '1p' "$prf_anchor_tree/target/cache-gate-control-bin.txt")
 test -x "$CACHE_GATE_CONTROL_BIN"
 prf_anchor_commit=$(git -C "$prf_anchor_tree" rev-parse HEAD)
 prf_candidate_commit=$(git -C "$prf_candidate_tree" rev-parse HEAD)
+test "${PRF_SURVIVOR_ATTEMPT:?set a positive, never-reused survivor attempt number}" -gt 0
+prf_campaign_id="$prf_arch-${prf_candidate_commit:0:12}-attempt-$PRF_SURVIVOR_ATTEMPT-$prf_candidate"
+test "$prf_anchor_commit" = "$cache_off_current_v2_commit"
 test -z "$(git -C "$prf_anchor_tree" status --porcelain)"
 test -z "$(git -C "$prf_candidate_tree" status --porcelain)"
+test -n "$cache_off_static_variant"
+accepted_cache_off_v2_manifest="$cache_off_v2_evidence_tree/target/cache-gate/$prf_arch/$cache_off_static_variant/manifest.json"
+case "$prf_arch" in
+    aarch64) expected_capability_sha=$aarch64_linker_capability_sha; expected_cache_off_manifest_sha=$aarch64_cache_off_v2_manifest_sha ;;
+    x86_64) expected_capability_sha=$x86_64_linker_capability_sha; expected_cache_off_manifest_sha=$x86_64_cache_off_v2_manifest_sha ;;
+    *) echo "HOLD: native Linux ELF AArch64/x86-64 proof required" >&2; exit 3 ;;
+esac
+test "$(sha256sum "$accepted_cache_off_v2_manifest" | cut -d' ' -f1)" = "$expected_cache_off_manifest_sha"
+CACHE_GATE_LINKER_CAPABILITY=$(jq -er '.linker_capability.copy.absolute_path' "$accepted_cache_off_v2_manifest")
+test "$(realpath -e "$CACHE_GATE_LINKER_CAPABILITY")" = "$cache_off_v2_evidence_tree/target/cache-gate/$prf_arch/$cache_off_static_variant/linker-capability.json"
+test "$(sha256sum "$CACHE_GATE_LINKER_CAPABILITY" | cut -d' ' -f1)" = "$expected_capability_sha"
+test "$(sha256sum "$CACHE_GATE_LINKER_CAPABILITY" | cut -d' ' -f1)" = "$(jq -er '.linker_capability.copy.sha256' "$accepted_cache_off_v2_manifest")"
 
-(cd "$prf_anchor_tree" && CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT=prf-original-current scripts/cache-gate.sh)
-(cd "$prf_candidate_tree" && CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT="prf-$prf_candidate" scripts/cache-gate.sh)
-prf_anchor_manifest="$prf_anchor_tree/target/cache-gate/$prf_arch/prf-original-current/manifest.json"
-prf_candidate_manifest="$prf_candidate_tree/target/cache-gate/$prf_arch/prf-$prf_candidate/manifest.json"
+prf_anchor_manifest="$prf_anchor_tree/target/cache-gate/$prf_arch/$prf_arch-prf-original-current/manifest.json"
+prf_anchor_manifest_sha=$(sed -n '1p' "$prf_anchor_manifest.sha256")
+test "$(sha256sum "$prf_anchor_manifest" | cut -d' ' -f1)" = "$prf_anchor_manifest_sha"
+prf_static_variant="$prf_campaign_id-static"
+(cd "$prf_candidate_tree" && CACHE_GATE_MANIFEST_INSTANCE="$prf_static_variant" CACHE_GATE_LINKER_CAPABILITY="$CACHE_GATE_LINKER_CAPABILITY" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT="$prf_static_variant" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_candidate_tree")
+prf_candidate_manifest="$prf_candidate_tree/target/cache-gate/$prf_arch/$prf_static_variant/manifest.json"
 test -f "$prf_anchor_manifest"
 test -f "$prf_candidate_manifest"
+elastic_body_changes=(
+  --allow-body-change elastic_cache_gate_insert_kernel
+  --allow-body-change elastic_cache_gate_get_kernel
+  --allow-body-change elastic_profile_insert_kernel
+  --allow-body-change elastic_profile_get_kernel
+)
+funnel_body_changes=(
+  --allow-body-change funnel_cache_gate_insert_kernel
+  --allow-body-change funnel_cache_gate_get_kernel
+  --allow-body-change funnel_profile_insert_kernel
+  --allow-body-change funnel_profile_get_kernel
+)
+case "$prf_candidate" in
+  *-elastic-only) prf_changed_kernel_args=("${elastic_body_changes[@]}") ;;
+  *-funnel-only) prf_changed_kernel_args=("${funnel_body_changes[@]}") ;;
+  guarded|philox6|philox10) prf_changed_kernel_args=("${elastic_body_changes[@]}" "${funnel_body_changes[@]}") ;;
+  *) echo "error: undeclared composition $prf_candidate" >&2; exit 1 ;;
+esac
+test "$(sha256sum "$CACHE_GATE_ELF_LAYOUT_TOOL" | cut -d' ' -f1)" = "$cache_gate_elf_layout_sha"
+test "$(sha256sum "$CACHE_GATE_SNAPSHOT_TOOL" | cut -d' ' -f1)" = "$cache_gate_snapshot_sha"
+"$CACHE_GATE_ELF_LAYOUT_TOOL" compare --anchor "$prf_anchor_manifest" --candidate "$prf_candidate_manifest" "${prf_changed_kernel_args[@]}"
 ```
 
-Before timing, compare the two manifests and module-local hot-layout snapshots.
-For both stable targets, the corresponding anchor/candidate insert and get
-kernel address, `start % 4096`, alignment, and link-map predecessor must be
-identical. Every recorded size/alignment/field offset for `ElasticTable`,
-`Level`, `ElasticMetadataWord`, `FunnelTable`, `FunnelShape`, `LevelShape`, and
-`FlatStorage` must match. `BucketLevel` must remain absent, or, if introduced by
-an independently approved change, have a complete exact snapshot. Any drift is
-a hard layout rejection before timing; a favorable timing result cannot waive
-it.
+Before timing, the structural comparator must verify all eight unique
+Elastic/Funnel stable/profile output and input sections; exact starts, page
+offsets and actual alignments; exact reservation-start/reservation-end names
+and addresses; an always-present, structurally valid `body_end` name, with its
+address exact only for an undeclared/unchanged kernel;
+reservation sizes, body sizes, raw/normalized hashes, direct calls, frames and
+spills; the exact capability/linker/fragment-set identities; PIE `ET_DYN`; wholly RX
+`PT_LOAD` ownership with no RWX/overlap; and no veneer/thunk. Each declared
+changed kernel must have a present, structurally valid body record; every
+undeclared kernel's `body_end`/body size, hashes, calls, frame, and spills must remain
+exact, and missing fields or changes outside the declared set fail. Every recorded
+size/alignment/field offset for `ElasticTable`, `Level`,
+`ElasticMetadataWord`, `FunnelTable`, `FunnelShape`, `LevelShape`, and
+`FlatStorage` must also match. `BucketLevel` must remain absent, or, if
+introduced by an independently approved change, have a complete exact
+snapshot. Any drift is a hard `HOLD` before timing; a favorable result cannot
+waive it.
 
 Run and immediately snapshot all three preflight comparisons, including the
 stable Funnel target even for a combined or Funnel-only selector:
 
 ```bash
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$prf_arch-prf-$prf_candidate-preflight-original-control" scripts/cache-gate.sh)
-(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$prf_arch-prf-$prf_candidate-preflight-candidate-control" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 LOAD="$prf_arch-prf-$prf_candidate-preflight-candidate-control" BASELINE="$prf_arch-prf-$prf_candidate-preflight-original-control" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "prf-$prf_candidate-preflight-control" --pair 1 --target control --anchor-run "$prf_arch-prf-$prf_candidate-preflight-original-control" --candidate-run "$prf_arch-prf-$prf_candidate-preflight-candidate-control" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest")
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$prf_campaign_id-preflight-original-control" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_anchor_tree")
+(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$prf_campaign_id-preflight-candidate-control" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_candidate_tree")
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_campaign_id-preflight-control" --pair 1 --target control --anchor-run "$prf_campaign_id-preflight-original-control" --candidate-run "$prf_campaign_id-preflight-candidate-control" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest"
 
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" ELASTIC=1 SAVE="$prf_arch-prf-$prf_candidate-preflight-original-elastic" scripts/cache-gate.sh)
-(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" ELASTIC=1 SAVE="$prf_arch-prf-$prf_candidate-preflight-candidate-elastic" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" ELASTIC=1 LOAD="$prf_arch-prf-$prf_candidate-preflight-candidate-elastic" BASELINE="$prf_arch-prf-$prf_candidate-preflight-original-elastic" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "prf-$prf_candidate-preflight-elastic" --pair 1 --target elastic_cache_gate --anchor-run "$prf_arch-prf-$prf_candidate-preflight-original-elastic" --candidate-run "$prf_arch-prf-$prf_candidate-preflight-candidate-elastic" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest")
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CACHE_GATE_MANIFEST="$prf_anchor_manifest" ELASTIC=1 SAVE="$prf_campaign_id-preflight-original-elastic" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_anchor_tree")
+(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CACHE_GATE_MANIFEST="$prf_candidate_manifest" ELASTIC=1 SAVE="$prf_campaign_id-preflight-candidate-elastic" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_candidate_tree")
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_campaign_id-preflight-elastic" --pair 1 --target elastic_cache_gate --anchor-run "$prf_campaign_id-preflight-original-elastic" --candidate-run "$prf_campaign_id-preflight-candidate-elastic" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest"
 
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" FUNNEL=1 SAVE="$prf_arch-prf-$prf_candidate-preflight-original-funnel" scripts/cache-gate.sh)
-(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" FUNNEL=1 SAVE="$prf_arch-prf-$prf_candidate-preflight-candidate-funnel" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" FUNNEL=1 LOAD="$prf_arch-prf-$prf_candidate-preflight-candidate-funnel" BASELINE="$prf_arch-prf-$prf_candidate-preflight-original-funnel" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "prf-$prf_candidate-preflight-funnel" --pair 1 --target funnel_cache_gate --anchor-run "$prf_arch-prf-$prf_candidate-preflight-original-funnel" --candidate-run "$prf_arch-prf-$prf_candidate-preflight-candidate-funnel" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest")
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CACHE_GATE_MANIFEST="$prf_anchor_manifest" FUNNEL=1 SAVE="$prf_campaign_id-preflight-original-funnel" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_anchor_tree")
+(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CACHE_GATE_MANIFEST="$prf_candidate_manifest" FUNNEL=1 SAVE="$prf_campaign_id-preflight-candidate-funnel" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_candidate_tree")
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_campaign_id-preflight-funnel" --pair 1 --target funnel_cache_gate --anchor-run "$prf_campaign_id-preflight-original-funnel" --candidate-run "$prf_campaign_id-preflight-candidate-funnel" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest"
 ```
 
 Require the fixed-control executable hashes to be byte-identical and every
+stable Elastic/Funnel invocation above to authenticate and execute the absolute
+Criterion executable from its named manifest. Stable modes may not invoke
+Cargo, compile, or relink after `MANIFEST=1`; snapshots record those exact
+executable and manifest hashes. Stable/control pair manifests must name the
+candidate manifest's exact authenticated executable as the sole executor,
+never the anchor binary, and record `offline_execution_count=1`; full/scaled
+pairs record the authenticated canonical runner. Require the same no-build
+property for all four profile operations. Then require every
 preflight std/hashbrown point to remain within 5%. For each of the three full
 pairs and three scaled pairs, run a fresh adjacent fixed-control pair first,
-execute its explicit `LOAD=<candidate> BASELINE=<anchor>` comparison, and call
-`snapshot-criterion-pair.sh` immediately. Then run the benchmark pair and
-immediately compare and snapshot it. This helper is the mandatory protocol;
+then call the authenticated snapshot helper. It is the sole offline executor
+and snapshots before releasing its Criterion-root lock. Then run the benchmark
+pair and invoke it once for that target. This helper is the mandatory protocol;
 its caller supplies unique `full-1` through `full-3` or `scale-1` through
 `scale-3` labels, and the benchmark SAVE order is `anchor,candidate`,
 `candidate,anchor`, `anchor,candidate`:
@@ -1499,61 +1822,65 @@ its caller supplies unique `full-1` through `full-3` or `scale-1` through
 ```bash
 snapshot_control_pair() {
     pair_label=$1 pair=$2
-    anchor_control="$prf_arch-prf-$prf_candidate-$pair_label-original-control"
-    candidate_control="$prf_arch-prf-$prf_candidate-$pair_label-candidate-control"
-    (cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$anchor_control" scripts/cache-gate.sh)
-    (cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$candidate_control" scripts/cache-gate.sh)
-    (cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 LOAD="$candidate_control" BASELINE="$anchor_control" scripts/cache-gate.sh)
-    (cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "prf-$prf_candidate-$pair_label-control" --pair "$pair" --target control --anchor-run "$anchor_control" --candidate-run "$candidate_control" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest")
+    anchor_control="$prf_campaign_id-$pair_label-original-control"
+    candidate_control="$prf_campaign_id-$pair_label-candidate-control"
+    (cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$anchor_control" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_anchor_tree")
+    (cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$candidate_control" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_candidate_tree")
+    "$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_campaign_id-$pair_label-control" --pair "$pair" --target control --anchor-run "$anchor_control" --candidate-run "$candidate_control" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest"
 }
 
 snapshot_full_pair() {
     pair=$1 anchor_run=$2 candidate_run=$3
-    (cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" LOAD="$candidate_run" BASELINE="$anchor_run" scripts/bench.sh)
-    (cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "prf-$prf_candidate-full" --pair "$pair" --target all --anchor-run "$anchor_run" --candidate-run "$candidate_run" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest")
+    "$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_campaign_id-full" --pair "$pair" --target all --anchor-run "$anchor_run" --candidate-run "$candidate_run" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest"
 }
 
 snapshot_scale_pair() {
     pair=$1 anchor_run=$2 candidate_run=$3
-    (cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert LOAD="$candidate_run" BASELINE="$anchor_run" scripts/bench.sh)
-    (cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "prf-$prf_candidate-scale" --pair "$pair" --target scaled_insert --anchor-run "$anchor_run" --candidate-run "$candidate_run" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest")
+    "$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_campaign_id-scale" --pair "$pair" --target scaled_insert --anchor-run "$anchor_run" --candidate-run "$candidate_run" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_candidate_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_candidate_manifest"
 }
 
 snapshot_control_pair full-1 1
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-original-$prf_candidate-a1" scripts/bench.sh)
-(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-$prf_candidate-c1" scripts/bench.sh)
-snapshot_full_pair 1 "$prf_arch-prf-original-$prf_candidate-a1" "$prf_arch-prf-$prf_candidate-c1"
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_campaign_id-full-original-a1" scripts/bench.sh)
+(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_campaign_id-full-candidate-c1" scripts/bench.sh)
+snapshot_full_pair 1 "$prf_campaign_id-full-original-a1" "$prf_campaign_id-full-candidate-c1"
 snapshot_control_pair full-2 2
-(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-$prf_candidate-c2" scripts/bench.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-original-$prf_candidate-a2" scripts/bench.sh)
-snapshot_full_pair 2 "$prf_arch-prf-original-$prf_candidate-a2" "$prf_arch-prf-$prf_candidate-c2"
+(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_campaign_id-full-candidate-c2" scripts/bench.sh)
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_campaign_id-full-original-a2" scripts/bench.sh)
+snapshot_full_pair 2 "$prf_campaign_id-full-original-a2" "$prf_campaign_id-full-candidate-c2"
 snapshot_control_pair full-3 3
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-original-$prf_candidate-a3" scripts/bench.sh)
-(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-$prf_candidate-c3" scripts/bench.sh)
-snapshot_full_pair 3 "$prf_arch-prf-original-$prf_candidate-a3" "$prf_arch-prf-$prf_candidate-c3"
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_campaign_id-full-original-a3" scripts/bench.sh)
+(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_campaign_id-full-candidate-c3" scripts/bench.sh)
+snapshot_full_pair 3 "$prf_campaign_id-full-original-a3" "$prf_campaign_id-full-candidate-c3"
 
 snapshot_control_pair scale-1 1
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-original-$prf_candidate-scale-a1" scripts/bench.sh)
-(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-$prf_candidate-scale-c1" scripts/bench.sh)
-snapshot_scale_pair 1 "$prf_arch-prf-original-$prf_candidate-scale-a1" "$prf_arch-prf-$prf_candidate-scale-c1"
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_campaign_id-scale-original-a1" scripts/bench.sh)
+(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_campaign_id-scale-candidate-c1" scripts/bench.sh)
+snapshot_scale_pair 1 "$prf_campaign_id-scale-original-a1" "$prf_campaign_id-scale-candidate-c1"
 snapshot_control_pair scale-2 2
-(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-$prf_candidate-scale-c2" scripts/bench.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-original-$prf_candidate-scale-a2" scripts/bench.sh)
-snapshot_scale_pair 2 "$prf_arch-prf-original-$prf_candidate-scale-a2" "$prf_arch-prf-$prf_candidate-scale-c2"
+(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_campaign_id-scale-candidate-c2" scripts/bench.sh)
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_campaign_id-scale-original-a2" scripts/bench.sh)
+snapshot_scale_pair 2 "$prf_campaign_id-scale-original-a2" "$prf_campaign_id-scale-candidate-c2"
 snapshot_control_pair scale-3 3
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-original-$prf_candidate-scale-a3" scripts/bench.sh)
-(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-$prf_candidate-scale-c3" scripts/bench.sh)
-snapshot_scale_pair 3 "$prf_arch-prf-original-$prf_candidate-scale-a3" "$prf_arch-prf-$prf_candidate-scale-c3"
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_campaign_id-scale-original-a3" scripts/bench.sh)
+(cd "$prf_candidate_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_campaign_id-scale-candidate-c3" scripts/bench.sh)
+snapshot_scale_pair 3 "$prf_campaign_id-scale-original-a3" "$prf_campaign_id-scale-candidate-c3"
 ```
 
-The fresh control pair uses the same immediate `CONTROL=1 LOAD/BASELINE` plus
-snapshot sequence shown in preflight, with comparison names containing the
-matching `full-N` or `scale-N`. Do not begin the next SAVE until the current
+The fresh control protocol is literally two adjacent `CONTROL=1 SAVE` calls
+followed by one atomic snapshot-helper call, with comparison names containing
+the matching `full-N` or `scale-N`. The helper itself performs the sole
+`CONTROL=1 LOAD/BASELINE` while holding the Criterion-root lock; no caller-side
+launcher command may perform that comparison. Do not begin the next SAVE until the current
 snapshot has atomically captured every `change/estimates.json`, both named
 absolute `estimates.json` trees, both manifests/link maps, commit/run/target
 metadata, and verified SHA-256 inventory. If either control moves by more than
 5%, preserve the rejected snapshot, discard that benchmark pair, and rerun it
-under a new run/pair name; never overwrite or subtract control movement.
+only as a new campaign: preserve every root for the failed
+`prf_campaign_id`, increment `PRF_SURVIVOR_ATTEMPT`, derive a fresh campaign
+ID from architecture + exact candidate commit + attempt + composition, and
+repeat Steps 4 and 6 from fresh diagnostic/static manifest instances. Never
+reuse a SAVE/comparison/pair name, overwrite an artifact, or subtract control
+movement.
 
 These direct original-current comparisons—not candidate-vs-scaffold or
 candidate-vs-cache-on comparisons—decide acceptance. Use distinct names and
@@ -1596,10 +1923,19 @@ accepted manifest. Run the no-build launcher separately for all four operations
 and retain three raw repetitions per operation/tree:
 
 ```bash
-CACHE_GATE_CAMPAIGN_ROOT=/absolute/shared/cache-gate-campaign-contracts
-CACHE_GATE_CAMPAIGN_KEY="counter-prf-$prf_candidate-vs-original-current"
-for tree in "$prf_anchor_tree" "$prf_candidate_tree"; do
-    manifest="$tree/target/cache-gate/$prf_arch/$(test "$tree" = "$prf_anchor_tree" && echo prf-original-current || echo prf-$prf_candidate)/manifest.json"
+test -n "${prf_campaign_id:?carry the exact survivor timing campaign ID}"
+test "$prf_campaign_id" = "$prf_arch-${prf_candidate_commit:0:12}-attempt-$PRF_SURVIVOR_ATTEMPT-$prf_candidate"
+CACHE_GATE_CAMPAIGN_KEY="counter-prf-$prf_campaign_id-vs-${prf_anchor_commit:0:12}"
+CACHE_GATE_PERF_TOOL="$cache_off_v2_evidence_tree/scripts/cache-gate-perf.sh"
+test "$(git -C "$cache_off_v2_evidence_tree" rev-parse HEAD:scripts/cache-gate-perf.sh)" = "$cache_gate_perf_blob"
+test "$(sha256sum "$CACHE_GATE_PERF_TOOL" | cut -d' ' -f1)" = "$cache_gate_perf_sha"
+prf_profile_trees=("$prf_anchor_tree" "$prf_candidate_tree")
+prf_profile_manifests=("$prf_anchor_manifest" "$prf_candidate_manifest")
+for index in 0 1; do
+    tree=${prf_profile_trees[$index]}
+    manifest=${prf_profile_manifests[$index]}
+    test "$(jq -er '.runner_root' "$manifest")" = "$tree"
+    CACHE_GATE_CAMPAIGN_ROOT="$tree/target/cache-gate-campaigns/$prf_campaign_id"
     profile_bin=$(jq -er '.executables.cache_gate_profile.absolute_path' "$manifest")
     test -x "$profile_bin"
     for operation in elastic-insert elastic-get funnel-insert funnel-get; do
@@ -1608,7 +1944,8 @@ for tree in "$prf_anchor_tree" "$prf_candidate_tree"; do
                 CACHE_GATE_PERF_BIN="$profile_bin" \
                 CACHE_GATE_CAMPAIGN_ROOT="$CACHE_GATE_CAMPAIGN_ROOT" \
                 CACHE_GATE_CAMPAIGN_KEY="$CACHE_GATE_CAMPAIGN_KEY" \
-                scripts/cache-gate-perf.sh --manifest "$manifest" \
+                "$CACHE_GATE_PERF_TOOL" --runner-root "$tree" \
+                --manifest "$manifest" \
                 --operation "$operation" --iterations 100 \
                 --repetition "$repetition")
         done
@@ -1616,9 +1953,12 @@ for tree in "$prf_anchor_tree" "$prf_candidate_tree"; do
 done
 ```
 
-The absolute campaign root and key above are one shared contract namespace for
-both immutable worktrees and all repetitions 1–3. Change the key only when
-starting a different anchor/candidate campaign.
+The identical campaign key is stored under each authenticated runner root for
+all repetitions 1–3; every output is root-contained and records that root. A
+retry uses a new immutable candidate commit or increments
+`PRF_SURVIVOR_ATTEMPT`, then repeats the whole survivor campaign under its new
+architecture/commit/attempt/composition ID; preserve every failed campaign
+root.
 
 `cache-gate-perf.sh` verifies the manifested binary hash, performs all setup
 before `READY`, enables `perf stat -x,` counters only around the one named
@@ -1682,7 +2022,9 @@ reasons for every quality survivor.
 - Create: `docs/performance/2026-07-20-counter-prf-performance.md`
 
 **Interfaces:**
-- Consumes: Task 5 quality survivors, Task 6 cross-architecture evidence, and immutable cache-off original current.
+- Consumes: Task 5 quality survivors, Task 6 cross-architecture evidence, and
+  immutable cache-off-v2 source-original plus its accepted native linker/layout
+  contract.
 - Produces: direct production modules for each backend, no selector machinery, and final verification evidence.
 
 - [ ] **Step 1: Run BigCrush on each provisional backend winner**
@@ -1779,84 +2121,160 @@ test -z "$(git status --porcelain)"
 
 - [ ] **Step 7: Pass fixed-control preflight and run three fresh final-vs-original pairs**
 
-The acceptance anchor remains immutable `prf-original-current` from Task 6;
+The acceptance anchor remains immutable repaired `prf-original-current` at
+`cache_off_current_v2_commit` from Task 6;
 `prf-current-anchor` is diagnostic only. The final tree is the clean
 `counter-prf-insert` worktree at `prf_final_commit`. On each pinned host first
 run adjacent independent fixed controls and both stable-layout backend targets.
 Require byte-identical control executables and every std/hashbrown movement
 within 5%. Re-declare Task 6 Step 6's exact `snapshot_control_pair` helper with
-`prf_candidate=final`, `prf_candidate_tree="$prf_final_tree"`,
+`prf_campaign_id="$prf_final_attempt_id"`,
+`prf_candidate="$prf_final_attempt_id"`, `prf_candidate_tree="$prf_final_tree"`,
 `prf_candidate_commit="$prf_final_commit"`, and
 `prf_candidate_manifest="$prf_final_manifest"`; invoke it at each marked
 position below. Then run this exact alternating sequence:
 
 ```bash
 prf_arch=$(uname -m)
+signature_cache_evidence_commit=$(git rev-list --all --grep='^docs: accept elastic candidate signature cache$' -1)
+signature_cache_blob=$(mktemp)
+trap 'rm -f "$signature_cache_blob"' EXIT
+git show "$signature_cache_evidence_commit:docs/performance/2026-07-21-elastic-candidate-signature-cache.md" > "$signature_cache_blob"
+cache_off_current_v2_commit=$(sed -n 's/^- Cache-off-v2 commit: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+aarch64_linker_capability_sha=$(sed -n 's/^- AArch64 linker capability SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+x86_64_linker_capability_sha=$(sed -n 's/^- x86-64 linker capability SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+aarch64_cache_off_static_variant=$(sed -n 's/^- AArch64 cache-off-v2 static variant: `\([A-Za-z0-9._-]\+\)`$/\1/p' "$signature_cache_blob")
+x86_64_cache_off_static_variant=$(sed -n 's/^- x86-64 cache-off-v2 static variant: `\([A-Za-z0-9._-]\+\)`$/\1/p' "$signature_cache_blob")
+aarch64_cache_off_v2_manifest_sha=$(sed -n 's/^- AArch64 cache-off-v2 manifest SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+x86_64_cache_off_v2_manifest_sha=$(sed -n 's/^- x86-64 cache-off-v2 manifest SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_elf_layout_sha=$(sed -n 's/^- ELF layout validator SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_snapshot_sha=$(sed -n 's/^- Snapshot helper SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_launcher_sha=$(sed -n 's/^- Cache-gate launcher SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_perf_blob=$(sed -n 's/^- Cache-gate perf launcher Git blob: `\([0-9a-f]\{40\}\)`$/\1/p' "$signature_cache_blob")
+cache_gate_perf_sha=$(sed -n 's/^- Cache-gate perf launcher SHA-256: `\([0-9a-f]\{64\}\)`$/\1/p' "$signature_cache_blob")
+test -n "$prf_elastic_winner"
+test -n "$prf_funnel_winner"
 prf_anchor_tree=/home/aang/projects/opthash/.worktrees/perf/prf-original-current
 prf_final_tree=/home/aang/projects/opthash/.worktrees/perf/counter-prf-insert
+cache_off_v2_evidence_tree=/home/aang/projects/opthash/.worktrees/perf/cache-off-v2
 CACHE_GATE_CONTROL_BIN=$(sed -n '1p' "$prf_anchor_tree/target/cache-gate-control-bin.txt")
 test -x "$CACHE_GATE_CONTROL_BIN"
 prf_anchor_commit=$(git -C "$prf_anchor_tree" rev-parse HEAD)
-test "$prf_anchor_commit" = "$cache_off_current_commit"
+test "$prf_anchor_commit" = "$cache_off_current_v2_commit"
 test "$(git -C "$prf_final_tree" rev-parse HEAD)" = "$prf_final_commit"
 test -z "$(git -C "$prf_anchor_tree" status --porcelain)"
 test -z "$(git -C "$prf_final_tree" status --porcelain)"
+test "${PRF_FINAL_ATTEMPT:?set a positive, never-reused final attempt number}" -gt 0
+prf_final_composition="$prf_elastic_winner-$prf_funnel_winner"
+prf_final_attempt_id="$prf_arch-${prf_final_commit:0:12}-attempt-$PRF_FINAL_ATTEMPT-$prf_final_composition"
+case "$prf_arch" in
+    aarch64) cache_off_static_variant=$aarch64_cache_off_static_variant; expected_capability_sha=$aarch64_linker_capability_sha; expected_cache_off_manifest_sha=$aarch64_cache_off_v2_manifest_sha ;;
+    x86_64) cache_off_static_variant=$x86_64_cache_off_static_variant; expected_capability_sha=$x86_64_linker_capability_sha; expected_cache_off_manifest_sha=$x86_64_cache_off_v2_manifest_sha ;;
+    *) echo "HOLD: native Linux ELF AArch64/x86-64 proof required" >&2; exit 3 ;;
+esac
+accepted_cache_off_v2_manifest="$cache_off_v2_evidence_tree/target/cache-gate/$prf_arch/$cache_off_static_variant/manifest.json"
+test "$(sha256sum "$accepted_cache_off_v2_manifest" | cut -d' ' -f1)" = "$expected_cache_off_manifest_sha"
+CACHE_GATE_LINKER_CAPABILITY=$(jq -er '.linker_capability.copy.absolute_path' "$accepted_cache_off_v2_manifest")
+test "$(realpath -e "$CACHE_GATE_LINKER_CAPABILITY")" = "$(dirname "$accepted_cache_off_v2_manifest")/linker-capability.json"
+test "$(sha256sum "$CACHE_GATE_LINKER_CAPABILITY" | cut -d' ' -f1)" = "$expected_capability_sha"
+test "$expected_capability_sha" = "$(jq -er '.linker_capability.copy.sha256' "$accepted_cache_off_v2_manifest")"
 
-(cd "$prf_anchor_tree" && CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT=prf-original-current scripts/cache-gate.sh)
-(cd "$prf_final_tree" && CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT=prf-final scripts/cache-gate.sh)
-prf_anchor_manifest="$prf_anchor_tree/target/cache-gate/$prf_arch/prf-original-current/manifest.json"
-prf_final_manifest="$prf_final_tree/target/cache-gate/$prf_arch/prf-final/manifest.json"
+prf_anchor_manifest="$prf_anchor_tree/target/cache-gate/$prf_arch/$prf_arch-prf-original-current/manifest.json"
+prf_anchor_manifest_sha=$(sed -n '1p' "$prf_anchor_manifest.sha256")
+test "$(sha256sum "$prf_anchor_manifest" | cut -d' ' -f1)" = "$prf_anchor_manifest_sha"
+CACHE_GATE_ELF_LAYOUT_TOOL="$cache_off_v2_evidence_tree/scripts/cache-gate-elf-layout.py"
+CACHE_GATE_SNAPSHOT_TOOL="$cache_off_v2_evidence_tree/scripts/snapshot-criterion-pair.sh"
+CACHE_GATE_LAUNCHER="$cache_off_v2_evidence_tree/scripts/cache-gate.sh"
+test "$(sha256sum "$CACHE_GATE_ELF_LAYOUT_TOOL" | cut -d' ' -f1)" = "$cache_gate_elf_layout_sha"
+test "$(sha256sum "$CACHE_GATE_SNAPSHOT_TOOL" | cut -d' ' -f1)" = "$cache_gate_snapshot_sha"
+test "$(sha256sum "$CACHE_GATE_LAUNCHER" | cut -d' ' -f1)" = "$cache_gate_launcher_sha"
+prf_final_variant="$prf_final_attempt_id-final-static"
+(cd "$prf_final_tree" && CACHE_GATE_MANIFEST_INSTANCE="$prf_final_variant" CACHE_GATE_LINKER_CAPABILITY="$CACHE_GATE_LINKER_CAPABILITY" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" MANIFEST=1 CACHE_GATE_VARIANT="$prf_final_variant" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_final_tree")
+prf_final_manifest="$prf_final_tree/target/cache-gate/$prf_arch/$prf_final_variant/manifest.json"
+test "$(jq -er '.runner_root' "$prf_final_manifest")" = "$prf_final_tree"
+prf_candidate="$prf_final_attempt_id"
+prf_candidate_tree="$prf_final_tree"
+prf_candidate_commit="$prf_final_commit"
+prf_candidate_manifest="$prf_final_manifest"
+prf_final_changed_kernel_args=()
+if test "$prf_elastic_winner" != current; then
+  prf_final_changed_kernel_args+=(
+    --allow-body-change elastic_cache_gate_insert_kernel
+    --allow-body-change elastic_cache_gate_get_kernel
+    --allow-body-change elastic_profile_insert_kernel
+    --allow-body-change elastic_profile_get_kernel
+  )
+fi
+if test "$prf_funnel_winner" != current; then
+  prf_final_changed_kernel_args+=(
+    --allow-body-change funnel_cache_gate_insert_kernel
+    --allow-body-change funnel_cache_gate_get_kernel
+    --allow-body-change funnel_profile_insert_kernel
+    --allow-body-change funnel_profile_get_kernel
+  )
+fi
+"$CACHE_GATE_ELF_LAYOUT_TOOL" compare --anchor "$prf_anchor_manifest" --candidate "$prf_final_manifest" "${prf_final_changed_kernel_args[@]}"
 
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$prf_arch-prf-final-preflight-original-control" scripts/cache-gate.sh)
-(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$prf_arch-prf-final-preflight-final-control" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 LOAD="$prf_arch-prf-final-preflight-final-control" BASELINE="$prf_arch-prf-final-preflight-original-control" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison prf-final-preflight-control --pair 1 --target control --anchor-run "$prf_arch-prf-final-preflight-original-control" --candidate-run "$prf_arch-prf-final-preflight-final-control" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest")
+final_anchor_control="$prf_final_attempt_id-preflight-original-control"
+final_candidate_control="$prf_final_attempt_id-preflight-final-control"
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$final_anchor_control" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_anchor_tree")
+(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CONTROL=1 SAVE="$final_candidate_control" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_final_tree")
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_final_attempt_id-preflight-control" --pair 1 --target control --anchor-run "$final_anchor_control" --candidate-run "$final_candidate_control" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest"
 
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" ELASTIC=1 SAVE="$prf_arch-prf-final-preflight-original-elastic" scripts/cache-gate.sh)
-(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" ELASTIC=1 SAVE="$prf_arch-prf-final-preflight-final-elastic" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" ELASTIC=1 LOAD="$prf_arch-prf-final-preflight-final-elastic" BASELINE="$prf_arch-prf-final-preflight-original-elastic" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison prf-final-preflight-elastic --pair 1 --target elastic_cache_gate --anchor-run "$prf_arch-prf-final-preflight-original-elastic" --candidate-run "$prf_arch-prf-final-preflight-final-elastic" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest")
+final_anchor_elastic="$prf_final_attempt_id-preflight-original-elastic"
+final_candidate_elastic="$prf_final_attempt_id-preflight-final-elastic"
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CACHE_GATE_MANIFEST="$prf_anchor_manifest" ELASTIC=1 SAVE="$final_anchor_elastic" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_anchor_tree")
+(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CACHE_GATE_MANIFEST="$prf_final_manifest" ELASTIC=1 SAVE="$final_candidate_elastic" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_final_tree")
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_final_attempt_id-preflight-elastic" --pair 1 --target elastic_cache_gate --anchor-run "$final_anchor_elastic" --candidate-run "$final_candidate_elastic" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest"
 
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" FUNNEL=1 SAVE="$prf_arch-prf-final-preflight-original-funnel" scripts/cache-gate.sh)
-(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" FUNNEL=1 SAVE="$prf_arch-prf-final-preflight-final-funnel" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" FUNNEL=1 LOAD="$prf_arch-prf-final-preflight-final-funnel" BASELINE="$prf_arch-prf-final-preflight-original-funnel" scripts/cache-gate.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison prf-final-preflight-funnel --pair 1 --target funnel_cache_gate --anchor-run "$prf_arch-prf-final-preflight-original-funnel" --candidate-run "$prf_arch-prf-final-preflight-final-funnel" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest")
+final_anchor_funnel="$prf_final_attempt_id-preflight-original-funnel"
+final_candidate_funnel="$prf_final_attempt_id-preflight-final-funnel"
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CACHE_GATE_MANIFEST="$prf_anchor_manifest" FUNNEL=1 SAVE="$final_anchor_funnel" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_anchor_tree")
+(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" CACHE_GATE_CONTROL_BIN="$CACHE_GATE_CONTROL_BIN" CACHE_GATE_MANIFEST="$prf_final_manifest" FUNNEL=1 SAVE="$final_candidate_funnel" "$CACHE_GATE_LAUNCHER" --runner-root "$prf_final_tree")
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_final_attempt_id-preflight-funnel" --pair 1 --target funnel_cache_gate --anchor-run "$final_anchor_funnel" --candidate-run "$final_candidate_funnel" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest"
 
 snapshot_control_pair final-full-1 1
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-final-original-a1" scripts/bench.sh)
-(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-final-f1" scripts/bench.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" LOAD="$prf_arch-prf-final-f1" BASELINE="$prf_arch-prf-final-original-a1" scripts/bench.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison prf-final-full --pair 1 --target all --anchor-run "$prf_arch-prf-final-original-a1" --candidate-run "$prf_arch-prf-final-f1" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest")
+final_anchor_full_1="$prf_final_attempt_id-full-original-a1"
+final_candidate_full_1="$prf_final_attempt_id-full-final-f1"
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$final_anchor_full_1" scripts/bench.sh)
+(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$final_candidate_full_1" scripts/bench.sh)
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_final_attempt_id-full" --pair 1 --target all --anchor-run "$final_anchor_full_1" --candidate-run "$final_candidate_full_1" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest"
 snapshot_control_pair final-full-2 2
-(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-final-f2" scripts/bench.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-final-original-a2" scripts/bench.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" LOAD="$prf_arch-prf-final-f2" BASELINE="$prf_arch-prf-final-original-a2" scripts/bench.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison prf-final-full --pair 2 --target all --anchor-run "$prf_arch-prf-final-original-a2" --candidate-run "$prf_arch-prf-final-f2" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest")
+final_anchor_full_2="$prf_final_attempt_id-full-original-a2"
+final_candidate_full_2="$prf_final_attempt_id-full-final-f2"
+(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$final_candidate_full_2" scripts/bench.sh)
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$final_anchor_full_2" scripts/bench.sh)
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_final_attempt_id-full" --pair 2 --target all --anchor-run "$final_anchor_full_2" --candidate-run "$final_candidate_full_2" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest"
 snapshot_control_pair final-full-3 3
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-final-original-a3" scripts/bench.sh)
-(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$prf_arch-prf-final-f3" scripts/bench.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" LOAD="$prf_arch-prf-final-f3" BASELINE="$prf_arch-prf-final-original-a3" scripts/bench.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison prf-final-full --pair 3 --target all --anchor-run "$prf_arch-prf-final-original-a3" --candidate-run "$prf_arch-prf-final-f3" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest")
+final_anchor_full_3="$prf_final_attempt_id-full-original-a3"
+final_candidate_full_3="$prf_final_attempt_id-full-final-f3"
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$final_anchor_full_3" scripts/bench.sh)
+(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" SAVE="$final_candidate_full_3" scripts/bench.sh)
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_final_attempt_id-full" --pair 3 --target all --anchor-run "$final_anchor_full_3" --candidate-run "$final_candidate_full_3" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest"
 
 snapshot_control_pair final-scale-1 1
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-final-original-scale-a1" scripts/bench.sh)
-(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-final-scale-f1" scripts/bench.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert LOAD="$prf_arch-prf-final-scale-f1" BASELINE="$prf_arch-prf-final-original-scale-a1" scripts/bench.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison prf-final-scale --pair 1 --target scaled_insert --anchor-run "$prf_arch-prf-final-original-scale-a1" --candidate-run "$prf_arch-prf-final-scale-f1" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest")
+final_anchor_scale_1="$prf_final_attempt_id-scale-original-a1"
+final_candidate_scale_1="$prf_final_attempt_id-scale-final-f1"
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$final_anchor_scale_1" scripts/bench.sh)
+(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$final_candidate_scale_1" scripts/bench.sh)
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_final_attempt_id-scale" --pair 1 --target scaled_insert --anchor-run "$final_anchor_scale_1" --candidate-run "$final_candidate_scale_1" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest"
 snapshot_control_pair final-scale-2 2
-(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-final-scale-f2" scripts/bench.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-final-original-scale-a2" scripts/bench.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert LOAD="$prf_arch-prf-final-scale-f2" BASELINE="$prf_arch-prf-final-original-scale-a2" scripts/bench.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison prf-final-scale --pair 2 --target scaled_insert --anchor-run "$prf_arch-prf-final-original-scale-a2" --candidate-run "$prf_arch-prf-final-scale-f2" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest")
+final_anchor_scale_2="$prf_final_attempt_id-scale-original-a2"
+final_candidate_scale_2="$prf_final_attempt_id-scale-final-f2"
+(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$final_candidate_scale_2" scripts/bench.sh)
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$final_anchor_scale_2" scripts/bench.sh)
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_final_attempt_id-scale" --pair 2 --target scaled_insert --anchor-run "$final_anchor_scale_2" --candidate-run "$final_candidate_scale_2" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest"
 snapshot_control_pair final-scale-3 3
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-final-original-scale-a3" scripts/bench.sh)
-(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$prf_arch-prf-final-scale-f3" scripts/bench.sh)
-(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert LOAD="$prf_arch-prf-final-scale-f3" BASELINE="$prf_arch-prf-final-original-scale-a3" scripts/bench.sh)
-(cd "$prf_anchor_tree" && scripts/snapshot-criterion-pair.sh --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison prf-final-scale --pair 3 --target scaled_insert --anchor-run "$prf_arch-prf-final-original-scale-a3" --candidate-run "$prf_arch-prf-final-scale-f3" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest")
+final_anchor_scale_3="$prf_final_attempt_id-scale-original-a3"
+final_candidate_scale_3="$prf_final_attempt_id-scale-final-f3"
+(cd "$prf_anchor_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$final_anchor_scale_3" scripts/bench.sh)
+(cd "$prf_final_tree" && OPTHASH_CRITERION_ROOT="$prf_criterion_root" BENCH=scaled_insert SAVE="$final_candidate_scale_3" scripts/bench.sh)
+"$CACHE_GATE_SNAPSHOT_TOOL" --runner-root "$prf_candidate_tree" --criterion-root "$prf_criterion_root" --snapshot-root target/cache-gate-evidence --arch "$prf_arch" --comparison "$prf_final_attempt_id-scale" --pair 3 --target scaled_insert --anchor-run "$final_anchor_scale_3" --candidate-run "$final_candidate_scale_3" --anchor-commit "$prf_anchor_commit" --candidate-commit "$prf_final_commit" --anchor-manifest "$prf_anchor_manifest" --candidate-manifest "$prf_final_manifest"
 ```
 
-The `LOAD/BASELINE` and atomic snapshot must occur at the exact positions shown,
-before another comparison can overwrite live `change/`. Each snapshot contains
+Each atomic helper call performs the only `LOAD/BASELINE` at the exact position
+shown and snapshots before another comparison can overwrite live `change/`.
+Each snapshot contains
 all changes, both absolute trees, both manifests/link maps, commits, run names,
 target, and verified hashes. Repeat the adjacent fixed-control comparison and
 snapshot immediately before each full and scaled pair, using unique names;
@@ -1874,9 +2292,19 @@ plus byte-identical hot-body/±0-Callgrind gate to any backend that still calls
 substitute for these direct original-current gates.
 
 Before accepting timing, require the final manifest to match original current
-for the stable Elastic and Funnel kernels' address, `start % 4096`, alignment,
-and link-map predecessor, and require every target-aware layout snapshot to
-match. Reject unexplained drift. If Funnel remains `current`, every Funnel
+for all eight unique output/input sections, exact starts/page offsets/actual
+alignments, exact reservation-start/reservation-end names and addresses, and
+an always-present structurally valid `body_end` name whose address is exact
+only for a kernel retaining `current`; also require exact reservations and linker
+capability/script identity, PIE/RX/load-segment state, and empty veneer/thunk
+inventory. Parse and validate all raw/normalized body hashes and sizes,
+calls/frames/spills; require exact equality for every backend retaining
+`current`, and permit body changes only for the predeclared four
+stable/profile kernels of a changed backend. Require every target-aware layout
+snapshot to match. The stable Elastic/Funnel invocations
+must execute their exact hash-verified manifested Criterion binaries with no
+Cargo or relink after manifest creation. Reject unexplained drift and keep the
+decision `HOLD` on missing capability or architecture proof. If Funnel remains `current`, every Funnel
 public/latency/scaled point is `<= +0.02`, its median is `<= +0.01`, at least
 two upper bounds are `<= +0.02`, and its named Callgrind counts and normalized
 stable hot bodies are exactly unchanged. Never gate a favorable negative lower
@@ -1885,10 +2313,39 @@ bound.
 - [ ] **Step 8: Capture final counters, Callgrind, and exact assembly**
 
 On AArch64 run only the manifested no-build profile binary in both immutable
-trees. Invoke `scripts/cache-gate-perf.sh` with the matching manifest for each
-of `elastic-insert`, `elastic-get`, `funnel-insert`, and `funnel-get`, with
-identical iterations and three separately retained repetitions, exactly as in
-Task 6 Step 7. Counters are enabled only after the profile process reports
+trees. Use the authenticated cache-off-v2 launcher and the actual anchor/final
+manifest variables, never a reconstructed variant path:
+
+```bash
+CACHE_GATE_PERF_TOOL="$cache_off_v2_evidence_tree/scripts/cache-gate-perf.sh"
+test "$(git -C "$cache_off_v2_evidence_tree" rev-parse HEAD:scripts/cache-gate-perf.sh)" = "$cache_gate_perf_blob"
+test "$(sha256sum "$CACHE_GATE_PERF_TOOL" | cut -d' ' -f1)" = "$cache_gate_perf_sha"
+test -n "${prf_final_attempt_id:?carry exact final campaign ID from Step 7}"
+test "$prf_final_attempt_id" = "$prf_arch-${prf_final_commit:0:12}-attempt-$PRF_FINAL_ATTEMPT-$prf_final_composition"
+CACHE_GATE_CAMPAIGN_KEY="counter-prf-final-$prf_final_attempt_id-vs-${prf_anchor_commit:0:12}"
+prf_profile_trees=("$prf_anchor_tree" "$prf_final_tree")
+prf_profile_manifests=("$prf_anchor_manifest" "$prf_final_manifest")
+for index in 0 1; do
+    tree=${prf_profile_trees[$index]}
+    manifest=${prf_profile_manifests[$index]}
+    test "$(jq -er '.runner_root' "$manifest")" = "$tree"
+    CACHE_GATE_CAMPAIGN_ROOT="$tree/target/cache-gate-campaigns/$prf_final_attempt_id"
+    profile_bin=$(jq -er '.executables.cache_gate_profile.absolute_path' "$manifest")
+    test -x "$profile_bin"
+    for operation in elastic-insert elastic-get funnel-insert funnel-get; do
+        for repetition in 1 2 3; do
+            CACHE_GATE_PERF_BIN="$profile_bin" \
+            CACHE_GATE_CAMPAIGN_ROOT="$CACHE_GATE_CAMPAIGN_ROOT" \
+            CACHE_GATE_CAMPAIGN_KEY="$CACHE_GATE_CAMPAIGN_KEY" \
+            "$CACHE_GATE_PERF_TOOL" --runner-root "$tree" \
+              --manifest "$manifest" --operation "$operation" \
+              --iterations 100 --repetition "$repetition"
+        done
+    done
+done
+```
+
+Counters are enabled only after the profile process reports
 `READY`; preserve every raw `perf stat -x,` CSV and compute per-operation
 medians. Cargo, Criterion, linking, fixture setup, and another operation are
 outside the enabled interval.
@@ -1930,19 +2387,32 @@ a previously eligible fallback, rerun the actual mixed
 BigCrush streams, and return to Steps 3-6: rewire/delete modules, update the
 final CLI/docs, rerun the entire test/no-std/nightly/Miri/pre-commit gate, and
 make a new immutable production commit. Only then repeat Steps 7-8. Do not
-document or ship a final composition until the reviewer approves it.
+reuse `PRF_FINAL_ATTEMPT`: increment it for the new immutable commit so every
+proof instance, manifest variant, SAVE run, comparison, snapshot destination,
+and perf campaign remains rooted at
+`$prf_arch-${prf_final_commit:0:12}-attempt-$PRF_FINAL_ATTEMPT-$prf_final_composition`.
+Preserve every
+failed attempt root and propagate only the selected final manifest path/hash.
+Do not document or ship a final composition until the reviewer approves it.
 
 - [ ] **Step 9: Record final performance evidence**
 
 Create `docs/performance/2026-07-20-counter-prf-performance.md` containing:
 
-1. Exact cache-off original, scaffold-current, and candidate commit IDs plus host architecture/CPU/kernel/toolchain.
+1. Exact source-original, rejected v1/policy diagnostics, historical revert,
+   policy-revert-v2, replayed-harness, cache-off-v2, policy-replay-v2,
+   scaffold-current, and candidate commit IDs plus host
+   architecture/CPU/kernel/toolchain.
 2. All three raw pairs, point estimates, 95% intervals, controls, and decisions
    per architecture/backend for `insert`, `get_hit`, `get_hit_sequential`,
    `get_miss`, `tiny_lookup`, `mixed`, `delete_heavy`, and `resize_heavy`.
 3. All three raw pairs, intervals, controls, and +2% decisions for randomized
    and sequential latency at 1K, 10K, 100K, 1M, and 10M.
-4. Fixed-control executable hashes/addresses, stable-layout preflight, and every discarded control run/movement.
+4. Fixed-control executable hashes/addresses; both native linker capability
+   records; linker path/flavor/version and all augmenting fragment/set hashes; exact
+   manifested Criterion/profile binary hashes; all eight section/start/page/
+   alignment/sentinel/reservation/body/call fields; PIE/RX/no-veneer proof;
+   stable-layout preflight; and every discarded control run/movement.
 5. All three 100K/1M/10M scaled-insert pairs, intervals, controls, and gate decisions.
 6. Callgrind and `perf stat` cycle/instruction/cache/branch changes.
 7. Struct sizes, stack-frame sizes, one-signature/lazy-get proof, and multiply lowering from final assembly.
