@@ -701,15 +701,17 @@ def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
         "exit 0\n"
     )
     linker.chmod(0o755)
+    link_output = tmp_path / "probe-hashed"
+    link_output.write_bytes(b"ELF fixture\n")
     binary = tmp_path / "probe"
-    binary.write_bytes(b"ELF fixture\n")
+    os.link(link_output, binary)
     trace = tmp_path / "linker-trace.jsonl"
     trace.write_text(
         json.dumps(
             {
                 "driver": str(linker.resolve()),
                 "driver_sha256": digest(linker),
-                "argv": ["-o", str(binary.resolve())],
+                "argv": ["-o", str(link_output.resolve())],
                 "cwd": str(tmp_path.resolve()),
                 "path": os.environ["PATH"],
             }
@@ -933,6 +935,24 @@ def test_explicit_linker_trace_is_contained_under_runner_target():
         )
     ]
     assert "linker trace is outside runner target" in capability
+
+
+def test_main_link_trace_output_hardlink_cannot_escape_runner_target(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    runner_target = tmp_path / "runner/target"
+    runner_target.mkdir(parents=True)
+    binary = runner_target / "bench"
+    binary.write_bytes(b"ELF fixture\n")
+    outside = tmp_path / "outside-bench"
+    os.link(binary, outside)
+
+    assert namespace["_output_matches"](["ld", "-o", str(outside)], binary)
+    with pytest.raises(ValueError, match="main link output is outside runner target"):
+        namespace["_require_output_contained"](
+            ["ld", "-o", str(outside)],
+            runner_target,
+            "main link output is outside runner target",
+        )
 
 
 @pytest.mark.parametrize(

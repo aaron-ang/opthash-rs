@@ -637,7 +637,7 @@ def replay_linker_execution(
         record
         for record in records
         if isinstance(record.get("argv"), list)
-        and _output_path(record["argv"]) == executable
+        and _output_matches(record["argv"], executable)
     ]
     _require(
         len(matches) == 1,
@@ -681,7 +681,7 @@ def replay_link_command(
         record
         for record in records
         if isinstance(record.get("argv"), list)
-        and _output_path(record["argv"]) == executable
+        and _output_matches(record["argv"], executable)
     ]
     _require(
         len(matches) == 1,
@@ -932,6 +932,11 @@ def _validate_capability(
                     observed = _json_file(
                         execution_path, f"{flavor}/{target} linker execution"
                     )
+                    _require_output_contained(
+                        observed.get("argv", []),
+                        runner_target,
+                        f"{flavor}/{target} linker output is outside runner target",
+                    )
                     linker_record = capability["required_linkers"][flavor]
                     trace = observed.get("trace", {})
                     trace_path = _trace_record(trace, f"{flavor}/{target} linker trace")
@@ -1068,6 +1073,7 @@ def _validate_main_link_records(
     capability: dict[str, Any],
     fragments: dict[str, Path],
     root: Path,
+    runner_target: Path,
 ) -> None:
     build = manifest["build"]
     _exact_keys(
@@ -1182,6 +1188,11 @@ def _validate_main_link_records(
             capability["linker"],
             fragments[target],
             link_map,
+        )
+        _require_output_contained(
+            regenerated["argv"],
+            runner_target,
+            f"{executable}: main link output is outside runner target",
         )
         _require(
             regenerated == command,
@@ -1423,7 +1434,11 @@ def validate_supplied_manifest(manifest: dict[str, Any], manifest_path: Path) ->
         manifest, capability, capability_path, fragments, tools, manifest_path.resolve()
     )
     _validate_main_link_records(
-        manifest, capability, fragments, manifest_path.resolve().parent
+        manifest,
+        capability,
+        fragments,
+        manifest_path.resolve().parent,
+        runner_target,
     )
 
 
@@ -2171,6 +2186,23 @@ def _output_path(argv: list[str]) -> Path | None:
     return None
 
 
+def _output_matches(argv: list[str], executable: Path) -> bool:
+    output = _output_path(argv)
+    if output is None:
+        return False
+    if output == executable:
+        return True
+    try:
+        return output.is_file() and executable.is_file() and output.samefile(executable)
+    except OSError:
+        return False
+
+
+def _require_output_contained(argv: list[str], root: Path, message: str) -> None:
+    output = _output_path(argv)
+    _require(output is not None and _is_contained(root, output), message)
+
+
 def validate_linker_execution(args: argparse.Namespace) -> dict[str, Any]:
     for path, label in (
         (args.trace, "trace"),
@@ -2201,7 +2233,7 @@ def validate_linker_execution(args: argparse.Namespace) -> dict[str, Any]:
         record
         for record in records
         if isinstance(record.get("argv"), list)
-        and _output_path(record["argv"]) == executable
+        and _output_matches(record["argv"], executable)
     ]
     _require(
         len(matches) == 1,
