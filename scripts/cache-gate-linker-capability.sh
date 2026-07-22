@@ -41,21 +41,44 @@ mkdir -p "$output_root"
 probe_root=$(mktemp -d "$output_root/.probe.XXXXXX")
 
 run_shape() {
-	local flavor=$1 target=$2 fuse=$3
+	local flavor=$1 target=$2 explicit_linker=$3 fuse=$4
 	local target_root="$probe_root/$flavor/$target" map="$probe_root/$flavor/$target.map"
 	local link_args="$probe_root/$flavor/$target.link-args.txt" symbols="$probe_root/$flavor/$target.symbols.json"
 	local layout="$probe_root/$flavor/$target.layout.json" binary
+	local linker_trace="$probe_root/$flavor/$target.linker-trace.jsonl"
+	local linker_execution="$probe_root/$flavor/$target.linker-execution.json"
 	mkdir -p "$target_root"
 	local flags="--cfg cache_gate_probe_$target --check-cfg=cfg(cache_gate_probe_elastic) --check-cfg=cfg(cache_gate_probe_funnel) --check-cfg=cfg(cache_gate_probe_profile)"
-	if [[ -n $fuse ]]; then flags+=" -C link-arg=-fuse-ld=$fuse"; fi
+	if [[ -n $explicit_linker ]]; then
+		local wrapper_dir="$probe_root/$flavor/linker-wrapper" wrapper="$probe_root/$flavor/linker-wrapper/ld.$fuse"
+		mkdir -p "$wrapper_dir"
+		if [[ ! -e $wrapper ]]; then
+			cp -- "$REPO_ROOT/scripts/cache-gate-link-wrapper.py" "$wrapper"
+			chmod 0755 "$wrapper"
+		fi
+		flags+=" -C link-arg=-B$wrapper_dir -C link-arg=-fuse-ld=$fuse"
+	fi
 	flags+=" -C link-arg=-Wl,-T,${fragments[$target]} -C link-arg=-Wl,-Map,$map"
-	if ! RUSTFLAGS="$flags" CARGO_TARGET_DIR="$target_root" cargo rustc --release --locked \
+	if [[ -n $explicit_linker ]]; then
+		CACHE_GATE_LINK_DRIVER="$explicit_linker" CACHE_GATE_LINK_TRACE="$linker_trace" \
+			RUSTFLAGS="$flags" CARGO_TARGET_DIR="$target_root" cargo rustc --release --locked \
+			--manifest-path tools/cache-gate-link-probe/Cargo.toml --bin "$target" -- \
+			-C codegen-units=1 --print link-args >"$link_args" 2>"$probe_root/$flavor/$target.cargo.stderr" || \
+			hold "$flavor failed $target 2/2/4 capability link"
+	elif ! RUSTFLAGS="$flags" CARGO_TARGET_DIR="$target_root" cargo rustc --release --locked \
 		--manifest-path tools/cache-gate-link-probe/Cargo.toml --bin "$target" -- \
 		-C codegen-units=1 --print link-args >"$link_args" 2>"$probe_root/$flavor/$target.cargo.stderr"; then
 		hold "$flavor failed $target 2/2/4 capability link"
 	fi
 	binary=$(realpath "$target_root/release/$target")
 	[[ -x $binary && -s $map && -s $link_args ]] || hold "$flavor did not emit $target ELF/map/link argv"
+	if [[ -n $explicit_linker ]]; then
+		[[ -s $linker_trace ]] || hold "$flavor did not trace exact $target linker execution"
+		"$REPO_ROOT/scripts/cache-gate-elf-layout.py" validate-linker-execution \
+			--trace "$linker_trace" --linker "$explicit_linker" \
+			--executable "$binary" --flavor "$flavor" --output "$linker_execution" || \
+			hold "$flavor did not bind exact $target linker executable"
+	fi
 	file "$binary" | rg -q 'ELF' || hold "$flavor emitted non-ELF $target output"
 	case "$target" in
 	elastic)
@@ -117,21 +140,21 @@ cat >"$probe_root/provisional-capability.json" <<EOF
 {"accepted":true,"arch":"$arch","max_page_size":$max_page_size,"fragment_set_sha256":"$fragment_set_sha","fragments":{"elastic":{"absolute_path":"${fragments[elastic]}","sha256":"$elastic_sha"},"funnel":{"absolute_path":"${fragments[funnel]}","sha256":"$funnel_sha"},"profile":{"absolute_path":"${fragments[profile]}","sha256":"$profile_sha"}}}
 EOF
 
-for target in elastic funnel profile; do run_shape actual "$target" ""; done
+for target in elastic funnel profile; do run_shape actual "$target" "" ""; done
 
 gnu_ld=$(command -v ld.bfd || true)
 [[ -n $gnu_ld ]] || hold "native GNU ld.bfd is unavailable"
 gnu_ld=$(realpath "$gnu_ld")
 gnu_version=$("$gnu_ld" --version | head -1)
 [[ $gnu_version == *"GNU ld"* ]] || hold "ld.bfd is not GNU ld: $gnu_version"
-for target in elastic funnel profile; do run_shape gnu "$target" bfd; done
+for target in elastic funnel profile; do run_shape gnu "$target" "$gnu_ld" bfd; done
 
 lld=$(command -v ld.lld || command -v lld || true)
 [[ -n $lld ]] || hold "native LLD is unavailable"
 lld=$(realpath "$lld")
 lld_version=$("$lld" --version | head -1)
 [[ $lld_version == *LLD* || $lld_version == *lld* ]] || hold "ld.lld is not LLD: $lld_version"
-for target in elastic funnel profile; do run_shape lld "$target" lld; done
+for target in elastic funnel profile; do run_shape lld "$target" "$lld" lld; done
 
 python3 - "$probe_root/capability.json" "$REPO_ROOT" "$probe_root" "$arch" "$target_triple" \
 	"$actual_driver" "$actual_flavor" "$actual_version" "$gnu_ld" "$gnu_version" "$lld" "$lld_version" \
@@ -149,18 +172,22 @@ for flavor in ("actual","gnu","lld"):
     shapes[flavor]={}
     for target in ("elastic","funnel","profile"):
         shapes[flavor][target]={
+            "binary":record(root/flavor/target/"release"/target),
             "link_argv":record(root/flavor/f"{target}.link-args.txt"),
             "link_map":record(root/flavor/f"{target}.map"),
             "layout":record(root/flavor/f"{target}.layout.json"),
+            "symbols":record(root/flavor/f"{target}.symbols.json"),
         }
+        execution=root/flavor/f"{target}.linker-execution.json"
+        if execution.exists(): shapes[flavor][target]["linker_execution"]=record(execution)
 payload={
  "accepted":True,"arch":arch,"target_triple":triple,"max_page_size":int(max_page),
  "rustc_version":subprocess.check_output(["rustc","-vV"],text=True).strip(),
  "cargo_version":subprocess.check_output(["cargo","-V"],text=True).strip(),
- "linker":{"absolute_path":actual_driver,"flavor":actual_flavor,"version":actual_version},
+ "linker":{"absolute_path":actual_driver,"sha256":hashlib.sha256(Path(actual_driver).read_bytes()).hexdigest(),"flavor":actual_flavor,"version":actual_version},
  "required_linkers":{
-   "gnu":{"absolute_path":gnu,"flavor":"GNU ld","version":gnu_version},
-   "lld":{"absolute_path":lld,"flavor":"LLD","version":lld_version},
+   "gnu":{"absolute_path":gnu,"sha256":hashlib.sha256(Path(gnu).read_bytes()).hexdigest(),"flavor":"GNU ld","version":gnu_version},
+   "lld":{"absolute_path":lld,"sha256":hashlib.sha256(Path(lld).read_bytes()).hexdigest(),"flavor":"LLD","version":lld_version},
  },
  "fragments":{
    "elastic":{"absolute_path":str(Path(repo)/"benches/cache-gate-elastic-layout.ld"),"sha256":elastic_sha},

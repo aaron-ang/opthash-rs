@@ -30,6 +30,34 @@ snapshot_tool=$(realpath -e -- "${BASH_SOURCE[0]}")
 HARNESS_ROOT=$(git -C "$(dirname "$snapshot_tool")" rev-parse --show-toplevel 2>/dev/null) || { echo "error: snapshot executor is not in a reviewed Git worktree" >&2; exit 2; }
 HARNESS_ROOT=$(realpath -e -- "$HARNESS_ROOT")
 [[ $snapshot_tool == "$HARNESS_ROOT"/* ]] || { echo "error: snapshot executor is outside reviewed harness root" >&2; exit 2; }
+elf_layout_tool=$(realpath -e -- "$HARNESS_ROOT/scripts/cache-gate-elf-layout.py")
+verify_reviewed_tool_blob() {
+	local tool=$1 relative expected actual
+	relative=${tool#"$HARNESS_ROOT/"}
+	[[ $relative != "$tool" ]] || { echo "error: snapshot tool is outside reviewed root: $tool" >&2; exit 2; }
+	expected=$(git -C "$HARNESS_ROOT" rev-parse "HEAD:$relative")
+	actual=$(git hash-object "$tool")
+	[[ $actual == "$expected" ]] || { echo "error: snapshot tool differs from reviewed Git blob: $tool" >&2; exit 2; }
+}
+verify_manifest_tool_binding() {
+	local manifest=$1 name=$2 tool=$3 relative head tree blob
+	verify_reviewed_tool_blob "$tool"
+	relative=${tool#"$HARNESS_ROOT/"}
+	head=$(git -C "$HARNESS_ROOT" rev-parse HEAD)
+	tree=$(git -C "$HARNESS_ROOT" rev-parse 'HEAD^{tree}')
+	blob=$(git -C "$HARNESS_ROOT" rev-parse "HEAD:$relative")
+	python3 - "$manifest" "$name" "$tool" "$HARNESS_ROOT" "$head" "$tree" "$blob" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+manifest,name,tool,root,head,tree,blob=sys.argv[1:]
+record=json.loads(Path(manifest).read_bytes())["tools"][name]
+actual=hashlib.sha256(Path(tool).read_bytes()).hexdigest()
+if (Path(record.get("absolute_path", "")).resolve()!=Path(tool) or record.get("sha256")!=actual or
+    Path(record.get("reviewed_root", "")).resolve()!=Path(root) or record.get("reviewed_commit")!=head or
+    record.get("reviewed_tree")!=tree or record.get("git_blob")!=blob or record.get("git_blob_sha256")!=actual):
+    raise SystemExit(f"error: manifested {name} is not the executing reviewed tool")
+PY
+}
 safe_component() {
 	[[ $2 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $2 != . && $2 != .. ]] || {
 		echo "error: unsafe component for $1: $2" >&2
@@ -51,8 +79,10 @@ else
 fi
 target_root=$(realpath -m -- "$REPO_ROOT/target")
 [[ $snapshot_root == "$target_root" || $snapshot_root == "$target_root"/* ]] || { echo "error: snapshot root must stay below runner root target" >&2; exit 2; }
-anchor_manifest=$(realpath -- "$anchor_manifest")
-candidate_manifest=$(realpath -- "$candidate_manifest")
+[[ -f $anchor_manifest && ! -L $anchor_manifest ]] || { echo "error: anchor manifest must be a regular non-symlink file" >&2; exit 2; }
+[[ -f $candidate_manifest && ! -L $candidate_manifest ]] || { echo "error: candidate manifest must be a regular non-symlink file" >&2; exit 2; }
+anchor_manifest=$(realpath -e -- "$anchor_manifest")
+candidate_manifest=$(realpath -e -- "$candidate_manifest")
 destination="$snapshot_root/$arch/$comparison/pair-$pair"
 [[ ! -e $destination ]] || { echo "error: destination already exists: $destination" >&2; exit 1; }
 mkdir -p -- "$(dirname "$destination")" "$LOCK_DIR"
@@ -83,8 +113,12 @@ import sys
 from pathlib import Path
 
 anchor_path, candidate_path, anchor_commit, candidate_commit, arch, output, repo, harness_root, snapshot_tool = sys.argv[1:]
-anchor = json.load(open(anchor_path, encoding="utf-8"))
-candidate = json.load(open(candidate_path, encoding="utf-8"))
+def load_manifest(path):
+    raw = Path(path).read_bytes()
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
+
+anchor, anchor_hash = load_manifest(anchor_path)
+candidate, candidate_hash = load_manifest(candidate_path)
 if anchor.get("control") != candidate.get("control"):
     raise SystemExit("error: control provenance differs between manifests")
 
@@ -154,7 +188,7 @@ def validate(manifest, path, supplied_commit, require_subject_root):
     if set(manifest["executables"]) != set(manifest["symbols"]):
         raise SystemExit("error: executable/symbol target sets differ")
     tools = manifest.get("tools", {})
-    if set(tools) != {"snapshot", "launcher", "perf", "elf_layout", "link_wrapper"}:
+    if set(tools) != {"snapshot", "launcher", "perf_launcher", "perf_support", "elf_layout", "extractor", "link_wrapper"}:
         raise SystemExit("error: authenticated tool set mismatch")
     for name, record in tools.items():
         resolved = Path(checked_file(record, f"tool {name}"))
@@ -174,7 +208,7 @@ validate(anchor, anchor_path, anchor_commit, False)
 validate(candidate, candidate_path, candidate_commit, True)
 if Path(candidate["tools"]["snapshot"]["absolute_path"]).resolve() != Path(snapshot_tool):
     raise SystemExit("error: candidate snapshot executor path mismatch")
-json.dump({"control": anchor["control"], "candidate_executables":candidate["executables"], "tools":candidate["tools"]}, open(output, "w", encoding="utf-8"), indent=2, sort_keys=True)
+json.dump({"control": anchor["control"], "candidate_executables":candidate["executables"], "tools":candidate["tools"], "manifest_hashes":{"anchor":anchor_hash,"candidate":candidate_hash}}, open(output, "w", encoding="utf-8"), indent=2, sort_keys=True)
 with open(output, "a", encoding="utf-8") as stream:
     stream.write("\n")
 PY
@@ -229,6 +263,20 @@ for benchmark in "${expected_ids[@]}"; do
 	fi
 done
 
+# The supplied manifests are mutable files. Re-derive and authenticate every
+# structural claim while holding the comparison lock, immediately before use.
+verify_manifest_tool_binding "$anchor_manifest" snapshot "$snapshot_tool"
+verify_manifest_tool_binding "$anchor_manifest" elf_layout "$elf_layout_tool"
+"$elf_layout_tool" validate-manifest --manifest "$anchor_manifest"
+verify_manifest_tool_binding "$candidate_manifest" snapshot "$snapshot_tool"
+verify_manifest_tool_binding "$candidate_manifest" elf_layout "$elf_layout_tool"
+"$elf_layout_tool" validate-manifest --manifest "$candidate_manifest"
+expected_anchor_manifest_hash=$(jq -er '.manifest_hashes.anchor' "$validation")
+expected_candidate_manifest_hash=$(jq -er '.manifest_hashes.candidate' "$validation")
+actual_anchor_manifest_hash=$(sha256sum -- "$anchor_manifest"); actual_anchor_manifest_hash=${actual_anchor_manifest_hash%% *}
+actual_candidate_manifest_hash=$(sha256sum -- "$candidate_manifest"); actual_candidate_manifest_hash=${actual_candidate_manifest_hash%% *}
+[[ $actual_anchor_manifest_hash == "$expected_anchor_manifest_hash" ]] || { echo "error: anchor manifest changed before execution" >&2; exit 1; }
+[[ $actual_candidate_manifest_hash == "$expected_candidate_manifest_hash" ]] || { echo "error: candidate manifest changed before execution" >&2; exit 1; }
 marker="$temporary/comparison-start.marker"
 touch "$marker"
 start_ns=$(python3 -c 'import time; print(time.time_ns())')
@@ -239,6 +287,9 @@ criterion_args=(--load-baseline "$candidate_run" --baseline "$anchor_run")
 comparison_commands="$temporary/comparison-commands.json"
 case "$target" in
 control)
+	control_hash=$(jq -er '.control.binary.sha256' "$validation")
+	actual_control_hash=$(sha256sum -- "$control_binary"); actual_control_hash=${actual_control_hash%% *}
+	[[ $actual_control_hash == "$control_hash" ]] || { echo "error: control binary hash mismatch immediately before execution" >&2; exit 1; }
 	comparison_command=("$control_binary" --bench "${criterion_args[@]}")
 	CRITERION_HOME="$criterion_root" "${comparison_command[@]}" >"$comparison_stdout" 2>"$comparison_stderr"
 	python3 - "$comparison_commands" "${comparison_command[@]}" <<'PY'
@@ -303,11 +354,12 @@ while IFS= read -r -d '' change; do
 done < <(find "$criterion_root" -type f -path '*/change/estimates.json' -print0)
 
 copy_verified() {
-	local source=$1 output=$2 source_root=${3:-} before after copied
+	local source=$1 output=$2 source_root=${3:-} expected=${4:-} before after copied
 	[[ -f $source && ! -L $source ]] || { echo "error: invalid copy source: $source" >&2; exit 1; }
 	[[ -z $source_root ]] || assert_contained "$source_root" "$source"
 	assert_contained "$temporary" "$output"
 	before=$(sha256sum -- "$source"); before=${before%% *}
+	[[ -z $expected || $before == "$expected" ]] || { echo "error: authenticated source hash mismatch: $source" >&2; exit 1; }
 	mkdir -p -- "$(dirname "$output")"; cp --preserve=mode,timestamps -- "$source" "$output"
 	after=$(sha256sum -- "$source"); after=${after%% *}; copied=$(sha256sum -- "$output"); copied=${copied%% *}
 	[[ $before == "$after" && $before == "$copied" ]] || { echo "error: hash changed while copying $source" >&2; exit 1; }
@@ -319,20 +371,25 @@ for benchmark in "${expected_ids[@]}"; do
 done
 
 copy_bundle() {
-	local label=$1 manifest=$2
+	local label=$1 manifest=$2 expected_manifest_hash=$3 copied_manifest="$temporary/build/$1-manifest.json"
 	mkdir -p "$temporary/build"
-	copy_verified "$manifest" "$temporary/build/$label-manifest.json"
-	while IFS=$'\t' read -r name map; do
-		copy_verified "$map" "$temporary/build/$label-link-maps/$name.map"
+	copy_verified "$manifest" "$copied_manifest" "" "$expected_manifest_hash"
+	while IFS=$'\t' read -r name map map_hash; do
+		copy_verified "$map" "$temporary/build/$label-link-maps/$name.map" "" "$map_hash"
 	done < <(
-		python3 - "$manifest" <<'PY'
+		python3 - "$copied_manifest" <<'PY'
 import json,sys
 m=json.load(open(sys.argv[1]))
-for name,item in sorted(m["executables"].items()): print(f'{name}\t{item["link_map"]["absolute_path"]}')
+for name,item in sorted(m["executables"].items()): print(f'{name}\t{item["link_map"]["absolute_path"]}\t{item["link_map"]["sha256"]}')
 PY
 	)
 }
-copy_bundle anchor "$anchor_manifest"; copy_bundle candidate "$candidate_manifest"
+post_anchor_manifest_hash=$(sha256sum -- "$anchor_manifest"); post_anchor_manifest_hash=${post_anchor_manifest_hash%% *}
+post_candidate_manifest_hash=$(sha256sum -- "$candidate_manifest"); post_candidate_manifest_hash=${post_candidate_manifest_hash%% *}
+[[ $post_anchor_manifest_hash == "$expected_anchor_manifest_hash" ]] || { echo "error: anchor manifest changed during execution" >&2; exit 1; }
+[[ $post_candidate_manifest_hash == "$expected_candidate_manifest_hash" ]] || { echo "error: candidate manifest changed during execution" >&2; exit 1; }
+copy_bundle anchor "$anchor_manifest" "$expected_anchor_manifest_hash"
+copy_bundle candidate "$candidate_manifest" "$expected_candidate_manifest_hash"
 
 python3 - "$temporary/pair-manifest.json" "$temporary/build/anchor-manifest.json" "$temporary/build/candidate-manifest.json" "$validation" "$comparison_commands" "$original_command" "$start_ns" "$end_ns" "$start_iso" "$end_iso" "$target" "$anchor_run" "$candidate_run" "$REPO_ROOT" "$snapshot_tool" <<'PY'
 import json,platform,sys
@@ -346,8 +403,8 @@ payload={
  "comparison_started_ns":int(start_ns), "comparison_finished_ns":int(end_ns),
  "comparison_started_at":start_iso, "comparison_finished_at":end_iso,
  "control":validation["control"],
- "anchor":{"run":anchor_run,"commit":anchor["commit"],"tree":anchor["tree"],"executable_hashes":{k:v["sha256"] for k,v in anchor["executables"].items()}},
- "candidate":{"run":candidate_run,"commit":candidate["commit"],"tree":candidate["tree"],"executable_hashes":{k:v["sha256"] for k,v in candidate["executables"].items()}},
+ "anchor":{"run":anchor_run,"commit":anchor["commit"],"tree":anchor["tree"],"manifest_sha256":validation["manifest_hashes"]["anchor"],"executable_hashes":{k:v["sha256"] for k,v in anchor["executables"].items()}},
+ "candidate":{"run":candidate_run,"commit":candidate["commit"],"tree":candidate["tree"],"manifest_sha256":validation["manifest_hashes"]["candidate"],"executable_hashes":{k:v["sha256"] for k,v in candidate["executables"].items()}},
 }
 json.dump(payload,open(output,"w"),indent=2,sort_keys=True); open(output,"a").write("\n")
 PY

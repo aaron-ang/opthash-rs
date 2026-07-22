@@ -12,15 +12,46 @@ REPO_ROOT=$(git -C "$runner_root" rev-parse --show-toplevel 2>/dev/null) || { ec
 REPO_ROOT=$(realpath -e -- "$REPO_ROOT")
 [[ $REPO_ROOT == "$runner_root" ]] || { echo "error: runner root must be exact Git worktree top level" >&2; exit 2; }
 cd "$REPO_ROOT"
-HARNESS_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
-CACHE_GATE_LAUNCHER_PATH=$(realpath -e -- "${CACHE_GATE_LAUNCHER:-${BASH_SOURCE[0]}}")
-CACHE_GATE_ELF_LAYOUT_TOOL=$(realpath -e -- "${CACHE_GATE_ELF_LAYOUT_TOOL:-$HARNESS_ROOT/scripts/cache-gate-elf-layout.py}")
-CACHE_GATE_SNAPSHOT_TOOL=$(realpath -e -- "${CACHE_GATE_SNAPSHOT_TOOL:-$HARNESS_ROOT/scripts/snapshot-criterion-pair.sh}")
-CACHE_GATE_PERF_TOOL=$(realpath -e -- "${CACHE_GATE_PERF_TOOL:-$HARNESS_ROOT/scripts/cache-gate-perf.sh}")
-CACHE_GATE_LINK_WRAPPER=$(realpath -e -- "${CACHE_GATE_LINK_WRAPPER:-$HARNESS_ROOT/scripts/cache-gate-link-wrapper.py}")
-for tool in "$CACHE_GATE_LAUNCHER_PATH" "$CACHE_GATE_ELF_LAYOUT_TOOL" "$CACHE_GATE_SNAPSHOT_TOOL" "$CACHE_GATE_PERF_TOOL" "$CACHE_GATE_LINK_WRAPPER"; do
+CACHE_GATE_LAUNCHER_PATH=$(realpath -e -- "${BASH_SOURCE[0]}")
+HARNESS_ROOT=$(git -C "$(dirname "$CACHE_GATE_LAUNCHER_PATH")" rev-parse --show-toplevel 2>/dev/null) || { echo "error: cache-gate launcher is not in a reviewed Git worktree" >&2; exit 2; }
+HARNESS_ROOT=$(realpath -e -- "$HARNESS_ROOT")
+[[ $CACHE_GATE_LAUNCHER_PATH == "$HARNESS_ROOT/"* ]] || { echo "error: cache-gate launcher is outside reviewed harness root" >&2; exit 2; }
+CACHE_GATE_ELF_LAYOUT_TOOL=$(realpath -e -- "$HARNESS_ROOT/scripts/cache-gate-elf-layout.py")
+CACHE_GATE_SNAPSHOT_TOOL=$(realpath -e -- "$HARNESS_ROOT/scripts/snapshot-criterion-pair.sh")
+CACHE_GATE_PERF_TOOL=$(realpath -e -- "$HARNESS_ROOT/scripts/cache-gate-perf.sh")
+CACHE_GATE_PERF_SUPPORT_TOOL=$(realpath -e -- "$HARNESS_ROOT/scripts/cache-gate-perf-support.py")
+CACHE_GATE_EXTRACTOR_TOOL=$(realpath -e -- "$HARNESS_ROOT/scripts/extract-hot-symbols.py")
+CACHE_GATE_LINK_WRAPPER=$(realpath -e -- "$HARNESS_ROOT/scripts/cache-gate-link-wrapper.py")
+for tool in "$CACHE_GATE_LAUNCHER_PATH" "$CACHE_GATE_ELF_LAYOUT_TOOL" "$CACHE_GATE_SNAPSHOT_TOOL" "$CACHE_GATE_PERF_TOOL" "$CACHE_GATE_PERF_SUPPORT_TOOL" "$CACHE_GATE_EXTRACTOR_TOOL" "$CACHE_GATE_LINK_WRAPPER"; do
 	[[ $tool == /* && -f $tool && ! -L $tool ]] || { echo "error: invalid authenticated harness tool: $tool" >&2; exit 2; }
 done
+verify_reviewed_tool_blob() {
+	local tool=$1 relative expected actual
+	relative=${tool#"$HARNESS_ROOT/"}
+	[[ $relative != "$tool" ]] || { echo "error: harness tool is outside reviewed root: $tool" >&2; exit 2; }
+	expected=$(git -C "$HARNESS_ROOT" rev-parse "HEAD:$relative")
+	actual=$(git hash-object "$tool")
+	[[ $actual == "$expected" ]] || { echo "error: harness tool differs from reviewed Git blob: $tool" >&2; exit 2; }
+}
+verify_manifest_tool_binding() {
+	local manifest=$1 name=$2 tool=$3 relative head tree blob
+	verify_reviewed_tool_blob "$tool"
+	relative=${tool#"$HARNESS_ROOT/"}
+	head=$(git -C "$HARNESS_ROOT" rev-parse HEAD)
+	tree=$(git -C "$HARNESS_ROOT" rev-parse 'HEAD^{tree}')
+	blob=$(git -C "$HARNESS_ROOT" rev-parse "HEAD:$relative")
+	python3 - "$manifest" "$name" "$tool" "$HARNESS_ROOT" "$head" "$tree" "$blob" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+manifest,name,tool,root,head,tree,blob=sys.argv[1:]
+record=json.loads(Path(manifest).read_bytes())["tools"][name]
+actual=hashlib.sha256(Path(tool).read_bytes()).hexdigest()
+if (Path(record.get("absolute_path", "")).resolve()!=Path(tool) or record.get("sha256")!=actual or
+    Path(record.get("reviewed_root", "")).resolve()!=Path(root) or record.get("reviewed_commit")!=head or
+    record.get("reviewed_tree")!=tree or record.get("git_blob")!=blob or record.get("git_blob_sha256")!=actual):
+    raise SystemExit(f"error: manifested {name} is not the executing reviewed tool")
+PY
+}
 LOCK_DIR=${LOCK_DIR:-/tmp}
 CRITERION_ROOT=${OPTHASH_CRITERION_ROOT:-$REPO_ROOT/target/criterion}
 SAVE=${SAVE:-}
@@ -43,18 +74,24 @@ runner_tree=$(git rev-parse 'HEAD^{tree}')
 stable_manifest_binary=
 stable_manifest_hash=
 stable_manifest_variant=
+stable_build_manifest_hash=
 if [[ ${ELASTIC:-0} == 1 || ${FUNNEL:-0} == 1 ]]; then
 	[[ -n ${CACHE_GATE_MANIFEST:-} ]] || { echo "error: CACHE_GATE_MANIFEST is required for stable timing" >&2; exit 2; }
 	[[ $CACHE_GATE_MANIFEST == /* ]] || { echo "error: CACHE_GATE_MANIFEST must be absolute" >&2; exit 2; }
+	[[ -f $CACHE_GATE_MANIFEST && ! -L $CACHE_GATE_MANIFEST ]] || { echo "error: CACHE_GATE_MANIFEST must be a regular non-symlink file" >&2; exit 2; }
 	CACHE_GATE_MANIFEST=$(realpath -e -- "$CACHE_GATE_MANIFEST")
 	[[ $CACHE_GATE_MANIFEST == "$REPO_ROOT/target/"* ]] || { echo "error: manifest is outside runner root target" >&2; exit 2; }
+	verify_manifest_tool_binding "$CACHE_GATE_MANIFEST" launcher "$CACHE_GATE_LAUNCHER_PATH"
+	verify_manifest_tool_binding "$CACHE_GATE_MANIFEST" elf_layout "$CACHE_GATE_ELF_LAYOUT_TOOL"
+	"$CACHE_GATE_ELF_LAYOUT_TOOL" validate-manifest --manifest "$CACHE_GATE_MANIFEST"
 	stable_target=elastic_cache_gate
 	[[ ${FUNNEL:-0} == 1 ]] && stable_target=funnel_cache_gate
 	readarray -t stable_metadata < <(python3 - "$CACHE_GATE_MANIFEST" "$REPO_ROOT" "$runner_head" "$runner_tree" "$stable_target" "$CACHE_GATE_LAUNCHER_PATH" <<'PY'
 import hashlib,json,os,sys
 from pathlib import Path
 manifest_path,repo,head,tree,target,launcher=sys.argv[1:]
-manifest=json.load(open(manifest_path,encoding="utf-8"))
+manifest_bytes=Path(manifest_path).read_bytes()
+manifest=json.loads(manifest_bytes)
 def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 if Path(manifest.get("runner_root", "")).resolve()!=Path(repo):
     raise SystemExit("error: manifest runner root mismatch")
@@ -82,12 +119,14 @@ if Path(layout["binary"]).resolve()!=binary.resolve() or layout["binary_sha256"]
 print(binary.resolve())
 print(item["sha256"])
 print(manifest["variant"])
+print(hashlib.sha256(manifest_bytes).hexdigest())
 PY
 	)
-	((${#stable_metadata[@]} == 3)) || { echo "error: malformed stable manifest" >&2; exit 1; }
+	((${#stable_metadata[@]} == 4)) || { echo "error: malformed stable manifest" >&2; exit 1; }
 	stable_manifest_binary=${stable_metadata[0]}
 	stable_manifest_hash=${stable_metadata[1]}
 	stable_manifest_variant=${stable_metadata[2]}
+	stable_build_manifest_hash=${stable_metadata[3]}
 fi
 
 if [[ -n "${SUDO_USER:-}" ]]; then
@@ -264,6 +303,11 @@ if [[ ${CONTROL:-0} == 1 || ${ELASTIC:-0} == 1 || ${FUNNEL:-0} == 1 ]]; then
 		require_control_binary
 		command=("${numa_wrapper[@]}" "${pin_wrapper[@]}" "${criterion_env[@]}" "$CACHE_GATE_CONTROL_BIN" --bench "${criterion_args[@]}" "${forward_args[@]}")
 	else
+		verify_manifest_tool_binding "$CACHE_GATE_MANIFEST" launcher "$CACHE_GATE_LAUNCHER_PATH"
+		verify_manifest_tool_binding "$CACHE_GATE_MANIFEST" elf_layout "$CACHE_GATE_ELF_LAYOUT_TOOL"
+		"$CACHE_GATE_ELF_LAYOUT_TOOL" validate-manifest --manifest "$CACHE_GATE_MANIFEST"
+		pre_exec_manifest_hash=$(sha256sum -- "$CACHE_GATE_MANIFEST"); pre_exec_manifest_hash=${pre_exec_manifest_hash%% *}
+		[[ $pre_exec_manifest_hash == "$stable_build_manifest_hash" ]] || { echo "error: stable build manifest changed before execution" >&2; exit 1; }
 		actual_hash=$(sha256sum -- "$stable_manifest_binary"); actual_hash=${actual_hash%% *}
 		[[ $actual_hash == "$stable_manifest_hash" ]] || { echo "error: stable binary hash mismatch immediately before execution" >&2; exit 1; }
 		command=("${numa_wrapper[@]}" "${pin_wrapper[@]}" "${criterion_env[@]}" "$stable_manifest_binary" --bench "${criterion_args[@]}" "${forward_args[@]}")
@@ -283,12 +327,18 @@ PY
 	elif [[ ${ELASTIC:-0} == 1 || ${FUNNEL:-0} == 1 ]]; then
 		run_name=${SAVE:-${LOAD:-${BASELINE:-comparison}}}
 		[[ $run_name =~ ^[A-Za-z0-9._-]+$ ]] || { echo "error: unsafe run metadata name" >&2; exit 2; }
-		run_dir="$REPO_ROOT/target/cache-gate-runs/$stable_manifest_variant"
+		runner_target_root=$(realpath -m -- "$REPO_ROOT/target")
+		stable_runs_root=$(realpath -m -- "$REPO_ROOT/target/cache-gate-runs")
+		[[ $stable_runs_root == "$runner_target_root/"* ]] || { echo "error: stable run root escapes runner target" >&2; exit 1; }
+		run_dir=$(realpath -m -- "$stable_runs_root/$stable_manifest_variant")
+		[[ $run_dir == "$stable_runs_root/"* ]] || { echo "error: stable run destination escapes runner target" >&2; exit 1; }
 		mkdir -p "$run_dir"
-		python3 - "$run_dir/$stable_target-$run_name.json" "$REPO_ROOT" "$runner_head" "$runner_tree" "$CACHE_GATE_MANIFEST" "$stable_manifest_binary" "$stable_manifest_hash" "$stable_target" "$run_name" "$CRITERION_ROOT" <<'PY'
+		post_exec_manifest_hash=$(sha256sum -- "$CACHE_GATE_MANIFEST"); post_exec_manifest_hash=${post_exec_manifest_hash%% *}
+		[[ $post_exec_manifest_hash == "$stable_build_manifest_hash" ]] || { echo "error: stable build manifest changed during execution" >&2; exit 1; }
+		python3 - "$run_dir/$stable_target-$run_name.json" "$REPO_ROOT" "$runner_head" "$runner_tree" "$CACHE_GATE_MANIFEST" "$stable_build_manifest_hash" "$stable_manifest_binary" "$stable_manifest_hash" "$stable_target" "$run_name" "$CRITERION_ROOT" <<'PY'
 import json,sys
-output,root,commit,tree,manifest,binary,binary_hash,mode,run,evidence_root=sys.argv[1:]
-json.dump({"runner_root":root,"commit":commit,"tree":tree,"mode":mode,"run":run,"build_manifest":manifest,"executable":{"absolute_path":binary,"sha256":binary_hash},"criterion_evidence_root":evidence_root,"build_commands":[]},open(output,"w"),indent=2,sort_keys=True);open(output,"a").write("\n")
+output,root,commit,tree,manifest,manifest_hash,binary,binary_hash,mode,run,evidence_root=sys.argv[1:]
+json.dump({"runner_root":root,"commit":commit,"tree":tree,"mode":mode,"run":run,"build_manifest":manifest,"build_manifest_sha256":manifest_hash,"executable":{"absolute_path":binary,"sha256":binary_hash},"criterion_evidence_root":evidence_root,"build_commands":[]},open(output,"w"),indent=2,sort_keys=True);open(output,"a").write("\n")
 PY
 	fi
 	exit 0
@@ -346,9 +396,25 @@ if [[ $EUID -eq 0 && -n ${SUDO_USER:-} ]]; then
 	staging_uid=$(id -u "$SUDO_USER")
 	staging_gid=$(id -g "$SUDO_USER")
 fi
-"$REPO_ROOT/scripts/cache-gate-perf-support.py" prepare-staging \
+mkdir -p "$REPO_ROOT/target"
+authenticated_tools_staging=$(mktemp "$REPO_ROOT/target/.cache-gate-authenticated-tools.XXXXXX")
+cleanup_authenticated_tools() { rm -f -- "$authenticated_tools_staging"; }
+trap cleanup_authenticated_tools EXIT
+verify_reviewed_tool_blob "$CACHE_GATE_ELF_LAYOUT_TOOL"
+"$CACHE_GATE_ELF_LAYOUT_TOOL" authenticate-tools --output "$authenticated_tools_staging" \
+	--tool "elf_layout=$CACHE_GATE_ELF_LAYOUT_TOOL" \
+	--tool "snapshot=$CACHE_GATE_SNAPSHOT_TOOL" \
+	--tool "launcher=$CACHE_GATE_LAUNCHER_PATH" \
+	--tool "perf_launcher=$CACHE_GATE_PERF_TOOL" \
+	--tool "perf_support=$CACHE_GATE_PERF_SUPPORT_TOOL" \
+	--tool "extractor=$CACHE_GATE_EXTRACTOR_TOOL" \
+	--tool "link_wrapper=$CACHE_GATE_LINK_WRAPPER"
+"$CACHE_GATE_PERF_SUPPORT_TOOL" prepare-staging \
 	--manifest-root "$manifest_dir" --build-root "$build_root" \
 	--uid "$staging_uid" --gid "$staging_gid"
+authenticated_tools="$manifest_dir/authenticated-tools.json"
+mv -- "$authenticated_tools_staging" "$authenticated_tools"
+trap - EXIT
 head_commit=$(git rev-parse HEAD)
 head_tree=$(git rev-parse 'HEAD^{tree}')
 head_epoch=$(git show -s --format=%ct HEAD)
@@ -396,13 +462,13 @@ elastic_bin=$(build_bench elastic_cache_gate elastic)
 funnel_bin=$(build_bench funnel_cache_gate funnel)
 profile_bin=$(build_bench cache_gate_profile profile)
 
-"$REPO_ROOT/scripts/extract-hot-symbols.py" --binary "$elastic_bin" --arch "$arch" \
+"$CACHE_GATE_EXTRACTOR_TOOL" --binary "$elastic_bin" --arch "$arch" \
 	--symbol '::elastic_cache_gate_insert_kernel$' --symbol '::elastic_cache_gate_get_kernel$' \
 	--output "$manifest_dir/symbols/elastic_cache_gate.json"
-"$REPO_ROOT/scripts/extract-hot-symbols.py" --binary "$funnel_bin" --arch "$arch" \
+"$CACHE_GATE_EXTRACTOR_TOOL" --binary "$funnel_bin" --arch "$arch" \
 	--symbol '::funnel_cache_gate_insert_kernel$' --symbol '::funnel_cache_gate_get_kernel$' \
 	--output "$manifest_dir/symbols/funnel_cache_gate.json"
-"$REPO_ROOT/scripts/extract-hot-symbols.py" --binary "$profile_bin" --arch "$arch" \
+"$CACHE_GATE_EXTRACTOR_TOOL" --binary "$profile_bin" --arch "$arch" \
 	--symbol '::elastic_profile_insert_kernel$' --symbol '::elastic_profile_get_kernel$' \
 	--symbol '::funnel_profile_insert_kernel$' --symbol '::funnel_profile_get_kernel$' \
 	--output "$manifest_dir/symbols/cache_gate_profile.json"
@@ -420,14 +486,6 @@ for executable in elastic_cache_gate funnel_cache_gate cache_gate_profile; do
 		--symbols "$manifest_dir/symbols/$executable.json" --arch "$arch" \
 		--output "$manifest_dir/layout/$executable.json"
 done
-
-authenticated_tools="$manifest_dir/authenticated-tools.json"
-"$CACHE_GATE_ELF_LAYOUT_TOOL" authenticate-tools --output "$authenticated_tools" \
-	--tool "elf_layout=$CACHE_GATE_ELF_LAYOUT_TOOL" \
-	--tool "snapshot=$CACHE_GATE_SNAPSHOT_TOOL" \
-	--tool "launcher=$CACHE_GATE_LAUNCHER_PATH" \
-	--tool "perf=$CACHE_GATE_PERF_TOOL" \
-	--tool "link_wrapper=$CACHE_GATE_LINK_WRAPPER"
 
 python3 - "$manifest_dir/manifest.json" "$head_commit" "$head_tree" "$arch" "$CACHE_GATE_VARIANT" "$CACHE_GATE_CONTROL_BIN" "$CACHE_GATE_CONTROL_PROVENANCE" "$elastic_bin" "$funnel_bin" "$profile_bin" "$REPO_ROOT" "${CACHE_GATE_LAYOUT_ADVERSARY:-0}" "$CACHE_GATE_MANIFEST_INSTANCE" "$authenticated_tools" <<'PY'
 import hashlib
@@ -467,6 +525,31 @@ for name in executables:
     with path.open(encoding="utf-8") as stream:
         symbols[name] = json.load(stream)
     elf_layout[name] = json.load((root / "layout" / f"{name}.json").open(encoding="utf-8"))
+    executables[name]["symbols"] = {
+        "absolute_path": str(path.resolve()),
+        "sha256": digest(path),
+    }
+    layout_path = root / "layout" / f"{name}.json"
+    executables[name]["layout"] = {
+        "absolute_path": str(layout_path.resolve()),
+        "sha256": digest(layout_path),
+    }
+    link_command_path = root / "link-commands" / f"{name}.json"
+    executables[name]["link_command"] = {
+        "absolute_path": str(link_command_path.resolve()),
+        "sha256": digest(link_command_path),
+    }
+    link_trace_path = root / "link-traces" / f"{name}.jsonl"
+    executables[name]["link_trace"] = {
+        "absolute_path": str(link_trace_path.resolve()),
+        "sha256": digest(link_trace_path),
+    }
+    target = {"elastic_cache_gate":"elastic", "funnel_cache_gate":"funnel", "cache_gate_profile":"profile"}[name]
+    fragment_path = root / "linker-fragments" / f"{target}.ld"
+    executables[name]["linker_fragment"] = {
+        "absolute_path": str(fragment_path.resolve()),
+        "sha256": digest(fragment_path),
+    }
 control_provenance = json.load(open(control_provenance_path, encoding="utf-8"))
 capability_path = root / "linker-capability.json"
 linker_capability = json.load(capability_path.open(encoding="utf-8"))

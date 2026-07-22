@@ -12,6 +12,7 @@ ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "scripts" / "snapshot-criterion-pair.sh"
 LAUNCHER = ROOT / "scripts" / "cache-gate.sh"
 PERF_LAUNCHER = ROOT / "scripts" / "cache-gate-perf.sh"
+PERF_SUPPORT = ROOT / "scripts" / "cache-gate-perf-support.py"
 CONTROL_IDS = (
     "cache_gate_insert/cache_gate_insert_std",
     "cache_gate_insert/cache_gate_insert_hashbrown",
@@ -38,6 +39,81 @@ def make_fixture(
         / f"{tmp_path.parent.name}-{tmp_path.name}"
     )
     tmp_path.mkdir(parents=True, exist_ok=False)
+    harness = tmp_path / "reviewed-harness"
+    scripts = harness / "scripts"
+    scripts.mkdir(parents=True)
+    snapshot_tool = write(scripts / "snapshot-criterion-pair.sh", SCRIPT.read_text())
+    snapshot_tool.chmod(0o755)
+    elf_layout_tool = write(
+        scripts / "cache-gate-elf-layout.py",
+        """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+if len(sys.argv) != 4 or sys.argv[1:3] != ["validate-manifest", "--manifest"]:
+    raise SystemExit("error: unsupported fixture validator invocation")
+manifest = json.loads(Path(sys.argv[3]).read_text())
+if "elf_layout" in manifest and set(manifest["elf_layout"]) != {
+    "elastic_cache_gate", "funnel_cache_gate", "cache_gate_profile"
+}:
+    raise SystemExit("error: ELF layout executable set mismatch")
+""",
+    )
+    elf_layout_tool.chmod(0o755)
+    tool_paths = {
+        "snapshot": snapshot_tool,
+        "elf_layout": elf_layout_tool,
+    }
+    for name, filename in {
+        "launcher": "cache-gate.sh",
+        "perf_launcher": "cache-gate-perf.sh",
+        "perf_support": "cache-gate-perf-support.py",
+        "extractor": "extract-hot-symbols.py",
+        "link_wrapper": "cache-gate-link-wrapper.py",
+    }.items():
+        path = write(scripts / filename, "#!/bin/sh\nexit 97\n")
+        path.chmod(0o755)
+        tool_paths[name] = path
+    subprocess.run(["git", "init", "-q"], cwd=harness, check=True)
+    subprocess.run(["git", "add", "scripts"], cwd=harness, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Cache Gate Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture tools",
+        ],
+        cwd=harness,
+        check=True,
+    )
+    harness_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=harness, text=True
+    ).strip()
+    harness_tree = subprocess.check_output(
+        ["git", "rev-parse", "HEAD^{tree}"], cwd=harness, text=True
+    ).strip()
+
+    def tool_record(path: Path) -> dict:
+        relative = path.relative_to(harness)
+        blob = subprocess.check_output(
+            ["git", "rev-parse", f"HEAD:{relative}"], cwd=harness, text=True
+        ).strip()
+        return {
+            "absolute_path": str(path.resolve()),
+            "sha256": digest(path),
+            "git_blob": blob,
+            "git_blob_sha256": digest(path),
+            "reviewed_root": str(harness.resolve()),
+            "reviewed_commit": harness_commit,
+            "reviewed_tree": harness_tree,
+        }
+
+    authenticated_tools = {name: tool_record(path) for name, path in tool_paths.items()}
     criterion = tmp_path / "criterion"
     snapshot = tmp_path / "snapshots"
     anchor_run = "anchor-run"
@@ -180,32 +256,7 @@ def make_fixture(
         "control": control_record,
         "executables": executables,
         "symbols": symbols,
-        "tools": {
-            "snapshot": {
-                "absolute_path": str(SCRIPT.resolve()),
-                "sha256": digest(SCRIPT),
-            },
-            "launcher": {
-                "absolute_path": str(LAUNCHER.resolve()),
-                "sha256": digest(LAUNCHER),
-            },
-            "perf": {
-                "absolute_path": str(PERF_LAUNCHER.resolve()),
-                "sha256": digest(PERF_LAUNCHER),
-            },
-            "elf_layout": {
-                "absolute_path": str(
-                    (ROOT / "scripts/cache-gate-elf-layout.py").resolve()
-                ),
-                "sha256": digest(ROOT / "scripts/cache-gate-elf-layout.py"),
-            },
-            "link_wrapper": {
-                "absolute_path": str(
-                    (ROOT / "scripts/cache-gate-link-wrapper.py").resolve()
-                ),
-                "sha256": digest(ROOT / "scripts/cache-gate-link-wrapper.py"),
-            },
-        },
+        "tools": authenticated_tools,
     }
     anchor_manifest = write(
         tmp_path / "anchor-manifest.json", json.dumps(manifest) + "\n"
@@ -235,6 +286,7 @@ def make_fixture(
             candidate["executables"]["elastic_cache_gate"]["absolute_path"]
         ),
         "elastic_invocation": tmp_path / "elastic_cache_gate.invocation",
+        "snapshot_tool": snapshot_tool,
     }
 
 
@@ -255,7 +307,7 @@ def command(fixture, **overrides):
         "candidate-manifest": fixture["candidate_manifest"],
     }
     values.update(overrides)
-    result = [str(SCRIPT)]
+    result = [str(fixture["snapshot_tool"])]
     for name, value in values.items():
         result += [f"--{name}", str(value)]
     return result
@@ -398,6 +450,146 @@ def test_stable_snapshot_refuses_candidate_binary_hash_mismatch(tmp_path):
     )
     assert completed.returncode != 0
     assert "hash mismatch" in completed.stderr
+
+
+def test_snapshot_rejects_corrupt_structural_manifest_before_execution(tmp_path):
+    fixture = make_fixture(tmp_path)
+    for name in ("anchor_manifest", "candidate_manifest"):
+        manifest = json.loads(fixture[name].read_text())
+        manifest["linker_capability"] = {"accepted": True}
+        manifest["elf_layout"] = {"corrupt": {"program_headers_have_rwx": True}}
+        fixture[name].write_text(json.dumps(manifest) + "\n")
+    completed = subprocess.run(
+        command(fixture), cwd=ROOT, text=True, capture_output=True
+    )
+    assert completed.returncode != 0
+    assert "ELF layout executable set mismatch" in completed.stderr
+    assert not fixture["invocation"].exists()
+
+
+def test_manifest_builder_uses_approved_perf_tool_schema_and_authenticates_helper():
+    source = LAUNCHER.read_text()
+    assert '--tool "perf_launcher=$CACHE_GATE_PERF_TOOL"' in source
+    assert '--tool "perf_support=$CACHE_GATE_PERF_SUPPORT_TOOL"' in source
+    assert '--tool "perf=' not in source
+
+
+def test_launchers_bootstrap_tools_only_from_their_own_reviewed_root():
+    launcher_source = LAUNCHER.read_text()
+    perf_source = PERF_LAUNCHER.read_text()
+    for variable in (
+        "CACHE_GATE_LAUNCHER",
+        "CACHE_GATE_ELF_LAYOUT_TOOL",
+        "CACHE_GATE_SNAPSHOT_TOOL",
+        "CACHE_GATE_PERF_TOOL",
+        "CACHE_GATE_PERF_SUPPORT_TOOL",
+        "CACHE_GATE_EXTRACTOR_TOOL",
+        "CACHE_GATE_LINK_WRAPPER",
+    ):
+        assert f"${{{variable}:-" not in launcher_source
+    for variable in ("CACHE_GATE_ELF_LAYOUT_TOOL", "CACHE_GATE_PERF_SUPPORT_TOOL"):
+        assert f"${{{variable}:-" not in perf_source
+    for source in (launcher_source, perf_source, SCRIPT.read_text()):
+        assert "verify_reviewed_tool_blob" in source
+        assert "verify_manifest_tool_binding" in source
+        assert 'git hash-object "$tool"' in source
+        assert 'record.get("reviewed_commit")!=head' in source
+
+
+def test_perf_launcher_executes_only_manifested_reviewed_helpers():
+    source = PERF_LAUNCHER.read_text()
+    assert '"$CACHE_GATE_ELF_LAYOUT_TOOL" validate-manifest' in source
+    assert '"$CACHE_GATE_PERF_SUPPORT_TOOL" select-pmu' in source
+    assert '"$CACHE_GATE_PERF_SUPPORT_TOOL" bind-contract' in source
+    assert '"$CACHE_GATE_PERF_SUPPORT_TOOL" verify-executable' in source
+    assert '"$CACHE_GATE_PERF_SUPPORT_TOOL" validate-csv' in source
+    assert "$REPO_ROOT/scripts/cache-gate-perf-support.py" not in source
+    assert source.count('require_tool_hash "$CACHE_GATE_PERF_SUPPORT_TOOL"') == 4
+    assert "perf destination escapes runner target" in source
+
+
+def test_perf_run_manifest_records_reviewed_launcher_and_helper_provenance():
+    source = PERF_LAUNCHER.read_text()
+    for field in (
+        '"build_manifest_sha256": manifest_hash',
+        '"tools": {"perf_launcher": perf_launcher, "perf_support": perf_support}',
+        '"root": perf_launcher["reviewed_root"]',
+        '"commit": perf_launcher["reviewed_commit"]',
+        '"tree": perf_launcher["reviewed_tree"]',
+    ):
+        assert field in source
+
+
+def test_manifest_metadata_hashes_the_exact_bytes_it_parses():
+    stable = LAUNCHER.read_text()
+    perf = PERF_LAUNCHER.read_text()
+    snapshot = SCRIPT.read_text()
+    assert "manifest_bytes=Path(manifest_path).read_bytes()" in stable
+    assert "manifest=json.loads(manifest_bytes)" in stable
+    assert "hashlib.sha256(manifest_bytes).hexdigest()" in stable
+    assert "manifest_bytes = Path(sys.argv[1]).read_bytes()" in perf
+    assert "data = json.loads(manifest_bytes)" in perf
+    assert "return json.loads(raw), hashlib.sha256(raw).hexdigest()" in snapshot
+
+
+def test_stable_and_perf_destination_roots_remain_under_runner_target():
+    stable = LAUNCHER.read_text()
+    perf = PERF_LAUNCHER.read_text()
+    assert "stable run root escapes runner target" in stable
+    assert "stable run destination escapes runner target" in stable
+    assert "perf destination root escapes runner target" in perf
+    assert "perf destination escapes runner target" in perf
+
+
+def test_snapshot_rechecks_executed_control_and_copies_authenticated_bytes():
+    source = SCRIPT.read_text()
+    assert "control binary hash mismatch immediately before execution" in source
+    assert "authenticated source hash mismatch" in source
+    assert 'python3 - "$copied_manifest"' in source
+    assert 'item["link_map"]["sha256"]' in source
+
+
+def perf_command(fixture, manifest, binary):
+    return [
+        str(PERF_LAUNCHER),
+        "--runner-root",
+        str(ROOT),
+        "--manifest",
+        str(manifest),
+        "--operation",
+        "elastic-get",
+        "--iterations",
+        "1",
+        "--repetition",
+        "1",
+    ], launcher_env(
+        CACHE_GATE_CAMPAIGN_ROOT=ROOT / "target/cache-gate-perf-test-campaign",
+        CACHE_GATE_CAMPAIGN_KEY="fixture-campaign",
+        CACHE_GATE_PERF_BIN=binary,
+    )
+
+
+def test_perf_launcher_rejects_manifest_outside_runner_target(tmp_path):
+    manifest = write(tmp_path / "manifest.json", "{}\n")
+    binary = write(ROOT / "target/cache-gate-test-fixtures/perf-outside-bin", "bin\n")
+    binary.chmod(0o755)
+    arguments, env = perf_command({}, manifest, binary)
+    completed = subprocess.run(arguments, env=env, text=True, capture_output=True)
+    assert completed.returncode != 0
+    assert "manifest must stay below runner root target" in completed.stderr
+
+
+def test_perf_launcher_rejects_binary_outside_runner_target(tmp_path):
+    manifest = write(
+        ROOT / "target/cache-gate-test-fixtures/perf-binary-outside-manifest.json",
+        "{}\n",
+    )
+    binary = write(tmp_path / "outside-bin", "bin\n")
+    binary.chmod(0o755)
+    arguments, env = perf_command({}, manifest, binary)
+    completed = subprocess.run(arguments, env=env, text=True, capture_output=True)
+    assert completed.returncode != 0
+    assert "profile binary must stay below runner root target" in completed.stderr
 
 
 def launcher_env(**values):

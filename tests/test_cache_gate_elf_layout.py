@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 import os
+import runpy
 import subprocess
 from pathlib import Path
 
@@ -265,6 +266,25 @@ def run_compare(
     )
 
 
+def run_validate_manifest(
+    tmp_path: Path, manifest: dict, *extra: str
+) -> subprocess.CompletedProcess[str]:
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    return subprocess.run(
+        [
+            "python3",
+            str(SCRIPT),
+            "validate-manifest",
+            "--manifest",
+            str(manifest_path.resolve()),
+            *extra,
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+
 def one_kernel(manifest: dict, name: str) -> dict:
     executable = {
         "elastic": "elastic_cache_gate",
@@ -407,6 +427,21 @@ def test_validate_accepts_captured_gnu_and_lld_maps(tmp_path, monkeypatch, flavo
         assert kernel["input_end"] == kernel["body_end"]
         assert kernel["function_start"] == kernel["input_start"]
         assert kernel["function_end"] == kernel["input_end"]
+
+
+def test_validate_rejects_compact_rwe_program_header_outside_reservations(
+    tmp_path, monkeypatch
+):
+    argv, _ = write_validate_fixture(tmp_path, monkeypatch, "gnu")
+    segments = tmp_path / "readelf" / "segments.txt"
+    with segments.open("a", encoding="utf-8") as stream:
+        stream.write(
+            "  LOAD 0x030000 0x0000000000040000 0x0000000000040000 "
+            "0x001000 0x001000 RWE 0x1000\n"
+        )
+    completed = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True)
+    assert completed.returncode != 0
+    assert "program header is RWX" in completed.stderr
 
 
 @pytest.mark.parametrize("flavor", ["gnu", "lld"])
@@ -554,6 +589,7 @@ def test_validate_link_command_binds_real_driver_and_final_output(tmp_path):
             {
                 "linker": {
                     "absolute_path": str(driver.resolve()),
+                    "sha256": digest(driver),
                     "flavor": "GNU ld",
                     "version": "GNU ld fixture 1.0",
                 }
@@ -653,6 +689,75 @@ def test_link_wrapper_records_driver_bytes_and_exact_argv(tmp_path):
             "path": os.environ["PATH"],
         }
     ]
+
+
+def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
+    tmp_path,
+):
+    linker = tmp_path / "ld.bfd"
+    linker.write_text(
+        "#!/bin/sh\n"
+        "if test \"${1:-}\" = --version; then echo 'GNU ld fixture 2.42'; fi\n"
+        "exit 0\n"
+    )
+    linker.chmod(0o755)
+    binary = tmp_path / "probe"
+    binary.write_bytes(b"ELF fixture\n")
+    trace = tmp_path / "linker-trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "driver": str(linker.resolve()),
+                "driver_sha256": digest(linker),
+                "argv": ["-o", str(binary.resolve())],
+                "cwd": str(tmp_path.resolve()),
+                "path": os.environ["PATH"],
+            }
+        )
+        + "\n"
+    )
+    output = tmp_path / "execution.json"
+    command = [
+        "python3",
+        str(SCRIPT),
+        "validate-linker-execution",
+        "--trace",
+        str(trace.resolve()),
+        "--linker",
+        str(linker.resolve()),
+        "--executable",
+        str(binary.resolve()),
+        "--flavor",
+        "gnu",
+        "--output",
+        str(output.resolve()),
+    ]
+    completed = subprocess.run(command, text=True, capture_output=True)
+    assert completed.returncode == 0, completed.stderr
+    record = json.loads(output.read_text())
+    assert record["linker"] == {
+        "absolute_path": str(linker.resolve()),
+        "flavor": "GNU ld",
+        "sha256": digest(linker),
+        "version": "GNU ld fixture 2.42",
+    }
+    assert record["trace"]["final_link_record_count"] == 1
+
+    wrong_linker = tmp_path / "other-ld"
+    wrong_linker.write_text(linker.read_text())
+    wrong_linker.chmod(0o755)
+    command[command.index("--linker") + 1] = str(wrong_linker.resolve())
+    rejected = subprocess.run(command, text=True, capture_output=True)
+    assert rejected.returncode != 0
+    assert "observed linker differs" in rejected.stderr
+
+
+def test_capability_probe_traces_explicit_linker_executables():
+    source = (ROOT / "scripts/cache-gate-linker-capability.sh").read_text()
+    assert "validate-linker-execution" in source
+    assert "CACHE_GATE_LINK_TRACE" in source
+    assert "CACHE_GATE_LINK_DRIVER" in source
+    assert "-B" in source
 
 
 def test_manifest_build_captures_and_authenticates_each_real_link_command():
@@ -776,6 +881,318 @@ def test_program_header_rwx_is_fatal(tmp_path):
     assert "RWX" in completed.stderr
 
 
+def test_supplied_manifest_validation_rejects_corrupt_structural_field(tmp_path):
+    manifest = make_manifest(tmp_path)
+    manifest["elf_layout"]["cache_gate_profile"]["program_headers_have_rwx"] = True
+    completed = run_validate_manifest(tmp_path, manifest)
+    assert completed.returncode != 0
+    assert "program header is RWX" in completed.stderr
+
+
+def test_supplied_manifest_requires_the_exact_authenticated_schema(tmp_path):
+    manifest = make_manifest(tmp_path)
+    completed = run_validate_manifest(tmp_path, manifest)
+    assert completed.returncode != 0
+    assert "exact manifest schema" in completed.stderr
+
+
+def test_supplied_manifest_validation_rederives_all_three_layouts_from_bytes():
+    source = SCRIPT.read_text()
+    assert "rederive_manifest_layouts" in source
+    assert "AUTHENTICATED_TOOL_NAMES" in source
+    assert 'resolved["elf_layout"] == Path(__file__).resolve()' in source
+    assert "validate_link_command" in source
+    assert "regenerated layout differs" in source
+
+
+def test_supplied_manifest_validation_never_executes_build_toolchain():
+    source = SCRIPT.read_text()
+    capability = source[
+        source.index("def _validate_capability(") : source.index(
+            "def _validate_control("
+        )
+    ]
+    link_records = source[
+        source.index("def _validate_main_link_records(") : source.index(
+            "def _run_extractor("
+        )
+    ]
+    assert 'run("rustc"' not in capability
+    assert 'run("cargo"' not in capability
+    assert "validate_linker_execution(" not in capability
+    assert "validate_link_command(" not in link_records
+    assert "replay_linker_execution" in capability
+    assert "replay_link_command" in link_records
+
+
+def test_explicit_linker_trace_is_contained_under_runner_target():
+    source = SCRIPT.read_text()
+    capability = source[
+        source.index("def _validate_capability(") : source.index(
+            "def _validate_control("
+        )
+    ]
+    assert "linker trace is outside runner target" in capability
+
+
+@pytest.mark.parametrize(
+    ("kind", "value", "accepted"),
+    [
+        ("variant", "cache-off-v2", True),
+        ("variant", "-candidate.2", True),
+        ("variant", "candidate/path", False),
+        ("variant", ".", False),
+        ("variant", "..", False),
+        ("variant", "", False),
+        ("manifest_instance", "build-2", True),
+        ("manifest_instance", "-build", False),
+        ("manifest_instance", ".build", False),
+        ("manifest_instance", "build/path", False),
+    ],
+)
+def test_supplied_manifest_component_validation_matches_builder(kind, value, accepted):
+    namespace = runpy.run_path(str(SCRIPT))
+    if accepted:
+        namespace["_validate_manifest_component"](kind, value)
+    else:
+        with pytest.raises(ValueError, match="unsafe"):
+            namespace["_validate_manifest_component"](kind, value)
+
+
+def test_control_validation_requires_current_clean_root_and_target_containment():
+    source = SCRIPT.read_text()
+    control = source[
+        source.index("def _validate_control(") : source.index(
+            "def _validate_main_link_records("
+        )
+    ]
+    assert 'rev-parse", "HEAD"' in control
+    assert 'rev-parse", "HEAD^{tree}"' in control
+    assert '"--untracked-files=no"' in control
+    assert '(control_root / "tools/cache-gate-control/target").resolve()' in control
+    assert '"tools/cache-gate-control/Cargo.toml"' in control
+    assert '"tools/cache-gate-control/Cargo.lock"' in control
+    assert '"tools/cache-gate-control/src/main.rs"' in control
+
+
+def test_control_validation_rejects_binary_outside_recorded_control_target(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    control_root = tmp_path / "control-root"
+    crate = control_root / "tools/cache-gate-control"
+    cargo_manifest = crate / "Cargo.toml"
+    cargo_lock = crate / "Cargo.lock"
+    source = crate / "src/main.rs"
+    source.parent.mkdir(parents=True)
+    cargo_manifest.write_text("[package]\nname='control'\nversion='0.0.0'\n")
+    cargo_lock.write_text("version = 4\n")
+    source.write_text("fn main() {}\n")
+    subprocess.run(["git", "init", "-q"], cwd=control_root, check=True)
+    subprocess.run(["git", "add", "."], cwd=control_root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "control fixture",
+        ],
+        cwd=control_root,
+        check=True,
+    )
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=control_root, text=True
+    ).strip()
+    tree = subprocess.check_output(
+        ["git", "rev-parse", "HEAD^{tree}"], cwd=control_root, text=True
+    ).strip()
+    binary = crate / "target/release/control"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"control binary\n")
+
+    def record(path):
+        return {"absolute_path": str(path.resolve()), "sha256": digest(path)}
+
+    provenance = {
+        "builder_commit": commit,
+        "builder_tree": tree,
+        "runner_root": str(control_root.resolve()),
+        "runner_commit": commit,
+        "runner_tree": tree,
+        "mode": "BUILD_CONTROL",
+        "binary": record(binary),
+        "inputs": {
+            "cargo_manifest": record(cargo_manifest),
+            "cargo_lock": record(cargo_lock),
+            "source": record(source),
+        },
+        "cargo_version": "cargo fixture",
+        "rustc_version": "rustc fixture",
+        "locked": True,
+    }
+    provenance_path = binary.with_suffix(".provenance.json")
+    provenance_path.write_text(json.dumps(provenance) + "\n")
+    control = {
+        **provenance,
+        "provenance_path": str(provenance_path.resolve()),
+        "provenance_sha256": digest(provenance_path),
+    }
+    namespace["_validate_control"](control)
+    outside = tmp_path / "outside-control"
+    outside.write_bytes(b"outside\n")
+    control["binary"] = record(outside)
+    with pytest.raises(ValueError, match="outside control target"):
+        namespace["_validate_control"](control)
+
+
+def test_link_trace_replay_never_executes_recorded_linkers(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    marker = tmp_path / "executed"
+    driver = tmp_path / "recorded-linker"
+    driver.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    driver.chmod(0o755)
+    binary = tmp_path / "bench"
+    binary.write_bytes(b"ELF fixture\n")
+    fragment = tmp_path / "layout.ld"
+    fragment.write_text("SECTIONS {}\n")
+    link_map = tmp_path / "bench.map"
+    link_map.write_text("map\n")
+    obj = tmp_path / "input.o"
+    obj.write_bytes(b"object\n")
+    argv = [
+        str(driver),
+        "-o",
+        str(binary),
+        f"-Wl,-T,{fragment}",
+        f"-Wl,-Map,{link_map}",
+        str(obj),
+    ]
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "driver": str(driver),
+                "driver_sha256": digest(driver),
+                "argv": argv,
+            }
+        )
+        + "\n"
+    )
+    linker = {
+        "absolute_path": str(driver),
+        "sha256": digest(driver),
+        "flavor": "GNU ld",
+        "version": "GNU ld fixture",
+    }
+    namespace["replay_linker_execution"](trace, linker, binary, "gnu")
+    namespace["replay_link_command"](trace, binary, linker, fragment, link_map)
+    assert not marker.exists()
+
+
+def test_stable_launcher_rejects_corrupt_manifest_before_execution(tmp_path):
+    fixture_root = (
+        ROOT
+        / "target"
+        / "cache-gate-test-fixtures"
+        / f"{tmp_path.parent.name}-{tmp_path.name}-stable-corrupt"
+    )
+    fixture_root.mkdir(parents=True, exist_ok=False)
+    harness_root = fixture_root / "reviewed-harness"
+    harness_scripts = harness_root / "scripts"
+    harness_scripts.mkdir(parents=True)
+    for filename in (
+        "cache-gate.sh",
+        "cache-gate-elf-layout.py",
+        "snapshot-criterion-pair.sh",
+        "cache-gate-perf.sh",
+        "cache-gate-perf-support.py",
+        "extract-hot-symbols.py",
+        "cache-gate-link-wrapper.py",
+    ):
+        source = ROOT / "scripts" / filename
+        copied = harness_scripts / filename
+        copied.write_bytes(source.read_bytes())
+        copied.chmod(source.stat().st_mode)
+    subprocess.run(["git", "init", "-q"], cwd=harness_root, check=True)
+    subprocess.run(["git", "add", "scripts"], cwd=harness_root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Cache Gate Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture harness",
+        ],
+        cwd=harness_root,
+        check=True,
+    )
+    harness_launcher = harness_scripts / "cache-gate.sh"
+    authenticated_tools_path = fixture_root / "authenticated-tools.json"
+    tool_files = {
+        "launcher": "cache-gate.sh",
+        "elf_layout": "cache-gate-elf-layout.py",
+        "snapshot": "snapshot-criterion-pair.sh",
+        "perf_launcher": "cache-gate-perf.sh",
+        "perf_support": "cache-gate-perf-support.py",
+        "extractor": "extract-hot-symbols.py",
+        "link_wrapper": "cache-gate-link-wrapper.py",
+    }
+    subprocess.run(
+        [
+            str(harness_scripts / "cache-gate-elf-layout.py"),
+            "authenticate-tools",
+            "--output",
+            str(authenticated_tools_path),
+            *[
+                argument
+                for name, filename in tool_files.items()
+                for argument in ("--tool", f"{name}={harness_scripts / filename}")
+            ],
+        ],
+        check=True,
+    )
+    authenticated_tools = json.loads(authenticated_tools_path.read_text())
+    manifest = make_manifest(fixture_root)
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
+    tree = subprocess.check_output(
+        ["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True
+    ).strip()
+    manifest.update(
+        {
+            "commit": commit,
+            "tree": tree,
+            "runner_root": str(ROOT.resolve()),
+            "empty_diff_assertion": True,
+            "variant": "fixture-corrupt",
+            "tools": authenticated_tools,
+        }
+    )
+    manifest["elf_layout"]["cache_gate_profile"]["program_headers_have_rwx"] = True
+    manifest_path = fixture_root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+    completed = subprocess.run(
+        [str(harness_launcher), "--runner-root", str(ROOT)],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "ELASTIC": "1",
+            "SAVE": "fixture",
+            "CACHE_GATE_MANIFEST": str(manifest_path),
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode != 0
+    assert "program header is RWX" in completed.stderr
+
+
 def test_overlap_is_fatal(tmp_path):
     manifest = make_manifest(tmp_path)
     left = one_kernel(manifest, "elastic_profile_insert_kernel")
@@ -868,6 +1285,24 @@ def test_veneer_thunk_or_kernel_plt_call_is_fatal(tmp_path, field, value, messag
     completed = run_compare(tmp_path, manifest)
     assert completed.returncode != 0
     assert message in completed.stderr
+
+
+def test_out_of_reservation_thunk_in_kernel_direct_call_graph_is_fatal(tmp_path):
+    manifest = make_manifest(tmp_path)
+    layout = manifest["elf_layout"]["cache_gate_profile"]
+    thunk = {
+        "name": "fixture::__AArch64AbsLongThunk_target",
+        "start": 0xF00000,
+        "end": 0xF00010,
+        "size": 0x10,
+    }
+    layout["veneer_thunk_inventory"] = [thunk]
+    kernel = one_kernel(manifest, "funnel_profile_get_kernel")
+    assert not kernel["reservation_start"] <= thunk["start"] < kernel["reservation_end"]
+    kernel["direct_calls"] = [f"0xf00000 <{thunk['name']}>"]
+    completed = run_compare(tmp_path, manifest)
+    assert completed.returncode != 0
+    assert "veneer|thunk in kernel call graph" in completed.stderr
 
 
 def test_exact_shape_rejects_absent_expected_reservation(tmp_path):
