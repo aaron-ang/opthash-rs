@@ -172,6 +172,10 @@ def _normalize_assembly(assembly: str, arch: str) -> str:
                 operands,
                 count=1,
             )
+        if opcode == "adrp":
+            operands = re.sub(
+                r"(<GCC_except_table\d+)[+-]0x[0-9A-Fa-f]+>", r"\1>", operands
+            )
     else:
         raise ValueError(f"unsupported architecture: {arch}")
     return f"{opcode}{(' ' + operands) if operands else ''}{relocation_suffix}"

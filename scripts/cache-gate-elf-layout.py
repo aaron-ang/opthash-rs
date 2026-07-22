@@ -3202,6 +3202,11 @@ def compare_manifests(
     _require(not unknown, f"unknown kernel in --allow-body-change: {sorted(unknown)}")
     validate_manifest(anchor)
     validate_manifest(candidate)
+    is_adversary = (
+        "build_proof" in anchor
+        and "build_proof" in candidate
+        and candidate.get("layout_adversary", {}).get("enabled") is True
+    )
     for field in ("arch", "max_page_size", "fragment_set_sha256"):
         _require(
             anchor["linker_capability"].get(field)
@@ -3237,6 +3242,8 @@ def compare_manifests(
                 )
             if name not in allowed:
                 for field in BODY_FIELDS:
+                    if is_adversary and field == "raw_sha256":
+                        continue
                     _require(
                         left.get(field) == right.get(field),
                         f"{name}: body {field} mismatch",
@@ -3266,7 +3273,6 @@ def compare_manifests(
                     ),
                     f"{label} {executable}: rustc argv lacks -C codegen-units=16",
                 )
-        is_adversary = candidate.get("layout_adversary", {}).get("enabled") is True
         proof_fields = (
             "cgu_partition_fingerprint",
             "object_member_fingerprint",

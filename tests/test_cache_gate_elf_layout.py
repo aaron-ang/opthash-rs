@@ -4161,3 +4161,58 @@ def test_compare_accepts_linked_exact_nonvacuous_adversary_proof(tmp_path):
     attach_build_proof(candidate, "adversary", adversary=True)
     completed = run_compare(tmp_path, anchor, candidate)
     assert completed.returncode == 0, completed.stderr
+
+
+def test_compare_adversary_allows_relocation_only_raw_body_change(tmp_path):
+    anchor = make_manifest(tmp_path)
+    candidate = copy.deepcopy(anchor)
+    attach_build_proof(anchor, "clean")
+    attach_build_proof(candidate, "adversary", adversary=True)
+    one_kernel(candidate, "elastic_cache_gate_insert_kernel")["raw_sha256"] = "c" * 64
+
+    completed = run_compare(tmp_path, anchor, candidate)
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_compare_adversary_rejects_normalized_body_change(tmp_path):
+    anchor = make_manifest(tmp_path)
+    candidate = copy.deepcopy(anchor)
+    attach_build_proof(anchor, "clean")
+    attach_build_proof(candidate, "adversary", adversary=True)
+    kernel = one_kernel(candidate, "elastic_cache_gate_insert_kernel")
+    kernel["raw_sha256"] = "c" * 64
+    kernel["normalized_sha256"] = "d" * 64
+
+    completed = run_compare(tmp_path, anchor, candidate)
+
+    assert completed.returncode != 0
+    assert "normalized_sha256" in completed.stderr
+
+
+def test_compare_clean_build_rejects_raw_only_body_change(tmp_path):
+    anchor = make_manifest(tmp_path)
+    candidate = copy.deepcopy(anchor)
+    attach_build_proof(anchor, "clean")
+    attach_build_proof(candidate, "clean")
+    one_kernel(candidate, "elastic_cache_gate_insert_kernel")["raw_sha256"] = "c" * 64
+
+    completed = run_compare(tmp_path, anchor, candidate)
+
+    assert completed.returncode != 0
+    assert "raw_sha256" in completed.stderr
+
+
+def test_compare_adversary_rejects_call_topology_change(tmp_path):
+    anchor = make_manifest(tmp_path)
+    candidate = copy.deepcopy(anchor)
+    attach_build_proof(anchor, "clean")
+    attach_build_proof(candidate, "adversary", adversary=True)
+    kernel = one_kernel(candidate, "elastic_cache_gate_insert_kernel")
+    kernel["raw_sha256"] = "c" * 64
+    kernel["direct_calls"] = ["<pc-rel> <fixture::different>"]
+
+    completed = run_compare(tmp_path, anchor, candidate)
+
+    assert completed.returncode != 0
+    assert "direct_calls" in completed.stderr

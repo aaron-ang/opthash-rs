@@ -123,6 +123,52 @@ def test_aarch64_complete_pc_relative_materialization_normalizes(left, right):
     )
 
 
+def test_aarch64_adrp_nearest_symbol_addend_is_not_semantic():
+    left = """0000000000001000 <crate::kernel>:
+ 1000:\t90000000 \tadrp\tx0, 2000 <GCC_except_table0+0x16720>
+ 1004:\t91000000 \tadd\tx0, x0, #0x120
+"""
+    right = left.replace("<GCC_except_table0+0x16720>", "<GCC_except_table0+0x166b0>")
+    assert (
+        extractor.normalize_objdump(left, "aarch64")["hash"]
+        == extractor.normalize_objdump(right, "aarch64")["hash"]
+    )
+
+
+def test_aarch64_adrp_data_symbol_addend_remains_significant():
+    original = """0000000000001000 <crate::kernel>:
+ 1000:\t90000000 \tadrp\tx0, 2000 <crate::data+0x1000>
+ 1004:\t91000000 \tadd\tx0, x0, #0x120
+"""
+    changed = original.replace("<crate::data+0x1000>", "<crate::data+0x2000>")
+    assert (
+        extractor.normalize_objdump(original, "aarch64")["hash"]
+        != extractor.normalize_objdump(changed, "aarch64")["hash"]
+    )
+
+
+def test_aarch64_adr_exact_symbol_addend_remains_significant():
+    original = """0000000000001000 <crate::kernel>:
+ 1000:\t10000000 \tadr\tx0, 1100 <crate::data+0x4>
+"""
+    changed = original.replace("<crate::data+0x4>", "<crate::data+0x8>")
+    assert (
+        extractor.normalize_objdump(original, "aarch64")["hash"]
+        != extractor.normalize_objdump(changed, "aarch64")["hash"]
+    )
+
+
+def test_aarch64_branch_symbol_addend_remains_significant():
+    original = """0000000000001000 <crate::kernel>:
+ 1000:\t14000000 \tb\t1100 <crate::kernel+0x100>
+"""
+    changed = original.replace("<crate::kernel+0x100>", "<crate::kernel+0x104>")
+    assert (
+        extractor.normalize_objdump(original, "aarch64")["hash"]
+        != extractor.normalize_objdump(changed, "aarch64")["hash"]
+    )
+
+
 def test_aarch64_non_pc_relative_immediate_remains_significant():
     original = (
         """0000000000001000 <crate::kernel>:\n 1000:\t91004000 \tadd\tx0, x0, #0x10\n"""
