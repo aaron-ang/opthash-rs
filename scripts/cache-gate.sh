@@ -636,12 +636,20 @@ x86_64 | amd64) arch=x86_64 ;;
 *) echo "error: unsupported host architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 [[ -n ${CACHE_GATE_LINKER_CAPABILITY:-} && $CACHE_GATE_LINKER_CAPABILITY == /* ]] || { echo "error: absolute CACHE_GATE_LINKER_CAPABILITY is required" >&2; exit 2; }
-CACHE_GATE_LINKER_CAPABILITY=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$CACHE_GATE_LINKER_CAPABILITY")
+[[ -f $CACHE_GATE_LINKER_CAPABILITY && ! -L $CACHE_GATE_LINKER_CAPABILITY ]] || { echo "error: linker capability must be a regular non-symlink" >&2; exit 2; }
 CACHE_GATE_LINK_DRIVER=$(python3 - "$CACHE_GATE_LINKER_CAPABILITY" "$REPO_ROOT" "$arch" "$HARNESS_ROOT" <<'PY'
-import hashlib,json,os,subprocess,sys
+import hashlib,json,os,re,shlex,subprocess,sys
 from pathlib import Path
 path,repo,arch,harness_root=sys.argv[1:]
-capability=json.load(open(path,encoding="utf-8"))
+capability_path=Path(sys.argv[1])
+if not capability_path.is_absolute() or capability_path.is_symlink() or not capability_path.is_file():
+    raise SystemExit("error: linker capability input is not a regular file")
+for component in capability_path.parents:
+    if not component.is_dir() or component.is_symlink():
+        raise SystemExit(f"error: linker capability input ancestry contains symlink: {component}")
+if capability_path!=capability_path.resolve(strict=True):
+    raise SystemExit("error: linker capability input path is not canonical")
+capability=json.load(open(capability_path,encoding="utf-8"))
 if capability.get("accepted") is not True or capability.get("arch")!=arch:
     raise SystemExit("error: linker capability is not accepted for this architecture")
 def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -660,11 +668,18 @@ if (git_root!=producer_root.resolve() or producer["commit"]!=head or producer["t
     producer["empty_diff_assertion"] is not True or status.strip()):
     raise SystemExit("error: capability producer revision is not immutable")
 artifact_root=Path(producer["artifact_root"])
-producer_target=(producer_root/"target").resolve()
-if (not artifact_root.is_absolute() or not artifact_root.is_dir() or artifact_root.is_symlink() or
-    os.path.commonpath([str(producer_target),str(artifact_root.resolve())])!=str(producer_target)):
+producer_target=producer_root/"target"
+linker_root=producer_target/"cache-gate-linker"
+arch_root=linker_root/arch
+for component in (producer_target,linker_root,arch_root,artifact_root):
+    if not component.is_dir() or component.is_symlink():
+        raise SystemExit(f"error: capability producer ancestry contains symlink or non-directory: {component}")
+try: artifact_relative=artifact_root.relative_to(arch_root)
+except ValueError: raise SystemExit("error: capability artifact root is outside producer target")
+if (len(artifact_relative.parts)!=1 or not artifact_relative.name.startswith(".probe.") or
+    producer["artifact_root"]!=str(artifact_root.resolve()) or artifact_root.resolve()!=artifact_root or
+    os.path.commonpath([str(producer_target),str(artifact_root)])!=str(producer_target)):
     raise SystemExit("error: capability artifact root is outside producer target")
-artifact_root=artifact_root.resolve()
 if set(capability.get("fragments",{}))!={"elastic","funnel","profile"}:
     raise SystemExit("error: linker fragment capability set mismatch")
 for target,record in capability["fragments"].items():
@@ -678,12 +693,15 @@ for target,record in capability["fragments"].items():
         raise SystemExit(f"error: linker fragment capability mismatch: {target}")
 if set(capability.get("shapes",{}))!={"actual","gnu","lld"}:
     raise SystemExit("error: linker capability shape set mismatch")
+driver=Path(capability["linker"]["absolute_path"])
+if (not driver.is_absolute() or driver.is_symlink() or not driver.is_file() or
+    str(driver.resolve())!=str(driver) or digest(driver)!=capability["linker"]["sha256"]):
+    raise SystemExit("error: capability linker path is invalid")
 for flavor,shapes in capability["shapes"].items():
     if set(shapes)!={"elastic","funnel","profile"}:
         raise SystemExit(f"error: linker capability target set mismatch: {flavor}")
     for target,shape in shapes.items():
-        required={"binary","link_argv","link_map","symbols","layout"}
-        if flavor in {"gnu","lld"}: required.add("linker_execution")
+        required={"binary","link_argv","link_map","symbols","layout","linker_execution"}
         if set(shape)!=required:
             raise SystemExit(f"error: exact linker capability shape mismatch: {flavor}/{target}")
         for name,record in shape.items():
@@ -692,10 +710,40 @@ for flavor,shapes in capability["shapes"].items():
                 os.path.commonpath([str(artifact_root),str(artifact.resolve())])!=str(artifact_root) or
                 digest(artifact)!=record["sha256"]):
                 raise SystemExit(f"error: linker capability artifact mismatch: {flavor}/{target}/{name}")
-driver=Path(capability["linker"]["absolute_path"])
-if (not driver.is_absolute() or driver.is_symlink() or not driver.is_file() or
-    str(driver.resolve())!=str(driver) or digest(driver)!=capability["linker"]["sha256"]):
-    raise SystemExit("error: capability linker path is invalid")
+        if flavor=="actual":
+            execution=json.loads(Path(shape["linker_execution"]["absolute_path"]).read_bytes())
+            if execution.get("linker")!=capability["linker"]:
+                raise SystemExit(f"error: actual linker execution identity mismatch: {target}")
+            trace_record=execution.get("trace",{})
+            trace_path=Path(trace_record.get("absolute_path",""))
+            if (not trace_path.is_absolute() or not trace_path.is_file() or trace_path.is_symlink() or
+                os.path.commonpath([str(artifact_root),str(trace_path.resolve())])!=str(artifact_root) or
+                digest(trace_path)!=trace_record.get("sha256")):
+                raise SystemExit(f"error: actual linker trace mismatch: {target}")
+            traces=[json.loads(line) for line in trace_path.read_text().splitlines() if line.strip()]
+            matches=[]
+            binary=Path(shape["binary"]["absolute_path"])
+            for item in traces:
+                argv=item.get("argv",[])
+                for index,value in enumerate(argv):
+                    if value=="-o" and index+1<len(argv): output=Path(argv[index+1]).resolve(); break
+                    if value.startswith("-o") and len(value)>2: output=Path(value[2:]).resolve(); break
+                else: continue
+                if output==binary.resolve() or (output.is_file() and output.samefile(binary)):
+                    matches.append(item)
+            if (len(matches)!=1 or Path(matches[0].get("driver",""))!=driver or
+                matches[0].get("driver_sha256")!=capability["linker"]["sha256"] or
+                execution.get("argv")!=matches[0].get("argv")):
+                raise SystemExit(f"error: actual linker trace driver/hash mismatch: {target}")
+            lines=[line.strip() for line in Path(shape["link_argv"]["absolute_path"]).read_text().splitlines() if line.strip()]
+            tokens=shlex.split(lines[-1]) if lines else []
+            command_index=next((index for index,value in enumerate(tokens)
+                                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*",value)),len(tokens))
+            expected_wrapper=(producer_root/"scripts/cache-gate-link-wrapper.py").resolve()
+            if (command_index>=len(tokens) or not Path(tokens[command_index]).is_absolute() or
+                Path(tokens[command_index])!=expected_wrapper or
+                tokens[command_index+1:]!=execution.get("argv")):
+                raise SystemExit(f"error: actual link argv/trace mismatch: {target}")
 version=next((line for line in subprocess.check_output([str(driver),"-Wl,--version"],stderr=subprocess.STDOUT,text=True).splitlines() if "GNU ld" in line or "LLD" in line or "lld" in line),"")
 if version!=capability["linker"]["version"]:
     raise SystemExit("error: actual linker identity differs from capability")

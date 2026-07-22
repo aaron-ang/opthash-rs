@@ -511,6 +511,8 @@ control)
 	[[ $actual_control_hash == "$control_hash" ]] || { echo "error: control binary hash mismatch immediately before execution" >&2; exit 1; }
 	comparison_command=("$control_binary" --bench "${criterion_args[@]}")
 	CRITERION_HOME="$criterion_root" "${comparison_command[@]}" >"$comparison_stdout" 2>"$comparison_stderr"
+	post_execution_control_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$control_binary"); post_execution_control_hash=${post_execution_control_hash%% *}
+	[[ $post_execution_control_hash == "$control_hash" ]] || { echo "error: control binary changed during offline execution" >&2; exit 1; }
 	python3 - "$comparison_commands" "${comparison_command[@]}" <<'PY'
 import json,sys
 json.dump([sys.argv[2:]], open(sys.argv[1], "w"), indent=2)
@@ -523,6 +525,8 @@ elastic_cache_gate | funnel_cache_gate)
 	[[ $actual_stable_hash == "$stable_hash" ]] || { echo "error: candidate stable binary hash mismatch" >&2; exit 1; }
 	comparison_command=("$stable_binary" --bench "${criterion_args[@]}")
 	CRITERION_HOME="$criterion_root" "${comparison_command[@]}" >"$comparison_stdout" 2>"$comparison_stderr"
+	post_execution_stable_hash=$("$CACHE_GATE_SHA256_TOOL" -- "$stable_binary"); post_execution_stable_hash=${post_execution_stable_hash%% *}
+	[[ $post_execution_stable_hash == "$stable_hash" ]] || { echo "error: stable binary changed during offline execution" >&2; exit 1; }
 	python3 - "$comparison_commands" "${comparison_command[@]}" <<'PY'
 import json,sys
 json.dump([sys.argv[2:]], open(sys.argv[1], "w"), indent=2)

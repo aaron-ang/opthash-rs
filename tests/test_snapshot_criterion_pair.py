@@ -606,6 +606,38 @@ def test_snapshot_rejects_missing_fresh_change_output(tmp_path):
     assert not (fixture["snapshot"] / "aarch64/fixture-comparison/pair-1").exists()
 
 
+def test_snapshot_rejects_control_binary_mutated_during_offline_execution(tmp_path):
+    fixture = make_fixture(tmp_path)
+    control = fixture["control"]
+    control.write_text(
+        control.read_text() + "\nprintf '# mutated during comparison\\n' >> \"$0\"\n"
+    )
+    control.chmod(0o755)
+    provenance_path = fixture["control_provenance"]
+    provenance = json.loads(provenance_path.read_text())
+    provenance["binary"]["sha256"] = digest(control)
+    provenance_path.write_text(json.dumps(provenance) + "\n")
+    for manifest_name in ("anchor_manifest", "candidate_manifest"):
+        manifest = json.loads(fixture[manifest_name].read_text())
+        manifest["control"]["binary"]["sha256"] = digest(control)
+        manifest["control"]["provenance_sha256"] = digest(provenance_path)
+        fixture[manifest_name].write_text(json.dumps(manifest) + "\n")
+    for label in ("anchor", "candidate"):
+        evidence_path = fixture["run_evidence"][label]["control"]
+        evidence = json.loads(evidence_path.read_text())
+        evidence["executable"]["sha256"] = digest(control)
+        evidence["control_provenance"]["sha256"] = digest(provenance_path)
+        evidence_path.write_text(json.dumps(evidence) + "\n")
+
+    completed = subprocess.run(
+        command(fixture), cwd=ROOT, text=True, capture_output=True
+    )
+
+    assert completed.returncode != 0
+    assert "control binary changed during offline execution" in completed.stderr
+    assert not (fixture["snapshot"] / "aarch64/fixture-comparison/pair-1").exists()
+
+
 def test_snapshot_does_not_accept_preexisting_change_as_fresh(tmp_path):
     fixture = make_fixture(tmp_path, omit_change=True, preexisting_changes=True)
     completed = subprocess.run(
@@ -793,6 +825,59 @@ def test_stable_snapshot_refuses_candidate_binary_hash_mismatch(tmp_path):
     )
     assert completed.returncode != 0
     assert "hash mismatch" in completed.stderr
+
+
+def test_snapshot_rejects_stable_binary_mutated_during_offline_execution(tmp_path):
+    fixture = make_fixture(tmp_path)
+    binary = fixture["candidate_elastic"]
+    binary.write_text(
+        binary.read_text() + "\nprintf '# mutated during comparison\\n' >> \"$0\"\n"
+    )
+    binary.chmod(0o755)
+    manifest_path = fixture["candidate_manifest"]
+    manifest = json.loads(manifest_path.read_text())
+    manifest["executables"]["elastic_cache_gate"]["sha256"] = digest(binary)
+    manifest["symbols"]["elastic_cache_gate"]["binary_sha256"] = digest(binary)
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+    evidence_path = fixture["run_evidence"]["candidate"]["elastic_cache_gate"]
+    evidence = json.loads(evidence_path.read_text())
+    evidence["executable"]["sha256"] = digest(binary)
+    evidence["build_manifest"]["sha256"] = digest(manifest_path)
+    evidence_path.write_text(json.dumps(evidence) + "\n")
+
+    completed = subprocess.run(
+        command(fixture, target="elastic_cache_gate"),
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode != 0
+    assert "stable binary changed during offline execution" in completed.stderr
+    assert not (fixture["snapshot"] / "aarch64/fixture-comparison/pair-1").exists()
+
+
+def test_offline_binary_rehash_is_immediate_and_branch_local():
+    source = SCRIPT.read_text()
+    execution = (
+        '\tCRITERION_HOME="$criterion_root" "${comparison_command[@]}" '
+        '>"$comparison_stdout" 2>"$comparison_stderr"'
+    )
+    control_rehash = (
+        '\tpost_execution_control_hash=$("$CACHE_GATE_SHA256_TOOL" -- '
+        '"$control_binary"); '
+    )
+    stable_rehash = (
+        '\tpost_execution_stable_hash=$("$CACHE_GATE_SHA256_TOOL" -- '
+        '"$stable_binary"); '
+    )
+    control_branch = source.index("control)\n")
+    stable_branch = source.index("elastic_cache_gate | funnel_cache_gate)\n")
+    scaled_branch = source.index("scaled_insert)\n", stable_branch)
+
+    assert execution + "\n" + control_rehash in source[control_branch:stable_branch]
+    assert execution + "\n" + stable_rehash in source[stable_branch:scaled_branch]
+    assert "$offline_binary" not in source
 
 
 def test_stable_snapshot_rejects_run_evidence_manifest_mismatch(tmp_path):

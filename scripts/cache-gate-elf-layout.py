@@ -607,7 +607,9 @@ def _validate_linker_record(record: Any, label: str) -> Path:
         path.is_absolute() and path.is_file() and not path.is_symlink(),
         f"invalid {label}",
     )
-    path = path.resolve()
+    resolved_path = path.resolve()
+    _require(path == resolved_path, f"{label} path is not canonical")
+    path = resolved_path
     _require(digest(path) == record["sha256"], f"{label} hash mismatch")
     _require(
         isinstance(record["flavor"], str)
@@ -628,7 +630,15 @@ def replay_linker_execution(
     linker = _validate_linker_record(linker_record, f"recorded {flavor} linker")
     _require(
         (flavor == "gnu" and "GNU ld" in linker_record["version"])
-        or (flavor == "lld" and "lld" in linker_record["version"].lower()),
+        or (flavor == "lld" and "lld" in linker_record["version"].lower())
+        or (
+            flavor == "actual"
+            and linker_record["flavor"] in {"GNU ld", "LLD"}
+            and (
+                "GNU ld" in linker_record["version"]
+                or "lld" in linker_record["version"].lower()
+            )
+        ),
         f"recorded {flavor} linker flavor mismatch",
     )
     records = [
@@ -647,7 +657,7 @@ def replay_linker_execution(
     observed = matches[0]
     driver = Path(observed.get("driver", ""))
     _require(
-        driver.is_absolute() and driver.resolve() == linker,
+        driver.is_absolute() and driver == linker,
         f"observed {flavor} linker differs from recorded linker",
     )
     _require(
@@ -665,6 +675,24 @@ def replay_linker_execution(
             "final_link_record_count": len(matches),
         },
     }
+
+
+def _validate_actual_link_argv_trace(
+    link_argv: Path,
+    observed: dict[str, Any],
+    expected_wrapper: Path,
+    label: str,
+) -> None:
+    _, printed_driver, printed_argv = _parse_cargo_link_argv(link_argv)
+    expected_wrapper = expected_wrapper.resolve()
+    _require(
+        Path(printed_driver).is_absolute() and Path(printed_driver) == expected_wrapper,
+        f"{label} link argv did not execute reviewed wrapper",
+    )
+    _require(
+        printed_argv == observed.get("argv"),
+        f"{label} link argv differs from execution trace",
+    )
 
 
 def replay_link_command(
@@ -691,7 +719,7 @@ def replay_link_command(
     record = matches[0]
     observed_driver = Path(record.get("driver", ""))
     _require(
-        observed_driver.is_absolute() and observed_driver.resolve() == driver,
+        observed_driver.is_absolute() and observed_driver == driver,
         "captured link driver differs from recorded capability",
     )
     _require(
@@ -778,19 +806,44 @@ def _validate_capability_producer(
         "capability producer revision differs from reviewed harness",
     )
     artifact_root = Path(producer["artifact_root"])
+    producer_target = root / "target"
+    linker_root = producer_target / "cache-gate-linker"
+    for component in (producer_target, linker_root):
+        _require(
+            component.is_dir() and not component.is_symlink(),
+            f"capability producer ancestry contains symlink or non-directory: {component}",
+        )
     _require(
         artifact_root.is_absolute()
         and artifact_root.is_dir()
         and not artifact_root.is_symlink(),
         "capability artifact root is invalid",
     )
-    artifact_root = artifact_root.resolve()
+    try:
+        artifact_relative = artifact_root.relative_to(linker_root)
+    except ValueError as error:
+        raise LayoutError(
+            "capability artifact root is outside producer target"
+        ) from error
     _require(
-        producer["artifact_root"] == str(artifact_root)
-        and _is_contained((root / "target").resolve(), artifact_root),
+        len(artifact_relative.parts) >= 2,
+        "capability artifact root lacks architecture/probe ancestry",
+    )
+    cursor = linker_root
+    for part in artifact_relative.parts:
+        cursor /= part
+        _require(
+            cursor.is_dir() and not cursor.is_symlink(),
+            f"capability producer ancestry contains symlink or non-directory: {cursor}",
+        )
+    resolved_artifact_root = artifact_root.resolve()
+    _require(
+        producer["artifact_root"] == str(resolved_artifact_root)
+        and resolved_artifact_root == artifact_root
+        and _is_contained(producer_target, resolved_artifact_root),
         "capability artifact root is outside producer target",
     )
-    return root, artifact_root
+    return root, resolved_artifact_root
 
 
 def _validate_capability(
@@ -852,6 +905,12 @@ def _validate_capability(
     )
     producer_root, artifact_root = _validate_capability_producer(
         capability["producer"], manifest["tools"]
+    )
+    _require(
+        artifact_root.parent
+        == producer_root / "target/cache-gate-linker" / capability["arch"]
+        and artifact_root.name.startswith(".probe."),
+        "capability artifact root architecture/probe mismatch",
     )
     _validate_linker_record(capability["linker"], "capability linker")
     _exact_keys(capability["required_linkers"], {"gnu", "lld"}, "required linker set")
@@ -918,9 +977,8 @@ def _validate_capability(
                     "link_map",
                     "symbols",
                     "layout",
+                    "linker_execution",
                 }
-                if flavor in {"gnu", "lld"}:
-                    expected_shape_keys.add("linker_execution")
                 _exact_keys(
                     shape, expected_shape_keys, f"{flavor}/{target} capability shape"
                 )
@@ -998,42 +1056,52 @@ def _validate_capability(
                     regenerated_layout == layout,
                     f"{flavor}/{target} capability layout differs from artifact bytes",
                 )
-                if flavor in {"gnu", "lld"}:
-                    execution_path = _file_record(
-                        shape["linker_execution"], f"{flavor}/{target} linker execution"
-                    )
-                    _require(
-                        _is_contained(artifact_root, execution_path),
-                        f"{flavor}/{target} execution proof is outside producer artifact root",
-                    )
-                    observed = _json_file(
-                        execution_path, f"{flavor}/{target} linker execution"
-                    )
-                    _require_output_contained(
-                        observed.get("argv", []),
-                        artifact_root,
-                        f"{flavor}/{target} linker output is outside producer artifact root",
-                    )
-                    linker_record = capability["required_linkers"][flavor]
-                    trace = observed.get("trace", {})
-                    trace_path = _trace_record(trace, f"{flavor}/{target} linker trace")
-                    _require(
-                        _is_contained(artifact_root, trace_path),
-                        f"{flavor}/{target} linker trace is outside producer artifact root",
-                    )
-                    regenerated = replay_linker_execution(
-                        trace_path,
-                        capability["required_linkers"][flavor],
-                        paths["binary"],
-                        flavor,
-                    )
-                    _require(
-                        regenerated == observed,
-                        f"{flavor}/{target} linker execution proof differs from trace",
-                    )
-                    _require(
-                        observed.get("linker") == linker_record,
-                        f"{flavor}/{target} linker execution identity mismatch",
+                execution_path = _file_record(
+                    shape["linker_execution"], f"{flavor}/{target} linker execution"
+                )
+                _require(
+                    _is_contained(artifact_root, execution_path),
+                    f"{flavor}/{target} execution proof is outside producer artifact root",
+                )
+                observed = _json_file(
+                    execution_path, f"{flavor}/{target} linker execution"
+                )
+                _require_output_contained(
+                    observed.get("argv", []),
+                    artifact_root,
+                    f"{flavor}/{target} linker output is outside producer artifact root",
+                )
+                linker_record = (
+                    capability["linker"]
+                    if flavor == "actual"
+                    else capability["required_linkers"][flavor]
+                )
+                trace = observed.get("trace", {})
+                trace_path = _trace_record(trace, f"{flavor}/{target} linker trace")
+                _require(
+                    _is_contained(artifact_root, trace_path),
+                    f"{flavor}/{target} linker trace is outside producer artifact root",
+                )
+                regenerated = replay_linker_execution(
+                    trace_path,
+                    linker_record,
+                    paths["binary"],
+                    flavor,
+                )
+                _require(
+                    regenerated == observed,
+                    f"{flavor}/{target} linker execution proof differs from trace",
+                )
+                _require(
+                    observed.get("linker") == linker_record,
+                    f"{flavor}/{target} linker execution identity mismatch",
+                )
+                if flavor == "actual":
+                    _validate_actual_link_argv_trace(
+                        paths["link_argv"],
+                        observed,
+                        tools["link_wrapper"],
+                        f"{flavor}/{target}",
                     )
     copied_fragments: dict[str, Path] = {}
     for target, record in capability["fragments"].items():
@@ -2290,18 +2358,27 @@ def validate_linker_execution(args: argparse.Namespace) -> dict[str, Any]:
         _require(path.is_file() and not path.is_symlink(), f"invalid {label}: {path}")
     linker = args.linker.resolve()
     executable = args.executable.resolve()
+    version_argument = "-Wl,--version" if args.flavor == "actual" else "--version"
     version_lines = [
         line.strip()
-        for line in run(str(linker), "--version").splitlines()
+        for line in run(str(linker), version_argument).splitlines()
         if line.strip()
+        and (args.flavor != "actual" or "GNU ld" in line or "lld" in line.lower())
     ]
     _require(bool(version_lines), "explicit linker emitted no version")
     version = version_lines[0]
     if args.flavor == "gnu":
         _require("GNU ld" in version, f"explicit linker is not GNU ld: {version}")
         flavor = "GNU ld"
-    else:
+    elif args.flavor == "lld":
         _require("lld" in version.lower(), f"explicit linker is not LLD: {version}")
+        flavor = "LLD"
+    elif "GNU ld" in version:
+        flavor = "GNU ld"
+    else:
+        _require(
+            "lld" in version.lower(), f"actual linker is not GNU ld/LLD: {version}"
+        )
         flavor = "LLD"
     records = [
         json.loads(line) for line in args.trace.read_text().splitlines() if line.strip()
@@ -2374,6 +2451,25 @@ def select_cargo_executable(args: argparse.Namespace) -> Path:
     return executable
 
 
+def _parse_cargo_link_argv(link_args: Path) -> tuple[dict[str, str], str, list[str]]:
+    lines = [
+        line.strip() for line in link_args.read_text().splitlines() if line.strip()
+    ]
+    _require(bool(lines), "Cargo link arguments are empty")
+    tokens = shlex.split(lines[-1])
+    environment: dict[str, str] = {}
+    command_index = 0
+    for command_index, token in enumerate(tokens):
+        name, separator, value = token.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            break
+        environment[name] = value
+    else:
+        command_index = len(tokens)
+    _require(command_index < len(tokens), "Cargo link arguments contain no command")
+    return environment, tokens[command_index], tokens[command_index + 1 :]
+
+
 def resolve_cargo_linker(args: argparse.Namespace) -> Path:
     _require(
         args.link_args.is_absolute()
@@ -2381,15 +2477,31 @@ def resolve_cargo_linker(args: argparse.Namespace) -> Path:
         and not args.link_args.is_symlink(),
         "--link-args must be an absolute regular file",
     )
-    lines = [
-        line.strip() for line in args.link_args.read_text().splitlines() if line.strip()
-    ]
-    _require(bool(lines), "Cargo link arguments are empty")
-    tokens = shlex.split(lines[-1])
-    command = next((token for token in tokens if "=" not in token), "")
-    resolved = shutil.which(command) if command else None
-    _require(bool(resolved), "cannot resolve actual Cargo linker command")
-    driver = Path(resolved).resolve(strict=True)
+    environment, command, _ = _parse_cargo_link_argv(args.link_args)
+    command_path = Path(command)
+    if command_path.is_absolute():
+        resolved = command_path
+    else:
+        _require("/" not in command, "relative Cargo linker command is unsupported")
+        embedded_path = environment.get("PATH")
+        _require(embedded_path is not None, "Cargo link arguments lack embedded PATH")
+        search = embedded_path.split(os.pathsep)
+        _require(
+            bool(search)
+            and all(value and Path(value).is_absolute() for value in search),
+            "Cargo embedded PATH must contain only absolute directories",
+        )
+        resolved = next(
+            (
+                Path(directory) / command
+                for directory in search
+                if (Path(directory) / command).is_file()
+                and os.access(Path(directory) / command, os.X_OK)
+            ),
+            None,
+        )
+        _require(resolved is not None, "cannot resolve linker from Cargo embedded PATH")
+    driver = resolved.resolve(strict=True)
     _require(
         driver.is_file() and not driver.is_symlink() and os.access(driver, os.X_OK),
         "resolved Cargo linker is not a canonical executable",
@@ -2428,7 +2540,7 @@ def main() -> int:
     linker_execution_parser.add_argument("--linker", type=Path, required=True)
     linker_execution_parser.add_argument("--executable", type=Path, required=True)
     linker_execution_parser.add_argument(
-        "--flavor", choices=("gnu", "lld"), required=True
+        "--flavor", choices=("actual", "gnu", "lld"), required=True
     )
     linker_execution_parser.add_argument("--output", type=Path, required=True)
     cargo_parser = subparsers.add_parser("select-cargo-executable")

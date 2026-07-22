@@ -1,8 +1,11 @@
 import copy
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import runpy
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -13,6 +16,7 @@ ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "scripts" / "cache-gate-elf-layout.py"
 LAUNCHER = ROOT / "scripts" / "cache-gate.sh"
 LINK_WRAPPER = ROOT / "scripts" / "cache-gate-link-wrapper.py"
+LINK_CAPABILITY = ROOT / "scripts" / "cache-gate-linker-capability.sh"
 MAP_FIXTURES = ROOT / "tests" / "fixtures" / "cache_gate_link_maps"
 
 KERNELS = {
@@ -754,12 +758,69 @@ def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
     assert "observed linker differs" in rejected.stderr
 
 
+def test_actual_driver_execution_record_uses_forwarded_linker_version(tmp_path):
+    driver = tmp_path / "cc"
+    driver.write_text(
+        "#!/bin/sh\n"
+        "if test \"${1:-}\" = -Wl,--version; then echo 'GNU ld fixture 2.42'; fi\n"
+        "exit 0\n"
+    )
+    driver.chmod(0o755)
+    binary = tmp_path / "probe"
+    binary.write_bytes(b"ELF fixture\n")
+    trace = tmp_path / "actual-trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "driver": str(driver.resolve()),
+                "driver_sha256": digest(driver),
+                "argv": ["-o", str(binary.resolve())],
+                "cwd": str(tmp_path.resolve()),
+                "path": os.environ["PATH"],
+            }
+        )
+        + "\n"
+    )
+    output = tmp_path / "execution.json"
+
+    completed = subprocess.run(
+        [
+            str(SCRIPT),
+            "validate-linker-execution",
+            "--trace",
+            str(trace.resolve()),
+            "--linker",
+            str(driver.resolve()),
+            "--executable",
+            str(binary.resolve()),
+            "--flavor",
+            "actual",
+            "--output",
+            str(output.resolve()),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(output.read_text())["linker"] == {
+        "absolute_path": str(driver.resolve()),
+        "flavor": "GNU ld",
+        "sha256": digest(driver),
+        "version": "GNU ld fixture 2.42",
+    }
+
+
 def test_capability_probe_traces_explicit_linker_executables():
     source = (ROOT / "scripts/cache-gate-linker-capability.sh").read_text()
     assert "validate-linker-execution" in source
     assert "CACHE_GATE_LINK_TRACE" in source
     assert "CACHE_GATE_LINK_DRIVER" in source
     assert "-B" in source
+    assert (
+        'for target in elastic funnel profile; do run_shape actual "$target" '
+        '"$actual_driver" actual; done'
+    ) in source
 
 
 def test_cargo_linker_resolver_canonicalizes_path_symlink(tmp_path):
@@ -769,10 +830,18 @@ def test_cargo_linker_resolver_canonicalizes_path_symlink(tmp_path):
     path_dir = tmp_path / "path"
     path_dir.mkdir()
     (path_dir / "cc").symlink_to(real_driver)
+    ambient_dir = tmp_path / "ambient-path"
+    ambient_dir.mkdir()
+    ambient_driver = ambient_dir / "cc"
+    ambient_driver.write_text("#!/bin/sh\nexit 0\n")
+    ambient_driver.chmod(0o755)
     link_args = tmp_path / "link-args.txt"
-    link_args.write_text("cc -Wl,--gc-sections -o /tmp/probe\n")
+    link_args.write_text(
+        f'LC_ALL="C" PATH="{path_dir}" VSLANG="1033" '
+        '"cc" -Wl,--gc-sections -o /tmp/probe\n'
+    )
     env = os.environ.copy()
-    env["PATH"] = f"{path_dir}:{env['PATH']}"
+    env["PATH"] = f"{ambient_dir}:{env['PATH']}"
 
     completed = subprocess.run(
         [
@@ -789,6 +858,31 @@ def test_cargo_linker_resolver_canonicalizes_path_symlink(tmp_path):
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == str(real_driver.resolve())
     assert not Path(completed.stdout.strip()).is_symlink()
+
+
+def test_cargo_linker_resolver_rejects_bare_driver_without_embedded_path(tmp_path):
+    ambient_driver = tmp_path / "cc"
+    ambient_driver.write_text("#!/bin/sh\nexit 0\n")
+    ambient_driver.chmod(0o755)
+    link_args = tmp_path / "link-args.txt"
+    link_args.write_text("cc -Wl,--gc-sections -o /tmp/probe\n")
+    env = os.environ.copy()
+    env["PATH"] = f"{tmp_path}:{env['PATH']}"
+
+    completed = subprocess.run(
+        [
+            str(SCRIPT),
+            "resolve-cargo-linker",
+            "--link-args",
+            str(link_args.resolve()),
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode != 0
+    assert "embedded PATH" in completed.stderr
 
 
 def test_capability_producer_may_differ_from_subject_but_authenticates_root(tmp_path):
@@ -848,6 +942,172 @@ def test_capability_producer_may_differ_from_subject_but_authenticates_root(tmp_
     record["artifact_root"] = str(escaped.resolve())
     with pytest.raises(ValueError, match="artifact root is outside producer target"):
         namespace["_validate_capability_producer"](record, tools)
+
+    external_target = tmp_path / "external-producer-target"
+    (producer / "target").rename(external_target)
+    (producer / "target").symlink_to(external_target, target_is_directory=True)
+    record["artifact_root"] = str(
+        (external_target / "cache-gate-linker/aarch64/.probe.fixture").resolve()
+    )
+    with pytest.raises(ValueError, match="symlink"):
+        namespace["_validate_capability_producer"](record, tools)
+
+
+def make_capability_output_fixture(tmp_path: Path) -> tuple[Path, str, Path]:
+    repo = tmp_path / "capability-producer"
+    scripts = repo / "scripts"
+    benches = repo / "benches"
+    scripts.mkdir(parents=True)
+    benches.mkdir()
+    script = scripts / LINK_CAPABILITY.name
+    script.write_text(LINK_CAPABILITY.read_text())
+    script.chmod(0o755)
+    for target in ("elastic", "funnel", "profile"):
+        (benches / f"cache-gate-{target}-layout.ld").write_text(
+            f"/* {target} fixture */\n"
+        )
+    (repo / ".gitignore").write_text("target\n")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "capability fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    machine = subprocess.check_output(["uname", "-m"], text=True).strip()
+    arch = "aarch64" if machine in {"aarch64", "arm64"} else "x86_64"
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_cargo = fake_bin / "cargo"
+    fake_cargo.write_text("#!/bin/sh\nexit 97\n")
+    fake_cargo.chmod(0o755)
+    for name in ("realpath", "sha256sum"):
+        forged_bootstrap = fake_bin / name
+        forged_bootstrap.write_text("#!/bin/sh\nexit 98\n")
+        forged_bootstrap.chmod(0o755)
+    return repo, arch, fake_bin
+
+
+@pytest.mark.parametrize("symlink_level", ["target", "cache-gate-linker", "arch"])
+def test_capability_producer_rejects_output_ancestor_symlink_before_probe(
+    tmp_path, symlink_level
+):
+    repo, arch, fake_bin = make_capability_output_fixture(tmp_path)
+    outside = tmp_path / f"outside-{symlink_level}"
+    outside.mkdir()
+    target = repo / "target"
+    if symlink_level == "target":
+        target.symlink_to(outside, target_is_directory=True)
+    else:
+        target.mkdir()
+        linker_root = target / "cache-gate-linker"
+        if symlink_level == "cache-gate-linker":
+            linker_root.symlink_to(outside, target_is_directory=True)
+        else:
+            linker_root.mkdir()
+            (linker_root / arch).symlink_to(outside, target_is_directory=True)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    completed = subprocess.run(
+        [str(repo / "scripts/cache-gate-linker-capability.sh")],
+        cwd=repo,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 3
+    assert "symlink" in completed.stderr
+    assert not list(outside.glob(".probe.*"))
+
+
+def test_capability_producer_rejects_dangling_record_before_probe(tmp_path):
+    repo, arch, fake_bin = make_capability_output_fixture(tmp_path)
+    output = repo / f"target/cache-gate-linker/{arch}"
+    output.mkdir(parents=True)
+    (output / "capability.json").symlink_to(output / "missing-capability.json")
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    completed = subprocess.run(
+        [str(repo / "scripts/cache-gate-linker-capability.sh")],
+        cwd=repo,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 3
+    assert "capability record already exists" in completed.stderr
+    assert not list(output.glob(".probe.*"))
+
+
+def test_capability_publication_rejects_source_and_destination_symlinks(tmp_path):
+    source = LINK_CAPABILITY.read_text()
+    for required in (
+        "os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC",
+        "os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC",
+        "RENAME_NOREPLACE=1",
+        "follow_symlinks=False",
+        "source_stat.st_nlink!=1",
+        "published=False",
+        'os.unlink("capability.json",dir_fd=arch_fd)',
+    ):
+        assert required in source
+    assert source.rindex("validate_probe_root") < source.index("if ! python3 -")
+
+    probe = tmp_path / "probe"
+    outside = tmp_path / "outside"
+    output = tmp_path / "output"
+    probe.mkdir()
+    outside.mkdir()
+    output.mkdir()
+    source_path = probe / "capability.json"
+    source_path.write_text("authenticated\n")
+    destination = output / "capability.json"
+    destination.symlink_to(outside, target_is_directory=True)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    probe_fd = os.open(probe, directory_flags)
+    output_fd = os.open(output, directory_flags)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        assert (
+            renameat2(probe_fd, b"capability.json", output_fd, b"capability.json", 1)
+            == -1
+        )
+        assert ctypes.get_errno() == errno.EEXIST
+    finally:
+        os.close(output_fd)
+        os.close(probe_fd)
+    assert destination.is_symlink() and not (outside / "capability.json").exists()
+
+    source_path.unlink()
+    source_path.symlink_to(outside / "forged-capability.json")
+    with pytest.raises(FileExistsError):
+        os.open(
+            source_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
 
 
 def test_manifest_build_captures_and_authenticates_each_real_link_command():
@@ -1197,6 +1457,126 @@ def test_link_trace_replay_never_executes_recorded_linkers(tmp_path):
     namespace["replay_linker_execution"](trace, linker, binary, "gnu")
     namespace["replay_link_command"](trace, binary, linker, fragment, link_map)
     assert not marker.exists()
+
+    forged = json.loads(trace.read_text())
+    forged["driver"] = str(tmp_path / "missing" / ".." / driver.name)
+    trace.write_text(json.dumps(forged) + "\n")
+    with pytest.raises(ValueError, match="observed gnu linker differs"):
+        namespace["replay_linker_execution"](trace, linker, binary, "gnu")
+    with pytest.raises(ValueError, match="captured link driver differs"):
+        namespace["replay_link_command"](trace, binary, linker, fragment, link_map)
+
+
+def test_actual_link_trace_replay_binds_capability_driver_path_and_hash(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    driver = tmp_path / "cc"
+    driver.write_text("#!/bin/sh\nexit 0\n")
+    driver.chmod(0o755)
+    binary = tmp_path / "probe"
+    binary.write_bytes(b"ELF fixture\n")
+    trace = tmp_path / "actual-trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "driver": str(driver.resolve()),
+                "driver_sha256": digest(driver),
+                "argv": ["-o", str(binary.resolve())],
+                "cwd": str(tmp_path.resolve()),
+                "path": os.environ["PATH"],
+            }
+        )
+        + "\n"
+    )
+    linker = {
+        "absolute_path": str(driver.resolve()),
+        "sha256": digest(driver),
+        "flavor": "GNU ld",
+        "version": "GNU ld fixture",
+    }
+
+    observed = namespace["replay_linker_execution"](trace, linker, binary, "actual")
+    assert observed["linker"] == linker
+
+    wrong_driver = tmp_path / "wrong-cc"
+    wrong_driver.write_text(driver.read_text())
+    wrong_driver.chmod(0o755)
+    forged = json.loads(trace.read_text())
+    forged["driver"] = str(wrong_driver.resolve())
+    forged["driver_sha256"] = digest(wrong_driver)
+    trace.write_text(json.dumps(forged) + "\n")
+    with pytest.raises(ValueError, match="observed actual linker differs"):
+        namespace["replay_linker_execution"](trace, linker, binary, "actual")
+
+    forged["driver"] = str(tmp_path / "missing" / ".." / driver.name)
+    forged["driver_sha256"] = digest(driver)
+    trace.write_text(json.dumps(forged) + "\n")
+    with pytest.raises(ValueError, match="observed actual linker differs"):
+        namespace["replay_linker_execution"](trace, linker, binary, "actual")
+
+
+@pytest.mark.parametrize("target", ["elastic", "funnel", "profile"])
+def test_every_actual_shape_binds_printed_argv_to_observed_trace(tmp_path, target):
+    namespace = runpy.run_path(str(SCRIPT))
+    producer = tmp_path / "producer"
+    wrapper = producer / "scripts/cache-gate-link-wrapper.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n")
+    wrapper.chmod(0o755)
+    output = tmp_path / target
+    argv = ["-Wl,--gc-sections", "-o", str(output.resolve())]
+    link_argv = tmp_path / f"{target}.link-args.txt"
+    link_argv.write_text(
+        f'LC_ALL="C" PATH="/usr/bin" "{wrapper.resolve()}" '
+        + " ".join(shlex.quote(value) for value in argv)
+        + "\n"
+    )
+    observed = {"argv": argv}
+
+    namespace["_validate_actual_link_argv_trace"](
+        link_argv, observed, wrapper.resolve(), f"actual/{target}"
+    )
+
+    observed["argv"] = [*argv, "--forged"]
+    with pytest.raises(ValueError, match="link argv differs from execution trace"):
+        namespace["_validate_actual_link_argv_trace"](
+            link_argv, observed, wrapper.resolve(), f"actual/{target}"
+        )
+
+    observed["argv"] = argv
+    forged_wrapper = producer / "missing" / ".." / "scripts/cache-gate-link-wrapper.py"
+    link_argv.write_text(
+        f'LC_ALL="C" PATH="/usr/bin" "{forged_wrapper}" '
+        + " ".join(shlex.quote(value) for value in argv)
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="did not execute reviewed wrapper"):
+        namespace["_validate_actual_link_argv_trace"](
+            link_argv, observed, wrapper.resolve(), f"actual/{target}"
+        )
+
+
+def test_inline_capability_consumer_requires_exact_actual_wrapper_path():
+    source = LAUNCHER.read_text()
+    assert "Path(tokens[command_index])!=expected_wrapper" in source
+    assert "Path(tokens[command_index]).resolve()!=expected_wrapper" not in source
+
+
+def test_launcher_rejects_capability_input_symlink_ancestry_before_read():
+    source = LAUNCHER.read_text()
+    shell_guard = (
+        "[[ -f $CACHE_GATE_LINKER_CAPABILITY && ! -L $CACHE_GATE_LINKER_CAPABILITY ]]"
+    )
+    assert shell_guard in source
+    python_start = source.index("CACHE_GATE_LINK_DRIVER=$(python3 -")
+    python_end = source.index("\nPY\n", python_start)
+    validator = source[python_start:python_end]
+    path_setup = validator.index("capability_path=Path(sys.argv[1])")
+    ancestry_walk = validator.index("for component in capability_path.parents")
+    canonical_check = validator.index(
+        "capability_path!=capability_path.resolve(strict=True)"
+    )
+    first_read = validator.index("capability=json.load")
+    assert path_setup < ancestry_walk < canonical_check < first_read
 
 
 def test_stable_launcher_rejects_corrupt_manifest_before_execution(tmp_path):
