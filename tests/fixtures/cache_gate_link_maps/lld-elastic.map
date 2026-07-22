@@ -1,0 +1,16 @@
+             VMA              LMA     Size Align Out     In      Symbol
+           20000            20000    10000     4 .opthash.cache_gate.elastic.insert
+           20000            20000        0     1         __opthash_cache_gate_elastic_insert_reservation_start = .
+           20000            20000       20     4         /captured/lld/elastic.fixture.rcgu.o:(.text.opthash.cache_gate.elastic.insert)
+           20000            20000       20     1                 elastic::elastic_cache_gate_insert_kernel::hfixture
+           20020            20020        0     1         __opthash_cache_gate_elastic_insert_body_end = .
+           20020            20020     ffe0     1         . = __opthash_cache_gate_elastic_insert_reservation_start + CONSTANT(MAXPAGESIZE)
+           30000            30000        0     1         __opthash_cache_gate_elastic_insert_reservation_end = .
+           30000            30000    10000     4 .opthash.cache_gate.elastic.get
+           30000            30000        0     1         __opthash_cache_gate_elastic_get_reservation_start = .
+           30000            30000       20     4         /captured/lld/elastic.fixture.rcgu.o:(.text.opthash.cache_gate.elastic.get)
+           30000            30000       20     1                 elastic::elastic_cache_gate_get_kernel::hfixture
+           30020            30020        0     1         __opthash_cache_gate_elastic_get_body_end = .
+           30020            30020     ffe0     1         . = __opthash_cache_gate_elastic_get_reservation_start + CONSTANT(MAXPAGESIZE)
+           40000            40000        0     1         __opthash_cache_gate_elastic_get_reservation_end = .
+           40000            40000       40     4 .text

@@ -1,0 +1,12 @@
+SECTIONS
+{
+  .opthash.cache_gate.profile.elastic.insert ALIGN(CONSTANT(MAXPAGESIZE)) :
+  { __opthash_cache_gate_profile_elastic_insert_reservation_start = .; KEEP(*(.text.opthash.cache_gate.profile.elastic.insert)) __opthash_cache_gate_profile_elastic_insert_body_end = .; ASSERT((__opthash_cache_gate_profile_elastic_insert_body_end - __opthash_cache_gate_profile_elastic_insert_reservation_start) <= CONSTANT(MAXPAGESIZE), "profile elastic insert reservation overflow"); . = __opthash_cache_gate_profile_elastic_insert_reservation_start + CONSTANT(MAXPAGESIZE); __opthash_cache_gate_profile_elastic_insert_reservation_end = .; }
+  .opthash.cache_gate.profile.elastic.get ALIGN(CONSTANT(MAXPAGESIZE)) :
+  { __opthash_cache_gate_profile_elastic_get_reservation_start = .; KEEP(*(.text.opthash.cache_gate.profile.elastic.get)) __opthash_cache_gate_profile_elastic_get_body_end = .; ASSERT((__opthash_cache_gate_profile_elastic_get_body_end - __opthash_cache_gate_profile_elastic_get_reservation_start) <= CONSTANT(MAXPAGESIZE), "profile elastic get reservation overflow"); . = __opthash_cache_gate_profile_elastic_get_reservation_start + CONSTANT(MAXPAGESIZE); __opthash_cache_gate_profile_elastic_get_reservation_end = .; }
+  .opthash.cache_gate.profile.funnel.insert ALIGN(CONSTANT(MAXPAGESIZE)) :
+  { __opthash_cache_gate_profile_funnel_insert_reservation_start = .; KEEP(*(.text.opthash.cache_gate.profile.funnel.insert)) __opthash_cache_gate_profile_funnel_insert_body_end = .; ASSERT((__opthash_cache_gate_profile_funnel_insert_body_end - __opthash_cache_gate_profile_funnel_insert_reservation_start) <= CONSTANT(MAXPAGESIZE), "profile funnel insert reservation overflow"); . = __opthash_cache_gate_profile_funnel_insert_reservation_start + CONSTANT(MAXPAGESIZE); __opthash_cache_gate_profile_funnel_insert_reservation_end = .; }
+  .opthash.cache_gate.profile.funnel.get ALIGN(CONSTANT(MAXPAGESIZE)) :
+  { __opthash_cache_gate_profile_funnel_get_reservation_start = .; KEEP(*(.text.opthash.cache_gate.profile.funnel.get)) __opthash_cache_gate_profile_funnel_get_body_end = .; ASSERT((__opthash_cache_gate_profile_funnel_get_body_end - __opthash_cache_gate_profile_funnel_get_reservation_start) <= CONSTANT(MAXPAGESIZE), "profile funnel get reservation overflow"); . = __opthash_cache_gate_profile_funnel_get_reservation_start + CONSTANT(MAXPAGESIZE); __opthash_cache_gate_profile_funnel_get_reservation_end = .; }
+}
+INSERT BEFORE .text;

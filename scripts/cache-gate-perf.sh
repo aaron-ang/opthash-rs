@@ -3,29 +3,36 @@
 
 set -euo pipefail
 
-REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
-cd "$REPO_ROOT"
 manifest=
 operation=
 iterations=
 repetition=
+runner_root=
 original_command=$(printf '%q ' "$0" "$@")
 while (($#)); do
 	case "$1" in
-	--manifest | --operation | --iterations | --repetition)
+	--runner-root | --manifest | --operation | --iterations | --repetition)
 		(($# >= 2)) || { echo "error: missing value for $1" >&2; exit 2; }
 		name=${1#--}; printf -v "$name" '%s' "$2"; shift 2
 		;;
 	*) echo "error: unsupported argument: $1" >&2; exit 2 ;;
 	esac
 done
-for name in manifest operation iterations repetition; do
-	[[ -n ${!name} ]] || { echo "error: --$name is required" >&2; exit 2; }
+for name in runner_root manifest operation iterations repetition; do
+	[[ -n ${!name} ]] || { echo "error: --${name//_/-} is required" >&2; exit 2; }
 done
+[[ $runner_root == /* ]] || { echo "error: runner root must be absolute" >&2; exit 2; }
+runner_root=$(realpath -e -- "$runner_root")
+REPO_ROOT=$(git -C "$runner_root" rev-parse --show-toplevel 2>/dev/null) || { echo "error: runner root is not a Git worktree" >&2; exit 2; }
+REPO_ROOT=$(realpath -e -- "$REPO_ROOT")
+[[ $REPO_ROOT == "$runner_root" ]] || { echo "error: runner root must be exact Git worktree top level" >&2; exit 2; }
+cd "$REPO_ROOT"
 case "$operation" in elastic-insert | elastic-get | funnel-insert | funnel-get) ;; *) echo "error: unsupported operation: $operation" >&2; exit 2 ;; esac
 [[ $iterations =~ ^[1-9][0-9]*$ ]] || { echo "error: --iterations must be positive" >&2; exit 2; }
 [[ $repetition =~ ^[123]$ ]] || { echo "error: --repetition must be 1, 2, or 3" >&2; exit 2; }
 [[ -n ${CACHE_GATE_CAMPAIGN_ROOT:-} && $CACHE_GATE_CAMPAIGN_ROOT == /* ]] || { echo "error: absolute CACHE_GATE_CAMPAIGN_ROOT is required" >&2; exit 2; }
+CACHE_GATE_CAMPAIGN_ROOT=$(realpath -m -- "$CACHE_GATE_CAMPAIGN_ROOT")
+[[ $CACHE_GATE_CAMPAIGN_ROOT == "$REPO_ROOT/target" || $CACHE_GATE_CAMPAIGN_ROOT == "$REPO_ROOT/target/"* ]] || { echo "error: CACHE_GATE_CAMPAIGN_ROOT must stay below runner root target" >&2; exit 2; }
 [[ -n ${CACHE_GATE_CAMPAIGN_KEY:-} ]] || { echo "error: CACHE_GATE_CAMPAIGN_KEY is required" >&2; exit 2; }
 [[ -n ${CACHE_GATE_PERF_BIN:-} && $CACHE_GATE_PERF_BIN == /* ]] || { echo "error: absolute CACHE_GATE_PERF_BIN is required" >&2; exit 2; }
 [[ $manifest == /* ]] || { echo "error: --manifest must be absolute" >&2; exit 2; }
@@ -89,12 +96,15 @@ if [[ $EUID -eq 0 ]]; then
 elif command -v chrt >/dev/null 2>&1; then
 	launcher=(chrt -b 0)
 fi
-readarray -t metadata < <(python3 - "$manifest" <<'PY'
+readarray -t metadata < <(python3 - "$manifest" "$REPO_ROOT" "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" <<'PY'
 import json
 import sys
+from pathlib import Path
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     data = json.load(stream)
+if Path(data.get("runner_root", "")).resolve()!=Path(sys.argv[2]) or data.get("commit")!=sys.argv[3] or data.get("tree")!=sys.argv[4]:
+    raise SystemExit("error: profile manifest runner root/HEAD/tree mismatch")
 profile = data["executables"]["cache_gate_profile"]
 print(profile["absolute_path"])
 print(profile["sha256"])
@@ -193,15 +203,18 @@ observed_pmu=$("$REPO_ROOT/scripts/cache-gate-perf-support.py" validate-csv \
 	--path "$raw_csv" --expected-pmu "$expected_pmu")
 
 rm -f "$ready_fifo" "$go_fifo" "$control_fifo" "$ack_fifo"
-python3 - "$temporary/run-manifest.json" "$manifest" "$operation" "$iterations" "$repetition" "$profile_status" "$perf_status" "$actual_hash" "$original_command" "${metadata[4]}" "$recorded_profile_pid" "$recorded_profile_monitor_pid" "$CORE" "$numa_node" "$observed_pmu" "$contract" "$CACHE_GATE_CAMPAIGN_ROOT" "$CACHE_GATE_CAMPAIGN_KEY" <<'PY'
+python3 - "$temporary/run-manifest.json" "$manifest" "$operation" "$iterations" "$repetition" "$profile_status" "$perf_status" "$actual_hash" "$original_command" "${metadata[4]}" "$recorded_profile_pid" "$recorded_profile_monitor_pid" "$CORE" "$numa_node" "$observed_pmu" "$contract" "$CACHE_GATE_CAMPAIGN_ROOT" "$CACHE_GATE_CAMPAIGN_KEY" "$REPO_ROOT" "$(git rev-parse 'HEAD^{tree}')" <<'PY'
 import json
 import platform
 import sys
 
-output, manifest, operation, iterations, repetition, profile_status, perf_status, binary_hash, command, commit, profile_pid, profile_monitor_pid, core, numa_node, pmu, contract, campaign_root, campaign_key = sys.argv[1:]
+output, manifest, operation, iterations, repetition, profile_status, perf_status, binary_hash, command, commit, profile_pid, profile_monitor_pid, core, numa_node, pmu, contract, campaign_root, campaign_key, runner_root, runner_tree = sys.argv[1:]
 payload = {
     "build_manifest": manifest,
     "commit": commit,
+    "tree": runner_tree,
+    "runner_root": runner_root,
+    "mode": "PROFILE",
     "operation": operation,
     "iterations": int(iterations),
     "exact_operations": int(iterations) * (100_000 if operation.endswith("-insert") else 1),

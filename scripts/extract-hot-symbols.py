@@ -18,7 +18,7 @@ NM_LINE = re.compile(
 )
 NM_NO_SIZE_LINE = re.compile(r"^(?P<start>[0-9A-Fa-f]+)\s+(?P<kind>\S)\s+(?P<name>.+)$")
 SECTION_LINE = re.compile(
-    r"^\s*\d+\s+(?P<name>\S+)\s+(?P<size>[0-9A-Fa-f]+)\s+"
+    r"^\s*(?P<index>\d+)\s+(?P<name>\S+)\s+(?P<size>[0-9A-Fa-f]+)\s+"
     r"(?P<vma>[0-9A-Fa-f]+)\s+[0-9A-Fa-f]+\s+"
     r"(?P<offset>[0-9A-Fa-f]+)\s+2\*\*(?P<align>\d+)\s*$"
 )
@@ -114,6 +114,13 @@ def validate_non_overlapping(symbols: list[dict[str, Any]]) -> None:
             raise ValueError(
                 f"symbol ranges overlap: {left['name']} and {right['name']}"
             )
+
+
+def inventory_linker_generated_symbols(
+    symbols: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    marker = re.compile(r"(?:veneer|thunk)", re.IGNORECASE)
+    return [dict(symbol) for symbol in symbols if marker.search(symbol["name"])]
 
 
 def _normalize_relocation_target(target: str) -> str:
@@ -465,6 +472,10 @@ def parse_sections(text: str) -> list[dict[str, Any]]:
             continue
         sections.append(
             {
+                # GNU objdump numbers displayed sections from zero because it
+                # omits ELF's null section. Record the real ELF shndx used by
+                # readelf and the symbol table.
+                "index": int(match.group("index")) + 1,
                 "name": match.group("name"),
                 "size": int(match.group("size"), 16),
                 "vma": int(match.group("vma"), 16),
@@ -540,14 +551,15 @@ def extract(binary: Path, arch: str, patterns: list[str]) -> dict[str, Any]:
             ]
         )
         normalized = normalize_objdump(dump, arch)
-        alignment = symbol["start"] & -symbol["start"] if symbol["start"] else 1
         extracted.append(
             {
                 **symbol,
                 "section": section["name"],
+                "section_index": section["index"],
+                "section_name": section["name"],
+                "section_alignment": section["alignment"],
                 "file_offset": file_offset,
                 "page_offset": symbol["start"] % 4096,
-                "declared_alignment": min(alignment, section["alignment"]),
                 "raw_sha256": sha256_bytes(raw),
                 "normalized_instructions_sha256": normalized["hash"],
                 "normalized_instructions": normalized["instructions"],
@@ -561,6 +573,7 @@ def extract(binary: Path, arch: str, patterns: list[str]) -> dict[str, Any]:
         "binary": str(binary),
         "binary_sha256": sha256_bytes(binary_bytes),
         "architecture": arch,
+        "linker_generated_veneer_thunks": inventory_linker_generated_symbols(symbols),
         "symbols": extracted,
     }
 

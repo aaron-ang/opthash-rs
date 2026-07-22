@@ -1,0 +1,26 @@
+[package]
+name = "opthash-cache-gate-link-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "elastic"
+path = "src/main.rs"
+
+[[bin]]
+name = "funnel"
+path = "src/main.rs"
+
+[[bin]]
+name = "profile"
+path = "src/main.rs"
+
+[workspace]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(cache_gate_probe_elastic)",
+    "cfg(cache_gate_probe_funnel)",
+    "cfg(cache_gate_probe_profile)",
+] }

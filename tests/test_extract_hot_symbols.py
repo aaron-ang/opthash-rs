@@ -278,3 +278,32 @@ def test_direct_and_indirect_calls_are_separate(arch, snippet, direct, indirect)
     normalized = extractor.normalize_objdump(snippet, arch)
     assert normalized["direct_calls"] == direct
     assert normalized["indirect_calls"] == indirect
+
+
+def test_section_parser_records_index_name_and_actual_alignment():
+    sections = extractor.parse_sections(
+        "  3 .text.kernel  00000020  0000000000001000  0000000000001000  00001000  2**12\n"
+    )
+    assert sections == [
+        {
+            "index": 4,
+            "name": ".text.kernel",
+            "size": 0x20,
+            "vma": 0x1000,
+            "file_offset": 0x1000,
+            "alignment": 4096,
+        }
+    ]
+
+
+def test_linker_generated_veneer_and_thunk_inventory_is_explicit():
+    symbols = extractor.parse_nm(
+        "0000000000001000 0000000000000010 t crate::kernel\n"
+        "0000000000002000 0000000000000008 t __AArch64AbsLongThunk_target\n"
+        "0000000000003000 0000000000000008 t helper.veneer\n"
+    )
+    inventory = extractor.inventory_linker_generated_symbols(symbols)
+    assert [item["name"] for item in inventory] == [
+        "__AArch64AbsLongThunk_target",
+        "helper.veneer",
+    ]

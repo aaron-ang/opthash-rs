@@ -1,5 +1,7 @@
+import copy
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -8,6 +10,8 @@ import pytest
 
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "scripts" / "snapshot-criterion-pair.sh"
+LAUNCHER = ROOT / "scripts" / "cache-gate.sh"
+PERF_LAUNCHER = ROOT / "scripts" / "cache-gate-perf.sh"
 CONTROL_IDS = (
     "cache_gate_insert/cache_gate_insert_std",
     "cache_gate_insert/cache_gate_insert_hashbrown",
@@ -27,6 +31,13 @@ def write(path: Path, text: str) -> Path:
 def make_fixture(
     tmp_path: Path, *, omit_change: bool = False, preexisting_changes: bool = False
 ):
+    tmp_path = (
+        ROOT
+        / "target"
+        / "cache-gate-test-fixtures"
+        / f"{tmp_path.parent.name}-{tmp_path.name}"
+    )
+    tmp_path.mkdir(parents=True, exist_ok=False)
     criterion = tmp_path / "criterion"
     snapshot = tmp_path / "snapshots"
     anchor_run = "anchor-run"
@@ -91,10 +102,34 @@ def make_fixture(
         tmp_path / "control.provenance.json", json.dumps(provenance) + "\n"
     )
 
+    executable_ids = {
+        "elastic_cache_gate": (
+            "cache_gate_insert/cache_gate_insert_elastic",
+            "cache_gate_get_hit_elastic",
+        ),
+        "funnel_cache_gate": (
+            "cache_gate_insert/cache_gate_insert_funnel",
+            "cache_gate_get_hit_funnel",
+        ),
+        "cache_gate_profile": (),
+    }
     executables = {}
     symbols = {}
     for name in ("elastic_cache_gate", "funnel_cache_gate", "cache_gate_profile"):
-        executable = write(tmp_path / name, f"binary {name}\n")
+        invocation_path = tmp_path / f"{name}.invocation"
+        executable_lines = [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            f"printf '%s\\n' \"$*\" > {invocation_path}",
+        ]
+        for benchmark in executable_ids[name]:
+            output = criterion / benchmark / "change" / "estimates.json"
+            executable_lines += [
+                f"mkdir -p {output.parent}",
+                f"printf '{{\"fresh\":true}}\\n' > {output}",
+            ]
+        executable = write(tmp_path / name, "\n".join(executable_lines) + "\n")
+        executable.chmod(0o755)
         link_map = write(tmp_path / f"{name}.map", f"map {name}\n")
         executables[name] = {
             "absolute_path": str(executable),
@@ -140,16 +175,52 @@ def make_fixture(
         "commit": commit,
         "tree": tree,
         "architecture": "aarch64",
+        "runner_root": str(ROOT.resolve()),
         "empty_diff_assertion": True,
         "control": control_record,
         "executables": executables,
         "symbols": symbols,
+        "tools": {
+            "snapshot": {
+                "absolute_path": str(SCRIPT.resolve()),
+                "sha256": digest(SCRIPT),
+            },
+            "launcher": {
+                "absolute_path": str(LAUNCHER.resolve()),
+                "sha256": digest(LAUNCHER),
+            },
+            "perf": {
+                "absolute_path": str(PERF_LAUNCHER.resolve()),
+                "sha256": digest(PERF_LAUNCHER),
+            },
+            "elf_layout": {
+                "absolute_path": str(
+                    (ROOT / "scripts/cache-gate-elf-layout.py").resolve()
+                ),
+                "sha256": digest(ROOT / "scripts/cache-gate-elf-layout.py"),
+            },
+            "link_wrapper": {
+                "absolute_path": str(
+                    (ROOT / "scripts/cache-gate-link-wrapper.py").resolve()
+                ),
+                "sha256": digest(ROOT / "scripts/cache-gate-link-wrapper.py"),
+            },
+        },
     }
     anchor_manifest = write(
         tmp_path / "anchor-manifest.json", json.dumps(manifest) + "\n"
     )
+    candidate = copy.deepcopy(manifest)
+    for name in executable_ids:
+        original = Path(candidate["executables"][name]["absolute_path"])
+        candidate_binary = write(tmp_path / f"candidate-{name}", original.read_text())
+        candidate_binary.chmod(0o755)
+        candidate["executables"][name]["absolute_path"] = str(candidate_binary)
+        candidate["executables"][name]["sha256"] = digest(candidate_binary)
+        candidate["symbols"][name]["binary"] = str(candidate_binary)
+        candidate["symbols"][name]["binary_sha256"] = digest(candidate_binary)
     candidate_manifest = write(
-        tmp_path / "candidate-manifest.json", json.dumps(manifest) + "\n"
+        tmp_path / "candidate-manifest.json", json.dumps(candidate) + "\n"
     )
     return {
         "criterion": criterion,
@@ -160,13 +231,18 @@ def make_fixture(
         "anchor_manifest": anchor_manifest,
         "candidate_manifest": candidate_manifest,
         "invocation": invocation,
+        "candidate_elastic": Path(
+            candidate["executables"]["elastic_cache_gate"]["absolute_path"]
+        ),
+        "elastic_invocation": tmp_path / "elastic_cache_gate.invocation",
     }
 
 
 def command(fixture, **overrides):
     values = {
+        "runner-root": ROOT,
         "criterion-root": fixture["criterion"],
-        "snapshot-root": fixture["snapshot"],
+        "snapshot-root": fixture["snapshot"].relative_to(ROOT),
         "arch": "aarch64",
         "comparison": "fixture-comparison",
         "pair": "1",
@@ -277,3 +353,108 @@ def test_snapshot_rejects_different_control_provenance(tmp_path):
     )
     assert completed.returncode != 0
     assert "control provenance differs" in completed.stderr
+
+
+def test_stable_snapshot_executes_exact_candidate_binary_without_cargo(tmp_path):
+    fixture = make_fixture(tmp_path)
+    for benchmark in (
+        "cache_gate_insert/cache_gate_insert_elastic",
+        "cache_gate_get_hit_elastic",
+    ):
+        write(
+            fixture["criterion"] / benchmark / fixture["anchor_run"] / "estimates.json",
+            '{"run":"anchor"}\n',
+        )
+        write(
+            fixture["criterion"]
+            / benchmark
+            / fixture["candidate_run"]
+            / "estimates.json",
+            '{"run":"candidate"}\n',
+        )
+    completed = subprocess.run(
+        command(fixture, target="elastic_cache_gate"),
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    destination = fixture["snapshot"] / "aarch64/fixture-comparison/pair-1"
+    pair = json.loads((destination / "pair-manifest.json").read_text())
+    assert Path(pair["comparison_command"][0]) == fixture["candidate_elastic"]
+    assert "cargo" not in " ".join(pair["comparison_command"])
+    assert pair["offline_execution_count"] == 1
+    assert pair["runner_root"] == str(ROOT.resolve())
+
+
+def test_stable_snapshot_refuses_candidate_binary_hash_mismatch(tmp_path):
+    fixture = make_fixture(tmp_path)
+    fixture["candidate_elastic"].write_text("tampered\n")
+    completed = subprocess.run(
+        command(fixture, target="elastic_cache_gate"),
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode != 0
+    assert "hash mismatch" in completed.stderr
+
+
+def launcher_env(**values):
+    env = os.environ.copy()
+    env.update({name: str(value) for name, value in values.items()})
+    return env
+
+
+@pytest.mark.parametrize("script", [LAUNCHER, PERF_LAUNCHER])
+def test_launchers_reject_omitted_runner_root(tmp_path, script):
+    completed = subprocess.run(
+        [str(script)],
+        cwd=tmp_path,
+        env=launcher_env(ELASTIC=1),
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode != 0
+    assert "--runner-root" in completed.stderr
+
+
+@pytest.mark.parametrize("runner_root", ["relative", "/tmp"])
+def test_cache_gate_rejects_nonabsolute_or_nonworktree_runner_root(
+    tmp_path, runner_root
+):
+    completed = subprocess.run(
+        [str(LAUNCHER), "--runner-root", runner_root],
+        cwd=tmp_path,
+        env=launcher_env(ELASTIC=1),
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode != 0
+    assert "runner root" in completed.stderr.lower()
+
+
+def test_cache_gate_resolves_runner_root_symlink_before_manifest_check(tmp_path):
+    link = tmp_path / "runner"
+    link.symlink_to(ROOT, target_is_directory=True)
+    completed = subprocess.run(
+        [str(LAUNCHER), "--runner-root", str(link)],
+        env=launcher_env(ELASTIC=1),
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode != 0
+    assert "CACHE_GATE_MANIFEST" in completed.stderr
+    assert "runner root" not in completed.stderr.lower()
+
+
+@pytest.mark.parametrize("mode", ["ELASTIC", "FUNNEL"])
+def test_stable_launcher_requires_cache_gate_manifest(mode):
+    completed = subprocess.run(
+        [str(LAUNCHER), "--runner-root", str(ROOT)],
+        env=launcher_env(**{mode: 1}),
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode != 0
+    assert "CACHE_GATE_MANIFEST" in completed.stderr

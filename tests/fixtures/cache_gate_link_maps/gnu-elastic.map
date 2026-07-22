@@ -1,0 +1,23 @@
+.opthash.cache_gate.elastic.insert
+                0x0000000000010000    0x10000
+                0x0000000000010000                __opthash_cache_gate_elastic_insert_reservation_start = .
+ *(.text.opthash.cache_gate.elastic.insert)
+ .text.opthash.cache_gate.elastic.insert
+                0x0000000000010000       0x20 /captured/gnu/elastic.fixture.rcgu.o
+                0x0000000000010020                __opthash_cache_gate_elastic_insert_body_end = .
+                0x0000000000020000                . = (__opthash_cache_gate_elastic_insert_reservation_start + CONSTANT (MAXPAGESIZE))
+ *fill*         0x0000000000010020     0xffe0
+                0x0000000000020000                __opthash_cache_gate_elastic_insert_reservation_end = .
+
+.opthash.cache_gate.elastic.get
+                0x0000000000020000    0x10000
+                0x0000000000020000                __opthash_cache_gate_elastic_get_reservation_start = .
+ *(.text.opthash.cache_gate.elastic.get)
+ .text.opthash.cache_gate.elastic.get
+                0x0000000000020000       0x20 /captured/gnu/elastic.fixture.rcgu.o
+                0x0000000000020020                __opthash_cache_gate_elastic_get_body_end = .
+                0x0000000000030000                . = (__opthash_cache_gate_elastic_get_reservation_start + CONSTANT (MAXPAGESIZE))
+ *fill*         0x0000000000020020     0xffe0
+                0x0000000000030000                __opthash_cache_gate_elastic_get_reservation_end = .
+
+.text           0x0000000000030000       0x40

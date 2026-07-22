@@ -5,6 +5,14 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
+include!("../tests/fixtures/cache_gate_layout_adversary.rs");
+
+// SAFETY: Linux cache-gate links this function through the checked RX-only
+// target-specific augmentation and validates the final ELF.
+#[cfg_attr(
+    target_os = "linux",
+    unsafe(link_section = ".text.opthash.cache_gate.elastic.insert")
+)]
 #[inline(never)]
 fn elastic_cache_gate_insert_kernel(
     map: &mut harness::ElasticHashMap<u64, u64>,
@@ -17,12 +25,19 @@ fn elastic_cache_gate_insert_kernel(
     start.elapsed()
 }
 
+// SAFETY: Linux cache-gate links this function through the checked RX-only
+// target-specific augmentation and validates the final ELF.
+#[cfg_attr(
+    target_os = "linux",
+    unsafe(link_section = ".text.opthash.cache_gate.elastic.get")
+)]
 #[inline(never)]
 fn elastic_cache_gate_get_kernel(map: &harness::ElasticHashMap<u64, u64>, key: u64) -> Option<u64> {
     map.get(black_box(&key)).copied()
 }
 
 fn cache_gate_insert(c: &mut Criterion) {
+    exercise_cache_gate_layout_adversary();
     let pairs = harness::cache_gate_pairs();
     let mut map = harness::elastic_cache_gate_map();
     harness::validate_cache_gate_fill(&mut map, &pairs);

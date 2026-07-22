@@ -5,6 +5,8 @@ use std::hint::black_box;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
+include!("../tests/fixtures/cache_gate_layout_adversary.rs");
+
 #[derive(Clone, Copy)]
 enum Operation {
     ElasticInsert,
@@ -126,6 +128,12 @@ impl Gate {
     }
 }
 
+// SAFETY: Linux cache-gate links this function through the checked RX-only
+// target-specific augmentation and validates the final ELF.
+#[cfg_attr(
+    target_os = "linux",
+    unsafe(link_section = ".text.opthash.cache_gate.profile.elastic.insert")
+)]
 #[inline(never)]
 fn elastic_profile_insert_kernel(
     maps: &mut [harness::ElasticHashMap<u64, u64>],
@@ -138,6 +146,12 @@ fn elastic_profile_insert_kernel(
     }
 }
 
+// SAFETY: Linux cache-gate links this function through the checked RX-only
+// target-specific augmentation and validates the final ELF.
+#[cfg_attr(
+    target_os = "linux",
+    unsafe(link_section = ".text.opthash.cache_gate.profile.elastic.get")
+)]
 #[inline(never)]
 fn elastic_profile_get_kernel(
     map: &harness::ElasticHashMap<u64, u64>,
@@ -151,6 +165,12 @@ fn elastic_profile_get_kernel(
     checksum
 }
 
+// SAFETY: Linux cache-gate links this function through the checked RX-only
+// target-specific augmentation and validates the final ELF.
+#[cfg_attr(
+    target_os = "linux",
+    unsafe(link_section = ".text.opthash.cache_gate.profile.funnel.insert")
+)]
 #[inline(never)]
 fn funnel_profile_insert_kernel(
     maps: &mut [harness::FunnelHashMap<u64, u64>],
@@ -191,6 +211,12 @@ fn empty_funnel_maps(
         .collect()
 }
 
+// SAFETY: Linux cache-gate links this function through the checked RX-only
+// target-specific augmentation and validates the final ELF.
+#[cfg_attr(
+    target_os = "linux",
+    unsafe(link_section = ".text.opthash.cache_gate.profile.funnel.get")
+)]
 #[inline(never)]
 fn funnel_profile_get_kernel(
     map: &harness::FunnelHashMap<u64, u64>,
@@ -205,6 +231,7 @@ fn funnel_profile_get_kernel(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    exercise_cache_gate_layout_adversary();
     let arguments = parse_arguments().map_err(|error| format!("error: {error}"))?;
     let pairs = harness::cache_gate_pairs();
     match arguments.operation {
