@@ -88,6 +88,43 @@ KERNELS = {
     },
 }
 
+
+def make_ubuntu_lld_multicall_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+    compiler = Path("/usr/bin/cc")
+    if not compiler.is_file():
+        pytest.skip("native C compiler is required for the multicall fixture")
+    extraction_root = tmp_path / "ubuntu-noble-lld18-arm64/root"
+    binary_dir = extraction_root / "usr/bin"
+    llvm_dir = extraction_root / "usr/lib/llvm-18/bin"
+    binary_dir.mkdir(parents=True)
+    llvm_dir.mkdir(parents=True)
+    source = tmp_path / "multicall-lld.c"
+    source.write_text(
+        "#include <stdio.h>\n"
+        "#include <string.h>\n"
+        "int main(int argc, char **argv) {\n"
+        "  const char *slash = strrchr(argv[0], '/');\n"
+        "  const char *name = slash ? slash + 1 : argv[0];\n"
+        '  if (strcmp(name, "ld.lld") != 0) {\n'
+        '    fputs("lld is a generic driver\\n", stderr);\n'
+        "    return 1;\n"
+        "  }\n"
+        '  if (argc == 2 && strcmp(argv[1], "--version") == 0) {\n'
+        '    puts("Ubuntu LLD 18.1.3 (compatible with GNU linkers)");\n'
+        "    return 0;\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n"
+    )
+    payload = llvm_dir / "lld"
+    subprocess.run([str(compiler), str(source), "-o", str(payload)], check=True)
+    (llvm_dir / "ld.lld").symlink_to("lld")
+    (binary_dir / "ld.lld-18").symlink_to("../lib/llvm-18/bin/ld.lld")
+    invocation = binary_dir / "ld.lld"
+    invocation.symlink_to("ld.lld-18")
+    return invocation, payload, extraction_root
+
+
 TARGET_KERNELS = {
     "elastic": tuple(
         name for name, spec in KERNELS.items() if spec["target"] == "elastic"
@@ -104,6 +141,44 @@ assert tuple(map(len, TARGET_KERNELS.values())) == (2, 2, 4)
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def linker_identity(
+    path: Path,
+    flavor: str,
+    version: str,
+    *,
+    actual: bool = False,
+    argv0: str | None = None,
+) -> dict:
+    payload = path.resolve()
+    return {
+        "invocation_path": str(payload),
+        "invocation_chain": [{"absolute_path": str(payload), "symlink_target": None}],
+        "payload_path": str(payload),
+        "payload_sha256": digest(payload),
+        "argv0": (
+            argv0
+            if argv0 is not None
+            else "ld.lld"
+            if flavor == "LLD" and not actual
+            else str(payload)
+        ),
+        "extraction_root": None,
+        "flavor": flavor,
+        "version_argument": "-Wl,--version" if actual else "--version",
+        "version": version,
+    }
+
+
+def linker_trace_identity(record: dict) -> dict[str, str]:
+    return {
+        "payload_path": record["payload_path"],
+        "payload_sha256": record["payload_sha256"],
+        "argv0": record["argv0"],
+        "cwd": str(Path.cwd().resolve()),
+        "path": os.environ["PATH"],
+    }
 
 
 def make_cargo_output_pair(tmp_path: Path, target: str = "probe") -> tuple[Path, Path]:
@@ -600,25 +675,14 @@ def test_validate_link_command_binds_real_driver_and_final_output(tmp_path):
     second_object.write_bytes(b"object two\n")
     archive = tmp_path / "libfixture.rlib"
     archive.write_bytes(b"archive\n")
+    linker = linker_identity(driver, "GNU ld", "GNU ld fixture 1.0", actual=True)
     capability = tmp_path / "capability.json"
-    capability.write_text(
-        json.dumps(
-            {
-                "linker": {
-                    "absolute_path": str(driver.resolve()),
-                    "sha256": digest(driver),
-                    "flavor": "GNU ld",
-                    "version": "GNU ld fixture 1.0",
-                }
-            }
-        )
-    )
+    capability.write_text(json.dumps({"linker": linker}))
     trace = tmp_path / "trace.jsonl"
     trace.write_text(
         json.dumps(
             {
-                "driver": str(driver.resolve()),
-                "driver_sha256": digest(driver),
+                **linker_trace_identity(linker),
                 "argv": [
                     str(first_object.resolve()),
                     str(second_object.resolve()),
@@ -654,7 +718,7 @@ def test_validate_link_command_binds_real_driver_and_final_output(tmp_path):
     accepted = subprocess.run(command, text=True, capture_output=True)
     assert accepted.returncode == 0, accepted.stderr
     record = json.loads(output.read_text())
-    assert record["driver"]["absolute_path"] == str(driver.resolve())
+    assert record["driver"]["payload_path"] == str(driver.resolve())
     assert record["ordered_linker_inputs"] == [
         first_object.name,
         second_object.name,
@@ -709,25 +773,199 @@ def test_main_link_replay_rejects_hidden_or_conflicting_controls(tmp_path, attac
     else:
         argv.extend(("-Xlinker", f"@{response}"))
     trace = tmp_path / "trace.jsonl"
+    linker = linker_identity(driver, "GNU ld", "GNU ld fixture", actual=True)
     trace.write_text(
         json.dumps(
             {
-                "driver": str(driver.resolve()),
-                "driver_sha256": digest(driver),
+                **linker_trace_identity(linker),
                 "argv": argv,
             }
         )
         + "\n"
     )
-    linker = {
-        "absolute_path": str(driver.resolve()),
-        "sha256": digest(driver),
-        "flavor": "GNU ld",
-        "version": "GNU ld fixture",
-    }
-
     with pytest.raises(ValueError, match="linker (controls|response files)"):
         namespace["replay_link_command"](trace, executable, linker, fragment, link_map)
+
+
+def test_ubuntu_lld_record_preserves_chain_payload_and_exact_argv0(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    invocation, payload, extraction_root = make_ubuntu_lld_multicall_fixture(tmp_path)
+
+    generic = subprocess.run(
+        [str(payload), "--version"], text=True, capture_output=True
+    )
+    exact = subprocess.run(
+        ["ld.lld", "--version"],
+        executable=str(payload),
+        text=True,
+        capture_output=True,
+    )
+    record = namespace["_inspect_linker_record"](
+        invocation, "ld.lld", "lld", extraction_root
+    )
+
+    assert generic.returncode == 1
+    assert "generic driver" in generic.stderr
+    assert exact.returncode == 0
+    assert exact.stdout.strip() == "Ubuntu LLD 18.1.3 (compatible with GNU linkers)"
+    assert record == {
+        "invocation_path": str(invocation),
+        "invocation_chain": [
+            {"absolute_path": str(invocation), "symlink_target": "ld.lld-18"},
+            {
+                "absolute_path": str(invocation.parent / "ld.lld-18"),
+                "symlink_target": "../lib/llvm-18/bin/ld.lld",
+            },
+            {
+                "absolute_path": str(extraction_root / "usr/lib/llvm-18/bin/ld.lld"),
+                "symlink_target": "lld",
+            },
+            {"absolute_path": str(payload), "symlink_target": None},
+        ],
+        "payload_path": str(payload),
+        "payload_sha256": digest(payload),
+        "argv0": "ld.lld",
+        "extraction_root": str(extraction_root),
+        "flavor": "LLD",
+        "version_argument": "--version",
+        "version": "Ubuntu LLD 18.1.3 (compatible with GNU linkers)",
+    }
+    assert namespace["_validate_linker_record"](record, "Ubuntu LLD") == payload
+
+
+@pytest.mark.parametrize("attack", ["invocation", "chain", "payload"])
+def test_ubuntu_lld_record_rejects_path_chain_and_payload_swaps(tmp_path, attack):
+    namespace = runpy.run_path(str(SCRIPT))
+    invocation, payload, extraction_root = make_ubuntu_lld_multicall_fixture(tmp_path)
+    record = namespace["_inspect_linker_record"](
+        invocation, "ld.lld", "lld", extraction_root
+    )
+    if attack == "invocation":
+        record["invocation_path"] = str(invocation.parent / "ld.lld-18")
+    elif attack == "chain":
+        record["invocation_chain"][0]["symlink_target"] = "./ld.lld-18"
+    else:
+        payload.write_bytes(payload.read_bytes() + b"payload swap")
+
+    with pytest.raises(ValueError, match="(chain|payload|hash|invocation)"):
+        namespace["_validate_linker_record"](record, "Ubuntu LLD")
+
+
+def test_explicit_lld_record_rejects_generic_multicall_argv0(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    invocation, _, extraction_root = make_ubuntu_lld_multicall_fixture(tmp_path)
+    record = namespace["_inspect_linker_record"](
+        invocation, "ld.lld", "lld", extraction_root
+    )
+    record["argv0"] = "lld"
+
+    with pytest.raises(ValueError, match="argv0"):
+        namespace["_validate_linker_record"](record, "Ubuntu LLD")
+
+
+def test_link_wrapper_executes_payload_with_recorded_lld_argv0(tmp_path):
+    invocation, payload, _ = make_ubuntu_lld_multicall_fixture(tmp_path)
+    wrapper = tmp_path / "wrapper/ld.lld"
+    wrapper.parent.mkdir()
+    wrapper.write_bytes(LINK_WRAPPER.read_bytes())
+    wrapper.chmod(0o755)
+    trace = tmp_path / "lld-trace.jsonl"
+    environment = {
+        **os.environ,
+        "CACHE_GATE_INNER_LINK_DRIVER": str(payload),
+        "CACHE_GATE_INNER_LINK_ARGV0": invocation.name,
+        "CACHE_GATE_INNER_LINK_TRACE": str(trace),
+    }
+
+    completed = subprocess.run(
+        [str(wrapper), "--version"], env=environment, text=True, capture_output=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "Ubuntu LLD 18.1.3 (compatible with GNU linkers)"
+    assert json.loads(trace.read_text()) == {
+        "payload_path": str(payload),
+        "payload_sha256": digest(payload),
+        "argv0": "ld.lld",
+        "argv": ["--version"],
+        "cwd": str(Path.cwd().resolve()),
+        "path": os.environ["PATH"],
+    }
+
+
+def test_inspect_linker_cli_reports_nonzero_version_probe(tmp_path):
+    invocation, _, extraction_root = make_ubuntu_lld_multicall_fixture(tmp_path)
+    output = tmp_path / "linker-record.json"
+
+    completed = subprocess.run(
+        [
+            str(SCRIPT),
+            "inspect-linker-record",
+            "--invocation-path",
+            str(invocation),
+            "--argv0",
+            "lld",
+            "--flavor",
+            "lld",
+            "--extraction-root",
+            str(extraction_root),
+            "--output",
+            str(output),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 1
+    assert "version probe exited 1" in completed.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("operation", ["inspect", "verify"])
+def test_linker_probe_rechecks_invocation_chain_after_execution(tmp_path, operation):
+    namespace = runpy.run_path(str(SCRIPT))
+    invocation, _, extraction_root = make_ubuntu_lld_multicall_fixture(tmp_path)
+    record = namespace["_inspect_linker_record"](
+        invocation, "ld.lld", "lld", extraction_root
+    )
+    module_globals = namespace["_inspect_linker_record"].__globals__
+
+    def swap_chain(*_):
+        invocation.unlink()
+        invocation.symlink_to("../lib/llvm-18/bin/ld.lld")
+        return "LLD", record["version"]
+
+    module_globals["_probe_linker_version"] = swap_chain
+    with pytest.raises(ValueError, match="invocation chain changed"):
+        if operation == "inspect":
+            namespace["_inspect_linker_record"](
+                invocation, "ld.lld", "lld", extraction_root
+            )
+        else:
+            namespace["_verify_linker_record"](record, "Ubuntu LLD")
+
+
+def test_link_trace_rejects_extra_schema_field(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    driver = tmp_path / "ld.bfd"
+    driver.write_text("#!/bin/sh\nexit 0\n")
+    driver.chmod(0o755)
+    linker = linker_identity(driver, "GNU ld", "GNU ld fixture")
+    binary, raw_output = make_cargo_output_pair(tmp_path)
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                **linker_trace_identity(linker),
+                "argv": ["-o", str(raw_output.resolve())],
+                "unexpected": True,
+            }
+        )
+        + "\n"
+    )
+
+    with pytest.raises(ValueError, match="exact .* schema mismatch"):
+        namespace["replay_linker_execution"](trace, linker, binary, "gnu")
 
 
 def test_link_wrapper_records_driver_bytes_and_exact_argv(tmp_path):
@@ -744,6 +982,7 @@ def test_link_wrapper_records_driver_bytes_and_exact_argv(tmp_path):
     env = {
         **os.environ,
         "CACHE_GATE_LINK_DRIVER": str(driver.resolve()),
+        "CACHE_GATE_LINK_ARGV0": str(driver.resolve()),
         "CACHE_GATE_LINK_TRACE": str(trace.resolve()),
         "LIBRARY_PATH": "/fixture/evil-library-path",
         "CPATH": "/fixture/evil-include-path",
@@ -761,8 +1000,9 @@ def test_link_wrapper_records_driver_bytes_and_exact_argv(tmp_path):
         {
             "argv": ["-o", str((tmp_path / "output").resolve())],
             "cwd": str(Path.cwd().resolve()),
-            "driver": str(driver.resolve()),
-            "driver_sha256": digest(driver),
+            "payload_path": str(driver.resolve()),
+            "payload_sha256": digest(driver),
+            "argv0": str(driver.resolve()),
             "path": os.environ["PATH"],
         }
     ]
@@ -820,13 +1060,15 @@ def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
         "exit 0\n"
     )
     linker.chmod(0o755)
+    linker_record = linker_identity(linker, "GNU ld", "GNU ld fixture 2.42")
+    linker_record_path = tmp_path / "linker-record.json"
+    linker_record_path.write_text(json.dumps(linker_record))
     binary, raw_output = make_cargo_output_pair(tmp_path)
     trace = tmp_path / "linker-trace.jsonl"
     trace.write_text(
         json.dumps(
             {
-                "driver": str(linker.resolve()),
-                "driver_sha256": digest(linker),
+                **linker_trace_identity(linker_record),
                 "argv": ["-o", str(raw_output.resolve())],
                 "cwd": str(tmp_path.resolve()),
                 "path": os.environ["PATH"],
@@ -843,8 +1085,8 @@ def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
         "validate-linker-execution",
         "--trace",
         str(trace.resolve()),
-        "--linker",
-        str(linker.resolve()),
+        "--linker-record",
+        str(linker_record_path.resolve()),
         "--executable",
         str(binary.resolve()),
         "--flavor",
@@ -855,12 +1097,7 @@ def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
     completed = subprocess.run(command, text=True, capture_output=True)
     assert completed.returncode == 0, completed.stderr
     record = json.loads(output.read_text())
-    assert record["linker"] == {
-        "absolute_path": str(linker.resolve()),
-        "flavor": "GNU ld",
-        "sha256": digest(linker),
-        "version": "GNU ld fixture 2.42",
-    }
+    assert record["linker"] == linker_record
     assert record["trace"]["final_link_record_count"] == 1
     assert record["role"] == "explicit-linker"
     assert record["session"] == "fixture-session"
@@ -868,7 +1105,11 @@ def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
     wrong_linker = tmp_path / "other-ld"
     wrong_linker.write_text(linker.read_text())
     wrong_linker.chmod(0o755)
-    command[command.index("--linker") + 1] = str(wrong_linker.resolve())
+    wrong_record = tmp_path / "wrong-linker-record.json"
+    wrong_record.write_text(
+        json.dumps(linker_identity(wrong_linker, "GNU ld", "GNU ld fixture 2.42"))
+    )
+    command[command.index("--linker-record") + 1] = str(wrong_record.resolve())
     rejected = subprocess.run(command, text=True, capture_output=True)
     assert rejected.returncode != 0
     assert "observed linker differs" in rejected.stderr
@@ -896,13 +1137,23 @@ def test_outer_and_inner_wrappers_produce_correlated_replayable_gnu_traces(tmp_p
     raw_output = deps / "probe-0123456789abcdef"
     outer_trace = tmp_path / "outer.jsonl"
     inner_trace = tmp_path / "inner.jsonl"
+    actual_record = namespace["_inspect_linker_record"](
+        compiler, str(compiler), "actual"
+    )
+    gnu_record = namespace["_inspect_linker_record"](linker, str(linker), "gnu")
+    actual_record_path = tmp_path / "actual-linker-record.json"
+    gnu_record_path = tmp_path / "gnu-linker-record.json"
+    actual_record_path.write_text(json.dumps(actual_record))
+    gnu_record_path.write_text(json.dumps(gnu_record))
     environment = {
         **os.environ,
         "CACHE_GATE_LINK_DRIVER": str(compiler),
+        "CACHE_GATE_LINK_ARGV0": str(compiler),
         "CACHE_GATE_LINK_TRACE": str(outer_trace),
         "CACHE_GATE_LINK_ROLE": "cargo-driver",
         "CACHE_GATE_LINK_SESSION": "integration-session",
         "CACHE_GATE_INNER_LINK_DRIVER": str(linker),
+        "CACHE_GATE_INNER_LINK_ARGV0": str(linker),
         "CACHE_GATE_INNER_LINK_TRACE": str(inner_trace),
         "CACHE_GATE_INNER_LINK_ROLE": "explicit-linker",
     }
@@ -925,9 +1176,9 @@ def test_outer_and_inner_wrappers_produce_correlated_replayable_gnu_traces(tmp_p
     binary = release / "probe"
     os.link(raw_output, binary)
 
-    for trace, driver, flavor, role in (
-        (outer_trace, compiler, "actual", "cargo-driver"),
-        (inner_trace, linker, "gnu", "explicit-linker"),
+    for trace, record_path, flavor, role in (
+        (outer_trace, actual_record_path, "actual", "cargo-driver"),
+        (inner_trace, gnu_record_path, "gnu", "explicit-linker"),
     ):
         execution = tmp_path / f"{role}.json"
         validated = subprocess.run(
@@ -937,8 +1188,8 @@ def test_outer_and_inner_wrappers_produce_correlated_replayable_gnu_traces(tmp_p
                 "validate-linker-execution",
                 "--trace",
                 str(trace),
-                "--linker",
-                str(driver),
+                "--linker-record",
+                str(record_path),
                 "--executable",
                 str(binary),
                 "--flavor",
@@ -976,13 +1227,17 @@ def test_actual_driver_execution_record_uses_forwarded_linker_version(tmp_path):
         "exit 0\n"
     )
     driver.chmod(0o755)
+    linker_record = linker_identity(
+        driver, "GNU ld", "GNU ld fixture 2.42", actual=True
+    )
+    linker_record_path = tmp_path / "actual-linker-record.json"
+    linker_record_path.write_text(json.dumps(linker_record))
     binary, raw_output = make_cargo_output_pair(tmp_path)
     trace = tmp_path / "actual-trace.jsonl"
     trace.write_text(
         json.dumps(
             {
-                "driver": str(driver.resolve()),
-                "driver_sha256": digest(driver),
+                **linker_trace_identity(linker_record),
                 "argv": ["-o", str(raw_output.resolve())],
                 "cwd": str(tmp_path.resolve()),
                 "path": os.environ["PATH"],
@@ -998,8 +1253,8 @@ def test_actual_driver_execution_record_uses_forwarded_linker_version(tmp_path):
             "validate-linker-execution",
             "--trace",
             str(trace.resolve()),
-            "--linker",
-            str(driver.resolve()),
+            "--linker-record",
+            str(linker_record_path.resolve()),
             "--executable",
             str(binary.resolve()),
             "--flavor",
@@ -1012,24 +1267,67 @@ def test_actual_driver_execution_record_uses_forwarded_linker_version(tmp_path):
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert json.loads(output.read_text())["linker"] == {
-        "absolute_path": str(driver.resolve()),
-        "flavor": "GNU ld",
-        "sha256": digest(driver),
-        "version": "GNU ld fixture 2.42",
-    }
+    assert json.loads(output.read_text())["linker"] == linker_record
 
 
 def test_capability_probe_traces_explicit_linker_executables():
     source = (ROOT / "scripts/cache-gate-linker-capability.sh").read_text()
+    assert "trap normalize_failure_to_hold EXIT" in source
+    assert "inspect-linker-record" in source
+    assert "verify-linker-record" in source
     assert "validate-linker-execution" in source
     assert "CACHE_GATE_LINK_TRACE" in source
     assert "CACHE_GATE_LINK_DRIVER" in source
+    assert "CACHE_GATE_LINK_ARGV0" in source
+    assert "CACHE_GATE_INNER_LINK_ARGV0" in source
+    assert '--linker-record "$linker_record"' in source
+    assert 'inspect_linker_record "$lld_invocation" ld.lld lld' in source
+    assert 'gnu_argv0=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$gnu_invocation")' in source
+    assert 'inspect_linker_record "$gnu_invocation" "$gnu_argv0" gnu' in source
     assert "-B" in source
     assert (
         'for target in elastic funnel profile; do run_shape actual "$target" '
-        '"$actual_driver" actual; done'
+        '"$actual_record" actual; done'
     ) in source
+
+
+def test_capability_inspection_failure_is_executable_hold_status_three(tmp_path):
+    source = (ROOT / "scripts/cache-gate-linker-capability.sh").read_text()
+    normalizer = source[
+        source.index("normalize_failure_to_hold()") : source.index(
+            "CACHE_GATE_REALPATH_TOOL="
+        )
+    ]
+    hold_start = source.index("\nhold() {") + 1
+    hold_function = source[hold_start : source.index("[[ -z ${RUSTFLAGS")]
+    inspection_functions = source[
+        source.index("verify_linker_record()") : source.index("run_shape() {")
+    ]
+    fake_root = tmp_path / "repo"
+    tool = fake_root / "scripts/cache-gate-elf-layout.py"
+    tool.parent.mkdir(parents=True)
+    tool.write_text("#!/bin/sh\nexit 1\n")
+    tool.chmod(0o755)
+    harness = "\n".join(
+        (
+            "set -euo pipefail",
+            normalizer,
+            hold_function,
+            inspection_functions,
+            f"REPO_ROOT={shlex.quote(str(fake_root))}",
+            'inspect_linker_record /missing/ld.lld ld.lld lld "$PWD/record.json"',
+        )
+    )
+
+    completed = subprocess.run(
+        ["bash", "-c", harness], text=True, capture_output=True, cwd=tmp_path
+    )
+
+    assert completed.returncode == 3
+    assert (
+        completed.stderr.splitlines()[-1]
+        == "HOLD: lld linker identity/version probe failed"
+    )
 
 
 def test_cargo_linker_resolver_canonicalizes_path_symlink(tmp_path):
@@ -1915,12 +2213,12 @@ def make_semantic_capability_fixture(tmp_path, namespace):
         driver.parent.mkdir(exist_ok=True)
         driver.write_text("#!/bin/sh\nexit 0\n")
         driver.chmod(0o755)
-        drivers[flavor] = {
-            "absolute_path": str(driver.resolve()),
-            "sha256": digest(driver),
-            "flavor": identity,
-            "version": version,
-        }
+        drivers[flavor] = linker_identity(
+            driver,
+            identity,
+            version,
+            actual=flavor == "actual",
+        )
     shapes = {}
     for flavor in ("actual", "gnu", "lld"):
         shapes[flavor] = {}
@@ -2011,8 +2309,7 @@ def make_semantic_capability_fixture(tmp_path, namespace):
             expected["linker_trace"].write_text(
                 json.dumps(
                     {
-                        "driver": linker["absolute_path"],
-                        "driver_sha256": linker["sha256"],
+                        **linker_trace_identity(linker),
                         "argv": observed_argv,
                         "role": (
                             "actual-driver" if flavor == "actual" else "explicit-linker"
@@ -2032,8 +2329,7 @@ def make_semantic_capability_fixture(tmp_path, namespace):
                 expected["cargo_trace"].write_text(
                     json.dumps(
                         {
-                            "driver": drivers["actual"]["absolute_path"],
-                            "driver_sha256": drivers["actual"]["sha256"],
+                            **linker_trace_identity(drivers["actual"]),
                             "argv": printed_argv,
                             "role": "cargo-driver",
                             "session": session,
@@ -2202,8 +2498,8 @@ def test_shared_capability_validator_rejects_forged_explicit_driver(tmp_path, fl
     forged_driver.write_text("#!/bin/sh\nexit 0\n")
     forged_driver.chmod(0o755)
     trace = json.loads(trace_path.read_text())
-    trace["driver"] = str(forged_driver.resolve())
-    trace["driver_sha256"] = digest(forged_driver)
+    trace["payload_path"] = str(forged_driver.resolve())
+    trace["payload_sha256"] = digest(forged_driver)
     trace_path.write_text(json.dumps(trace) + "\n")
     execution["trace"]["sha256"] = digest(trace_path)
     execution_path.write_text(json.dumps(execution) + "\n")
@@ -3059,27 +3355,22 @@ def test_link_trace_replay_never_executes_recorded_linkers(tmp_path):
     trace.write_text(
         json.dumps(
             {
-                "driver": str(driver),
-                "driver_sha256": digest(driver),
+                **linker_trace_identity(
+                    linker_identity(driver, "GNU ld", "GNU ld fixture")
+                ),
                 "argv": argv,
             }
         )
         + "\n"
     )
-    linker = {
-        "absolute_path": str(driver),
-        "sha256": digest(driver),
-        "flavor": "GNU ld",
-        "version": "GNU ld fixture",
-    }
+    linker = linker_identity(driver, "GNU ld", "GNU ld fixture")
     namespace["replay_linker_execution"](trace, linker, binary, "gnu")
     main_argv = [*argv]
     main_argv[main_argv.index(str(raw_output))] = str(binary)
     trace.write_text(
         json.dumps(
             {
-                "driver": str(driver),
-                "driver_sha256": digest(driver),
+                **linker_trace_identity(linker),
                 "argv": main_argv,
             }
         )
@@ -3089,7 +3380,7 @@ def test_link_trace_replay_never_executes_recorded_linkers(tmp_path):
     assert not marker.exists()
 
     forged = json.loads(trace.read_text())
-    forged["driver"] = str(tmp_path / "missing" / ".." / driver.name)
+    forged["payload_path"] = str(tmp_path / "missing" / ".." / driver.name)
     trace.write_text(json.dumps(forged) + "\n")
     with pytest.raises(ValueError, match="captured link driver differs"):
         namespace["replay_link_command"](trace, binary, linker, fragment, link_map)
@@ -3113,19 +3404,13 @@ def test_capability_replay_rejects_lexical_output_alias(
     trace.write_text(
         json.dumps(
             {
-                "driver": str(driver.resolve()),
-                "driver_sha256": digest(driver),
+                **linker_trace_identity(linker_identity(driver, identity, version)),
                 "argv": ["-o", str(aliased_output)],
             }
         )
         + "\n"
     )
-    linker = {
-        "absolute_path": str(driver.resolve()),
-        "sha256": digest(driver),
-        "flavor": identity,
-        "version": version,
-    }
+    linker = linker_identity(driver, identity, version)
 
     with pytest.raises(ValueError, match=f"observed {flavor} linker"):
         namespace["replay_linker_execution"](trace, linker, binary, flavor)
@@ -3200,8 +3485,13 @@ def test_capability_replay_rejects_duplicate_output_selectors(tmp_path, flavor):
     trace.write_text(
         json.dumps(
             {
-                "driver": str(driver.resolve()),
-                "driver_sha256": digest(driver),
+                **linker_trace_identity(
+                    linker_identity(
+                        driver,
+                        "GNU ld" if flavor == "gnu" else "LLD",
+                        "GNU ld fixture" if flavor == "gnu" else "LLD fixture",
+                    )
+                ),
                 "argv": [
                     "-o",
                     str(raw_output.resolve()),
@@ -3212,12 +3502,11 @@ def test_capability_replay_rejects_duplicate_output_selectors(tmp_path, flavor):
         )
         + "\n"
     )
-    linker = {
-        "absolute_path": str(driver.resolve()),
-        "sha256": digest(driver),
-        "flavor": "GNU ld" if flavor == "gnu" else "LLD",
-        "version": "GNU ld fixture" if flavor == "gnu" else "LLD fixture",
-    }
+    linker = linker_identity(
+        driver,
+        "GNU ld" if flavor == "gnu" else "LLD",
+        "GNU ld fixture" if flavor == "gnu" else "LLD fixture",
+    )
 
     with pytest.raises(ValueError, match=f"observed {flavor} linker"):
         namespace["replay_linker_execution"](trace, linker, binary, flavor)
@@ -3240,19 +3529,25 @@ def test_capability_replay_binds_exact_cargo_deps_output_alias(tmp_path, flavor)
     trace.write_text(
         json.dumps(
             {
-                "driver": str(driver.resolve()),
-                "driver_sha256": digest(driver),
+                **linker_trace_identity(
+                    linker_identity(
+                        driver,
+                        "GNU ld" if flavor != "lld" else "LLD",
+                        "GNU ld fixture" if flavor != "lld" else "LLD fixture",
+                        actual=flavor == "actual",
+                    )
+                ),
                 "argv": ["-o", str(raw_output.resolve())],
             }
         )
         + "\n"
     )
-    linker = {
-        "absolute_path": str(driver.resolve()),
-        "sha256": digest(driver),
-        "flavor": "GNU ld" if flavor != "lld" else "LLD",
-        "version": "GNU ld fixture" if flavor != "lld" else "LLD fixture",
-    }
+    linker = linker_identity(
+        driver,
+        "GNU ld" if flavor != "lld" else "LLD",
+        "GNU ld fixture" if flavor != "lld" else "LLD fixture",
+        actual=flavor == "actual",
+    )
 
     observed = namespace["replay_linker_execution"](
         trace, linker, binary.resolve(), flavor
@@ -3279,19 +3574,24 @@ def test_capability_replay_rejects_noncanonical_raw_driver(tmp_path, flavor):
     trace.write_text(
         json.dumps(
             {
-                "driver": raw_driver,
-                "driver_sha256": digest(driver),
+                **linker_trace_identity(
+                    linker_identity(
+                        driver,
+                        "GNU ld" if flavor == "gnu" else "LLD",
+                        "GNU ld fixture" if flavor == "gnu" else "LLD fixture",
+                    )
+                ),
+                "payload_path": raw_driver,
                 "argv": ["-o", str(raw_output.resolve())],
             }
         )
         + "\n"
     )
-    linker = {
-        "absolute_path": str(driver.resolve()),
-        "sha256": digest(driver),
-        "flavor": "GNU ld" if flavor == "gnu" else "LLD",
-        "version": "GNU ld fixture" if flavor == "gnu" else "LLD fixture",
-    }
+    linker = linker_identity(
+        driver,
+        "GNU ld" if flavor == "gnu" else "LLD",
+        "GNU ld fixture" if flavor == "gnu" else "LLD fixture",
+    )
 
     with pytest.raises(ValueError, match=f"observed {flavor} linker differs"):
         namespace["replay_linker_execution"](trace, linker, binary, flavor)
@@ -3307,8 +3607,9 @@ def test_actual_link_trace_replay_binds_capability_driver_path_and_hash(tmp_path
     trace.write_text(
         json.dumps(
             {
-                "driver": str(driver.resolve()),
-                "driver_sha256": digest(driver),
+                **linker_trace_identity(
+                    linker_identity(driver, "GNU ld", "GNU ld fixture", actual=True)
+                ),
                 "argv": ["-o", str(raw_output.resolve())],
                 "cwd": str(tmp_path.resolve()),
                 "path": os.environ["PATH"],
@@ -3316,12 +3617,7 @@ def test_actual_link_trace_replay_binds_capability_driver_path_and_hash(tmp_path
         )
         + "\n"
     )
-    linker = {
-        "absolute_path": str(driver.resolve()),
-        "sha256": digest(driver),
-        "flavor": "GNU ld",
-        "version": "GNU ld fixture",
-    }
+    linker = linker_identity(driver, "GNU ld", "GNU ld fixture", actual=True)
 
     observed = namespace["replay_linker_execution"](trace, linker, binary, "actual")
     assert observed["linker"] == linker
@@ -3330,14 +3626,14 @@ def test_actual_link_trace_replay_binds_capability_driver_path_and_hash(tmp_path
     wrong_driver.write_text(driver.read_text())
     wrong_driver.chmod(0o755)
     forged = json.loads(trace.read_text())
-    forged["driver"] = str(wrong_driver.resolve())
-    forged["driver_sha256"] = digest(wrong_driver)
+    forged["payload_path"] = str(wrong_driver.resolve())
+    forged["payload_sha256"] = digest(wrong_driver)
     trace.write_text(json.dumps(forged) + "\n")
     with pytest.raises(ValueError, match="observed actual linker differs"):
         namespace["replay_linker_execution"](trace, linker, binary, "actual")
 
-    forged["driver"] = str(tmp_path / "missing" / ".." / driver.name)
-    forged["driver_sha256"] = digest(driver)
+    forged["payload_path"] = str(tmp_path / "missing" / ".." / driver.name)
+    forged["payload_sha256"] = digest(driver)
     trace.write_text(json.dumps(forged) + "\n")
     with pytest.raises(ValueError, match="observed actual linker differs"):
         namespace["replay_linker_execution"](trace, linker, binary, "actual")

@@ -3,6 +3,17 @@
 
 set -euo pipefail
 
+normalize_failure_to_hold() {
+	local status=$?
+	trap - EXIT
+	if [[ $status -ne 0 && $status -ne 3 ]]; then
+		echo "HOLD: capability probe stopped with status $status" >&2
+		exit 3
+	fi
+	exit "$status"
+}
+trap normalize_failure_to_hold EXIT
+
 CACHE_GATE_REALPATH_TOOL=/usr/bin/realpath
 CACHE_GATE_SHA256_TOOL=/usr/bin/sha256sum
 for bootstrap_tool in "$CACHE_GATE_REALPATH_TOOL" "$CACHE_GATE_SHA256_TOOL"; do
@@ -75,8 +86,35 @@ validate_probe_root() {
 }
 validate_probe_root
 
+record_field() {
+	python3 - "$1" "$2" <<'PY'
+import json,sys
+value=json.loads(open(sys.argv[1],encoding="utf-8").read())[sys.argv[2]]
+if not isinstance(value,str) or not value:
+    raise SystemExit(f"invalid linker record field: {sys.argv[2]}")
+print(value)
+PY
+}
+
+verify_linker_record() {
+	local record=$1 label=$2
+	if ! "$REPO_ROOT/scripts/cache-gate-elf-layout.py" verify-linker-record --record "$record"; then
+		hold "$label linker identity/version changed"
+	fi
+}
+
+inspect_linker_record() {
+	local invocation=$1 argv0=$2 flavor=$3 output=$4 extraction_root=${5:-}
+	local args=(inspect-linker-record --invocation-path "$invocation" --argv0 "$argv0" --flavor "$flavor" --output "$output")
+	if [[ -n $extraction_root ]]; then args+=(--extraction-root "$extraction_root"); fi
+	if ! "$REPO_ROOT/scripts/cache-gate-elf-layout.py" "${args[@]}"; then
+		hold "$flavor linker identity/version probe failed"
+	fi
+	verify_linker_record "$output" "$flavor"
+}
+
 run_shape() {
-	local flavor=$1 target=$2 explicit_linker=$3 fuse=$4
+	local flavor=$1 target=$2 linker_record=$3 fuse=$4
 	local target_root="$probe_root/$flavor/$target" map="$probe_root/$flavor/$target.map"
 	local link_args="$probe_root/$flavor/$target.link-args.txt" symbols="$probe_root/$flavor/$target.symbols.json"
 	local layout="$probe_root/$flavor/$target.layout.json" binary
@@ -85,11 +123,17 @@ run_shape() {
 	local cargo_trace="$probe_root/$flavor/$target.cargo-driver-trace.jsonl"
 	local cargo_execution="$probe_root/$flavor/$target.cargo-driver-execution.json"
 	local link_session="$flavor-$target-$$"
+	local linker_payload linker_argv0
+	linker_payload=$(record_field "$linker_record" payload_path) || hold "$flavor linker record has invalid payload"
+	linker_argv0=$(record_field "$linker_record" argv0) || hold "$flavor linker record has invalid argv0"
+	validate_probe_root
+	verify_linker_record "$actual_record" actual
+	if [[ $linker_record != "$actual_record" ]]; then verify_linker_record "$linker_record" "$flavor"; fi
 	mkdir -p "$target_root"
 	local flags="--cfg cache_gate_probe_$target --check-cfg=cfg(cache_gate_probe_elastic) --check-cfg=cfg(cache_gate_probe_funnel) --check-cfg=cfg(cache_gate_probe_profile)"
 	if [[ $flavor == actual ]]; then
 		flags+=" -C linker=$REPO_ROOT/scripts/cache-gate-link-wrapper.py"
-	elif [[ -n $explicit_linker ]]; then
+	else
 		local wrapper_dir="$probe_root/$flavor/linker-wrapper" wrapper="$probe_root/$flavor/linker-wrapper/ld.$fuse"
 		mkdir -p "$wrapper_dir"
 		if [[ ! -e $wrapper ]]; then
@@ -100,41 +144,35 @@ run_shape() {
 	fi
 	flags+=" -C link-arg=-Wl,-T,${fragments[$target]} -C link-arg=-Wl,-Map,$map"
 	if [[ $flavor == actual ]]; then
-		CACHE_GATE_LINK_DRIVER="$explicit_linker" CACHE_GATE_LINK_TRACE="$linker_trace" \
+		CACHE_GATE_LINK_DRIVER="$linker_payload" CACHE_GATE_LINK_ARGV0="$linker_argv0" CACHE_GATE_LINK_TRACE="$linker_trace" \
 			CACHE_GATE_LINK_ROLE=actual-driver CACHE_GATE_LINK_SESSION="$link_session" \
 			RUSTFLAGS="$flags" CARGO_TARGET_DIR="$target_root" cargo rustc --release --locked \
 			--manifest-path tools/cache-gate-link-probe/Cargo.toml --bin "$target" -- \
 			-C codegen-units=1 --print link-args >"$link_args" 2>"$probe_root/$flavor/$target.cargo.stderr" || \
 			hold "$flavor failed $target 2/2/4 capability link"
-	elif [[ -n $explicit_linker ]]; then
-		CACHE_GATE_LINK_DRIVER="$actual_driver" CACHE_GATE_LINK_TRACE="$cargo_trace" \
+	else
+		CACHE_GATE_LINK_DRIVER="$actual_payload" CACHE_GATE_LINK_ARGV0="$actual_argv0" CACHE_GATE_LINK_TRACE="$cargo_trace" \
 			CACHE_GATE_LINK_ROLE=cargo-driver CACHE_GATE_LINK_SESSION="$link_session" \
-			CACHE_GATE_INNER_LINK_DRIVER="$explicit_linker" CACHE_GATE_INNER_LINK_TRACE="$linker_trace" \
+			CACHE_GATE_INNER_LINK_DRIVER="$linker_payload" CACHE_GATE_INNER_LINK_ARGV0="$linker_argv0" CACHE_GATE_INNER_LINK_TRACE="$linker_trace" \
 			CACHE_GATE_INNER_LINK_ROLE=explicit-linker \
 			RUSTFLAGS="$flags" CARGO_TARGET_DIR="$target_root" cargo rustc --release --locked \
 			--manifest-path tools/cache-gate-link-probe/Cargo.toml --bin "$target" -- \
 			-C codegen-units=1 --print link-args >"$link_args" 2>"$probe_root/$flavor/$target.cargo.stderr" || \
 			hold "$flavor failed $target 2/2/4 capability link"
-	elif ! RUSTFLAGS="$flags" CARGO_TARGET_DIR="$target_root" cargo rustc --release --locked \
-		--manifest-path tools/cache-gate-link-probe/Cargo.toml --bin "$target" -- \
-		-C codegen-units=1 --print link-args >"$link_args" 2>"$probe_root/$flavor/$target.cargo.stderr"; then
-		hold "$flavor failed $target 2/2/4 capability link"
 	fi
 	binary=$("$CACHE_GATE_REALPATH_TOOL" "$target_root/release/$target")
 	[[ -x $binary && -s $map && -s $link_args ]] || hold "$flavor did not emit $target ELF/map/link argv"
-	if [[ -n $explicit_linker ]]; then
-		[[ -s $linker_trace ]] || hold "$flavor did not trace exact $target linker execution"
+	[[ -s $linker_trace ]] || hold "$flavor did not trace exact $target linker execution"
+	"$REPO_ROOT/scripts/cache-gate-elf-layout.py" validate-linker-execution \
+		--trace "$linker_trace" --linker-record "$linker_record" \
+		--executable "$binary" --flavor "$flavor" --output "$linker_execution" || \
+		hold "$flavor did not bind exact $target linker executable"
+	if [[ $flavor != actual ]]; then
+		[[ -s $cargo_trace ]] || hold "$flavor did not trace exact $target Cargo driver execution"
 		"$REPO_ROOT/scripts/cache-gate-elf-layout.py" validate-linker-execution \
-			--trace "$linker_trace" --linker "$explicit_linker" \
-			--executable "$binary" --flavor "$flavor" --output "$linker_execution" || \
-			hold "$flavor did not bind exact $target linker executable"
-		if [[ $flavor != actual ]]; then
-			[[ -s $cargo_trace ]] || hold "$flavor did not trace exact $target Cargo driver execution"
-			"$REPO_ROOT/scripts/cache-gate-elf-layout.py" validate-linker-execution \
-				--trace "$cargo_trace" --linker "$actual_driver" \
-				--executable "$binary" --flavor actual --output "$cargo_execution" || \
-				hold "$flavor did not bind exact $target Cargo driver execution"
-		fi
+			--trace "$cargo_trace" --linker-record "$actual_record" \
+			--executable "$binary" --flavor actual --output "$cargo_execution" || \
+			hold "$flavor did not bind exact $target Cargo driver execution"
 	fi
 	file "$binary" | rg -q 'ELF' || hold "$flavor emitted non-ELF $target output"
 	case "$target" in
@@ -158,6 +196,9 @@ run_shape() {
 		--arch "$arch" --output "$layout"; then
 		hold "$flavor failed structural $target 2/2/4 validation"
 	fi
+	verify_linker_record "$actual_record" actual
+	if [[ $linker_record != "$actual_record" ]]; then verify_linker_record "$linker_record" "$flavor"; fi
+	validate_probe_root
 }
 
 # First exercise Cargo's actual configured linker and resolve its absolute driver.
@@ -175,12 +216,10 @@ actual_driver=$("$REPO_ROOT/scripts/cache-gate-elf-layout.py" resolve-cargo-link
 	--link-args "$actual_args") || hold "cannot resolve actual Cargo linker command"
 actual_driver=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$actual_driver")
 [[ -f $actual_driver && ! -L $actual_driver && -x $actual_driver ]] || hold "actual Cargo linker is not canonical"
-actual_version=$("$actual_driver" -Wl,--version 2>&1 | rg -m1 'GNU ld|LLD|lld' || true)
-case "$actual_version" in
-*"GNU ld"*) actual_flavor="GNU ld" ;;
-*"LLD"* | *"lld"*) actual_flavor="LLD" ;;
-*) hold "unsupported actual Cargo linker flavor: $actual_version" ;;
-esac
+actual_record="$probe_root/actual-linker-record.json"
+inspect_linker_record "$actual_driver" "$actual_driver" actual "$actual_record"
+actual_payload=$(record_field "$actual_record" payload_path) || hold "actual linker record has invalid payload"
+actual_argv0=$(record_field "$actual_record" argv0) || hold "actual linker record has invalid argv0"
 
 # Derive target MAXPAGESIZE from actual link's executable LOAD alignment.
 actual_binary=$("$CACHE_GATE_REALPATH_TOOL" "$actual_target_root/release/elastic")
@@ -191,35 +230,52 @@ cat >"$probe_root/provisional-capability.json" <<EOF
 {"accepted":true,"arch":"$arch","max_page_size":$max_page_size,"fragment_set_sha256":"$fragment_set_sha","fragments":{"elastic":{"absolute_path":"${fragments[elastic]}","sha256":"$elastic_sha"},"funnel":{"absolute_path":"${fragments[funnel]}","sha256":"$funnel_sha"},"profile":{"absolute_path":"${fragments[profile]}","sha256":"$profile_sha"}}}
 EOF
 
-for target in elastic funnel profile; do run_shape actual "$target" "$actual_driver" actual; done
+for target in elastic funnel profile; do run_shape actual "$target" "$actual_record" actual; done
 
-gnu_ld=$(command -v ld.bfd || true)
-[[ -n $gnu_ld ]] || hold "native GNU ld.bfd is unavailable"
-gnu_ld=$("$CACHE_GATE_REALPATH_TOOL" "$gnu_ld")
-gnu_version=$("$gnu_ld" --version | head -1)
-[[ $gnu_version == *"GNU ld"* ]] || hold "ld.bfd is not GNU ld: $gnu_version"
-for target in elastic funnel profile; do run_shape gnu "$target" "$gnu_ld" bfd; done
+gnu_invocation=$(command -v ld.bfd || true)
+[[ -n $gnu_invocation ]] || hold "native GNU ld.bfd is unavailable"
+[[ $gnu_invocation == /* ]] || hold "native GNU ld.bfd invocation is not absolute"
+gnu_argv0=$("$CACHE_GATE_REALPATH_TOOL" -e -- "$gnu_invocation")
+gnu_record="$probe_root/gnu-linker-record.json"
+inspect_linker_record "$gnu_invocation" "$gnu_argv0" gnu "$gnu_record"
+for target in elastic funnel profile; do run_shape gnu "$target" "$gnu_record" bfd; done
 
-lld=$(command -v ld.lld || command -v lld || true)
-[[ -n $lld ]] || hold "native LLD is unavailable"
-lld=$("$CACHE_GATE_REALPATH_TOOL" "$lld")
-lld_version=$("$lld" --version | head -1)
-[[ $lld_version == *LLD* || $lld_version == *lld* ]] || hold "ld.lld is not LLD: $lld_version"
-for target in elastic funnel profile; do run_shape lld "$target" "$lld" lld; done
+lld_invocation=$(command -v ld.lld || true)
+[[ -n $lld_invocation ]] || hold "native ld.lld is unavailable"
+[[ $lld_invocation == /* ]] || hold "native ld.lld invocation is not absolute"
+lld_extraction_root=
+case $lld_invocation in
+"$REPO_ROOT"/target/toolchains/*/root/*)
+	relative_lld=${lld_invocation#"$REPO_ROOT/target/toolchains/"}
+	toolchain_name=${relative_lld%%/root/*}
+	lld_extraction_root="$REPO_ROOT/target/toolchains/$toolchain_name/root"
+	;;
+esac
+lld_record="$probe_root/lld-linker-record.json"
+inspect_linker_record "$lld_invocation" ld.lld lld "$lld_record" "$lld_extraction_root"
+for target in elastic funnel profile; do run_shape lld "$target" "$lld_record" lld; done
 
 validate_output_ancestry
 validate_probe_root
 [[ ! -e $output_root/capability.json && ! -L $output_root/capability.json ]] || hold "capability record appeared before publication: $output_root/capability.json"
 if ! python3 - "$REPO_ROOT" "$probe_root" "$arch" "$target_triple" \
-	"$actual_driver" "$actual_flavor" "$actual_version" "$gnu_ld" "$gnu_version" "$lld" "$lld_version" \
+	"$actual_record" "$gnu_record" "$lld_record" \
 	"$max_page_size" "$elastic_sha" "$funnel_sha" "$profile_sha" "$fragment_set_sha" \
 	"$producer_commit" "$producer_tree" <<'PY'
 import ctypes,errno,hashlib,json,os,stat,subprocess,sys
 from pathlib import Path
-(repo,probe,arch,triple,actual_driver,actual_flavor,actual_version,gnu,gnu_version,
- lld,lld_version,max_page,elastic_sha,funnel_sha,profile_sha,set_sha,producer_commit,
+(repo,probe,arch,triple,actual_record,gnu_record,lld_record,
+ max_page,elastic_sha,funnel_sha,profile_sha,set_sha,producer_commit,
  producer_tree)=sys.argv[1:]
 root=Path(probe)
+def load_linker(path):
+    path=Path(path)
+    if path.parent!=root or path!=path.resolve(strict=True):
+        raise RuntimeError("linker record path escapes exact probe root")
+    return json.loads(path.read_text())
+actual_linker=load_linker(actual_record)
+gnu_linker=load_linker(gnu_record)
+lld_linker=load_linker(lld_record)
 def record(path):
     path=Path(path).resolve()
     return {"absolute_path":str(path),"sha256":hashlib.sha256(path.read_bytes()).hexdigest()}
@@ -244,10 +300,10 @@ payload={
    "tree":producer_tree,"empty_diff_assertion":True,"artifact_root":str(root)},
  "rustc_version":subprocess.check_output(["rustc","-vV"],text=True).strip(),
  "cargo_version":subprocess.check_output(["cargo","-V"],text=True).strip(),
- "linker":{"absolute_path":actual_driver,"sha256":hashlib.sha256(Path(actual_driver).read_bytes()).hexdigest(),"flavor":actual_flavor,"version":actual_version},
+ "linker":actual_linker,
  "required_linkers":{
-   "gnu":{"absolute_path":gnu,"sha256":hashlib.sha256(Path(gnu).read_bytes()).hexdigest(),"flavor":"GNU ld","version":gnu_version},
-   "lld":{"absolute_path":lld,"sha256":hashlib.sha256(Path(lld).read_bytes()).hexdigest(),"flavor":"LLD","version":lld_version},
+   "gnu":gnu_linker,
+   "lld":lld_linker,
  },
  "fragments":{
    "elastic":{"absolute_path":str(Path(repo)/"benches/cache-gate-elastic-layout.ld"),"sha256":elastic_sha},

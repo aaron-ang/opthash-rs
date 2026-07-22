@@ -1457,29 +1457,271 @@ def _validate_tools(tools: Any) -> dict[str, Path]:
     return resolved
 
 
+LINKER_RECORD_KEYS = {
+    "invocation_path",
+    "invocation_chain",
+    "payload_path",
+    "payload_sha256",
+    "argv0",
+    "extraction_root",
+    "flavor",
+    "version_argument",
+    "version",
+}
+
+
+def _linker_invocation_chain(invocation: Path) -> tuple[list[dict[str, Any]], Path]:
+    _require(invocation.is_absolute(), "linker invocation path must be absolute")
+    normalized = Path(os.path.normpath(str(invocation)))
+    _require(
+        str(invocation) == str(normalized), "linker invocation path is not normalized"
+    )
+    pending = list(normalized.parts[1:])
+    current = Path("/")
+    chain: list[dict[str, Any]] = []
+    visited: set[tuple[str, str, tuple[str, ...]]] = set()
+    while pending:
+        component = pending.pop(0)
+        candidate = current / component
+        try:
+            metadata = candidate.lstat()
+        except OSError as error:
+            raise LayoutError(
+                f"linker invocation chain is missing: {candidate}"
+            ) from error
+        if stat.S_ISLNK(metadata.st_mode):
+            target = os.readlink(candidate)
+            state = (str(candidate), target, tuple(pending))
+            _require(
+                state not in visited and len(chain) < 40,
+                "linker invocation chain contains a symlink loop",
+            )
+            visited.add(state)
+            chain.append({"absolute_path": str(candidate), "symlink_target": target})
+            destination = Path(target)
+            if not destination.is_absolute():
+                destination = candidate.parent / destination
+            destination = Path(os.path.normpath(str(destination)))
+            _require(
+                destination.is_absolute(),
+                "linker symlink target is not absolute after join",
+            )
+            pending = [*destination.parts[1:], *pending]
+            current = Path("/")
+            continue
+        if pending:
+            _require(
+                stat.S_ISDIR(metadata.st_mode),
+                f"linker invocation ancestry is not a directory: {candidate}",
+            )
+        else:
+            _require(
+                stat.S_ISREG(metadata.st_mode) and os.access(candidate, os.X_OK),
+                f"linker payload is not an executable regular file: {candidate}",
+            )
+        current = candidate
+    payload = current
+    _require(
+        payload == payload.resolve(strict=True) and not payload.is_symlink(),
+        "linker payload path is not canonical",
+    )
+    chain.append({"absolute_path": str(payload), "symlink_target": None})
+    return chain, payload
+
+
+def _probe_linker_version(
+    payload: Path, argv0: str, version_argument: str, flavor: str, label: str
+) -> tuple[str, str]:
+    _require(
+        isinstance(argv0, str) and bool(argv0) and "\x00" not in argv0,
+        f"{label} argv0 is invalid",
+    )
+    completed = subprocess.run(
+        [argv0, version_argument],
+        executable=str(payload),
+        env={"LC_ALL": "C", "PATH": os.environ.get("PATH", "")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    combined = "\n".join((completed.stdout, completed.stderr)).strip()
+    _require(
+        completed.returncode == 0,
+        f"{label} version probe exited {completed.returncode}: {combined}",
+    )
+    lines = [line.strip() for line in combined.splitlines() if line.strip()]
+    if flavor == "gnu":
+        matches = [line for line in lines if "GNU ld" in line]
+        stored_flavor = "GNU ld"
+    elif flavor == "lld":
+        matches = [line for line in lines if "lld" in line.lower()]
+        stored_flavor = "LLD"
+    else:
+        matches = [line for line in lines if "GNU ld" in line or "lld" in line.lower()]
+        stored_flavor = "GNU ld" if matches and "GNU ld" in matches[0] else "LLD"
+    _require(bool(matches), f"{label} emitted no recognized linker version")
+    return stored_flavor, matches[0]
+
+
+def _inspect_linker_record(
+    invocation: Path,
+    argv0: str,
+    flavor: str,
+    extraction_root: Path | None = None,
+) -> dict[str, Any]:
+    _require(flavor in {"actual", "gnu", "lld"}, "invalid linker probe flavor")
+    chain, payload = _linker_invocation_chain(invocation)
+    root_text: str | None = None
+    if extraction_root is not None:
+        _require(
+            extraction_root.is_absolute()
+            and extraction_root.is_dir()
+            and not extraction_root.is_symlink()
+            and extraction_root == extraction_root.resolve(strict=True),
+            "linker extraction root is invalid",
+        )
+        for entry in chain:
+            path = Path(entry["absolute_path"])
+            _require(
+                path == extraction_root or extraction_root in path.parents,
+                "linker invocation chain escapes authenticated extraction root",
+            )
+        root_text = str(extraction_root)
+    version_argument = "-Wl,--version" if flavor == "actual" else "--version"
+    stored_flavor, version = _probe_linker_version(
+        payload, argv0, version_argument, flavor, "linker"
+    )
+    record = {
+        "invocation_path": str(invocation),
+        "invocation_chain": chain,
+        "payload_path": str(payload),
+        "payload_sha256": digest(payload),
+        "argv0": argv0,
+        "extraction_root": root_text,
+        "flavor": stored_flavor,
+        "version_argument": version_argument,
+        "version": version,
+    }
+    _validate_linker_record(record, "inspected linker")
+    return record
+
+
 def _validate_linker_record(record: Any, label: str) -> Path:
-    _exact_keys(record, {"absolute_path", "sha256", "flavor", "version"}, label)
-    raw_path = record["absolute_path"]
-    path = Path(raw_path)
+    _exact_keys(record, LINKER_RECORD_KEYS, label)
+    invocation_text = record["invocation_path"]
+    _require(isinstance(invocation_text, str), f"{label} invocation path is invalid")
+    invocation = Path(invocation_text)
+    chain, payload = _linker_invocation_chain(invocation)
+    _require(chain == record["invocation_chain"], f"{label} invocation chain changed")
+    _require(record["payload_path"] == str(payload), f"{label} payload path changed")
     _require(
-        path.is_absolute() and path.is_file() and not path.is_symlink(),
-        f"invalid {label}",
+        digest(payload) == record["payload_sha256"], f"{label} payload hash mismatch"
     )
-    resolved_path = path.resolve()
+    extraction_root = record["extraction_root"]
+    if extraction_root is not None:
+        _require(
+            isinstance(extraction_root, str), f"{label} extraction root is invalid"
+        )
+        root = Path(extraction_root)
+        _require(
+            root.is_absolute()
+            and root.is_dir()
+            and not root.is_symlink()
+            and root == root.resolve(strict=True),
+            f"{label} extraction root is invalid",
+        )
+        for entry in chain:
+            path = Path(entry["absolute_path"])
+            _require(
+                path == root or root in path.parents,
+                f"{label} invocation chain escapes extraction root",
+            )
+    flavor = record["flavor"]
+    version_argument = record["version_argument"]
     _require(
-        isinstance(raw_path, str) and raw_path == str(resolved_path),
-        f"{label} path is not canonical",
-    )
-    path = resolved_path
-    _require(digest(path) == record["sha256"], f"{label} hash mismatch")
-    _require(
-        isinstance(record["flavor"], str)
-        and bool(record["flavor"].strip())
+        flavor in {"GNU ld", "LLD"}
+        and version_argument in {"--version", "-Wl,--version"}
         and isinstance(record["version"], str)
-        and bool(record["version"].strip()),
-        f"{label} recorded identity is empty",
+        and bool(record["version"])
+        and isinstance(record["argv0"], str)
+        and bool(record["argv0"])
+        and "\x00" not in record["argv0"],
+        f"{label} recorded identity is invalid",
     )
-    return path
+    _require(
+        not (flavor == "LLD" and version_argument == "--version")
+        or record["argv0"] == "ld.lld",
+        f"{label} explicit LLD argv0 must be ld.lld",
+    )
+    return payload
+
+
+def _verify_linker_record(record: Any, label: str) -> Path:
+    payload = _validate_linker_record(record, label)
+    flavor = record["flavor"]
+    version_argument = record["version_argument"]
+    expected_probe_flavor = (
+        "gnu"
+        if flavor == "GNU ld" and version_argument == "--version"
+        else "lld"
+        if flavor == "LLD" and version_argument == "--version"
+        else "actual"
+    )
+    observed_flavor, version = _probe_linker_version(
+        payload,
+        record["argv0"],
+        version_argument,
+        expected_probe_flavor,
+        label,
+    )
+    _require(
+        observed_flavor == flavor and version == record["version"],
+        f"{label} version changed",
+    )
+    _require(
+        _validate_linker_record(record, label) == payload,
+        f"{label} payload changed during version probe",
+    )
+    return payload
+
+
+LINK_TRACE_BASE_KEYS = {
+    "payload_path",
+    "payload_sha256",
+    "argv0",
+    "argv",
+    "cwd",
+    "path",
+}
+
+
+def _validate_link_trace_record(record: Any, label: str) -> None:
+    _require(isinstance(record, dict), f"{label} is not an object")
+    has_correlation = "role" in record or "session" in record
+    expected = LINK_TRACE_BASE_KEYS | (
+        {"role", "session"} if has_correlation else set()
+    )
+    _exact_keys(record, expected, label)
+    _require(
+        isinstance(record["payload_path"], str)
+        and isinstance(record["payload_sha256"], str)
+        and isinstance(record["argv0"], str)
+        and bool(record["argv0"])
+        and isinstance(record["argv"], list)
+        and all(isinstance(token, str) for token in record["argv"])
+        and isinstance(record["cwd"], str)
+        and Path(record["cwd"]).is_absolute()
+        and isinstance(record["path"], str),
+        f"{label} fields are invalid",
+    )
+    if has_correlation:
+        _require(
+            isinstance(record["role"], str)
+            and bool(record["role"])
+            and isinstance(record["session"], str)
+            and bool(record["session"]),
+            f"{label} role/session is incomplete",
+        )
 
 
 def replay_linker_execution(
@@ -1505,6 +1747,8 @@ def replay_linker_execution(
     records = [
         json.loads(line) for line in trace.read_text().splitlines() if line.strip()
     ]
+    for index, record in enumerate(records):
+        _validate_link_trace_record(record, f"{flavor} linker trace record {index}")
     matches: list[tuple[dict[str, Any], Path]] = []
     for record in records:
         if not isinstance(record.get("argv"), list):
@@ -1519,27 +1763,18 @@ def replay_linker_execution(
         f"expected one observed {flavor} linker execution, got {len(matches)}",
     )
     observed, raw_output = matches[0]
-    driver_text = observed.get("driver", "")
+    driver_text = observed.get("payload_path", "")
     _require(
         isinstance(driver_text, str) and driver_text == str(linker),
         f"observed {flavor} linker differs from recorded linker",
     )
     _require(
-        observed.get("driver_sha256") == linker_record["sha256"],
+        observed.get("payload_sha256") == linker_record["payload_sha256"]
+        and observed.get("argv0") == linker_record["argv0"],
         f"observed {flavor} linker hash differs from recorded linker",
     )
     role = observed.get("role")
     session = observed.get("session")
-    _require(
-        (role is None and session is None)
-        or (
-            isinstance(role, str)
-            and bool(role)
-            and isinstance(session, str)
-            and bool(session)
-        ),
-        f"observed {flavor} linker role/session is incomplete",
-    )
     result = {
         "linker": linker_record,
         "argv": observed["argv"],
@@ -1884,7 +2119,7 @@ def _validate_explicit_link_argv_trace(
     )
     _require(
         printed_argv == cargo_observed.get("argv")
-        and cargo_observed.get("linker", {}).get("absolute_path")
+        and cargo_observed.get("linker", {}).get("payload_path")
         == str(configured_driver),
         f"{label} Cargo link argv differs from execution trace",
     )
@@ -1956,6 +2191,8 @@ def replay_link_command(
     records = [
         json.loads(line) for line in trace.read_text().splitlines() if line.strip()
     ]
+    for index, record in enumerate(records):
+        _validate_link_trace_record(record, f"link trace record {index}")
     matches = [
         record
         for record in records
@@ -1967,13 +2204,14 @@ def replay_link_command(
         f"expected one captured final link command, got {len(matches)}",
     )
     record = matches[0]
-    observed_driver = record.get("driver", "")
+    observed_driver = record.get("payload_path", "")
     _require(
         isinstance(observed_driver, str) and observed_driver == str(driver),
         "captured link driver differs from recorded capability",
     )
     _require(
-        record.get("driver_sha256") == linker_record["sha256"],
+        record.get("payload_sha256") == linker_record["payload_sha256"]
+        and record.get("argv0") == linker_record["argv0"],
         "captured link driver hash differs from recorded capability",
     )
     argv = record.get("argv", [])
@@ -2431,7 +2669,7 @@ def _validate_capability(
                         paths["link_argv"],
                         cargo_observed,
                         observed,
-                        Path(capability["linker"]["absolute_path"]),
+                        Path(capability["linker"]["payload_path"]),
                         tools["link_wrapper"],
                         artifact_root,
                         flavor,
@@ -3648,18 +3886,6 @@ def authenticate_tools(args: argparse.Namespace) -> dict[str, Any]:
     return records
 
 
-def _linker_version(driver: Path) -> str:
-    output = run(str(driver), "-Wl,--version")
-    return next(
-        (
-            line.strip()
-            for line in output.splitlines()
-            if "GNU ld" in line or "LLD" in line or "lld" in line
-        ),
-        "",
-    )
-
-
 def _link_command_inputs(argv: list[str]) -> tuple[list[str], list[str]]:
     """Return stable names for actual object/archive/library linker inputs."""
 
@@ -3713,11 +3939,6 @@ def validate_link_command(args: argparse.Namespace) -> dict[str, Any]:
         )
     capability = json.loads(capability_bytes)
     linker = capability.get("linker", {})
-    configured_driver = _validate_linker_record(linker, "capability linker")
-    _require(
-        _linker_version(configured_driver) == linker.get("version"),
-        "capability linker version no longer matches actual driver",
-    )
     return replay_link_command(
         args.trace.resolve(),
         args.executable.resolve(),
@@ -3828,38 +4049,37 @@ def _require_output_contained(argv: list[str], root: Path, message: str) -> None
 def validate_linker_execution(args: argparse.Namespace) -> dict[str, Any]:
     for path, label in (
         (args.trace, "trace"),
-        (args.linker, "linker"),
+        (args.linker_record, "linker record"),
         (args.executable, "executable"),
     ):
         _require(path.is_absolute(), f"--{label} must be absolute")
         _require(path.is_file() and not path.is_symlink(), f"invalid {label}: {path}")
-    linker = args.linker.resolve()
+    linker_record = _json_file(args.linker_record, "linker record")
+    linker = _verify_linker_record(linker_record, "linker record")
     executable = args.executable.resolve()
-    version_argument = "-Wl,--version" if args.flavor == "actual" else "--version"
-    version_lines = [
-        line.strip()
-        for line in run(str(linker), version_argument).splitlines()
-        if line.strip()
-        and (args.flavor != "actual" or "GNU ld" in line or "lld" in line.lower())
-    ]
-    _require(bool(version_lines), "explicit linker emitted no version")
-    version = version_lines[0]
     if args.flavor == "gnu":
-        _require("GNU ld" in version, f"explicit linker is not GNU ld: {version}")
-        flavor = "GNU ld"
+        _require(
+            linker_record["flavor"] == "GNU ld"
+            and linker_record["version_argument"] == "--version",
+            "explicit linker is not GNU ld",
+        )
     elif args.flavor == "lld":
-        _require("lld" in version.lower(), f"explicit linker is not LLD: {version}")
-        flavor = "LLD"
-    elif "GNU ld" in version:
-        flavor = "GNU ld"
+        _require(
+            linker_record["flavor"] == "LLD"
+            and linker_record["version_argument"] == "--version",
+            "explicit linker is not LLD",
+        )
     else:
         _require(
-            "lld" in version.lower(), f"actual linker is not GNU ld/LLD: {version}"
+            linker_record["flavor"] in {"GNU ld", "LLD"}
+            and linker_record["version_argument"] == "-Wl,--version",
+            "actual linker is not a compiler driver for GNU ld/LLD",
         )
-        flavor = "LLD"
     records = [
         json.loads(line) for line in args.trace.read_text().splitlines() if line.strip()
     ]
+    for index, candidate in enumerate(records):
+        _validate_link_trace_record(candidate, f"explicit linker trace record {index}")
     matches: list[tuple[dict[str, Any], Path]] = []
     for candidate in records:
         if not isinstance(candidate.get("argv"), list):
@@ -3874,13 +4094,14 @@ def validate_linker_execution(args: argparse.Namespace) -> dict[str, Any]:
         f"expected one observed explicit linker execution, got {len(matches)}",
     )
     record, raw_output = matches[0]
-    observed = record.get("driver", "")
+    observed = record.get("payload_path", "")
     _require(
         isinstance(observed, str) and observed == str(linker),
         "observed linker differs from required explicit linker",
     )
     _require(
-        record.get("driver_sha256") == digest(linker),
+        record.get("payload_sha256") == linker_record["payload_sha256"]
+        and record.get("argv0") == linker_record["argv0"],
         "observed linker hash differs from required explicit linker",
     )
     role = record.get("role")
@@ -3896,12 +4117,7 @@ def validate_linker_execution(args: argparse.Namespace) -> dict[str, Any]:
         "observed linker role/session is incomplete",
     )
     result = {
-        "linker": {
-            "absolute_path": str(linker),
-            "sha256": digest(linker),
-            "flavor": flavor,
-            "version": version,
-        },
+        "linker": linker_record,
         "argv": record["argv"],
         "executable": str(executable),
         "raw_output": str(raw_output),
@@ -4048,11 +4264,7 @@ def _capability_stage_validator(
             producer_root,
             tools,
         )
-        driver = _validate_linker_record(validated["linker"], "capability linker")
-        _require(
-            _linker_version(driver) == validated["linker"]["version"],
-            "capability linker version no longer matches actual driver",
-        )
+        driver = _verify_linker_record(validated["linker"], "capability linker")
         return str(driver)
 
     return validate_staged
@@ -4171,12 +4383,22 @@ def main() -> int:
     link_parser.add_argument("--output", type=Path, required=True)
     linker_execution_parser = subparsers.add_parser("validate-linker-execution")
     linker_execution_parser.add_argument("--trace", type=Path, required=True)
-    linker_execution_parser.add_argument("--linker", type=Path, required=True)
+    linker_execution_parser.add_argument("--linker-record", type=Path, required=True)
     linker_execution_parser.add_argument("--executable", type=Path, required=True)
     linker_execution_parser.add_argument(
         "--flavor", choices=("actual", "gnu", "lld"), required=True
     )
     linker_execution_parser.add_argument("--output", type=Path, required=True)
+    inspect_linker_parser = subparsers.add_parser("inspect-linker-record")
+    inspect_linker_parser.add_argument("--invocation-path", type=Path, required=True)
+    inspect_linker_parser.add_argument("--argv0", required=True)
+    inspect_linker_parser.add_argument(
+        "--flavor", choices=("actual", "gnu", "lld"), required=True
+    )
+    inspect_linker_parser.add_argument("--extraction-root", type=Path)
+    inspect_linker_parser.add_argument("--output", type=Path, required=True)
+    verify_linker_parser = subparsers.add_parser("verify-linker-record")
+    verify_linker_parser.add_argument("--record", type=Path, required=True)
     cargo_parser = subparsers.add_parser("select-cargo-executable")
     cargo_parser.add_argument("--cargo-output", type=Path, required=True)
     cargo_parser.add_argument("--bench", required=True)
@@ -4251,6 +4473,24 @@ def main() -> int:
             if not args.output.is_absolute():
                 raise LayoutError("--output must be absolute")
             _write_json_atomic(args.output, validate_linker_execution(args))
+        elif args.command == "inspect-linker-record":
+            if not args.output.is_absolute():
+                raise LayoutError("--output must be absolute")
+            _write_json_atomic(
+                args.output,
+                _inspect_linker_record(
+                    args.invocation_path,
+                    args.argv0,
+                    args.flavor,
+                    args.extraction_root,
+                ),
+            )
+        elif args.command == "verify-linker-record":
+            if not args.record.is_absolute():
+                raise LayoutError("--record must be absolute")
+            _verify_linker_record(
+                _json_file(args.record, "linker record"), "linker record"
+            )
         elif args.command == "select-cargo-executable":
             print(select_cargo_executable(args))
         elif args.command == "stage-validate-capability":
