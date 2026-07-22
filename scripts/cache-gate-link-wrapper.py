@@ -47,4 +47,13 @@ with trace.open("a", encoding="utf-8") as stream:
     stream.flush()
     os.fsync(stream.fileno())
     fcntl.flock(stream, fcntl.LOCK_UN)
-os.execv(str(driver), [str(driver), *sys.argv[1:]])
+compiler_environment = {"LC_ALL": "C", "PATH": record["path"]}
+for variable in (
+    "CACHE_GATE_INNER_LINK_DRIVER",
+    "CACHE_GATE_INNER_LINK_TRACE",
+    "CACHE_GATE_INNER_LINK_ROLE",
+    "CACHE_GATE_LINK_SESSION",
+):
+    if variable in os.environ:
+        compiler_environment[variable] = os.environ[variable]
+os.execve(str(driver), [str(driver), *sys.argv[1:]], compiler_environment)

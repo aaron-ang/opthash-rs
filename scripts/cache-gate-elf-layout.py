@@ -243,6 +243,23 @@ def _directory_identity_fingerprint(
     ).hexdigest()
 
 
+def _file_identity_token(
+    ancestry: tuple[tuple[int, int], ...], metadata: os.stat_result, content: bytes
+) -> str:
+    return ":".join(
+        (
+            _directory_identity_fingerprint(ancestry),
+            str(metadata.st_dev),
+            str(metadata.st_ino),
+            str(metadata.st_mode),
+            str(metadata.st_size),
+            str(metadata.st_mtime_ns),
+            str(metadata.st_ctime_ns),
+            hashlib.sha256(content).hexdigest(),
+        )
+    )
+
+
 def _read_descriptor(descriptor: int) -> bytes:
     chunks: list[bytes] = []
     while True:
@@ -291,10 +308,15 @@ class _CapabilityGuard:
         self.destination_ancestry: tuple[tuple[int, int], ...] = ()
         self.source_descriptor: int | None = None
         self.staged_descriptor: int | None = None
+        self.manifest_descriptor: int | None = None
         self.inotify_descriptor: int | None = None
         self.source_identity: tuple[int, int, int, int, int, int] | None = None
         self.staged_identity: tuple[int, int, int, int, int, int] | None = None
         self.staged_inode: tuple[int, int] | None = None
+        self.manifest_identity: tuple[int, int, int, int, int, int] | None = None
+        self.manifest_path: Path | None = None
+        self.manifest_bytes = b""
+        self.manifest_publish_identity = ""
         self.source_bytes = b""
         self.payload: dict[str, Any] = {}
         self.result = ""
@@ -446,6 +468,33 @@ class _CapabilityGuard:
                 error = ctypes.get_errno()
                 raise OSError(error, os.strerror(error))
 
+    def _watch_manifest(self) -> None:
+        assert self.inotify_descriptor is not None
+        assert self.manifest_descriptor is not None
+        libc = ctypes.CDLL(None, use_errno=True)
+        add = libc.inotify_add_watch
+        add.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32)
+        add.restype = ctypes.c_int
+        mask = (
+            self._IN_MOVE_SELF
+            | self._IN_DELETE_SELF
+            | self._IN_UNMOUNT
+            | self._IN_IGNORED
+            | self._IN_MODIFY
+            | self._IN_ATTRIB
+            | self._IN_CLOSE_WRITE
+        )
+        if (
+            add(
+                self.inotify_descriptor,
+                f"/proc/self/fd/{self.manifest_descriptor}".encode(),
+                mask,
+            )
+            < 0
+        ):
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+
     def _drain_events(self) -> None:
         if self.inotify_descriptor is None:
             return
@@ -461,7 +510,12 @@ class _CapabilityGuard:
     def checkpoint(self) -> None:
         self._drain_events()
         _require(
-            not self.poisoned, "capability guardian observed an inode lifecycle event"
+            not self.poisoned,
+            (
+                "guarded manifest lifecycle event"
+                if self.manifest_descriptor is not None
+                else "capability guardian observed an inode lifecycle event"
+            ),
         )
         assert self.source_descriptor is not None
         assert self.staged_descriptor is not None
@@ -499,6 +553,26 @@ class _CapabilityGuard:
             _read_descriptor(self.staged_descriptor) == self.source_bytes,
             "staged capability bytes changed while guarded",
         )
+        if self.manifest_descriptor is not None:
+            assert self.manifest_identity is not None
+            assert self.manifest_path is not None
+            _require(
+                _stat_identity(os.fstat(self.manifest_descriptor))
+                == self.manifest_identity
+                == _stat_identity(
+                    os.stat(
+                        self.manifest_path.name,
+                        dir_fd=self.destination_parent,
+                        follow_symlinks=False,
+                    )
+                ),
+                "guarded manifest changed while guarded",
+            )
+            os.lseek(self.manifest_descriptor, 0, os.SEEK_SET)
+            _require(
+                _read_descriptor(self.manifest_descriptor) == self.manifest_bytes,
+                "guarded manifest bytes changed while guarded",
+            )
         _verify_directory_identity_chain(
             self.source.parent, self.source_ancestry, "capability input"
         )
@@ -509,61 +583,52 @@ class _CapabilityGuard:
         )
         self._drain_events()
         _require(
-            not self.poisoned, "capability guardian observed an inode lifecycle event"
+            not self.poisoned,
+            (
+                "guarded manifest lifecycle event"
+                if self.manifest_descriptor is not None
+                else "capability guardian observed an inode lifecycle event"
+            ),
         )
 
     def finalize(
         self,
+        manifest_path: Path,
         manifest_validator: Callable[[dict[str, Any], Path, bytes], None] | None = None,
     ) -> None:
         self.checkpoint()
-        manifest_descriptor = os.open(
-            "manifest.json",
+        _require(
+            manifest_path.is_absolute()
+            and manifest_path.parent == self.destination.parent
+            and manifest_path.name.startswith(".manifest.")
+            and manifest_path.name.endswith(".pending.json"),
+            "guarded manifest pending path is invalid",
+        )
+        _require(
+            not (self.destination.parent / "manifest.json").exists(),
+            "final manifest path exists before guardian commit",
+        )
+        self.manifest_path = manifest_path
+        self.manifest_descriptor = os.open(
+            manifest_path.name,
             os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=self.destination_parent,
         )
-        try:
-            before = os.fstat(manifest_descriptor)
-            _require(
-                stat.S_ISREG(before.st_mode) and before.st_nlink == 1,
-                "guarded manifest is not a private regular file",
-            )
-            manifest_bytes = _read_descriptor(manifest_descriptor)
-            manifest = json.loads(manifest_bytes)
-            _require(
-                _stat_identity(
-                    os.stat(
-                        "manifest.json",
-                        dir_fd=self.destination_parent,
-                        follow_symlinks=False,
-                    )
-                )
-                == _stat_identity(before),
-                "guarded manifest path changed before validation",
-            )
-            if manifest_validator is not None:
-                manifest_validator(
-                    manifest,
-                    self.destination.parent / "manifest.json",
-                    self.source_bytes,
-                )
-            os.lseek(manifest_descriptor, 0, os.SEEK_SET)
-            after = os.fstat(manifest_descriptor)
-            _require(
-                _stat_identity(before)
-                == _stat_identity(after)
-                == _stat_identity(
-                    os.stat(
-                        "manifest.json",
-                        dir_fd=self.destination_parent,
-                        follow_symlinks=False,
-                    )
-                )
-                and _read_descriptor(manifest_descriptor) == manifest_bytes,
-                "guarded manifest changed during full validation",
-            )
-        finally:
-            os.close(manifest_descriptor)
+        before = os.fstat(self.manifest_descriptor)
+        _require(
+            stat.S_ISREG(before.st_mode)
+            and before.st_nlink == 1
+            and before.st_mode & 0o777 == 0o444,
+            "guarded manifest is not a private read-only regular file",
+        )
+        self.manifest_identity = _stat_identity(before)
+        self.manifest_bytes = _read_descriptor(self.manifest_descriptor)
+        self._watch_manifest()
+        self.checkpoint()
+        manifest = json.loads(self.manifest_bytes)
+        if manifest_validator is not None:
+            manifest_validator(manifest, manifest_path, self.source_bytes)
+        self.checkpoint()
         embedded = manifest.get("linker_capability", {})
         _require(
             isinstance(embedded, dict)
@@ -576,7 +641,17 @@ class _CapabilityGuard:
             == self.payload,
             "guarded manifest capability differs from held bytes",
         )
+        _require(
+            not (self.destination.parent / "manifest.json").exists(),
+            "final manifest path appeared during guardian validation",
+        )
         self.checkpoint()
+        assert self.manifest_identity is not None
+        self.manifest_publish_identity = _file_identity_token(
+            self.destination_ancestry,
+            os.fstat(self.manifest_descriptor),
+            self.manifest_bytes,
+        )
         self.committed = True
 
     def close(self, *, remove_stage: bool) -> None:
@@ -608,7 +683,11 @@ class _CapabilityGuard:
         if self.inotify_descriptor is not None:
             os.close(self.inotify_descriptor)
             self.inotify_descriptor = None
-        for descriptor_name in ("staged_descriptor", "source_descriptor"):
+        for descriptor_name in (
+            "manifest_descriptor",
+            "staged_descriptor",
+            "source_descriptor",
+        ):
             descriptor = getattr(self, descriptor_name)
             if descriptor is not None:
                 os.close(descriptor)
@@ -622,6 +701,250 @@ class _CapabilityGuard:
             descriptors.clear()
         if checkpoint_error is not None:
             raise checkpoint_error
+
+
+def _guarded_file_identity(path: Path) -> str:
+    _require(path.is_absolute(), "guarded file path must be absolute")
+    parent, ancestry = _open_directory_with_identity_chain(path.parent)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent,
+        )
+        metadata = os.fstat(descriptor)
+        content = _read_descriptor(descriptor)
+        _require(
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_nlink == 1
+            and metadata.st_mode & 0o777 == 0o444
+            and _stat_identity(os.stat(path.name, dir_fd=parent, follow_symlinks=False))
+            == _stat_identity(metadata),
+            "guarded file is not one exact private read-only inode",
+        )
+        return _file_identity_token(ancestry, metadata, content)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _link_descriptor_noreplace(
+    source_descriptor: int, destination_parent: int, destination_name: str
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    linkat = libc.linkat
+    linkat.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    )
+    linkat.restype = ctypes.c_int
+    if (
+        linkat(
+            -100,
+            f"/proc/self/fd/{source_descriptor}".encode(),
+            destination_parent,
+            destination_name.encode(),
+            0x400,
+        )
+        != 0
+    ):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _write_private_pending(output: Path, content: bytes) -> None:
+    _require(
+        output.is_absolute()
+        and output.name.startswith(".manifest.")
+        and output.name.endswith(".pending.json"),
+        "private pending manifest path is invalid",
+    )
+    parent, ancestry = _open_directory_with_identity_chain(output.parent)
+    descriptor: int | None = None
+    temporary_name: str | None = None
+    metadata: os.stat_result | None = None
+    linked = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        for _ in range(128):
+            candidate = f".manifest.{os.urandom(16).hex()}.tmp"
+            try:
+                descriptor = os.open(candidate, flags, 0o600, dir_fd=parent)
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            metadata = os.fstat(descriptor)
+            break
+        _require(descriptor is not None, "cannot allocate private manifest temporary")
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            _require(written > 0, "cannot write private pending manifest")
+            remaining = remaining[written:]
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        assert temporary_name is not None
+        temporary_stat = os.stat(temporary_name, dir_fd=parent, follow_symlinks=False)
+        _require(
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_nlink == 1
+            and metadata.st_mode & 0o777 == 0o444
+            and _stat_identity(temporary_stat) == _stat_identity(metadata),
+            "private manifest temporary differs from held inode",
+        )
+        _verify_directory_identity_chain(
+            output.parent, ancestry, "private pending manifest"
+        )
+        _link_descriptor_noreplace(descriptor, parent, output.name)
+        linked = True
+        linked_metadata = os.fstat(descriptor)
+        published = os.stat(output.name, dir_fd=parent, follow_symlinks=False)
+        _require(
+            _stat_identity(published) == _stat_identity(linked_metadata)
+            and published.st_nlink == 2,
+            "private pending manifest differs from held inode",
+        )
+        _verify_directory_identity_chain(
+            output.parent, ancestry, "private pending manifest"
+        )
+        current_temporary = os.stat(
+            temporary_name, dir_fd=parent, follow_symlinks=False
+        )
+        _require(
+            _stat_identity(current_temporary) == _stat_identity(linked_metadata),
+            "private manifest temporary name changed during publication",
+        )
+        os.unlink(temporary_name, dir_fd=parent)
+        temporary_name = None
+        os.fsync(parent)
+        final_metadata = os.fstat(descriptor)
+        final = os.stat(output.name, dir_fd=parent, follow_symlinks=False)
+        _require(
+            _stat_identity(final) == _stat_identity(final_metadata)
+            and final.st_nlink == 1
+            and final.st_mode & 0o777 == 0o444,
+            "private pending manifest final inode is invalid",
+        )
+        _verify_directory_identity_chain(
+            output.parent, ancestry, "private pending manifest"
+        )
+        linked = False
+    except Exception:
+        if linked and metadata is not None:
+            try:
+                current = os.stat(output.name, dir_fd=parent, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    os.unlink(output.name, dir_fd=parent)
+                    os.fsync(parent)
+            except OSError:
+                pass
+        raise
+    finally:
+        if temporary_name is not None and metadata is not None:
+            try:
+                current = os.stat(temporary_name, dir_fd=parent, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    os.unlink(temporary_name, dir_fd=parent)
+                    os.fsync(parent)
+            except OSError:
+                pass
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _publish_guarded_manifest(
+    pending: Path,
+    output: Path,
+    expected_identity: str,
+    held_fd_path: Path | None = None,
+) -> None:
+    _require(
+        pending.is_absolute()
+        and output.is_absolute()
+        and pending.parent == output.parent
+        and pending.name.startswith(".manifest.")
+        and pending.name.endswith(".pending.json")
+        and output.name == "manifest.json",
+        "guarded manifest publication paths are invalid",
+    )
+    parent, ancestry = _open_directory_with_identity_chain(pending.parent)
+    held: int | None = None
+    linked = False
+    try:
+        source = held_fd_path if held_fd_path is not None else pending
+        held = os.open(source, os.O_RDONLY | os.O_CLOEXEC)
+        metadata = os.fstat(held)
+        content = _read_descriptor(held)
+        pending_stat = os.stat(pending.name, dir_fd=parent, follow_symlinks=False)
+        _require(
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_nlink == 1
+            and metadata.st_mode & 0o777 == 0o444
+            and _stat_identity(pending_stat) == _stat_identity(metadata)
+            and _file_identity_token(ancestry, metadata, content) == expected_identity,
+            "pending manifest differs from guardian publish identity",
+        )
+        _verify_directory_identity_chain(
+            pending.parent, ancestry, "guarded manifest publication"
+        )
+        _link_descriptor_noreplace(held, parent, output.name)
+        linked = True
+        published = os.stat(output.name, dir_fd=parent, follow_symlinks=False)
+        _require(
+            (published.st_dev, published.st_ino) == (metadata.st_dev, metadata.st_ino),
+            "published manifest differs from held guardian inode",
+        )
+        current_pending = os.stat(pending.name, dir_fd=parent, follow_symlinks=False)
+        _require(
+            (current_pending.st_dev, current_pending.st_ino)
+            == (metadata.st_dev, metadata.st_ino),
+            "pending manifest name changed during publication",
+        )
+        os.unlink(pending.name, dir_fd=parent)
+        os.fsync(parent)
+        final = os.stat(output.name, dir_fd=parent, follow_symlinks=False)
+        _require(
+            (final.st_dev, final.st_ino) == (metadata.st_dev, metadata.st_ino)
+            and final.st_nlink == 1
+            and final.st_mode & 0o777 == 0o444,
+            "published manifest final inode is invalid",
+        )
+        _verify_directory_identity_chain(
+            pending.parent, ancestry, "guarded manifest publication"
+        )
+        linked = False
+    except Exception:
+        if linked:
+            try:
+                current = os.stat(output.name, dir_fd=parent, follow_symlinks=False)
+                if held is not None:
+                    held_stat = os.fstat(held)
+                    if (current.st_dev, current.st_ino) == (
+                        held_stat.st_dev,
+                        held_stat.st_ino,
+                    ):
+                        os.unlink(output.name, dir_fd=parent)
+                        os.fsync(parent)
+            except OSError:
+                pass
+        raise
+    finally:
+        if held is not None:
+            os.close(held)
+        os.close(parent)
 
 
 def _stage_capability_once(
@@ -1230,8 +1553,20 @@ def replay_linker_execution(
         },
     }
     if role is not None:
+        cwd = observed.get("cwd")
+        embedded_path = observed.get("path")
+        _require(
+            isinstance(cwd, str)
+            and Path(cwd).is_absolute()
+            and Path(cwd).is_dir()
+            and isinstance(embedded_path, str)
+            and bool(embedded_path),
+            f"observed {flavor} linker environment is incomplete",
+        )
         result["role"] = role
         result["session"] = session
+        result["cwd"] = cwd
+        result["path"] = embedded_path
     return result
 
 
@@ -1394,115 +1729,140 @@ def _raw_linker_controls(
     return scripts, maps
 
 
-def _normalize_raw_linker_semantics(argv: list[str]) -> list[str]:
-    normalized: list[str] = []
-    index = 0
-    paired = {
-        "-o": "output",
-        "--output": "output",
-        "-L": "library-path",
-        "-T": "script",
-        "--script": "script",
-        "-Map": "map",
-        "--Map": "map",
+def _normalize_driver_flag(argument: str) -> str:
+    if argument.startswith("-plugin-opt=-fresolution="):
+        return "-plugin-opt=-fresolution=<driver-temporary>"
+    return argument
+
+
+def _linker_semantic_categories(argv: list[str]) -> dict[str, list[str]]:
+    output: list[str] = []
+    library_paths: list[str] = []
+    ordered_semantics: list[str] = []
+    paired_flags = {
+        "-plugin",
+        "-dynamic-linker",
+        "-m",
+        "-z",
+        "-e",
+        "-T",
+        "--script",
+        "-Map",
+        "--Map",
+        "-rpath",
+        "-rpath-link",
+        "-soname",
+        "--version-script",
+        "-u",
+        "--undefined",
+        "-Y",
+        "-a",
+        "-b",
+        "--format",
     }
+    file_suffix = re.compile(r"(?:\.o|\.rlib|\.a|\.so(?:\.[^/]+)*)$")
+    index = 0
     while index < len(argv):
         argument = argv[index]
-        if argument in paired and index + 1 < len(argv):
-            normalized.append(f"{paired[argument]}:{argv[index + 1]}")
+        if argument in {"-o", "--output"} and index + 1 < len(argv):
+            output.append(argv[index + 1])
             index += 2
             continue
         if argument.startswith("--output="):
-            normalized.append(f"output:{argument.split('=', 1)[1]}")
+            output.append(argument.split("=", 1)[1])
         elif argument.startswith("-o") and len(argument) > 2:
-            normalized.append(f"output:{argument[2:]}")
-        elif argument.startswith("-L") and len(argument) > 2:
-            normalized.append(f"library-path:{argument[2:]}")
-        elif argument.startswith("-l") and len(argument) > 2:
-            normalized.append(f"library:{argument}")
-        elif argument.startswith("--script="):
-            normalized.append(f"script:{argument.split('=', 1)[1]}")
-        elif argument.startswith("-T") and len(argument) > 2:
-            normalized.append(f"script:{argument[2:]}")
-        elif argument.startswith("-Map=") or argument.startswith("--Map="):
-            normalized.append(f"map:{argument.split('=', 1)[1]}")
-        elif not argument.startswith("-"):
-            normalized.append(f"input:{argument}")
-        else:
-            normalized.append(f"flag:{argument}")
-        index += 1
-    return normalized
-
-
-def _normalize_cargo_linker_semantics(argv: list[str]) -> list[str]:
-    linker_argv: list[str] = []
-    index = 0
-    while index < len(argv):
-        argument = argv[index]
-        if argument.startswith("-Wl,"):
-            linker_argv.extend(argument.removeprefix("-Wl,").split(","))
-        elif argument == "-Xlinker" and index + 1 < len(argv):
-            linker_argv.append(argv[index + 1])
-            index += 1
-        elif argument.startswith("-Xlinker="):
-            linker_argv.append(argument.removeprefix("-Xlinker="))
-        elif argument in {"-o", "--output", "-L"} and index + 1 < len(argv):
-            linker_argv.extend((argument, argv[index + 1]))
-            index += 1
-        elif argument.startswith(
-            ("-o", "--output=", "-L", "-l")
-        ) or not argument.startswith("-"):
-            linker_argv.append(argument)
-        index += 1
-    return _normalize_raw_linker_semantics(linker_argv)
-
-
-def _is_ordered_subsequence(expected: list[str], observed: list[str]) -> bool:
-    cursor = iter(observed)
-    return all(any(candidate == value for candidate in cursor) for value in expected)
-
-
-def _unexpected_explicit_linker_semantics(
-    expected: list[str], observed: list[str]
-) -> list[str]:
-    matched: set[int] = set()
-    cursor = 0
-    for value in expected:
-        while cursor < len(observed) and observed[cursor] != value:
-            cursor += 1
-        if cursor == len(observed):
-            return ["missing:" + value]
-        matched.add(cursor)
-        cursor += 1
-    sensitive_flags = {
-        "flag:--as-needed",
-        "flag:--no-as-needed",
-        "flag:-Bstatic",
-        "flag:-Bdynamic",
-        "flag:--whole-archive",
-        "flag:--no-whole-archive",
-        "flag:-static",
-        "flag:-shared",
-        "flag:-pie",
-        "flag:-no-pie",
-    }
-    default_libraries = {"library:-lc", "library:-lgcc", "library:-lgcc_s"}
-    crt_object = re.compile(
-        r"^(?:[A-Za-z]*crt[0-9A-Za-z_]*|crt(?:begin|end)[0-9A-Za-z_]*)\.o$"
-    )
-    unexpected: list[str] = []
-    for index, value in enumerate(observed):
-        if index in matched:
+            output.append(argument[2:])
+        elif argument == "-L" and index + 1 < len(argv):
+            library_paths.append(os.path.normpath(argv[index + 1]))
+            index += 2
             continue
-        if value in sensitive_flags:
-            unexpected.append(value)
-        elif value.startswith("library:") and value not in default_libraries:
-            unexpected.append(value)
-        elif value.startswith("input:"):
-            name = Path(value.removeprefix("input:")).name
-            if name.endswith((".o", ".rlib", ".a")) and not crt_object.fullmatch(name):
-                unexpected.append(value)
-    return unexpected
+        elif argument.startswith("-L") and len(argument) > 2:
+            library_paths.append(os.path.normpath(argument[2:]))
+        elif argument in {"-l", "--library"} and index + 1 < len(argv):
+            ordered_semantics.append(f"library:-l{argv[index + 1]}")
+            index += 2
+            continue
+        elif argument.startswith("--library="):
+            ordered_semantics.append(f"library:-l{argument.split('=', 1)[1]}")
+        elif argument.startswith("-l") and len(argument) > 2:
+            ordered_semantics.append(f"library:{argument}")
+        elif argument in paired_flags and index + 1 < len(argv):
+            ordered_semantics.append(
+                f"flag:{argument}={_normalize_driver_flag(argv[index + 1])}"
+            )
+            index += 2
+            continue
+        elif not argument.startswith("-") and file_suffix.search(argument):
+            ordered_semantics.append(f"input:{os.path.normpath(argument)}")
+        else:
+            ordered_semantics.append(f"argument:{_normalize_driver_flag(argument)}")
+        index += 1
+    return {
+        "output": output,
+        "library_paths": library_paths,
+        "ordered_semantics": ordered_semantics,
+    }
+
+
+def _validate_driver_semantic_closure(
+    projected: list[str], observed: list[str], label: str
+) -> None:
+    projected_categories = _linker_semantic_categories(projected)
+    observed_categories = _linker_semantic_categories(observed)
+    _require(
+        projected_categories == observed_categories,
+        f"{label} driver/linker semantic categories differ",
+    )
+
+
+def _project_driver_linker_argv(
+    driver: Path,
+    printed_argv: list[str],
+    raw_output: str,
+    cwd: Path,
+    embedded_path: str,
+    label: str,
+) -> list[str]:
+    _require(cwd.is_absolute() and cwd.is_dir(), f"{label} trace cwd is invalid")
+    path_parts = embedded_path.split(os.pathsep)
+    _require(
+        bool(path_parts)
+        and all(
+            component and Path(component).is_absolute() for component in path_parts
+        ),
+        f"{label} trace PATH is invalid",
+    )
+    environment = {"LC_ALL": "C", "PATH": embedded_path}
+    completed = subprocess.run(
+        [str(driver), "-###", *printed_argv],
+        cwd=cwd,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    _require(completed.returncode == 0, f"{label} compiler projection failed")
+    candidates: list[list[str]] = []
+    for line in (*completed.stdout.splitlines(), *completed.stderr.splitlines()):
+        try:
+            command = shlex.split(line)
+        except ValueError:
+            continue
+        if len(command) < 2:
+            continue
+        executable = Path(command[0])
+        if not executable.is_absolute() or not executable.is_file():
+            continue
+        candidate = [
+            argument for argument in command[1:] if not argument.startswith("-fuse-ld=")
+        ]
+        if _raw_output_values(candidate) == [raw_output]:
+            candidates.append(candidate)
+    _require(
+        len(candidates) == 1,
+        f"{label} compiler projection did not identify one exact linker command",
+    )
+    return candidates[0]
 
 
 def _validate_explicit_link_argv_trace(
@@ -1574,16 +1934,15 @@ def _validate_explicit_link_argv_trace(
         and bool(observed["session"]),
         f"{label} Cargo/linker trace correlation differs",
     )
-    normalized_cargo = _normalize_cargo_linker_semantics(printed_argv)
-    normalized_linker = _normalize_raw_linker_semantics(observed_argv)
-    _require(
-        _is_ordered_subsequence(normalized_cargo, normalized_linker),
-        f"{label} normalized Cargo/linker argv differs",
+    projected = _project_driver_linker_argv(
+        configured_driver,
+        printed_argv,
+        cargo_observed["raw_output"],
+        Path(cargo_observed.get("cwd", "")),
+        cargo_observed.get("path", ""),
+        label,
     )
-    _require(
-        not _unexpected_explicit_linker_semantics(normalized_cargo, normalized_linker),
-        f"{label} normalized Cargo/linker argv has extra semantic inputs",
-    )
+    _validate_driver_semantic_closure(projected, observed_argv, label)
 
 
 def replay_link_command(
@@ -3554,8 +3913,20 @@ def validate_linker_execution(args: argparse.Namespace) -> dict[str, Any]:
         },
     }
     if role is not None:
+        cwd = record.get("cwd")
+        embedded_path = record.get("path")
+        _require(
+            isinstance(cwd, str)
+            and Path(cwd).is_absolute()
+            and Path(cwd).is_dir()
+            and isinstance(embedded_path, str)
+            and bool(embedded_path),
+            "observed linker environment is incomplete",
+        )
         result["role"] = role
         result["session"] = session
+        result["cwd"] = cwd
+        result["path"] = embedded_path
     return result
 
 
@@ -3698,6 +4069,7 @@ def _serve_capability_guard(
     command_stream: Any,
     response_stream: Any,
     manifest_validator: Callable[[dict[str, Any], Path, bytes], None] | None = None,
+    manifest_path: Path | None = None,
 ) -> int:
     print(guard.result, file=response_stream, flush=True)
     print(guard.identity, file=response_stream, flush=True)
@@ -3731,8 +4103,16 @@ def _serve_capability_guard(
                 guard.checkpoint()
                 print("OK", file=response_stream, flush=True)
             elif command == "FINALIZE":
-                guard.finalize(manifest_validator)
+                _require(
+                    manifest_path is not None, "guardian lacks pending manifest path"
+                )
+                guard.finalize(manifest_path, manifest_validator)
                 print("COMMITTED", file=response_stream, flush=True)
+                print(
+                    guard.manifest_publish_identity,
+                    file=response_stream,
+                    flush=True,
+                )
                 return 0
             elif command == "ABORT":
                 print("ABORTED", file=response_stream, flush=True)
@@ -3752,6 +4132,7 @@ def guard_capability(args: argparse.Namespace) -> int:
             sys.stdin,
             sys.stdout,
             validate_supplied_manifest,
+            args.manifest_pending,
         )
         remove_stage = not guard.committed
         return result
@@ -3815,6 +4196,14 @@ def main() -> int:
         "--arch", choices=("aarch64", "x86_64"), required=True
     )
     guard_capability_parser.add_argument("--tools", type=Path, required=True)
+    guard_capability_parser.add_argument("--manifest-pending", type=Path, required=True)
+    publish_manifest_parser = subparsers.add_parser("publish-guarded-manifest")
+    publish_manifest_parser.add_argument("--input", type=Path, required=True)
+    publish_manifest_parser.add_argument("--output", type=Path, required=True)
+    publish_manifest_parser.add_argument("--identity", required=True)
+    publish_manifest_parser.add_argument("--held-fd-path", type=Path)
+    private_pending_parser = subparsers.add_parser("write-private-pending")
+    private_pending_parser.add_argument("--output", type=Path, required=True)
     verify_capability_parser = subparsers.add_parser("verify-staged-capability")
     verify_capability_parser.add_argument("--path", type=Path, required=True)
     verify_capability_parser.add_argument("--identity", required=True)
@@ -3871,6 +4260,15 @@ def main() -> int:
             print(document)
         elif args.command == "guard-capability":
             return guard_capability(args)
+        elif args.command == "publish-guarded-manifest":
+            _publish_guarded_manifest(
+                args.input,
+                args.output,
+                args.identity,
+                args.held_fd_path,
+            )
+        elif args.command == "write-private-pending":
+            _write_private_pending(args.output, sys.stdin.buffer.read())
         elif args.command == "verify-staged-capability":
             verify_staged_capability(args.path, args.identity)
         else:

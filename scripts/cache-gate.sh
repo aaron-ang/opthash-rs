@@ -644,6 +644,7 @@ unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 manifest_dir="$REPO_ROOT/target/cache-gate/$arch/$CACHE_GATE_VARIANT"
 build_root="$REPO_ROOT/target/cache-gate-build/$CACHE_GATE_MANIFEST_INSTANCE"
+manifest_pending="$manifest_dir/.manifest.$CACHE_GATE_MANIFEST_INSTANCE.pending.json"
 [[ ! -e $manifest_dir && ! -e $build_root ]] || { echo "error: variant output already exists" >&2; exit 1; }
 staging_uid=$(id -u)
 staging_gid=$(id -g)
@@ -678,7 +679,8 @@ cp -- "$REPO_ROOT/benches/cache-gate-elastic-layout.ld" "$manifest_dir/linker-fr
 cp -- "$REPO_ROOT/benches/cache-gate-funnel-layout.ld" "$manifest_dir/linker-fragments/funnel.ld"
 cp -- "$REPO_ROOT/benches/cache-gate-profile-layout.ld" "$manifest_dir/linker-fragments/profile.ld"
 coproc CAPABILITY_GUARD { "$CACHE_GATE_ELF_LAYOUT_TOOL" guard-capability --input "$capability_input" \
-	--output "$manifest_dir/linker-capability.json" --arch "$arch" --tools "$authenticated_tools"; }
+	--output "$manifest_dir/linker-capability.json" --manifest-pending "$manifest_pending" \
+	--arch "$arch" --tools "$authenticated_tools"; }
 capability_guard_pid=$CAPABILITY_GUARD_PID
 capability_guard_read_fd=${CAPABILITY_GUARD[0]}
 capability_guard_write_fd=${CAPABILITY_GUARD[1]}
@@ -787,7 +789,8 @@ for executable in elastic_cache_gate funnel_cache_gate cache_gate_profile; do
 done
 
 verify_staged_capability
-python3 - "$manifest_dir/manifest.json" "$head_commit" "$head_tree" "$arch" "$CACHE_GATE_VARIANT" "$CACHE_GATE_CONTROL_BIN" "$CACHE_GATE_CONTROL_PROVENANCE" "$elastic_bin" "$funnel_bin" "$profile_bin" "$REPO_ROOT" "${CACHE_GATE_LAYOUT_ADVERSARY:-0}" "$CACHE_GATE_MANIFEST_INSTANCE" "$authenticated_tools" "$capability_identity" "$capability_document_b64" <<'PY'
+python3 - "$manifest_pending" "$head_commit" "$head_tree" "$arch" "$CACHE_GATE_VARIANT" "$CACHE_GATE_CONTROL_BIN" "$CACHE_GATE_CONTROL_PROVENANCE" "$elastic_bin" "$funnel_bin" "$profile_bin" "$REPO_ROOT" "${CACHE_GATE_LAYOUT_ADVERSARY:-0}" "$CACHE_GATE_MANIFEST_INSTANCE" "$authenticated_tools" "$capability_identity" "$capability_document_b64" <<'PY' | \
+	"$CACHE_GATE_ELF_LAYOUT_TOOL" write-private-pending --output "$manifest_pending"
 import base64
 import hashlib
 import json
@@ -958,23 +961,28 @@ payload = {
     },
     "layout_adversary":{"enabled":adversary_enabled,"symbol":"cache_gate_layout_adversary_private","input_section":".text.opthash.cache_gate.layout_adversary"},
 }
-with open(output + ".tmp", "w", encoding="utf-8") as stream:
-    json.dump(payload, stream, indent=2, sort_keys=True)
-    stream.write("\n")
-Path(output + ".tmp").replace(output)
+json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
 PY
 
 verify_staged_capability
-symbol_count=$(jq '[.symbols[].symbols[]] | length' "$manifest_dir/manifest.json")
+symbol_count=$(jq '[.symbols[].symbols[]] | length' "$manifest_pending")
 [[ $symbol_count == 8 ]] || { echo "error: manifest resolved $symbol_count symbols, expected 8" >&2; exit 1; }
 verify_staged_capability
-"$CACHE_GATE_ELF_LAYOUT_TOOL" validate-manifest --manifest "$manifest_dir/manifest.json" \
+"$CACHE_GATE_ELF_LAYOUT_TOOL" validate-manifest --manifest "$manifest_pending" \
 	--capability-document-b64 "$capability_document_b64"
 verify_staged_capability
+test ! -e "$manifest_dir/manifest.json" || { echo "error: final manifest appeared before guardian commit" >&2; exit 1; }
+exec {manifest_hold_fd}<"$manifest_pending"
 printf 'FINALIZE\n' >&"$capability_guard_write_fd" || { echo "error: capability guardian command channel closed" >&2; exit 1; }
 IFS= read -r capability_guard_final <&"$capability_guard_read_fd" || { echo "error: capability guardian exited before FINALIZE" >&2; exit 1; }
 [[ $capability_guard_final == COMMITTED ]] || { echo "error: capability guardian rejected FINALIZE" >&2; exit 1; }
+IFS= read -r manifest_publish_identity <&"$capability_guard_read_fd" || { echo "error: capability guardian omitted publish identity" >&2; exit 1; }
 wait "$capability_guard_pid" || { echo "error: capability guardian failed after FINALIZE" >&2; exit 1; }
 capability_guard_active=0
 trap - EXIT
+"$CACHE_GATE_ELF_LAYOUT_TOOL" publish-guarded-manifest \
+	--input "$manifest_pending" --output "$manifest_dir/manifest.json" \
+	--identity "$manifest_publish_identity" --held-fd-path "/proc/$BASHPID/fd/$manifest_hold_fd"
+exec {manifest_hold_fd}<&-
 echo "$manifest_dir/manifest.json"

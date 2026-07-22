@@ -7,6 +7,7 @@ import json
 import os
 import runpy
 import shlex
+import stat
 import subprocess
 from pathlib import Path
 
@@ -731,13 +732,22 @@ def test_main_link_replay_rejects_hidden_or_conflicting_controls(tmp_path, attac
 
 def test_link_wrapper_records_driver_bytes_and_exact_argv(tmp_path):
     driver = tmp_path / "driver"
-    driver.write_text("#!/bin/sh\nexit 0\n")
+    driver.write_text(
+        "#!/bin/sh\n"
+        'test "${LIBRARY_PATH+x}" != x || exit 41\n'
+        'test "${CPATH+x}" != x || exit 42\n'
+        'test "${LC_ALL:-}" = C || exit 43\n'
+        "exit 0\n"
+    )
     driver.chmod(0o755)
     trace = tmp_path / "trace.jsonl"
     env = {
         **os.environ,
         "CACHE_GATE_LINK_DRIVER": str(driver.resolve()),
         "CACHE_GATE_LINK_TRACE": str(trace.resolve()),
+        "LIBRARY_PATH": "/fixture/evil-library-path",
+        "CPATH": "/fixture/evil-include-path",
+        "LC_ALL": "C.UTF-8",
     }
     completed = subprocess.run(
         [str(LINK_WRAPPER), "-o", str((tmp_path / "output").resolve())],
@@ -756,6 +766,48 @@ def test_link_wrapper_records_driver_bytes_and_exact_argv(tmp_path):
             "path": os.environ["PATH"],
         }
     ]
+
+
+def test_driver_projection_uses_only_authenticated_compiler_environment(
+    tmp_path, monkeypatch
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    driver = tmp_path / "cc"
+    driver.write_text("fixture compiler\n")
+    raw_output = tmp_path / "probe"
+    embedded_path = "/usr/bin:/bin"
+    captured = {}
+
+    class ProjectionSubprocess:
+        @staticmethod
+        def run(arguments, **kwargs):
+            captured["environment"] = kwargs["env"]
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout="",
+                stderr=(
+                    f"{shlex.quote(str(driver))} -o {shlex.quote(str(raw_output))}\n"
+                ),
+            )
+
+    namespace["_project_driver_linker_argv"].__globals__["subprocess"] = (
+        ProjectionSubprocess()
+    )
+    monkeypatch.setenv("LIBRARY_PATH", "/fixture/evil-library-path")
+    monkeypatch.setenv("GCC_EXEC_PREFIX", "/fixture/evil-gcc-prefix")
+
+    projected = namespace["_project_driver_linker_argv"](
+        driver,
+        ["-o", str(raw_output)],
+        str(raw_output),
+        tmp_path,
+        embedded_path,
+        "compiler environment",
+    )
+
+    assert projected == ["-o", str(raw_output)]
+    assert captured["environment"] == {"LC_ALL": "C", "PATH": embedded_path}
 
 
 def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
@@ -823,6 +875,7 @@ def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
 
 
 def test_outer_and_inner_wrappers_produce_correlated_replayable_gnu_traces(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
     compiler = Path("/usr/bin/cc").resolve()
     linker = Path("/usr/bin/ld.bfd").resolve()
     if not compiler.is_file() or not linker.is_file():
@@ -900,6 +953,19 @@ def test_outer_and_inner_wrappers_produce_correlated_replayable_gnu_traces(tmp_p
         record = json.loads(execution.read_text())
         assert record["role"] == role
         assert record["session"] == "integration-session"
+    outer = json.loads(outer_trace.read_text())
+    inner = json.loads(inner_trace.read_text())
+    projected = namespace["_project_driver_linker_argv"](
+        compiler,
+        outer["argv"],
+        str(raw_output),
+        Path(outer["cwd"]),
+        outer["path"],
+        "native GNU fixture",
+    )
+    namespace["_validate_driver_semantic_closure"](
+        projected, inner["argv"], "native GNU fixture"
+    )
 
 
 def test_actual_driver_execution_record_uses_forwarded_linker_version(tmp_path):
@@ -1423,6 +1489,7 @@ def test_capability_guard_rejects_rename_away_restore_between_checks(tmp_path, r
             guard.checkpoint()
     finally:
         guard.close(remove_stage=True)
+    assert not (stage_parent / "manifest.json").exists()
 
 
 def test_capability_guard_holds_descriptors_and_ignores_normal_child_creation(
@@ -1451,6 +1518,7 @@ def test_capability_guard_holds_descriptors_and_ignores_normal_child_creation(
         guard.checkpoint()
     finally:
         guard.close(remove_stage=True)
+    assert not (stage_parent / "manifest.json").exists()
 
 
 def test_capability_guard_treats_command_eof_as_failure(tmp_path):
@@ -1474,6 +1542,7 @@ def test_capability_guard_treats_command_eof_as_failure(tmp_path):
                 namespace["_serve_capability_guard"](guard, commands, output)
     finally:
         guard.close(remove_stage=True)
+    assert not (stage_parent / "manifest.json").exists()
 
 
 def test_capability_guard_finalizes_only_exact_held_manifest(tmp_path):
@@ -1497,11 +1566,11 @@ def test_capability_guard_finalizes_only_exact_held_manifest(tmp_path):
                 "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             },
         }
-        temporary = stage_parent / "manifest.json.tmp"
+        temporary = stage_parent / ".manifest.fixture.pending.json"
         temporary.write_text(json.dumps({"linker_capability": embedded}) + "\n")
-        temporary.replace(stage_parent / "manifest.json")
+        temporary.chmod(0o444)
 
-        guard.finalize()
+        guard.finalize(temporary.resolve())
 
         assert guard.committed is True
     finally:
@@ -1528,17 +1597,19 @@ def test_capability_guard_runs_full_validation_on_exact_manifest_bytes(tmp_path)
             "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         },
     }
-    manifest_path = stage_parent / "manifest.json"
+    manifest_path = stage_parent / ".manifest.fixture.pending.json"
     manifest_path.write_text(
         json.dumps({"linker_capability": embedded, "proof": "forged"}) + "\n"
     )
+    manifest_path.chmod(0o444)
     try:
         with pytest.raises(ValueError, match="full manifest rejected"):
             guard.finalize(
+                manifest_path.resolve(),
                 lambda manifest, *_: namespace["_require"](
                     manifest.get("proof") == "authenticated",
                     "full manifest rejected",
-                )
+                ),
             )
         assert guard.committed is False
     finally:
@@ -1567,20 +1638,218 @@ def test_capability_guard_rejects_manifest_replacement_during_full_validation(
             "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         },
     }
-    manifest_path = stage_parent / "manifest.json"
+    manifest_path = stage_parent / ".manifest.fixture.pending.json"
     manifest_path.write_text(json.dumps({"linker_capability": embedded}) + "\n")
+    manifest_path.chmod(0o444)
 
     def replace_manifest(*_):
         replacement = stage_parent / "replacement.json"
         replacement.write_text(json.dumps({"linker_capability": embedded}) + "\n")
+        replacement.chmod(0o444)
         replacement.replace(manifest_path)
 
     try:
-        with pytest.raises(ValueError, match="manifest changed during full validation"):
-            guard.finalize(replace_manifest)
+        with pytest.raises(ValueError, match="manifest.*(changed|lifecycle event)"):
+            guard.finalize(manifest_path.resolve(), replace_manifest)
         assert guard.committed is False
     finally:
         guard.close(remove_stage=True)
+
+
+def test_capability_guard_rejects_manifest_rename_away_restore_during_validation(
+    tmp_path,
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    source_parent = tmp_path / "source"
+    stage_parent = tmp_path / "stage"
+    source_parent.mkdir()
+    stage_parent.mkdir()
+    source = source_parent / "capability.json"
+    destination = stage_parent / "linker-capability.json"
+    pending_manifest = stage_parent / ".manifest.pending.json"
+    payload = {"accepted": True}
+    source.write_text(json.dumps(payload) + "\n")
+    guard = namespace["_CapabilityGuard"].stage(
+        source.resolve(), destination.resolve(), lambda *_: "/usr/bin/cc"
+    )
+    embedded = {
+        **payload,
+        "copy": {
+            "absolute_path": str(destination.resolve()),
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        },
+    }
+    pending_manifest.write_text(json.dumps({"linker_capability": embedded}) + "\n")
+    pending_manifest.chmod(0o444)
+
+    def rename_away_restore(*_):
+        assert not (stage_parent / "manifest.json").exists()
+        detached = stage_parent / ".manifest.detached.json"
+        pending_manifest.rename(detached)
+        detached.rename(pending_manifest)
+
+    try:
+        with pytest.raises(ValueError, match="manifest.*lifecycle event"):
+            guard.finalize(pending_manifest.resolve(), rename_away_restore)
+        assert not (stage_parent / "manifest.json").exists()
+    finally:
+        guard.close(remove_stage=True)
+
+
+def test_guarded_manifest_publication_is_exact_and_no_clobber(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    pending = tmp_path / ".manifest.pending.json"
+    final = tmp_path / "manifest.json"
+    pending.write_text('{"accepted": true}\n')
+    pending.chmod(0o444)
+    identity = namespace["_guarded_file_identity"](pending.resolve())
+
+    namespace["_publish_guarded_manifest"](pending.resolve(), final.resolve(), identity)
+
+    assert not pending.exists()
+    assert final.read_text() == '{"accepted": true}\n'
+    replacement = tmp_path / ".manifest.second.json"
+    replacement.write_text('{"accepted": false}\n')
+    replacement.chmod(0o444)
+    with pytest.raises((FileExistsError, ValueError)):
+        namespace["_publish_guarded_manifest"](
+            replacement.resolve(),
+            final.resolve(),
+            namespace["_guarded_file_identity"](replacement.resolve()),
+        )
+    assert final.read_text() == '{"accepted": true}\n'
+
+
+def test_guarded_manifest_cli_publishes_from_parent_held_fd(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    pending = tmp_path / ".manifest.fixture.pending.json"
+    final = tmp_path / "manifest.json"
+    pending.write_text('{"accepted": true}\n')
+    pending.chmod(0o444)
+    held = os.open(pending, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        completed = subprocess.run(
+            [
+                str(SCRIPT),
+                "publish-guarded-manifest",
+                "--input",
+                str(pending),
+                "--output",
+                str(final),
+                "--identity",
+                namespace["_guarded_file_identity"](pending.resolve()),
+                "--held-fd-path",
+                f"/proc/{os.getpid()}/fd/{held}",
+            ],
+            text=True,
+            capture_output=True,
+        )
+    finally:
+        os.close(held)
+
+    assert completed.returncode == 0, completed.stderr
+    assert final.read_text() == '{"accepted": true}\n'
+    assert not pending.exists()
+
+
+def test_guarded_manifest_publication_rejects_pending_inode_swap(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    pending = tmp_path / ".manifest.fixture.pending.json"
+    final = tmp_path / "manifest.json"
+    pending.write_text('{"accepted": true}\n')
+    pending.chmod(0o444)
+    identity = namespace["_guarded_file_identity"](pending.resolve())
+    held = os.open(pending, os.O_RDONLY | os.O_CLOEXEC)
+    detached = tmp_path / ".manifest.detached.json"
+    pending.rename(detached)
+    pending.write_text('{"accepted": false}\n')
+    pending.chmod(0o444)
+    try:
+        with pytest.raises(ValueError, match="differs from guardian publish identity"):
+            namespace["_publish_guarded_manifest"](
+                pending.resolve(),
+                final.resolve(),
+                identity,
+                Path(f"/proc/{os.getpid()}/fd/{held}"),
+            )
+    finally:
+        os.close(held)
+
+    assert not final.exists()
+
+
+def test_guarded_manifest_publication_rejects_parent_replacement_after_link(
+    tmp_path, monkeypatch
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    variant = tmp_path / "variant"
+    variant.mkdir()
+    pending = variant / ".manifest.fixture.pending.json"
+    pending.write_text('{"fixture": true}\n')
+    pending.chmod(0o444)
+    final = variant / "manifest.json"
+    identity = namespace["_guarded_file_identity"](pending)
+    detached = tmp_path / "detached"
+    real_fsync = os.fsync
+    replaced = False
+
+    def replace_parent_after_link(descriptor):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            variant.rename(detached)
+            variant.mkdir()
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", replace_parent_after_link)
+
+    with pytest.raises(ValueError, match="directory ancestry"):
+        namespace["_publish_guarded_manifest"](pending, final, identity)
+
+    assert replaced
+    assert not final.exists()
+    assert not (detached / "manifest.json").exists()
+
+
+def test_private_pending_writer_creates_one_read_only_inode(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    variant = tmp_path / "variant"
+    variant.mkdir()
+    pending = variant / ".manifest.fixture.pending.json"
+    content = b'{"fixture": true}\n'
+
+    namespace["_write_private_pending"](pending, content)
+
+    metadata = pending.stat(follow_symlinks=False)
+    assert pending.read_bytes() == content
+    assert stat.S_ISREG(metadata.st_mode)
+    assert metadata.st_nlink == 1
+    assert metadata.st_mode & 0o777 == 0o444
+    assert not list(variant.glob(".manifest.*.tmp"))
+
+
+@pytest.mark.parametrize("alias_kind", ["symlink", "hardlink"])
+def test_private_pending_writer_rejects_preplanted_alias_without_touching_target(
+    tmp_path, alias_kind
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    variant = tmp_path / "variant"
+    variant.mkdir()
+    pending = variant / ".manifest.fixture.pending.json"
+    outside = tmp_path / "outside.json"
+    sentinel = b"outside sentinel\n"
+    outside.write_bytes(sentinel)
+    if alias_kind == "symlink":
+        pending.symlink_to(outside)
+    else:
+        os.link(outside, pending)
+
+    with pytest.raises(OSError):
+        namespace["_write_private_pending"](pending, b'{"replacement": true}\n')
+
+    assert outside.read_bytes() == sentinel
+    assert pending.read_bytes() == sentinel
+    assert not list(variant.glob(".manifest.*.tmp"))
 
 
 def test_staged_identity_holds_original_parent_ancestry_across_verifications(tmp_path):
@@ -1749,6 +2018,8 @@ def make_semantic_capability_fixture(tmp_path, namespace):
                             "actual-driver" if flavor == "actual" else "explicit-linker"
                         ),
                         "session": session,
+                        "cwd": str(artifact_root),
+                        "path": "/usr/bin",
                     }
                 )
                 + "\n"
@@ -1766,6 +2037,8 @@ def make_semantic_capability_fixture(tmp_path, namespace):
                             "argv": printed_argv,
                             "role": "cargo-driver",
                             "session": session,
+                            "cwd": str(artifact_root),
+                            "path": "/usr/bin",
                         }
                     )
                     + "\n"
@@ -1864,6 +2137,25 @@ def make_semantic_capability_fixture(tmp_path, namespace):
             / f"{arguments.binary.name}.layout.json"
         ).read_text()
     )
+
+    def project_fixture_driver(_driver, printed, *_):
+        projected = []
+        index = 0
+        while index < len(printed):
+            argument = printed[index]
+            if argument.startswith("-Wl,"):
+                projected.extend(argument.removeprefix("-Wl,").split(","))
+            elif argument == "-L" and index + 1 < len(printed):
+                projected.append(f"-L{printed[index + 1]}")
+                index += 1
+            elif argument.startswith(("-B", "-fuse-ld=")):
+                pass
+            else:
+                projected.append(argument)
+            index += 1
+        return projected
+
+    module_globals["_project_driver_linker_argv"] = project_fixture_driver
     tools = {"extractor": extractor.resolve(), "link_wrapper": wrapper.resolve()}
     return payload, refresh, capability_copy, manifest_root, tools, module_globals
 
@@ -1961,7 +2253,7 @@ def test_shared_capability_validator_binds_complete_explicit_link_argv(
     shape["linker_execution"]["sha256"] = digest(execution_path)
     manifest = refresh()
 
-    with pytest.raises(ValueError, match="normalized Cargo/linker argv differs"):
+    with pytest.raises(ValueError, match="semantic categories differ"):
         namespace["_validate_capability"](
             manifest, manifest_root / "manifest.json", ROOT, tools
         )
@@ -1996,9 +2288,170 @@ def test_shared_capability_validator_rejects_extra_explicit_link_semantics(
     shape["linker_execution"]["sha256"] = digest(execution_path)
     manifest = refresh()
 
-    with pytest.raises(ValueError, match="extra semantic inputs"):
+    with pytest.raises(ValueError, match="semantic categories differ"):
         namespace["_validate_capability"](
             manifest, manifest_root / "manifest.json", ROOT, tools
+        )
+
+
+def test_driver_semantic_closure_accepts_captured_real_gnu_reordering():
+    namespace = runpy.run_path(str(SCRIPT))
+    root = "/fixture/probe/release"
+    projected = [
+        "-plugin",
+        "/usr/libexec/gcc/aarch64-linux-gnu/14/liblto_plugin.so",
+        "-plugin-opt=-fresolution=/tmp/ccProjected.res",
+        "--build-id",
+        "--eh-frame-hdr",
+        "--hash-style=gnu",
+        "--as-needed",
+        "-dynamic-linker",
+        "/lib/ld-linux-aarch64.so.1",
+        "-X",
+        "-EL",
+        "-maarch64linux",
+        "-pie",
+        "-z",
+        "relro",
+        "-o",
+        f"{root}/deps/probe-0123456789abcdef",
+        "-L/fixture/wrapper",
+        "-L/usr/lib/gcc/aarch64-linux-gnu/14/../../..",
+        "-e",
+        "0",
+        f"{root}/deps/probe.fixture.rcgu.o",
+        "-lfixture",
+    ]
+    observed = [
+        *projected[:2],
+        "-plugin-opt=-fresolution=/tmp/ccObserved.res",
+        *projected[3:],
+    ]
+
+    namespace["_validate_driver_semantic_closure"](projected, observed, "captured GNU")
+
+
+def test_driver_semantic_closure_accepts_representative_lld_trace():
+    namespace = runpy.run_path(str(SCRIPT))
+    projected = [
+        "-pie",
+        "--hash-style=gnu",
+        "--eh-frame-hdr",
+        "-m",
+        "aarch64linux",
+        "-dynamic-linker",
+        "/lib/ld-linux-aarch64.so.1",
+        "-o",
+        "/fixture/release/deps/probe-0123456789abcdef",
+        "-L/fixture/wrapper",
+        "-L/usr/lib/llvm/lib",
+        "/fixture/release/deps/probe.fixture.rcgu.o",
+        "-lfixture",
+        "--as-needed",
+        "-T",
+        "/fixture/layout.ld",
+        "-Map",
+        "/fixture/probe.map",
+    ]
+
+    namespace["_validate_driver_semantic_closure"](
+        projected, list(projected), "representative LLD"
+    )
+
+
+@pytest.mark.parametrize("extra", ["library-path", "flag"])
+def test_driver_semantic_closure_rejects_unaudited_inner_extras(extra):
+    namespace = runpy.run_path(str(SCRIPT))
+    projected = [
+        "-o",
+        "/fixture/release/deps/probe-0123456789abcdef",
+        "-L/fixture/audited",
+        "/fixture/probe.fixture.rcgu.o",
+        "--as-needed",
+    ]
+    observed = list(projected)
+    observed.append("-L/fixture/evil" if extra == "library-path" else "--no-as-needed")
+
+    with pytest.raises(ValueError, match="semantic categories differ"):
+        namespace["_validate_driver_semantic_closure"](
+            projected, observed, "negative fixture"
+        )
+
+
+def test_driver_semantic_closure_rejects_library_path_priority_reordering():
+    namespace = runpy.run_path(str(SCRIPT))
+    projected = [
+        "-o",
+        "/fixture/probe",
+        "-L/fixture/preferred",
+        "-L/fixture/fallback",
+        "-lfixture",
+    ]
+    observed = [
+        "-o",
+        "/fixture/probe",
+        "-L/fixture/fallback",
+        "-L/fixture/preferred",
+        "-lfixture",
+    ]
+
+    with pytest.raises(ValueError, match="semantic categories differ"):
+        namespace["_validate_driver_semantic_closure"](
+            projected, observed, "library search priority"
+        )
+
+
+@pytest.mark.parametrize(
+    ("open_control", "close_control"),
+    [
+        ("--push-state", "--pop-state"),
+        ("--start-group", "--end-group"),
+        ("-(", "-)"),
+        ("--start-lib", "--end-lib"),
+    ],
+)
+def test_driver_semantic_closure_rejects_scope_boundary_crossing_library(
+    open_control, close_control
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    projected = [open_control, "--as-needed", "-lfixture", close_control]
+    observed = [open_control, "--as-needed", close_control, "-lfixture"]
+
+    with pytest.raises(ValueError, match="semantic categories differ"):
+        namespace["_validate_driver_semantic_closure"](
+            projected, observed, "linker scope boundary"
+        )
+
+
+@pytest.mark.parametrize(
+    ("projected", "observed"),
+    [
+        (
+            ["-static", "-lfirst", "-Bdynamic", "-lsecond"],
+            ["-lfirst", "-static", "-Bdynamic", "-lsecond"],
+        ),
+        (
+            ["--add-needed", "-lfirst", "--no-add-needed", "-lsecond"],
+            ["--add-needed", "--no-add-needed", "-lfirst", "-lsecond"],
+        ),
+        (
+            ["-a", "archive", "-lfirst", "-a", "shared", "-lsecond"],
+            ["-a", "archive", "-a", "shared", "-lfirst", "-lsecond"],
+        ),
+        (
+            ["-b", "elf64-x86-64", "/fixture/first.o", "-lsecond"],
+            ["/fixture/first.o", "-b", "elf64-x86-64", "-lsecond"],
+        ),
+    ],
+)
+def test_driver_semantic_closure_rejects_mode_alias_crossing_link_item(
+    projected, observed
+):
+    namespace = runpy.run_path(str(SCRIPT))
+
+    with pytest.raises(ValueError, match="semantic categories differ"):
+        namespace["_validate_driver_semantic_closure"](
+            projected, observed, "linker mode alias"
         )
 
 
@@ -2221,19 +2674,22 @@ def test_launcher_stages_then_fully_validates_capability_before_build():
         'CACHE_GATE_LINKER_CAPABILITY="$manifest_dir/linker-capability.json"' in source
     )
     assert source.count("verify_staged_capability") >= 10
-    manifest_publish = source.index('Path(output + ".tmp").replace(output)')
-    manifest_validate = source.index(
-        'validate-manifest --manifest "$manifest_dir/manifest.json"'
-    )
+    manifest_publish = source.index("write-private-pending")
+    manifest_validate = source.index('validate-manifest --manifest "$manifest_pending"')
     finalize = source.index("printf 'FINALIZE\\n'")
     assert manifest_publish < manifest_validate < finalize
-    assert 'wait "$capability_guard_pid"' in source[finalize:]
+    guardian_wait = source.index('wait "$capability_guard_pid"', finalize)
+    publication = source.index("publish-guarded-manifest", guardian_wait)
+    assert finalize < guardian_wait < publication
+    assert 'manifest_pending="$manifest_dir/.manifest.' in source
+    assert 'test ! -e "$manifest_dir/manifest.json"' in source
+    assert '--output "$manifest_dir/manifest.json"' in source[publication:]
     assert "capability guardian exited before CHECK" in source
     assert "error: staged capability identity changed" in source
     assert "staged capability changed during manifest construction" in source
     assert "elastic_bin=$(build_bench" not in source
     assert "build_bench elastic_bin elastic_cache_gate elastic" in source
-    manifest_builder = source[source.index('python3 - "$manifest_dir/manifest.json"') :]
+    manifest_builder = source[source.index('python3 - "$manifest_pending"') :]
     assert (
         "base64.b64decode(capability_document_b64, validate=True)" in manifest_builder
     )
