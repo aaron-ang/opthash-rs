@@ -636,120 +636,7 @@ x86_64 | amd64) arch=x86_64 ;;
 *) echo "error: unsupported host architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 [[ -n ${CACHE_GATE_LINKER_CAPABILITY:-} && $CACHE_GATE_LINKER_CAPABILITY == /* ]] || { echo "error: absolute CACHE_GATE_LINKER_CAPABILITY is required" >&2; exit 2; }
-[[ -f $CACHE_GATE_LINKER_CAPABILITY && ! -L $CACHE_GATE_LINKER_CAPABILITY ]] || { echo "error: linker capability must be a regular non-symlink" >&2; exit 2; }
-CACHE_GATE_LINK_DRIVER=$(python3 - "$CACHE_GATE_LINKER_CAPABILITY" "$REPO_ROOT" "$arch" "$HARNESS_ROOT" <<'PY'
-import hashlib,json,os,re,shlex,subprocess,sys
-from pathlib import Path
-path,repo,arch,harness_root=sys.argv[1:]
-capability_path=Path(sys.argv[1])
-if not capability_path.is_absolute() or capability_path.is_symlink() or not capability_path.is_file():
-    raise SystemExit("error: linker capability input is not a regular file")
-for component in capability_path.parents:
-    if not component.is_dir() or component.is_symlink():
-        raise SystemExit(f"error: linker capability input ancestry contains symlink: {component}")
-if capability_path!=capability_path.resolve(strict=True):
-    raise SystemExit("error: linker capability input path is not canonical")
-capability=json.load(open(capability_path,encoding="utf-8"))
-if capability.get("accepted") is not True or capability.get("arch")!=arch:
-    raise SystemExit("error: linker capability is not accepted for this architecture")
-def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-producer=capability.get("producer",{})
-if set(producer)!={"runner_root","commit","tree","empty_diff_assertion","artifact_root"}:
-    raise SystemExit("error: exact capability producer schema mismatch")
-producer_root=Path(producer["runner_root"])
-if (not producer_root.is_absolute() or producer_root.is_symlink() or
-    producer["runner_root"]!=str(producer_root.resolve()) or producer_root.resolve()!=Path(harness_root)):
-    raise SystemExit("error: capability producer root differs from reviewed harness")
-git_root=Path(subprocess.check_output(["git","-C",str(producer_root),"rev-parse","--show-toplevel"],text=True).strip()).resolve()
-head=subprocess.check_output(["git","-C",str(producer_root),"rev-parse","HEAD"],text=True).strip()
-tree=subprocess.check_output(["git","-C",str(producer_root),"rev-parse","HEAD^{tree}"],text=True).strip()
-status=subprocess.check_output(["git","-C",str(producer_root),"status","--porcelain","--untracked-files=no"],text=True)
-if (git_root!=producer_root.resolve() or producer["commit"]!=head or producer["tree"]!=tree or
-    producer["empty_diff_assertion"] is not True or status.strip()):
-    raise SystemExit("error: capability producer revision is not immutable")
-artifact_root=Path(producer["artifact_root"])
-producer_target=producer_root/"target"
-linker_root=producer_target/"cache-gate-linker"
-arch_root=linker_root/arch
-for component in (producer_target,linker_root,arch_root,artifact_root):
-    if not component.is_dir() or component.is_symlink():
-        raise SystemExit(f"error: capability producer ancestry contains symlink or non-directory: {component}")
-try: artifact_relative=artifact_root.relative_to(arch_root)
-except ValueError: raise SystemExit("error: capability artifact root is outside producer target")
-if (len(artifact_relative.parts)!=1 or not artifact_relative.name.startswith(".probe.") or
-    producer["artifact_root"]!=str(artifact_root.resolve()) or artifact_root.resolve()!=artifact_root or
-    os.path.commonpath([str(producer_target),str(artifact_root)])!=str(producer_target)):
-    raise SystemExit("error: capability artifact root is outside producer target")
-if set(capability.get("fragments",{}))!={"elastic","funnel","profile"}:
-    raise SystemExit("error: linker fragment capability set mismatch")
-for target,record in capability["fragments"].items():
-    expected=(producer_root/f"benches/cache-gate-{target}-layout.ld").resolve()
-    subject=(Path(repo)/f"benches/cache-gate-{target}-layout.ld").resolve()
-    source=Path(record["absolute_path"])
-    blob=subprocess.check_output(["git","-C",str(producer_root),"show",f'{producer["commit"]}:benches/cache-gate-{target}-layout.ld'])
-    if (not source.is_absolute() or source.resolve()!=expected or not source.is_file() or source.is_symlink() or
-        digest(source)!=record["sha256"] or digest(subject)!=record["sha256"] or
-        hashlib.sha256(blob).hexdigest()!=record["sha256"]):
-        raise SystemExit(f"error: linker fragment capability mismatch: {target}")
-if set(capability.get("shapes",{}))!={"actual","gnu","lld"}:
-    raise SystemExit("error: linker capability shape set mismatch")
-driver=Path(capability["linker"]["absolute_path"])
-if (not driver.is_absolute() or driver.is_symlink() or not driver.is_file() or
-    str(driver.resolve())!=str(driver) or digest(driver)!=capability["linker"]["sha256"]):
-    raise SystemExit("error: capability linker path is invalid")
-for flavor,shapes in capability["shapes"].items():
-    if set(shapes)!={"elastic","funnel","profile"}:
-        raise SystemExit(f"error: linker capability target set mismatch: {flavor}")
-    for target,shape in shapes.items():
-        required={"binary","link_argv","link_map","symbols","layout","linker_execution"}
-        if set(shape)!=required:
-            raise SystemExit(f"error: exact linker capability shape mismatch: {flavor}/{target}")
-        for name,record in shape.items():
-            artifact=Path(record["absolute_path"])
-            if (not artifact.is_absolute() or not artifact.is_file() or artifact.is_symlink() or
-                os.path.commonpath([str(artifact_root),str(artifact.resolve())])!=str(artifact_root) or
-                digest(artifact)!=record["sha256"]):
-                raise SystemExit(f"error: linker capability artifact mismatch: {flavor}/{target}/{name}")
-        if flavor=="actual":
-            execution=json.loads(Path(shape["linker_execution"]["absolute_path"]).read_bytes())
-            if execution.get("linker")!=capability["linker"]:
-                raise SystemExit(f"error: actual linker execution identity mismatch: {target}")
-            trace_record=execution.get("trace",{})
-            trace_path=Path(trace_record.get("absolute_path",""))
-            if (not trace_path.is_absolute() or not trace_path.is_file() or trace_path.is_symlink() or
-                os.path.commonpath([str(artifact_root),str(trace_path.resolve())])!=str(artifact_root) or
-                digest(trace_path)!=trace_record.get("sha256")):
-                raise SystemExit(f"error: actual linker trace mismatch: {target}")
-            traces=[json.loads(line) for line in trace_path.read_text().splitlines() if line.strip()]
-            matches=[]
-            binary=Path(shape["binary"]["absolute_path"])
-            for item in traces:
-                argv=item.get("argv",[])
-                for index,value in enumerate(argv):
-                    if value=="-o" and index+1<len(argv): output=Path(argv[index+1]).resolve(); break
-                    if value.startswith("-o") and len(value)>2: output=Path(value[2:]).resolve(); break
-                else: continue
-                if output==binary.resolve() or (output.is_file() and output.samefile(binary)):
-                    matches.append(item)
-            if (len(matches)!=1 or Path(matches[0].get("driver",""))!=driver or
-                matches[0].get("driver_sha256")!=capability["linker"]["sha256"] or
-                execution.get("argv")!=matches[0].get("argv")):
-                raise SystemExit(f"error: actual linker trace driver/hash mismatch: {target}")
-            lines=[line.strip() for line in Path(shape["link_argv"]["absolute_path"]).read_text().splitlines() if line.strip()]
-            tokens=shlex.split(lines[-1]) if lines else []
-            command_index=next((index for index,value in enumerate(tokens)
-                                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*",value)),len(tokens))
-            expected_wrapper=(producer_root/"scripts/cache-gate-link-wrapper.py").resolve()
-            if (command_index>=len(tokens) or not Path(tokens[command_index]).is_absolute() or
-                Path(tokens[command_index])!=expected_wrapper or
-                tokens[command_index+1:]!=execution.get("argv")):
-                raise SystemExit(f"error: actual link argv/trace mismatch: {target}")
-version=next((line for line in subprocess.check_output([str(driver),"-Wl,--version"],stderr=subprocess.STDOUT,text=True).splitlines() if "GNU ld" in line or "LLD" in line or "lld" in line),"")
-if version!=capability["linker"]["version"]:
-    raise SystemExit("error: actual linker identity differs from capability")
-print(driver.resolve())
-PY
-)
+capability_input=$CACHE_GATE_LINKER_CAPABILITY
 [[ ${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16} == 16 ]] || { echo "error: conflicting CARGO_PROFILE_RELEASE_CODEGEN_UNITS" >&2; exit 2; }
 [[ ${RUSTFLAGS:-} != *codegen-units* && ${CARGO_ENCODED_RUSTFLAGS:-} != *codegen-units* ]] || { echo "error: conflicting rustc codegen-unit configuration" >&2; exit 2; }
 [[ -z ${CARGO_ENCODED_RUSTFLAGS:-} ]] || { echo "error: CARGO_ENCODED_RUSTFLAGS is unsupported for authenticated manifest builds" >&2; exit 2; }
@@ -785,17 +672,33 @@ trap - EXIT
 head_commit=$(git rev-parse HEAD)
 head_tree=$(git rev-parse 'HEAD^{tree}')
 head_epoch=$(git show -s --format=%ct HEAD)
-cp -- "$CACHE_GATE_LINKER_CAPABILITY" "$manifest_dir/linker-capability.json"
 mkdir -p "$manifest_dir/linker-fragments" "$manifest_dir/layout" "$manifest_dir/link-traces" "$manifest_dir/link-commands"
 cp -- "$REPO_ROOT/benches/cache-gate-elastic-layout.ld" "$manifest_dir/linker-fragments/elastic.ld"
 cp -- "$REPO_ROOT/benches/cache-gate-funnel-layout.ld" "$manifest_dir/linker-fragments/funnel.ld"
 cp -- "$REPO_ROOT/benches/cache-gate-profile-layout.ld" "$manifest_dir/linker-fragments/profile.ld"
+mapfile -t staged_capability < <("$CACHE_GATE_ELF_LAYOUT_TOOL" stage-validate-capability --input "$capability_input" \
+	--output "$manifest_dir/linker-capability.json" --arch "$arch" --tools "$authenticated_tools")
+((${#staged_capability[@]} == 3)) || { echo "error: invalid staged capability result" >&2; exit 1; }
+CACHE_GATE_LINK_DRIVER=${staged_capability[0]}
+capability_identity=${staged_capability[1]}
+capability_document_b64=${staged_capability[2]}
+CACHE_GATE_LINKER_CAPABILITY="$manifest_dir/linker-capability.json"
+verify_staged_capability() {
+	"$CACHE_GATE_ELF_LAYOUT_TOOL" verify-staged-capability \
+		--path "$CACHE_GATE_LINKER_CAPABILITY" --identity "$capability_identity" || {
+		echo "error: staged capability identity changed" >&2
+		exit 1
+	}
+}
+verify_staged_capability
 
 build_bench() {
-	local bench=$1 target=$2 fragment="$manifest_dir/linker-fragments/$2.ld"
-	local map_path="$manifest_dir/link-maps/$1.map" json_path="$manifest_dir/$1.cargo.json" verbose_path="$manifest_dir/$1.rustc.txt" executable
-	local trace_path="$manifest_dir/link-traces/$1.jsonl" command_path="$manifest_dir/link-commands/$1.json"
+	local -n result=$1
+	local bench=$2 target=$3 fragment="$manifest_dir/linker-fragments/$3.ld"
+	local map_path="$manifest_dir/link-maps/$bench.map" json_path="$manifest_dir/$bench.cargo.json" verbose_path="$manifest_dir/$bench.rustc.txt" executable
+	local trace_path="$manifest_dir/link-traces/$bench.jsonl" command_path="$manifest_dir/link-commands/$bench.json"
 	local rustflags="${RUSTFLAGS:-} -C codegen-units=16 -C link-arg=-Wl,-T,$fragment -C link-arg=-Wl,-Map,$map_path -C linker=$CACHE_GATE_LINK_WRAPPER"
+	verify_staged_capability
 	[[ ! -e $trace_path && ! -e $command_path ]] || { echo "error: link proof output already exists for $bench" >&2; exit 1; }
 	if [[ ${CACHE_GATE_LAYOUT_ADVERSARY:-0} == 1 ]]; then
 		rustflags+=" --cfg cache_gate_layout_adversary --check-cfg=cfg(cache_gate_layout_adversary)"
@@ -806,28 +709,30 @@ build_bench() {
 		sudo -u "$SUDO_USER" --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME -- env \
 			CACHE_GATE_LINK_DRIVER="$CACHE_GATE_LINK_DRIVER" CACHE_GATE_LINK_TRACE="$trace_path" \
 			CARGO_TARGET_DIR="$build_root" CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 RUSTFLAGS="$rustflags" \
-			cargo build -vv --release --locked --bench "$bench" --message-format=json >"$json_path" 2>"$verbose_path"
+			cargo build -vv --release --locked --bench "$bench" --message-format=json >"$json_path" 2>"$verbose_path" || return 1
 	else
 		CACHE_GATE_LINK_DRIVER="$CACHE_GATE_LINK_DRIVER" CACHE_GATE_LINK_TRACE="$trace_path" \
 			CARGO_TARGET_DIR="$build_root" CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 RUSTFLAGS="$rustflags" \
-			cargo build -vv --release --locked --bench "$bench" --message-format=json >"$json_path" 2>"$verbose_path"
+			cargo build -vv --release --locked --bench "$bench" --message-format=json >"$json_path" 2>"$verbose_path" || return 1
 	fi
 	rg -q -- 'codegen-units(=|[[:space:]]+)16' "$verbose_path" || { echo "error: captured rustc argv lacks -C codegen-units=16 for $bench" >&2; exit 1; }
+	verify_staged_capability
 	executable=$("$CACHE_GATE_ELF_LAYOUT_TOOL" select-cargo-executable \
-		--cargo-output "$json_path" --bench "$bench")
-	executable=$("$CACHE_GATE_REALPATH_TOOL" -- "$executable")
+		--cargo-output "$json_path" --bench "$bench") || return 1
+	executable=$("$CACHE_GATE_REALPATH_TOOL" -- "$executable") || return 1
 	[[ -x $executable && -s $map_path ]] || { echo "error: missing executable or link map for $bench" >&2; exit 1; }
 	(($("$CACHE_GATE_STAT_TOOL" -c %Y "$executable") >= head_epoch)) || { echo "error: stale artifact for $bench" >&2; exit 1; }
 	"$CACHE_GATE_ELF_LAYOUT_TOOL" validate-link-command \
 		--trace "$trace_path" --executable "$executable" \
-		--capability "$CACHE_GATE_LINKER_CAPABILITY" --fragment "$fragment" \
-		--link-map "$map_path" --output "$command_path"
-	printf '%s\n' "$executable"
+		--capability "$CACHE_GATE_LINKER_CAPABILITY" --capability-identity "$capability_identity" --fragment "$fragment" \
+		--link-map "$map_path" --output "$command_path" || return 1
+	verify_staged_capability
+	result=$executable
 }
 
-elastic_bin=$(build_bench elastic_cache_gate elastic)
-funnel_bin=$(build_bench funnel_cache_gate funnel)
-profile_bin=$(build_bench cache_gate_profile profile)
+build_bench elastic_bin elastic_cache_gate elastic || exit 1
+build_bench funnel_bin funnel_cache_gate funnel || exit 1
+build_bench profile_bin cache_gate_profile profile || exit 1
 
 "$CACHE_GATE_EXTRACTOR_TOOL" --binary "$elastic_bin" --arch "$arch" \
 	--symbol '::elastic_cache_gate_insert_kernel$' --symbol '::elastic_cache_gate_get_kernel$' \
@@ -846,15 +751,20 @@ for executable in elastic_cache_gate funnel_cache_gate cache_gate_profile; do
 	funnel_cache_gate) binary=$funnel_bin; target=funnel ;;
 	cache_gate_profile) binary=$profile_bin; target=profile ;;
 	esac
+	verify_staged_capability
 	CACHE_GATE_LINKER_CAPABILITY="$manifest_dir/linker-capability.json" \
+		CACHE_GATE_LINKER_CAPABILITY_IDENTITY="$capability_identity" \
 		"$CACHE_GATE_ELF_LAYOUT_TOOL" validate --binary "$binary" \
 		--link-map "$manifest_dir/link-maps/$executable.map" \
 		--script "$manifest_dir/linker-fragments/$target.ld" \
 		--symbols "$manifest_dir/symbols/$executable.json" --arch "$arch" \
 		--output "$manifest_dir/layout/$executable.json"
+	verify_staged_capability
 done
 
-python3 - "$manifest_dir/manifest.json" "$head_commit" "$head_tree" "$arch" "$CACHE_GATE_VARIANT" "$CACHE_GATE_CONTROL_BIN" "$CACHE_GATE_CONTROL_PROVENANCE" "$elastic_bin" "$funnel_bin" "$profile_bin" "$REPO_ROOT" "${CACHE_GATE_LAYOUT_ADVERSARY:-0}" "$CACHE_GATE_MANIFEST_INSTANCE" "$authenticated_tools" <<'PY'
+verify_staged_capability
+python3 - "$manifest_dir/manifest.json" "$head_commit" "$head_tree" "$arch" "$CACHE_GATE_VARIANT" "$CACHE_GATE_CONTROL_BIN" "$CACHE_GATE_CONTROL_PROVENANCE" "$elastic_bin" "$funnel_bin" "$profile_bin" "$REPO_ROOT" "${CACHE_GATE_LAYOUT_ADVERSARY:-0}" "$CACHE_GATE_MANIFEST_INSTANCE" "$authenticated_tools" "$capability_identity" "$capability_document_b64" <<'PY'
+import base64
 import hashlib
 import json
 import os
@@ -863,7 +773,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-output, commit, tree, arch, variant, control, control_provenance_path, elastic, funnel, profile, repo, adversary, instance, authenticated_tools_path = sys.argv[1:]
+output, commit, tree, arch, variant, control, control_provenance_path, elastic, funnel, profile, repo, adversary, instance, authenticated_tools_path, capability_identity, capability_document_b64 = sys.argv[1:]
 root = Path(output).parent
 repository = Path(repo)
 
@@ -919,10 +829,13 @@ for name in executables:
     }
 control_provenance = json.load(open(control_provenance_path, encoding="utf-8"))
 capability_path = root / "linker-capability.json"
-linker_capability = json.load(capability_path.open(encoding="utf-8"))
+capability_bytes = base64.b64decode(capability_document_b64, validate=True)
+if hashlib.sha256(capability_bytes).hexdigest() != capability_identity.rsplit(":", 1)[1]:
+    raise SystemExit("staged capability changed during manifest construction")
+linker_capability = json.loads(capability_bytes)
 linker_capability["copy"] = {
-    "absolute_path": str(capability_path.resolve()),
-    "sha256": digest(capability_path),
+    "absolute_path": str(capability_path),
+    "sha256": capability_identity.rsplit(":", 1)[1],
 }
 
 def fingerprint(values):
@@ -1019,6 +932,8 @@ with open(output + ".tmp", "w", encoding="utf-8") as stream:
 Path(output + ".tmp").replace(output)
 PY
 
+verify_staged_capability
 symbol_count=$(jq '[.symbols[].symbols[]] | length' "$manifest_dir/manifest.json")
 [[ $symbol_count == 8 ]] || { echo "error: manifest resolved $symbol_count symbols, expected 8" >&2; exit 1; }
+verify_staged_capability
 echo "$manifest_dir/manifest.json"

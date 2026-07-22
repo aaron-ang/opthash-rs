@@ -4,17 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 KERNELS = {
@@ -174,9 +176,297 @@ def checked_absolute_file(record: dict[str, Any], label: str) -> Path:
     path = Path(record.get("absolute_path", ""))
     if not path.is_absolute() or not path.is_file() or path.is_symlink():
         raise LayoutError(f"invalid {label} path: {path}")
+    resolved = path.resolve(strict=True)
+    if path != resolved or record.get("absolute_path") != str(resolved):
+        raise LayoutError(f"{label} path is not canonical: {path}")
     if digest(path) != record.get("sha256"):
         raise LayoutError(f"{label} hash mismatch: {path}")
-    return path.resolve()
+    return path
+
+
+def _stat_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _open_directory_with_identity_chain(
+    directory: Path,
+) -> tuple[int, tuple[tuple[int, int], ...]]:
+    _require(directory.is_absolute(), f"directory path must be absolute: {directory}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open("/", flags)
+    identities = [(os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)]
+    try:
+        for component in directory.parts[1:]:
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            metadata = os.fstat(descriptor)
+            identities.append((metadata.st_dev, metadata.st_ino))
+        return descriptor, tuple(identities)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_directory_without_symlinks(directory: Path) -> int:
+    descriptor, _ = _open_directory_with_identity_chain(directory)
+    return descriptor
+
+
+def _verify_directory_identity_chain(
+    directory: Path,
+    expected: tuple[tuple[int, int], ...],
+    label: str,
+) -> None:
+    descriptor, observed = _open_directory_with_identity_chain(directory)
+    try:
+        _require(observed == expected, f"{label} directory ancestry changed")
+    finally:
+        os.close(descriptor)
+
+
+def _directory_identity_fingerprint(
+    identities: tuple[tuple[int, int], ...],
+) -> str:
+    return hashlib.sha256(
+        "".join(f"{device}:{inode}\n" for device, inode in identities).encode()
+    ).hexdigest()
+
+
+def _read_descriptor(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _stage_capability_once(
+    source: Path,
+    destination: Path,
+    validator: Callable[[Path, dict[str, Any]], str],
+) -> tuple[str, str, str]:
+    _require(source.is_absolute(), "capability input must be absolute")
+    _require(destination.is_absolute(), "staged capability path must be absolute")
+    _require(
+        source == source.resolve(strict=True),
+        "capability input path is not canonical",
+    )
+    _require(
+        destination.parent == destination.parent.resolve(strict=True),
+        "staged capability parent is not canonical",
+    )
+    source_parent, source_ancestry = _open_directory_with_identity_chain(source.parent)
+    destination_parent, destination_ancestry = _open_directory_with_identity_chain(
+        destination.parent
+    )
+    source_descriptor: int | None = None
+    staged_descriptor: int | None = None
+    staged_identity: tuple[int, int] | None = None
+    try:
+        source_descriptor = os.open(
+            source.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=source_parent,
+        )
+        source_stat = os.fstat(source_descriptor)
+        _require(
+            stat.S_ISREG(source_stat.st_mode),
+            "capability input is not a regular file",
+        )
+        source_identity = _stat_identity(source_stat)
+        source_path_stat = os.stat(
+            source.name, dir_fd=source_parent, follow_symlinks=False
+        )
+        _require(
+            _stat_identity(source_path_stat) == source_identity,
+            "capability input path changed before staging",
+        )
+        source_bytes = _read_descriptor(source_descriptor)
+        _require(
+            _stat_identity(os.fstat(source_descriptor)) == source_identity
+            and _stat_identity(
+                os.stat(source.name, dir_fd=source_parent, follow_symlinks=False)
+            )
+            == source_identity,
+            "capability input changed during staging",
+        )
+        payload = json.loads(source_bytes)
+        staged_descriptor = os.open(
+            destination.name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=destination_parent,
+        )
+        view = memoryview(source_bytes)
+        while view:
+            written = os.write(staged_descriptor, view)
+            _require(written > 0, "short staged capability write")
+            view = view[written:]
+        os.fsync(staged_descriptor)
+        os.lseek(staged_descriptor, 0, os.SEEK_SET)
+        _require(
+            _read_descriptor(staged_descriptor) == source_bytes,
+            "staged capability bytes differ from input",
+        )
+        staged_stat = os.fstat(staged_descriptor)
+        _require(
+            stat.S_ISREG(staged_stat.st_mode) and staged_stat.st_nlink == 1,
+            "staged capability is not a private regular file",
+        )
+        staged_identity = (staged_stat.st_dev, staged_stat.st_ino)
+        _require(
+            _stat_identity(
+                os.stat(
+                    destination.name, dir_fd=destination_parent, follow_symlinks=False
+                )
+            )
+            == _stat_identity(staged_stat),
+            "staged capability path changed before validation",
+        )
+        _verify_directory_identity_chain(
+            source.parent, source_ancestry, "capability input"
+        )
+        _verify_directory_identity_chain(
+            destination.parent, destination_ancestry, "staged capability"
+        )
+        result = validator(destination, payload)
+        _verify_directory_identity_chain(
+            source.parent, source_ancestry, "capability input"
+        )
+        _verify_directory_identity_chain(
+            destination.parent, destination_ancestry, "staged capability"
+        )
+        _require(
+            _stat_identity(os.fstat(source_descriptor)) == source_identity
+            and _stat_identity(
+                os.stat(source.name, dir_fd=source_parent, follow_symlinks=False)
+            )
+            == source_identity,
+            "capability input changed during validation",
+        )
+        os.lseek(staged_descriptor, 0, os.SEEK_SET)
+        final_staged_stat = os.fstat(staged_descriptor)
+        _require(
+            _stat_identity(final_staged_stat) == _stat_identity(staged_stat)
+            and _stat_identity(
+                os.stat(
+                    destination.name, dir_fd=destination_parent, follow_symlinks=False
+                )
+            )
+            == _stat_identity(staged_stat)
+            and _read_descriptor(staged_descriptor) == source_bytes,
+            "staged capability changed during validation",
+        )
+        os.fchmod(staged_descriptor, 0o444)
+        os.fsync(staged_descriptor)
+        os.fsync(destination_parent)
+        published_stat = os.fstat(staged_descriptor)
+        _require(
+            _stat_identity(
+                os.stat(
+                    destination.name, dir_fd=destination_parent, follow_symlinks=False
+                )
+            )
+            == _stat_identity(published_stat),
+            "staged capability changed during publication",
+        )
+        _verify_directory_identity_chain(
+            source.parent, source_ancestry, "capability input"
+        )
+        _verify_directory_identity_chain(
+            destination.parent, destination_ancestry, "staged capability"
+        )
+        identity = ":".join(
+            (
+                _directory_identity_fingerprint(destination_ancestry),
+                str(published_stat.st_dev),
+                str(published_stat.st_ino),
+                str(published_stat.st_size),
+                hashlib.sha256(source_bytes).hexdigest(),
+            )
+        )
+        return result, identity, base64.b64encode(source_bytes).decode("ascii")
+    except Exception:
+        if staged_identity is not None:
+            try:
+                current = os.stat(
+                    destination.name,
+                    dir_fd=destination_parent,
+                    follow_symlinks=False,
+                )
+                if (current.st_dev, current.st_ino) == staged_identity:
+                    os.unlink(destination.name, dir_fd=destination_parent)
+                    os.fsync(destination_parent)
+            except OSError:
+                pass
+        raise
+    finally:
+        if staged_descriptor is not None:
+            os.close(staged_descriptor)
+        if source_descriptor is not None:
+            os.close(source_descriptor)
+        os.close(destination_parent)
+        os.close(source_parent)
+
+
+def _read_verified_staged_capability(path: Path, expected_identity: str) -> bytes:
+    _require(path.is_absolute(), "staged capability path must be absolute")
+    _require(
+        path == path.resolve(strict=True), "staged capability path is not canonical"
+    )
+    parent, parent_ancestry = _open_directory_with_identity_chain(path.parent)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent,
+        )
+        before = os.fstat(descriptor)
+        _require(
+            stat.S_ISREG(before.st_mode)
+            and before.st_nlink == 1
+            and before.st_mode & 0o777 == 0o444,
+            "staged capability is not a read-only regular file",
+        )
+        content = _read_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        path_stat = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        actual_identity = ":".join(
+            (
+                _directory_identity_fingerprint(parent_ancestry),
+                str(after.st_dev),
+                str(after.st_ino),
+                str(after.st_size),
+                hashlib.sha256(content).hexdigest(),
+            )
+        )
+        _require(
+            _stat_identity(before) == _stat_identity(after) == _stat_identity(path_stat)
+            and actual_identity == expected_identity,
+            "staged capability inode or hash changed",
+        )
+        _verify_directory_identity_chain(
+            path.parent, parent_ancestry, "staged capability"
+        )
+        return content
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def verify_staged_capability(path: Path, expected_identity: str) -> None:
+    _read_verified_staged_capability(path, expected_identity)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -490,6 +780,28 @@ def _trace_record(record: Any, label: str) -> Path:
     return checked_absolute_file(record, label)
 
 
+def _exact_capability_file_record(
+    record: Any,
+    expected: Path,
+    label: str,
+    *,
+    trace: bool = False,
+    required_links: int = 1,
+) -> Path:
+    _require(
+        isinstance(record, dict) and record.get("absolute_path") == str(expected),
+        f"{label} path differs from exact producer path",
+    )
+    path = _trace_record(record, label) if trace else _file_record(record, label)
+    _require(
+        path == expected
+        and expected == expected.resolve(strict=True)
+        and expected.stat(follow_symlinks=False).st_nlink == required_links,
+        f"{label} path differs from exact producer path",
+    )
+    return path
+
+
 def _fingerprint(values: list[str]) -> str:
     return hashlib.sha256(("\n".join(values) + "\n").encode()).hexdigest()
 
@@ -602,13 +914,17 @@ def _validate_tools(tools: Any) -> dict[str, Path]:
 
 def _validate_linker_record(record: Any, label: str) -> Path:
     _exact_keys(record, {"absolute_path", "sha256", "flavor", "version"}, label)
-    path = Path(record["absolute_path"])
+    raw_path = record["absolute_path"]
+    path = Path(raw_path)
     _require(
         path.is_absolute() and path.is_file() and not path.is_symlink(),
         f"invalid {label}",
     )
     resolved_path = path.resolve()
-    _require(path == resolved_path, f"{label} path is not canonical")
+    _require(
+        isinstance(raw_path, str) and raw_path == str(resolved_path),
+        f"{label} path is not canonical",
+    )
     path = resolved_path
     _require(digest(path) == record["sha256"], f"{label} hash mismatch")
     _require(
@@ -644,20 +960,23 @@ def replay_linker_execution(
     records = [
         json.loads(line) for line in trace.read_text().splitlines() if line.strip()
     ]
-    matches = [
-        record
-        for record in records
-        if isinstance(record.get("argv"), list)
-        and _output_matches(record["argv"], executable)
-    ]
+    matches: list[tuple[dict[str, Any], Path]] = []
+    for record in records:
+        if not isinstance(record.get("argv"), list):
+            continue
+        try:
+            raw_output = _cargo_output_alias(record["argv"], executable)
+        except LayoutError:
+            continue
+        matches.append((record, raw_output))
     _require(
         len(matches) == 1,
         f"expected one observed {flavor} linker execution, got {len(matches)}",
     )
-    observed = matches[0]
-    driver = Path(observed.get("driver", ""))
+    observed, raw_output = matches[0]
+    driver_text = observed.get("driver", "")
     _require(
-        driver.is_absolute() and driver == linker,
+        isinstance(driver_text, str) and driver_text == str(linker),
         f"observed {flavor} linker differs from recorded linker",
     )
     _require(
@@ -668,6 +987,7 @@ def replay_linker_execution(
         "linker": linker_record,
         "argv": observed["argv"],
         "executable": str(executable),
+        "raw_output": str(raw_output),
         "trace": {
             "absolute_path": str(trace),
             "sha256": digest(trace),
@@ -681,17 +1001,213 @@ def _validate_actual_link_argv_trace(
     link_argv: Path,
     observed: dict[str, Any],
     expected_wrapper: Path,
+    fragment: Path,
+    link_map: Path,
     label: str,
 ) -> None:
     _, printed_driver, printed_argv = _parse_cargo_link_argv(link_argv)
     expected_wrapper = expected_wrapper.resolve()
     _require(
-        Path(printed_driver).is_absolute() and Path(printed_driver) == expected_wrapper,
+        isinstance(printed_driver, str) and printed_driver == str(expected_wrapper),
         f"{label} link argv did not execute reviewed wrapper",
     )
     _require(
         printed_argv == observed.get("argv"),
         f"{label} link argv differs from execution trace",
+    )
+    _require(
+        not _linker_response_files(printed_argv),
+        f"{label} linker response files are forbidden",
+    )
+    selection, scripts, maps = _printed_linker_controls(printed_argv)
+    _require(
+        selection == []
+        and scripts == [f"-Wl,-T,{fragment}"]
+        and maps == [f"-Wl,-Map,{link_map}"],
+        f"{label} linker controls are not exact",
+    )
+
+
+def _resolve_printed_cargo_driver(
+    environment: dict[str, str], printed_driver: str, label: str
+) -> Path:
+    command = Path(printed_driver)
+    if command.is_absolute():
+        _require(
+            printed_driver == str(command.resolve(strict=True)),
+            f"{label} Cargo driver path is not canonical",
+        )
+        return command
+    _require("/" not in printed_driver, f"{label} Cargo driver is unsafe")
+    embedded_path = environment.get("PATH", "")
+    search = embedded_path.split(os.pathsep)
+    _require(
+        bool(search)
+        and all(component and Path(component).is_absolute() for component in search),
+        f"{label} Cargo PATH is invalid",
+    )
+    resolved = next(
+        (
+            candidate.resolve()
+            for directory in search
+            for candidate in (Path(directory) / printed_driver,)
+            if candidate.is_file() and os.access(candidate, os.X_OK)
+        ),
+        None,
+    )
+    _require(resolved is not None, f"{label} Cargo driver cannot be resolved")
+    return resolved
+
+
+def _is_script_control(argument: str) -> bool:
+    return (
+        argument in {"-T", "--script"}
+        or (argument.startswith("-T") and len(argument) > 2)
+        or argument.startswith("--script=")
+    )
+
+
+def _is_map_control(argument: str) -> bool:
+    return (
+        argument in {"-Map", "--Map"}
+        or argument.startswith("-Map=")
+        or argument.startswith("--Map=")
+    )
+
+
+def _printed_linker_controls(
+    argv: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    selection: list[str] = []
+    scripts: list[str] = []
+    maps: list[str] = []
+    for index, argument in enumerate(argv):
+        if index > 0 and argv[index - 1] == "-Xlinker":
+            continue
+        forwarded = (
+            argument.startswith("-Wl,")
+            or argument == "-Xlinker"
+            or argument.startswith("-Xlinker=")
+        )
+        candidates = [argument]
+        if argument.startswith("-Wl,"):
+            candidates = argument[4:].split(",")
+        elif argument == "-Xlinker" and index + 1 < len(argv):
+            candidates = [argv[index + 1]]
+        elif argument.startswith("-Xlinker="):
+            candidates = [argument.split("=", 1)[1]]
+        if any(
+            candidate == "--ld-path"
+            or candidate.startswith("--ld-path=")
+            or (
+                not forwarded
+                and (
+                    candidate == "-B"
+                    or (candidate.startswith("-B") and len(candidate) > 2)
+                    or candidate == "-fuse-ld"
+                    or candidate.startswith("-fuse-ld=")
+                )
+            )
+            for candidate in candidates
+        ):
+            selection.append(argument)
+        if any(_is_script_control(candidate) for candidate in candidates):
+            scripts.append(argument)
+        if any(_is_map_control(candidate) for candidate in candidates):
+            maps.append(argument)
+    return selection, scripts, maps
+
+
+def _linker_response_files(argv: list[str]) -> bool:
+    for index, argument in enumerate(argv):
+        if index > 0 and argv[index - 1] == "-Xlinker":
+            continue
+        candidates = [argument]
+        if argument.startswith("-Wl,"):
+            candidates = argument[4:].split(",")
+        elif argument == "-Xlinker" and index + 1 < len(argv):
+            candidates = [argv[index + 1]]
+        elif argument.startswith("-Xlinker="):
+            candidates = [argument.split("=", 1)[1]]
+        if any(candidate.startswith("@") for candidate in candidates):
+            return True
+    return False
+
+
+def _raw_linker_controls(
+    argv: list[str],
+) -> tuple[list[tuple[str, str | None]], list[tuple[str, str | None]]]:
+    scripts: list[tuple[str, str | None]] = []
+    maps: list[tuple[str, str | None]] = []
+    for index, argument in enumerate(argv):
+        following = argv[index + 1] if index + 1 < len(argv) else None
+        if argument in {"-T", "--script"}:
+            scripts.append((argument, following))
+        elif argument.startswith("--script="):
+            scripts.append(("--script=", argument.split("=", 1)[1]))
+        elif argument.startswith("-T") and len(argument) > 2:
+            scripts.append(("-T", argument[2:]))
+        if argument in {"-Map", "--Map"}:
+            maps.append((argument, following))
+        elif argument.startswith("-Map="):
+            maps.append(("-Map=", argument.split("=", 1)[1]))
+        elif argument.startswith("--Map="):
+            maps.append(("--Map=", argument.split("=", 1)[1]))
+    return scripts, maps
+
+
+def _validate_explicit_link_argv_trace(
+    link_argv: Path,
+    observed: dict[str, Any],
+    configured_driver: Path,
+    reviewed_wrapper: Path,
+    artifact_root: Path,
+    flavor: str,
+    fragment: Path,
+    link_map: Path,
+    label: str,
+) -> None:
+    environment, printed_driver, printed_argv = _parse_cargo_link_argv(link_argv)
+    _require(
+        _resolve_printed_cargo_driver(environment, printed_driver, label)
+        == configured_driver,
+        f"{label} Cargo driver differs from configured linker",
+    )
+    fuse = "bfd" if flavor == "gnu" else "lld"
+    wrapper_dir = artifact_root / flavor / "linker-wrapper"
+    explicit_wrapper = wrapper_dir / f"ld.{fuse}"
+    _require(
+        explicit_wrapper.is_file()
+        and not explicit_wrapper.is_symlink()
+        and explicit_wrapper == explicit_wrapper.resolve(strict=True)
+        and explicit_wrapper.stat(follow_symlinks=False).st_nlink == 1
+        and digest(explicit_wrapper) == digest(reviewed_wrapper),
+        f"{label} explicit linker wrapper differs from reviewed wrapper",
+    )
+    selection, scripts, maps = _printed_linker_controls(printed_argv)
+    _require(
+        not _linker_response_files(printed_argv)
+        and not _linker_response_files(observed.get("argv", [])),
+        f"{label} linker response files are forbidden",
+    )
+    _require(
+        selection == [f"-B{wrapper_dir}", f"-fuse-ld={fuse}"]
+        and scripts == [f"-Wl,-T,{fragment}"]
+        and maps == [f"-Wl,-Map,{link_map}"]
+        and _raw_output_values(printed_argv) == [observed.get("raw_output")],
+        f"{label} linker controls are not exact",
+    )
+    observed_argv = observed.get("argv", [])
+    observed_scripts, observed_maps = (
+        _raw_linker_controls(observed_argv)
+        if isinstance(observed_argv, list)
+        else ([], [])
+    )
+    _require(
+        isinstance(observed_argv, list)
+        and observed_scripts == [("-T", str(fragment))]
+        and observed_maps == [("-Map", str(link_map))],
+        f"{label} observed linker controls are not exact",
     )
 
 
@@ -717,9 +1233,9 @@ def replay_link_command(
         f"expected one captured final link command, got {len(matches)}",
     )
     record = matches[0]
-    observed_driver = Path(record.get("driver", ""))
+    observed_driver = record.get("driver", "")
     _require(
-        observed_driver.is_absolute() and observed_driver == driver,
+        isinstance(observed_driver, str) and observed_driver == str(driver),
         "captured link driver differs from recorded capability",
     )
     _require(
@@ -731,18 +1247,16 @@ def replay_link_command(
         isinstance(argv, list) and all(isinstance(token, str) for token in argv),
         "captured final link argv is invalid",
     )
-    selectors = ("-fuse-ld", "-B", "--ld-path", "-Wl,--ld-path")
     _require(
-        not any(token.startswith(selectors) for token in argv),
-        "captured link command contains unprobed linker-selection arguments",
+        not _linker_response_files(argv),
+        "captured link command contains linker response files",
     )
+    selection, scripts, maps = _printed_linker_controls(argv)
     _require(
-        f"-Wl,-T,{fragment}" in argv,
-        "captured link command lacks exact fragment",
-    )
-    _require(
-        f"-Wl,-Map,{link_map}" in argv,
-        "captured link command lacks exact map path",
+        selection == []
+        and scripts == [f"-Wl,-T,{fragment}"]
+        and maps == [f"-Wl,-Map,{link_map}"],
+        "captured link command linker controls are not exact",
     )
     ordered_inputs, direct_files = _link_command_inputs(argv)
     return {
@@ -846,6 +1360,21 @@ def _validate_capability_producer(
     return root, resolved_artifact_root
 
 
+def _expected_capability_shape_paths(
+    artifact_root: Path, flavor: str, target: str
+) -> dict[str, Path]:
+    flavor_root = artifact_root / flavor
+    return {
+        "binary": flavor_root / target / "release" / target,
+        "link_argv": flavor_root / f"{target}.link-args.txt",
+        "link_map": flavor_root / f"{target}.map",
+        "symbols": flavor_root / f"{target}.symbols.json",
+        "layout": flavor_root / f"{target}.layout.json",
+        "linker_execution": flavor_root / f"{target}.linker-execution.json",
+        "linker_trace": flavor_root / f"{target}.linker-trace.jsonl",
+    }
+
+
 def _validate_capability(
     manifest: dict[str, Any],
     manifest_path: Path,
@@ -873,10 +1402,10 @@ def _validate_capability(
         "linker capability",
     )
     _require(embedded["accepted"] is True, "linker capability is not accepted")
-    copy_path = _file_record(embedded["copy"], "linker capability copy")
-    _require(
-        _is_contained(manifest_path.parent, copy_path),
-        "linker capability copy is outside manifest root",
+    copy_path = _exact_capability_file_record(
+        embedded["copy"],
+        manifest_path.parent / "linker-capability.json",
+        "linker capability copy",
     )
     capability = _json_file(copy_path, "linker capability copy")
     _require(
@@ -928,11 +1457,11 @@ def _validate_capability(
     fragments: dict[str, Path] = {}
     fragment_lines: list[str] = []
     for target, record in sorted(capability["fragments"].items()):
-        path = _file_record(record, f"capability fragment {target}")
         expected = (producer_root / f"benches/cache-gate-{target}-layout.ld").resolve()
-        _require(
-            path == expected,
-            f"capability fragment {target} is outside producer",
+        path = _exact_capability_file_record(
+            record,
+            expected,
+            f"capability fragment {target}",
         )
         relative = path.relative_to(producer_root)
         blob = subprocess.run(
@@ -971,6 +1500,9 @@ def _validate_capability(
         for flavor, shapes in capability["shapes"].items():
             _exact_keys(shapes, set(TARGET_KERNELS), f"{flavor} capability targets")
             for target, shape in shapes.items():
+                expected_paths = _expected_capability_shape_paths(
+                    artifact_root, flavor, target
+                )
                 expected_shape_keys = {
                     "binary",
                     "link_argv",
@@ -983,7 +1515,12 @@ def _validate_capability(
                     shape, expected_shape_keys, f"{flavor}/{target} capability shape"
                 )
                 paths = {
-                    key: _file_record(shape[key], f"{flavor}/{target} {key}")
+                    key: _exact_capability_file_record(
+                        shape[key],
+                        expected_paths[key],
+                        f"{flavor}/{target} {key}",
+                        required_links=2 if key == "binary" else 1,
+                    )
                     for key in (
                         "binary",
                         "link_argv",
@@ -993,8 +1530,8 @@ def _validate_capability(
                     )
                 }
                 _require(
-                    all(_is_contained(artifact_root, path) for path in paths.values()),
-                    f"{flavor}/{target} capability artifact is outside producer artifact root",
+                    all(paths[key] == expected_paths[key] for key in paths),
+                    f"{flavor}/{target} capability artifact path mismatch",
                 )
                 layout = _json_file(paths["layout"], f"{flavor}/{target} layout")
                 link_argv_text = paths["link_argv"].read_text(errors="replace")
@@ -1056,12 +1593,14 @@ def _validate_capability(
                     regenerated_layout == layout,
                     f"{flavor}/{target} capability layout differs from artifact bytes",
                 )
-                execution_path = _file_record(
-                    shape["linker_execution"], f"{flavor}/{target} linker execution"
+                execution_path = _exact_capability_file_record(
+                    shape["linker_execution"],
+                    expected_paths["linker_execution"],
+                    f"{flavor}/{target} linker execution",
                 )
                 _require(
-                    _is_contained(artifact_root, execution_path),
-                    f"{flavor}/{target} execution proof is outside producer artifact root",
+                    execution_path == expected_paths["linker_execution"],
+                    f"{flavor}/{target} execution proof path mismatch",
                 )
                 observed = _json_file(
                     execution_path, f"{flavor}/{target} linker execution"
@@ -1077,10 +1616,15 @@ def _validate_capability(
                     else capability["required_linkers"][flavor]
                 )
                 trace = observed.get("trace", {})
-                trace_path = _trace_record(trace, f"{flavor}/{target} linker trace")
+                trace_path = _exact_capability_file_record(
+                    trace,
+                    expected_paths["linker_trace"],
+                    f"{flavor}/{target} linker trace",
+                    trace=True,
+                )
                 _require(
-                    _is_contained(artifact_root, trace_path),
-                    f"{flavor}/{target} linker trace is outside producer artifact root",
+                    trace_path == expected_paths["linker_trace"],
+                    f"{flavor}/{target} linker trace path mismatch",
                 )
                 regenerated = replay_linker_execution(
                     trace_path,
@@ -1101,14 +1645,31 @@ def _validate_capability(
                         paths["link_argv"],
                         observed,
                         tools["link_wrapper"],
+                        fragments[target],
+                        paths["link_map"],
+                        f"{flavor}/{target}",
+                    )
+                else:
+                    _validate_explicit_link_argv_trace(
+                        paths["link_argv"],
+                        observed,
+                        Path(capability["linker"]["absolute_path"]),
+                        tools["link_wrapper"],
+                        artifact_root,
+                        flavor,
+                        fragments[target],
+                        paths["link_map"],
                         f"{flavor}/{target}",
                     )
     copied_fragments: dict[str, Path] = {}
     for target, record in capability["fragments"].items():
-        copied = (manifest_path.parent / "linker-fragments" / f"{target}.ld").resolve()
+        copied = manifest_path.parent / "linker-fragments" / f"{target}.ld"
         _require(
-            copied.is_file() and not copied.is_symlink(),
-            f"missing copied fragment {target}",
+            copied.is_file()
+            and not copied.is_symlink()
+            and copied == copied.resolve(strict=True)
+            and copied.stat(follow_symlinks=False).st_nlink == 1,
+            f"copied fragment {target} is not exact private file",
         )
         _require(
             digest(copied) == record["sha256"],
@@ -1930,6 +2491,9 @@ def _load_capability() -> dict[str, Any]:
     capability_path = Path(path)
     if not capability_path.is_absolute() or not capability_path.is_file():
         raise LayoutError("CACHE_GATE_LINKER_CAPABILITY must be an absolute file")
+    identity = os.environ.get("CACHE_GATE_LINKER_CAPABILITY_IDENTITY")
+    if identity:
+        return json.loads(_read_verified_staged_capability(capability_path, identity))
     return json.loads(capability_path.read_text())
 
 
@@ -2306,7 +2870,12 @@ def validate_link_command(args: argparse.Namespace) -> dict[str, Any]:
     ):
         _require(path.is_absolute(), f"--{label.replace(' ', '-')} must be absolute")
         _require(path.is_file() and not path.is_symlink(), f"invalid {label}: {path}")
-    capability = json.loads(args.capability.read_text())
+    capability_bytes = (
+        _read_verified_staged_capability(args.capability, args.capability_identity)
+        if args.capability_identity
+        else args.capability.read_bytes()
+    )
+    capability = json.loads(capability_bytes)
     linker = capability.get("linker", {})
     configured_driver = _validate_linker_record(linker, "capability linker")
     _require(
@@ -2322,25 +2891,60 @@ def validate_link_command(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
-def _output_path(argv: list[str]) -> Path | None:
+def _raw_output_values(argv: list[str]) -> list[str]:
+    outputs: list[str] = []
     for index, token in enumerate(argv):
         if token == "-o" and index + 1 < len(argv):
-            return Path(argv[index + 1]).resolve()
-        if token.startswith("-o") and len(token) > 2:
-            return Path(token[2:]).resolve()
-    return None
+            outputs.append(argv[index + 1])
+        elif token.startswith("-o") and len(token) > 2:
+            outputs.append(token[2:])
+    return outputs
+
+
+def _output_path(argv: list[str]) -> Path | None:
+    outputs = _raw_output_values(argv)
+    return Path(outputs[0]).resolve() if len(outputs) == 1 else None
+
+
+def _raw_output_matches(argv: list[str], executable: Path) -> bool:
+    return _raw_output_values(argv) == [str(executable)]
+
+
+def _cargo_output_alias(argv: list[str], executable: Path) -> Path:
+    outputs = _raw_output_values(argv)
+    _require(len(outputs) == 1, "capability trace lacks one exact Cargo output")
+    raw_text = outputs[0]
+    raw_output = Path(raw_text)
+    _require(
+        raw_output.is_absolute()
+        and raw_text == str(raw_output.resolve(strict=True))
+        and executable.is_absolute()
+        and str(executable) == str(executable.resolve(strict=True)),
+        "capability Cargo output alias is not canonical",
+    )
+    _require(
+        raw_output.parent == executable.parent / "deps"
+        and re.fullmatch(
+            rf"{re.escape(executable.name)}-[0-9a-f]{{16}}", raw_output.name
+        )
+        is not None,
+        "capability Cargo output alias has unexpected path",
+    )
+    raw_stat = raw_output.stat(follow_symlinks=False)
+    executable_stat = executable.stat(follow_symlinks=False)
+    _require(
+        stat.S_ISREG(raw_stat.st_mode)
+        and stat.S_ISREG(executable_stat.st_mode)
+        and raw_stat.st_nlink == executable_stat.st_nlink == 2
+        and (raw_stat.st_dev, raw_stat.st_ino)
+        == (executable_stat.st_dev, executable_stat.st_ino),
+        "capability Cargo output alias is not exact hardlink pair",
+    )
+    return raw_output
 
 
 def _output_matches(argv: list[str], executable: Path) -> bool:
-    output = _output_path(argv)
-    if output is None:
-        return False
-    if output == executable:
-        return True
-    try:
-        return output.is_file() and executable.is_file() and output.samefile(executable)
-    except OSError:
-        return False
+    return _raw_output_matches(argv, executable)
 
 
 def _require_output_contained(argv: list[str], root: Path, message: str) -> None:
@@ -2383,20 +2987,23 @@ def validate_linker_execution(args: argparse.Namespace) -> dict[str, Any]:
     records = [
         json.loads(line) for line in args.trace.read_text().splitlines() if line.strip()
     ]
-    matches = [
-        record
-        for record in records
-        if isinstance(record.get("argv"), list)
-        and _output_matches(record["argv"], executable)
-    ]
+    matches: list[tuple[dict[str, Any], Path]] = []
+    for candidate in records:
+        if not isinstance(candidate.get("argv"), list):
+            continue
+        try:
+            raw_output = _cargo_output_alias(candidate["argv"], executable)
+        except LayoutError:
+            continue
+        matches.append((candidate, raw_output))
     _require(
         len(matches) == 1,
         f"expected one observed explicit linker execution, got {len(matches)}",
     )
-    record = matches[0]
-    observed = Path(record.get("driver", ""))
+    record, raw_output = matches[0]
+    observed = record.get("driver", "")
     _require(
-        observed.is_absolute() and observed.resolve() == linker,
+        isinstance(observed, str) and observed == str(linker),
         "observed linker differs from required explicit linker",
     )
     _require(
@@ -2412,6 +3019,7 @@ def validate_linker_execution(args: argparse.Namespace) -> dict[str, Any]:
         },
         "argv": record["argv"],
         "executable": str(executable),
+        "raw_output": str(raw_output),
         "trace": {
             "absolute_path": str(args.trace.resolve()),
             "sha256": digest(args.trace),
@@ -2509,6 +3117,44 @@ def resolve_cargo_linker(args: argparse.Namespace) -> Path:
     return driver
 
 
+def stage_validate_capability(args: argparse.Namespace) -> tuple[str, str, str]:
+    _require(args.tools.is_absolute(), "--tools must be absolute")
+    _require(
+        args.tools.is_file()
+        and not args.tools.is_symlink()
+        and args.tools == args.tools.resolve(strict=True),
+        "invalid authenticated tools path",
+    )
+    tool_records = _json_file(args.tools, "authenticated tools")
+    tools = _validate_tools(tool_records)
+
+    def validate_staged(staged: Path, capability: dict[str, Any]) -> str:
+        embedded = {
+            **capability,
+            "copy": {"absolute_path": str(staged), "sha256": digest(staged)},
+        }
+        manifest = {
+            "architecture": args.arch,
+            "linker_capability": embedded,
+            "tools": tool_records,
+        }
+        producer_root = Path(capability["producer"]["runner_root"])
+        validated, _, _ = _validate_capability(
+            manifest,
+            staged.parent / "manifest.json",
+            producer_root,
+            tools,
+        )
+        driver = _validate_linker_record(validated["linker"], "capability linker")
+        _require(
+            _linker_version(driver) == validated["linker"]["version"],
+            "capability linker version no longer matches actual driver",
+        )
+        return str(driver)
+
+    return _stage_capability_once(args.input, args.output, validate_staged)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2532,6 +3178,7 @@ def main() -> int:
     link_parser.add_argument("--trace", type=Path, required=True)
     link_parser.add_argument("--executable", type=Path, required=True)
     link_parser.add_argument("--capability", type=Path, required=True)
+    link_parser.add_argument("--capability-identity")
     link_parser.add_argument("--fragment", type=Path, required=True)
     link_parser.add_argument("--link-map", type=Path, required=True)
     link_parser.add_argument("--output", type=Path, required=True)
@@ -2548,6 +3195,16 @@ def main() -> int:
     cargo_parser.add_argument("--bench", required=True)
     cargo_linker_parser = subparsers.add_parser("resolve-cargo-linker")
     cargo_linker_parser.add_argument("--link-args", type=Path, required=True)
+    stage_capability_parser = subparsers.add_parser("stage-validate-capability")
+    stage_capability_parser.add_argument("--input", type=Path, required=True)
+    stage_capability_parser.add_argument("--output", type=Path, required=True)
+    stage_capability_parser.add_argument(
+        "--arch", choices=("aarch64", "x86_64"), required=True
+    )
+    stage_capability_parser.add_argument("--tools", type=Path, required=True)
+    verify_capability_parser = subparsers.add_parser("verify-staged-capability")
+    verify_capability_parser.add_argument("--path", type=Path, required=True)
+    verify_capability_parser.add_argument("--identity", required=True)
     args = parser.parse_args()
     try:
         if args.command == "validate":
@@ -2585,6 +3242,13 @@ def main() -> int:
             _write_json_atomic(args.output, validate_linker_execution(args))
         elif args.command == "select-cargo-executable":
             print(select_cargo_executable(args))
+        elif args.command == "stage-validate-capability":
+            driver, identity, document = stage_validate_capability(args)
+            print(driver)
+            print(identity)
+            print(document)
+        elif args.command == "verify-staged-capability":
+            verify_staged_capability(args.path, args.identity)
         else:
             print(resolve_cargo_linker(args))
     except (KeyError, OSError, json.JSONDecodeError, LayoutError) as error:

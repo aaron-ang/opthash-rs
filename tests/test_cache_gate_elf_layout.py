@@ -1,3 +1,4 @@
+import base64
 import copy
 import ctypes
 import errno
@@ -102,6 +103,17 @@ assert tuple(map(len, TARGET_KERNELS.values())) == (2, 2, 4)
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def make_cargo_output_pair(tmp_path: Path, target: str = "probe") -> tuple[Path, Path]:
+    release = tmp_path / target / "release"
+    deps = release / "deps"
+    deps.mkdir(parents=True)
+    raw_output = deps / f"{target}-0123456789abcdef"
+    raw_output.write_bytes(b"ELF fixture\n")
+    binary = release / target
+    os.link(raw_output, binary)
+    return binary, raw_output
 
 
 def make_manifest(tmp_path: Path) -> dict:
@@ -663,7 +675,58 @@ def test_validate_link_command_binds_real_driver_and_final_output(tmp_path):
     trace.write_text(trace.read_text().replace("-Wl,-T,", "-fuse-ld=lld -Wl,-T,"))
     rejected = subprocess.run(command, text=True, capture_output=True)
     assert rejected.returncode != 0
-    assert "linker-selection" in rejected.stderr
+    assert "linker controls are not exact" in rejected.stderr
+
+
+@pytest.mark.parametrize("attack", ["conflicting-controls", "response", "xresponse"])
+def test_main_link_replay_rejects_hidden_or_conflicting_controls(tmp_path, attack):
+    namespace = runpy.run_path(str(SCRIPT))
+    driver = tmp_path / "cc"
+    driver.write_text("#!/bin/sh\nexit 0\n")
+    driver.chmod(0o755)
+    executable = tmp_path / "bench"
+    executable.write_bytes(b"ELF\n")
+    fragment = tmp_path / "layout.ld"
+    fragment.write_text("SECTIONS {}\n")
+    link_map = tmp_path / "bench.map"
+    link_map.write_text("map\n")
+    obj = tmp_path / "input.o"
+    obj.write_bytes(b"object\n")
+    response = tmp_path / "hidden.rsp"
+    response.write_text("--script=/evil.ld\n")
+    argv = [
+        str(obj),
+        "-o",
+        str(executable),
+        f"-Wl,-T,{fragment}",
+        f"-Wl,-Map,{link_map}",
+    ]
+    if attack == "conflicting-controls":
+        argv.extend(("-Wl,--script,/evil.ld", "-Wl,-Map,/evil.map"))
+    elif attack == "response":
+        argv.append(f"-Wl,@{response}")
+    else:
+        argv.extend(("-Xlinker", f"@{response}"))
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "driver": str(driver.resolve()),
+                "driver_sha256": digest(driver),
+                "argv": argv,
+            }
+        )
+        + "\n"
+    )
+    linker = {
+        "absolute_path": str(driver.resolve()),
+        "sha256": digest(driver),
+        "flavor": "GNU ld",
+        "version": "GNU ld fixture",
+    }
+
+    with pytest.raises(ValueError, match="linker (controls|response files)"):
+        namespace["replay_link_command"](trace, executable, linker, fragment, link_map)
 
 
 def test_link_wrapper_records_driver_bytes_and_exact_argv(tmp_path):
@@ -705,17 +768,14 @@ def test_explicit_linker_execution_record_binds_observed_path_hash_and_version(
         "exit 0\n"
     )
     linker.chmod(0o755)
-    link_output = tmp_path / "probe-hashed"
-    link_output.write_bytes(b"ELF fixture\n")
-    binary = tmp_path / "probe"
-    os.link(link_output, binary)
+    binary, raw_output = make_cargo_output_pair(tmp_path)
     trace = tmp_path / "linker-trace.jsonl"
     trace.write_text(
         json.dumps(
             {
                 "driver": str(linker.resolve()),
                 "driver_sha256": digest(linker),
-                "argv": ["-o", str(link_output.resolve())],
+                "argv": ["-o", str(raw_output.resolve())],
                 "cwd": str(tmp_path.resolve()),
                 "path": os.environ["PATH"],
             }
@@ -766,15 +826,14 @@ def test_actual_driver_execution_record_uses_forwarded_linker_version(tmp_path):
         "exit 0\n"
     )
     driver.chmod(0o755)
-    binary = tmp_path / "probe"
-    binary.write_bytes(b"ELF fixture\n")
+    binary, raw_output = make_cargo_output_pair(tmp_path)
     trace = tmp_path / "actual-trace.jsonl"
     trace.write_text(
         json.dumps(
             {
                 "driver": str(driver.resolve()),
                 "driver_sha256": digest(driver),
-                "argv": ["-o", str(binary.resolve())],
+                "argv": ["-o", str(raw_output.resolve())],
                 "cwd": str(tmp_path.resolve()),
                 "path": os.environ["PATH"],
             }
@@ -1110,6 +1169,644 @@ def test_capability_publication_rejects_source_and_destination_symlinks(tmp_path
         )
 
 
+def test_checked_absolute_file_rejects_existing_child_parent_alias(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    subject = tmp_path / "subject.json"
+    subject.write_text("authenticated\n")
+    (tmp_path / "existing-child").mkdir()
+    aliased = tmp_path / "existing-child" / ".." / subject.name
+    record = {"absolute_path": str(aliased), "sha256": digest(subject)}
+
+    with pytest.raises(ValueError, match="canonical"):
+        namespace["checked_absolute_file"](record, "aliased capability artifact")
+
+
+@pytest.mark.parametrize(
+    "alias_kind", ["hardlink", "existing-child-parent", "exact-extra-hardlink"]
+)
+def test_capability_record_requires_exact_expected_path(tmp_path, alias_kind):
+    namespace = runpy.run_path(str(SCRIPT))
+    expected = tmp_path / "actual/elastic.map"
+    expected.parent.mkdir(parents=True)
+    expected.write_text("authenticated map\n")
+    if alias_kind == "hardlink":
+        alias = tmp_path / "actual/elastic-alias.map"
+        os.link(expected, alias)
+    elif alias_kind == "exact-extra-hardlink":
+        os.link(expected, tmp_path / "actual/extra-hardlink.map")
+        alias = expected
+    else:
+        (expected.parent / "existing-child").mkdir()
+        alias = expected.parent / "existing-child" / ".." / expected.name
+    record = {"absolute_path": str(alias), "sha256": digest(expected)}
+
+    with pytest.raises(ValueError, match="exact producer path"):
+        namespace["_exact_capability_file_record"](
+            record, expected.resolve(), "actual/elastic link map"
+        )
+
+
+def test_stage_capability_rejects_input_inode_swap_during_validation(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    source = tmp_path / "capability.json"
+    source.write_text('{"accepted":true}\n')
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text('{"accepted":false}\n')
+    destination_dir = tmp_path / "staged"
+    destination_dir.mkdir()
+    destination = destination_dir / "linker-capability.json"
+
+    def swap_input(_staged, _payload):
+        source.rename(tmp_path / "original-capability.json")
+        replacement.rename(source)
+        return "validated"
+
+    with pytest.raises(ValueError, match="input.*changed"):
+        namespace["_stage_capability_once"](source, destination, swap_input)
+    assert not destination.exists()
+    assert source.read_text() == '{"accepted":false}\n'
+
+
+def test_stage_capability_rejects_staged_inode_swap_without_deleting_replacement(
+    tmp_path,
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    source = tmp_path / "capability.json"
+    source.write_text('{"accepted":true}\n')
+    destination_dir = tmp_path / "staged"
+    destination_dir.mkdir()
+    destination = destination_dir / "linker-capability.json"
+
+    def swap_stage(staged, payload):
+        assert payload == {"accepted": True}
+        staged.rename(destination_dir / "validated-original.json")
+        staged.write_text('{"accepted":"forged"}\n')
+        return "validated"
+
+    with pytest.raises(ValueError, match="staged capability changed"):
+        namespace["_stage_capability_once"](source, destination, swap_stage)
+    assert json.loads(destination.read_text()) == {"accepted": "forged"}
+
+
+@pytest.mark.parametrize("swapped_parent", ["source", "destination"])
+def test_stage_capability_rejects_parent_directory_replacement(
+    tmp_path, swapped_parent
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    source_parent = tmp_path / "source"
+    destination_parent = tmp_path / "staged"
+    source_parent.mkdir()
+    destination_parent.mkdir()
+    source = source_parent / "capability.json"
+    source.write_text('{"accepted":true}\n')
+    destination = destination_parent / "linker-capability.json"
+
+    def replace_parent(_staged, _payload):
+        parent = source_parent if swapped_parent == "source" else destination_parent
+        moved = tmp_path / f"detached-{swapped_parent}"
+        parent.rename(moved)
+        parent.mkdir()
+        replacement = source if swapped_parent == "source" else destination
+        replacement.write_text('{"accepted":true}\n')
+        return "validated"
+
+    with pytest.raises(ValueError, match="directory ancestry changed"):
+        namespace["_stage_capability_once"](source, destination, replace_parent)
+    if swapped_parent == "destination":
+        assert destination.read_text() == '{"accepted":true}\n'
+
+
+def test_stage_capability_preserves_exact_input_bytes(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    source = tmp_path / "capability.json"
+    source_bytes = b'{"accepted": true, "padding": "exact bytes"}\n'
+    source.write_bytes(source_bytes)
+    destination_dir = tmp_path / "staged"
+    destination_dir.mkdir()
+    destination = destination_dir / "linker-capability.json"
+
+    result, identity, document = namespace["_stage_capability_once"](
+        source,
+        destination,
+        lambda staged, payload: f"{staged.name}:{payload['accepted']}",
+    )
+
+    assert result == "linker-capability.json:True"
+    assert base64.b64decode(document) == source_bytes
+    assert identity.rsplit(":", 1)[1] == hashlib.sha256(source_bytes).hexdigest()
+    assert destination.read_bytes() == source_bytes
+    assert destination.stat().st_mode & 0o777 == 0o444
+    namespace["verify_staged_capability"](destination, identity)
+    destination.chmod(0o644)
+    destination.write_bytes(b'{"accepted": false}\n')
+    with pytest.raises(ValueError, match="staged capability"):
+        namespace["verify_staged_capability"](destination, identity)
+
+
+def test_staged_identity_holds_original_parent_ancestry_across_verifications(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    source = tmp_path / "capability.json"
+    source.write_text('{"accepted":true}\n')
+    destination_parent = tmp_path / "staged"
+    destination_parent.mkdir()
+    destination = destination_parent / "linker-capability.json"
+    _, identity, _ = namespace["_stage_capability_once"](
+        source, destination, lambda *_: "validated"
+    )
+    original_stat = destination.stat(follow_symlinks=False)
+
+    detached = tmp_path / "detached-staged"
+    destination_parent.rename(detached)
+    destination_parent.mkdir()
+    (detached / destination.name).rename(destination)
+    moved_stat = destination.stat(follow_symlinks=False)
+    assert (moved_stat.st_dev, moved_stat.st_ino) == (
+        original_stat.st_dev,
+        original_stat.st_ino,
+    )
+
+    with pytest.raises(ValueError, match="staged capability"):
+        namespace["verify_staged_capability"](destination, identity)
+
+
+def make_semantic_capability_fixture(tmp_path, namespace):
+    module_globals = namespace["_validate_capability"].__globals__
+    producer = tmp_path / "producer"
+    artifact_root = producer / "target/cache-gate-linker/aarch64/.probe.fixture"
+    manifest_root = tmp_path / "manifest"
+    copied_fragments = manifest_root / "linker-fragments"
+    wrapper = producer / "scripts/cache-gate-link-wrapper.py"
+    extractor = producer / "scripts/extract-hot-symbols.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n")
+    extractor.write_text("#!/usr/bin/env python3\n")
+    wrapper.chmod(0o755)
+    extractor.chmod(0o755)
+    copied_fragments.mkdir(parents=True)
+    (producer / "benches").mkdir()
+    fragments = {}
+    for target in ("elastic", "funnel", "profile"):
+        fragment = producer / f"benches/cache-gate-{target}-layout.ld"
+        fragment.write_text(f"/* {target} */\n")
+        fragments[target] = {
+            "absolute_path": str(fragment.resolve()),
+            "sha256": digest(fragment),
+        }
+        (copied_fragments / f"{target}.ld").write_bytes(fragment.read_bytes())
+    fragment_set = namespace["_fingerprint"](
+        [f"{target}:{fragments[target]['sha256']}" for target in sorted(fragments)]
+    )
+    drivers = {}
+    for flavor, identity, version in (
+        ("actual", "GNU ld", "GNU ld actual fixture"),
+        ("gnu", "GNU ld", "GNU ld explicit fixture"),
+        ("lld", "LLD", "LLD explicit fixture"),
+    ):
+        driver = producer / f"tools/{flavor}-driver"
+        driver.parent.mkdir(exist_ok=True)
+        driver.write_text("#!/bin/sh\nexit 0\n")
+        driver.chmod(0o755)
+        drivers[flavor] = {
+            "absolute_path": str(driver.resolve()),
+            "sha256": digest(driver),
+            "flavor": identity,
+            "version": version,
+        }
+    shapes = {}
+    for flavor in ("actual", "gnu", "lld"):
+        shapes[flavor] = {}
+        linker = drivers[flavor]
+        for target in ("elastic", "funnel", "profile"):
+            expected = namespace["_expected_capability_shape_paths"](
+                artifact_root, flavor, target
+            )
+            deps = expected["binary"].parent / "deps"
+            deps.mkdir(parents=True)
+            raw_output = deps / f"{target}-0123456789abcdef"
+            raw_output.write_bytes(f"ELF {flavor}/{target}\n".encode())
+            os.link(raw_output, expected["binary"])
+            expected["link_map"].write_text(f"map {flavor}/{target}\n")
+            expected["symbols"].write_text(json.dumps({"target": target}) + "\n")
+            expected["layout"].write_text(
+                json.dumps(
+                    {
+                        "binary": str(expected["binary"]),
+                        "link_map": str(expected["link_map"]),
+                        "fragment_sha256": fragments[target]["sha256"],
+                        "fragment_set_sha256": fragment_set,
+                    }
+                )
+                + "\n"
+            )
+            printed_argv = [
+                "-o",
+                str(raw_output),
+                "-Wl,-Bstatic",
+                "-Wl,-Bdynamic",
+            ]
+            if flavor == "actual":
+                printed_driver = wrapper
+                printed_argv.extend(
+                    (
+                        f"-Wl,-T,{fragments[target]['absolute_path']}",
+                        f"-Wl,-Map,{expected['link_map']}",
+                    )
+                )
+                observed_argv = printed_argv
+            else:
+                fuse = "bfd" if flavor == "gnu" else "lld"
+                wrapper_dir = artifact_root / flavor / "linker-wrapper"
+                wrapper_dir.mkdir(exist_ok=True)
+                explicit_wrapper = wrapper_dir / f"ld.{fuse}"
+                if not explicit_wrapper.exists():
+                    explicit_wrapper.write_bytes(wrapper.read_bytes())
+                    explicit_wrapper.chmod(0o755)
+                printed_driver = Path(drivers["actual"]["absolute_path"])
+                printed_argv.extend(
+                    (
+                        f"-B{wrapper_dir}",
+                        f"-fuse-ld={fuse}",
+                        f"-Wl,-T,{fragments[target]['absolute_path']}",
+                        f"-Wl,-Map,{expected['link_map']}",
+                    )
+                )
+                observed_argv = [
+                    "-o",
+                    str(raw_output),
+                    "-T",
+                    fragments[target]["absolute_path"],
+                    "-Map",
+                    str(expected["link_map"]),
+                ]
+            expected["link_argv"].write_text(
+                f'PATH="/usr/bin" "{printed_driver}" '
+                + " ".join(shlex.quote(value) for value in printed_argv)
+                + "\n"
+            )
+            expected["linker_trace"].write_text(
+                json.dumps(
+                    {
+                        "driver": linker["absolute_path"],
+                        "driver_sha256": linker["sha256"],
+                        "argv": observed_argv,
+                    }
+                )
+                + "\n"
+            )
+            execution = namespace["replay_linker_execution"](
+                expected["linker_trace"], linker, expected["binary"], flavor
+            )
+            expected["linker_execution"].write_text(json.dumps(execution) + "\n")
+            shapes[flavor][target] = {
+                key: {
+                    "absolute_path": str(expected[key]),
+                    "sha256": digest(expected[key]),
+                }
+                for key in (
+                    "binary",
+                    "link_argv",
+                    "link_map",
+                    "symbols",
+                    "layout",
+                    "linker_execution",
+                )
+            }
+    payload = {
+        "accepted": True,
+        "arch": "aarch64",
+        "target_triple": "aarch64-unknown-linux-gnu",
+        "max_page_size": 65536,
+        "rustc_version": "rustc fixture\nhost: aarch64-unknown-linux-gnu",
+        "cargo_version": "cargo fixture",
+        "linker": drivers["actual"],
+        "required_linkers": {"gnu": drivers["gnu"], "lld": drivers["lld"]},
+        "fragments": fragments,
+        "fragment_set_sha256": fragment_set,
+        "shapes": shapes,
+        "producer": {
+            "runner_root": str(producer.resolve()),
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "empty_diff_assertion": True,
+            "artifact_root": str(artifact_root.resolve()),
+        },
+    }
+    capability_copy = manifest_root / "linker-capability.json"
+
+    def refresh():
+        capability_copy.write_text(json.dumps(payload) + "\n")
+        return {
+            "architecture": "aarch64",
+            "tools": {"elf_layout": {}},
+            "linker_capability": {
+                **copy.deepcopy(payload),
+                "copy": {
+                    "absolute_path": str(capability_copy.resolve()),
+                    "sha256": digest(capability_copy),
+                },
+            },
+        }
+
+    class SubprocessProxy:
+        def run(self, arguments, *args, **kwargs):
+            if arguments[:4] == ["git", "-C", str(producer), "show"]:
+                relative = arguments[4].split(":", 1)[1]
+                return subprocess.CompletedProcess(
+                    arguments, 0, stdout=(producer / relative).read_bytes(), stderr=b""
+                )
+            return subprocess.run(arguments, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(subprocess, name)
+
+    module_globals["subprocess"] = SubprocessProxy()
+    module_globals["_validate_capability_producer"] = lambda *_: (
+        producer.resolve(),
+        artifact_root.resolve(),
+    )
+    module_globals["validate_layout_record"] = lambda *_: None
+
+    def copy_symbols(_extractor, binary, _arch, _target, output, _label):
+        flavor = binary.parents[2].name
+        recorded = artifact_root / flavor / f"{binary.name}.symbols.json"
+        output.write_bytes(recorded.read_bytes())
+
+    module_globals["_run_extractor"] = copy_symbols
+    module_globals["validate_elf"] = lambda arguments, _capability=None: json.loads(
+        (
+            artifact_root
+            / arguments.binary.parents[2].name
+            / f"{arguments.binary.name}.layout.json"
+        ).read_text()
+    )
+    tools = {"extractor": extractor.resolve(), "link_wrapper": wrapper.resolve()}
+    return payload, refresh, capability_copy, manifest_root, tools, module_globals
+
+
+def test_shared_capability_validator_replays_all_nine_shapes(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    payload, refresh, capability_copy, manifest_root, tools, module_globals = (
+        make_semantic_capability_fixture(tmp_path, namespace)
+    )
+    observed = []
+    replay = namespace["replay_linker_execution"]
+
+    def record_replay(trace, linker, executable, flavor):
+        observed.append((flavor, executable.name))
+        return replay(trace, linker, executable, flavor)
+
+    module_globals["replay_linker_execution"] = record_replay
+    manifest = refresh()
+    namespace["_validate_capability"](
+        manifest, manifest_root / "manifest.json", ROOT, tools
+    )
+
+    assert set(observed) == {
+        (flavor, target)
+        for flavor in ("actual", "gnu", "lld")
+        for target in ("elastic", "funnel", "profile")
+    }
+    assert payload["accepted"] is True and capability_copy.is_file()
+
+
+@pytest.mark.parametrize("flavor", ["gnu", "lld"])
+def test_shared_capability_validator_rejects_forged_explicit_driver(tmp_path, flavor):
+    namespace = runpy.run_path(str(SCRIPT))
+    payload, refresh, _, manifest_root, tools, _ = make_semantic_capability_fixture(
+        tmp_path, namespace
+    )
+    target = "elastic"
+    execution_path = Path(
+        payload["shapes"][flavor][target]["linker_execution"]["absolute_path"]
+    )
+    execution = json.loads(execution_path.read_text())
+    trace_path = Path(execution["trace"]["absolute_path"])
+    forged_driver = trace_path.parent / "forged-driver"
+    forged_driver.write_text("#!/bin/sh\nexit 0\n")
+    forged_driver.chmod(0o755)
+    trace = json.loads(trace_path.read_text())
+    trace["driver"] = str(forged_driver.resolve())
+    trace["driver_sha256"] = digest(forged_driver)
+    trace_path.write_text(json.dumps(trace) + "\n")
+    execution["trace"]["sha256"] = digest(trace_path)
+    execution_path.write_text(json.dumps(execution) + "\n")
+    payload["shapes"][flavor][target]["linker_execution"]["sha256"] = digest(
+        execution_path
+    )
+    manifest = refresh()
+
+    with pytest.raises(ValueError, match=f"observed {flavor} linker differs"):
+        namespace["_validate_capability"](
+            manifest, manifest_root / "manifest.json", ROOT, tools
+        )
+
+
+@pytest.mark.parametrize("flavor", ["gnu", "lld"])
+def test_shared_capability_validator_binds_explicit_trace_fragment_and_map(
+    tmp_path, flavor
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    payload, refresh, _, manifest_root, tools, _ = make_semantic_capability_fixture(
+        tmp_path, namespace
+    )
+    target = "elastic"
+    execution_path = Path(
+        payload["shapes"][flavor][target]["linker_execution"]["absolute_path"]
+    )
+    execution = json.loads(execution_path.read_text())
+    trace_path = Path(execution["trace"]["absolute_path"])
+    trace = json.loads(trace_path.read_text())
+    trace["argv"] = trace["argv"][:2]
+    trace_path.write_text(json.dumps(trace) + "\n")
+    execution["argv"] = trace["argv"]
+    execution["trace"]["sha256"] = digest(trace_path)
+    execution_path.write_text(json.dumps(execution) + "\n")
+    payload["shapes"][flavor][target]["linker_execution"]["sha256"] = digest(
+        execution_path
+    )
+    manifest = refresh()
+
+    with pytest.raises(ValueError, match="observed linker controls are not exact"):
+        namespace["_validate_capability"](
+            manifest, manifest_root / "manifest.json", ROOT, tools
+        )
+
+
+@pytest.mark.parametrize("flavor", ["actual", "gnu", "lld"])
+def test_shared_capability_validator_rejects_conflicting_linker_controls(
+    tmp_path, flavor
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    payload, refresh, _, manifest_root, tools, _ = make_semantic_capability_fixture(
+        tmp_path, namespace
+    )
+    target = "elastic"
+    shape = payload["shapes"][flavor][target]
+    link_argv_path = Path(shape["link_argv"]["absolute_path"])
+    conflicting_printed = [
+        "-Wl,--script,/evil.ld",
+        "-Wl,-Map,/evil.map",
+        "-B/evil",
+        "-fuse-ld=gold",
+    ]
+    link_argv_path.write_text(
+        link_argv_path.read_text().rstrip()
+        + " "
+        + " ".join(shlex.quote(value) for value in conflicting_printed)
+        + "\n"
+    )
+    shape["link_argv"]["sha256"] = digest(link_argv_path)
+
+    execution_path = Path(shape["linker_execution"]["absolute_path"])
+    execution = json.loads(execution_path.read_text())
+    trace_path = Path(execution["trace"]["absolute_path"])
+    trace = json.loads(trace_path.read_text())
+    conflicting_observed = (
+        conflicting_printed
+        if flavor == "actual"
+        else ["--script=/evil.ld", "-Map=/evil.map"]
+    )
+    trace["argv"].extend(conflicting_observed)
+    trace_path.write_text(json.dumps(trace) + "\n")
+    execution["argv"] = trace["argv"]
+    execution["trace"]["sha256"] = digest(trace_path)
+    execution_path.write_text(json.dumps(execution) + "\n")
+    shape["linker_execution"]["sha256"] = digest(execution_path)
+    manifest = refresh()
+
+    with pytest.raises(ValueError, match="linker controls are not exact"):
+        namespace["_validate_capability"](
+            manifest, manifest_root / "manifest.json", ROOT, tools
+        )
+
+
+@pytest.mark.parametrize("flavor", ["actual", "gnu", "lld"])
+def test_shared_capability_validator_rejects_linker_response_files(tmp_path, flavor):
+    namespace = runpy.run_path(str(SCRIPT))
+    payload, refresh, _, manifest_root, tools, _ = make_semantic_capability_fixture(
+        tmp_path, namespace
+    )
+    target = "elastic"
+    shape = payload["shapes"][flavor][target]
+    response = tmp_path / f"{flavor}.rsp"
+    response.write_text("--script=/evil.ld\n")
+    link_argv_path = Path(shape["link_argv"]["absolute_path"])
+    printed_response = f"-Wl,@{response}"
+    link_argv_path.write_text(
+        link_argv_path.read_text().rstrip() + " " + shlex.quote(printed_response) + "\n"
+    )
+    shape["link_argv"]["sha256"] = digest(link_argv_path)
+
+    execution_path = Path(shape["linker_execution"]["absolute_path"])
+    execution = json.loads(execution_path.read_text())
+    trace_path = Path(execution["trace"]["absolute_path"])
+    trace = json.loads(trace_path.read_text())
+    trace["argv"].append(printed_response if flavor == "actual" else f"@{response}")
+    trace_path.write_text(json.dumps(trace) + "\n")
+    execution["argv"] = trace["argv"]
+    execution["trace"]["sha256"] = digest(trace_path)
+    execution_path.write_text(json.dumps(execution) + "\n")
+    shape["linker_execution"]["sha256"] = digest(execution_path)
+    manifest = refresh()
+
+    with pytest.raises(ValueError, match="linker response files are forbidden"):
+        namespace["_validate_capability"](
+            manifest, manifest_root / "manifest.json", ROOT, tools
+        )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["@/evil.rsp"],
+        ["-Wl,@/evil.rsp"],
+        ["-Xlinker", "@/evil.rsp"],
+    ],
+)
+def test_linker_response_file_detection_covers_forwarding_forms(argv):
+    namespace = runpy.run_path(str(SCRIPT))
+    assert namespace["_linker_response_files"](argv)
+
+
+@pytest.mark.parametrize(
+    "argv", [["-Wl,--ld-path=/evil"], ["-Xlinker", "--ld-path=/evil"]]
+)
+def test_linker_selection_detection_covers_forwarding_forms(argv):
+    namespace = runpy.run_path(str(SCRIPT))
+    selection, _, _ = namespace["_printed_linker_controls"](argv)
+    assert selection == [argv[0]]
+
+
+def test_linker_selection_ignores_forwarded_static_dynamic_modes():
+    namespace = runpy.run_path(str(SCRIPT))
+    selection, _, _ = namespace["_printed_linker_controls"](
+        [
+            "-Wl,-Bstatic",
+            "-Wl,-Bdynamic",
+            "-B/exact-wrapper",
+            "-fuse-ld=bfd",
+        ]
+    )
+    assert selection == ["-B/exact-wrapper", "-fuse-ld=bfd"]
+
+
+@pytest.mark.parametrize("alias_kind", ["symlink", "hardlink"])
+def test_shared_capability_validator_rejects_copied_fragment_alias(
+    tmp_path, alias_kind
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    payload, refresh, _, manifest_root, tools, _ = make_semantic_capability_fixture(
+        tmp_path, namespace
+    )
+    copied = manifest_root / "linker-fragments/elastic.ld"
+    producer_fragment = Path(payload["fragments"]["elastic"]["absolute_path"])
+    copied.unlink()
+    if alias_kind == "symlink":
+        copied.symlink_to(producer_fragment)
+    else:
+        outside = tmp_path / "copied-fragment-alias.ld"
+        outside.write_bytes(producer_fragment.read_bytes())
+        os.link(outside, copied)
+    manifest = refresh()
+
+    with pytest.raises(ValueError, match="copied fragment elastic is not exact"):
+        namespace["_validate_capability"](
+            manifest, manifest_root / "manifest.json", ROOT, tools
+        )
+
+
+def test_launcher_stages_then_fully_validates_capability_before_build():
+    source = LAUNCHER.read_text()
+    stage = 'stage-validate-capability --input "$capability_input"'
+    assert stage in source
+    assert source.index(stage) < source.index("cargo build -vv")
+    assert 'cp -- "$CACHE_GATE_LINKER_CAPABILITY"' not in source
+    assert "capability=json.load(open(capability_path" not in source
+    assert (
+        'CACHE_GATE_LINKER_CAPABILITY="$manifest_dir/linker-capability.json"' in source
+    )
+    assert source.count("verify_staged_capability") >= 10
+    assert "error: staged capability identity changed" in source
+    assert "staged capability changed during manifest construction" in source
+    assert "elastic_bin=$(build_bench" not in source
+    assert "build_bench elastic_bin elastic_cache_gate elastic" in source
+    manifest_builder = source[source.index('python3 - "$manifest_dir/manifest.json"') :]
+    assert (
+        "base64.b64decode(capability_document_b64, validate=True)" in manifest_builder
+    )
+    assert "capability_path.read_bytes()" not in manifest_builder
+    assert "capability_path.resolve()" not in manifest_builder
+    assert "digest(capability_path)" not in manifest_builder
+    build_bench = source[
+        source.index("build_bench() {") : source.index("build_bench elastic_bin")
+    ]
+    assert '"$manifest_dir/link-maps/$bench.map"' in build_bench
+    assert '"$manifest_dir/$bench.cargo.json"' in build_bench
+    assert '"$manifest_dir/link-traces/$bench.jsonl"' in build_bench
+    assert '"$manifest_dir/link-commands/$bench.json"' in build_bench
+    assert "$manifest_dir/link-maps/$1.map" not in build_bench
+
+
 def test_manifest_build_captures_and_authenticates_each_real_link_command():
     source = LAUNCHER.read_text()
     assert "cache-gate-link-wrapper.py" in source
@@ -1275,14 +1972,15 @@ def test_supplied_manifest_validation_never_executes_build_toolchain():
     assert "replay_link_command" in link_records
 
 
-def test_explicit_linker_trace_is_contained_under_producer_artifact_root():
+def test_explicit_linker_trace_uses_exact_producer_path():
     source = SCRIPT.read_text()
     capability = source[
         source.index("def _validate_capability(") : source.index(
             "def _validate_control("
         )
     ]
-    assert "linker trace is outside producer artifact root" in capability
+    assert "linker trace path mismatch" in capability
+    assert "_exact_capability_file_record" in capability
 
 
 def test_main_link_trace_output_hardlink_cannot_escape_runner_target(tmp_path):
@@ -1294,7 +1992,7 @@ def test_main_link_trace_output_hardlink_cannot_escape_runner_target(tmp_path):
     outside = tmp_path / "outside-bench"
     os.link(binary, outside)
 
-    assert namespace["_output_matches"](["ld", "-o", str(outside)], binary)
+    assert not namespace["_output_matches"](["ld", "-o", str(outside)], binary)
     with pytest.raises(ValueError, match="main link output is outside runner target"):
         namespace["_require_output_contained"](
             ["ld", "-o", str(outside)],
@@ -1421,8 +2119,7 @@ def test_link_trace_replay_never_executes_recorded_linkers(tmp_path):
     driver = tmp_path / "recorded-linker"
     driver.write_text(f"#!/bin/sh\ntouch {marker}\n")
     driver.chmod(0o755)
-    binary = tmp_path / "bench"
-    binary.write_bytes(b"ELF fixture\n")
+    binary, raw_output = make_cargo_output_pair(tmp_path, "bench")
     fragment = tmp_path / "layout.ld"
     fragment.write_text("SECTIONS {}\n")
     link_map = tmp_path / "bench.map"
@@ -1432,7 +2129,7 @@ def test_link_trace_replay_never_executes_recorded_linkers(tmp_path):
     argv = [
         str(driver),
         "-o",
-        str(binary),
+        str(raw_output),
         f"-Wl,-T,{fragment}",
         f"-Wl,-Map,{link_map}",
         str(obj),
@@ -1455,16 +2152,172 @@ def test_link_trace_replay_never_executes_recorded_linkers(tmp_path):
         "version": "GNU ld fixture",
     }
     namespace["replay_linker_execution"](trace, linker, binary, "gnu")
+    main_argv = [*argv]
+    main_argv[main_argv.index(str(raw_output))] = str(binary)
+    trace.write_text(
+        json.dumps(
+            {
+                "driver": str(driver),
+                "driver_sha256": digest(driver),
+                "argv": main_argv,
+            }
+        )
+        + "\n"
+    )
     namespace["replay_link_command"](trace, binary, linker, fragment, link_map)
     assert not marker.exists()
 
     forged = json.loads(trace.read_text())
     forged["driver"] = str(tmp_path / "missing" / ".." / driver.name)
     trace.write_text(json.dumps(forged) + "\n")
-    with pytest.raises(ValueError, match="observed gnu linker differs"):
-        namespace["replay_linker_execution"](trace, linker, binary, "gnu")
     with pytest.raises(ValueError, match="captured link driver differs"):
         namespace["replay_link_command"](trace, binary, linker, fragment, link_map)
+
+
+@pytest.mark.parametrize(
+    ("flavor", "identity", "version"),
+    [("gnu", "GNU ld", "GNU ld fixture"), ("lld", "LLD", "LLD fixture")],
+)
+def test_capability_replay_rejects_lexical_output_alias(
+    tmp_path, flavor, identity, version
+):
+    namespace = runpy.run_path(str(SCRIPT))
+    driver = tmp_path / f"{flavor}-linker"
+    driver.write_text("#!/bin/sh\nexit 0\n")
+    driver.chmod(0o755)
+    binary, raw_output = make_cargo_output_pair(tmp_path)
+    (raw_output.parent / "existing-child").mkdir()
+    aliased_output = raw_output.parent / "existing-child" / ".." / raw_output.name
+    trace = tmp_path / f"{flavor}.trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "driver": str(driver.resolve()),
+                "driver_sha256": digest(driver),
+                "argv": ["-o", str(aliased_output)],
+            }
+        )
+        + "\n"
+    )
+    linker = {
+        "absolute_path": str(driver.resolve()),
+        "sha256": digest(driver),
+        "flavor": identity,
+        "version": version,
+    }
+
+    with pytest.raises(ValueError, match=f"observed {flavor} linker"):
+        namespace["replay_linker_execution"](trace, linker, binary, flavor)
+
+
+@pytest.mark.parametrize("flavor", ["gnu", "lld"])
+def test_capability_replay_rejects_duplicate_output_selectors(tmp_path, flavor):
+    namespace = runpy.run_path(str(SCRIPT))
+    driver = tmp_path / f"{flavor}-linker"
+    driver.write_text("#!/bin/sh\nexit 0\n")
+    driver.chmod(0o755)
+    binary, raw_output = make_cargo_output_pair(tmp_path)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"ELF outside\n")
+    trace = tmp_path / f"{flavor}.trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "driver": str(driver.resolve()),
+                "driver_sha256": digest(driver),
+                "argv": [
+                    "-o",
+                    str(raw_output.resolve()),
+                    "-o",
+                    str(outside.resolve()),
+                ],
+            }
+        )
+        + "\n"
+    )
+    linker = {
+        "absolute_path": str(driver.resolve()),
+        "sha256": digest(driver),
+        "flavor": "GNU ld" if flavor == "gnu" else "LLD",
+        "version": "GNU ld fixture" if flavor == "gnu" else "LLD fixture",
+    }
+
+    with pytest.raises(ValueError, match=f"observed {flavor} linker"):
+        namespace["replay_linker_execution"](trace, linker, binary, flavor)
+
+
+@pytest.mark.parametrize("flavor", ["actual", "gnu", "lld"])
+def test_capability_replay_binds_exact_cargo_deps_output_alias(tmp_path, flavor):
+    namespace = runpy.run_path(str(SCRIPT))
+    driver = tmp_path / f"{flavor}-linker"
+    driver.write_text("#!/bin/sh\nexit 0\n")
+    driver.chmod(0o755)
+    release = tmp_path / flavor / "elastic/release"
+    deps = release / "deps"
+    deps.mkdir(parents=True)
+    raw_output = deps / "elastic-0123456789abcdef"
+    raw_output.write_bytes(b"ELF fixture\n")
+    binary = release / "elastic"
+    os.link(raw_output, binary)
+    trace = tmp_path / f"{flavor}.trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "driver": str(driver.resolve()),
+                "driver_sha256": digest(driver),
+                "argv": ["-o", str(raw_output.resolve())],
+            }
+        )
+        + "\n"
+    )
+    linker = {
+        "absolute_path": str(driver.resolve()),
+        "sha256": digest(driver),
+        "flavor": "GNU ld" if flavor != "lld" else "LLD",
+        "version": "GNU ld fixture" if flavor != "lld" else "LLD fixture",
+    }
+
+    observed = namespace["replay_linker_execution"](
+        trace, linker, binary.resolve(), flavor
+    )
+
+    assert observed["executable"] == str(binary.resolve())
+    assert observed["raw_output"] == str(raw_output.resolve())
+
+    extra_alias = tmp_path / "forged-extra-alias"
+    os.link(raw_output, extra_alias)
+    with pytest.raises(ValueError, match=f"observed {flavor} linker"):
+        namespace["replay_linker_execution"](trace, linker, binary.resolve(), flavor)
+
+
+@pytest.mark.parametrize("flavor", ["gnu", "lld"])
+def test_capability_replay_rejects_noncanonical_raw_driver(tmp_path, flavor):
+    namespace = runpy.run_path(str(SCRIPT))
+    driver = tmp_path / f"{flavor}-linker"
+    driver.write_text("#!/bin/sh\nexit 0\n")
+    driver.chmod(0o755)
+    binary, raw_output = make_cargo_output_pair(tmp_path)
+    trace = tmp_path / f"{flavor}.trace.jsonl"
+    raw_driver = f"{tmp_path}//{driver.name}"
+    trace.write_text(
+        json.dumps(
+            {
+                "driver": raw_driver,
+                "driver_sha256": digest(driver),
+                "argv": ["-o", str(raw_output.resolve())],
+            }
+        )
+        + "\n"
+    )
+    linker = {
+        "absolute_path": str(driver.resolve()),
+        "sha256": digest(driver),
+        "flavor": "GNU ld" if flavor == "gnu" else "LLD",
+        "version": "GNU ld fixture" if flavor == "gnu" else "LLD fixture",
+    }
+
+    with pytest.raises(ValueError, match=f"observed {flavor} linker differs"):
+        namespace["replay_linker_execution"](trace, linker, binary, flavor)
 
 
 def test_actual_link_trace_replay_binds_capability_driver_path_and_hash(tmp_path):
@@ -1472,15 +2325,14 @@ def test_actual_link_trace_replay_binds_capability_driver_path_and_hash(tmp_path
     driver = tmp_path / "cc"
     driver.write_text("#!/bin/sh\nexit 0\n")
     driver.chmod(0o755)
-    binary = tmp_path / "probe"
-    binary.write_bytes(b"ELF fixture\n")
+    binary, raw_output = make_cargo_output_pair(tmp_path)
     trace = tmp_path / "actual-trace.jsonl"
     trace.write_text(
         json.dumps(
             {
                 "driver": str(driver.resolve()),
                 "driver_sha256": digest(driver),
-                "argv": ["-o", str(binary.resolve())],
+                "argv": ["-o", str(raw_output.resolve())],
                 "cwd": str(tmp_path.resolve()),
                 "path": os.environ["PATH"],
             }
@@ -1523,7 +2375,15 @@ def test_every_actual_shape_binds_printed_argv_to_observed_trace(tmp_path, targe
     wrapper.write_text("#!/usr/bin/env python3\n")
     wrapper.chmod(0o755)
     output = tmp_path / target
-    argv = ["-Wl,--gc-sections", "-o", str(output.resolve())]
+    fragment = tmp_path / "layout.ld"
+    link_map = tmp_path / "map"
+    argv = [
+        "-Wl,--gc-sections",
+        "-o",
+        str(output.resolve()),
+        f"-Wl,-T,{fragment}",
+        f"-Wl,-Map,{link_map}",
+    ]
     link_argv = tmp_path / f"{target}.link-args.txt"
     link_argv.write_text(
         f'LC_ALL="C" PATH="/usr/bin" "{wrapper.resolve()}" '
@@ -1533,13 +2393,23 @@ def test_every_actual_shape_binds_printed_argv_to_observed_trace(tmp_path, targe
     observed = {"argv": argv}
 
     namespace["_validate_actual_link_argv_trace"](
-        link_argv, observed, wrapper.resolve(), f"actual/{target}"
+        link_argv,
+        observed,
+        wrapper.resolve(),
+        fragment,
+        link_map,
+        f"actual/{target}",
     )
 
     observed["argv"] = [*argv, "--forged"]
     with pytest.raises(ValueError, match="link argv differs from execution trace"):
         namespace["_validate_actual_link_argv_trace"](
-            link_argv, observed, wrapper.resolve(), f"actual/{target}"
+            link_argv,
+            observed,
+            wrapper.resolve(),
+            fragment,
+            link_map,
+            f"actual/{target}",
         )
 
     observed["argv"] = argv
@@ -1551,32 +2421,49 @@ def test_every_actual_shape_binds_printed_argv_to_observed_trace(tmp_path, targe
     )
     with pytest.raises(ValueError, match="did not execute reviewed wrapper"):
         namespace["_validate_actual_link_argv_trace"](
-            link_argv, observed, wrapper.resolve(), f"actual/{target}"
+            link_argv,
+            observed,
+            wrapper.resolve(),
+            fragment,
+            link_map,
+            f"actual/{target}",
         )
+
+    for raw_wrapper in (
+        f"{wrapper.parent}//{wrapper.name}",
+        f"{wrapper.parent}/./{wrapper.name}",
+    ):
+        link_argv.write_text(
+            f'LC_ALL="C" PATH="/usr/bin" "{raw_wrapper}" '
+            + " ".join(shlex.quote(value) for value in argv)
+            + "\n"
+        )
+        with pytest.raises(ValueError, match="did not execute reviewed wrapper"):
+            namespace["_validate_actual_link_argv_trace"](
+                link_argv,
+                observed,
+                wrapper.resolve(),
+                fragment,
+                link_map,
+                f"actual/{target}",
+            )
 
 
 def test_inline_capability_consumer_requires_exact_actual_wrapper_path():
-    source = LAUNCHER.read_text()
-    assert "Path(tokens[command_index])!=expected_wrapper" in source
-    assert "Path(tokens[command_index]).resolve()!=expected_wrapper" not in source
+    source = SCRIPT.read_text()
+    assert "printed_driver == str(expected_wrapper)" in source
 
 
 def test_launcher_rejects_capability_input_symlink_ancestry_before_read():
-    source = LAUNCHER.read_text()
-    shell_guard = (
-        "[[ -f $CACHE_GATE_LINKER_CAPABILITY && ! -L $CACHE_GATE_LINKER_CAPABILITY ]]"
-    )
-    assert shell_guard in source
-    python_start = source.index("CACHE_GATE_LINK_DRIVER=$(python3 -")
-    python_end = source.index("\nPY\n", python_start)
-    validator = source[python_start:python_end]
-    path_setup = validator.index("capability_path=Path(sys.argv[1])")
-    ancestry_walk = validator.index("for component in capability_path.parents")
-    canonical_check = validator.index(
-        "capability_path!=capability_path.resolve(strict=True)"
-    )
-    first_read = validator.index("capability=json.load")
-    assert path_setup < ancestry_walk < canonical_check < first_read
+    source = SCRIPT.read_text()
+    start = source.index("def _stage_capability_once(")
+    validator = source[start : source.index("def _require(", start)]
+    opened = validator.index("os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC")
+    read = validator.index("source_bytes = _read_descriptor(source_descriptor)")
+    parsed = validator.index("payload = json.loads(source_bytes)")
+    assert opened < read < parsed
+    assert "_open_directory_with_identity_chain(source.parent)" in validator
+    assert "_verify_directory_identity_chain(\n            source.parent" in validator
 
 
 def test_stable_launcher_rejects_corrupt_manifest_before_execution(tmp_path):
