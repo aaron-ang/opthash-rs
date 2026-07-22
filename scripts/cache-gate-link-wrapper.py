@@ -38,11 +38,41 @@ if not trace.is_absolute() or not trace.parent.is_dir() or trace.is_symlink():
     fail(f"{prefix}_TRACE must name a new or regular file in an existing directory")
 if bool(role) != bool(session):
     fail("link role and session must either both be set or both be empty")
+arguments = sys.argv[1:]
+if not inner:
+    fragment_text = os.environ.get("CACHE_GATE_LINK_FRAGMENT", "")
+    map_text = os.environ.get("CACHE_GATE_LINK_MAP", "")
+    if bool(fragment_text) != bool(map_text):
+        fail("CACHE_GATE_LINK_FRAGMENT and CACHE_GATE_LINK_MAP must be set together")
+    if fragment_text:
+        fragment = Path(fragment_text)
+        link_map = Path(map_text)
+        if (
+            not fragment.is_absolute()
+            or not fragment.is_file()
+            or fragment.is_symlink()
+            or fragment != fragment.resolve()
+        ):
+            fail("CACHE_GATE_LINK_FRAGMENT must be an absolute regular file")
+        if (
+            not link_map.is_absolute()
+            or not link_map.parent.is_dir()
+            or link_map.parent.is_symlink()
+            or link_map.parent != link_map.parent.resolve()
+            or link_map.is_symlink()
+            or (link_map.exists() and not link_map.is_file())
+        ):
+            fail("CACHE_GATE_LINK_MAP must be an absolute regular-file path")
+        arguments = [
+            *arguments,
+            f"-Wl,-T,{fragment}",
+            f"-Wl,-Map,{link_map}",
+        ]
 record = {
     "payload_path": str(driver),
     "payload_sha256": hashlib.sha256(driver.read_bytes()).hexdigest(),
     "argv0": argv0,
-    "argv": sys.argv[1:],
+    "argv": arguments,
     "cwd": str(Path.cwd().resolve()),
     "path": os.environ.get("PATH", ""),
 }
@@ -65,4 +95,4 @@ for variable in (
 ):
     if variable in os.environ:
         compiler_environment[variable] = os.environ[variable]
-os.execve(str(driver), [argv0, *sys.argv[1:]], compiler_environment)
+os.execve(str(driver), [argv0, *arguments], compiler_environment)

@@ -39,7 +39,10 @@ hold() {
 
 [[ -z ${RUSTFLAGS:-} ]] || hold "RUSTFLAGS is unsupported for authenticated capability builds"
 [[ -z ${CARGO_ENCODED_RUSTFLAGS:-} ]] || hold "CARGO_ENCODED_RUSTFLAGS is unsupported for authenticated capability builds"
+[[ -z ${CACHE_GATE_LINK_FRAGMENT:-} ]] || hold "CACHE_GATE_LINK_FRAGMENT is reserved for manifest builds"
+[[ -z ${CACHE_GATE_LINK_MAP:-} ]] || hold "CACHE_GATE_LINK_MAP is reserved for manifest builds"
 unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+unset CACHE_GATE_LINK_FRAGMENT CACHE_GATE_LINK_MAP
 
 [[ $(uname -s) == Linux ]] || hold "cache-gate linker capability requires native Linux ELF"
 case $(uname -m) in

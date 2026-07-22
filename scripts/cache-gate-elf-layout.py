@@ -2821,10 +2821,6 @@ def _validate_main_link_records(
         "-C",
         "codegen-units=16",
         "-C",
-        "link-arg=-Wl,-T,<target-fragment>",
-        "-C",
-        "link-arg=-Wl,-Map,<per-target-map>",
-        "-C",
         f"linker={manifest['tools']['link_wrapper']['absolute_path']}",
     ]
     if manifest.get("layout_adversary", {}).get("enabled") is True:

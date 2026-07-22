@@ -1008,6 +1008,45 @@ def test_link_wrapper_records_driver_bytes_and_exact_argv(tmp_path):
     ]
 
 
+def test_link_wrapper_injects_manifest_link_controls_outside_rustflags(tmp_path):
+    captured = tmp_path / "driver-argv.txt"
+    driver = tmp_path / "driver"
+    driver.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {shlex.quote(str(captured))}\n"
+    )
+    driver.chmod(0o755)
+    fragment = tmp_path / "layout.ld"
+    fragment.write_text("SECTIONS {}\n")
+    link_map = tmp_path / "bench.map"
+    trace = tmp_path / "trace.jsonl"
+    env = {
+        **os.environ,
+        "CACHE_GATE_LINK_DRIVER": str(driver.resolve()),
+        "CACHE_GATE_LINK_ARGV0": str(driver.resolve()),
+        "CACHE_GATE_LINK_TRACE": str(trace.resolve()),
+        "CACHE_GATE_LINK_FRAGMENT": str(fragment.resolve()),
+        "CACHE_GATE_LINK_MAP": str(link_map.resolve()),
+    }
+
+    completed = subprocess.run(
+        [str(LINK_WRAPPER), "input.o", "-o", "bench"],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    expected = [
+        "input.o",
+        "-o",
+        "bench",
+        f"-Wl,-T,{fragment.resolve()}",
+        f"-Wl,-Map,{link_map.resolve()}",
+    ]
+    assert captured.read_text().splitlines() == expected
+    assert json.loads(trace.read_text())["argv"] == expected
+
+
 def test_driver_projection_uses_only_authenticated_compiler_environment(
     tmp_path, monkeypatch
 ):
@@ -3049,8 +3088,17 @@ def test_manifest_build_rejects_and_scrubs_caller_rustflags():
     assert "[[ -z ${CARGO_ENCODED_RUSTFLAGS:-} ]]" in manifest
     assert "unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS" in manifest
     assert "${RUSTFLAGS:-}" not in build_bench
-    assert 'local rustflags="-C codegen-units=16 ' in build_bench
+    assert (
+        'local rustflags="-C codegen-units=16 -C linker=$CACHE_GATE_LINK_WRAPPER"'
+        in build_bench
+    )
+    assert "link-arg=-Wl" not in build_bench
+    assert build_bench.count('CACHE_GATE_LINK_FRAGMENT="$fragment"') == 2
+    assert build_bench.count('CACHE_GATE_LINK_MAP="$map_path"') == 2
     assert "f\"linker={tools['link_wrapper']['absolute_path']}\"" in manifest
+    manifest_builder = manifest[manifest.index("rustc_flags = [") :]
+    rustc_flags = manifest_builder[: manifest_builder.index("]")]
+    assert "link-arg=-Wl" not in rustc_flags
     validator = SCRIPT.read_text()
     assert 'build["rustc_flags"] == expected_rustc_flags' in validator
     assert 'build["linker_flags"]' in validator
@@ -3059,6 +3107,13 @@ def test_manifest_build_rejects_and_scrubs_caller_rustflags():
     assert "[[ -z ${RUSTFLAGS:-} ]]" in producer
     assert "[[ -z ${CARGO_ENCODED_RUSTFLAGS:-} ]]" in producer
     assert "unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS" in producer
+
+
+def test_capability_producer_rejects_and_scrubs_manifest_route_environment():
+    producer = LINK_CAPABILITY.read_text()
+    assert "[[ -z ${CACHE_GATE_LINK_FRAGMENT:-} ]]" in producer
+    assert "[[ -z ${CACHE_GATE_LINK_MAP:-} ]]" in producer
+    assert "unset CACHE_GATE_LINK_FRAGMENT CACHE_GATE_LINK_MAP" in producer
 
 
 def test_manifest_build_captures_and_authenticates_each_real_link_command():

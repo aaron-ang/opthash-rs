@@ -725,7 +725,7 @@ build_bench() {
 	local bench=$2 target=$3 fragment="$manifest_dir/linker-fragments/$3.ld"
 	local map_path="$manifest_dir/link-maps/$bench.map" json_path="$manifest_dir/$bench.cargo.json" verbose_path="$manifest_dir/$bench.rustc.txt" executable
 	local trace_path="$manifest_dir/link-traces/$bench.jsonl" command_path="$manifest_dir/link-commands/$bench.json"
-	local rustflags="-C codegen-units=16 -C link-arg=-Wl,-T,$fragment -C link-arg=-Wl,-Map,$map_path -C linker=$CACHE_GATE_LINK_WRAPPER"
+	local rustflags="-C codegen-units=16 -C linker=$CACHE_GATE_LINK_WRAPPER"
 	verify_staged_capability
 	[[ ! -e $trace_path && ! -e $command_path ]] || { echo "error: link proof output already exists for $bench" >&2; exit 1; }
 	if [[ ${CACHE_GATE_LAYOUT_ADVERSARY:-0} == 1 ]]; then
@@ -736,10 +736,12 @@ build_bench() {
 	if [[ $EUID -eq 0 && -n ${SUDO_USER:-} ]]; then
 		sudo -u "$SUDO_USER" --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME -- env \
 			CACHE_GATE_LINK_DRIVER="$CACHE_GATE_LINK_DRIVER" CACHE_GATE_LINK_ARGV0="$CACHE_GATE_LINK_ARGV0" CACHE_GATE_LINK_TRACE="$trace_path" \
+			CACHE_GATE_LINK_FRAGMENT="$fragment" CACHE_GATE_LINK_MAP="$map_path" \
 			CARGO_TARGET_DIR="$build_root" CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 RUSTFLAGS="$rustflags" \
 			cargo build -vv --release --locked --bench "$bench" --message-format=json >"$json_path" 2>"$verbose_path" || return 1
 	else
 		CACHE_GATE_LINK_DRIVER="$CACHE_GATE_LINK_DRIVER" CACHE_GATE_LINK_ARGV0="$CACHE_GATE_LINK_ARGV0" CACHE_GATE_LINK_TRACE="$trace_path" \
+		CACHE_GATE_LINK_FRAGMENT="$fragment" CACHE_GATE_LINK_MAP="$map_path" \
 			CARGO_TARGET_DIR="$build_root" CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 RUSTFLAGS="$rustflags" \
 			cargo build -vv --release --locked --bench "$bench" --message-format=json >"$json_path" 2>"$verbose_path" || return 1
 	fi
@@ -919,8 +921,6 @@ for name,item in executables.items():
 tools=json.load(open(authenticated_tools_path,encoding="utf-8"))
 rustc_flags = [
     "-C", "codegen-units=16",
-    "-C", "link-arg=-Wl,-T,<target-fragment>",
-    "-C", "link-arg=-Wl,-Map,<per-target-map>",
     "-C", f"linker={tools['link_wrapper']['absolute_path']}",
 ]
 if adversary_enabled:
