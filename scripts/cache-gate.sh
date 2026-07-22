@@ -693,6 +693,7 @@ read_guard_value() {
 	}
 }
 read_guard_value CACHE_GATE_LINK_DRIVER
+read_guard_value CACHE_GATE_LINK_ARGV0
 read_guard_value capability_identity
 read_guard_value capability_document_b64
 read_guard_value capability_guard_ready
@@ -734,11 +735,11 @@ build_bench() {
 	fi
 	if [[ $EUID -eq 0 && -n ${SUDO_USER:-} ]]; then
 		sudo -u "$SUDO_USER" --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME -- env \
-			CACHE_GATE_LINK_DRIVER="$CACHE_GATE_LINK_DRIVER" CACHE_GATE_LINK_TRACE="$trace_path" \
+			CACHE_GATE_LINK_DRIVER="$CACHE_GATE_LINK_DRIVER" CACHE_GATE_LINK_ARGV0="$CACHE_GATE_LINK_ARGV0" CACHE_GATE_LINK_TRACE="$trace_path" \
 			CARGO_TARGET_DIR="$build_root" CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 RUSTFLAGS="$rustflags" \
 			cargo build -vv --release --locked --bench "$bench" --message-format=json >"$json_path" 2>"$verbose_path" || return 1
 	else
-		CACHE_GATE_LINK_DRIVER="$CACHE_GATE_LINK_DRIVER" CACHE_GATE_LINK_TRACE="$trace_path" \
+		CACHE_GATE_LINK_DRIVER="$CACHE_GATE_LINK_DRIVER" CACHE_GATE_LINK_ARGV0="$CACHE_GATE_LINK_ARGV0" CACHE_GATE_LINK_TRACE="$trace_path" \
 			CARGO_TARGET_DIR="$build_root" CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 RUSTFLAGS="$rustflags" \
 			cargo build -vv --release --locked --bench "$bench" --message-format=json >"$json_path" 2>"$verbose_path" || return 1
 	fi

@@ -1829,7 +1829,7 @@ def test_capability_guard_treats_command_eof_as_failure(tmp_path):
     destination = stage_parent / "linker-capability.json"
     source.write_text('{"accepted": true}\n')
     guard = namespace["_CapabilityGuard"].stage(
-        source.resolve(), destination.resolve(), lambda *_: "/usr/bin/cc"
+        source.resolve(), destination.resolve(), lambda *_: ("/usr/bin/cc", "cc")
     )
     read_descriptor, write_descriptor = os.pipe()
     os.close(write_descriptor)
@@ -1841,6 +1841,37 @@ def test_capability_guard_treats_command_eof_as_failure(tmp_path):
     finally:
         guard.close(remove_stage=True)
     assert not (stage_parent / "manifest.json").exists()
+
+
+def test_capability_guard_handshake_returns_exact_payload_and_argv0(tmp_path):
+    namespace = runpy.run_path(str(SCRIPT))
+    source_parent = tmp_path / "source"
+    stage_parent = tmp_path / "stage"
+    source_parent.mkdir()
+    stage_parent.mkdir()
+    source = source_parent / "capability.json"
+    destination = stage_parent / "linker-capability.json"
+    source.write_text('{"accepted": true}\n')
+    payload = "/authenticated/multicall-payload"
+    argv0 = "ld.lld"
+    guard = namespace["_CapabilityGuard"].stage(
+        source.resolve(), destination.resolve(), lambda *_: (payload, argv0)
+    )
+    read_descriptor, write_descriptor = os.pipe()
+    os.write(write_descriptor, b"ABORT\n")
+    responses = tmp_path / "responses"
+    try:
+        with os.fdopen(read_descriptor) as commands, responses.open("w+") as output:
+            assert namespace["_serve_capability_guard"](guard, commands, output) == 0
+            output.seek(0)
+            lines = output.read().splitlines()
+        assert lines[:2] == [payload, argv0]
+        assert lines[2] == guard.identity
+        assert base64.b64decode(lines[3]) == source.read_bytes()
+        assert lines[4:] == ["READY", "ABORTED"]
+    finally:
+        os.close(write_descriptor)
+        guard.close(remove_stage=True)
 
 
 def test_capability_guard_finalizes_only_exact_held_manifest(tmp_path):
@@ -2985,6 +3016,11 @@ def test_launcher_stages_then_fully_validates_capability_before_build():
     assert "staged capability changed during manifest construction" in source
     assert "elastic_bin=$(build_bench" not in source
     assert "build_bench elastic_bin elastic_cache_gate elastic" in source
+    assert (
+        source.index("read_guard_value CACHE_GATE_LINK_DRIVER")
+        < source.index("read_guard_value CACHE_GATE_LINK_ARGV0")
+        < source.index("read_guard_value capability_identity")
+    )
     manifest_builder = source[source.index('python3 - "$manifest_pending"') :]
     assert (
         "base64.b64decode(capability_document_b64, validate=True)" in manifest_builder
@@ -3000,6 +3036,7 @@ def test_launcher_stages_then_fully_validates_capability_before_build():
     assert '"$manifest_dir/link-traces/$bench.jsonl"' in build_bench
     assert '"$manifest_dir/link-commands/$bench.json"' in build_bench
     assert "$manifest_dir/link-maps/$1.map" not in build_bench
+    assert build_bench.count('CACHE_GATE_LINK_ARGV0="$CACHE_GATE_LINK_ARGV0"') == 2
 
 
 def test_manifest_build_rejects_and_scrubs_caller_rustflags():

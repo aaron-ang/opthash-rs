@@ -319,7 +319,7 @@ class _CapabilityGuard:
         self.manifest_publish_identity = ""
         self.source_bytes = b""
         self.payload: dict[str, Any] = {}
-        self.result = ""
+        self.result: Any = ""
         self.identity = ""
         self.poisoned = False
         self.committed = False
@@ -337,7 +337,7 @@ class _CapabilityGuard:
         cls,
         source: Path,
         destination: Path,
-        validator: Callable[[Path, dict[str, Any]], str],
+        validator: Callable[[Path, dict[str, Any]], Any],
     ) -> _CapabilityGuard:
         guard = cls(source, destination)
         try:
@@ -347,7 +347,7 @@ class _CapabilityGuard:
             guard.close(remove_stage=True)
             raise
 
-    def _stage(self, validator: Callable[[Path, dict[str, Any]], str]) -> None:
+    def _stage(self, validator: Callable[[Path, dict[str, Any]], Any]) -> None:
         _require(self.source.is_absolute(), "capability input must be absolute")
         _require(
             self.destination.is_absolute(), "staged capability path must be absolute"
@@ -950,8 +950,8 @@ def _publish_guarded_manifest(
 def _stage_capability_once(
     source: Path,
     destination: Path,
-    validator: Callable[[Path, dict[str, Any]], str],
-) -> tuple[str, str, str]:
+    validator: Callable[[Path, dict[str, Any]], Any],
+) -> tuple[Any, str, str]:
     guard = _CapabilityGuard.stage(source, destination, validator)
     try:
         return (
@@ -4236,7 +4236,7 @@ def resolve_cargo_linker(args: argparse.Namespace) -> Path:
 
 def _capability_stage_validator(
     args: argparse.Namespace,
-) -> Callable[[Path, dict[str, Any]], str]:
+) -> Callable[[Path, dict[str, Any]], tuple[str, str]]:
     _require(args.tools.is_absolute(), "--tools must be absolute")
     _require(
         args.tools.is_file()
@@ -4247,7 +4247,7 @@ def _capability_stage_validator(
     tool_records = _json_file(args.tools, "authenticated tools")
     tools = _validate_tools(tool_records)
 
-    def validate_staged(staged: Path, capability: dict[str, Any]) -> str:
+    def validate_staged(staged: Path, capability: dict[str, Any]) -> tuple[str, str]:
         embedded = {
             **capability,
             "copy": {"absolute_path": str(staged), "sha256": digest(staged)},
@@ -4265,15 +4265,17 @@ def _capability_stage_validator(
             tools,
         )
         driver = _verify_linker_record(validated["linker"], "capability linker")
-        return str(driver)
+        return str(driver), validated["linker"]["argv0"]
 
     return validate_staged
 
 
-def stage_validate_capability(args: argparse.Namespace) -> tuple[str, str, str]:
-    return _stage_capability_once(
+def stage_validate_capability(args: argparse.Namespace) -> tuple[str, str, str, str]:
+    linker, identity, document = _stage_capability_once(
         args.input, args.output, _capability_stage_validator(args)
     )
+    payload, argv0 = linker
+    return payload, argv0, identity, document
 
 
 def _serve_capability_guard(
@@ -4283,7 +4285,15 @@ def _serve_capability_guard(
     manifest_validator: Callable[[dict[str, Any], Path, bytes], None] | None = None,
     manifest_path: Path | None = None,
 ) -> int:
-    print(guard.result, file=response_stream, flush=True)
+    _require(
+        isinstance(guard.result, tuple)
+        and len(guard.result) == 2
+        and all(isinstance(value, str) and bool(value) for value in guard.result),
+        "capability guardian linker execution identity is invalid",
+    )
+    payload, argv0 = guard.result
+    print(payload, file=response_stream, flush=True)
+    print(argv0, file=response_stream, flush=True)
     print(guard.identity, file=response_stream, flush=True)
     print(
         base64.b64encode(guard.source_bytes).decode("ascii"),
@@ -4494,8 +4504,9 @@ def main() -> int:
         elif args.command == "select-cargo-executable":
             print(select_cargo_executable(args))
         elif args.command == "stage-validate-capability":
-            driver, identity, document = stage_validate_capability(args)
-            print(driver)
+            payload, argv0, identity, document = stage_validate_capability(args)
+            print(payload)
+            print(argv0)
             print(identity)
             print(document)
         elif args.command == "guard-capability":
