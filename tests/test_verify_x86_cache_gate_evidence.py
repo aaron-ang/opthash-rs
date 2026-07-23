@@ -17,23 +17,24 @@ import pytest
 ROOT = Path(__file__).parents[1]
 PACKAGE_SCRIPT = ROOT / "scripts/package-x86-cache-gate-evidence.py"
 VERIFY_SCRIPT = ROOT / "scripts/verify-x86-cache-gate-evidence.py"
+REVIEWED_RECORDS = (
+    ROOT / "tests/fixtures/x86_cache_gate_evidence" / "aarch64-attempt-5-records.tar.xz"
+)
+REVIEWED_RECORDS_SHA256 = (
+    "088f5e3edfdc3d0d51ca2b7cb4f24bd2247f5b47c4794c726b9401f854144b69"
+)
 HEX = "0" * 64
-AARCH64_ATTEMPT_5 = (
-    ROOT
-    / ".worktrees/bench/cache-gate-layout-v2/target/cache-gate/aarch64"
-    / "aarch64-061d13da22b8-attempt-5-clean-a"
-)
-if not AARCH64_ATTEMPT_5.is_dir():
-    AARCH64_ATTEMPT_5 = (
-        ROOT.parents[1]
-        / "bench/cache-gate-layout-v2/target/cache-gate/aarch64"
-        / "aarch64-061d13da22b8-attempt-5-clean-a"
-    )
-V1_AARCH64_MANIFEST = (
-    ROOT.parents[1]
-    / "perf/cache-off-current/target/cache-gate/aarch64"
-    / "cache-off-current/manifest.json"
-)
+SUBJECT_COMMIT = "061d13da22b89208c801308efd578444c8e9caba"
+SUBJECT_TREE = "24921a941f8c3c26467465b99d6b45ee5912b2da"
+V1_REPLAY_COMMIT = "b0d53234dc051af91fe0321450b3e8312a84e635"
+V1_REPLAY_TREE = "d77cc082fe48799f26ff4440bd1898a71d0dc8cc"
+REVIEWED_RECORD_SHA256S = {
+    "capability.json": "29a43afea6137683f8b8df0bcc6864c753697b1cc4de51276dd9ab7770558d6f",
+    "clean-a.json": "86ad819b59dc963bb4350e1d018449c8f293f498948ccaa399691c5f78946312",
+    "clean-b.json": "b1ec373934d806c53bb340adf2fbd3923206d74fd9b1c0e842153e6a61d90498",
+    "adversary.json": "e40f70f566f5381fad4143e8e06ca0a1c7009945b2d445618ca01ab150027235",
+    "v1.json": "b48df7e6221402b4e3d099262a1b3f1e8f3a13568c160f390b2ca735ee0fafd9",
+}
 
 
 def load_script(path: Path, name: str) -> ModuleType:
@@ -56,6 +57,41 @@ def verify_module() -> ModuleType:
 
 def json_bytes(value: Any) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def reviewed_records() -> dict[str, Any]:
+    assert REVIEWED_RECORDS.is_file(), (
+        "checked-in reviewed cache-gate records are required"
+    )
+    assert hashlib.sha256(REVIEWED_RECORDS.read_bytes()).hexdigest() == (
+        REVIEWED_RECORDS_SHA256
+    )
+    with tarfile.open(REVIEWED_RECORDS, mode="r:xz") as archive:
+        members = {item.name: item for item in archive.getmembers() if item.isfile()}
+        for name, expected in REVIEWED_RECORD_SHA256S.items():
+            assert name in members
+            extracted = archive.extractfile(members[name])
+            assert extracted is not None
+            data = extracted.read()
+            assert hashlib.sha256(data).hexdigest() == expected
+            members[name] = data
+        shape_records: dict[str, bytes] = {}
+        for name, item in list(members.items()):
+            if not name.startswith("capability-shapes/") or not isinstance(
+                item, tarfile.TarInfo
+            ):
+                continue
+            extracted = archive.extractfile(item)
+            assert extracted is not None
+            shape_records[name] = extracted.read()
+    return {
+        "capability": json.loads(members["capability.json"]),
+        "clean_a": json.loads(members["clean-a.json"]),
+        "clean_b": json.loads(members["clean-b.json"]),
+        "adversary": json.loads(members["adversary.json"]),
+        "v1": json.loads(members["v1.json"]),
+        "shape_records": shape_records,
+    }
 
 
 def portable_paths(system_links: list[dict[str, str]] | None = None) -> dict[str, Any]:
@@ -535,6 +571,71 @@ def test_package_rejects_unlisted_hardlink(
         )
 
 
+def test_package_pins_scanned_directory_descriptors(
+    tmp_path: Path,
+    package_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / "staging"
+    bundle = staging / "bundle"
+    subdirectory = bundle / "sub"
+    subdirectory.mkdir(parents=True)
+    (bundle / "provenance.json").write_bytes(b"{}\n")
+    (subdirectory / "proof.bin").write_bytes(b"trusted")
+    original_write_archive = package_module._write_archive
+
+    def swap_then_write(path: Path, entries: list[Any]) -> str:
+        retired = bundle / "retired"
+        subdirectory.rename(retired)
+        subdirectory.mkdir()
+        (subdirectory / "proof.bin").write_bytes(b"forged!")
+        return original_write_archive(path, entries)
+
+    monkeypatch.setattr(package_module, "_write_archive", swap_then_write)
+    archive = tmp_path / "out.tar"
+    with pytest.raises(
+        package_module.EvidenceError,
+        match="staging tree changed while packaging",
+    ):
+        package_module.package_evidence(staging, archive, tmp_path / "out.tar.sha256")
+
+
+def test_package_hashes_bytes_read_from_archive_file_descriptor(
+    tmp_path: Path,
+    package_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / "staging"
+    bundle = staging / "bundle"
+    bundle.mkdir(parents=True)
+    proof = bundle / "proof.bin"
+    proof.write_bytes(b"trusted")
+    (bundle / "provenance.json").write_bytes(b"{}\n")
+    original_addfile = package_module.tarfile.TarFile.addfile
+
+    def mutate_before_read(
+        archive: tarfile.TarFile,
+        info: tarfile.TarInfo,
+        fileobj: Any = None,
+    ) -> None:
+        if info.name == "bundle/proof.bin" and fileobj is not None:
+            proof.write_bytes(b"forged!")
+        original_addfile(archive, info, fileobj)
+
+    monkeypatch.setattr(
+        package_module.tarfile.TarFile,
+        "addfile",
+        mutate_before_read,
+    )
+    with pytest.raises(
+        package_module.EvidenceError,
+        match="changed while packaging|archive bytes differ",
+    ):
+        package_module.package_evidence(
+            staging, tmp_path / "out.tar", tmp_path / "out.tar.sha256"
+        )
+
+
 def semantic_documents() -> dict[str, dict[str, Any]]:
     file_sha = hashlib.sha256(b"payload").hexdigest()
     body = {
@@ -815,28 +916,219 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
             "arch": "x86_64",
             "target_triple": "x86_64-unknown-linux-gnu",
             "max_page_size": 4096,
-            "fragment_set_sha256": "3" * 64,
+            "fragment_set_sha256": verify_module._fingerprint(
+                [
+                    f"{target}:{payload_sha}"
+                    for target in sorted(("elastic", "funnel", "profile"))
+                ]
+            ),
         }
     )
     capability["producer"].update(
         {
             "runner_root": "/host/subject",
-            "artifact_root": "/host/subject/probe",
-            "commit": "a" * 40,
-            "tree": "b" * 40,
+            "artifact_root": (
+                "/host/subject/target/cache-gate-linker/x86_64/.probe.fixture"
+            ),
+            "commit": SUBJECT_COMMIT,
+            "tree": SUBJECT_TREE,
             "empty_diff_assertion": True,
         }
     )
     set_linker_record(capability["linker"], "actual", linker_sha)
     set_linker_record(capability["required_linkers"]["gnu"], "gnu", linker_sha)
     set_linker_record(capability["required_linkers"]["lld"], "lld", linker_sha)
+    shape_files: dict[str, bytes] = {}
+    hosted_files: dict[str, bytes] = {}
+    for flavor in ("actual", "gnu", "lld"):
+        for target in ("elastic", "funnel", "profile"):
+            kernel_names = next(
+                kernels
+                for shape_target, kernels in verify_module.EXECUTABLE_TARGETS.values()
+                if shape_target == target
+            )
+            shape = capability["shapes"][flavor][target]
+            prefix = f"{capability['producer']['artifact_root']}/{flavor}/{target}"
+            symbols = schema_sample(
+                verify_module._symbol_document_schema(
+                    verify_module.SYMBOL_V2_SCHEMA, veneers=True
+                ),
+                verify_module,
+            )
+            symbols.update(
+                {
+                    "binary": "/host/subject/payload",
+                    "binary_sha256": payload_sha,
+                    "architecture": "x86_64",
+                    "symbols": [
+                        full_symbol(verify_module, kernel) for kernel in kernel_names
+                    ],
+                    "linker_generated_veneer_thunks": [],
+                }
+            )
+            layout = schema_sample(
+                verify_module._layout_schema(kernel_names), verify_module
+            )
+            layout.update(
+                {
+                    "target": target,
+                    "arch": "x86_64",
+                    "binary": "/host/subject/payload",
+                    "binary_sha256": payload_sha,
+                    "link_map": "/host/subject/payload",
+                    "link_map_sha256": payload_sha,
+                    "fragment_sha256": payload_sha,
+                    "fragment_set_sha256": capability["fragment_set_sha256"],
+                    "archive_member_owners": [],
+                    "veneer_thunk_inventory": [],
+                    "plt_inventory": [],
+                }
+            )
+            for item in layout["cache_gate_input_sections"]:
+                item["owner"] = "/host/subject/input.o"
+            for kernel, record in layout["kernels"].items():
+                record["name"] = kernel
+                record["input_owner"] = "/host/subject/input.o"
+            symbols_bytes = json_bytes(symbols)
+            layout_bytes = json_bytes(layout)
+            symbols_path = f"{prefix}/symbols.json"
+            layout_path = f"{prefix}/layout.json"
+            shape_files[symbols_path] = symbols_bytes
+            shape_files[layout_path] = layout_bytes
+            shape["symbols"] = {
+                "absolute_path": symbols_path,
+                "sha256": hashlib.sha256(symbols_bytes).hexdigest(),
+            }
+            shape["layout"] = {
+                "absolute_path": layout_path,
+                "sha256": hashlib.sha256(layout_bytes).hexdigest(),
+            }
+            raw_output = f"{prefix}/raw-output"
+            common = [
+                "/host/subject/input.o",
+                "-Wl,-T,/host/subject/payload",
+                "-Wl,-Map,/host/subject/payload",
+                "-o",
+                raw_output,
+            ]
+            if flavor == "actual":
+                cargo_argv = common
+                linker_argv = common
+                linker_role = "actual-driver"
+            else:
+                fuse = "bfd" if flavor == "gnu" else "lld"
+                cargo_argv = [
+                    f"-B{capability['producer']['artifact_root']}/{flavor}/linker-wrapper",
+                    f"-fuse-ld={fuse}",
+                    *common,
+                ]
+                linker_argv = [
+                    "/host/subject/input.o",
+                    "-T",
+                    "/host/subject/payload",
+                    "-Map",
+                    "/host/subject/payload",
+                    "-o",
+                    raw_output,
+                ]
+                linker_role = "explicit-linker"
+            session = f"{flavor}-{target}-session"
+            path_value = "/host/toolchain/bin:/usr/bin"
+
+            def execution_record(
+                *,
+                argv: list[str],
+                linker: dict[str, Any],
+                role: str,
+                trace_name: str,
+            ) -> tuple[dict[str, Any], bytes]:
+                trace_path = f"{prefix}/{trace_name}"
+                trace_record = {
+                    "argv": argv,
+                    "argv0": linker["argv0"],
+                    "cwd": "/host/subject",
+                    "path": path_value,
+                    "payload_path": linker["payload_path"],
+                    "payload_sha256": linker["payload_sha256"],
+                    "role": role,
+                    "session": session,
+                }
+                trace_bytes = json_bytes(trace_record)
+                shape_files[trace_path] = trace_bytes
+                return (
+                    {
+                        "linker": copy.deepcopy(linker),
+                        "argv": argv,
+                        "executable": "/host/subject/payload",
+                        "raw_output": raw_output,
+                        "trace": {
+                            "absolute_path": trace_path,
+                            "sha256": hashlib.sha256(trace_bytes).hexdigest(),
+                            "record_count": 1,
+                            "final_link_record_count": 1,
+                        },
+                        "role": role,
+                        "session": session,
+                        "cwd": "/host/subject",
+                        "path": path_value,
+                    },
+                    trace_bytes,
+                )
+
+            linker = (
+                capability["linker"]
+                if flavor == "actual"
+                else capability["required_linkers"][flavor]
+            )
+            linker_execution, _ = execution_record(
+                argv=linker_argv,
+                linker=linker,
+                role=linker_role,
+                trace_name="linker-trace.jsonl",
+            )
+            linker_execution_bytes = json_bytes(linker_execution)
+            linker_execution_path = f"{prefix}/linker-execution.json"
+            shape_files[linker_execution_path] = linker_execution_bytes
+            shape["linker_execution"] = {
+                "absolute_path": linker_execution_path,
+                "sha256": hashlib.sha256(linker_execution_bytes).hexdigest(),
+            }
+            if flavor != "actual":
+                cargo_execution, _ = execution_record(
+                    argv=cargo_argv,
+                    linker=capability["linker"],
+                    role="cargo-driver",
+                    trace_name="cargo-trace.jsonl",
+                )
+                cargo_execution_bytes = json_bytes(cargo_execution)
+                cargo_execution_path = f"{prefix}/cargo-execution.json"
+                shape_files[cargo_execution_path] = cargo_execution_bytes
+                shape["cargo_execution"] = {
+                    "absolute_path": cargo_execution_path,
+                    "sha256": hashlib.sha256(cargo_execution_bytes).hexdigest(),
+                }
+            link_argv = " ".join(
+                [
+                    "LC_ALL=C",
+                    f"PATH={path_value}",
+                    "VSLANG=1033",
+                    "/host/subject/scripts/cache-gate-link-wrapper.py",
+                    *cargo_argv,
+                ]
+            ).encode()
+            link_argv_path = f"{prefix}/link-args.txt"
+            shape_files[link_argv_path] = link_argv
+            shape["link_argv"] = {
+                "absolute_path": link_argv_path,
+                "sha256": hashlib.sha256(link_argv).hexdigest(),
+            }
 
     manifest = schema_sample(verify_module.MANIFEST_V2_SCHEMA, verify_module)
     rewrite_file_records(manifest, "/host/subject/payload", payload_sha)
     manifest.update(
         {
-            "commit": "a" * 40,
-            "tree": "b" * 40,
+            "commit": SUBJECT_COMMIT,
+            "tree": SUBJECT_TREE,
             "empty_diff_assertion": True,
             "mode": "MANIFEST",
             "architecture": "x86_64",
@@ -857,11 +1149,19 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
                 "-C",
                 "linker=/host/subject/payload",
             ],
-            "linker_flags": ["-Wl,-T,<target-fragment>"],
+            "linker_flags": [
+                "-Wl,-T,<target-fragment>",
+                "-Wl,-Map,<per-target-map>",
+            ],
         }
     )
+    manifest["build_proof"]["codegen_units"] = 16
     manifest["control"]["runner_root"] = "/host/subject"
     manifest["control"]["mode"] = "BUILD_CONTROL"
+    for field in ("runner_commit", "builder_commit"):
+        manifest["control"][field] = SUBJECT_COMMIT
+    for field in ("runner_tree", "builder_tree"):
+        manifest["control"][field] = SUBJECT_TREE
     manifest["control"]["provenance_path"] = "/host/subject/payload"
     manifest["control"]["provenance_sha256"] = payload_sha
     for tool in manifest["tools"].values():
@@ -893,19 +1193,26 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
         layout["plt_inventory"] = []
         for item in layout["cache_gate_input_sections"]:
             item["owner"] = "/host/subject/input.o"
-        for kernel in layout["kernels"].values():
+        for kernel_name, kernel in layout["kernels"].items():
+            kernel["name"] = kernel_name
             kernel["input_owner"] = "/host/subject/input.o"
         proof = manifest["build_proof"]["executables"][executable]
         proof["rustc_argv"] = [
             "Running `/host/toolchain/bin/rustc /host/subject/input.rs "
-            "-o /host/subject/out`"
+            "-Ccodegen-units=16 -o /host/subject/out`"
         ]
         proof["archive_member_owners"] = []
+        proof["emitted_object_members"] = ["input.o"]
+        proof["cgu_members"] = ["input.o"]
+        proof["ordered_linker_inputs"] = ["input.o"]
         proof["link_command"]["argv"] = [
             "/host/subject/input.o",
             "-o",
-            "/host/subject/out",
+            "/host/subject/payload",
         ]
+        proof["link_command"]["ordered_linker_inputs"] = ["input.o"]
+        proof["link_command"]["direct_input_files"] = ["input.o"]
+        proof["link_command"]["direct_cgu_members"] = ["input.o"]
         proof["link_command"]["executable"] = "/host/subject/payload"
         proof["link_command"]["fragment"] = "/host/subject/payload"
         proof["link_command"]["link_map"] = "/host/subject/payload"
@@ -926,6 +1233,7 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
     adversary = copy.deepcopy(manifest)
     adversary["variant"] = adversary["manifest_instance"] = "proof-adversary"
     adversary["layout_adversary"]["enabled"] = True
+    adversary["layout_adversary"]["symbol"] = "layout_adversary"
     adversary["build"]["rustc_flags"].extend(
         [
             "--cfg",
@@ -933,13 +1241,11 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
             "--check-cfg=cfg(cache_gate_layout_adversary)",
         ]
     )
-    for field in (
-        "cgu_partition_fingerprint",
-        "object_member_fingerprint",
-        "link_order_fingerprint",
-    ):
-        adversary["build_proof"][field] = f"adversary-{field}"
     for proof in adversary["build_proof"]["executables"].values():
+        proof["emitted_object_members"].append("adversary-object.o")
+        proof["ordered_linker_inputs"].append("adversary.o")
+        proof["link_command"]["ordered_linker_inputs"].append("adversary.o")
+        proof["cgu_members"].append("adversary-cgu.o")
         proof["adversary"] = {
             "symbol_occurrences": [
                 {"name": "layout_adversary", "start": 8192, "size": 32}
@@ -948,19 +1254,118 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
             "outside_reservations": True,
         }
 
+    def finalize_build_proof(document: dict[str, Any]) -> None:
+        artifact_root = f"/host/subject/manifest-artifacts/{document['variant']}"
+        control = document["control"]
+        control_bytes = json_bytes(
+            {
+                key: value
+                for key, value in control.items()
+                if key not in {"provenance_path", "provenance_sha256"}
+            }
+        )
+        control_path = f"{artifact_root}/control-provenance.json"
+        hosted_files[control_path] = control_bytes
+        control["provenance_path"] = control_path
+        control["provenance_sha256"] = hashlib.sha256(control_bytes).hexdigest()
+        aggregate = {
+            "cgu_partition_fingerprint": [],
+            "object_member_fingerprint": [],
+            "link_order_fingerprint": [],
+            "reserved_input_owner_fingerprint": [],
+        }
+        for executable, proof in document["build_proof"]["executables"].items():
+            command = proof["link_command"]
+            driver = command["driver"]
+            trace_record = {
+                "argv": command["argv"],
+                "argv0": driver["argv0"],
+                "cwd": "/host/subject",
+                "path": "/host/toolchain/bin:/usr/bin",
+                "payload_path": driver["payload_path"],
+                "payload_sha256": driver["payload_sha256"],
+            }
+            trace_bytes = json_bytes(trace_record)
+            trace_path = f"{artifact_root}/{executable}.trace.jsonl"
+            hosted_files[trace_path] = trace_bytes
+            command["trace"] = {
+                "absolute_path": trace_path,
+                "sha256": hashlib.sha256(trace_bytes).hexdigest(),
+                "record_count": 1,
+                "final_link_record_count": 1,
+            }
+            document["executables"][executable]["link_trace"] = {
+                "absolute_path": trace_path,
+                "sha256": hashlib.sha256(trace_bytes).hexdigest(),
+            }
+            command["ordered_linker_input_fingerprint"] = verify_module._fingerprint(
+                command["ordered_linker_inputs"]
+            )
+            proof["direct_linker_input_files"] = copy.deepcopy(
+                command["direct_input_files"]
+            )
+            proof["reserved_input_owners"] = [
+                Path(kernel["input_owner"]).name
+                for kernel in document["elf_layout"][executable]["kernels"].values()
+            ]
+            values_by_field = {
+                "cgu_partition_fingerprint": proof["cgu_members"],
+                "object_member_fingerprint": proof["emitted_object_members"],
+                "link_order_fingerprint": proof["ordered_linker_inputs"],
+                "reserved_input_owner_fingerprint": proof["reserved_input_owners"],
+            }
+            for field, values in values_by_field.items():
+                proof[field] = verify_module._fingerprint(values)
+                aggregate[field].extend(f"{executable}:{value}" for value in values)
+            artifacts = (
+                ("symbols", document["symbols"][executable]),
+                ("layout", document["elf_layout"][executable]),
+                ("link_command", command),
+            )
+            for name, embedded in artifacts:
+                data = json_bytes(embedded)
+                path = f"{artifact_root}/{executable}.{name}.json"
+                hosted_files[path] = data
+                document["executables"][executable][name] = {
+                    "absolute_path": path,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+        for field, values in aggregate.items():
+            document["build_proof"][field] = verify_module._fingerprint(values)
+
+    for document in (clean_a, clean_b, adversary):
+        finalize_build_proof(document)
+
     v1 = schema_sample(verify_module.MANIFEST_V1_SCHEMA, verify_module)
     rewrite_file_records(v1, "/host/v1/payload", payload_sha)
     v1.update(
         {
-            "commit": "c" * 40,
-            "tree": "d" * 40,
+            "commit": V1_REPLAY_COMMIT,
+            "tree": V1_REPLAY_TREE,
             "empty_diff_assertion": True,
             "architecture": "x86_64",
             "variant": "proof-v1",
         }
     )
-    v1["control"]["provenance_path"] = "/host/v1/payload"
-    v1["control"]["provenance_sha256"] = payload_sha
+    v1["build"] = {
+        "cargo_incremental": "0",
+        "profile": "release",
+        "locked": True,
+        "rustc_flags": ["-C", "link-arg=-Wl,-Map,<per-target-map>"],
+        "linker_flags": ["-Wl,-Map,<per-target-map>"],
+    }
+    v1["control"]["builder_commit"] = V1_REPLAY_COMMIT
+    v1["control"]["builder_tree"] = V1_REPLAY_TREE
+    v1_control_bytes = json_bytes(
+        {
+            key: value
+            for key, value in v1["control"].items()
+            if key not in {"provenance_path", "provenance_sha256"}
+        }
+    )
+    v1["control"]["provenance_path"] = "/host/v1/control-provenance.json"
+    v1["control"]["provenance_sha256"] = hashlib.sha256(v1_control_bytes).hexdigest()
+    hosted_files["/host/v1/control-provenance.json"] = v1_control_bytes
     for executable, (_target, kernels) in verify_module.EXECUTABLE_TARGETS.items():
         v1["symbols"][executable].update(
             {
@@ -1021,6 +1426,12 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
         }
         for index, document in enumerate(transcript_documents)
     ]
+    body_comparison = {
+        "version": 1,
+        "fields": list(verify_module.BODY_FIELDS),
+        "rows": body_rows,
+    }
+    portable_paths_document = full_portable_paths(verify_module)
     return {
         "capability": capability,
         "capability_bytes": capability_bytes,
@@ -1028,7 +1439,7 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
         "manifest_v1": v1,
         "provenance": {
             "version": 1,
-            "subject": {"commit": "a" * 40, "tree": "b" * 40},
+            "subject": {"commit": SUBJECT_COMMIT, "tree": SUBJECT_TREE},
             "run": {"id": 7, "attempt": 2, "derived_attempt": 7002},
             "documents": {
                 "capability": {
@@ -1041,16 +1452,24 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
                     "sha256": hashlib.sha256(json_bytes(v1)).hexdigest(),
                 },
                 "transcripts": transcript_records,
+                "body_comparison": {
+                    "archive_path": "bundle/body-comparison.json",
+                    "sha256": hashlib.sha256(json_bytes(body_comparison)).hexdigest(),
+                },
+                "portable_paths": {
+                    "archive_path": "bundle/portable-paths.json",
+                    "sha256": hashlib.sha256(
+                        json_bytes(portable_paths_document)
+                    ).hexdigest(),
+                },
             },
             "hardlinks": [],
         },
         "transcripts": transcript_documents,
-        "body_comparison": {
-            "version": 1,
-            "fields": list(verify_module.BODY_FIELDS),
-            "rows": body_rows,
-        },
-        "portable_paths": full_portable_paths(verify_module),
+        "body_comparison": body_comparison,
+        "portable_paths": portable_paths_document,
+        "shape_files": shape_files,
+        "hosted_files": hosted_files,
     }
 
 
@@ -1393,8 +1812,26 @@ def write_semantic_staging(staging: Path, verify_module: ModuleType) -> dict[str
     for name in ("actual", "gnu", "lld"):
         (bundle / f"system-root/usr/bin/{name}").write_bytes(b"linker")
     (bundle / "subject/payload").write_bytes(b"payload")
+    (bundle / "subject/input.o").write_bytes(b"object")
+    (bundle / "subject/scripts").mkdir()
+    (bundle / "subject/scripts/cache-gate-link-wrapper.py").write_bytes(b"wrapper")
     (bundle / "v1/payload").write_bytes(b"payload")
     (bundle / "toolchain/rust/bin/rustc").write_bytes(b"rustc")
+    for hosted, data in documents["shape_files"].items():
+        relative = Path(hosted).relative_to("/host/subject")
+        destination = bundle / "subject" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+    for hosted, data in documents["hosted_files"].items():
+        if hosted.startswith("/host/subject/"):
+            root_name = "subject"
+            relative = Path(hosted).relative_to("/host/subject")
+        else:
+            root_name = "v1"
+            relative = Path(hosted).relative_to("/host/v1")
+        destination = bundle / root_name / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
 
     named_documents = {
         "capability.json": documents["capability"],
@@ -1431,8 +1868,8 @@ def test_verify_archive_returns_stable_ready_report(
     report = verify_module.verify_archive(archive, digest)
     assert report.status == "READY"
     assert report.archive_sha256 == digest
-    assert report.subject_commit == "a" * 40
-    assert report.subject_tree == "b" * 40
+    assert report.subject_commit == SUBJECT_COMMIT
+    assert report.subject_tree == SUBJECT_TREE
     assert (report.run_id, report.run_attempt) == (7, 2)
     assert report.body_comparison_sha256 == verify_module.verify_body_rows(
         documents["body_comparison"]["rows"]
@@ -1479,38 +1916,43 @@ def test_hosted_transcript_must_match_manifest_link_proof(
         verify_module.verify_archive(archive, digest)
 
 
-def require_aarch64_fixture(path: Path) -> Path:
-    if not path.is_file():
-        pytest.skip(f"local accepted AArch64 fixture is unavailable: {path}")
-    return path
-
-
 def test_full_immutable_capability_and_v2_schemas_accept_attempt_5(
     verify_module: ModuleType,
 ) -> None:
-    capability = json.loads(
-        require_aarch64_fixture(
-            AARCH64_ATTEMPT_5 / "linker-capability.json"
-        ).read_text()
-    )
-    manifest = json.loads(
-        require_aarch64_fixture(AARCH64_ATTEMPT_5 / "manifest.json").read_text()
-    )
+    records = reviewed_records()
+    capability = records["capability"]
+    manifest = records["clean_a"]
     verify_module._validate_schema(
         capability, verify_module.CAPABILITY_SCHEMA, "capability"
     )
     verify_module._validate_schema(
         manifest, verify_module.MANIFEST_V2_SCHEMA, "manifest_v2"
     )
+    assert capability["producer"]["commit"] == SUBJECT_COMMIT
+    assert capability["producer"]["tree"] == SUBJECT_TREE
+    assert manifest["commit"] == SUBJECT_COMMIT
+    assert manifest["tree"] == SUBJECT_TREE
+    assert any(
+        item["symlink_target"] is not None
+        for linker in (
+            capability["linker"],
+            *capability["required_linkers"].values(),
+        )
+        for item in linker["invocation_chain"]
+    )
+    assert any(
+        layout["archive_member_owners"] for layout in manifest["elf_layout"].values()
+    )
 
 
 def test_full_immutable_v1_schema_accepts_replayed_shape(
     verify_module: ModuleType,
 ) -> None:
-    manifest = json.loads(require_aarch64_fixture(V1_AARCH64_MANIFEST).read_text())
+    manifest = reviewed_records()["v1"]
     verify_module._validate_schema(
         manifest, verify_module.MANIFEST_V1_SCHEMA, "manifest_v1"
     )
+    assert manifest["tree"] == V1_REPLAY_TREE
 
 
 @pytest.mark.parametrize(
@@ -1567,14 +2009,97 @@ def test_full_typed_route_table_is_closed(
     assert verify_module.classify(path) == field_kind
 
 
+def test_concrete_route_walk_reaches_real_nested_path_fields(
+    verify_module: ModuleType,
+) -> None:
+    manifest = reviewed_records()["clean_a"]
+    routed = {
+        path: field_kind
+        for path, field_kind, _value in verify_module.collect_concrete_routes(
+            "manifest", manifest
+        )
+    }
+    assert (
+        routed[
+            (
+                "manifest",
+                "control",
+                "runner_root",
+            )
+        ]
+        == "root"
+    )
+    assert (
+        routed[
+            (
+                "manifest",
+                "linker_capability",
+                "required_linkers",
+                "lld",
+                "invocation_chain",
+                0,
+                "absolute_path",
+            )
+        ]
+        == "system-file"
+    )
+    assert (
+        routed[
+            (
+                "manifest",
+                "build_proof",
+                "executables",
+                "elastic_cache_gate",
+                "rustc_argv",
+                0,
+            )
+        ]
+        == "rustc-command"
+    )
+    assert (
+        routed[
+            (
+                "manifest",
+                "elf_layout",
+                "elastic_cache_gate",
+                "kernels",
+                "elastic_cache_gate_insert_kernel",
+                "input_owner",
+            )
+        ]
+        == "transient-file"
+    )
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        "MYSTERY_PATH=/outside",
+        "CARGO_ENCODED_RUSTFLAGS='-Ccodegen-units=16-Clinker=/outside/wrapper'",
+    ],
+)
+def test_rustc_transcript_rejects_unclassified_path_environment(
+    verify_module: ModuleType,
+    environment: str,
+) -> None:
+    roots = verify_module.PortableRoots.from_document(
+        full_portable_paths(verify_module)
+    )
+    line = (
+        f"Running `{environment} /host/toolchain/bin/rustc "
+        "/host/subject/input.rs -o /host/subject/out`"
+    )
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="environment|outside declared roots",
+    ):
+        verify_module.validate_rustc_transcript(line, roots)
+
+
 def test_full_capability_has_exact_nine_linker_shapes(
     verify_module: ModuleType,
 ) -> None:
-    capability = json.loads(
-        require_aarch64_fixture(
-            AARCH64_ATTEMPT_5 / "linker-capability.json"
-        ).read_text()
-    )
+    capability = reviewed_records()["capability"]
     assert verify_module.capability_shapes(capability) == {
         ("actual", "elastic", 2),
         ("actual", "funnel", 2),
@@ -1588,25 +2113,156 @@ def test_full_capability_has_exact_nine_linker_shapes(
     }
 
 
+def test_real_capability_shape_records_bind_nine_executions(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+
+    def read_record(flavor: str, target: str, name: str) -> bytes:
+        return records["shape_records"][f"capability-shapes/{flavor}/{target}/{name}"]
+
+    assert verify_module.verify_capability_shape_records(
+        records["capability"],
+        read_record,
+    ) == {
+        (flavor, target, count)
+        for flavor in ("actual", "gnu", "lld")
+        for target, count in (("elastic", 2), ("funnel", 2), ("profile", 4))
+    }
+
+
+def test_capability_shape_rejects_linker_identity_substitution(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+    substituted = copy.deepcopy(records["shape_records"])
+    key = "capability-shapes/lld/elastic/linker-execution.json"
+    execution = json.loads(substituted[key])
+    execution["linker"] = copy.deepcopy(
+        records["capability"]["required_linkers"]["gnu"]
+    )
+    substituted[key] = json_bytes(execution)
+
+    def read_record(flavor: str, target: str, name: str) -> bytes:
+        return substituted[f"capability-shapes/{flavor}/{target}/{name}"]
+
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="shape linker identity mismatch",
+    ):
+        verify_module.verify_capability_shape_records(
+            records["capability"],
+            read_record,
+        )
+
+
 def test_full_clean_and_adversary_relationships_use_immutable_fields(
     verify_module: ModuleType,
 ) -> None:
-    root = require_aarch64_fixture(AARCH64_ATTEMPT_5 / "manifest.json").parent
-    clean_a = json.loads((root / "manifest.json").read_text())
-    clean_b = json.loads(
-        (
-            root.parent / root.name.replace("clean-a", "clean-b") / "manifest.json"
-        ).read_text()
-    )
-    adversary = json.loads(
-        (
-            root.parent / root.name.replace("clean-a", "adversary") / "manifest.json"
-        ).read_text()
-    )
+    records = reviewed_records()
+    clean_a = records["clean_a"]
+    clean_b = records["clean_b"]
+    adversary = records["adversary"]
     verify_module.verify_manifest_relationships(clean_a, clean_b, adversary)
     clean_b["build_proof"]["link_order_fingerprint"] = "f" * 64
     with pytest.raises(verify_module.EvidenceError, match="clean build proof"):
         verify_module.verify_manifest_relationships(clean_a, clean_b, adversary)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "per-executable-fingerprint",
+        "ordered-inputs",
+        "adversary-reserved",
+        "kernel-name",
+    ],
+)
+def test_strict_manifest_relationships_recompute_every_semantic(
+    verify_module: ModuleType,
+    mutation: str,
+) -> None:
+    records = reviewed_records()
+    clean_a = records["clean_a"]
+    clean_b = records["clean_b"]
+    adversary = records["adversary"]
+    executable = "elastic_cache_gate"
+    if mutation == "per-executable-fingerprint":
+        for manifest in (clean_a, clean_b):
+            manifest["build_proof"]["executables"][executable][
+                "object_member_fingerprint"
+            ] = "f" * 64
+    elif mutation == "ordered-inputs":
+        for manifest in (clean_a, clean_b):
+            manifest["build_proof"]["executables"][executable][
+                "ordered_linker_inputs"
+            ].reverse()
+    elif mutation == "adversary-reserved":
+        adversary["build_proof"]["reserved_input_owner_fingerprint"] = "f" * 64
+    else:
+        for manifest in (clean_a, clean_b, adversary):
+            manifest["symbols"][executable]["symbols"][0]["name"] = (
+                "crate::substituted_kernel"
+            )
+            layout = manifest["elf_layout"][executable]
+            kernel = layout["kernels"].pop("elastic_cache_gate_insert_kernel")
+            kernel["name"] = "substituted_kernel"
+            layout["kernels"]["elastic_cache_gate_insert_kernel"] = kernel
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="fingerprint|ordered linker inputs|adversary|kernel",
+    ):
+        verify_module.verify_manifest_relationships(clean_a, clean_b, adversary)
+
+
+def test_exact_identity_contract_binds_subject_v1_controls_and_capability_bytes(
+    verify_module: ModuleType,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifests = documents["manifests"]
+    v1 = documents["manifest_v1"]
+    provenance = documents["provenance"]
+    capability["producer"]["commit"] = SUBJECT_COMMIT
+    capability["producer"]["tree"] = SUBJECT_TREE
+    provenance["subject"] = {"commit": SUBJECT_COMMIT, "tree": SUBJECT_TREE}
+    for manifest in manifests:
+        manifest["commit"] = SUBJECT_COMMIT
+        manifest["tree"] = SUBJECT_TREE
+        for field in ("runner_commit", "builder_commit"):
+            manifest["control"][field] = SUBJECT_COMMIT
+        for field in ("runner_tree", "builder_tree"):
+            manifest["control"][field] = SUBJECT_TREE
+        manifest["linker_capability"] = {
+            **copy.deepcopy(capability),
+            "copy": {
+                "absolute_path": "/host/evidence/capability.json",
+                "sha256": hashlib.sha256(json_bytes(capability)).hexdigest(),
+            },
+        }
+    v1["commit"] = V1_REPLAY_COMMIT
+    v1["tree"] = V1_REPLAY_TREE
+    v1["control"]["builder_commit"] = V1_REPLAY_COMMIT
+    v1["control"]["builder_tree"] = V1_REPLAY_TREE
+    verify_module.verify_identity_contract(
+        provenance,
+        capability,
+        manifests,
+        v1,
+        json_bytes(capability),
+    )
+    manifests[0]["control"]["builder_commit"] = "f" * 40
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="exact subject identity",
+    ):
+        verify_module.verify_identity_contract(
+            provenance,
+            capability,
+            manifests,
+            v1,
+            json_bytes(capability),
+        )
 
 
 def test_rlib_member_validation_is_reached_from_manifest_owner(
@@ -1628,3 +2284,40 @@ def test_rlib_member_validation_is_reached_from_manifest_owner(
         lambda raw: archive if raw == "/host/toolchain/lib/libproof.rlib" else None,
     )
     assert called == [(archive, "member.o")]
+
+
+def test_every_rlib_occurrence_is_index_checked_and_owner_lists_cross_bound(
+    tmp_path: Path,
+    verify_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "libproof.rlib"
+    archive.write_bytes(b"archive")
+    absolute = "/host/toolchain/lib/libproof.rlib(member.o)"
+    relative = "libproof.rlib(member.o)"
+    layout = {
+        "archive_member_owners": [absolute],
+        "cache_gate_input_sections": [{"owner": absolute}],
+        "kernels": {"kernel": {"input_owner": absolute}},
+    }
+    proof = {"archive_member_owners": [relative]}
+    called: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        verify_module,
+        "validate_rlib_member",
+        lambda path, member: called.append((path, member)),
+    )
+    verify_module.validate_manifest_rlib_occurrences(
+        layout,
+        proof,
+        lambda raw: (
+            archive
+            if raw
+            in {
+                "/host/toolchain/lib/libproof.rlib",
+                "libproof.rlib",
+            }
+            else None
+        ),
+    )
+    assert called == [(archive, "member.o")] * 4

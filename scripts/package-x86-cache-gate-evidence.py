@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import stat
 import sys
 import tarfile
@@ -21,6 +22,9 @@ class EvidenceError(RuntimeError):
 
 class StagedEntry(NamedTuple):
     path: Path
+    parent_fd: int
+    name: str
+    directory_fd: int
     archive_path: str
     kind: str
     mode: int
@@ -30,24 +34,63 @@ class StagedEntry(NamedTuple):
     device: int = 0
     inode: int = 0
     links: int = 1
+    raw_mode: int = 0
+    metadata_size: int = 0
+    modified_ns: int = 0
+    changed_ns: int = 0
+    children: tuple[str, ...] = ()
 
 
 def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def _digest_file(path: Path, expected: os.stat_result) -> tuple[str, int]:
+def _identity(item: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+        item.st_nlink,
+    )
+
+
+def _open_regular(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result | tuple[int, int, int, int, int, int, int],
+    display_path: Path,
+) -> int:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
     except OSError as error:
         raise EvidenceError(
-            f"cannot open staged regular file without following: {path}"
+            f"cannot open staged regular file without following: {display_path}"
         ) from error
+    expected_identity = (
+        _identity(expected) if isinstance(expected, os.stat_result) else expected
+    )
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or _identity(metadata) != expected_identity:
+        os.close(descriptor)
+        raise EvidenceError(
+            f"staged regular file changed while packaging: {display_path}"
+        )
+    return descriptor
+
+
+def _digest_file_at(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+    display_path: Path,
+) -> tuple[str, int]:
+    descriptor = _open_regular(parent_fd, name, expected, display_path)
     try:
         before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise EvidenceError(f"staged file changed type: {path}")
         digest = hashlib.sha256()
         size = 0
         while True:
@@ -59,26 +102,19 @@ def _digest_file(path: Path, expected: os.stat_result) -> tuple[str, int]:
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-
-    def identity(item: os.stat_result) -> tuple[int, int, int, int, int, int]:
-        return (
-            item.st_dev,
-            item.st_ino,
-            item.st_mode,
-            item.st_size,
-            item.st_mtime_ns,
-            item.st_ctime_ns,
+    if _identity(before) != _identity(after) or _identity(before) != _identity(
+        expected
+    ):
+        raise EvidenceError(
+            f"staged regular file changed while packaging: {display_path}"
         )
-
-    if identity(before) != identity(after) or identity(before) != identity(expected):
-        raise EvidenceError(f"staged regular file changed while packaging: {path}")
     return digest.hexdigest(), size
 
 
-def _load_hardlinks(provenance_path: Path) -> dict[str, str]:
+def _load_hardlinks(bundle_fd: int, bundle_path: Path) -> dict[str, str]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(provenance_path, flags)
+        descriptor = os.open("provenance.json", flags, dir_fd=bundle_fd)
         try:
             metadata = os.fstat(descriptor)
             if (
@@ -96,6 +132,8 @@ def _load_hardlinks(provenance_path: Path) -> dict[str, str]:
                 remaining -= len(chunk)
             if remaining:
                 raise EvidenceError("invalid bundle/provenance.json")
+            if _identity(os.fstat(descriptor)) != _identity(metadata):
+                raise EvidenceError("bundle/provenance.json changed while packaging")
         finally:
             os.close(descriptor)
 
@@ -109,7 +147,9 @@ def _load_hardlinks(provenance_path: Path) -> dict[str, str]:
 
         document = json.loads(b"".join(chunks), object_pairs_hook=reject_duplicates)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise EvidenceError("invalid bundle/provenance.json") from error
+        raise EvidenceError(
+            f"invalid bundle/provenance.json beneath {bundle_path}"
+        ) from error
     if not isinstance(document, dict):
         raise EvidenceError("invalid bundle/provenance.json")
     raw_records = document.get("hardlinks", [])
@@ -145,64 +185,126 @@ def _validate_archive_path(raw: str) -> PurePosixPath:
 
 
 def _walk(
-    root: Path, hardlinks: dict[str, str], *, include_inventory: bool
-) -> list[StagedEntry]:
-    root_metadata = root.stat(follow_symlinks=False)
-    if not stat.S_ISDIR(root_metadata.st_mode) or root.is_symlink():
+    root_fd: int,
+    root: Path,
+    hardlinks: dict[str, str],
+    *,
+    include_inventory: bool,
+) -> tuple[list[StagedEntry], list[int]]:
+    root_metadata = os.fstat(root_fd)
+    if not stat.S_ISDIR(root_metadata.st_mode):
         raise EvidenceError("bundle is not a real directory")
-    entries: list[StagedEntry] = [
-        StagedEntry(
-            root,
-            "bundle",
-            "dir",
-            stat.S_IMODE(root_metadata.st_mode),
-            device=root_metadata.st_dev,
-            inode=root_metadata.st_ino,
-        )
-    ]
+    entries: list[StagedEntry] = []
+    opened_directories: list[int] = []
     allowed_link_paths = set(hardlinks) | set(hardlinks.values())
 
-    def visit(directory: Path, relative: PurePosixPath) -> None:
+    def visit(
+        directory_fd: int,
+        directory: Path,
+        relative: PurePosixPath,
+        metadata: os.stat_result,
+        parent_fd: int,
+        name: str,
+    ) -> None:
         try:
-            children = list(os.scandir(directory))
+            child_names = os.listdir(directory_fd)
         except OSError as error:
             raise EvidenceError(
                 f"cannot scan staging directory: {directory}"
             ) from error
-        children.sort(key=lambda child: os.fsencode((relative / child.name).as_posix()))
-        for child in children:
-            child_relative = relative / child.name
+        child_names = [
+            child_name
+            for child_name in child_names
+            if include_inventory
+            or (relative / child_name).as_posix() != "bundle/inventory.json"
+        ]
+        child_names.sort(
+            key=lambda child_name: os.fsencode((relative / child_name).as_posix())
+        )
+        after_list = os.fstat(directory_fd)
+        if _identity(metadata) != _identity(after_list):
+            raise EvidenceError(f"staging tree changed while packaging: {directory}")
+        entries.append(
+            StagedEntry(
+                directory,
+                parent_fd,
+                name,
+                directory_fd,
+                relative.as_posix(),
+                "dir",
+                stat.S_IMODE(after_list.st_mode),
+                device=after_list.st_dev,
+                inode=after_list.st_ino,
+                links=after_list.st_nlink,
+                raw_mode=after_list.st_mode,
+                metadata_size=after_list.st_size,
+                modified_ns=after_list.st_mtime_ns,
+                changed_ns=after_list.st_ctime_ns,
+                children=tuple(child_names),
+            )
+        )
+        for child_name in child_names:
+            child_relative = relative / child_name
             archive_path = child_relative.as_posix()
             _validate_archive_path(archive_path)
-            if archive_path == "bundle/inventory.json" and not include_inventory:
-                continue
+            path = directory / child_name
             try:
-                metadata = child.stat(follow_symlinks=False)
-            except OSError as error:
-                raise EvidenceError(
-                    f"cannot stat staged entry: {child.path}"
-                ) from error
-            mode = stat.S_IMODE(metadata.st_mode)
-            path = Path(child.path)
-            if stat.S_ISDIR(metadata.st_mode):
-                entries.append(
-                    StagedEntry(
-                        path,
-                        archive_path,
-                        "dir",
-                        mode,
-                        device=metadata.st_dev,
-                        inode=metadata.st_ino,
-                    )
+                child_metadata = os.stat(
+                    child_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
                 )
-                visit(path, child_relative)
-            elif stat.S_ISLNK(metadata.st_mode):
+            except OSError as error:
+                raise EvidenceError(f"cannot stat staged entry: {path}") from error
+            mode = stat.S_IMODE(child_metadata.st_mode)
+            common = {
+                "device": child_metadata.st_dev,
+                "inode": child_metadata.st_ino,
+                "links": child_metadata.st_nlink,
+                "raw_mode": child_metadata.st_mode,
+                "metadata_size": child_metadata.st_size,
+                "modified_ns": child_metadata.st_mtime_ns,
+                "changed_ns": child_metadata.st_ctime_ns,
+            }
+            if stat.S_ISDIR(child_metadata.st_mode):
+                flags = (
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
                 try:
-                    target = os.readlink(path)
+                    child_fd = os.open(child_name, flags, dir_fd=directory_fd)
+                except OSError as error:
+                    raise EvidenceError(
+                        f"cannot open staged directory without following: {path}"
+                    ) from error
+                opened_directories.append(child_fd)
+                opened_metadata = os.fstat(child_fd)
+                if _identity(opened_metadata) != _identity(child_metadata):
+                    raise EvidenceError(f"staging tree changed while packaging: {path}")
+                visit(
+                    child_fd,
+                    path,
+                    child_relative,
+                    opened_metadata,
+                    directory_fd,
+                    child_name,
+                )
+            elif stat.S_ISLNK(child_metadata.st_mode):
+                try:
+                    target = os.readlink(child_name, dir_fd=directory_fd)
                 except OSError as error:
                     raise EvidenceError(
                         f"cannot read staged symlink: {path}"
                     ) from error
+                after_readlink = os.stat(
+                    child_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if _identity(after_readlink) != _identity(child_metadata):
+                    raise EvidenceError(f"staging tree changed while packaging: {path}")
                 if not target or "\x00" in target:
                     raise EvidenceError(
                         f"invalid staged symlink target: {archive_path}"
@@ -210,39 +312,62 @@ def _walk(
                 entries.append(
                     StagedEntry(
                         path,
+                        directory_fd,
+                        child_name,
+                        -1,
                         archive_path,
                         "symlink",
                         mode,
                         target=target,
-                        device=metadata.st_dev,
-                        inode=metadata.st_ino,
+                        **common,
                     )
                 )
-            elif stat.S_ISREG(metadata.st_mode):
-                if metadata.st_nlink > 1 and archive_path not in allowed_link_paths:
+            elif stat.S_ISREG(child_metadata.st_mode):
+                if (
+                    child_metadata.st_nlink > 1
+                    and archive_path not in allowed_link_paths
+                ):
                     raise EvidenceError(f"unlisted hardlink: {archive_path}")
-                digest, size = _digest_file(path, metadata)
+                digest, size = _digest_file_at(
+                    directory_fd,
+                    child_name,
+                    child_metadata,
+                    path,
+                )
                 kind = "hardlink" if archive_path in hardlinks else "file"
                 entries.append(
                     StagedEntry(
                         path,
+                        directory_fd,
+                        child_name,
+                        -1,
                         archive_path,
                         kind,
                         mode,
                         size,
                         digest,
                         hardlinks.get(archive_path, ""),
-                        metadata.st_dev,
-                        metadata.st_ino,
-                        metadata.st_nlink,
+                        **common,
                     )
                 )
             else:
                 raise EvidenceError(f"unsupported staged entry type: {archive_path}")
 
-    visit(root, PurePosixPath("bundle"))
-    entries.sort(key=lambda entry: entry.archive_path.encode())
-    return entries
+    try:
+        visit(
+            root_fd,
+            root,
+            PurePosixPath("bundle"),
+            root_metadata,
+            -1,
+            "",
+        )
+        entries.sort(key=lambda entry: entry.archive_path.encode())
+        return entries, opened_directories
+    except BaseException:
+        for descriptor in reversed(opened_directories):
+            os.close(descriptor)
+        raise
 
 
 def _inventory(entries: list[StagedEntry]) -> dict[str, object]:
@@ -288,23 +413,177 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o644) -> None:
         raise
 
 
+def _atomic_write_at(
+    directory_fd: int,
+    name: str,
+    data: bytes,
+    mode: int = 0o644,
+) -> None:
+    temporary = ""
+    descriptor = -1
+    try:
+        for _attempt in range(128):
+            temporary = f".{name}.{secrets.token_hex(16)}"
+            try:
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    mode,
+                    dir_fd=directory_fd,
+                )
+                break
+            except FileExistsError:
+                continue
+        if descriptor < 0:
+            raise EvidenceError("cannot allocate private inventory temporary")
+        os.fchmod(descriptor, mode)
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise EvidenceError("cannot write inventory")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary = ""
+        os.fsync(directory_fd)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        raise
+
+
 def _same_entry(left: StagedEntry, right: StagedEntry) -> bool:
-    return left[1:] == right[1:]
+    return (
+        left.archive_path,
+        left.kind,
+        left.mode,
+        left.size,
+        left.sha256,
+        left.target,
+        left.device,
+        left.inode,
+        left.links,
+    ) == (
+        right.archive_path,
+        right.kind,
+        right.mode,
+        right.size,
+        right.sha256,
+        right.target,
+        right.device,
+        right.inode,
+        right.links,
+    )
+
+
+def _entry_identity(entry: StagedEntry) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        entry.device,
+        entry.inode,
+        entry.raw_mode,
+        entry.metadata_size,
+        entry.modified_ns,
+        entry.changed_ns,
+        entry.links,
+    )
+
+
+class _HashingReader:
+    def __init__(self, descriptor: int):
+        self.descriptor = descriptor
+        self.digest = hashlib.sha256()
+        self.size = 0
+
+    def read(self, size: int = -1) -> bytes:
+        amount = 1024 * 1024 if size is None or size < 0 else size
+        chunk = os.read(self.descriptor, amount)
+        self.digest.update(chunk)
+        self.size += len(chunk)
+        return chunk
 
 
 def _add_regular(
     archive: tarfile.TarFile, info: tarfile.TarInfo, entry: StagedEntry
 ) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(entry.path, flags)
+    descriptor = _open_regular(
+        entry.parent_fd,
+        entry.name,
+        _entry_identity(entry),
+        entry.path,
+    )
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise EvidenceError(f"staged file changed type: {entry.archive_path}")
-        with os.fdopen(descriptor, "rb", closefd=False) as source:
-            archive.addfile(info, source)
+        before = os.fstat(descriptor)
+        reader = _HashingReader(descriptor)
+        archive.addfile(info, reader)
+        after = os.fstat(descriptor)
+        if (
+            _identity(before) != _entry_identity(entry)
+            or _identity(after) != _entry_identity(entry)
+            or reader.size != entry.size
+            or reader.digest.hexdigest() != entry.sha256
+        ):
+            raise EvidenceError(
+                f"archive bytes differ from inventoried file: {entry.archive_path}"
+            )
     finally:
         os.close(descriptor)
+
+
+def _verify_snapshot(entries: list[StagedEntry]) -> None:
+    for entry in entries:
+        if entry.kind == "dir":
+            metadata = os.fstat(entry.directory_fd)
+            try:
+                names = os.listdir(entry.directory_fd)
+            except OSError as error:
+                raise EvidenceError(
+                    f"cannot rescan staged directory: {entry.path}"
+                ) from error
+            names.sort(
+                key=lambda name: os.fsencode(
+                    (PurePosixPath(entry.archive_path) / name).as_posix()
+                )
+            )
+            if (
+                _identity(metadata) != _entry_identity(entry)
+                or tuple(names) != entry.children
+            ):
+                raise EvidenceError("staging tree changed while packaging")
+            continue
+        try:
+            metadata = os.stat(
+                entry.name,
+                dir_fd=entry.parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise EvidenceError("staging tree changed while packaging") from error
+        if _identity(metadata) != _entry_identity(entry):
+            raise EvidenceError("staging tree changed while packaging")
+        if entry.kind == "symlink":
+            try:
+                target = os.readlink(entry.name, dir_fd=entry.parent_fd)
+            except OSError as error:
+                raise EvidenceError("staging tree changed while packaging") from error
+            if target != entry.target:
+                raise EvidenceError("staging tree changed while packaging")
 
 
 def _write_archive(path: Path, entries: list[StagedEntry]) -> str:
@@ -336,6 +615,7 @@ def _write_archive(path: Path, entries: list[StagedEntry]) -> str:
                     info.type = tarfile.REGTYPE
                     info.size = entry.size
                     _add_regular(archive, info, entry)
+        _verify_snapshot(entries)
         archive_fd = os.open(temporary, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         digest = hashlib.sha256()
         try:
@@ -363,51 +643,105 @@ def package_evidence(staging_root: Path, archive: Path, checksum: Path) -> str:
     staging_root = Path(staging_root)
     archive = Path(archive)
     checksum = Path(checksum)
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    staging_fd = -1
+    bundle_fd = -1
+    before_directories: list[int] = []
+    after_directories: list[int] = []
     try:
-        root_stat = staging_root.stat(follow_symlinks=False)
+        staging_fd = os.open(staging_root, directory_flags)
     except OSError as error:
         raise EvidenceError("staging root is not a real directory") from error
-    if not stat.S_ISDIR(root_stat.st_mode) or staging_root.is_symlink():
-        raise EvidenceError("staging root is not a real directory")
-    top = list(os.scandir(staging_root))
-    if (
-        len(top) != 1
-        or top[0].name != "bundle"
-        or not top[0].is_dir(follow_symlinks=False)
-    ):
-        raise EvidenceError(
-            "staging root must contain exactly one top-level bundle directory"
+    try:
+        root_stat = os.fstat(staging_fd)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise EvidenceError("staging root is not a real directory")
+        try:
+            top_names = os.listdir(staging_fd)
+        except OSError as error:
+            raise EvidenceError("cannot scan staging root") from error
+        if top_names != ["bundle"]:
+            raise EvidenceError(
+                "staging root must contain exactly one top-level bundle directory"
+            )
+        try:
+            bundle_stat = os.stat(
+                "bundle",
+                dir_fd=staging_fd,
+                follow_symlinks=False,
+            )
+            bundle_fd = os.open("bundle", directory_flags, dir_fd=staging_fd)
+        except OSError as error:
+            raise EvidenceError("bundle is not a real directory") from error
+        if not stat.S_ISDIR(bundle_stat.st_mode) or _identity(
+            os.fstat(bundle_fd)
+        ) != _identity(bundle_stat):
+            raise EvidenceError("bundle is not a real directory")
+
+        bundle = staging_root / "bundle"
+        hardlinks = _load_hardlinks(bundle_fd, bundle)
+        before, before_directories = _walk(
+            bundle_fd,
+            bundle,
+            hardlinks,
+            include_inventory=False,
         )
-    bundle = staging_root / "bundle"
-    provenance = bundle / "provenance.json"
-    hardlinks = _load_hardlinks(provenance)
-    before = _walk(bundle, hardlinks, include_inventory=False)
-    by_path = {entry.archive_path: entry for entry in before}
-    for path, target in hardlinks.items():
-        source_entry = by_path.get(path)
-        target_entry = by_path.get(target)
-        if source_entry is None or target_entry is None:
-            raise EvidenceError("provenance hardlink member is missing")
-        if target_entry.kind not in {"file", "hardlink"}:
-            raise EvidenceError("provenance hardlink target is not regular")
-        if (source_entry.device, source_entry.inode) != (
-            target_entry.device,
-            target_entry.inode,
+        by_path = {entry.archive_path: entry for entry in before}
+        for path, target in hardlinks.items():
+            source_entry = by_path.get(path)
+            target_entry = by_path.get(target)
+            if source_entry is None or target_entry is None:
+                raise EvidenceError("provenance hardlink member is missing")
+            if target_entry.kind not in {"file", "hardlink"}:
+                raise EvidenceError("provenance hardlink target is not regular")
+            if (source_entry.device, source_entry.inode) != (
+                target_entry.device,
+                target_entry.inode,
+            ):
+                raise EvidenceError("provenance hardlink inode mismatch")
+        for descriptor in reversed(before_directories):
+            os.close(descriptor)
+        before_directories = []
+
+        _atomic_write_at(
+            bundle_fd,
+            "inventory.json",
+            _json_bytes(_inventory(before)),
+        )
+        after, after_directories = _walk(
+            bundle_fd,
+            bundle,
+            hardlinks,
+            include_inventory=True,
+        )
+        after_without_inventory = [
+            entry for entry in after if entry.archive_path != "bundle/inventory.json"
+        ]
+        if len(before) != len(after_without_inventory) or any(
+            not _same_entry(left, right)
+            for left, right in zip(
+                before,
+                after_without_inventory,
+                strict=True,
+            )
         ):
-            raise EvidenceError("provenance hardlink inode mismatch")
-    _atomic_write(bundle / "inventory.json", _json_bytes(_inventory(before)))
-    after = _walk(bundle, hardlinks, include_inventory=True)
-    after_without_inventory = [
-        entry for entry in after if entry.archive_path != "bundle/inventory.json"
-    ]
-    if len(before) != len(after_without_inventory) or any(
-        not _same_entry(left, right)
-        for left, right in zip(before, after_without_inventory, strict=True)
-    ):
-        raise EvidenceError("staging tree changed while packaging")
-    digest = _write_archive(archive, after)
-    _atomic_write(checksum, f"{digest}  {archive.name}\n".encode())
-    return digest
+            raise EvidenceError("staging tree changed while packaging")
+        digest = _write_archive(archive, after)
+        _atomic_write(checksum, f"{digest}  {archive.name}\n".encode())
+        return digest
+    finally:
+        for descriptor in reversed(after_directories):
+            os.close(descriptor)
+        for descriptor in reversed(before_directories):
+            os.close(descriptor)
+        if bundle_fd >= 0:
+            os.close(bundle_fd)
+        os.close(staging_fd)
 
 
 def _absolute(value: str, label: str) -> Path:

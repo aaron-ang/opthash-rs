@@ -42,6 +42,10 @@ BODY_FIELDS = (
     "frame_adjustment",
     "spills",
 )
+SUBJECT_COMMIT = "061d13da22b89208c801308efd578444c8e9caba"
+SUBJECT_TREE = "24921a941f8c3c26467465b99d6b45ee5912b2da"
+V1_REPLAY_COMMIT = "b0d53234dc051af91fe0321450b3e8312a84e635"
+V1_REPLAY_TREE = "d77cc082fe48799f26ff4440bd1898a71d0dc8cc"
 
 
 class ListSchema(NamedTuple):
@@ -504,6 +508,8 @@ PROVENANCE_SCHEMA = {
         },
         "v1_manifest": DOCUMENT_RECORD_SCHEMA,
         "transcripts": ListSchema(DOCUMENT_RECORD_SCHEMA, nonempty=True),
+        "body_comparison": DOCUMENT_RECORD_SCHEMA,
+        "portable_paths": DOCUMENT_RECORD_SCHEMA,
     },
     "hardlinks": ListSchema({"path": STRING, "target": STRING}),
 }
@@ -569,6 +575,8 @@ DOCUMENT_SCHEMAS: dict[str, object] = {
 # Closed routing table. Patterns contain literal ``*`` for array elements.
 PATH_ROUTES: dict[tuple[str, ...], str] = {
     ("manifest", "runner_root"): "root",
+    ("manifest", "build", "rustc_flags"): "rustc-options",
+    ("manifest", "build", "linker_flags"): "linker-template",
     # Stable classifier examples retained by the versioned routing interface.
     ("manifest", "environment", "PATH"): "path-list",
     ("manifest", "executables", "*", "rustc_argv"): "rustc-command",
@@ -579,6 +587,8 @@ PATH_ROUTES: dict[tuple[str, ...], str] = {
     ("manifest", "tools", "*", "absolute_path"): "hashed-file",
     ("manifest", "tools", "*", "reviewed_root"): "root",
     ("v1-manifest", "executables", "*", "absolute_path"): "hashed-file",
+    ("v1-manifest", "build", "rustc_flags"): "rustc-options-template",
+    ("v1-manifest", "build", "linker_flags"): "linker-template",
     ("v1-manifest", "executables", "*", "link_map", "absolute_path"): "hashed-file",
     ("v1-manifest", "control", "binary", "absolute_path"): "hashed-file",
     ("v1-manifest", "control", "inputs", "*", "absolute_path"): "hashed-file",
@@ -646,9 +656,84 @@ PATH_ROUTES: dict[tuple[str, ...], str] = {
         "build_proof",
         "executables",
         "*",
+        "emitted_object_members",
+        "*",
+    ): "semantic-file",
+    (
+        "manifest",
+        "build_proof",
+        "executables",
+        "*",
+        "ordered_linker_inputs",
+        "*",
+    ): "semantic-file",
+    (
+        "manifest",
+        "build_proof",
+        "executables",
+        "*",
+        "direct_linker_input_files",
+        "*",
+    ): "semantic-file",
+    (
+        "manifest",
+        "build_proof",
+        "executables",
+        "*",
+        "archive_member_owners",
+        "*",
+    ): "semantic-rlib-member",
+    (
+        "manifest",
+        "build_proof",
+        "executables",
+        "*",
+        "cgu_members",
+        "*",
+    ): "semantic-file",
+    (
+        "manifest",
+        "build_proof",
+        "executables",
+        "*",
+        "reserved_input_owners",
+        "*",
+    ): "semantic-file",
+    (
+        "manifest",
+        "build_proof",
+        "executables",
+        "*",
         "link_command",
         "argv",
     ): "linker-command",
+    (
+        "manifest",
+        "build_proof",
+        "executables",
+        "*",
+        "link_command",
+        "ordered_linker_inputs",
+        "*",
+    ): "semantic-file",
+    (
+        "manifest",
+        "build_proof",
+        "executables",
+        "*",
+        "link_command",
+        "direct_input_files",
+        "*",
+    ): "semantic-file",
+    (
+        "manifest",
+        "build_proof",
+        "executables",
+        "*",
+        "link_command",
+        "direct_cgu_members",
+        "*",
+    ): "semantic-file",
     (
         "manifest",
         "build_proof",
@@ -732,6 +817,55 @@ PATH_ROUTES: dict[tuple[str, ...], str] = {
     ("manifest", "linker_capability", "copy", "absolute_path"): "hashed-file",
     ("manifest", "linker_capability", "producer", "runner_root"): "root",
     ("manifest", "linker_capability", "producer", "artifact_root"): "root",
+    ("manifest", "linker_capability", "linker", "invocation_path"): "system-file",
+    (
+        "manifest",
+        "linker_capability",
+        "linker",
+        "invocation_chain",
+        "*",
+        "absolute_path",
+    ): "system-file",
+    ("manifest", "linker_capability", "linker", "payload_path"): "system-hashed-file",
+    ("manifest", "linker_capability", "linker", "argv0"): "system-file",
+    ("manifest", "linker_capability", "linker", "extraction_root"): "nullable-root",
+    (
+        "manifest",
+        "linker_capability",
+        "required_linkers",
+        "*",
+        "invocation_path",
+    ): "system-file",
+    (
+        "manifest",
+        "linker_capability",
+        "required_linkers",
+        "*",
+        "invocation_chain",
+        "*",
+        "absolute_path",
+    ): "system-file",
+    (
+        "manifest",
+        "linker_capability",
+        "required_linkers",
+        "*",
+        "payload_path",
+    ): "system-hashed-file",
+    (
+        "manifest",
+        "linker_capability",
+        "required_linkers",
+        "*",
+        "argv0",
+    ): "system-file",
+    (
+        "manifest",
+        "linker_capability",
+        "required_linkers",
+        "*",
+        "extraction_root",
+    ): "nullable-root",
     ("manifest", "linker_capability", "fragments", "*", "absolute_path"): "hashed-file",
     (
         "manifest",
@@ -758,6 +892,18 @@ PATH_ROUTES: dict[tuple[str, ...], str] = {
         "*",
         "archive_path",
     ): "archive-file",
+    (
+        "provenance",
+        "documents",
+        "body_comparison",
+        "archive_path",
+    ): "archive-file",
+    (
+        "provenance",
+        "documents",
+        "portable_paths",
+        "archive_path",
+    ): "archive-file",
     ("provenance", "hardlinks", "*", "path"): "archive-member",
     ("provenance", "hardlinks", "*", "target"): "archive-member",
     ("inventory", "entries", "*", "path"): "archive-member",
@@ -767,7 +913,11 @@ PATH_ROUTES: dict[tuple[str, ...], str] = {
     ("transcript", "path"): "path-list",
     ("transcript", "payload_path"): "system-hashed-file",
     ("transcript", "trace", "absolute_path"): "hashed-file",
-    ("transcript", "ordered_inputs", "*"): "transient-file",
+    ("transcript", "ordered_inputs", "*"): "semantic-file",
+    ("portable-paths", "roots", "*", "hosted"): "root-definition",
+    ("portable-paths", "roots", "*", "archive"): "archive-root",
+    ("portable-paths", "system_links", "*", "source"): "system-link-source",
+    ("portable-paths", "system_links", "*", "raw_target"): "system-link-target",
 }
 ROUTE_COMPATIBILITY_ALIASES = {
     ("manifest", "environment", "PATH"),
@@ -841,6 +991,68 @@ def classify(path: tuple[str, ...]) -> str:
         result = next(iter(matches), None)
     _require(result is not None, f"unclassified path field: {'.'.join(normalized)}")
     return result
+
+
+def collect_concrete_routes(
+    document_kind: str, document: object
+) -> list[tuple[tuple[str | int, ...], str, object]]:
+    """Expand every declared route against a concrete, schema-checked document."""
+
+    collected: list[tuple[tuple[str | int, ...], str, object]] = []
+
+    def can_follow(value: object, pattern: tuple[str, ...]) -> bool:
+        if not pattern:
+            return True
+        head, *tail = pattern
+        if head == "*":
+            children = value.values() if isinstance(value, dict) else value
+            return isinstance(value, (dict, list)) and any(
+                can_follow(child, tuple(tail)) for child in children
+            )
+        return (
+            isinstance(value, dict)
+            and head in value
+            and can_follow(value[head], tuple(tail))
+        )
+
+    def expand(
+        value: object,
+        pattern: tuple[str, ...],
+        concrete: tuple[str | int, ...],
+    ) -> None:
+        if not pattern:
+            normalized = tuple(
+                "*" if isinstance(part, int) else part for part in concrete
+            )
+            collected.append((concrete, classify(normalized), value))
+            return
+        head, *tail = pattern
+        if head == "*":
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if can_follow(child, tuple(tail)):
+                        expand(child, tuple(tail), (*concrete, key))
+                return
+            _require(isinstance(value, list), "route wildcard reached non-container")
+            for index, child in enumerate(value):
+                if can_follow(child, tuple(tail)):
+                    expand(child, tuple(tail), (*concrete, index))
+            return
+        _require(
+            isinstance(value, dict) and head in value,
+            "declared route is absent: "
+            + ".".join(str(part) for part in (*concrete, head)),
+        )
+        expand(value[head], tuple(tail), (*concrete, head))
+
+    patterns = [
+        path
+        for path in PATH_ROUTES
+        if path[0] == document_kind and path not in ROUTE_COMPATIBILITY_ALIASES
+    ]
+    for pattern in patterns:
+        expand(document, pattern[1:], (document_kind,))
+    return collected
 
 
 def _validate_schema(value: object, schema: object, label: str) -> None:
@@ -1041,6 +1253,88 @@ def validate_path_list(value: str, roots: PortableRoots) -> list[PurePosixPath]:
     return [roots.map_path(item) for item in parts]
 
 
+def validate_concrete_route_values(
+    document_kind: str, document: object, roots: PortableRoots
+) -> None:
+    for concrete, field_kind, value in collect_concrete_routes(document_kind, document):
+        label = ".".join(str(part) for part in concrete)
+        if field_kind in {
+            "root",
+            "hashed-file",
+            "hashed-file-pair",
+            "duplicate-file",
+            "transient-directory",
+            "archive-file",
+            "archive-member",
+        }:
+            _require(isinstance(value, str), f"{label} route type mismatch")
+            if field_kind.startswith("archive-"):
+                _canonical_member(value)
+            else:
+                roots.map_path(value)
+        elif field_kind in {"system-file", "system-hashed-file"}:
+            _require(isinstance(value, str), f"{label} route type mismatch")
+            roots.map_path(value, expected_root="system-root")
+        elif field_kind == "nullable-root":
+            _require(
+                value is None or isinstance(value, str), f"{label} route type mismatch"
+            )
+            if value is not None:
+                roots.map_path(value)
+        elif field_kind == "path-list":
+            validate_path_list(value, roots)
+        elif field_kind == "rustc-command":
+            _require(isinstance(value, str), f"{label} route type mismatch")
+            validate_rustc_transcript(value, roots)
+        elif field_kind == "linker-command":
+            _require(isinstance(value, list), f"{label} route type mismatch")
+            validate_command(value, roots, rustc=False, has_program=False)
+        elif field_kind in {"rustc-options", "rustc-options-template"}:
+            _require(isinstance(value, list), f"{label} route type mismatch")
+            validate_command(["rustc", *value], roots, rustc=True)
+        elif field_kind == "linker-template":
+            _require(
+                isinstance(value, list)
+                and all(
+                    isinstance(token, str) and token and "\x00" not in token
+                    for token in value
+                ),
+                f"{label} route type mismatch",
+            )
+        elif field_kind == "semantic-file":
+            _require(
+                isinstance(value, str)
+                and value not in {"", ".", ".."}
+                and "/" not in value
+                and "\x00" not in value,
+                f"{label} semantic file mismatch",
+            )
+        elif field_kind == "semantic-rlib-member":
+            _require(isinstance(value, str), f"{label} route type mismatch")
+            archive, _member = parse_rlib_owner(value)
+            _require(
+                "/" not in archive and PurePosixPath(archive).name == archive,
+                f"{label} semantic rlib mismatch",
+            )
+        elif field_kind in {"rlib-member", "transient-file"}:
+            _require(isinstance(value, str), f"{label} route type mismatch")
+            raw = parse_rlib_owner(value)[0] if ".rlib(" in value else value
+            roots.map_path(raw)
+        elif field_kind == "root-definition":
+            _canonical_absolute(value, label)
+        elif field_kind == "archive-root":
+            _canonical_member(value)
+        elif field_kind == "system-link-source":
+            _canonical_absolute(value, label)
+        elif field_kind == "system-link-target":
+            _require(
+                isinstance(value, str) and bool(value) and "\x00" not in value,
+                f"{label} route type mismatch",
+            )
+        else:
+            raise AssertionError(f"unsupported concrete route kind: {field_kind}")
+
+
 def _looks_path_valued(value: str) -> bool:
     return (
         "/" in value
@@ -1169,6 +1463,13 @@ def validate_command(
             _validate_link_arg(token.removeprefix("-Clink-arg="), roots)
         elif token.startswith("-Wl,"):
             _validate_wl_token(token, roots)
+        elif token.startswith("-B") and token != "-B":
+            roots.map_path(token[2:])
+        elif token == "-B":
+            _require(index + 1 < len(command), "-B lacks value")
+            roots.map_path(command[index + 1])
+            index += 2
+            continue
         elif token == "-Xlinker":
             _require(index + 1 < len(command), "-Xlinker lacks value")
             _validate_link_arg(command[index + 1], roots)
@@ -1217,6 +1518,29 @@ def validate_rustc_transcript(line: str, roots: PortableRoots) -> None:
             for element in value.split(":"):
                 if element:
                     roots.map_path(element)
+        elif name in {"CARGO_TARGET_TMPDIR", "OUT_DIR", "RUSTC", "RUSTDOC"}:
+            roots.map_path(value)
+        elif name == "CARGO_ENCODED_RUSTFLAGS":
+            encoded = value.replace("\x1f", " ")
+            residual = encoded
+            for marker in ("-Clinker=", "-Clink-arg="):
+                search_from = 0
+                while marker in encoded[search_from:]:
+                    start = encoded.index(marker, search_from) + len(marker)
+                    end = encoded.find(" ", start)
+                    option = encoded[start:] if end == -1 else encoded[start:end]
+                    if marker == "-Clinker=":
+                        roots.map_path(option)
+                    else:
+                        _validate_link_arg(option, roots)
+                    residual = residual.replace(f"{marker}{option}", "")
+                    search_from = len(encoded) if end == -1 else end + 1
+            _require(
+                not _looks_path_valued(residual),
+                "unclassified path-valued environment",
+            )
+        elif _looks_path_valued(value):
+            raise EvidenceError(f"unclassified path-valued environment: {name}")
         index += 1
     _require(index < len(tokens), "rustc transcript lacks command")
     validate_command(tokens[index:], roots, rustc=True)
@@ -1252,7 +1576,6 @@ def validate_manifest_rlib_owners(owners: list[str], resolve_archive: Any) -> No
         isinstance(owners, list) and all(isinstance(item, str) for item in owners),
         "rlib owner list schema mismatch",
     )
-    checked: set[tuple[Path, str]] = set()
     for owner in owners:
         archive_raw, member = parse_rlib_owner(owner)
         archive = resolve_archive(archive_raw)
@@ -1260,9 +1583,39 @@ def validate_manifest_rlib_owners(owners: list[str], resolve_archive: Any) -> No
             isinstance(archive, Path),
             f"rlib archive is not mapped: {archive_raw}",
         )
-        if (archive, member) not in checked:
-            validate_rlib_member(archive, member)
-            checked.add((archive, member))
+        validate_rlib_member(archive, member)
+
+
+def validate_manifest_rlib_occurrences(
+    layout: dict[str, Any], proof: dict[str, Any], resolve_archive: Any
+) -> None:
+    layout_owners = layout["archive_member_owners"]
+    proof_owners = proof["archive_member_owners"]
+    _require(
+        [
+            f"{PurePosixPath(parse_rlib_owner(owner)[0]).name}"
+            f"({parse_rlib_owner(owner)[1]})"
+            for owner in layout_owners
+        ]
+        == proof_owners,
+        "layout/proof rlib owner lists differ",
+    )
+    occurrences = [
+        *layout_owners,
+        *proof_owners,
+        *(item["owner"] for item in layout["cache_gate_input_sections"]),
+        *(item["input_owner"] for item in layout["kernels"].values()),
+    ]
+    for owner in occurrences:
+        if not isinstance(owner, str) or ".rlib(" not in owner:
+            continue
+        archive_raw, member = parse_rlib_owner(owner)
+        archive = resolve_archive(archive_raw)
+        _require(
+            isinstance(archive, Path),
+            f"rlib archive is not mapped: {archive_raw}",
+        )
+        validate_rlib_member(archive, member)
 
 
 def verify_body_rows(rows: list[dict[str, Any]]) -> str:
@@ -1293,6 +1646,316 @@ def verify_body_rows(rows: list[dict[str, Any]]) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _shape_json(data: bytes, label: str) -> dict[str, Any]:
+    try:
+        value = _strict_json(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EvidenceError(f"invalid JSON in {label}") from error
+    _require(isinstance(value, dict), f"{label} schema mismatch")
+    return value
+
+
+def _output_values(argv: list[str]) -> list[str]:
+    outputs: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "-o":
+            _require(index + 1 < len(argv), "shape output flag lacks value")
+            outputs.append(argv[index + 1])
+            index += 2
+            continue
+        if token.startswith("-o") and token != "-o":
+            outputs.append(token[2:])
+        index += 1
+    return outputs
+
+
+def _verify_shape_trace(
+    execution: dict[str, Any], trace_bytes: bytes, expected_linker: dict[str, Any]
+) -> None:
+    trace = execution["trace"]
+    _validate_schema(trace, TRACE_RECORD_SCHEMA, "shape execution trace")
+    _require(
+        hashlib.sha256(trace_bytes).hexdigest() == trace["sha256"],
+        "shape trace hash mismatch",
+    )
+    records: list[dict[str, Any]] = []
+    for line in trace_bytes.splitlines():
+        if not line.strip():
+            continue
+        records.append(_shape_json(line, "shape trace record"))
+    expected_trace_keys = {
+        "argv",
+        "argv0",
+        "cwd",
+        "path",
+        "payload_path",
+        "payload_sha256",
+        "role",
+        "session",
+    }
+    _require(
+        len(records) == trace["record_count"] and trace["final_link_record_count"] == 1,
+        "shape trace counts mismatch",
+    )
+    matches = [record for record in records if record.get("argv") == execution["argv"]]
+    _require(len(matches) == 1, "shape trace lacks exact final execution")
+    record = matches[0]
+    _require(set(record) == expected_trace_keys, "shape trace record schema mismatch")
+    _require(
+        record
+        == {
+            "argv": execution["argv"],
+            "argv0": expected_linker["argv0"],
+            "cwd": execution["cwd"],
+            "path": execution["path"],
+            "payload_path": expected_linker["payload_path"],
+            "payload_sha256": expected_linker["payload_sha256"],
+            "role": execution["role"],
+            "session": execution["session"],
+        },
+        "shape execution differs from trace",
+    )
+    _require(
+        _output_values(execution["argv"]) == [execution["raw_output"]],
+        "shape execution raw output mismatch",
+    )
+
+
+def verify_capability_shape_records(
+    capability: dict[str, Any],
+    read_record: Any,
+    roots: PortableRoots | None = None,
+) -> set[tuple[str, str, int]]:
+    _validate_schema(capability, CAPABILITY_SCHEMA, "capability")
+    observed_shapes: set[tuple[str, str, int]] = set()
+    execution_keys = {
+        "argv",
+        "cwd",
+        "executable",
+        "linker",
+        "path",
+        "raw_output",
+        "role",
+        "session",
+        "trace",
+    }
+    for flavor, shapes in capability["shapes"].items():
+        for target, shape in shapes.items():
+            linker = (
+                capability["linker"]
+                if flavor == "actual"
+                else capability["required_linkers"][flavor]
+            )
+            records = {
+                "link-args.txt": shape["link_argv"],
+                "linker-execution.json": shape["linker_execution"],
+                "symbols.json": shape["symbols"],
+                "layout.json": shape["layout"],
+            }
+            raw: dict[str, bytes] = {}
+            for name, record in records.items():
+                data = read_record(flavor, target, name)
+                _require(isinstance(data, bytes), "shape reader did not return bytes")
+                if name != "linker-execution.json":
+                    _require(
+                        hashlib.sha256(data).hexdigest() == record["sha256"],
+                        f"{flavor}/{target} {name} hash mismatch",
+                    )
+                raw[name] = data
+            symbols = _shape_json(raw["symbols.json"], "shape symbols")
+            layout = _shape_json(raw["layout.json"], "shape layout")
+            executable, kernel_names = next(
+                (name, kernels)
+                for name, (shape_target, kernels) in EXECUTABLE_TARGETS.items()
+                if shape_target == target
+            )
+            del executable
+            _validate_schema(
+                symbols,
+                _symbol_document_schema(SYMBOL_V2_SCHEMA, veneers=True),
+                f"{flavor}/{target} symbols",
+            )
+            _validate_schema(
+                layout,
+                _layout_schema(kernel_names),
+                f"{flavor}/{target} layout",
+            )
+            symbol_names = [
+                symbol["name"].rsplit("::", 1)[-1] for symbol in symbols["symbols"]
+            ]
+            _require(
+                len(symbol_names) == len(kernel_names)
+                and set(symbol_names) == set(kernel_names)
+                and set(layout["kernels"]) == set(kernel_names)
+                and all(
+                    layout["kernels"][kernel]["name"] == kernel
+                    for kernel in kernel_names
+                ),
+                f"{flavor}/{target} exact kernel shape mismatch",
+            )
+            _require(
+                symbols["binary"]
+                == layout["binary"]
+                == shape["binary"]["absolute_path"]
+                and symbols["binary_sha256"]
+                == layout["binary_sha256"]
+                == shape["binary"]["sha256"]
+                and layout["link_map"] == shape["link_map"]["absolute_path"]
+                and layout["link_map_sha256"] == shape["link_map"]["sha256"]
+                and layout["fragment_sha256"]
+                == capability["fragments"][target]["sha256"]
+                and layout["fragment_set_sha256"] == capability["fragment_set_sha256"],
+                f"{flavor}/{target} shape artifact association mismatch",
+            )
+            execution = _shape_json(
+                raw["linker-execution.json"], "shape linker execution"
+            )
+            _require(
+                set(execution) == execution_keys, "shape execution schema mismatch"
+            )
+            _require(
+                execution["linker"] == linker,
+                "shape linker identity mismatch",
+            )
+            _require(
+                hashlib.sha256(raw["linker-execution.json"]).hexdigest()
+                == shape["linker_execution"]["sha256"],
+                f"{flavor}/{target} linker-execution.json hash mismatch",
+            )
+            _require(
+                execution["executable"] == shape["binary"]["absolute_path"],
+                "shape executable identity mismatch",
+            )
+            expected_role = "actual-driver" if flavor == "actual" else "explicit-linker"
+            _require(
+                execution["role"] == expected_role
+                and isinstance(execution["session"], str)
+                and bool(execution["session"]),
+                "shape execution correlation mismatch",
+            )
+            trace_bytes = read_record(flavor, target, "linker-trace.jsonl")
+            _verify_shape_trace(execution, trace_bytes, linker)
+            if roots is not None:
+                roots.map_path(execution["cwd"])
+                validate_path_list(execution["path"], roots)
+                validate_command(
+                    execution["argv"], roots, rustc=False, has_program=False
+                )
+                roots.map_path(execution["raw_output"])
+
+            try:
+                printed = shlex.split(raw["link-args.txt"].decode(), posix=True)
+            except (UnicodeDecodeError, ValueError) as error:
+                raise EvidenceError("shape link argv grammar mismatch") from error
+            _require(
+                len(printed) >= 5
+                and printed[0] == "LC_ALL=C"
+                and printed[1] == f"PATH={execution['path']}"
+                and printed[2] == "VSLANG=1033"
+                and printed[3]
+                == f"{capability['producer']['runner_root']}/scripts/"
+                "cache-gate-link-wrapper.py",
+                "shape link argv environment/wrapper mismatch",
+            )
+            driver_argv = execution["argv"]
+            if flavor != "actual":
+                cargo_record = shape["cargo_execution"]
+                cargo_bytes = read_record(flavor, target, "cargo-execution.json")
+                _require(
+                    hashlib.sha256(cargo_bytes).hexdigest() == cargo_record["sha256"],
+                    f"{flavor}/{target} cargo execution hash mismatch",
+                )
+                cargo = _shape_json(cargo_bytes, "shape Cargo execution")
+                _require(
+                    set(cargo) == execution_keys
+                    and cargo["linker"] == capability["linker"]
+                    and cargo["role"] == "cargo-driver"
+                    and cargo["session"] == execution["session"]
+                    and cargo["executable"] == execution["executable"]
+                    and cargo["raw_output"] == execution["raw_output"],
+                    "shape Cargo/linker execution association mismatch",
+                )
+                _verify_shape_trace(
+                    cargo,
+                    read_record(flavor, target, "cargo-trace.jsonl"),
+                    capability["linker"],
+                )
+                if roots is not None:
+                    roots.map_path(cargo["cwd"])
+                    validate_path_list(cargo["path"], roots)
+                    validate_command(
+                        cargo["argv"], roots, rustc=False, has_program=False
+                    )
+                    roots.map_path(cargo["raw_output"])
+                driver_argv = cargo["argv"]
+            _require(
+                printed[4:] == driver_argv,
+                "shape link argv differs from execution",
+            )
+            if roots is not None:
+                roots.map_path(printed[3])
+            fragment = capability["fragments"][target]["absolute_path"]
+            link_map = shape["link_map"]["absolute_path"]
+            printed_scripts = [
+                token for token in driver_argv if token.startswith("-Wl,-T,")
+            ]
+            printed_maps = [
+                token for token in driver_argv if token.startswith("-Wl,-Map,")
+            ]
+            _require(
+                printed_scripts == [f"-Wl,-T,{fragment}"]
+                and printed_maps == [f"-Wl,-Map,{link_map}"]
+                and not any(token.startswith("@") for token in driver_argv),
+                "shape linker controls are not exact",
+            )
+            selection = [
+                token
+                for token in driver_argv
+                if token.startswith("-B/") or token.startswith("-fuse-ld=")
+            ]
+            if flavor == "actual":
+                _require(selection == [], "actual shape linker selection is not exact")
+            else:
+                fuse = "bfd" if flavor == "gnu" else "lld"
+                wrapper_dir = (
+                    f"{capability['producer']['artifact_root']}/{flavor}/linker-wrapper"
+                )
+                _require(
+                    selection == [f"-B{wrapper_dir}", f"-fuse-ld={fuse}"],
+                    "explicit shape linker selection is not exact",
+                )
+                raw_scripts = [
+                    (
+                        token,
+                        execution["argv"][index + 1]
+                        if token == "-T" and index + 1 < len(execution["argv"])
+                        else token[2:],
+                    )
+                    for index, token in enumerate(execution["argv"])
+                    if token == "-T" or token.startswith("-T")
+                ]
+                raw_maps = [
+                    (
+                        token,
+                        execution["argv"][index + 1]
+                        if token == "-Map" and index + 1 < len(execution["argv"])
+                        else token[4:],
+                    )
+                    for index, token in enumerate(execution["argv"])
+                    if token == "-Map" or token.startswith("-Map")
+                ]
+                _require(
+                    raw_scripts == [("-T", fragment)]
+                    and raw_maps == [("-Map", link_map)]
+                    and not any(token.startswith("@") for token in execution["argv"]),
+                    "explicit shape raw linker controls are not exact",
+                )
+            observed_shapes.add((flavor, target, len(kernel_names)))
+    return observed_shapes
+
+
 def capability_shapes(capability: dict[str, Any]) -> set[tuple[str, str, int]]:
     _validate_schema(capability, CAPABILITY_SCHEMA, "capability")
     counts = {
@@ -1304,6 +1967,61 @@ def capability_shapes(capability: dict[str, Any]) -> set[tuple[str, str, int]]:
         for flavor, targets in capability["shapes"].items()
         for target in targets
     }
+
+
+def verify_identity_contract(
+    provenance: dict[str, Any],
+    capability: dict[str, Any],
+    manifests: list[dict[str, Any]],
+    v1: dict[str, Any],
+    capability_bytes: bytes,
+) -> None:
+    _require(
+        provenance["subject"] == {"commit": SUBJECT_COMMIT, "tree": SUBJECT_TREE},
+        "exact subject identity mismatch",
+    )
+    producer = capability["producer"]
+    _require(
+        producer["commit"] == SUBJECT_COMMIT
+        and producer["tree"] == SUBJECT_TREE
+        and producer["empty_diff_assertion"] is True,
+        "exact subject identity mismatch in capability producer",
+    )
+    capability_sha = hashlib.sha256(capability_bytes).hexdigest()
+    for manifest in manifests:
+        control = manifest["control"]
+        _require(
+            manifest["commit"] == SUBJECT_COMMIT
+            and manifest["tree"] == SUBJECT_TREE
+            and manifest["empty_diff_assertion"] is True
+            and control["runner_commit"] == SUBJECT_COMMIT
+            and control["builder_commit"] == SUBJECT_COMMIT
+            and control["runner_tree"] == SUBJECT_TREE
+            and control["builder_tree"] == SUBJECT_TREE
+            and control["mode"] == "BUILD_CONTROL",
+            "exact subject identity mismatch in v2 manifest/control",
+        )
+        embedded = {
+            key: value
+            for key, value in manifest["linker_capability"].items()
+            if key != "copy"
+        }
+        _require(
+            embedded == capability,
+            "embedded capability differs from exact capability document",
+        )
+        _require(
+            manifest["linker_capability"]["copy"]["sha256"] == capability_sha,
+            "capability copy differs from held capability bytes",
+        )
+    _require(
+        v1["commit"] == V1_REPLAY_COMMIT
+        and v1["tree"] == V1_REPLAY_TREE
+        and v1["empty_diff_assertion"] is True
+        and v1["control"]["builder_commit"] == V1_REPLAY_COMMIT
+        and v1["control"]["builder_tree"] == V1_REPLAY_TREE,
+        "exact v1 replay identity mismatch",
+    )
 
 
 def _symbol_bodies(manifest: dict[str, Any]) -> dict[str, tuple[object, ...]]:
@@ -1337,6 +2055,120 @@ def require_ordered_equal(left: list[str], right: list[str], label: str) -> None
     _require(left == right, f"{label} mismatch")
 
 
+def _fingerprint(values: list[str]) -> str:
+    _require(
+        isinstance(values, list) and all(isinstance(value, str) for value in values),
+        "fingerprint input schema mismatch",
+    )
+    return hashlib.sha256(("\n".join(values) + "\n").encode()).hexdigest()
+
+
+def _validate_manifest_build_proof(manifest: dict[str, Any], label: str) -> None:
+    proof = manifest["build_proof"]
+    expected_rustc_flags = [
+        "-C",
+        "codegen-units=16",
+        "-C",
+        f"linker={manifest['tools']['link_wrapper']['absolute_path']}",
+    ]
+    if manifest["layout_adversary"]["enabled"]:
+        expected_rustc_flags.extend(
+            [
+                "--cfg",
+                "cache_gate_layout_adversary",
+                "--check-cfg=cfg(cache_gate_layout_adversary)",
+            ]
+        )
+    _require(
+        manifest["build"]
+        == {
+            "cargo_incremental": "0",
+            "profile": "release",
+            "locked": True,
+            "codegen_units": 16,
+            "rustc_flags": expected_rustc_flags,
+            "linker_flags": [
+                "-Wl,-T,<target-fragment>",
+                "-Wl,-Map,<per-target-map>",
+            ],
+        }
+        and proof["codegen_units"] == 16,
+        f"{label} build proof/configuration mismatch",
+    )
+    aggregate: dict[str, list[str]] = {
+        "cgu_partition_fingerprint": [],
+        "object_member_fingerprint": [],
+        "link_order_fingerprint": [],
+        "reserved_input_owner_fingerprint": [],
+    }
+    for executable, (_target, kernel_names) in EXECUTABLE_TARGETS.items():
+        item = proof["executables"][executable]
+        command = item["link_command"]
+        _require(
+            bool(item["rustc_argv"])
+            and all(
+                "codegen-units=16" in line or "codegen-units 16" in line
+                for line in item["rustc_argv"]
+            ),
+            f"{label} {executable} rustc argv lacks codegen-units=16",
+        )
+        _require(
+            item["ordered_linker_inputs"] == command["ordered_linker_inputs"],
+            f"{label} {executable} ordered linker inputs mismatch",
+        )
+        _require(
+            item["direct_linker_input_files"] == command["direct_input_files"],
+            f"{label} {executable} direct linker inputs mismatch",
+        )
+        fingerprint_inputs = (
+            ("object_member_fingerprint", item["emitted_object_members"]),
+            ("link_order_fingerprint", item["ordered_linker_inputs"]),
+            ("cgu_partition_fingerprint", item["cgu_members"]),
+            ("reserved_input_owner_fingerprint", item["reserved_input_owners"]),
+        )
+        for field, values in fingerprint_inputs:
+            _require(
+                item[field] == _fingerprint(values),
+                f"{label} {executable} {field} mismatch",
+            )
+            aggregate[field].extend(f"{executable}:{value}" for value in values)
+        _require(
+            command["ordered_linker_input_fingerprint"]
+            == _fingerprint(command["ordered_linker_inputs"]),
+            f"{label} {executable} command link-order fingerprint mismatch",
+        )
+        layout = manifest["elf_layout"][executable]
+        expected_reserved = [
+            PurePosixPath(kernel["input_owner"]).name
+            for kernel in layout["kernels"].values()
+        ]
+        _require(
+            item["reserved_input_owners"] == expected_reserved,
+            f"{label} {executable} reserved input owners mismatch",
+        )
+        _require(
+            set(layout["kernels"]) == set(kernel_names)
+            and all(
+                layout["kernels"][kernel]["name"] == kernel for kernel in kernel_names
+            ),
+            f"{label} {executable} exact kernel layout mismatch",
+        )
+        symbol_names = [
+            symbol["name"].rsplit("::", 1)[-1]
+            for symbol in manifest["symbols"][executable]["symbols"]
+        ]
+        _require(
+            len(symbol_names) == len(kernel_names)
+            and set(symbol_names) == set(kernel_names),
+            f"{label} {executable} exact kernel symbol set mismatch",
+        )
+    for field, values in aggregate.items():
+        _require(
+            proof[field] == _fingerprint(values),
+            f"clean build proof mismatch: {label} aggregate {field}",
+        )
+
+
 def verify_manifest_relationships(
     clean_a: dict[str, Any], clean_b: dict[str, Any], adversary: dict[str, Any]
 ) -> None:
@@ -1346,6 +2178,7 @@ def verify_manifest_relationships(
         ("adversary", adversary),
     ):
         _validate_schema(manifest, MANIFEST_V2_SCHEMA, label)
+        _validate_manifest_build_proof(manifest, label)
     _require(
         clean_a["variant"].endswith("-clean-a")
         and clean_b["variant"].endswith("-clean-b")
@@ -1425,6 +2258,28 @@ def verify_manifest_relationships(
         _symbol_bodies(adversary) == _symbol_bodies(clean_a),
         "adversary semantic mismatch",
     )
+    placement_fields = (
+        "input_section",
+        "output_section",
+        "reservation_start",
+        "reservation_end",
+        "reservation_size",
+        "page_offset",
+        "max_page_remainder",
+        "sh_addralign",
+    )
+    for executable, (_target, kernels) in EXECUTABLE_TARGETS.items():
+        for kernel in kernels:
+            anchor = clean_a["elf_layout"][executable]["kernels"][kernel]
+            for candidate, label in (
+                (clean_b, "clean"),
+                (adversary, "adversary"),
+            ):
+                observed = candidate["elf_layout"][executable]["kernels"][kernel]
+                _require(
+                    all(observed[field] == anchor[field] for field in placement_fields),
+                    f"{label} kernel placement mismatch: {kernel}",
+                )
     for executable in EXECUTABLE_TARGETS:
         record = adversary["build_proof"]["executables"][executable]["adversary"]
         _require(
@@ -1432,6 +2287,12 @@ def verify_manifest_relationships(
             and record["input_section_occurrences"] == 1
             and record["outside_reservations"] is True,
             f"adversary symbol/section proof is not exact: {executable}",
+        )
+        _require(
+            record["symbol_occurrences"][0]["name"].endswith(
+                adversary["layout_adversary"]["symbol"]
+            ),
+            f"adversary symbol identity mismatch: {executable}",
         )
 
 
@@ -2258,6 +3119,30 @@ def _verify_path_hash_pair(
     )
 
 
+def _verify_control_provenance(
+    root: Path, roots: PortableRoots, control: dict[str, Any], label: str
+) -> None:
+    _verify_path_hash_pair(
+        root,
+        roots,
+        control["provenance_path"],
+        control["provenance_sha256"],
+        label,
+    )
+    mapped = roots.map_path(control["provenance_path"])
+    data = _read_extracted(root, mapped.as_posix())
+    document = _shape_json(data, label)
+    _require(
+        document
+        == {
+            key: value
+            for key, value in control.items()
+            if key not in {"provenance_path", "provenance_sha256"}
+        },
+        f"{label} content mismatch",
+    )
+
+
 def _mapped_extracted_file(root: Path, roots: PortableRoots, raw: str) -> Path:
     mapped = roots.map_path(raw)
     metadata = _require_archived_path(root, mapped, "mapped file")
@@ -2283,6 +3168,27 @@ def _manifest_rlib_paths(
     return candidates
 
 
+def _resolve_hosted_symlink(source: str, raw_target: str) -> PurePosixPath:
+    _require(
+        isinstance(raw_target, str) and bool(raw_target) and "\x00" not in raw_target,
+        "invalid capability symlink target",
+    )
+    parts = (
+        [""]
+        if raw_target.startswith("/")
+        else ["", *PurePosixPath(source).parent.parts[1:]]
+    )
+    for component in raw_target.split("/"):
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            _require(len(parts) > 1, "capability symlink escapes hosted root")
+            parts.pop()
+        else:
+            parts.append(component)
+    return _canonical_absolute("/".join(parts), "capability symlink target")
+
+
 def _verify_capability(
     root: Path, roots: PortableRoots, capability: dict[str, Any]
 ) -> None:
@@ -2299,10 +3205,36 @@ def _verify_capability(
         },
         "capability does not have exact actual/GNU/LLD 2/2/4 shapes",
     )
+    _require(
+        roots.by_name["system-root"][0] == PurePosixPath("/"),
+        "system-root hosted identity must be exact /",
+    )
     subject_root = roots.by_name["subject"][0].as_posix()
     _require(
         capability["producer"]["runner_root"] == subject_root,
         "capability producer root alias mismatch",
+    )
+    artifact_root = _canonical_absolute(
+        capability["producer"]["artifact_root"], "capability artifact root"
+    )
+    expected_artifact_parent = (
+        _canonical_absolute(subject_root, "subject root")
+        / "target"
+        / "cache-gate-linker"
+        / capability["arch"]
+    )
+    _require(
+        artifact_root.parent == expected_artifact_parent
+        and artifact_root.name.startswith(".probe."),
+        "capability artifact root identity mismatch",
+    )
+    fragment_lines = [
+        f"{target}:{capability['fragments'][target]['sha256']}"
+        for target in sorted(capability["fragments"])
+    ]
+    _require(
+        capability["fragment_set_sha256"] == _fingerprint(fragment_lines),
+        "capability fragment-set hash mismatch",
     )
     for target, fragment in capability["fragments"].items():
         _verify_mapped_file(root, roots, fragment, f"capability fragment {target}")
@@ -2332,9 +3264,47 @@ def _verify_capability(
             metadata = _require_archived_path(
                 root, mapped, f"capability {flavor} chain member {chain_index}"
             )
+            hosted_path = _extracted_path(root, mapped.as_posix())
+            if item["symlink_target"] is None:
+                _require(
+                    chain_index == len(chain) - 1
+                    and raw == record["payload_path"]
+                    and stat.S_ISREG(metadata.st_mode),
+                    "capability chain terminal identity mismatch",
+                )
+            else:
+                _require(
+                    chain_index < len(chain) - 1 and stat.S_ISLNK(metadata.st_mode),
+                    "capability chain symlink type mismatch",
+                )
+                _require(
+                    os.readlink(hosted_path) == item["symlink_target"],
+                    "capability chain raw symlink target mismatch",
+                )
+                _require(
+                    _resolve_hosted_symlink(raw, item["symlink_target"])
+                    == PurePosixPath(chain[chain_index + 1]["absolute_path"]),
+                    "capability chain adjacency mismatch",
+                )
+        extraction_root = record["extraction_root"]
+        if extraction_root is None:
             _require(
-                stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode),
-                "capability chain member has invalid type",
+                record["argv0"] == record["payload_path"],
+                "capability linker argv0 mismatch",
+            )
+        else:
+            extracted = _canonical_absolute(extraction_root, "linker extraction root")
+            invocation = _canonical_absolute(
+                record["invocation_path"], "linker invocation path"
+            )
+            payload_path = _canonical_absolute(
+                record["payload_path"], "linker payload path"
+            )
+            _require(
+                invocation.is_relative_to(extracted)
+                and payload_path.is_relative_to(extracted)
+                and record["argv0"] == invocation.name,
+                "capability linker extraction-root/argv0 mismatch",
             )
         terminal = roots.map_path(record["payload_path"], expected_root="system-root")
         payload_metadata = _require_archived_path(
@@ -2351,11 +3321,45 @@ def _verify_capability(
             f"capability {flavor} payload hash mismatch",
         )
 
+    def read_shape_record(flavor: str, target: str, name: str) -> bytes:
+        shape = capability["shapes"][flavor][target]
+        direct = {
+            "link-args.txt": shape["link_argv"]["absolute_path"],
+            "linker-execution.json": shape["linker_execution"]["absolute_path"],
+            "symbols.json": shape["symbols"]["absolute_path"],
+            "layout.json": shape["layout"]["absolute_path"],
+        }
+        if name == "cargo-execution.json":
+            raw_path = shape["cargo_execution"]["absolute_path"]
+        elif name in {"linker-trace.jsonl", "cargo-trace.jsonl"}:
+            execution_key = (
+                "linker_execution"
+                if name == "linker-trace.jsonl"
+                else "cargo_execution"
+            )
+            execution_data = _read_extracted(
+                root,
+                roots.map_path(shape[execution_key]["absolute_path"]).as_posix(),
+            )
+            execution = _shape_json(execution_data, "shape execution")
+            raw_path = execution["trace"]["absolute_path"]
+        else:
+            _require(name in direct, "unknown shape record")
+            raw_path = direct[name]
+        return _read_extracted(root, roots.map_path(raw_path).as_posix())
+
+    _require(
+        verify_capability_shape_records(capability, read_shape_record, roots)
+        == capability_shapes(capability),
+        "capability shape record set mismatch",
+    )
+
 
 def _verify_manifests(
     root: Path,
     roots: PortableRoots,
     capability: dict[str, Any],
+    capability_bytes: bytes,
     manifests: list[dict[str, Any]],
     v1: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -2390,12 +3394,18 @@ def _verify_manifests(
         _verify_hash_file_records(
             root, roots, manifest, f"manifest {manifest['variant']}"
         )
-        _verify_path_hash_pair(
-            root,
-            roots,
-            manifest["control"]["provenance_path"],
-            manifest["control"]["provenance_sha256"],
-            "control provenance",
+        _require(
+            _read_extracted(
+                root,
+                roots.map_path(
+                    manifest["linker_capability"]["copy"]["absolute_path"]
+                ).as_posix(),
+            )
+            == capability_bytes,
+            "capability copy bytes differ from original document",
+        )
+        _verify_control_provenance(
+            root, roots, manifest["control"], "control provenance"
         )
         for name, tool in manifest["tools"].items():
             _require(
@@ -2426,6 +3436,32 @@ def _verify_manifests(
                 == executable_record["link_map"]["absolute_path"],
                 f"{executable} link-map aliases differ",
             )
+            _require(
+                executable_record["link_trace"]
+                == {
+                    "absolute_path": proof["link_command"]["trace"]["absolute_path"],
+                    "sha256": proof["link_command"]["trace"]["sha256"],
+                },
+                f"{executable} link-trace aliases differ",
+            )
+            for artifact_label, record, embedded in (
+                ("symbols", executable_record["symbols"], symbols),
+                ("layout", executable_record["layout"], layout),
+                (
+                    "link command",
+                    executable_record["link_command"],
+                    proof["link_command"],
+                ),
+            ):
+                mapped = roots.map_path(record["absolute_path"])
+                document = _shape_json(
+                    _read_extracted(root, mapped.as_posix()),
+                    f"{executable} {artifact_label} artifact",
+                )
+                _require(
+                    document == embedded,
+                    f"{executable} {artifact_label} artifact differs from manifest",
+                )
             for line in proof["rustc_argv"]:
                 validate_rustc_transcript(line, roots)
             validate_command(
@@ -2441,26 +3477,34 @@ def _verify_manifests(
                     return _mapped_extracted_file(root, roots, raw)
                 return rlib_paths.get(PurePosixPath(raw).name)
 
-            validate_manifest_rlib_owners(
-                layout["archive_member_owners"], resolve_archive
-            )
-            validate_manifest_rlib_owners(
-                proof["archive_member_owners"], resolve_archive
-            )
+            validate_manifest_rlib_occurrences(layout, proof, resolve_archive)
             for item in layout["cache_gate_input_sections"]:
-                archive_owner = item["owner"].rsplit("(", 1)[0]
+                archive_owner = (
+                    parse_rlib_owner(item["owner"])[0]
+                    if ".rlib(" in item["owner"]
+                    else item["owner"]
+                )
                 roots.map_path(archive_owner)
             for kernel in layout["kernels"].values():
-                archive_owner = kernel["input_owner"].rsplit("(", 1)[0]
+                archive_owner = (
+                    parse_rlib_owner(kernel["input_owner"])[0]
+                    if ".rlib(" in kernel["input_owner"]
+                    else kernel["input_owner"]
+                )
                 roots.map_path(archive_owner)
     _verify_hash_file_records(root, roots, v1, "v1 manifest")
-    _verify_path_hash_pair(
-        root,
-        roots,
-        v1["control"]["provenance_path"],
-        v1["control"]["provenance_sha256"],
-        "v1 control provenance",
+    _require(
+        v1["build"]
+        == {
+            "cargo_incremental": "0",
+            "profile": "release",
+            "locked": True,
+            "rustc_flags": ["-C", "link-arg=-Wl,-Map,<per-target-map>"],
+            "linker_flags": ["-Wl,-Map,<per-target-map>"],
+        },
+        "v1 build configuration mismatch",
     )
+    _verify_control_provenance(root, roots, v1["control"], "v1 control provenance")
     v1_hosted = roots.by_name["v1"][0]
     for executable in EXECUTABLE_TARGETS:
         executable_record = v1["executables"][executable]
@@ -2533,6 +3577,52 @@ def _verify_transcripts(
         roots.map_path(transcript["cwd"], expected_root="subject")
         validate_path_list(transcript["path"], roots)
         _verify_mapped_file(root, roots, transcript["trace"], "hosted transcript trace")
+        trace_bytes = _read_extracted(
+            root, roots.map_path(transcript["trace"]["absolute_path"]).as_posix()
+        )
+        trace_records = [
+            _shape_json(line, "hosted transcript trace record")
+            for line in trace_bytes.splitlines()
+            if line.strip()
+        ]
+        trace_keys = {
+            "argv",
+            "argv0",
+            "cwd",
+            "path",
+            "payload_path",
+            "payload_sha256",
+        }
+        _require(
+            len(trace_records) == transcript["trace"]["record_count"]
+            and transcript["trace"]["final_link_record_count"] == 1
+            and all(set(record) == trace_keys for record in trace_records),
+            "hosted transcript trace schema/count mismatch",
+        )
+        for record in trace_records:
+            validate_command(record["argv"], roots, rustc=False, has_program=False)
+            roots.map_path(record["argv0"], expected_root="system-root")
+            roots.map_path(record["cwd"])
+            validate_path_list(record["path"], roots)
+            roots.map_path(record["payload_path"], expected_root="system-root")
+        trace_matches = [
+            record
+            for record in trace_records
+            if record
+            == {
+                "argv": transcript["argv"],
+                "argv0": transcript["argv0"],
+                "cwd": transcript["cwd"],
+                "path": transcript["path"],
+                "payload_path": transcript["payload_path"],
+                "payload_sha256": transcript["payload_sha256"],
+            }
+        ]
+        _require(
+            len(trace_matches) == 1
+            and _output_values(transcript["argv"]) == [command["executable"]],
+            "hosted transcript differs from trace contents",
+        )
         _verify_path_hash_pair(
             root,
             roots,
@@ -2609,6 +3699,8 @@ def _verify_extracted_documents(root: Path, archive_sha256: str) -> Verification
         *manifest_records,
         paths["v1_manifest"],
         *paths["transcripts"],
+        paths["body_comparison"],
+        paths["portable_paths"],
     ]
     _require(
         len(all_records) == len({record["archive_path"] for record in all_records}),
@@ -2631,11 +3723,16 @@ def _verify_extracted_documents(root: Path, archive_sha256: str) -> Verification
     inventory, _inventory_bytes = _load_extracted_json(
         root, "bundle/inventory.json", "inventory"
     )
-    body, _body_bytes = _load_extracted_json(
-        root, "bundle/body-comparison.json", "body comparison"
+    _require(
+        paths["body_comparison"]["archive_path"] == "bundle/body-comparison.json"
+        and paths["portable_paths"]["archive_path"] == "bundle/portable-paths.json",
+        "provenance fixed document path mismatch",
     )
-    portable, _portable_bytes = _load_extracted_json(
-        root, "bundle/portable-paths.json", "portable paths"
+    body, _body_bytes = _load_provenance_document(
+        root, paths["body_comparison"], "body comparison"
+    )
+    portable, _portable_bytes = _load_provenance_document(
+        root, paths["portable_paths"], "portable paths"
     )
 
     _validate_all_structures(
@@ -2664,10 +3761,21 @@ def _verify_extracted_documents(root: Path, archive_sha256: str) -> Verification
             archive == expected_archives[name],
             "portable archive root alias mismatch",
         )
+    for kind, document in (
+        ("capability", capability),
+        *(("manifest", manifest) for manifest in manifests),
+        ("v1-manifest", v1),
+        ("provenance", provenance),
+        ("inventory", inventory),
+        *(("transcript", transcript) for transcript in transcripts),
+        ("portable-paths", portable),
+    ):
+        validate_concrete_route_values(kind, document, roots)
 
+    verify_identity_contract(provenance, capability, manifests, v1, capability_bytes)
     _verify_capability(root, roots, capability)
     clean_a, clean_b, adversary = _verify_manifests(
-        root, roots, capability, manifests, v1
+        root, roots, capability, capability_bytes, manifests, v1
     )
     _verify_transcripts(root, roots, transcripts, (clean_a, clean_b, adversary))
     body_sha = _verify_body_contract(body, clean_a, v1)
