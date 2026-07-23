@@ -18,6 +18,22 @@ ROOT = Path(__file__).parents[1]
 PACKAGE_SCRIPT = ROOT / "scripts/package-x86-cache-gate-evidence.py"
 VERIFY_SCRIPT = ROOT / "scripts/verify-x86-cache-gate-evidence.py"
 HEX = "0" * 64
+AARCH64_ATTEMPT_5 = (
+    ROOT
+    / ".worktrees/bench/cache-gate-layout-v2/target/cache-gate/aarch64"
+    / "aarch64-061d13da22b8-attempt-5-clean-a"
+)
+if not AARCH64_ATTEMPT_5.is_dir():
+    AARCH64_ATTEMPT_5 = (
+        ROOT.parents[1]
+        / "bench/cache-gate-layout-v2/target/cache-gate/aarch64"
+        / "aarch64-061d13da22b8-attempt-5-clean-a"
+    )
+V1_AARCH64_MANIFEST = (
+    ROOT.parents[1]
+    / "perf/cache-off-current/target/cache-gate/aarch64"
+    / "cache-off-current/manifest.json"
+)
 
 
 def load_script(path: Path, name: str) -> ModuleType:
@@ -525,7 +541,7 @@ def semantic_documents() -> dict[str, dict[str, Any]]:
         "size": 7,
         "normalized_instructions_sha256": "1" * 64,
         "direct_calls": ["callee"],
-        "indirect_calls": 0,
+        "indirect_calls": [],
         "frame_adjustment": 16,
         "spills": ["x19"],
         "raw_sha256": "2" * 64,
@@ -672,6 +688,397 @@ def semantic_documents() -> dict[str, dict[str, Any]]:
     }
 
 
+def schema_sample(schema: Any, verify_module: ModuleType) -> Any:
+    if isinstance(schema, verify_module.ListSchema):
+        return [schema_sample(schema.item, verify_module)]
+    if isinstance(schema, verify_module.NullableSchema):
+        return None
+    if isinstance(schema, verify_module.LiteralSchema):
+        return copy.deepcopy(schema.value)
+    if isinstance(schema, dict):
+        return {
+            key: schema_sample(child, verify_module) for key, child in schema.items()
+        }
+    if schema is str:
+        return "value"
+    if schema is int:
+        return 1
+    if schema is bool:
+        return False
+    raise AssertionError(f"unsupported test schema: {schema!r}")
+
+
+def rewrite_file_records(value: Any, absolute_path: str, sha256: str) -> None:
+    if isinstance(value, dict):
+        if {"absolute_path", "sha256"}.issubset(value):
+            value["absolute_path"] = absolute_path
+            value["sha256"] = sha256
+        for child in value.values():
+            rewrite_file_records(child, absolute_path, sha256)
+    elif isinstance(value, list):
+        for child in value:
+            rewrite_file_records(child, absolute_path, sha256)
+
+
+def full_portable_paths(verify_module: ModuleType) -> dict[str, Any]:
+    archives = {
+        "orchestrator": "bundle/orchestrator",
+        "subject": "bundle/subject",
+        "v1": "bundle/v1",
+        "evidence": "bundle/evidence",
+        "toolchain": "bundle/toolchain/rust",
+        "cargo-registry": "bundle/toolchain/cargo-registry",
+        "system-root": "bundle/system-root",
+    }
+    return {
+        "version": 1,
+        "roots": [
+            {
+                "name": name,
+                "hosted": "/" if name == "system-root" else f"/host/{name}",
+                "archive": archive,
+            }
+            for name, archive in archives.items()
+        ],
+        "system_links": [],
+        "routing_records": [
+            {"document": path[0], "key_path": list(path[1:]), "field_kind": kind}
+            for path, kind in sorted(verify_module.PATH_ROUTES.items())
+            if path not in verify_module.ROUTE_COMPATIBILITY_ALIASES
+        ],
+    }
+
+
+def full_symbol(
+    verify_module: ModuleType, kernel: str, *, v1: bool = False
+) -> dict[str, Any]:
+    schema = verify_module.SYMBOL_V1_SCHEMA if v1 else verify_module.SYMBOL_V2_SCHEMA
+    symbol = schema_sample(schema, verify_module)
+    symbol.update(
+        {
+            "name": f"crate::{kernel}",
+            "start": 4096,
+            "end": 4103,
+            "size": 7,
+            "kind": "T",
+            "pattern": f"::{kernel}$",
+            "section": ".text.proof",
+            "file_offset": 64,
+            "page_offset": 0,
+            "raw_sha256": "2" * 64,
+            "normalized_instructions_sha256": "1" * 64,
+            "normalized_instructions": ["ret"],
+            "direct_calls": ["callee"],
+            "indirect_calls": [],
+            "frame_adjustment": 16,
+            "spills": ["x19"],
+        }
+    )
+    if not v1:
+        symbol.update(
+            {
+                "section_index": 1,
+                "section_name": ".text.proof",
+                "section_alignment": 16,
+            }
+        )
+    else:
+        symbol["declared_alignment"] = 16
+    return symbol
+
+
+def set_linker_record(record: dict[str, Any], flavor: str, linker_sha: str) -> None:
+    path = f"/usr/bin/{flavor}"
+    record.update(
+        {
+            "invocation_path": path,
+            "invocation_chain": [{"absolute_path": path, "symlink_target": None}],
+            "payload_path": path,
+            "payload_sha256": linker_sha,
+            "argv0": path,
+            "extraction_root": None,
+            "flavor": flavor,
+            "version_argument": "--version",
+            "version": f"{flavor} version",
+        }
+    )
+
+
+def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
+    payload_sha = hashlib.sha256(b"payload").hexdigest()
+    linker_sha = hashlib.sha256(b"linker").hexdigest()
+    capability = schema_sample(verify_module.CAPABILITY_SCHEMA, verify_module)
+    rewrite_file_records(capability, "/host/subject/payload", payload_sha)
+    capability.update(
+        {
+            "accepted": True,
+            "arch": "x86_64",
+            "target_triple": "x86_64-unknown-linux-gnu",
+            "max_page_size": 4096,
+            "fragment_set_sha256": "3" * 64,
+        }
+    )
+    capability["producer"].update(
+        {
+            "runner_root": "/host/subject",
+            "artifact_root": "/host/subject/probe",
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "empty_diff_assertion": True,
+        }
+    )
+    set_linker_record(capability["linker"], "actual", linker_sha)
+    set_linker_record(capability["required_linkers"]["gnu"], "gnu", linker_sha)
+    set_linker_record(capability["required_linkers"]["lld"], "lld", linker_sha)
+
+    manifest = schema_sample(verify_module.MANIFEST_V2_SCHEMA, verify_module)
+    rewrite_file_records(manifest, "/host/subject/payload", payload_sha)
+    manifest.update(
+        {
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "empty_diff_assertion": True,
+            "mode": "MANIFEST",
+            "architecture": "x86_64",
+            "variant": "proof-clean-a",
+            "manifest_instance": "proof-clean-a",
+            "runner_root": "/host/subject",
+        }
+    )
+    manifest["build"].update(
+        {
+            "cargo_incremental": "0",
+            "profile": "release",
+            "locked": True,
+            "codegen_units": 16,
+            "rustc_flags": [
+                "-C",
+                "codegen-units=16",
+                "-C",
+                "linker=/host/subject/payload",
+            ],
+            "linker_flags": ["-Wl,-T,<target-fragment>"],
+        }
+    )
+    manifest["control"]["runner_root"] = "/host/subject"
+    manifest["control"]["mode"] = "BUILD_CONTROL"
+    manifest["control"]["provenance_path"] = "/host/subject/payload"
+    manifest["control"]["provenance_sha256"] = payload_sha
+    for tool in manifest["tools"].values():
+        tool["reviewed_root"] = "/host/subject"
+    manifest["linker_capability"] = {
+        **copy.deepcopy(capability),
+        "copy": {
+            "absolute_path": "/host/evidence/capability.json",
+            "sha256": "",
+        },
+    }
+    for executable, (_target, kernels) in verify_module.EXECUTABLE_TARGETS.items():
+        manifest["symbols"][executable].update(
+            {
+                "binary": "/host/subject/payload",
+                "binary_sha256": payload_sha,
+                "architecture": "x86_64",
+                "linker_generated_veneer_thunks": [],
+                "symbols": [full_symbol(verify_module, kernel) for kernel in kernels],
+            }
+        )
+        layout = manifest["elf_layout"][executable]
+        layout["binary"] = "/host/subject/payload"
+        layout["binary_sha256"] = payload_sha
+        layout["link_map"] = "/host/subject/payload"
+        layout["link_map_sha256"] = payload_sha
+        layout["archive_member_owners"] = []
+        layout["veneer_thunk_inventory"] = []
+        layout["plt_inventory"] = []
+        for item in layout["cache_gate_input_sections"]:
+            item["owner"] = "/host/subject/input.o"
+        for kernel in layout["kernels"].values():
+            kernel["input_owner"] = "/host/subject/input.o"
+        proof = manifest["build_proof"]["executables"][executable]
+        proof["rustc_argv"] = [
+            "Running `/host/toolchain/bin/rustc /host/subject/input.rs "
+            "-o /host/subject/out`"
+        ]
+        proof["archive_member_owners"] = []
+        proof["link_command"]["argv"] = [
+            "/host/subject/input.o",
+            "-o",
+            "/host/subject/out",
+        ]
+        proof["link_command"]["executable"] = "/host/subject/payload"
+        proof["link_command"]["fragment"] = "/host/subject/payload"
+        proof["link_command"]["link_map"] = "/host/subject/payload"
+        set_linker_record(proof["link_command"]["driver"], "actual", linker_sha)
+        proof["adversary"] = {
+            "symbol_occurrences": [],
+            "input_section_occurrences": 0,
+            "outside_reservations": False,
+        }
+
+    capability_bytes = json_bytes(capability)
+    manifest["linker_capability"]["copy"]["sha256"] = hashlib.sha256(
+        capability_bytes
+    ).hexdigest()
+    clean_a = manifest
+    clean_b = copy.deepcopy(manifest)
+    clean_b["variant"] = clean_b["manifest_instance"] = "proof-clean-b"
+    adversary = copy.deepcopy(manifest)
+    adversary["variant"] = adversary["manifest_instance"] = "proof-adversary"
+    adversary["layout_adversary"]["enabled"] = True
+    adversary["build"]["rustc_flags"].extend(
+        [
+            "--cfg",
+            "cache_gate_layout_adversary",
+            "--check-cfg=cfg(cache_gate_layout_adversary)",
+        ]
+    )
+    for field in (
+        "cgu_partition_fingerprint",
+        "object_member_fingerprint",
+        "link_order_fingerprint",
+    ):
+        adversary["build_proof"][field] = f"adversary-{field}"
+    for proof in adversary["build_proof"]["executables"].values():
+        proof["adversary"] = {
+            "symbol_occurrences": [
+                {"name": "layout_adversary", "start": 8192, "size": 32}
+            ],
+            "input_section_occurrences": 1,
+            "outside_reservations": True,
+        }
+
+    v1 = schema_sample(verify_module.MANIFEST_V1_SCHEMA, verify_module)
+    rewrite_file_records(v1, "/host/v1/payload", payload_sha)
+    v1.update(
+        {
+            "commit": "c" * 40,
+            "tree": "d" * 40,
+            "empty_diff_assertion": True,
+            "architecture": "x86_64",
+            "variant": "proof-v1",
+        }
+    )
+    v1["control"]["provenance_path"] = "/host/v1/payload"
+    v1["control"]["provenance_sha256"] = payload_sha
+    for executable, (_target, kernels) in verify_module.EXECUTABLE_TARGETS.items():
+        v1["symbols"][executable].update(
+            {
+                "binary": "/host/v1/payload",
+                "binary_sha256": payload_sha,
+                "architecture": "x86_64",
+                "symbols": [
+                    full_symbol(verify_module, kernel, v1=True) for kernel in kernels
+                ],
+            }
+        )
+
+    body_rows = [
+        {
+            "kernel": kernel,
+            "v1": copy.deepcopy(v1_body),
+            "v2": copy.deepcopy(verify_module._body_records(clean_a)[kernel]),
+        }
+        for kernel, v1_body in sorted(verify_module._body_records(v1).items())
+    ]
+    transcript_documents = []
+    for hosted_manifest in (clean_a, clean_b, adversary):
+        for executable in verify_module.EXECUTABLE_TARGETS:
+            proof = hosted_manifest["build_proof"]["executables"][executable]
+            command = proof["link_command"]
+            driver = command["driver"]
+            transcript_documents.append(
+                {
+                    "version": 1,
+                    "kind": "link-validation",
+                    "manifest_variant": hosted_manifest["variant"],
+                    "executable": executable,
+                    "trace": copy.deepcopy(command["trace"]),
+                    "argv": copy.deepcopy(command["argv"]),
+                    "argv0": driver["argv0"],
+                    "cwd": "/host/subject",
+                    "path": "/host/toolchain/bin:/usr/bin",
+                    "payload_path": driver["payload_path"],
+                    "payload_sha256": driver["payload_sha256"],
+                    "status": 0,
+                    "ordered_inputs": copy.deepcopy(command["ordered_linker_inputs"]),
+                }
+            )
+    manifest_names = ("clean-a", "clean-b", "adversary")
+    manifest_records = {
+        name.replace("-", "_"): {
+            "archive_path": f"bundle/evidence/{name}.json",
+            "sha256": hashlib.sha256(json_bytes(document)).hexdigest(),
+        }
+        for name, document in zip(
+            manifest_names, (clean_a, clean_b, adversary), strict=True
+        )
+    }
+    transcript_records = [
+        {
+            "archive_path": f"bundle/evidence/transcript-{index}.json",
+            "sha256": hashlib.sha256(json_bytes(document)).hexdigest(),
+        }
+        for index, document in enumerate(transcript_documents)
+    ]
+    return {
+        "capability": capability,
+        "capability_bytes": capability_bytes,
+        "manifests": [clean_a, clean_b, adversary],
+        "manifest_v1": v1,
+        "provenance": {
+            "version": 1,
+            "subject": {"commit": "a" * 40, "tree": "b" * 40},
+            "run": {"id": 7, "attempt": 2, "derived_attempt": 7002},
+            "documents": {
+                "capability": {
+                    "archive_path": "bundle/evidence/capability.json",
+                    "sha256": hashlib.sha256(capability_bytes).hexdigest(),
+                },
+                "manifests": manifest_records,
+                "v1_manifest": {
+                    "archive_path": "bundle/evidence/v1.json",
+                    "sha256": hashlib.sha256(json_bytes(v1)).hexdigest(),
+                },
+                "transcripts": transcript_records,
+            },
+            "hardlinks": [],
+        },
+        "transcripts": transcript_documents,
+        "body_comparison": {
+            "version": 1,
+            "fields": list(verify_module.BODY_FIELDS),
+            "rows": body_rows,
+        },
+        "portable_paths": full_portable_paths(verify_module),
+    }
+
+
+def full_document_set(verify_module: ModuleType) -> dict[str, dict[str, Any]]:
+    documents = full_semantic_documents(verify_module)
+    return {
+        "capability": documents["capability"],
+        "manifest_v2": documents["manifests"][0],
+        "manifest_v1": documents["manifest_v1"],
+        "provenance": documents["provenance"],
+        "inventory": {
+            "version": 1,
+            "entries": [
+                {
+                    "path": "bundle/subject/payload",
+                    "type": "file",
+                    "mode": 420,
+                    "size": 7,
+                    "sha256": hashlib.sha256(b"payload").hexdigest(),
+                }
+            ],
+        },
+        "transcript": documents["transcripts"][0],
+        "body_comparison": documents["body_comparison"],
+        "portable_paths": documents["portable_paths"],
+    }
+
+
 def nested_objects(
     value: Any, path: tuple[str, ...] = ()
 ) -> list[tuple[tuple[str, ...], dict[str, Any]]]:
@@ -710,13 +1117,25 @@ def test_classifier_is_closed_and_covers_required_routes(
         verify_module.classify(("manifest", "binary"))
 
 
-@pytest.mark.parametrize("kind", list(semantic_documents()))
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "capability",
+        "manifest_v2",
+        "manifest_v1",
+        "provenance",
+        "inventory",
+        "transcript",
+        "body_comparison",
+        "portable_paths",
+    ],
+)
 def test_recursive_schema_rejects_unknown_key_before_routing(
     verify_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     kind: str,
 ) -> None:
-    documents = semantic_documents()
+    documents = full_document_set(verify_module)
     target_kind = kind
     path, _ = nested_objects(documents[target_kind])[-1]
     mutated = copy.deepcopy(documents)
@@ -734,13 +1153,25 @@ def test_recursive_schema_rejects_unknown_key_before_routing(
     assert not called
 
 
-@pytest.mark.parametrize("kind", list(semantic_documents()))
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "capability",
+        "manifest_v2",
+        "manifest_v1",
+        "provenance",
+        "inventory",
+        "transcript",
+        "body_comparison",
+        "portable_paths",
+    ],
+)
 def test_recursive_schema_rejects_missing_key_before_routing(
     verify_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     kind: str,
 ) -> None:
-    documents = semantic_documents()
+    documents = full_document_set(verify_module)
     path, target = nested_objects(documents[kind])[-1]
     key = next(iter(target))
     mutated = copy.deepcopy(documents)
@@ -773,7 +1204,7 @@ def test_recursive_schema_rejects_missing_key_before_routing(
 def test_schema_rejects_wrong_types(
     verify_module: ModuleType, path: tuple[str, ...], value: Any
 ) -> None:
-    documents = semantic_documents()
+    documents = full_document_set(verify_module)
     parent = at_path(documents, path[:-1])
     key = path[-1]
     if key == "*":
@@ -783,6 +1214,55 @@ def test_schema_rejects_wrong_types(
         verify_module.EvidenceError, match="schema mismatch|type mismatch"
     ):
         verify_module.validate_document_set(documents)
+
+
+def test_full_document_set_passes_recursive_schema_and_routes(
+    verify_module: ModuleType,
+) -> None:
+    verify_module.validate_document_set(full_document_set(verify_module))
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "capability",
+        "manifest_v2",
+        "manifest_v1",
+        "provenance",
+        "inventory",
+        "transcript",
+        "body_comparison",
+        "portable_paths",
+    ],
+)
+def test_every_recursive_object_shape_rejects_unknown_and_missing_keys_before_routing(
+    verify_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    base = full_document_set(verify_module)
+    paths = sorted({path for path, _value in nested_objects(base[kind])})
+    called = False
+
+    def classifier_spy(_path: tuple[str, ...]) -> str:
+        nonlocal called
+        called = True
+        raise AssertionError("routing called before structural gate")
+
+    monkeypatch.setattr(verify_module, "classify", classifier_spy)
+    for path in paths:
+        unknown = copy.deepcopy(base)
+        at_path(unknown[kind], path)["ordinary_unknown"] = "rejected"
+        with pytest.raises(verify_module.EvidenceError, match="schema mismatch"):
+            verify_module.validate_document_set(unknown)
+        assert not called
+
+        missing = copy.deepcopy(base)
+        target = at_path(missing[kind], path)
+        del target[next(iter(target))]
+        with pytest.raises(verify_module.EvidenceError, match="schema mismatch"):
+            verify_module.validate_document_set(missing)
+        assert not called
 
 
 def test_body_comparison_ignores_raw_hash_and_placement(
@@ -825,7 +1305,6 @@ def test_body_comparison_rejects_semantic_change(
 @pytest.mark.parametrize(
     "command",
     [
-        ["rustc", "--out-dir=/host/subject/out"],
         ["rustc", "@relative.rsp"],
         ["rustc", "-C", "link-arg=-T/unknown/layout.ld"],
         ["rustc", "/outside/input.rs"],
@@ -839,6 +1318,15 @@ def test_rustc_command_rejects_unclassified_path_positions(
         verify_module.EvidenceError, match="unclassified|outside declared roots"
     ):
         verify_module.validate_command(command, roots, rustc=True)
+
+
+def test_rustc_command_classifies_output_directory(
+    verify_module: ModuleType,
+) -> None:
+    roots = verify_module.PortableRoots.from_document(portable_paths())
+    verify_module.validate_command(
+        ["rustc", "--out-dir=/host/subject/out"], roots, rustc=True
+    )
 
 
 def test_path_list_rejects_empty_and_cross_namespace_entries(
@@ -859,62 +1347,68 @@ def test_rlib_owner_rejects_malformed_value(
         verify_module.parse_rlib_owner(owner)
 
 
+def test_rlib_member_rejects_missing_index_member(
+    tmp_path: Path,
+    verify_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "libproof.rlib"
+    archive.write_bytes(b"archive")
+    monkeypatch.setattr(
+        verify_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: verify_module.subprocess.CompletedProcess(
+            [], 0, stdout="present.o\n"
+        ),
+    )
+    with pytest.raises(verify_module.EvidenceError, match="index member is missing"):
+        verify_module.validate_rlib_member(archive, "missing.o")
+
+
 def test_semantic_aggregate_comparison_preserves_order_and_duplicates(
     verify_module: ModuleType,
 ) -> None:
-    documents = semantic_documents()
-    clean = documents["manifest_v2"]
-    clean_b = copy.deepcopy(clean)
-    clean_b["kind"] = "clean-b"
-    adversary = copy.deepcopy(clean)
-    adversary["kind"] = "adversary"
-    adversary["aggregate"]["cgu"] = "different"
-    adversary["aggregate"]["objects"] = "different"
-    adversary["aggregate"]["semantic"] = clean["aggregate"]["semantic"]
-    verify_module.verify_manifest_relationships(clean, clean_b, adversary)
-    clean_b["aggregate"]["link_order"] = ["one", "two", "one"]
-    with pytest.raises(verify_module.EvidenceError, match="clean aggregate mismatch"):
-        verify_module.verify_manifest_relationships(clean, clean_b, adversary)
+    verify_module.require_ordered_equal(
+        ["one", "one", "two"], ["one", "one", "two"], "ordered inputs"
+    )
+    with pytest.raises(verify_module.EvidenceError, match="ordered inputs"):
+        verify_module.require_ordered_equal(
+            ["one", "one", "two"], ["one", "two", "one"], "ordered inputs"
+        )
 
 
-def write_semantic_staging(staging: Path) -> dict[str, dict[str, Any]]:
-    documents = semantic_documents()
+def write_semantic_staging(staging: Path, verify_module: ModuleType) -> dict[str, Any]:
+    documents = full_semantic_documents(verify_module)
     bundle = staging / "bundle"
     for root in (
         "orchestrator",
         "subject",
         "v1",
         "evidence",
-        "toolchain/bin",
+        "toolchain/rust/bin",
+        "toolchain/cargo-registry",
         "system-root/usr/bin",
-        "system-root/bin",
     ):
         (bundle / root).mkdir(parents=True, exist_ok=True)
     for name in ("actual", "gnu", "lld"):
         (bundle / f"system-root/usr/bin/{name}").write_bytes(b"linker")
-    for flavor in ("actual", "gnu", "lld"):
-        for target in ("elastic", "funnel", "profile"):
-            (bundle / f"subject/{flavor}-{target}").write_bytes(b"payload")
     (bundle / "subject/payload").write_bytes(b"payload")
     (bundle / "v1/payload").write_bytes(b"payload")
+    (bundle / "toolchain/rust/bin/rustc").write_bytes(b"rustc")
 
-    clean_a = documents["manifest_v2"]
-    clean_b = copy.deepcopy(clean_a)
-    clean_b["kind"] = "clean-b"
-    adversary = copy.deepcopy(clean_a)
-    adversary["kind"] = "adversary"
-    adversary["aggregate"]["cgu"] = "different-cgu"
-    adversary["aggregate"]["objects"] = "different-objects"
     named_documents = {
         "capability.json": documents["capability"],
-        "clean-a.json": clean_a,
-        "clean-b.json": clean_b,
-        "adversary.json": adversary,
+        "clean-a.json": documents["manifests"][0],
+        "clean-b.json": documents["manifests"][1],
+        "adversary.json": documents["manifests"][2],
         "v1.json": documents["manifest_v1"],
-        "transcript.json": documents["transcript"],
     }
     for name, document in named_documents.items():
         (bundle / f"evidence/{name}").write_bytes(json_bytes(document))
+    for index, transcript in enumerate(documents["transcripts"]):
+        (bundle / f"evidence/transcript-{index}.json").write_bytes(
+            json_bytes(transcript)
+        )
     (bundle / "provenance.json").write_bytes(json_bytes(documents["provenance"]))
     (bundle / "portable-paths.json").write_bytes(
         json_bytes(documents["portable_paths"])
@@ -929,7 +1423,7 @@ def test_verify_archive_returns_stable_ready_report(
     tmp_path: Path, package_module: ModuleType, verify_module: ModuleType
 ) -> None:
     staging = tmp_path / "staging"
-    documents = write_semantic_staging(staging)
+    documents = write_semantic_staging(staging, verify_module)
     archive = tmp_path / "evidence.tar"
     digest = package_module.package_evidence(
         staging, archive, tmp_path / "evidence.tar.sha256"
@@ -944,3 +1438,193 @@ def test_verify_archive_returns_stable_ready_report(
         documents["body_comparison"]["rows"]
     )
     assert len(report.manifest_sha256s) == 3
+
+
+def test_provenance_binds_original_document_bytes(
+    tmp_path: Path, package_module: ModuleType, verify_module: ModuleType
+) -> None:
+    staging = tmp_path / "staging"
+    write_semantic_staging(staging, verify_module)
+    manifest_path = staging / "bundle/evidence/clean-a.json"
+    manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+    archive = tmp_path / "evidence.tar"
+    digest = package_module.package_evidence(
+        staging, archive, tmp_path / "evidence.tar.sha256"
+    )
+    with pytest.raises(verify_module.EvidenceError, match="document hash mismatch"):
+        verify_module.verify_archive(archive, digest)
+
+
+def test_hosted_transcript_must_match_manifest_link_proof(
+    tmp_path: Path, package_module: ModuleType, verify_module: ModuleType
+) -> None:
+    staging = tmp_path / "staging"
+    write_semantic_staging(staging, verify_module)
+    transcript_path = staging / "bundle/evidence/transcript-0.json"
+    transcript = json.loads(transcript_path.read_bytes())
+    transcript["argv"].insert(0, "--gc-sections")
+    transcript_bytes = json_bytes(transcript)
+    transcript_path.write_bytes(transcript_bytes)
+    provenance_path = staging / "bundle/provenance.json"
+    provenance = json.loads(provenance_path.read_bytes())
+    provenance["documents"]["transcripts"][0]["sha256"] = hashlib.sha256(
+        transcript_bytes
+    ).hexdigest()
+    provenance_path.write_bytes(json_bytes(provenance))
+    archive = tmp_path / "evidence.tar"
+    digest = package_module.package_evidence(
+        staging, archive, tmp_path / "evidence.tar.sha256"
+    )
+    with pytest.raises(verify_module.EvidenceError, match="hosted transcript argv"):
+        verify_module.verify_archive(archive, digest)
+
+
+def require_aarch64_fixture(path: Path) -> Path:
+    if not path.is_file():
+        pytest.skip(f"local accepted AArch64 fixture is unavailable: {path}")
+    return path
+
+
+def test_full_immutable_capability_and_v2_schemas_accept_attempt_5(
+    verify_module: ModuleType,
+) -> None:
+    capability = json.loads(
+        require_aarch64_fixture(
+            AARCH64_ATTEMPT_5 / "linker-capability.json"
+        ).read_text()
+    )
+    manifest = json.loads(
+        require_aarch64_fixture(AARCH64_ATTEMPT_5 / "manifest.json").read_text()
+    )
+    verify_module._validate_schema(
+        capability, verify_module.CAPABILITY_SCHEMA, "capability"
+    )
+    verify_module._validate_schema(
+        manifest, verify_module.MANIFEST_V2_SCHEMA, "manifest_v2"
+    )
+
+
+def test_full_immutable_v1_schema_accepts_replayed_shape(
+    verify_module: ModuleType,
+) -> None:
+    manifest = json.loads(require_aarch64_fixture(V1_AARCH64_MANIFEST).read_text())
+    verify_module._validate_schema(
+        manifest, verify_module.MANIFEST_V1_SCHEMA, "manifest_v1"
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "field_kind"),
+    [
+        (
+            (
+                "capability",
+                "shapes",
+                "*",
+                "*",
+                "binary",
+                "absolute_path",
+            ),
+            "hashed-file",
+        ),
+        (
+            (
+                "manifest",
+                "build_proof",
+                "executables",
+                "*",
+                "rustc_argv",
+                "*",
+            ),
+            "rustc-command",
+        ),
+        (
+            (
+                "manifest",
+                "elf_layout",
+                "*",
+                "archive_member_owners",
+                "*",
+            ),
+            "rlib-member",
+        ),
+        (
+            (
+                "manifest",
+                "build_proof",
+                "executables",
+                "*",
+                "link_command",
+                "argv",
+            ),
+            "linker-command",
+        ),
+    ],
+)
+def test_full_typed_route_table_is_closed(
+    verify_module: ModuleType, path: tuple[str, ...], field_kind: str
+) -> None:
+    assert verify_module.classify(path) == field_kind
+
+
+def test_full_capability_has_exact_nine_linker_shapes(
+    verify_module: ModuleType,
+) -> None:
+    capability = json.loads(
+        require_aarch64_fixture(
+            AARCH64_ATTEMPT_5 / "linker-capability.json"
+        ).read_text()
+    )
+    assert verify_module.capability_shapes(capability) == {
+        ("actual", "elastic", 2),
+        ("actual", "funnel", 2),
+        ("actual", "profile", 4),
+        ("gnu", "elastic", 2),
+        ("gnu", "funnel", 2),
+        ("gnu", "profile", 4),
+        ("lld", "elastic", 2),
+        ("lld", "funnel", 2),
+        ("lld", "profile", 4),
+    }
+
+
+def test_full_clean_and_adversary_relationships_use_immutable_fields(
+    verify_module: ModuleType,
+) -> None:
+    root = require_aarch64_fixture(AARCH64_ATTEMPT_5 / "manifest.json").parent
+    clean_a = json.loads((root / "manifest.json").read_text())
+    clean_b = json.loads(
+        (
+            root.parent / root.name.replace("clean-a", "clean-b") / "manifest.json"
+        ).read_text()
+    )
+    adversary = json.loads(
+        (
+            root.parent / root.name.replace("clean-a", "adversary") / "manifest.json"
+        ).read_text()
+    )
+    verify_module.verify_manifest_relationships(clean_a, clean_b, adversary)
+    clean_b["build_proof"]["link_order_fingerprint"] = "f" * 64
+    with pytest.raises(verify_module.EvidenceError, match="clean build proof"):
+        verify_module.verify_manifest_relationships(clean_a, clean_b, adversary)
+
+
+def test_rlib_member_validation_is_reached_from_manifest_owner(
+    tmp_path: Path,
+    verify_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "libproof.rlib"
+    archive.write_bytes(b"archive")
+    called: list[tuple[Path, str]] = []
+
+    monkeypatch.setattr(
+        verify_module,
+        "validate_rlib_member",
+        lambda path, member: called.append((path, member)),
+    )
+    verify_module.validate_manifest_rlib_owners(
+        ["/host/toolchain/lib/libproof.rlib(member.o)"],
+        lambda raw: archive if raw == "/host/toolchain/lib/libproof.rlib" else None,
+    )
+    assert called == [(archive, "member.o")]
