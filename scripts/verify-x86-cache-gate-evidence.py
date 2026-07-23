@@ -46,6 +46,89 @@ SUBJECT_COMMIT = "061d13da22b89208c801308efd578444c8e9caba"
 SUBJECT_TREE = "24921a941f8c3c26467465b99d6b45ee5912b2da"
 V1_REPLAY_COMMIT = "b0d53234dc051af91fe0321450b3e8312a84e635"
 V1_REPLAY_TREE = "d77cc082fe48799f26ff4440bd1898a71d0dc8cc"
+X86_TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
+PINNED_CARGO_VERSION = "cargo 1.95.0 (f2d3ce0bd 2026-03-21)"
+PINNED_RUSTC_VERSION = (
+    "rustc 1.95.0 (59807616e 2026-04-14)\n"
+    "binary: rustc\n"
+    "commit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\n"
+    "commit-date: 2026-04-14\n"
+    f"host: {X86_TARGET_TRIPLE}\n"
+    "release: 1.95.0\n"
+    "LLVM version: 22.1.2"
+)
+KERNEL_SENTINEL_STEMS = {
+    "elastic_cache_gate_insert_kernel": "elastic_insert",
+    "elastic_cache_gate_get_kernel": "elastic_get",
+    "funnel_cache_gate_insert_kernel": "funnel_insert",
+    "funnel_cache_gate_get_kernel": "funnel_get",
+    "elastic_profile_insert_kernel": "profile_elastic_insert",
+    "elastic_profile_get_kernel": "profile_elastic_get",
+    "funnel_profile_insert_kernel": "profile_funnel_insert",
+    "funnel_profile_get_kernel": "profile_funnel_get",
+}
+SUBJECT_TOOL_IDENTITIES = {
+    "elf_layout": (
+        "scripts/cache-gate-elf-layout.py",
+        "38d77e3253673342ac8150836dae2f790386c152",
+        "b6cb974d815b1bfb3132632fade62bf894bd431f8f0836e5a7ddd026be69e088",
+    ),
+    "extractor": (
+        "scripts/extract-hot-symbols.py",
+        "c6f856f32f7207a5a7975a9332039e4141f11403",
+        "8553fed90042dbde1414f8d6c17e123d5c1d3dc0101c66fa336ef098e84293f7",
+    ),
+    "launcher": (
+        "scripts/cache-gate.sh",
+        "ef778aa3c7bbe8795af9d6d878a4e830a26cea79",
+        "9d549d7a19e31a6d8cba13339955aff2e5f8b26539429a67aedfaf7de393dddc",
+    ),
+    "link_wrapper": (
+        "scripts/cache-gate-link-wrapper.py",
+        "34b6761cb5f27d61553bb69105ad16b6b5bbe10a",
+        "afdb7442212dc346db0104b95d218e96b85e628e1f1ed7b6ad59203ab1e3a08c",
+    ),
+    "perf_launcher": (
+        "scripts/cache-gate-perf.sh",
+        "ce8d418fd6c7d1b798affdc4e9cf5fba69db2cc2",
+        "02d96dd5347ef52d96f5a1418ce15905087105d6ee80b9523af6353059f7fbd8",
+    ),
+    "perf_support": (
+        "scripts/cache-gate-perf-support.py",
+        "7f5434d586a1466e171f4e343adc79b3d5e224e3",
+        "8bc1de76aa791b7b10d9934db32d12f7da4d774537a00ce7d8bd99549bed4531",
+    ),
+    "snapshot": (
+        "scripts/snapshot-criterion-pair.sh",
+        "ce25155fcca66c2e1a2129c51562dad912335a42",
+        "5a050eb68b3abf8d398e7849abb2cb08fddaac8e88e1fef24314dbfbaba77607",
+    ),
+}
+CONTROL_INPUT_IDENTITIES = {
+    "cargo_manifest": (
+        "tools/cache-gate-control/Cargo.toml",
+        "086cbc963cf2b336da7f4f0ee8d06cd17c475ed1c31956058e410d05e09634dd",
+    ),
+    "cargo_lock": (
+        "tools/cache-gate-control/Cargo.lock",
+        "c8e86f671e65831bcd69ca653ae6c5761bc32ff671c24b9cac19ab17879e8666",
+    ),
+    "source": (
+        "tools/cache-gate-control/src/main.rs",
+        "2efeafb631c3bc1b04bb35729f83f221168bf0d55e02e383912c78b18d722e8c",
+    ),
+}
+LAYOUT_BODY_FIELDS = (
+    "body_end",
+    "body_size",
+    "raw_sha256",
+    "normalized_sha256",
+    "direct_calls",
+    "indirect_calls",
+    "frame_bytes",
+    "spills",
+)
+SENTINEL_FIELDS = ("reservation_start", "body_end", "reservation_end")
 
 
 class ListSchema(NamedTuple):
@@ -1213,11 +1296,19 @@ class PortableRoots(NamedTuple):
                     "/etc/alternatives",
                     "/lib",
                     "/lib64",
+                    "/opt/miniforge3/condabin",
                     "/sbin",
+                    "/snap/bin",
                     "/usr/bin",
+                    "/usr/games",
                     "/usr/lib",
+                    "/usr/libexec",
                     "/usr/local/bin",
+                    "/usr/local/cuda/bin",
+                    "/usr/local/cuda/lib64",
+                    "/usr/local/games",
                     "/usr/local/lib",
+                    "/usr/local/sbin",
                     "/usr/sbin",
                 )
             )
@@ -1256,6 +1347,13 @@ def validate_path_list(value: str, roots: PortableRoots) -> list[PurePosixPath]:
 def validate_concrete_route_values(
     document_kind: str, document: object, roots: PortableRoots
 ) -> None:
+    command_cwd = (
+        document.get("cwd")
+        if isinstance(document, dict) and document_kind == "transcript"
+        else document.get("runner_root")
+        if isinstance(document, dict) and document_kind == "manifest"
+        else None
+    )
     for concrete, field_kind, value in collect_concrete_routes(document_kind, document):
         label = ".".join(str(part) for part in concrete)
         if field_kind in {
@@ -1288,10 +1386,16 @@ def validate_concrete_route_values(
             validate_rustc_transcript(value, roots)
         elif field_kind == "linker-command":
             _require(isinstance(value, list), f"{label} route type mismatch")
-            validate_command(value, roots, rustc=False, has_program=False)
+            validate_command(
+                value,
+                roots,
+                rustc=False,
+                has_program=False,
+                cwd=command_cwd,
+            )
         elif field_kind in {"rustc-options", "rustc-options-template"}:
             _require(isinstance(value, list), f"{label} route type mismatch")
-            validate_command(["rustc", *value], roots, rustc=True)
+            validate_command(["rustc", *value], roots, rustc=True, cwd=command_cwd)
         elif field_kind == "linker-template":
             _require(
                 isinstance(value, list)
@@ -1343,20 +1447,72 @@ def _looks_path_valued(value: str) -> bool:
     )
 
 
-def _map_search_path(value: str, roots: PortableRoots) -> None:
+def _map_command_path(
+    value: str,
+    roots: PortableRoots,
+    *,
+    cwd: str | None,
+    expected_root: str | None = None,
+) -> PurePosixPath:
+    if value.startswith("/"):
+        parts: list[str] = []
+        for part in value.split("/")[1:]:
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                _require(bool(parts), "command path escapes filesystem root")
+                parts.pop()
+            else:
+                parts.append(part)
+        return roots.map_path("/" + "/".join(parts), expected_root=expected_root)
+    _require(
+        cwd is not None,
+        "unclassified relative command input lacks authenticated cwd",
+    )
+    base = _canonical_absolute(cwd, "authenticated cwd")
+    roots.map_path(base.as_posix())
+    parts = value.split("/")
+    _require(
+        bool(value) and all(part not in {"", ".", ".."} for part in parts),
+        "invalid relative command input",
+    )
+    return roots.map_path(
+        (base / PurePosixPath(*parts)).as_posix(), expected_root=expected_root
+    )
+
+
+def _map_search_path(value: str, roots: PortableRoots, *, cwd: str | None) -> None:
     path = (
         value.split("=", 1)[1] if "=" in value and not value.startswith("/") else value
     )
-    roots.map_path(path)
+    _map_command_path(path, roots, cwd=cwd)
 
 
-def _validate_link_arg(value: str, roots: PortableRoots) -> None:
+def _validate_gcc_resolution_file(value: str) -> None:
+    path = _canonical_absolute(value, "GCC resolution file")
+    stem = path.name.removeprefix("cc").removesuffix(".res")
+    _require(
+        path.parent == PurePosixPath("/tmp")
+        and path.name.startswith("cc")
+        and path.name.endswith(".res")
+        and bool(stem)
+        and stem.isascii()
+        and stem.isalnum()
+        and len(stem) == 6,
+        "invalid GCC resolution file",
+    )
+
+
+def _validate_link_arg(value: str, roots: PortableRoots, *, cwd: str | None) -> None:
+    if value.startswith("-fresolution="):
+        _validate_gcc_resolution_file(value.removeprefix("-fresolution="))
+        return
     if value.startswith("@"):
-        roots.map_path(value[1:])
+        _map_command_path(value[1:], roots, cwd=cwd)
         return
     for prefix in ("-T", "-B", "-L"):
         if value.startswith(prefix) and len(value) > len(prefix):
-            roots.map_path(value[len(prefix) :])
+            _map_command_path(value[len(prefix) :], roots, cwd=cwd)
             return
     for prefix in (
         "--script=",
@@ -1368,15 +1524,15 @@ def _validate_link_arg(value: str, roots: PortableRoots) -> None:
         "-rpath,",
     ):
         if value.startswith(prefix):
-            roots.map_path(value[len(prefix) :])
+            _map_command_path(value[len(prefix) :], roots, cwd=cwd)
             return
     if value.startswith("/"):
-        roots.map_path(value)
+        _map_command_path(value, roots, cwd=cwd)
         return
     _require(not _looks_path_valued(value), "unclassified path-valued link argument")
 
 
-def _validate_wl_token(token: str, roots: PortableRoots) -> None:
+def _validate_wl_token(token: str, roots: PortableRoots, *, cwd: str | None) -> None:
     values = token.removeprefix("-Wl,").split(",")
     _require(all(values), "malformed -Wl argument")
     index = 0
@@ -1384,10 +1540,10 @@ def _validate_wl_token(token: str, roots: PortableRoots) -> None:
         value = values[index]
         if value in {"-T", "--script", "--version-script", "-Map", "-rpath"}:
             _require(index + 1 < len(values), "path-valued linker flag lacks value")
-            roots.map_path(values[index + 1])
+            _map_command_path(values[index + 1], roots, cwd=cwd)
             index += 2
             continue
-        _validate_link_arg(value, roots)
+        _validate_link_arg(value, roots, cwd=cwd)
         index += 1
 
 
@@ -1397,6 +1553,7 @@ def validate_command(
     *,
     rustc: bool,
     has_program: bool = True,
+    cwd: str | None = None,
 ) -> None:
     _require(
         isinstance(command, list)
@@ -1412,44 +1569,60 @@ def validate_command(
         token = command[index]
         if index == 0 and has_program:
             if "/" in token:
-                roots.map_path(token)
+                _map_command_path(token, roots, cwd=cwd)
             index += 1
             continue
         if token in {"-o", "-L", "--extern", "--out-dir", "--sysroot"}:
             _require(index + 1 < len(command), "path-valued flag lacks value")
             value = command[index + 1]
             if token == "--extern":
-                _require(
-                    "=" in value and bool(value.split("=", 1)[0]), "malformed --extern"
-                )
-                roots.map_path(value.split("=", 1)[1])
+                if "=" in value:
+                    _require(bool(value.split("=", 1)[0]), "malformed --extern")
+                    _map_command_path(value.split("=", 1)[1], roots, cwd=cwd)
+                else:
+                    _require(not _looks_path_valued(value), "malformed --extern")
             elif token == "-L":
-                _map_search_path(value, roots)
+                _map_search_path(value, roots, cwd=cwd)
             else:
-                roots.map_path(value)
+                _map_command_path(value, roots, cwd=cwd)
+            index += 2
+            continue
+        if token in {
+            "-Map",
+            "-T",
+            "--dynamic-linker",
+            "--script",
+            "--version-script",
+            "-dynamic-linker",
+            "-plugin",
+            "-rpath",
+        }:
+            _require(index + 1 < len(command), "path-valued flag lacks value")
+            _map_command_path(command[index + 1], roots, cwd=cwd)
             index += 2
             continue
         if token.startswith("-o") and token != "-o":
-            roots.map_path(token[2:])
+            _map_command_path(token[2:], roots, cwd=cwd)
         elif token.startswith("-L") and token != "-L":
-            _map_search_path(token[2:], roots)
+            _map_search_path(token[2:], roots, cwd=cwd)
         elif token.startswith("--out-dir="):
-            roots.map_path(token.removeprefix("--out-dir="))
+            _map_command_path(token.removeprefix("--out-dir="), roots, cwd=cwd)
         elif token.startswith("--sysroot="):
-            roots.map_path(token.removeprefix("--sysroot="))
+            _map_command_path(token.removeprefix("--sysroot="), roots, cwd=cwd)
         elif token.startswith("--extern="):
             value = token.removeprefix("--extern=")
-            _require(
-                "=" in value and bool(value.split("=", 1)[0]), "malformed --extern"
-            )
-            roots.map_path(value.split("=", 1)[1])
+            if "=" in value:
+                _require(bool(value.split("=", 1)[0]), "malformed --extern")
+                _map_command_path(value.split("=", 1)[1], roots, cwd=cwd)
+            else:
+                _require(not _looks_path_valued(value), "malformed --extern")
         elif token == "-C":
             _require(index + 1 < len(command), "-C lacks value")
             option = command[index + 1]
             if option.startswith("linker="):
-                roots.map_path(option.removeprefix("linker="))
+                _map_command_path(option.removeprefix("linker="), roots, cwd=cwd)
             elif option.startswith("link-arg="):
-                _validate_link_arg(option.removeprefix("link-arg="), roots)
+                _validate_link_arg(option.removeprefix("link-arg="), roots, cwd=cwd)
             else:
                 _require(
                     not _looks_path_valued(option),
@@ -1458,30 +1631,72 @@ def validate_command(
             index += 2
             continue
         elif token.startswith("-Clinker="):
-            roots.map_path(token.removeprefix("-Clinker="))
+            _map_command_path(token.removeprefix("-Clinker="), roots, cwd=cwd)
         elif token.startswith("-Clink-arg="):
-            _validate_link_arg(token.removeprefix("-Clink-arg="), roots)
+            _validate_link_arg(token.removeprefix("-Clink-arg="), roots, cwd=cwd)
         elif token.startswith("-Wl,"):
-            _validate_wl_token(token, roots)
+            _validate_wl_token(token, roots, cwd=cwd)
+        elif token.startswith("-plugin-opt="):
+            _validate_link_arg(token.removeprefix("-plugin-opt="), roots, cwd=cwd)
         elif token.startswith("-B") and token != "-B":
-            roots.map_path(token[2:])
+            _map_command_path(token[2:], roots, cwd=cwd)
         elif token == "-B":
             _require(index + 1 < len(command), "-B lacks value")
-            roots.map_path(command[index + 1])
+            _map_command_path(command[index + 1], roots, cwd=cwd)
             index += 2
             continue
         elif token == "-Xlinker":
             _require(index + 1 < len(command), "-Xlinker lacks value")
-            _validate_link_arg(command[index + 1], roots)
+            _validate_link_arg(command[index + 1], roots, cwd=cwd)
             index += 2
             continue
         elif token.startswith("@"):
-            _require(token[1:].startswith("/"), "unclassified response file path")
-            roots.map_path(token[1:])
+            _map_command_path(token[1:], roots, cwd=cwd)
+        elif rustc and token in {
+            "--allow",
+            "--cap-lints",
+            "--cfg",
+            "--check-cfg",
+            "--crate-name",
+            "--crate-type",
+            "--deny",
+            "--edition",
+            "--emit",
+            "--error-format",
+            "--forbid",
+            "--json",
+            "--target",
+            "--warn",
+            "-A",
+            "-D",
+            "-F",
+            "-W",
+            "-l",
+        }:
+            _require(index + 1 < len(command), f"{token} lacks value")
+            value = command[index + 1]
+            _require(
+                not _looks_path_valued(value),
+                f"unclassified path-valued {token} value",
+            )
+            index += 2
+            continue
+        elif not rustc and token in {"-m", "-plugin-opt", "-X", "-z"}:
+            _require(index + 1 < len(command), f"{token} lacks value")
+            value = command[index + 1]
+            if token == "-plugin-opt":
+                _validate_link_arg(value, roots, cwd=cwd)
+            else:
+                _require(
+                    not _looks_path_valued(value),
+                    f"unclassified path-valued {token} value",
+                )
+            index += 2
+            continue
         elif token.startswith("-"):
             _require(not _looks_path_valued(token), "unclassified path-valued flag")
-        elif _looks_path_valued(token):
-            roots.map_path(token)
+        else:
+            _map_command_path(token, roots, cwd=cwd)
         index += 1
 
 
@@ -1499,6 +1714,21 @@ def validate_rustc_transcript(line: str, roots: PortableRoots) -> None:
         raise EvidenceError("rustc transcript grammar mismatch") from error
     _require(bool(tokens), "rustc transcript grammar mismatch")
     index = 0
+    manifest_dir: str | None = None
+    manifest_path: str | None = None
+    encoded_rustflags: list[str] = []
+
+    def map_manifest_value(value: str) -> None:
+        accepted = False
+        for root_name in ("subject", "cargo-registry"):
+            try:
+                roots.map_path(value, expected_root=root_name)
+            except EvidenceError:
+                continue
+            accepted = True
+            break
+        _require(accepted, "manifest path is outside subject/registry roots")
+
     while index < len(tokens):
         name, separator, value = tokens[index].partition("=")
         if (
@@ -1512,8 +1742,12 @@ def validate_rustc_transcript(line: str, roots: PortableRoots) -> None:
             break
         if name == "CARGO":
             roots.map_path(value, expected_root="toolchain")
-        elif name in {"CARGO_MANIFEST_DIR", "CARGO_MANIFEST_PATH"}:
-            roots.map_path(value, expected_root="cargo-registry")
+        elif name == "CARGO_MANIFEST_DIR":
+            map_manifest_value(value)
+            manifest_dir = value
+        elif name == "CARGO_MANIFEST_PATH":
+            map_manifest_value(value)
+            manifest_path = value
         elif name == "LD_LIBRARY_PATH":
             for element in value.split(":"):
                 if element:
@@ -1521,29 +1755,54 @@ def validate_rustc_transcript(line: str, roots: PortableRoots) -> None:
         elif name in {"CARGO_TARGET_TMPDIR", "OUT_DIR", "RUSTC", "RUSTDOC"}:
             roots.map_path(value)
         elif name == "CARGO_ENCODED_RUSTFLAGS":
-            encoded = value.replace("\x1f", " ")
-            residual = encoded
-            for marker in ("-Clinker=", "-Clink-arg="):
-                search_from = 0
-                while marker in encoded[search_from:]:
-                    start = encoded.index(marker, search_from) + len(marker)
-                    end = encoded.find(" ", start)
-                    option = encoded[start:] if end == -1 else encoded[start:end]
-                    if marker == "-Clinker=":
-                        roots.map_path(option)
-                    else:
-                        _validate_link_arg(option, roots)
-                    residual = residual.replace(f"{marker}{option}", "")
-                    search_from = len(encoded) if end == -1 else end + 1
-            _require(
-                not _looks_path_valued(residual),
-                "unclassified path-valued environment",
-            )
+            encoded_rustflags.extend(value.split("\x1f") if value else [])
+        elif name.startswith(
+            ("CARGO_CFG_", "CARGO_FEATURE_", "CARGO_PKG_", "CODSPEED_")
+        ) or name in {
+            "CARGO_CRATE_NAME",
+            "CARGO_MANIFEST_LINKS",
+            "CARGO_PRIMARY_PACKAGE",
+            "DEBUG",
+            "HOST",
+            "NUM_JOBS",
+            "OPT_LEVEL",
+            "PROFILE",
+            "TARGET",
+        }:
+            pass
         elif _looks_path_valued(value):
             raise EvidenceError(f"unclassified path-valued environment: {name}")
         index += 1
     _require(index < len(tokens), "rustc transcript lacks command")
-    validate_command(tokens[index:], roots, rustc=True)
+    if manifest_path is not None:
+        _require(
+            manifest_dir is not None
+            and PurePosixPath(manifest_path).parent
+            == _canonical_absolute(manifest_dir, "Cargo manifest directory"),
+            "Cargo manifest path/directory mismatch",
+        )
+    if encoded_rustflags:
+        try:
+            for encoded in encoded_rustflags:
+                residual = encoded
+                for marker in ("-Clinker=", "-Clink-arg="):
+                    if marker not in residual:
+                        continue
+                    start = residual.index(marker)
+                    option = residual[start + len(marker) :]
+                    _require(bool(option), "empty encoded rustflag path")
+                    if marker == "-Clinker=":
+                        _map_command_path(option, roots, cwd=manifest_dir)
+                    else:
+                        _validate_link_arg(option, roots, cwd=manifest_dir)
+                    residual = residual[:start]
+                _require(
+                    not _looks_path_valued(residual),
+                    "unclassified encoded rustflag path",
+                )
+        except EvidenceError as error:
+            raise EvidenceError("unclassified path-valued environment") from error
+    validate_command(tokens[index:], roots, rustc=True, cwd=manifest_dir)
 
 
 def parse_rlib_owner(value: str) -> tuple[str, str]:
@@ -1723,6 +1982,111 @@ def _verify_shape_trace(
     )
 
 
+def _expected_link_map_flavor(linker: dict[str, Any], label: str) -> str:
+    flavor = linker["flavor"]
+    _require(flavor in {"GNU ld", "LLD"}, f"{label} linker flavor mismatch")
+    return "gnu" if flavor == "GNU ld" else "lld"
+
+
+def _verify_symbol_layout_contract(
+    symbols: dict[str, Any],
+    layout: dict[str, Any],
+    target: str,
+    kernel_names: tuple[str, ...],
+    label: str,
+) -> None:
+    _require(
+        symbols["architecture"] == layout["arch"],
+        f"{label} symbol/layout architecture mismatch",
+    )
+    _require(layout["target"] == target, f"{label} layout target mismatch")
+    by_kernel: dict[str, dict[str, Any]] = {}
+    for symbol in symbols["symbols"]:
+        kernel = symbol["name"].rsplit("::", 1)[-1]
+        _require(kernel not in by_kernel, f"{label} duplicate symbol kernel")
+        by_kernel[kernel] = symbol
+    _require(
+        set(by_kernel) == set(kernel_names)
+        and set(layout["kernels"]) == set(kernel_names),
+        f"{label} exact symbol/layout kernel set mismatch",
+    )
+    max_page = layout["max_page_size"]
+    _require(max_page > 0, f"{label} invalid MAXPAGESIZE")
+    field_pairs = (
+        ("function_start", "start"),
+        ("function_end", "end"),
+        ("function_size", "size"),
+        ("body_end", "end"),
+        ("body_size", "size"),
+        ("function_section_index", "section_index"),
+        ("output_section_index", "section_index"),
+        ("function_section_name", "section_name"),
+        ("output_section", "section"),
+        ("sh_addralign", "section_alignment"),
+        ("page_offset", "page_offset"),
+        ("raw_sha256", "raw_sha256"),
+        ("normalized_sha256", "normalized_instructions_sha256"),
+        ("direct_calls", "direct_calls"),
+        ("indirect_calls", "indirect_calls"),
+        ("frame_bytes", "frame_adjustment"),
+        ("spills", "spills"),
+    )
+    reservation_ranges: list[tuple[int, int, str]] = []
+    for kernel_name in kernel_names:
+        kernel = layout["kernels"][kernel_name]
+        symbol = by_kernel[kernel_name]
+        reservation_start = kernel["reservation_start"]
+        body_end = kernel["body_end"]
+        reservation_end = kernel["reservation_end"]
+        reservation_ranges.append((reservation_start, reservation_end, kernel_name))
+        _require(
+            kernel["name"] == kernel_name
+            and all(kernel[left] == symbol[right] for left, right in field_pairs),
+            f"{label} symbol/layout body mismatch: {kernel_name}",
+        )
+        _require(
+            kernel["reservation_start"]
+            == kernel["input_start"]
+            == kernel["function_start"]
+            and kernel["body_end"] == kernel["input_end"] == kernel["function_end"]
+            and kernel["body_size"] == kernel["input_size"] == kernel["function_size"],
+            f"{label} symbol/layout body range mismatch: {kernel_name}",
+        )
+        _require(
+            reservation_start <= body_end <= reservation_end
+            and reservation_end - reservation_start == max_page
+            and kernel["output_start"] == reservation_start
+            and kernel["output_end"] == reservation_end
+            and kernel["reservation_size"] == max_page
+            and reservation_start % max_page == 0
+            and kernel["max_page_remainder"] == 0
+            and kernel["page_offset"] == reservation_start % 4096
+            and kernel["body_size"] == body_end - reservation_start,
+            f"{label} layout reservation/body arithmetic mismatch: {kernel_name}",
+        )
+        sentinel_stem = KERNEL_SENTINEL_STEMS[kernel_name]
+        for sentinel_name in SENTINEL_FIELDS:
+            sentinel = kernel["sentinels"][sentinel_name]
+            _require(
+                sentinel["name"]
+                == f"__opthash_cache_gate_{sentinel_stem}_{sentinel_name}"
+                and sentinel["address"] == kernel[sentinel_name]
+                and kernel["link_map_sentinels"][sentinel_name] == kernel[sentinel_name]
+                and sentinel["count"] == 1
+                and sentinel["binding"] == "GLOBAL"
+                and sentinel["visibility"] == "DEFAULT"
+                and sentinel["defined"] is True,
+                f"{label} sentinel mismatch: {kernel_name}/{sentinel_name}",
+            )
+    for left, right in zip(
+        sorted(reservation_ranges), sorted(reservation_ranges)[1:], strict=False
+    ):
+        _require(
+            right[0] >= left[1],
+            f"{label} reservation overlap: {left[2]}/{right[2]}",
+        )
+
+
 def verify_capability_shape_records(
     capability: dict[str, Any],
     read_record: Any,
@@ -1781,6 +2145,26 @@ def verify_capability_shape_records(
                 layout,
                 _layout_schema(kernel_names),
                 f"{flavor}/{target} layout",
+            )
+            _verify_symbol_layout_contract(
+                symbols,
+                layout,
+                target,
+                kernel_names,
+                f"{flavor}/{target}",
+            )
+            _require(
+                symbols["architecture"] == capability["arch"],
+                f"{flavor}/{target} architecture mismatch",
+            )
+            expected_map_flavor = (
+                _expected_link_map_flavor(capability["linker"], "actual")
+                if flavor == "actual"
+                else flavor
+            )
+            _require(
+                layout["link_map_flavor"] == expected_map_flavor,
+                f"{flavor}/{target} link-map flavor mismatch",
             )
             symbol_names = [
                 symbol["name"].rsplit("::", 1)[-1] for symbol in symbols["symbols"]
@@ -1841,7 +2225,11 @@ def verify_capability_shape_records(
                 roots.map_path(execution["cwd"])
                 validate_path_list(execution["path"], roots)
                 validate_command(
-                    execution["argv"], roots, rustc=False, has_program=False
+                    execution["argv"],
+                    roots,
+                    rustc=False,
+                    has_program=False,
+                    cwd=execution["cwd"],
                 )
                 roots.map_path(execution["raw_output"])
 
@@ -1886,7 +2274,11 @@ def verify_capability_shape_records(
                     roots.map_path(cargo["cwd"])
                     validate_path_list(cargo["path"], roots)
                     validate_command(
-                        cargo["argv"], roots, rustc=False, has_program=False
+                        cargo["argv"],
+                        roots,
+                        rustc=False,
+                        has_program=False,
+                        cwd=cargo["cwd"],
                     )
                     roots.map_path(cargo["raw_output"])
                 driver_argv = cargo["argv"]
@@ -1969,12 +2361,117 @@ def capability_shapes(capability: dict[str, Any]) -> set[tuple[str, str, int]]:
     }
 
 
+def verify_x86_contracts(
+    capability: dict[str, Any],
+    manifests: list[dict[str, Any]],
+    v1: dict[str, Any],
+) -> None:
+    _require(
+        capability["arch"] == "x86_64"
+        and capability["target_triple"] == X86_TARGET_TRIPLE,
+        "exact native x86_64 target mismatch",
+    )
+    actual_map_flavor = _expected_link_map_flavor(capability["linker"], "actual")
+    _require(
+        capability["required_linkers"]["gnu"]["flavor"] == "GNU ld"
+        and capability["required_linkers"]["lld"]["flavor"] == "LLD",
+        "required GNU/LLD linker flavor mismatch",
+    )
+    for manifest in manifests:
+        _require(
+            manifest["architecture"] == "x86_64",
+            "v2 manifest architecture mismatch",
+        )
+        for executable, (target, _kernel_names) in EXECUTABLE_TARGETS.items():
+            _require(
+                manifest["symbols"][executable]["architecture"] == "x86_64",
+                f"{executable} symbol architecture mismatch",
+            )
+            layout = manifest["elf_layout"][executable]
+            _require(
+                layout["target"] == target
+                and layout["arch"] == "x86_64"
+                and layout["link_map_flavor"] == actual_map_flavor,
+                f"{executable} x86 layout target/architecture/flavor mismatch",
+            )
+    _require(v1["architecture"] == "x86_64", "v1 manifest architecture mismatch")
+    for executable in EXECUTABLE_TARGETS:
+        _require(
+            v1["symbols"][executable]["architecture"] == "x86_64",
+            f"v1 {executable} symbol architecture mismatch",
+        )
+
+
+def _rooted_path(root: str, relative: str) -> str:
+    base = _canonical_absolute(root, "identity root")
+    return (base / PurePosixPath(relative)).as_posix()
+
+
+def _control_root(control: dict[str, Any]) -> str:
+    relative = PurePosixPath(CONTROL_INPUT_IDENTITIES["cargo_manifest"][0])
+    manifest = _canonical_absolute(
+        control["inputs"]["cargo_manifest"]["absolute_path"],
+        "control Cargo manifest",
+    )
+    _require(
+        len(manifest.parts) > len(relative.parts)
+        and manifest.parts[-len(relative.parts) :] == relative.parts,
+        "control input identity mismatch",
+    )
+    root_parts = manifest.parts[: -len(relative.parts)]
+    return PurePosixPath(*root_parts).as_posix()
+
+
+def _verify_control_identity(
+    control: dict[str, Any],
+    root: str,
+    commit: str,
+    tree: str,
+    *,
+    v2: bool,
+) -> None:
+    _require(control["locked"] is True, "control locked identity mismatch")
+    if v2:
+        _require(
+            control["runner_root"] == root
+            and control["runner_commit"] == commit
+            and control["builder_commit"] == commit
+            and control["runner_tree"] == tree
+            and control["builder_tree"] == tree
+            and control["mode"] == "BUILD_CONTROL",
+            "v2 control identity mismatch",
+        )
+    else:
+        _require(
+            control["builder_commit"] == commit and control["builder_tree"] == tree,
+            "v1 control identity mismatch",
+        )
+    for name, (relative, sha256) in CONTROL_INPUT_IDENTITIES.items():
+        _require(
+            control["inputs"][name]
+            == {
+                "absolute_path": _rooted_path(root, relative),
+                "sha256": sha256,
+            },
+            f"control input identity mismatch: {name}",
+        )
+    release_root = _rooted_path(root, "tools/cache-gate-control/target/release")
+    _require(
+        control["binary"]["absolute_path"]
+        == f"{release_root}/opthash-cache-gate-control"
+        and control["provenance_path"]
+        == f"{release_root}/opthash-cache-gate-control.provenance.json",
+        "control output identity mismatch",
+    )
+
+
 def verify_identity_contract(
     provenance: dict[str, Any],
     capability: dict[str, Any],
     manifests: list[dict[str, Any]],
     v1: dict[str, Any],
     capability_bytes: bytes,
+    v1_root: str,
 ) -> None:
     _require(
         provenance["subject"] == {"commit": SUBJECT_COMMIT, "tree": SUBJECT_TREE},
@@ -1987,9 +2484,17 @@ def verify_identity_contract(
         and producer["empty_diff_assertion"] is True,
         "exact subject identity mismatch in capability producer",
     )
+    _require(
+        capability["cargo_version"] == PINNED_CARGO_VERSION
+        and capability["rustc_version"] == PINNED_RUSTC_VERSION,
+        "exact pinned Rust toolchain version mismatch",
+    )
     capability_sha = hashlib.sha256(capability_bytes).hexdigest()
+    subject_root = producer["runner_root"]
+    v2_controls: list[dict[str, Any]] = []
     for manifest in manifests:
         control = manifest["control"]
+        v2_controls.append(control)
         _require(
             manifest["commit"] == SUBJECT_COMMIT
             and manifest["tree"] == SUBJECT_TREE
@@ -2001,6 +2506,32 @@ def verify_identity_contract(
             and control["mode"] == "BUILD_CONTROL",
             "exact subject identity mismatch in v2 manifest/control",
         )
+        _require(
+            control["cargo_version"] == capability["cargo_version"]
+            and control["rustc_version"] == capability["rustc_version"],
+            "v2 control Rust toolchain identity mismatch",
+        )
+        _verify_control_identity(
+            control,
+            subject_root,
+            SUBJECT_COMMIT,
+            SUBJECT_TREE,
+            v2=True,
+        )
+        for name, (relative, git_blob, sha256) in SUBJECT_TOOL_IDENTITIES.items():
+            _require(
+                manifest["tools"][name]
+                == {
+                    "absolute_path": _rooted_path(subject_root, relative),
+                    "sha256": sha256,
+                    "git_blob": git_blob,
+                    "git_blob_sha256": sha256,
+                    "reviewed_root": subject_root,
+                    "reviewed_commit": SUBJECT_COMMIT,
+                    "reviewed_tree": SUBJECT_TREE,
+                },
+                f"tool {name} exact identity mismatch",
+            )
         embedded = {
             key: value
             for key, value in manifest["linker_capability"].items()
@@ -2015,12 +2546,43 @@ def verify_identity_contract(
             "capability copy differs from held capability bytes",
         )
     _require(
+        bool(v2_controls)
+        and all(control == v2_controls[0] for control in v2_controls[1:]),
+        "v2 control identities differ",
+    )
+    declared_v1_root = _canonical_absolute(str(v1_root), "declared v1 root").as_posix()
+    _require(
+        _control_root(v1["control"]) == declared_v1_root,
+        "v1 control root differs from declared portable root",
+    )
+    _require(
         v1["commit"] == V1_REPLAY_COMMIT
         and v1["tree"] == V1_REPLAY_TREE
         and v1["empty_diff_assertion"] is True
         and v1["control"]["builder_commit"] == V1_REPLAY_COMMIT
         and v1["control"]["builder_tree"] == V1_REPLAY_TREE,
         "exact v1 replay identity mismatch",
+    )
+    _verify_control_identity(
+        v1["control"],
+        declared_v1_root,
+        V1_REPLAY_COMMIT,
+        V1_REPLAY_TREE,
+        v2=False,
+    )
+    _require(
+        v1["control"]["binary"]["sha256"] == v2_controls[0]["binary"]["sha256"]
+        and v1["control"]["cargo_version"]
+        == v2_controls[0]["cargo_version"]
+        == capability["cargo_version"]
+        and v1["control"]["rustc_version"]
+        == v2_controls[0]["rustc_version"]
+        == capability["rustc_version"]
+        and {name: record["sha256"] for name, record in v1["control"]["inputs"].items()}
+        == {
+            name: record["sha256"] for name, record in v2_controls[0]["inputs"].items()
+        },
+        "v1/v2 control identity mismatch",
     )
 
 
@@ -2179,6 +2741,14 @@ def verify_manifest_relationships(
     ):
         _validate_schema(manifest, MANIFEST_V2_SCHEMA, label)
         _validate_manifest_build_proof(manifest, label)
+        for executable, (target, kernel_names) in EXECUTABLE_TARGETS.items():
+            _verify_symbol_layout_contract(
+                manifest["symbols"][executable],
+                manifest["elf_layout"][executable],
+                target,
+                kernel_names,
+                f"{label}/{executable}",
+            )
     _require(
         clean_a["variant"].endswith("-clean-a")
         and clean_b["variant"].endswith("-clean-b")
@@ -2279,6 +2849,22 @@ def verify_manifest_relationships(
                 _require(
                     all(observed[field] == anchor[field] for field in placement_fields),
                     f"{label} kernel placement mismatch: {kernel}",
+                )
+                body_fields = (
+                    LAYOUT_BODY_FIELDS
+                    if label == "clean"
+                    else tuple(
+                        field for field in LAYOUT_BODY_FIELDS if field != "raw_sha256"
+                    )
+                )
+                _require(
+                    all(observed[field] == anchor[field] for field in body_fields),
+                    f"{label} kernel body mismatch: {kernel}",
+                )
+                _require(
+                    observed["sentinels"] == anchor["sentinels"]
+                    and observed["link_map_sentinels"] == anchor["link_map_sentinels"],
+                    f"{label} kernel sentinel mismatch: {kernel}",
                 )
     for executable in EXECUTABLE_TARGETS:
         record = adversary["build_proof"]["executables"][executable]["adversary"]
@@ -3104,6 +3690,23 @@ def _verify_hash_file_records(
         )
 
 
+def _verify_subject_tool_bytes(
+    root: Path, roots: PortableRoots, tools: dict[str, Any]
+) -> None:
+    for name, record in tools.items():
+        mapped = roots.map_path(record["absolute_path"], expected_root="subject")
+        data = _read_extracted(root, mapped.as_posix())
+        blob_payload = f"blob {len(data)}\0".encode() + data
+        git_blob = hashlib.sha1(blob_payload, usedforsecurity=False).hexdigest()
+        _require(
+            git_blob == record["git_blob"]
+            and hashlib.sha256(data).hexdigest()
+            == record["git_blob_sha256"]
+            == record["sha256"],
+            f"tool {name} archived bytes differ from exact Git blob",
+        )
+
+
 def _verify_path_hash_pair(
     root: Path,
     roots: PortableRoots,
@@ -3141,6 +3744,14 @@ def _verify_control_provenance(
         },
         f"{label} content mismatch",
     )
+
+
+def _verify_control_namespace(
+    control: dict[str, Any], roots: PortableRoots, expected_root: str
+) -> None:
+    for record in (control["binary"], *control["inputs"].values()):
+        roots.map_path(record["absolute_path"], expected_root=expected_root)
+    roots.map_path(control["provenance_path"], expected_root=expected_root)
 
 
 def _mapped_extracted_file(root: Path, roots: PortableRoots, raw: str) -> Path:
@@ -3394,6 +4005,7 @@ def _verify_manifests(
         _verify_hash_file_records(
             root, roots, manifest, f"manifest {manifest['variant']}"
         )
+        _verify_subject_tool_bytes(root, roots, manifest["tools"])
         _require(
             _read_extracted(
                 root,
@@ -3404,6 +4016,7 @@ def _verify_manifests(
             == capability_bytes,
             "capability copy bytes differ from original document",
         )
+        _verify_control_namespace(manifest["control"], roots, "subject")
         _verify_control_provenance(
             root, roots, manifest["control"], "control provenance"
         )
@@ -3469,6 +4082,7 @@ def _verify_manifests(
                 roots,
                 rustc=False,
                 has_program=False,
+                cwd=manifest["runner_root"],
             )
             rlib_paths = _manifest_rlib_paths(root, roots, manifest, executable)
 
@@ -3504,6 +4118,7 @@ def _verify_manifests(
         },
         "v1 build configuration mismatch",
     )
+    _verify_control_namespace(v1["control"], roots, "v1")
     _verify_control_provenance(root, roots, v1["control"], "v1 control provenance")
     v1_hosted = roots.by_name["v1"][0]
     for executable in EXECUTABLE_TARGETS:
@@ -3572,7 +4187,13 @@ def _verify_transcripts(
             and transcript["payload_sha256"] == driver["payload_sha256"],
             "hosted transcript linker identity mismatch",
         )
-        validate_command(transcript["argv"], roots, rustc=False, has_program=False)
+        validate_command(
+            transcript["argv"],
+            roots,
+            rustc=False,
+            has_program=False,
+            cwd=transcript["cwd"],
+        )
         roots.map_path(transcript["argv0"], expected_root="system-root")
         roots.map_path(transcript["cwd"], expected_root="subject")
         validate_path_list(transcript["path"], roots)
@@ -3600,7 +4221,13 @@ def _verify_transcripts(
             "hosted transcript trace schema/count mismatch",
         )
         for record in trace_records:
-            validate_command(record["argv"], roots, rustc=False, has_program=False)
+            validate_command(
+                record["argv"],
+                roots,
+                rustc=False,
+                has_program=False,
+                cwd=record["cwd"],
+            )
             roots.map_path(record["argv0"], expected_root="system-root")
             roots.map_path(record["cwd"])
             validate_path_list(record["path"], roots)
@@ -3772,7 +4399,15 @@ def _verify_extracted_documents(root: Path, archive_sha256: str) -> Verification
     ):
         validate_concrete_route_values(kind, document, roots)
 
-    verify_identity_contract(provenance, capability, manifests, v1, capability_bytes)
+    verify_identity_contract(
+        provenance,
+        capability,
+        manifests,
+        v1,
+        capability_bytes,
+        roots.by_name["v1"][0],
+    )
+    verify_x86_contracts(capability, manifests, v1)
     _verify_capability(root, roots, capability)
     clean_a, clean_b, adversary = _verify_manifests(
         root, roots, capability, capability_bytes, manifests, v1

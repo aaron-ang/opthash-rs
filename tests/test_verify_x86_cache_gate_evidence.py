@@ -28,6 +28,77 @@ SUBJECT_COMMIT = "061d13da22b89208c801308efd578444c8e9caba"
 SUBJECT_TREE = "24921a941f8c3c26467465b99d6b45ee5912b2da"
 V1_REPLAY_COMMIT = "b0d53234dc051af91fe0321450b3e8312a84e635"
 V1_REPLAY_TREE = "d77cc082fe48799f26ff4440bd1898a71d0dc8cc"
+PINNED_CARGO_VERSION = "cargo 1.95.0 (f2d3ce0bd 2026-03-21)"
+PINNED_RUSTC_VERSION = (
+    "rustc 1.95.0 (59807616e 2026-04-14)\n"
+    "binary: rustc\n"
+    "commit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\n"
+    "commit-date: 2026-04-14\n"
+    "host: x86_64-unknown-linux-gnu\n"
+    "release: 1.95.0\n"
+    "LLVM version: 22.1.2"
+)
+KERNEL_SENTINEL_STEMS = {
+    "elastic_cache_gate_insert_kernel": "elastic_insert",
+    "elastic_cache_gate_get_kernel": "elastic_get",
+    "funnel_cache_gate_insert_kernel": "funnel_insert",
+    "funnel_cache_gate_get_kernel": "funnel_get",
+    "elastic_profile_insert_kernel": "profile_elastic_insert",
+    "elastic_profile_get_kernel": "profile_elastic_get",
+    "funnel_profile_insert_kernel": "profile_funnel_insert",
+    "funnel_profile_get_kernel": "profile_funnel_get",
+}
+SUBJECT_TOOL_IDENTITIES = {
+    "elf_layout": (
+        "scripts/cache-gate-elf-layout.py",
+        "38d77e3253673342ac8150836dae2f790386c152",
+        "b6cb974d815b1bfb3132632fade62bf894bd431f8f0836e5a7ddd026be69e088",
+    ),
+    "extractor": (
+        "scripts/extract-hot-symbols.py",
+        "c6f856f32f7207a5a7975a9332039e4141f11403",
+        "8553fed90042dbde1414f8d6c17e123d5c1d3dc0101c66fa336ef098e84293f7",
+    ),
+    "launcher": (
+        "scripts/cache-gate.sh",
+        "ef778aa3c7bbe8795af9d6d878a4e830a26cea79",
+        "9d549d7a19e31a6d8cba13339955aff2e5f8b26539429a67aedfaf7de393dddc",
+    ),
+    "link_wrapper": (
+        "scripts/cache-gate-link-wrapper.py",
+        "34b6761cb5f27d61553bb69105ad16b6b5bbe10a",
+        "afdb7442212dc346db0104b95d218e96b85e628e1f1ed7b6ad59203ab1e3a08c",
+    ),
+    "perf_launcher": (
+        "scripts/cache-gate-perf.sh",
+        "ce8d418fd6c7d1b798affdc4e9cf5fba69db2cc2",
+        "02d96dd5347ef52d96f5a1418ce15905087105d6ee80b9523af6353059f7fbd8",
+    ),
+    "perf_support": (
+        "scripts/cache-gate-perf-support.py",
+        "7f5434d586a1466e171f4e343adc79b3d5e224e3",
+        "8bc1de76aa791b7b10d9934db32d12f7da4d774537a00ce7d8bd99549bed4531",
+    ),
+    "snapshot": (
+        "scripts/snapshot-criterion-pair.sh",
+        "ce25155fcca66c2e1a2129c51562dad912335a42",
+        "5a050eb68b3abf8d398e7849abb2cb08fddaac8e88e1fef24314dbfbaba77607",
+    ),
+}
+CONTROL_INPUT_IDENTITIES = {
+    "cargo_manifest": (
+        "tools/cache-gate-control/Cargo.toml",
+        "086cbc963cf2b336da7f4f0ee8d06cd17c475ed1c31956058e410d05e09634dd",
+    ),
+    "cargo_lock": (
+        "tools/cache-gate-control/Cargo.lock",
+        "c8e86f671e65831bcd69ca653ae6c5761bc32ff671c24b9cac19ab17879e8666",
+    ),
+    "source": (
+        "tools/cache-gate-control/src/main.rs",
+        "2efeafb631c3bc1b04bb35729f83f221168bf0d55e02e383912c78b18d722e8c",
+    ),
+}
 REVIEWED_RECORD_SHA256S = {
     "capability.json": "29a43afea6137683f8b8df0bcc6864c753697b1cc4de51276dd9ab7770558d6f",
     "clean-a.json": "86ad819b59dc963bb4350e1d018449c8f293f498948ccaa399691c5f78946312",
@@ -92,6 +163,29 @@ def reviewed_records() -> dict[str, Any]:
         "v1": json.loads(members["v1.json"]),
         "shape_records": shape_records,
     }
+
+
+def reviewed_record_roots(verify_module: ModuleType, records: dict[str, Any]) -> Any:
+    capability = records["capability"]
+    subject = capability["producer"]["runner_root"]
+    v1 = str(
+        Path(
+            records["v1"]["executables"]["elastic_cache_gate"]["absolute_path"]
+        ).parents[3]
+    )
+    document = full_portable_paths(verify_module)
+    hosted = {
+        "orchestrator": "/home/aang",
+        "subject": subject,
+        "v1": v1,
+        "evidence": f"{subject}/target/cache-gate-evidence",
+        "toolchain": "/home/aang/.rustup",
+        "cargo-registry": "/home/aang/.cargo/registry",
+        "system-root": "/",
+    }
+    for root in document["roots"]:
+        root["hosted"] = hosted[root["name"]]
+    return verify_module.PortableRoots.from_document(document)
 
 
 def portable_paths(system_links: list[dict[str, str]] | None = None) -> dict[str, Any]:
@@ -888,6 +982,87 @@ def full_symbol(
     return symbol
 
 
+def bind_fixture_symbol_layout(
+    symbols: dict[str, Any],
+    layout: dict[str, Any],
+    target: str,
+    link_map_flavor: str,
+) -> None:
+    layout.update(
+        {
+            "target": target,
+            "arch": symbols["architecture"],
+            "link_map_flavor": link_map_flavor,
+            "max_page_size": 4096,
+        }
+    )
+    by_kernel = {
+        symbol["name"].rsplit("::", 1)[-1]: symbol for symbol in symbols["symbols"]
+    }
+    for index, (kernel_name, kernel) in enumerate(layout["kernels"].items(), start=1):
+        symbol = by_kernel[kernel_name]
+        start = index * 4096
+        body_end = start + symbol["size"]
+        reservation_end = start + 4096
+        symbol["start"] = start
+        symbol["end"] = body_end
+        symbol["page_offset"] = start % 4096
+        kernel.update(
+            {
+                "name": kernel_name,
+                "input_start": start,
+                "input_end": body_end,
+                "input_size": symbol["size"],
+                "output_section": symbol["section"],
+                "output_section_index": symbol["section_index"],
+                "output_start": start,
+                "output_end": reservation_end,
+                "reservation_start": start,
+                "body_end": body_end,
+                "reservation_end": reservation_end,
+                "body_size": symbol["size"],
+                "reservation_size": 4096,
+                "page_offset": symbol["page_offset"],
+                "max_page_remainder": 0,
+                "sh_addralign": symbol["section_alignment"],
+                "function_start": start,
+                "function_end": body_end,
+                "function_size": symbol["size"],
+                "function_section_index": symbol["section_index"],
+                "function_section_name": symbol["section_name"],
+                "raw_sha256": symbol["raw_sha256"],
+                "normalized_sha256": symbol["normalized_instructions_sha256"],
+                "direct_calls": copy.deepcopy(symbol["direct_calls"]),
+                "indirect_calls": copy.deepcopy(symbol["indirect_calls"]),
+                "frame_bytes": symbol["frame_adjustment"],
+                "spills": copy.deepcopy(symbol["spills"]),
+                "sentinels": {
+                    name: {
+                        "name": (
+                            "__opthash_cache_gate_"
+                            f"{KERNEL_SENTINEL_STEMS[kernel_name]}_{name}"
+                        ),
+                        "address": address,
+                        "binding": "GLOBAL",
+                        "visibility": "DEFAULT",
+                        "defined": True,
+                        "count": 1,
+                    }
+                    for name, address in (
+                        ("reservation_start", start),
+                        ("body_end", body_end),
+                        ("reservation_end", reservation_end),
+                    )
+                },
+                "link_map_sentinels": {
+                    "reservation_start": start,
+                    "body_end": body_end,
+                    "reservation_end": reservation_end,
+                },
+            }
+        )
+
+
 def set_linker_record(record: dict[str, Any], flavor: str, linker_sha: str) -> None:
     path = f"/usr/bin/{flavor}"
     record.update(
@@ -915,6 +1090,8 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
             "accepted": True,
             "arch": "x86_64",
             "target_triple": "x86_64-unknown-linux-gnu",
+            "cargo_version": PINNED_CARGO_VERSION,
+            "rustc_version": PINNED_RUSTC_VERSION,
             "max_page_size": 4096,
             "fragment_set_sha256": verify_module._fingerprint(
                 [
@@ -938,6 +1115,9 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
     set_linker_record(capability["linker"], "actual", linker_sha)
     set_linker_record(capability["required_linkers"]["gnu"], "gnu", linker_sha)
     set_linker_record(capability["required_linkers"]["lld"], "lld", linker_sha)
+    capability["linker"]["flavor"] = "GNU ld"
+    capability["required_linkers"]["gnu"]["flavor"] = "GNU ld"
+    capability["required_linkers"]["lld"]["flavor"] = "LLD"
     shape_files: dict[str, bytes] = {}
     hosted_files: dict[str, bytes] = {}
     for flavor in ("actual", "gnu", "lld"):
@@ -971,8 +1151,6 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
             )
             layout.update(
                 {
-                    "target": target,
-                    "arch": "x86_64",
                     "binary": "/host/subject/payload",
                     "binary_sha256": payload_sha,
                     "link_map": "/host/subject/payload",
@@ -983,6 +1161,12 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
                     "veneer_thunk_inventory": [],
                     "plt_inventory": [],
                 }
+            )
+            bind_fixture_symbol_layout(
+                symbols,
+                layout,
+                target,
+                ("gnu" if flavor in {"actual", "gnu"} else "lld"),
             )
             for item in layout["cache_gate_input_sections"]:
                 item["owner"] = "/host/subject/input.o"
@@ -1147,7 +1331,7 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
                 "-C",
                 "codegen-units=16",
                 "-C",
-                "linker=/host/subject/payload",
+                "linker=/host/subject/scripts/cache-gate-link-wrapper.py",
             ],
             "linker_flags": [
                 "-Wl,-T,<target-fragment>",
@@ -1158,14 +1342,45 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
     manifest["build_proof"]["codegen_units"] = 16
     manifest["control"]["runner_root"] = "/host/subject"
     manifest["control"]["mode"] = "BUILD_CONTROL"
+    manifest["control"]["locked"] = True
+    manifest["control"]["cargo_version"] = PINNED_CARGO_VERSION
+    manifest["control"]["rustc_version"] = PINNED_RUSTC_VERSION
     for field in ("runner_commit", "builder_commit"):
         manifest["control"][field] = SUBJECT_COMMIT
     for field in ("runner_tree", "builder_tree"):
         manifest["control"][field] = SUBJECT_TREE
-    manifest["control"]["provenance_path"] = "/host/subject/payload"
-    manifest["control"]["provenance_sha256"] = payload_sha
-    for tool in manifest["tools"].values():
-        tool["reviewed_root"] = "/host/subject"
+    control_binary_path = (
+        "/host/subject/tools/cache-gate-control/target/release/"
+        "opthash-cache-gate-control"
+    )
+    manifest["control"]["binary"] = {
+        "absolute_path": control_binary_path,
+        "sha256": payload_sha,
+    }
+    hosted_files[control_binary_path] = b"payload"
+    for name, (relative, sha256) in CONTROL_INPUT_IDENTITIES.items():
+        data = (ROOT / relative).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == sha256
+        hosted = f"/host/subject/{relative}"
+        manifest["control"]["inputs"][name] = {
+            "absolute_path": hosted,
+            "sha256": sha256,
+        }
+        hosted_files[hosted] = data
+    for name, (relative, git_blob, sha256) in SUBJECT_TOOL_IDENTITIES.items():
+        data = (ROOT / relative).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == sha256
+        hosted = f"/host/subject/{relative}"
+        manifest["tools"][name] = {
+            "absolute_path": hosted,
+            "sha256": sha256,
+            "git_blob": git_blob,
+            "git_blob_sha256": sha256,
+            "reviewed_root": "/host/subject",
+            "reviewed_commit": SUBJECT_COMMIT,
+            "reviewed_tree": SUBJECT_TREE,
+        }
+        hosted_files[hosted] = data
     manifest["linker_capability"] = {
         **copy.deepcopy(capability),
         "copy": {
@@ -1191,6 +1406,12 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
         layout["archive_member_owners"] = []
         layout["veneer_thunk_inventory"] = []
         layout["plt_inventory"] = []
+        bind_fixture_symbol_layout(
+            manifest["symbols"][executable],
+            layout,
+            _target,
+            "gnu",
+        )
         for item in layout["cache_gate_input_sections"]:
             item["owner"] = "/host/subject/input.o"
         for kernel_name, kernel in layout["kernels"].items():
@@ -1216,7 +1437,7 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
         proof["link_command"]["executable"] = "/host/subject/payload"
         proof["link_command"]["fragment"] = "/host/subject/payload"
         proof["link_command"]["link_map"] = "/host/subject/payload"
-        set_linker_record(proof["link_command"]["driver"], "actual", linker_sha)
+        proof["link_command"]["driver"] = copy.deepcopy(capability["linker"])
         proof["adversary"] = {
             "symbol_occurrences": [],
             "input_section_occurrences": 0,
@@ -1264,7 +1485,10 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
                 if key not in {"provenance_path", "provenance_sha256"}
             }
         )
-        control_path = f"{artifact_root}/control-provenance.json"
+        control_path = (
+            "/host/subject/tools/cache-gate-control/target/release/"
+            "opthash-cache-gate-control.provenance.json"
+        )
         hosted_files[control_path] = control_bytes
         control["provenance_path"] = control_path
         control["provenance_sha256"] = hashlib.sha256(control_bytes).hexdigest()
@@ -1356,6 +1580,26 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
     }
     v1["control"]["builder_commit"] = V1_REPLAY_COMMIT
     v1["control"]["builder_tree"] = V1_REPLAY_TREE
+    v1["control"]["locked"] = True
+    v1["control"]["cargo_version"] = PINNED_CARGO_VERSION
+    v1["control"]["rustc_version"] = PINNED_RUSTC_VERSION
+    v1_binary_path = (
+        "/host/v1/tools/cache-gate-control/target/release/opthash-cache-gate-control"
+    )
+    v1["control"]["binary"] = {
+        "absolute_path": v1_binary_path,
+        "sha256": payload_sha,
+    }
+    hosted_files[v1_binary_path] = b"payload"
+    for name, (relative, sha256) in CONTROL_INPUT_IDENTITIES.items():
+        data = (ROOT / relative).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == sha256
+        hosted = f"/host/v1/{relative}"
+        v1["control"]["inputs"][name] = {
+            "absolute_path": hosted,
+            "sha256": sha256,
+        }
+        hosted_files[hosted] = data
     v1_control_bytes = json_bytes(
         {
             key: value
@@ -1363,9 +1607,12 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
             if key not in {"provenance_path", "provenance_sha256"}
         }
     )
-    v1["control"]["provenance_path"] = "/host/v1/control-provenance.json"
+    v1["control"]["provenance_path"] = (
+        "/host/v1/tools/cache-gate-control/target/release/"
+        "opthash-cache-gate-control.provenance.json"
+    )
     v1["control"]["provenance_sha256"] = hashlib.sha256(v1_control_bytes).hexdigest()
-    hosted_files["/host/v1/control-provenance.json"] = v1_control_bytes
+    hosted_files[v1["control"]["provenance_path"]] = v1_control_bytes
     for executable, (_target, kernels) in verify_module.EXECUTABLE_TARGETS.items():
         v1["symbols"][executable].update(
             {
@@ -1746,6 +1993,62 @@ def test_rustc_command_classifies_output_directory(
     verify_module.validate_command(
         ["rustc", "--out-dir=/host/subject/out"], roots, rustc=True
     )
+
+
+def test_command_resolves_every_relative_positional_against_authenticated_cwd(
+    verify_module: ModuleType,
+) -> None:
+    roots = verify_module.PortableRoots.from_document(
+        full_portable_paths(verify_module)
+    )
+    verify_module.validate_command(
+        ["rustc", "--crate-name", "proof", "src/lib.rs", "bare-input"],
+        roots,
+        rustc=True,
+        cwd="/host/subject",
+    )
+    with pytest.raises(verify_module.EvidenceError, match="authenticated cwd"):
+        verify_module.validate_command(
+            ["rustc", "src/lib.rs"],
+            roots,
+            rustc=True,
+        )
+
+
+def test_command_accepts_only_exact_gcc_resolution_transient_grammar(
+    verify_module: ModuleType,
+) -> None:
+    roots = verify_module.PortableRoots.from_document(
+        full_portable_paths(verify_module)
+    )
+    verify_module.validate_command(
+        ["ld", "-plugin-opt=-fresolution=/tmp/ccA09zQ2.res"],
+        roots,
+        rustc=False,
+        cwd="/host/subject",
+    )
+    for value in (
+        "/tmp/ccA09z.res",
+        "/tmp/ccA09zQ2x.res",
+        "/outside/ccA09z.res",
+        "/tmp/not-gcc.res",
+        "/tmp/ccA09z.o",
+        "ccA09z.res",
+    ):
+        with pytest.raises(verify_module.EvidenceError, match="resolution"):
+            verify_module.validate_command(
+                ["ld", f"-plugin-opt=-fresolution={value}"],
+                roots,
+                rustc=False,
+                cwd="/host/subject",
+            )
+    with pytest.raises(verify_module.EvidenceError, match="outside declared roots"):
+        verify_module.validate_command(
+            ["ld", "/tmp/evil.o"],
+            roots,
+            rustc=False,
+            cwd="/host/subject",
+        )
 
 
 def test_path_list_rejects_empty_and_cross_namespace_entries(
@@ -2131,6 +2434,34 @@ def test_real_capability_shape_records_bind_nine_executions(
     }
 
 
+def test_real_fixture_routes_every_authentic_command_with_authenticated_roots(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+    roots = reviewed_record_roots(verify_module, records)
+
+    rustc_commands = [
+        line
+        for proof in records["clean_a"]["build_proof"]["executables"].values()
+        for line in proof["rustc_argv"]
+    ]
+    assert len(rustc_commands) == 92
+    for line in rustc_commands:
+        verify_module.validate_rustc_transcript(line, roots)
+
+    def read_record(flavor: str, target: str, name: str) -> bytes:
+        return records["shape_records"][f"capability-shapes/{flavor}/{target}/{name}"]
+
+    assert (
+        len(
+            verify_module.verify_capability_shape_records(
+                records["capability"], read_record, roots
+            )
+        )
+        == 9
+    )
+
+
 def test_capability_shape_rejects_linker_identity_substitution(
     verify_module: ModuleType,
 ) -> None:
@@ -2167,6 +2498,240 @@ def test_full_clean_and_adversary_relationships_use_immutable_fields(
     clean_b["build_proof"]["link_order_fingerprint"] = "f" * 64
     with pytest.raises(verify_module.EvidenceError, match="clean build proof"):
         verify_module.verify_manifest_relationships(clean_a, clean_b, adversary)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("raw_sha256", "f" * 64),
+        ("body_end", 999_999),
+        ("sentinels", {"reservation_start": {"address": 999_999}}),
+        ("link_map_sentinels", {"body_end": 999_999}),
+    ],
+)
+def test_clean_layout_comparison_rejects_raw_body_end_and_sentinel_drift(
+    verify_module: ModuleType,
+    field: str,
+    replacement: Any,
+) -> None:
+    records = reviewed_records()
+    clean_a = records["clean_a"]
+    clean_b = records["clean_b"]
+    adversary = records["adversary"]
+    kernel = clean_b["elf_layout"]["elastic_cache_gate"]["kernels"][
+        "elastic_cache_gate_insert_kernel"
+    ]
+    if field in {"sentinels", "link_map_sentinels"}:
+        for key, value in replacement.items():
+            if isinstance(value, dict):
+                kernel[field][key].update(value)
+            else:
+                kernel[field][key] = value
+    else:
+        kernel[field] = replacement
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="body|sentinel|symbol/layout",
+    ):
+        verify_module.verify_manifest_relationships(clean_a, clean_b, adversary)
+
+
+def test_layout_body_is_cross_bound_to_symbol_record(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+    for manifest in (
+        records["clean_a"],
+        records["clean_b"],
+        records["adversary"],
+    ):
+        manifest["elf_layout"]["elastic_cache_gate"]["kernels"][
+            "elastic_cache_gate_insert_kernel"
+        ]["raw_sha256"] = "f" * 64
+    with pytest.raises(verify_module.EvidenceError, match="symbol/layout"):
+        verify_module.verify_manifest_relationships(
+            records["clean_a"], records["clean_b"], records["adversary"]
+        )
+
+
+def test_manifest_layout_rejects_coherent_non_arithmetic_body_size(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+    kernel_name = "elastic_cache_gate_insert_kernel"
+    for manifest in (
+        records["clean_a"],
+        records["clean_b"],
+        records["adversary"],
+    ):
+        layout = manifest["elf_layout"]["elastic_cache_gate"]["kernels"][kernel_name]
+        for field in ("body_size", "input_size", "function_size"):
+            layout[field] += 1
+        symbol = next(
+            item
+            for item in manifest["symbols"]["elastic_cache_gate"]["symbols"]
+            if item["name"].endswith(f"::{kernel_name}")
+        )
+        symbol["size"] += 1
+    with pytest.raises(verify_module.EvidenceError, match="size|range|arithmetic"):
+        verify_module.verify_manifest_relationships(
+            records["clean_a"], records["clean_b"], records["adversary"]
+        )
+
+
+def test_manifest_layout_rejects_coherent_attacker_sentinel_names(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+    for manifest in (
+        records["clean_a"],
+        records["clean_b"],
+        records["adversary"],
+    ):
+        manifest["elf_layout"]["elastic_cache_gate"]["kernels"][
+            "elastic_cache_gate_insert_kernel"
+        ]["sentinels"]["body_end"]["name"] = "__attacker_body_end"
+    with pytest.raises(verify_module.EvidenceError, match="sentinel.*name|sentinel"):
+        verify_module.verify_manifest_relationships(
+            records["clean_a"], records["clean_b"], records["adversary"]
+        )
+
+
+def test_capability_shape_rejects_attacker_sentinel_name(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+    capability = copy.deepcopy(records["capability"])
+    shape_records = copy.deepcopy(records["shape_records"])
+    key = "capability-shapes/actual/elastic/layout.json"
+    layout = json.loads(shape_records[key])
+    layout["kernels"]["elastic_cache_gate_insert_kernel"]["sentinels"]["body_end"][
+        "name"
+    ] = "__attacker_body_end"
+    shape_records[key] = json_bytes(layout)
+    capability["shapes"]["actual"]["elastic"]["layout"]["sha256"] = hashlib.sha256(
+        shape_records[key]
+    ).hexdigest()
+
+    def read_record(flavor: str, target: str, name: str) -> bytes:
+        return shape_records[f"capability-shapes/{flavor}/{target}/{name}"]
+
+    with pytest.raises(verify_module.EvidenceError, match="sentinel.*name|sentinel"):
+        verify_module.verify_capability_shape_records(capability, read_record)
+
+
+def test_adversary_raw_relocation_is_accepted_only_when_symbol_and_layout_agree(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+    adversary = records["adversary"]
+    kernel_name = "elastic_cache_gate_insert_kernel"
+    raw_sha256 = "f" * 64
+    adversary["elf_layout"]["elastic_cache_gate"]["kernels"][kernel_name][
+        "raw_sha256"
+    ] = raw_sha256
+    symbol = next(
+        item
+        for item in adversary["symbols"]["elastic_cache_gate"]["symbols"]
+        if item["name"].endswith(f"::{kernel_name}")
+    )
+    symbol["raw_sha256"] = raw_sha256
+    verify_module.verify_manifest_relationships(
+        records["clean_a"], records["clean_b"], adversary
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "target-triple",
+        "manifest-architecture",
+        "v1-architecture",
+        "v1-symbol-architecture",
+        "symbol-architecture",
+        "layout-target",
+        "layout-architecture",
+        "actual-record-flavor",
+        "gnu-record-flavor",
+        "lld-record-flavor",
+        "lld-link-map-flavor",
+    ],
+)
+def test_exact_x86_target_architecture_and_linker_flavor_contract(
+    verify_module: ModuleType,
+    mutation: str,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifests = documents["manifests"]
+    v1 = documents["manifest_v1"]
+    if mutation == "target-triple":
+        capability["target_triple"] = "aarch64-unknown-linux-gnu"
+    elif mutation == "manifest-architecture":
+        manifests[0]["architecture"] = "aarch64"
+    elif mutation == "v1-architecture":
+        v1["architecture"] = "aarch64"
+    elif mutation == "v1-symbol-architecture":
+        v1["symbols"]["elastic_cache_gate"]["architecture"] = "aarch64"
+    elif mutation == "symbol-architecture":
+        manifests[0]["symbols"]["elastic_cache_gate"]["architecture"] = "aarch64"
+    elif mutation == "layout-target":
+        manifests[0]["elf_layout"]["elastic_cache_gate"]["target"] = "funnel"
+    elif mutation == "layout-architecture":
+        manifests[0]["elf_layout"]["elastic_cache_gate"]["arch"] = "aarch64"
+    elif mutation == "actual-record-flavor":
+        capability["linker"]["flavor"] = "mold"
+    elif mutation == "gnu-record-flavor":
+        capability["required_linkers"]["gnu"]["flavor"] = "LLD"
+    elif mutation == "lld-record-flavor":
+        capability["required_linkers"]["lld"]["flavor"] = "GNU ld"
+    else:
+        manifests[0]["elf_layout"]["elastic_cache_gate"]["link_map_flavor"] = "lld"
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="x86|architecture|target|flavor",
+    ):
+        verify_module.verify_x86_contracts(capability, manifests, v1)
+
+
+@pytest.mark.parametrize(
+    ("flavor", "record_name", "field", "replacement"),
+    [
+        ("actual", "symbols.json", "architecture", "x86_64"),
+        ("actual", "layout.json", "target", "funnel"),
+        ("actual", "layout.json", "arch", "x86_64"),
+        ("actual", "layout.json", "link_map_flavor", "lld"),
+        ("gnu", "layout.json", "link_map_flavor", "lld"),
+        ("lld", "layout.json", "link_map_flavor", "gnu"),
+    ],
+)
+def test_capability_shape_records_bind_arch_target_and_keyed_flavor(
+    verify_module: ModuleType,
+    flavor: str,
+    record_name: str,
+    field: str,
+    replacement: str,
+) -> None:
+    records = reviewed_records()
+    capability = copy.deepcopy(records["capability"])
+    shape_records = copy.deepcopy(records["shape_records"])
+    key = f"capability-shapes/{flavor}/elastic/{record_name}"
+    document = json.loads(shape_records[key])
+    document[field] = replacement
+    shape_records[key] = json_bytes(document)
+    artifact = "symbols" if record_name == "symbols.json" else "layout"
+    capability["shapes"][flavor]["elastic"][artifact]["sha256"] = hashlib.sha256(
+        shape_records[key]
+    ).hexdigest()
+
+    def read_record(shape_flavor: str, target: str, name: str) -> bytes:
+        return shape_records[f"capability-shapes/{shape_flavor}/{target}/{name}"]
+
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="architecture|target|flavor",
+    ):
+        verify_module.verify_capability_shape_records(capability, read_record)
 
 
 @pytest.mark.parametrize(
@@ -2250,6 +2815,7 @@ def test_exact_identity_contract_binds_subject_v1_controls_and_capability_bytes(
         manifests,
         v1,
         json_bytes(capability),
+        "/host/v1",
     )
     manifests[0]["control"]["builder_commit"] = "f" * 40
     with pytest.raises(
@@ -2262,6 +2828,111 @@ def test_exact_identity_contract_binds_subject_v1_controls_and_capability_bytes(
             manifests,
             v1,
             json_bytes(capability),
+            "/host/v1",
+        )
+
+
+def test_identity_rejects_equal_but_unpinned_rust_toolchain(
+    verify_module: ModuleType,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifests = documents["manifests"]
+    v1 = documents["manifest_v1"]
+    capability["cargo_version"] = "cargo 9.9.9"
+    capability["rustc_version"] = (
+        "rustc 9.9.9\nhost: x86_64-unknown-linux-gnu\nrelease: 9.9.9"
+    )
+    for manifest in manifests:
+        manifest["control"]["cargo_version"] = capability["cargo_version"]
+        manifest["control"]["rustc_version"] = capability["rustc_version"]
+        manifest["linker_capability"]["cargo_version"] = capability["cargo_version"]
+        manifest["linker_capability"]["rustc_version"] = capability["rustc_version"]
+        manifest["linker_capability"]["copy"]["sha256"] = hashlib.sha256(
+            json_bytes(capability)
+        ).hexdigest()
+    v1["control"]["cargo_version"] = capability["cargo_version"]
+    v1["control"]["rustc_version"] = capability["rustc_version"]
+
+    with pytest.raises(verify_module.EvidenceError, match="Rust|toolchain|version"):
+        verify_module.verify_identity_contract(
+            documents["provenance"],
+            capability,
+            manifests,
+            v1,
+            json_bytes(capability),
+            "/host/v1",
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "tool-revision",
+        "tool-tree",
+        "tool-blob",
+        "tool-blob-sha",
+        "tool-path",
+        "tool-bytes",
+        "v2-unlocked",
+        "v1-unlocked",
+        "v2-control-root",
+        "control-version",
+        "v1-declared-root",
+        "v1-control-input-path",
+    ],
+)
+def test_exact_identity_contract_binds_tools_and_locked_controls(
+    verify_module: ModuleType,
+    mutation: str,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifests = documents["manifests"]
+    v1 = documents["manifest_v1"]
+    provenance = documents["provenance"]
+    declared_v1_root = "/host/v1"
+    if mutation == "tool-revision":
+        manifests[0]["tools"]["launcher"]["reviewed_commit"] = "f" * 40
+    elif mutation == "tool-tree":
+        manifests[0]["tools"]["launcher"]["reviewed_tree"] = "f" * 40
+    elif mutation == "tool-blob":
+        manifests[0]["tools"]["launcher"]["git_blob"] = "f" * 40
+    elif mutation == "tool-blob-sha":
+        manifests[0]["tools"]["launcher"]["git_blob_sha256"] = "f" * 64
+    elif mutation == "tool-path":
+        manifests[0]["tools"]["launcher"]["absolute_path"] = (
+            "/host/subject/scripts/cache-gate-perf.sh"
+        )
+    elif mutation == "tool-bytes":
+        manifests[0]["tools"]["launcher"]["sha256"] = "f" * 64
+    elif mutation == "v2-unlocked":
+        manifests[0]["control"]["locked"] = False
+    elif mutation == "v1-unlocked":
+        v1["control"]["locked"] = False
+    elif mutation == "v2-control-root":
+        manifests[0]["control"]["runner_root"] = "/host/v1"
+    elif mutation == "control-version":
+        for manifest in manifests:
+            manifest["control"]["cargo_version"] = "cargo 9.9.9"
+        v1["control"]["cargo_version"] = "cargo 9.9.9"
+    elif mutation == "v1-declared-root":
+        declared_v1_root = "/host/not-v1"
+    else:
+        v1["control"]["inputs"]["source"]["absolute_path"] = (
+            "/host/v1/tools/cache-gate-control/Cargo.toml"
+        )
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="tool|locked|identity|control",
+    ):
+        verify_module.verify_identity_contract(
+            provenance,
+            capability,
+            manifests,
+            v1,
+            documents["capability_bytes"],
+            declared_v1_root,
         )
 
 
