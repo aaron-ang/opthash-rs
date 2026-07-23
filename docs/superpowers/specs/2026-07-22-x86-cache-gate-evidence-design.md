@@ -113,8 +113,9 @@ In `subject` it:
 
 1. runs `scripts/cache-gate-linker-capability.sh`;
 2. builds the authenticated fixed-control binary;
-3. validates `run_id <= 9223372036854774` and `1 <= run_attempt <= 999`, derives
-   the injective signed-64-bit value
+3. requires `run_id` and `run_attempt` to be canonical positive decimals
+   matching `^[1-9][0-9]*$`, validates `run_id <= 9223372036854774` and
+   `run_attempt <= 999`, derives the injective signed-64-bit value
    `CACHE_GATE_ATTEMPT = run_id * 1000 + run_attempt`, then builds fresh
    `x86_64-061d13da22b8-attempt-<id>-clean-a`, `clean-b`, and `adversary`
    instances;
@@ -140,25 +141,36 @@ Manifest/build roots must not pre-exist, and artifact upload uses
 The proof step writes allowlisted run provenance, tool/package versions,
 validation, comparison, and canonical body-comparison logs beneath a dedicated
 evidence root. It creates a SHA-256 inventory covering the capability record,
-producer probe files, three v2 manifests and every referenced artifact, v1
-manifest and binaries, control provenance, workflow/support files, and logs.
+producer probe files, three v2 manifests and every hash-bearing referenced
+artifact, v1 manifest and binaries, control provenance, workflow/support files,
+logs, the pinned Rust toolchain root, and exact mirrored system files.
 
 Packaging names whole directories in a tar archive so hidden `.probe.*` files,
 executable bits, and symlinks are retained. `actions/upload-artifact` uploads
 only the tar archive and its SHA-256 file. It does not upload loose trees whose
 hidden files or modes could be lost.
 
-The proof step captures its exit status without converting it to success.
-Packaging and upload run under `if: always()`. Upload uses
-`if-no-files-found: error` and `overwrite: false`. After upload, a final step
-exits with the captured proof status, so diagnostics are preserved without
-turning a failed gate green.
+The proof wrapper captures its exit status without converting the proof to
+success and atomically writes the canonical decimal value to a durable status
+file beneath the evidence root before exiting with that value. Packaging,
+upload, and the final status step each explicitly run under `if: always()`;
+default success gating therefore cannot skip any of them after an earlier
+failure. Upload uses `if-no-files-found: error` and `overwrite: false`. After
+upload, the final step reads, strictly validates, and exits with the durable
+proof status as a canonical decimal in the range 0 through 255. A missing,
+non-canonical, or out-of-range status file exits 125 instead of being treated as
+success.
 
 The Actions artifact is externally bound to the run. The controller records
 the reviewed `GITHUB_SHA`, run ID/attempt, artifact ID/name/size, and the digest
-reported by the GitHub Actions artifact API. It downloads the raw artifact
-archive through the API and verifies that digest before trusting the co-uploaded
-cache-gate tar checksum.
+reported by the GitHub Actions artifact API. That API download is an outer ZIP,
+whose independently reported digest is verified before any member is inspected.
+The controller then parses the ZIP without general-purpose extraction:
+canonical POSIX names must be unique and cannot be absolute, empty, dot, or
+parent-traversing; directories, links, and every non-regular ZIP member fail.
+Exactly the expected cache-gate tar and checksum regular members must exist,
+with no extras, and their bytes are read directly for the next verification
+stage.
 
 ### Portable archive verification
 
@@ -167,26 +179,71 @@ post-download rewrite is allowed. They contain hosted-runner absolute paths,
 so ordinary `validate-manifest` cannot be rerun after relocation and the local
 AArch64 host cannot execute the archived x86-64 linkers.
 
-A separate reviewed portable verifier consumes an extracted archive plus an
-allowlisted mapping from the recorded hosted workspace roots to archive roots.
-Exact system linker paths and symlink-chain members are copied into an
-inventoried `system-root` mirror and listed individually in run provenance;
-they do not authorize arbitrary `/usr` traversal. The verifier requires every
-recorded absolute path to be either under an allowed workspace root or one of
-those exact mirrored system paths. It maps paths without changing the JSON,
-verifies every referenced byte and SHA-256, rechecks capability/manifests'
-exact schemas and cross-document relationships, repeats clean/adversary
-comparisons over embedded semantic fields, and verifies the canonical v1/v2
-body proof. Live linker identity and ELF validation remain the hosted runner's
-responsibility; their exact command, status, records, and logs are inventoried
-for review. The portable verifier does not claim to rerun native x86 execution
-on AArch64.
+A separate reviewed portable verifier takes only the inner cache-gate tar
+archive and its expected SHA-256, obtained after the controller's safe outer-ZIP
+handling, as inputs. It verifies the checksum before parsing any tar member and
+owns the complete inspect/extract/verify lifecycle; it never trusts a
+caller-extracted tree.
 
-Before extracting, the verifier inventories the tar and rejects absolute or
-parent-traversing member names, device/FIFO/socket entries, duplicate paths,
-and symlink or hardlink targets that escape the archive root. Extraction uses
-`--no-same-owner`; the verifier then checks types, modes, link targets, and the
-internal SHA-256 inventory before following mapped records.
+Before extraction it canonicalizes every POSIX member name, rejects absolute,
+empty, dot, or parent-traversing names, and rejects duplicate canonical names.
+Only directories, regular files, symlinks, and hardlinks are permitted;
+devices, FIFOs, sockets, and unknown types fail. Before extraction, the verifier
+builds and validates the complete link graph. Relative symlink targets resolve
+from their containing member. Absolute symlink targets fail except for
+individually allowlisted system-link source/target pairs: their raw absolute
+link text is preserved as evidence, while verifier-internal resolution treats
+the leading `/` as the root of the archived `system-root` namespace, never the
+host filesystem. Every member in such a chain must be mirrored and individually
+allowlisted through its terminal regular file. Hardlink targets resolve from
+the archive root, and every hardlink chain must terminate at a regular-file
+member; a symlink or directory terminal fails. Every resolved target must be an
+existing canonical member without escaping or cycling. Any archive member under
+a link-valued ancestor is rejected, regardless of its own type. Only after the
+whole graph passes does the verifier extract into a newly created private root
+using dirfd-relative no-follow operations, create link objects without following
+them, never restore ownership, and perform all link resolution internally rather
+than through filesystem traversal. It then checks exact types, modes, raw link
+targets, and the internal SHA-256 inventory.
+
+Portable path validation uses a closed, schema-aware routing table. It enumerates
+every path-bearing field and command-token position in the accepted capability,
+manifest, provenance, inventory, and transcript schemas; any new, unknown, or
+otherwise unclassified path-bearing field fails closed rather than falling back
+to string substitution. Routing includes:
+
+- hash-bearing file records must map to archived bytes under the subject, v1,
+  evidence, or pinned Rust toolchain roots, or to an individually allowlisted
+  file/symlink in the `system-root` mirror;
+- root fields and duplicate path fields are classified explicitly, mapped once,
+  and required to retain their declared equality or alias relationship;
+- every element of each captured `PATH` list is parsed separately, with empty or
+  unclassified elements rejected and ordering preserved;
+- Cargo registry, pinned Rust toolchain, and allowlisted system paths route to
+  distinct archived namespaces and cannot cross-map;
+- system linker paths and every symlink-chain member are mirrored exactly and
+  listed individually with their expected raw link text, never treated as
+  permission to traverse arbitrary host `/usr` or `/etc` paths;
+- `rlib(member)` archive-owner values are semantic pairs: the archived rlib is
+  mapped separately and the named member is checked against its archive index;
+- rustc flags and command transcripts are parsed by their captured command
+  grammar, including path-valued output, search-path, `--extern`, linker,
+  link-argument, response-file, and input positions; each discovered path is
+  routed by its field/token class;
+- linker argv, map ownership, rustc temporary inputs, and other classified
+  transient link inputs without a hash-bearing file-record contract remain
+  semantic evidence. They must use allowed recorded roots and preserve grammar,
+  ordering, duplicate relationships, and agreement with the hosted
+  trace/validation output, but are not falsely required to survive after the
+  link.
+
+The verifier maps paths without changing original JSON bytes, verifies every
+hash-bearing record, rechecks capability/manifests' exact schemas and
+cross-document relationships, repeats clean/adversary comparisons over
+embedded semantic fields, and verifies the canonical v1/v2 body proof. Live
+linker identity and ELF validation remain the hosted runner's responsibility;
+their exact command, status, records, and logs are inventoried for review. The
+portable verifier does not claim to rerun native x86 execution on AArch64.
 
 ### Verification and acceptance
 
