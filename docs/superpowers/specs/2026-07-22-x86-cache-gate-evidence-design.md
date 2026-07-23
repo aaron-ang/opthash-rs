@@ -75,7 +75,9 @@ the required host contract.
 
 The orchestration branch is `ci/x86-cache-gate-evidence`, descended from
 `061d13d`. Its workflow triggers only on a push to that branch and has
-`contents: read` permission.
+`contents: read` permission. Every referenced Action is pinned by full commit
+SHA, checkout disables persisted credentials, and no step receives repository
+write permission.
 
 The job creates three independent directories:
 
@@ -88,8 +90,19 @@ The job creates three independent directories:
 Before building, the runner must report `x86_64`; `subject` must have the exact
 commit and tree above; both subject and v1 checkouts must be clean. Rust is
 pinned to 1.95.0, matching the reviewed AArch64 toolchain. The workflow
-installs the distribution's native `lld`; its exact path, payload hash,
-symlink chain, `argv0`, and version are captured by the capability record.
+installs the distribution's native `lld`, then uses a minimal explicit `PATH`
+containing the pinned Rust toolchain and system directories. It requires
+`command -v ld.lld` to resolve to `/usr/bin/ld.lld`, verifies the owning `lld`
+packages with `dpkg-query` and `dpkg -V`, and records their versions. The
+linker's exact invocation path, payload hash, symlink chain, `argv0`, and
+version are also captured by the capability record.
+
+The reviewed orchestration commit is the exact push target. The job requires
+`GITHUB_SHA` to equal its checked-out orchestration commit and records the
+orchestration tree plus SHA-256 values for the workflow, runner, and portable
+archive verifier. Run provenance contains only an allowlisted set of GitHub
+identifiers and tool/package versions; it never dumps the ambient environment
+or credentials.
 
 ### Proof execution
 
@@ -100,8 +113,9 @@ In `subject` it:
 
 1. runs `scripts/cache-gate-linker-capability.sh`;
 2. builds the authenticated fixed-control binary;
-3. derives a positive, unique `CACHE_GATE_ATTEMPT` from the GitHub run ID and
-   run-attempt number, then builds fresh
+3. validates `run_id <= 9223372036854774` and `1 <= run_attempt <= 999`, derives
+   the injective signed-64-bit value
+   `CACHE_GATE_ATTEMPT = run_id * 1000 + run_attempt`, then builds fresh
    `x86_64-061d13da22b8-attempt-<id>-clean-a`, `clean-b`, and `adversary`
    instances;
 4. validates every manifest;
@@ -115,26 +129,64 @@ binaries. A canonical comparison requires equality across all eight kernels
 for body size, current normalized-instruction hash, direct and indirect calls,
 frame size, and spills. It never compares v1 placement or raw hashes.
 
-Every attempt name is immutable. A failed hosted run is retained in its
-artifact; a workflow rerun or orchestration repair derives a different positive
-attempt ID and never overwrites earlier evidence.
+Every attempt name is immutable. A failed hosted run is retained in an artifact
+named with both `run_id` and `run_attempt`; a workflow rerun or orchestration
+repair therefore derives a different positive attempt and artifact name.
+Manifest/build roots must not pre-exist, and artifact upload uses
+`overwrite: false`.
 
 ### Evidence packaging
 
-The proof step writes environment, tool-version, validation, comparison, and
-canonical body-comparison logs beneath a dedicated evidence root. It creates a
-SHA-256 inventory covering the capability record, producer probe files, three
-v2 manifests and their referenced artifacts, v1 manifest and binaries,
-control provenance, and logs.
+The proof step writes allowlisted run provenance, tool/package versions,
+validation, comparison, and canonical body-comparison logs beneath a dedicated
+evidence root. It creates a SHA-256 inventory covering the capability record,
+producer probe files, three v2 manifests and every referenced artifact, v1
+manifest and binaries, control provenance, workflow/support files, and logs.
 
 Packaging names whole directories in a tar archive so hidden `.probe.*` files,
 executable bits, and symlinks are retained. `actions/upload-artifact` uploads
 only the tar archive and its SHA-256 file. It does not upload loose trees whose
 hidden files or modes could be lost.
 
-The proof command is allowed to fail without skipping packaging. After the
-artifact upload, a final workflow step re-emits the proof failure so diagnostics
-are preserved without turning a failed gate green.
+The proof step captures its exit status without converting it to success.
+Packaging and upload run under `if: always()`. Upload uses
+`if-no-files-found: error` and `overwrite: false`. After upload, a final step
+exits with the captured proof status, so diagnostics are preserved without
+turning a failed gate green.
+
+The Actions artifact is externally bound to the run. The controller records
+the reviewed `GITHUB_SHA`, run ID/attempt, artifact ID/name/size, and the digest
+reported by the GitHub Actions artifact API. It downloads the raw artifact
+archive through the API and verifies that digest before trusting the co-uploaded
+cache-gate tar checksum.
+
+### Portable archive verification
+
+Original manifests and capability records remain byte-for-byte immutable; no
+post-download rewrite is allowed. They contain hosted-runner absolute paths,
+so ordinary `validate-manifest` cannot be rerun after relocation and the local
+AArch64 host cannot execute the archived x86-64 linkers.
+
+A separate reviewed portable verifier consumes an extracted archive plus an
+allowlisted mapping from the recorded hosted workspace roots to archive roots.
+Exact system linker paths and symlink-chain members are copied into an
+inventoried `system-root` mirror and listed individually in run provenance;
+they do not authorize arbitrary `/usr` traversal. The verifier requires every
+recorded absolute path to be either under an allowed workspace root or one of
+those exact mirrored system paths. It maps paths without changing the JSON,
+verifies every referenced byte and SHA-256, rechecks capability/manifests'
+exact schemas and cross-document relationships, repeats clean/adversary
+comparisons over embedded semantic fields, and verifies the canonical v1/v2
+body proof. Live linker identity and ELF validation remain the hosted runner's
+responsibility; their exact command, status, records, and logs are inventoried
+for review. The portable verifier does not claim to rerun native x86 execution
+on AArch64.
+
+Before extracting, the verifier inventories the tar and rejects absolute or
+parent-traversing member names, device/FIFO/socket entries, duplicate paths,
+and symlink or hardlink targets that escape the archive root. Extraction uses
+`--no-same-owner`; the verifier then checks types, modes, link targets, and the
+internal SHA-256 inventory before following mapped records.
 
 ### Verification and acceptance
 
@@ -142,10 +194,10 @@ Local checks before push must cover workflow syntax, shell/static checks, and
 orchestration-script tests using the existing AArch64 manifests as fixtures.
 A fresh reviewer must report zero Critical or Important findings before push.
 
-After download, local review must verify the outer archive checksum, safely
-inspect archive paths before extraction, verify the internal inventory, rerun
-manifest validation and comparisons against the extracted files, and inspect
-the native x86-64 ELF/linker records. Only a fresh reviewer may then choose
+After download, local review must verify the external Actions artifact digest,
+the cache-gate tar checksum, safe archive structure, internal inventory,
+portable mapped records/comparisons, hosted validation logs, and native x86-64
+ELF/linker records. Only a fresh reviewer may then choose
 `APPROVE POLICY REPLAY`, `REPAIR HARNESS`, or `HOLD` under Task 2 Step 10.
 
 The remote orchestration branch remains until that review completes. Cleanup
@@ -156,6 +208,9 @@ is a separate explicit action; it is not part of this evidence run.
 - Wrong architecture, subject commit/tree drift, dirty checkout, missing GNU
   ld/LLD, incomplete 2/2/4 shapes, manifest failure, comparison failure, or v1
   body mismatch fails the job.
+- Orchestration SHA/tree/hash drift, an unexpected LLD package/path, unsafe
+  archive member, mapped-path escape, inventory mismatch, or external artifact
+  digest mismatch also fails the gate.
 - Partial evidence is still packaged and uploaded when possible.
 - No failure permits timing, policy replay, or a synthetic native claim.
 - If GitHub-hosted Ubuntu cannot satisfy the native linker contract, the result
