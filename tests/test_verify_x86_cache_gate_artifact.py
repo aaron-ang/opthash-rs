@@ -1,6 +1,8 @@
 import hashlib
 import importlib.util
+import os
 import stat
+import struct
 import zipfile
 from pathlib import Path
 
@@ -130,6 +132,50 @@ def test_rejects_unix_symlink_member(tmp_path):
 
     with pytest.raises(artifact.EvidenceError, match="non-regular ZIP member"):
         bind(archive, digest, tmp_path / "output")
+
+
+def test_rejects_encrypted_member(tmp_path):
+    archive = tmp_path / "artifact.zip"
+    make_zip(archive, [(TAR_NAME, b"tar"), (CHECKSUM_NAME, b"checksum")])
+    data = bytearray(archive.read_bytes())
+    local_header = data.index(b"PK\x03\x04")
+    central_header = data.index(b"PK\x01\x02")
+    for offset in (local_header + 6, central_header + 8):
+        flags = struct.unpack_from("<H", data, offset)[0]
+        struct.pack_into("<H", data, offset, flags | 0x1)
+    archive.write_bytes(data)
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+
+    with pytest.raises(artifact.EvidenceError, match="encrypted ZIP member"):
+        bind(archive, digest, tmp_path / "output")
+
+
+def test_opens_zip_once_with_no_follow_and_checks_regular_file(tmp_path, monkeypatch):
+    archive = tmp_path / "artifact.zip"
+    digest = make_zip(archive, [(TAR_NAME, b"tar"), (CHECKSUM_NAME, b"checksum")])
+    opened_archive_fds: list[int] = []
+    real_open = artifact.os.open
+    real_fstat = artifact.os.fstat
+
+    def track_open(path, flags, mode=0o777):
+        descriptor = real_open(path, flags, mode)
+        if Path(path) == archive:
+            opened_archive_fds.append(descriptor)
+            assert flags & os.O_NOFOLLOW
+        return descriptor
+
+    def non_regular_archive(descriptor):
+        if descriptor in opened_archive_fds:
+            return os.stat_result((stat.S_IFIFO,) + (0,) * 9)
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(artifact.os, "open", track_open)
+    monkeypatch.setattr(artifact.os, "fstat", non_regular_archive)
+
+    with pytest.raises(artifact.EvidenceError, match="regular file"):
+        bind(archive, digest, tmp_path / "output")
+
+    assert len(opened_archive_fds) == 1
 
 
 def test_preserves_zip_read_error_when_member_body_is_corrupt(tmp_path):

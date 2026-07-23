@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
@@ -45,16 +46,37 @@ def _expected_basename(name: str) -> PurePosixPath:
     return path
 
 
-def _hash_zip(path: Path, expected_digest: str) -> None:
+def _expected_digest(expected_digest: str) -> str:
     match = DIGEST_RE.fullmatch(expected_digest)
     if match is None:
         raise EvidenceError("invalid API digest")
+    return match.group(1)
+
+
+def _hash_zip(stream, expected_digest: str) -> None:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    if digest.hexdigest() != match.group(1):
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(block)
+    if digest.hexdigest() != expected_digest:
         raise EvidenceError("API digest mismatch")
+
+
+@contextmanager
+def _verified_archive(zip_path: Path, expected_digest: str):
+    expected_hash = _expected_digest(expected_digest)
+    descriptor = os.open(zip_path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise EvidenceError("ZIP input is not a regular file")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            _hash_zip(stream, expected_hash)
+            stream.seek(0)
+            with zipfile.ZipFile(stream) as archive:
+                yield archive
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
 
 
 def _validated_members(
@@ -97,8 +119,7 @@ def verify_artifact(
     checksum_path = _expected_basename(checksum_name)
     if tar_path == checksum_path:
         raise EvidenceError("expected ZIP member names must differ")
-    _hash_zip(zip_path, expected_digest)
-    with zipfile.ZipFile(zip_path) as archive:
+    with _verified_archive(zip_path, expected_digest) as archive:
         members = _validated_members(archive, {tar_path, checksum_path})
         try:
             os.mkdir(output, mode=0o700)
