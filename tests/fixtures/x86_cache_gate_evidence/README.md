@@ -9,13 +9,19 @@ real recursive schemas and semantic relationships. It contains:
 - the original replayed v1 manifest shape;
 - all nine capability shape symbol, layout, link-argument, linker-execution,
   and trace records;
-- all six explicit GNU/LLD Cargo-execution and trace records.
+- all six explicit GNU/LLD Cargo-execution and trace records;
+- all nine original manifest link-command and link-trace records.
 
-The JSON and log bytes are unchanged. Large ELF binaries, link maps, rlibs, and
-toolchain payloads are omitted; their original hash records, complete linker
-chains/raw symlink targets, and every `rlib(member)` owner remain in the JSON.
-Focused tests bind the five top-level source records to their reviewed SHA-256
-values and exercise tiny real `ar` archives for member-index behavior.
+The capability, v1, shape, manifest link-command, and manifest link-trace bytes
+are unchanged. The three v2 manifests have one documented safety normalization:
+trailing empty `LD_LIBRARY_PATH` elements were removed from captured
+`rustc_argv` environment strings because an empty dynamic-library search
+element denotes the current directory and is rejected by the portable
+verifier. Large ELF binaries, link maps, rlibs, and toolchain payloads are
+omitted; their original hash records, complete linker chains/raw symlink
+targets, and every `rlib(member)` owner remain in the JSON. Focused tests bind
+the five top-level records to reviewed fixture SHA-256 values and exercise tiny
+real `ar` archives for member-index behavior.
 
 The v1 record was produced at `1080c188a47f02202b6a0878830dbf2947629992`,
 whose tree is the exact replay tree
@@ -27,7 +33,7 @@ commit.
 Fixture SHA-256:
 
 ```text
-088f5e3edfdc3d0d51ca2b7cb4f24bd2247f5b47c4794c726b9401f854144b69  aarch64-attempt-5-records.tar.xz
+6338f010d568d891ea76ea63c1c954b441918a7b467903468736f71d35413af5  aarch64-attempt-5-records.tar.xz
 ```
 
 This fixture is schema/semantic test evidence only. It is not native x86-64

@@ -41,6 +41,14 @@ class StagedEntry(NamedTuple):
     children: tuple[str, ...] = ()
 
 
+class ProvenanceAuthority(NamedTuple):
+    hardlinks: dict[str, str]
+    descriptor: int
+    identity: tuple[int, int, int, int, int, int, int]
+    data: bytes
+    sha256: str
+
+
 def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
@@ -111,31 +119,27 @@ def _digest_file_at(
     return digest.hexdigest(), size
 
 
-def _load_hardlinks(bundle_fd: int, bundle_path: Path) -> dict[str, str]:
+def _load_hardlinks(bundle_fd: int, bundle_path: Path) -> ProvenanceAuthority:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
     try:
         descriptor = os.open("provenance.json", flags, dir_fd=bundle_fd)
-        try:
-            metadata = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_size > 16 * 1024 * 1024
-            ):
-                raise EvidenceError("invalid bundle/provenance.json")
-            chunks: list[bytes] = []
-            remaining = metadata.st_size
-            while remaining:
-                chunk = os.read(descriptor, min(1024 * 1024, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            if remaining:
-                raise EvidenceError("invalid bundle/provenance.json")
-            if _identity(os.fstat(descriptor)) != _identity(metadata):
-                raise EvidenceError("bundle/provenance.json changed while packaging")
-        finally:
-            os.close(descriptor)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 16 * 1024 * 1024:
+            raise EvidenceError("invalid bundle/provenance.json")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if remaining:
+            raise EvidenceError("invalid bundle/provenance.json")
+        if _identity(os.fstat(descriptor)) != _identity(metadata):
+            raise EvidenceError("bundle/provenance.json changed while packaging")
+        data = b"".join(chunks)
 
         def reject_duplicates(values: list[tuple[str, object]]) -> dict[str, object]:
             result: dict[str, object] = {}
@@ -145,30 +149,46 @@ def _load_hardlinks(bundle_fd: int, bundle_path: Path) -> dict[str, str]:
                 result[key] = value
             return result
 
-        document = json.loads(b"".join(chunks), object_pairs_hook=reject_duplicates)
+        document = json.loads(data, object_pairs_hook=reject_duplicates)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        if descriptor >= 0:
+            os.close(descriptor)
         raise EvidenceError(
             f"invalid bundle/provenance.json beneath {bundle_path}"
         ) from error
-    if not isinstance(document, dict):
-        raise EvidenceError("invalid bundle/provenance.json")
-    raw_records = document.get("hardlinks", [])
-    if not isinstance(raw_records, list):
-        raise EvidenceError("invalid provenance hardlinks")
-    result: dict[str, str] = {}
-    for index, record in enumerate(raw_records):
-        if not isinstance(record, dict) or set(record) != {"path", "target"}:
-            raise EvidenceError(f"invalid provenance hardlink record {index}")
-        path = record["path"]
-        target = record["target"]
-        if not isinstance(path, str) or not isinstance(target, str):
-            raise EvidenceError(f"invalid provenance hardlink record {index}")
-        _validate_archive_path(path)
-        _validate_archive_path(target)
-        if path in result:
-            raise EvidenceError("duplicate provenance hardlink path")
-        result[path] = target
-    return result
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    try:
+        if not isinstance(document, dict):
+            raise EvidenceError("invalid bundle/provenance.json")
+        raw_records = document.get("hardlinks", [])
+        if not isinstance(raw_records, list):
+            raise EvidenceError("invalid provenance hardlinks")
+        result: dict[str, str] = {}
+        for index, record in enumerate(raw_records):
+            if not isinstance(record, dict) or set(record) != {"path", "target"}:
+                raise EvidenceError(f"invalid provenance hardlink record {index}")
+            path = record["path"]
+            target = record["target"]
+            if not isinstance(path, str) or not isinstance(target, str):
+                raise EvidenceError(f"invalid provenance hardlink record {index}")
+            _validate_archive_path(path)
+            _validate_archive_path(target)
+            if path in result:
+                raise EvidenceError("duplicate provenance hardlink path")
+            result[path] = target
+        return ProvenanceAuthority(
+            result,
+            descriptor,
+            _identity(metadata),
+            data,
+            hashlib.sha256(data).hexdigest(),
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _validate_archive_path(raw: str) -> PurePosixPath:
@@ -505,6 +525,49 @@ def _entry_identity(entry: StagedEntry) -> tuple[int, int, int, int, int, int, i
     )
 
 
+def _verify_provenance_authority(
+    authority: ProvenanceAuthority,
+    entries: list[StagedEntry],
+) -> None:
+    try:
+        before = os.fstat(authority.descriptor)
+        os.lseek(authority.descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = len(authority.data)
+        while remaining:
+            chunk = os.read(authority.descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        extra = os.read(authority.descriptor, 1)
+        after = os.fstat(authority.descriptor)
+    except OSError as error:
+        raise EvidenceError("bundle/provenance.json changed while packaging") from error
+    if (
+        remaining
+        or extra
+        or b"".join(chunks) != authority.data
+        or _identity(before) != authority.identity
+        or _identity(after) != authority.identity
+    ):
+        raise EvidenceError("bundle/provenance.json changed while packaging")
+
+    matches = [
+        entry for entry in entries if entry.archive_path == "bundle/provenance.json"
+    ]
+    if len(matches) != 1:
+        raise EvidenceError("bundle/provenance.json changed while packaging")
+    entry = matches[0]
+    if (
+        entry.kind != "file"
+        or _entry_identity(entry) != authority.identity
+        or entry.size != len(authority.data)
+        or entry.sha256 != authority.sha256
+    ):
+        raise EvidenceError("bundle/provenance.json changed while packaging")
+
+
 class _HashingReader:
     def __init__(self, descriptor: int):
         self.descriptor = descriptor
@@ -651,6 +714,7 @@ def package_evidence(staging_root: Path, archive: Path, checksum: Path) -> str:
     )
     staging_fd = -1
     bundle_fd = -1
+    provenance_authority: ProvenanceAuthority | None = None
     before_directories: list[int] = []
     after_directories: list[int] = []
     try:
@@ -684,13 +748,15 @@ def package_evidence(staging_root: Path, archive: Path, checksum: Path) -> str:
             raise EvidenceError("bundle is not a real directory")
 
         bundle = staging_root / "bundle"
-        hardlinks = _load_hardlinks(bundle_fd, bundle)
+        provenance_authority = _load_hardlinks(bundle_fd, bundle)
+        hardlinks = provenance_authority.hardlinks
         before, before_directories = _walk(
             bundle_fd,
             bundle,
             hardlinks,
             include_inventory=False,
         )
+        _verify_provenance_authority(provenance_authority, before)
         by_path = {entry.archive_path: entry for entry in before}
         for path, target in hardlinks.items():
             source_entry = by_path.get(path)
@@ -719,6 +785,7 @@ def package_evidence(staging_root: Path, archive: Path, checksum: Path) -> str:
             hardlinks,
             include_inventory=True,
         )
+        _verify_provenance_authority(provenance_authority, after)
         after_without_inventory = [
             entry for entry in after if entry.archive_path != "bundle/inventory.json"
         ]
@@ -732,6 +799,7 @@ def package_evidence(staging_root: Path, archive: Path, checksum: Path) -> str:
         ):
             raise EvidenceError("staging tree changed while packaging")
         digest = _write_archive(archive, after)
+        _verify_provenance_authority(provenance_authority, after)
         _atomic_write(checksum, f"{digest}  {archive.name}\n".encode())
         return digest
     finally:
@@ -739,6 +807,8 @@ def package_evidence(staging_root: Path, archive: Path, checksum: Path) -> str:
             os.close(descriptor)
         for descriptor in reversed(before_directories):
             os.close(descriptor)
+        if provenance_authority is not None:
+            os.close(provenance_authority.descriptor)
         if bundle_fd >= 0:
             os.close(bundle_fd)
         os.close(staging_fd)

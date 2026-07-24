@@ -21,7 +21,7 @@ REVIEWED_RECORDS = (
     ROOT / "tests/fixtures/x86_cache_gate_evidence" / "aarch64-attempt-5-records.tar.xz"
 )
 REVIEWED_RECORDS_SHA256 = (
-    "088f5e3edfdc3d0d51ca2b7cb4f24bd2247f5b47c4794c726b9401f854144b69"
+    "6338f010d568d891ea76ea63c1c954b441918a7b467903468736f71d35413af5"
 )
 HEX = "0" * 64
 SUBJECT_COMMIT = "061d13da22b89208c801308efd578444c8e9caba"
@@ -101,9 +101,9 @@ CONTROL_INPUT_IDENTITIES = {
 }
 REVIEWED_RECORD_SHA256S = {
     "capability.json": "29a43afea6137683f8b8df0bcc6864c753697b1cc4de51276dd9ab7770558d6f",
-    "clean-a.json": "86ad819b59dc963bb4350e1d018449c8f293f498948ccaa399691c5f78946312",
-    "clean-b.json": "b1ec373934d806c53bb340adf2fbd3923206d74fd9b1c0e842153e6a61d90498",
-    "adversary.json": "e40f70f566f5381fad4143e8e06ca0a1c7009945b2d445618ca01ab150027235",
+    "clean-a.json": "cd63cfa57dcb4c1aad06fb04af38657fdb639558e73f1b1398afdf27359b5e3b",
+    "clean-b.json": "d50367fd39a39630100a3ddaccdea9b00da8e66b8c8af8d4c3effb832b4c762e",
+    "adversary.json": "5b65f6bf6a4d996a09299bb0329c90986eac0b79219e322a70312a738020f95e",
     "v1.json": "b48df7e6221402b4e3d099262a1b3f1e8f3a13568c160f390b2ca735ee0fafd9",
 }
 
@@ -147,14 +147,25 @@ def reviewed_records() -> dict[str, Any]:
             assert hashlib.sha256(data).hexdigest() == expected
             members[name] = data
         shape_records: dict[str, bytes] = {}
+        manifest_link_records: dict[str, bytes] = {}
         for name, item in list(members.items()):
-            if not name.startswith("capability-shapes/") or not isinstance(
-                item, tarfile.TarInfo
+            if not isinstance(item, tarfile.TarInfo):
+                continue
+            if not name.startswith(
+                (
+                    "capability-shapes/",
+                    "manifest-link-commands/",
+                    "manifest-link-traces/",
+                )
             ):
                 continue
             extracted = archive.extractfile(item)
             assert extracted is not None
-            shape_records[name] = extracted.read()
+            data = extracted.read()
+            if name.startswith("capability-shapes/"):
+                shape_records[name] = data
+            else:
+                manifest_link_records[name] = data
     return {
         "capability": json.loads(members["capability.json"]),
         "clean_a": json.loads(members["clean-a.json"]),
@@ -162,6 +173,7 @@ def reviewed_records() -> dict[str, Any]:
         "adversary": json.loads(members["adversary.json"]),
         "v1": json.loads(members["v1.json"]),
         "shape_records": shape_records,
+        "manifest_link_records": manifest_link_records,
     }
 
 
@@ -730,6 +742,150 @@ def test_package_hashes_bytes_read_from_archive_file_descriptor(
         )
 
 
+def test_package_keeps_provenance_authority_pinned_through_archive(
+    tmp_path: Path,
+    package_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / "staging"
+    bundle = staging / "bundle"
+    bundle.mkdir(parents=True)
+    original = bundle / "original"
+    original.write_bytes(b"same inode")
+    os.link(original, bundle / "copy")
+    provenance = bundle / "provenance.json"
+    provenance.write_bytes(
+        json_bytes(
+            {
+                "hardlinks": [
+                    {"path": "bundle/copy", "target": "bundle/original"},
+                ]
+            }
+        )
+    )
+    original_walk = package_module._walk
+    swapped = False
+
+    def swap_provenance_then_walk(*args: Any, **kwargs: Any) -> Any:
+        nonlocal swapped
+        if not swapped:
+            replacement = bundle / "replacement.json"
+            replacement.write_bytes(json_bytes({"hardlinks": []}))
+            replacement.replace(provenance)
+            swapped = True
+        return original_walk(*args, **kwargs)
+
+    monkeypatch.setattr(package_module, "_walk", swap_provenance_then_walk)
+    with pytest.raises(
+        package_module.EvidenceError,
+        match="provenance.*changed|staging tree changed",
+    ):
+        package_module.package_evidence(
+            staging, tmp_path / "out.tar", tmp_path / "out.tar.sha256"
+        )
+
+
+def test_extracted_reads_require_exact_member_and_no_follow_ancestors(
+    tmp_path: Path,
+    verify_module: ModuleType,
+) -> None:
+    root = tmp_path / "root"
+    (root / "bundle/subject").mkdir(parents=True)
+    (root / "bundle/evidence").mkdir(parents=True)
+    (root / "bundle/evidence/proof").write_bytes(b"forged")
+    (root / "bundle/subject/alias").symlink_to("../evidence", target_is_directory=True)
+    members = {
+        path: verify_module.MemberRecord(
+            path,
+            kind,
+            0o755 if kind == "dir" else 0o644,
+            0,
+            "../evidence" if kind == "symlink" else "",
+            "",
+            tarfile.TarInfo(path),
+        )
+        for path, kind in (
+            ("bundle", "dir"),
+            ("bundle/subject", "dir"),
+            ("bundle/evidence", "dir"),
+            ("bundle/evidence/proof", "file"),
+            ("bundle/subject/alias", "symlink"),
+        )
+    }
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="exact archive member|missing from archive",
+    ):
+        verify_module._read_extracted(
+            root,
+            members,
+            "bundle/subject/alias/proof",
+        )
+
+    real_directory = root / "bundle/subject/real"
+    real_directory.mkdir()
+    (real_directory / "proof").write_bytes(b"trusted")
+    members["bundle/subject/real"] = verify_module.MemberRecord(
+        "bundle/subject/real",
+        "dir",
+        0o755,
+        0,
+        "",
+        "",
+        tarfile.TarInfo("bundle/subject/real"),
+    )
+    members["bundle/subject/real/proof"] = verify_module.MemberRecord(
+        "bundle/subject/real/proof",
+        "file",
+        0o644,
+        7,
+        "",
+        "",
+        tarfile.TarInfo("bundle/subject/real/proof"),
+    )
+    real_directory.rename(root / "bundle/subject/retired")
+    real_directory.symlink_to("../../evidence", target_is_directory=True)
+    with pytest.raises(
+        verify_module.EvidenceError, match="no-follow|ancestor|directory"
+    ):
+        verify_module._read_extracted(
+            root,
+            members,
+            "bundle/subject/real/proof",
+        )
+
+
+def test_provenance_hardlinks_must_equal_tar_and_inventory(
+    verify_module: ModuleType,
+) -> None:
+    hardlink = verify_module.MemberRecord(
+        "bundle/copy",
+        "hardlink",
+        0o644,
+        0,
+        "bundle/original",
+        "bundle/original",
+        tarfile.TarInfo("bundle/copy"),
+    )
+    inventory = {
+        "version": 1,
+        "entries": [
+            {
+                "path": "bundle/copy",
+                "type": "hardlink",
+                "mode": 0o644,
+                "target": "bundle/original",
+            }
+        ],
+    }
+    with pytest.raises(verify_module.EvidenceError, match="hardlink.*provenance"):
+        verify_module._verify_provenance_hardlinks(
+            {"hardlinks": []},
+            {"bundle/copy": hardlink},
+            inventory,
+        )
+
+
 def semantic_documents() -> dict[str, dict[str, Any]]:
     file_sha = hashlib.sha256(b"payload").hexdigest()
     body = {
@@ -993,7 +1149,22 @@ def bind_fixture_symbol_layout(
             "target": target,
             "arch": symbols["architecture"],
             "link_map_flavor": link_map_flavor,
+            "elf_type": "ET_DYN",
             "max_page_size": 4096,
+            "program_headers_have_rwx": False,
+            "program_headers": [
+                {
+                    "offset": 0,
+                    "vaddr": 4096,
+                    "filesz": 4096,
+                    "memsz": 4096,
+                    "flags": "R E",
+                    "alignment": 4096,
+                }
+            ],
+            "cache_gate_input_sections": [],
+            "veneer_thunk_inventory": [],
+            "plt_inventory": [],
         }
     )
     by_kernel = {
@@ -1007,13 +1178,22 @@ def bind_fixture_symbol_layout(
         symbol["start"] = start
         symbol["end"] = body_end
         symbol["page_offset"] = start % 4096
+        section_stem = KERNEL_SENTINEL_STEMS[kernel_name].replace("_", ".")
+        input_section = f".text.opthash.cache_gate.{section_stem}"
+        output_section = f".opthash.cache_gate.{section_stem}"
+        input_owner = f"/host/subject/{kernel_name}.o"
         kernel.update(
             {
                 "name": kernel_name,
+                "function_symbol_count": 1,
+                "input_section": input_section,
+                "input_section_count": 1,
+                "input_owner": input_owner,
                 "input_start": start,
                 "input_end": body_end,
                 "input_size": symbol["size"],
-                "output_section": symbol["section"],
+                "output_section": output_section,
+                "output_section_count": 1,
                 "output_section_index": symbol["section_index"],
                 "output_start": start,
                 "output_end": reservation_end,
@@ -1025,17 +1205,24 @@ def bind_fixture_symbol_layout(
                 "page_offset": symbol["page_offset"],
                 "max_page_remainder": 0,
                 "sh_addralign": symbol["section_alignment"],
+                "section_flags": ["ALLOC", "EXECINSTR"],
+                "pt_load_count": 1,
+                "pt_load_flags": "R E",
+                "writable_segment_overlap": False,
+                "overlapping_elf_sections": [],
                 "function_start": start,
                 "function_end": body_end,
                 "function_size": symbol["size"],
                 "function_section_index": symbol["section_index"],
-                "function_section_name": symbol["section_name"],
+                "function_section_name": output_section,
                 "raw_sha256": symbol["raw_sha256"],
                 "normalized_sha256": symbol["normalized_instructions_sha256"],
                 "direct_calls": copy.deepcopy(symbol["direct_calls"]),
                 "indirect_calls": copy.deepcopy(symbol["indirect_calls"]),
                 "frame_bytes": symbol["frame_adjustment"],
                 "spills": copy.deepcopy(symbol["spills"]),
+                "veneer_thunks": [],
+                "plt_calls": [],
                 "sentinels": {
                     name: {
                         "name": (
@@ -1059,6 +1246,18 @@ def bind_fixture_symbol_layout(
                     "body_end": body_end,
                     "reservation_end": reservation_end,
                 },
+            }
+        )
+        symbol["section"] = output_section
+        symbol["section_name"] = output_section
+        layout["cache_gate_input_sections"].append(
+            {
+                "owner": input_owner,
+                "section": input_section,
+                "output": output_section,
+                "start": start,
+                "end": body_end,
+                "size": symbol["size"],
             }
         )
 
@@ -1321,6 +1520,13 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
             "runner_root": "/host/subject",
         }
     )
+    manifest["layout_adversary"].update(
+        {
+            "enabled": False,
+            "symbol": "cache_gate_layout_adversary_private",
+            "input_section": ".text.opthash.cache_gate.layout_adversary",
+        }
+    )
     manifest["build"].update(
         {
             "cargo_incremental": "0",
@@ -1403,6 +1609,8 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
         layout["binary_sha256"] = payload_sha
         layout["link_map"] = "/host/subject/payload"
         layout["link_map_sha256"] = payload_sha
+        layout["fragment_sha256"] = capability["fragments"][_target]["sha256"]
+        layout["fragment_set_sha256"] = capability["fragment_set_sha256"]
         layout["archive_member_owners"] = []
         layout["veneer_thunk_inventory"] = []
         layout["plt_inventory"] = []
@@ -1428,12 +1636,14 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
         proof["ordered_linker_inputs"] = ["input.o"]
         proof["link_command"]["argv"] = [
             "/host/subject/input.o",
+            "-Wl,-T,/host/subject/payload",
+            "-Wl,-Map,/host/subject/payload",
             "-o",
             "/host/subject/payload",
         ]
         proof["link_command"]["ordered_linker_inputs"] = ["input.o"]
         proof["link_command"]["direct_input_files"] = ["input.o"]
-        proof["link_command"]["direct_cgu_members"] = ["input.o"]
+        proof["link_command"]["direct_cgu_members"] = []
         proof["link_command"]["executable"] = "/host/subject/payload"
         proof["link_command"]["fragment"] = "/host/subject/payload"
         proof["link_command"]["link_map"] = "/host/subject/payload"
@@ -1441,7 +1651,7 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
         proof["adversary"] = {
             "symbol_occurrences": [],
             "input_section_occurrences": 0,
-            "outside_reservations": False,
+            "outside_reservations": True,
         }
 
     capability_bytes = json_bytes(capability)
@@ -1454,7 +1664,6 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
     adversary = copy.deepcopy(manifest)
     adversary["variant"] = adversary["manifest_instance"] = "proof-adversary"
     adversary["layout_adversary"]["enabled"] = True
-    adversary["layout_adversary"]["symbol"] = "layout_adversary"
     adversary["build"]["rustc_flags"].extend(
         [
             "--cfg",
@@ -1462,14 +1671,34 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
             "--check-cfg=cfg(cache_gate_layout_adversary)",
         ]
     )
-    for proof in adversary["build_proof"]["executables"].values():
+    for executable, proof in adversary["build_proof"]["executables"].items():
         proof["emitted_object_members"].append("adversary-object.o")
         proof["ordered_linker_inputs"].append("adversary.o")
         proof["link_command"]["ordered_linker_inputs"].append("adversary.o")
+        proof["link_command"]["argv"].insert(1, "/host/subject/adversary.o")
+        proof["link_command"]["direct_input_files"] = ["adversary.o", "input.o"]
+        proof["link_command"]["direct_cgu_members"] = []
         proof["cgu_members"].append("adversary-cgu.o")
+        layout = adversary["elf_layout"][executable]
+        occurrence_start = (len(layout["kernels"]) + 2) * 4096
+        occurrence_size = 32
+        layout["cache_gate_input_sections"].append(
+            {
+                "owner": "/host/subject/adversary.o",
+                "section": ".text.opthash.cache_gate.layout_adversary",
+                "output": ".text",
+                "start": occurrence_start,
+                "end": occurrence_start + occurrence_size,
+                "size": occurrence_size,
+            }
+        )
         proof["adversary"] = {
             "symbol_occurrences": [
-                {"name": "layout_adversary", "start": 8192, "size": 32}
+                {
+                    "name": f"{executable}::cache_gate_layout_adversary_private",
+                    "start": occurrence_start,
+                    "size": occurrence_size,
+                }
             ],
             "input_section_occurrences": 1,
             "outside_reservations": True,
@@ -2399,6 +2628,21 @@ def test_rustc_transcript_rejects_unclassified_path_environment(
         verify_module.validate_rustc_transcript(line, roots)
 
 
+def test_rustc_transcript_rejects_empty_ld_library_path_element(
+    verify_module: ModuleType,
+) -> None:
+    roots = verify_module.PortableRoots.from_document(
+        full_portable_paths(verify_module)
+    )
+    line = (
+        "Running `LD_LIBRARY_PATH=/host/toolchain/lib::/usr/lib "
+        "/host/toolchain/bin/rustc /host/subject/input.rs "
+        "-o /host/subject/out`"
+    )
+    with pytest.raises(verify_module.EvidenceError, match="empty LD_LIBRARY_PATH"):
+        verify_module.validate_rustc_transcript(line, roots)
+
+
 def test_full_capability_has_exact_nine_linker_shapes(
     verify_module: ModuleType,
 ) -> None:
@@ -2460,6 +2704,41 @@ def test_real_fixture_routes_every_authentic_command_with_authenticated_roots(
         )
         == 9
     )
+    verify_module.validate_concrete_route_values(
+        "capability",
+        records["capability"],
+        roots,
+    )
+    replayed = 0
+    for kind, manifest in (
+        ("clean-a", records["clean_a"]),
+        ("clean-b", records["clean_b"]),
+        ("adversary", records["adversary"]),
+    ):
+        verify_module.validate_concrete_route_values("manifest", manifest, roots)
+        for executable, (target, _kernels) in verify_module.EXECUTABLE_TARGETS.items():
+            command = manifest["build_proof"]["executables"][executable]["link_command"]
+            command_bytes = records["manifest_link_records"][
+                f"manifest-link-commands/{kind}/{executable}.json"
+            ]
+            trace_bytes = records["manifest_link_records"][
+                f"manifest-link-traces/{kind}/{executable}.jsonl"
+            ]
+            assert json.loads(command_bytes) == command
+            assert (
+                verify_module.verify_manifest_link_command(
+                    command,
+                    trace_bytes,
+                    records["capability"],
+                    target,
+                    manifest["executables"][executable],
+                    roots=roots,
+                    subject_root=manifest["runner_root"],
+                )
+                == command
+            )
+            replayed += 1
+    assert replayed == 9
 
 
 def test_capability_shape_rejects_linker_identity_substitution(
@@ -2485,6 +2764,278 @@ def test_capability_shape_rejects_linker_identity_substitution(
             records["capability"],
             read_record,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("elf_type", "ET_EXEC"),
+        ("program_headers_have_rwx", True),
+        ("function_symbol_count", 2),
+        ("input_section", ".text.attacker"),
+        ("output_section_count", 2),
+        ("section_flags", ["ALLOC", "WRITE", "EXECINSTR"]),
+        ("pt_load_count", 2),
+        ("pt_load_flags", "RWE"),
+        ("writable_segment_overlap", True),
+        ("overlapping_elf_sections", [".data"]),
+        ("sh_addralign", 3),
+        ("veneer_thunks", ["attacker_thunk"]),
+        ("plt_calls", ["puts@plt"]),
+    ],
+)
+def test_manifest_layout_ports_every_hosted_safety_invariant(
+    verify_module: ModuleType,
+    field: str,
+    replacement: Any,
+) -> None:
+    records = reviewed_records()
+    layout = records["clean_a"]["elf_layout"]["elastic_cache_gate"]
+    if field in {"elf_type", "program_headers_have_rwx"}:
+        layout[field] = replacement
+    else:
+        layout["kernels"]["elastic_cache_gate_insert_kernel"][field] = replacement
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="ELF|RWX|count|section|segment|overlap|align|veneer|thunk|PLT",
+    ):
+        verify_module.verify_manifest_relationships(
+            records["clean_a"],
+            records["clean_b"],
+            records["adversary"],
+        )
+
+
+def test_capability_layout_binds_max_page_size(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+    capability = records["capability"]
+    capability["max_page_size"] *= 2
+
+    def read_record(flavor: str, target: str, name: str) -> bytes:
+        return records["shape_records"][f"capability-shapes/{flavor}/{target}/{name}"]
+
+    with pytest.raises(verify_module.EvidenceError, match="MAXPAGESIZE|max.page"):
+        verify_module.verify_capability_shape_records(capability, read_record)
+
+
+def test_manifest_layout_binds_keyed_capability_fragment(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+    for manifest in (
+        records["clean_a"],
+        records["clean_b"],
+        records["adversary"],
+    ):
+        manifest["elf_layout"]["elastic_cache_gate"]["fragment_sha256"] = "f" * 64
+    with pytest.raises(verify_module.EvidenceError, match="fragment"):
+        verify_module.verify_manifest_relationships(
+            records["clean_a"],
+            records["clean_b"],
+            records["adversary"],
+        )
+
+
+def test_manifest_layout_binds_executable_link_map_hash(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+    records["clean_a"]["elf_layout"]["elastic_cache_gate"]["link_map_sha256"] = "f" * 64
+    with pytest.raises(verify_module.EvidenceError, match="link-map.*association"):
+        verify_module.verify_manifest_relationships(
+            records["clean_a"],
+            records["clean_b"],
+            records["adversary"],
+        )
+
+
+@pytest.mark.parametrize("mutation", ["driver", "fragment", "map", "inputs"])
+def test_manifest_link_command_is_independently_replayed(
+    verify_module: ModuleType,
+    mutation: str,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifest = documents["manifests"][0]
+    executable = "elastic_cache_gate"
+    target = "elastic"
+    command = manifest["build_proof"]["executables"][executable]["link_command"]
+    executable_record = manifest["executables"][executable]
+    trace_path = command["trace"]["absolute_path"]
+    trace_record = json.loads(documents["hosted_files"][trace_path])
+    if mutation == "driver":
+        command["driver"] = copy.deepcopy(capability["required_linkers"]["lld"])
+        trace_record["argv0"] = command["driver"]["argv0"]
+        trace_record["payload_path"] = command["driver"]["payload_path"]
+        trace_record["payload_sha256"] = command["driver"]["payload_sha256"]
+    elif mutation == "fragment":
+        command["fragment"] = "/host/subject/attacker.ld"
+        command["argv"] = [
+            token.replace(
+                "-Wl,-T,/host/subject/payload",
+                "-Wl,-T,/host/subject/attacker.ld",
+            )
+            for token in command["argv"]
+        ]
+        trace_record["argv"] = copy.deepcopy(command["argv"])
+    elif mutation == "map":
+        command["link_map"] = "/host/subject/attacker.map"
+        command["argv"] = [
+            token.replace(
+                "-Wl,-Map,/host/subject/payload",
+                "-Wl,-Map,/host/subject/attacker.map",
+            )
+            for token in command["argv"]
+        ]
+        trace_record["argv"] = copy.deepcopy(command["argv"])
+    else:
+        command["ordered_linker_inputs"].append("forged.o")
+        command["direct_input_files"].append("forged.o")
+        command["direct_cgu_members"].append("forged.rcgu.o")
+        command["ordered_linker_input_fingerprint"] = verify_module._fingerprint(
+            command["ordered_linker_inputs"]
+        )
+    trace_bytes = json_bytes(trace_record)
+    command["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="driver|fragment|map|input|trace|link command",
+    ):
+        verify_module.verify_manifest_link_command(
+            command,
+            trace_bytes,
+            capability,
+            target,
+            executable_record,
+        )
+
+
+@pytest.mark.parametrize("extra_kind", ["malformed", "second-producer"])
+def test_manifest_link_trace_validates_every_record_and_unique_producer(
+    verify_module: ModuleType,
+    extra_kind: str,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifest = documents["manifests"][0]
+    executable = "elastic_cache_gate"
+    command = manifest["build_proof"]["executables"][executable]["link_command"]
+    trace_path = command["trace"]["absolute_path"]
+    original = json.loads(documents["hosted_files"][trace_path])
+    if extra_kind == "malformed":
+        extra = {"argv": []}
+    else:
+        extra = copy.deepcopy(original)
+        extra["argv"].insert(0, "--build-id")
+    trace_bytes = json_bytes(original) + json_bytes(extra)
+    command["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    command["trace"]["record_count"] = 2
+    command["trace"]["final_link_record_count"] = 1
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="trace record|one captured final|producer|count",
+    ):
+        verify_module.verify_manifest_link_command(
+            command,
+            trace_bytes,
+            capability,
+            "elastic",
+            manifest["executables"][executable],
+        )
+
+
+def test_shape_trace_recomputes_unique_final_output_producer(
+    verify_module: ModuleType,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    shape = capability["shapes"]["actual"]["elastic"]
+    execution_path = shape["linker_execution"]["absolute_path"]
+    execution = json.loads(documents["shape_files"][execution_path])
+    trace_path = execution["trace"]["absolute_path"]
+    first = json.loads(documents["shape_files"][trace_path])
+    second = copy.deepcopy(first)
+    second["argv"].insert(0, "--build-id")
+    trace_bytes = json_bytes(first) + json_bytes(second)
+    execution["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    execution["trace"]["record_count"] = 2
+    execution["trace"]["final_link_record_count"] = 1
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="one.*execution|producer|count",
+    ):
+        verify_module._verify_shape_trace(
+            execution,
+            trace_bytes,
+            capability["linker"],
+        )
+
+
+@pytest.mark.parametrize("mutation", ["cwd", "raw-output"])
+def test_shape_execution_is_confined_to_subject_and_artifact_roots(
+    verify_module: ModuleType,
+    mutation: str,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    shape = capability["shapes"]["actual"]["elastic"]
+    execution_path = shape["linker_execution"]["absolute_path"]
+    execution = json.loads(documents["shape_files"][execution_path])
+    trace_path = execution["trace"]["absolute_path"]
+    trace = json.loads(documents["shape_files"][trace_path])
+    if mutation == "cwd":
+        execution["cwd"] = trace["cwd"] = "/host/v1"
+    else:
+        old_output = execution["raw_output"]
+        new_output = "/host/evidence/forged-output"
+        execution["raw_output"] = new_output
+        execution["argv"] = [
+            new_output if token == old_output else token for token in execution["argv"]
+        ]
+        trace["argv"] = copy.deepcopy(execution["argv"])
+        link_argv_path = shape["link_argv"]["absolute_path"]
+        link_argv = documents["shape_files"][link_argv_path].replace(
+            old_output.encode(),
+            new_output.encode(),
+        )
+        documents["shape_files"][link_argv_path] = link_argv
+        shape["link_argv"]["sha256"] = hashlib.sha256(link_argv).hexdigest()
+    trace_bytes = json_bytes(trace)
+    documents["shape_files"][trace_path] = trace_bytes
+    execution["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    execution_bytes = json_bytes(execution)
+    documents["shape_files"][execution_path] = execution_bytes
+    shape["linker_execution"]["sha256"] = hashlib.sha256(execution_bytes).hexdigest()
+    roots = verify_module.PortableRoots.from_document(documents["portable_paths"])
+
+    def read_record(flavor: str, target: str, name: str) -> bytes:
+        prefix = f"{capability['producer']['artifact_root']}/{flavor}/{target}"
+        return documents["shape_files"][f"{prefix}/{name}"]
+
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="subject root|artifact root|outside producer",
+    ):
+        verify_module.verify_capability_shape_records(
+            capability,
+            read_record,
+            roots,
+        )
+
+
+def test_bare_linker_argv0_uses_explicit_safe_grammar(
+    verify_module: ModuleType,
+) -> None:
+    records = reviewed_records()
+    roots = reviewed_record_roots(verify_module, records)
+    linker = records["capability"]["required_linkers"]["lld"]
+    verify_module.validate_linker_record_routes(linker, roots)
+    forged = copy.deepcopy(linker)
+    forged["argv0"] = "../ld.lld"
+    with pytest.raises(verify_module.EvidenceError, match="argv0"):
+        verify_module.validate_linker_record_routes(forged, roots)
 
 
 def test_full_clean_and_adversary_relationships_use_immutable_fields(
@@ -2639,6 +3190,58 @@ def test_adversary_raw_relocation_is_accepted_only_when_symbol_and_layout_agree(
     verify_module.verify_manifest_relationships(
         records["clean_a"], records["clean_b"], adversary
     )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "constants",
+        "clean-occurrence",
+        "occurrence-name",
+        "occurrence-start",
+        "occurrence-size",
+        "occurrence-count",
+        "outside",
+    ],
+)
+def test_layout_adversary_occurrences_are_recomputed_from_layout(
+    verify_module: ModuleType,
+    mutation: str,
+) -> None:
+    records = reviewed_records()
+    clean_a = records["clean_a"]
+    clean_b = records["clean_b"]
+    adversary = records["adversary"]
+    executable = "elastic_cache_gate"
+    if mutation == "constants":
+        for manifest in (clean_a, clean_b, adversary):
+            manifest["layout_adversary"]["symbol"] = "attacker_symbol"
+            manifest["layout_adversary"]["input_section"] = ".text.attacker"
+    elif mutation == "clean-occurrence":
+        clean_a["build_proof"]["executables"][executable]["adversary"] = {
+            "symbol_occurrences": [
+                {"name": "attacker", "start": 1, "size": 999},
+            ],
+            "input_section_occurrences": 999,
+            "outside_reservations": False,
+        }
+    else:
+        occurrence = adversary["build_proof"]["executables"][executable]["adversary"]
+        if mutation == "occurrence-name":
+            occurrence["symbol_occurrences"][0]["name"] = "attacker"
+        elif mutation == "occurrence-start":
+            occurrence["symbol_occurrences"][0]["start"] = 1
+        elif mutation == "occurrence-size":
+            occurrence["symbol_occurrences"][0]["size"] = 999
+        elif mutation == "occurrence-count":
+            occurrence["input_section_occurrences"] = 999
+        else:
+            occurrence["outside_reservations"] = False
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="adversary.*(constant|symbol|section|occurrence|reservation|outside)",
+    ):
+        verify_module.verify_manifest_relationships(clean_a, clean_b, adversary)
 
 
 @pytest.mark.parametrize(
