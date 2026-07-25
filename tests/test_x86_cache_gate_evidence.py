@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
+import tarfile
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run-x86-cache-gate-evidence.sh"
+WORKFLOW = ROOT / ".github" / "workflows" / "x86-cache-gate-evidence.yml"
 SUBJECT_COMMIT = "061d13da22b89208c801308efd578444c8e9caba"
 SUBJECT_TREE = "24921a941f8c3c26467465b99d6b45ee5912b2da"
 V1_COMMIT = "b0d53234dc051af91fe0321450b3e8312a84e635"
@@ -705,6 +709,301 @@ def invoke(
         check=False,
         env=merged,
     )
+
+
+def test_workflow_is_valid_and_branch_scoped() -> None:
+    assert WORKFLOW.is_file(), "native x86 evidence workflow is missing"
+    source = WORKFLOW.read_text()
+    ruby = shutil.which("ruby")
+    if ruby is not None:
+        completed = subprocess.run(
+            [
+                ruby,
+                "-e",
+                'require "yaml"; YAML.load_file(ARGV[0], aliases: true)',
+                str(WORKFLOW),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+    assert re.search(
+        r"(?m)^on:\n  push:\n    branches: \[ci/x86-cache-gate-evidence\]\n",
+        source,
+    )
+    assert re.search(r"(?m)^permissions:\n  contents: read\n", source)
+    assert re.search(
+        r"(?m)^jobs:\n  x86-cache-gate-evidence:\n    runs-on: ubuntu-24\.04\n",
+        source,
+    )
+
+
+def test_workflow_uses_immutable_sibling_checkouts_and_native_tools() -> None:
+    source = WORKFLOW.read_text()
+    tool_homes = (
+        r"        env:\n"
+        r"          RUSTUP_HOME: \$\{\{ runner\.temp \}\}/rustup\n"
+        r"          CARGO_HOME: \$\{\{ runner\.temp \}\}/cargo\n"
+    )
+    assert source.count("RUSTUP_HOME: ${{ runner.temp }}/rustup") == 2
+    assert source.count("CARGO_HOME: ${{ runner.temp }}/cargo") == 2
+    assert re.search(rf"(?m)^      - name: Install Rust 1\.95\.0\n{tool_homes}", source)
+    assert not re.search(r"(?m)^    env:\n      RUSTUP_HOME:", source)
+    checkout = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+    assert source.count(f"uses: {checkout}") == 3
+    assert source.count("persist-credentials: false") == 3
+    for path, ref in (
+        ("orchestrator", "${{ github.sha }}"),
+        ("subject", SUBJECT_COMMIT),
+        ("v1", V1_COMMIT),
+    ):
+        assert re.search(
+            rf"(?ms)^      - name: Checkout [^\n]+\n"
+            rf"        uses: {re.escape(checkout)}\n"
+            rf"        with:\n"
+            rf"(?:          [^\n]+\n)*?"
+            rf"          ref: {re.escape(ref)}\n"
+            rf"(?:          [^\n]+\n)*?"
+            rf"          path: {path}\n"
+            rf"(?:          [^\n]+\n)*?"
+            rf"          persist-credentials: false\n",
+            source,
+        )
+    uses = re.findall(r"(?m)^\s*uses:\s*([^ \n]+)", source)
+    assert uses
+    assert all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", value) for value in uses)
+    assert re.search(
+        r"(?m)^      - name: Install Rust 1\.95\.0\n"
+        + tool_homes
+        + (
+            r"        uses: dtolnay/rust-toolchain@"
+            r"2c7215f132e9ebf062739d9130488b56d53c060c\n"
+            r"        with:\n"
+            r"          toolchain: 1\.95\.0\n"
+        ),
+        source,
+    )
+    assert re.search(
+        r"(?m)^      - name: Install native LLD\n"
+        r"        run: \|\n"
+        r"          sudo apt-get update\n"
+        r"          sudo apt-get install --yes --no-install-recommends lld\n",
+        source,
+    )
+    assert all(
+        token not in source
+        for token in ("container:", "matrix:", "actions/cache@", "docker ")
+    )
+    sudo_lines = [
+        line.strip() for line in source.splitlines() if re.search(r"\bsudo\b", line)
+    ]
+    assert sudo_lines == [
+        "sudo apt-get update",
+        "sudo apt-get install --yes --no-install-recommends lld",
+    ]
+
+
+def test_workflow_runs_proof_directly_with_durable_status() -> None:
+    source = WORKFLOW.read_text()
+    proof = re.search(
+        r"(?ms)^      - name: Run native x86 proof\n"
+        r"        id: proof\n"
+        r"        continue-on-error: true\n"
+        r"        shell: bash\n"
+        r"        env:\n"
+        r"          RUSTUP_HOME: \$\{\{ runner\.temp \}\}/rustup\n"
+        r"          CARGO_HOME: \$\{\{ runner\.temp \}\}/cargo\n"
+        r"        run: \|\n"
+        r"(?P<body>(?:          [^\n]*\n)+)",
+        source,
+    )
+    assert proof
+    body = proof.group("body")
+    for literal in (
+        '"$GITHUB_WORKSPACE/orchestrator/scripts/run-x86-cache-gate-evidence.sh"',
+        '--orchestrator "$GITHUB_WORKSPACE/orchestrator"',
+        '--subject "$GITHUB_WORKSPACE/subject"',
+        '--v1 "$GITHUB_WORKSPACE/v1"',
+        '--evidence "$RUNNER_TEMP/x86-cache-gate-evidence"',
+        '--run-id "${{ github.run_id }}"',
+        '--run-attempt "${{ github.run_attempt }}"',
+        '--status-file "$RUNNER_TEMP/x86-cache-gate-evidence/proof.status"',
+    ):
+        assert literal in body
+    assert all(token not in body for token in ("set +e", "|| true", "exit 0"))
+
+
+def workflow_run_script(step_name: str) -> str:
+    source = WORKFLOW.read_text()
+    match = re.search(
+        rf"(?ms)^      - name: {re.escape(step_name)}\n"
+        rf"(?:(?!^      - name:).)*?"
+        rf"^        run: \|\n"
+        rf"(?P<body>(?:^(?:          [^\n]*)?\n)+)",
+        source,
+    )
+    assert match, f"workflow step has no executable body: {step_name}"
+    return textwrap.dedent(match.group("body"))
+
+
+def test_workflow_always_packages_and_uploads_only_archive_pair(
+    tmp_path: Path,
+) -> None:
+    source = WORKFLOW.read_text()
+    for step_name in (
+        "Package evidence",
+        "Upload evidence",
+        "Exit with durable proof status",
+    ):
+        step = re.search(
+            rf"(?ms)^      - name: {re.escape(step_name)}\n"
+            rf"(?P<body>(?:(?!^      - name:).)*)",
+            source,
+        )
+        assert step
+        assert "if: ${{ always() }}" in step.group("body")
+
+    upload = re.search(
+        r"(?ms)^      - name: Upload evidence\n"
+        r"        if: \$\{\{ always\(\) \}\}\n"
+        r"        uses: actions/upload-artifact@"
+        r"ea165f8d65b6e75b540449e92b4886f43607fa02\n"
+        r"        with:\n"
+        r"          name: (?P<name>[^\n]+)\n"
+        r"          path: \|\n"
+        r"            \$\{\{ runner\.temp \}\}/x86-cache-gate-evidence\.tar\n"
+        r"            \$\{\{ runner\.temp \}\}/x86-cache-gate-evidence\.tar\.sha256\n"
+        r"          if-no-files-found: error\n"
+        r"          overwrite: false\n",
+        source,
+    )
+    assert upload
+    assert "${{ github.run_id }}" in upload.group("name")
+    assert "${{ github.run_attempt }}" in upload.group("name")
+
+    runner_temp = tmp_path / "runner-temp"
+    workspace = tmp_path / "workspace"
+    runner_temp.mkdir()
+    workspace.mkdir()
+    completed = subprocess.run(
+        ["bash", "-c", workflow_run_script("Package evidence")],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_SHA": ORCHESTRATOR_COMMIT,
+            "GITHUB_RUN_ID": "7",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "PROOF_OUTCOME": "skipped",
+        },
+    )
+    assert completed.returncode == 0, completed.stderr
+    status = runner_temp / "x86-cache-gate-evidence/proof.status"
+    archive = runner_temp / "x86-cache-gate-evidence.tar"
+    checksum = runner_temp / "x86-cache-gate-evidence.tar.sha256"
+    assert status.read_bytes() == b"125\n"
+    assert archive.is_file()
+    assert checksum.read_text() == (
+        f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+    )
+    with tarfile.open(archive, mode="r:") as evidence:
+        names = evidence.getnames()
+        assert "bundle/provenance.json" in names
+        assert "bundle/proof.status" in names
+
+
+@pytest.mark.parametrize(
+    ("raw_status", "proof_outcome", "expected_returncode", "effective_status"),
+    [
+        ("73\n", "failure", 0, 73),
+        ("0\n", "success", 125, 125),
+    ],
+)
+def test_workflow_packages_fallback_when_staging_is_partial(
+    tmp_path: Path,
+    raw_status: str,
+    proof_outcome: str,
+    expected_returncode: int,
+    effective_status: int,
+) -> None:
+    runner_temp = tmp_path / "runner-temp"
+    workspace = tmp_path / "workspace"
+    evidence = runner_temp / "x86-cache-gate-evidence"
+    (evidence / "staging/bundle").mkdir(parents=True)
+    (evidence / "proof.status").write_text(raw_status)
+    scripts = workspace / "orchestrator/scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "package-x86-cache-gate-evidence.py").symlink_to(
+        ROOT / "scripts/package-x86-cache-gate-evidence.py"
+    )
+    completed = subprocess.run(
+        ["bash", "-c", workflow_run_script("Package evidence")],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_SHA": ORCHESTRATOR_COMMIT,
+            "GITHUB_RUN_ID": "7",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "PROOF_OUTCOME": proof_outcome,
+        },
+    )
+    assert completed.returncode == expected_returncode, completed.stderr
+    archive = runner_temp / "x86-cache-gate-evidence.tar"
+    checksum = runner_temp / "x86-cache-gate-evidence.tar.sha256"
+    assert checksum.read_text() == (
+        f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+    )
+    with tarfile.open(archive, mode="r:") as packaged:
+        provenance = json.load(packaged.extractfile("bundle/provenance.json"))
+        packaged_status = packaged.extractfile("bundle/proof.status").read()
+        assert provenance["proof"] == {"status": effective_status, "result": "FAIL"}
+        assert packaged_status == f"{effective_status}\n".encode()
+        assert provenance["diagnostic"]["reason"] == (
+            "canonical staging bundle unavailable"
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload", "proof_outcome", "expected"),
+    [
+        (None, "skipped", 125),
+        (b"0\n", "success", 0),
+        (b"73\n", "failure", 73),
+        (b"00\n", "success", 125),
+        (b"256\n", "success", 125),
+        (b"0\n", "failure", 125),
+    ],
+)
+def test_workflow_final_status_is_authoritative(
+    tmp_path: Path,
+    payload: bytes | None,
+    proof_outcome: str,
+    expected: int,
+) -> None:
+    evidence = tmp_path / "x86-cache-gate-evidence"
+    if payload is not None:
+        evidence.mkdir()
+        (evidence / "proof.status").write_bytes(payload)
+    completed = subprocess.run(
+        ["bash", "-c", workflow_run_script("Exit with durable proof status")],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "RUNNER_TEMP": str(tmp_path),
+            "PROOF_OUTCOME": proof_outcome,
+        },
+    )
+    assert completed.returncode == expected, completed.stderr
 
 
 def test_runner_source_contract_is_exact_and_never_times() -> None:

@@ -1,0 +1,225 @@
+name: Native x86 cache-gate evidence
+
+on:
+  push:
+    branches: [ci/x86-cache-gate-evidence]
+
+permissions:
+  contents: read
+
+jobs:
+  x86-cache-gate-evidence:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: orchestrator
+          persist-credentials: false
+
+      - name: Checkout subject
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 061d13da22b89208c801308efd578444c8e9caba
+          path: subject
+          persist-credentials: false
+
+      - name: Checkout v1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: b0d53234dc051af91fe0321450b3e8312a84e635
+          path: v1
+          persist-credentials: false
+
+      - name: Install Rust 1.95.0
+        env:
+          RUSTUP_HOME: ${{ runner.temp }}/rustup
+          CARGO_HOME: ${{ runner.temp }}/cargo
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.95.0
+
+      - name: Install native LLD
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends lld
+
+      - name: Run native x86 proof
+        id: proof
+        continue-on-error: true
+        shell: bash
+        env:
+          RUSTUP_HOME: ${{ runner.temp }}/rustup
+          CARGO_HOME: ${{ runner.temp }}/cargo
+        run: |
+          "$GITHUB_WORKSPACE/orchestrator/scripts/run-x86-cache-gate-evidence.sh" \
+            --orchestrator "$GITHUB_WORKSPACE/orchestrator" \
+            --subject "$GITHUB_WORKSPACE/subject" \
+            --v1 "$GITHUB_WORKSPACE/v1" \
+            --evidence "$RUNNER_TEMP/x86-cache-gate-evidence" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --status-file "$RUNNER_TEMP/x86-cache-gate-evidence/proof.status"
+
+      - name: Package evidence
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PROOF_OUTCOME: ${{ steps.proof.outcome }}
+        run: |
+          set -Eeuo pipefail
+          evidence="$RUNNER_TEMP/x86-cache-gate-evidence"
+          status_file="$evidence/proof.status"
+          archive="$RUNNER_TEMP/x86-cache-gate-evidence.tar"
+          checksum="$RUNNER_TEMP/x86-cache-gate-evidence.tar.sha256"
+          package_staging="$evidence/staging"
+          fallback_staging="$RUNNER_TEMP/x86-cache-gate-fallback/staging"
+          fallback_required=0
+          prepare_fallback() {
+            fallback_required=1
+            package_staging="$fallback_staging"
+            mkdir -p -- "$fallback_staging/bundle"
+            /usr/bin/python3 - "$status_file" \
+              "$fallback_staging/bundle/provenance.json" \
+              "$fallback_staging/bundle/proof.status" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          status_path, output_path, bundled_status_path = map(Path, sys.argv[1:])
+          raw = status_path.read_bytes()
+          match = re.fullmatch(rb"(?:0|[1-9][0-9]{0,2})\n", raw)
+          status = int(raw[:-1]) if match and int(raw[:-1]) <= 255 else 125
+          outcome = os.environ.get("PROOF_OUTCOME", "unknown")
+          if status == 0:
+              status = 125
+          document = {
+              "version": 1,
+              "hardlinks": [],
+              "proof": {
+                  "status": status,
+                  "result": "PASS" if status == 0 else "FAIL",
+              },
+              "diagnostic": {
+                  "reason": "canonical staging bundle unavailable",
+                  "proof_outcome": outcome,
+                  "github_sha": os.environ.get("GITHUB_SHA", ""),
+                  "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                  "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+              },
+          }
+          output_path.write_text(
+              json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+          )
+          bundled_status_path.write_text(f"{status}\n")
+          PY
+          }
+          package_fallback_without_helper() {
+            /usr/bin/rm -f -- "$archive" "$checksum"
+            /usr/bin/tar \
+              --format=pax \
+              --sort=name \
+              --numeric-owner \
+              --owner=0 \
+              --group=0 \
+              --mtime=@0 \
+              -cf "$archive" \
+              -C "$package_staging" \
+              bundle
+            digest=$(/usr/bin/sha256sum "$archive")
+            printf '%s  %s\n' "${digest%% *}" "${archive##*/}" >"$checksum"
+          }
+          if [[ ! -f "$status_file" ]]; then
+            umask 077
+            mkdir -p -- "$evidence"
+            printf '125\n' >"$status_file"
+            prepare_fallback
+          elif [[ ! -d "$package_staging/bundle" ]]; then
+            prepare_fallback
+          fi
+          packager="$GITHUB_WORKSPACE/orchestrator/scripts/package-x86-cache-gate-evidence.py"
+          package_with_helper() {
+            /usr/bin/python3 "$packager" \
+              --staging-root "$package_staging" \
+              --archive "$archive" \
+              --checksum "$checksum"
+          }
+          if [[ -f "$packager" ]]; then
+            if ! package_with_helper; then
+              if [[ "$package_staging" != "$fallback_staging" ]]; then
+                prepare_fallback
+              fi
+              package_with_helper || package_fallback_without_helper
+            fi
+          else
+            if [[ "$package_staging" != "$fallback_staging" ]]; then
+              prepare_fallback
+            fi
+            package_fallback_without_helper
+          fi
+          if (( fallback_required )) && [[ $(<"$status_file") == 0 ]]; then
+            exit 125
+          fi
+
+      - name: Upload evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: x86-cache-gate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/x86-cache-gate-evidence.tar
+            ${{ runner.temp }}/x86-cache-gate-evidence.tar.sha256
+          if-no-files-found: error
+          overwrite: false
+
+      - name: Exit with durable proof status
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PROOF_OUTCOME: ${{ steps.proof.outcome }}
+        run: |
+          set -Eeuo pipefail
+          status_file="$RUNNER_TEMP/x86-cache-gate-evidence/proof.status"
+          status=$(/usr/bin/python3 - "$status_file" <<'PY'
+          import os
+          import re
+          import stat
+          import sys
+
+          path = sys.argv[1]
+          try:
+              descriptor = os.open(
+                  path,
+                  os.O_RDONLY
+                  | os.O_NOFOLLOW
+                  | getattr(os, "O_CLOEXEC", 0),
+              )
+          except OSError:
+              raise SystemExit(125)
+          try:
+              before = os.fstat(descriptor)
+              raw = os.read(descriptor, 16)
+              extra = os.read(descriptor, 1)
+              after = os.fstat(descriptor)
+          finally:
+              os.close(descriptor)
+          if (
+              not stat.S_ISREG(before.st_mode)
+              or before.st_nlink != 1
+              or (before.st_dev, before.st_ino, before.st_size)
+              != (after.st_dev, after.st_ino, after.st_size)
+              or extra
+              or re.fullmatch(rb"(?:0|[1-9][0-9]{0,2})\n", raw) is None
+              or int(raw[:-1]) > 255
+          ):
+              raise SystemExit(125)
+          print(int(raw[:-1]))
+          PY
+          ) || exit 125
+          if [[ "$PROOF_OUTCOME" == failure && "$status" == 0 ]]; then
+            status=125
+          fi
+          exit "$status"
