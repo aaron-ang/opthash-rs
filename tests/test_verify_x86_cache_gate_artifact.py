@@ -178,6 +178,59 @@ def test_opens_zip_once_with_no_follow_and_checks_regular_file(tmp_path, monkeyp
     assert len(opened_archive_fds) == 1
 
 
+def test_extracts_hashed_snapshot_when_open_file_is_overwritten_in_place(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "artifact.zip"
+    digest = make_zip(
+        archive, [(TAR_NAME, b"original"), (CHECKSUM_NAME, b"checksum-a")]
+    )
+    replacement = tmp_path / "replacement.zip"
+    make_zip(replacement, [(TAR_NAME, b"mutated!"), (CHECKSUM_NAME, b"checksum-b")])
+    replacement_bytes = replacement.read_bytes()
+    original_size = archive.stat().st_size
+    assert len(replacement_bytes) == original_size
+
+    real_fdopen = artifact.os.fdopen
+    overwritten = False
+
+    class OverwrittenAfterRead:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def read(self, size=-1):
+            nonlocal overwritten
+            data = self.stream.read(size)
+            if data and self.stream.tell() == original_size and not overwritten:
+                archive.write_bytes(replacement_bytes)
+                overwritten = True
+            return data
+
+    def overwrite_after_archive_read(descriptor, mode="r", *args, **kwargs):
+        stream = real_fdopen(descriptor, mode, *args, **kwargs)
+        if mode == "rb":
+            return OverwrittenAfterRead(stream)
+        return stream
+
+    monkeypatch.setattr(artifact.os, "fdopen", overwrite_after_archive_read)
+
+    extracted_tar, extracted_checksum = bind(archive, digest, tmp_path / "output")
+
+    assert overwritten
+    assert extracted_tar.read_bytes() == b"original"
+    assert extracted_checksum.read_bytes() == b"checksum-a"
+
+
 def test_preserves_zip_read_error_when_member_body_is_corrupt(tmp_path):
     archive = tmp_path / "artifact.zip"
     make_zip(archive, [(TAR_NAME, b"tar"), (CHECKSUM_NAME, b"checksum")])

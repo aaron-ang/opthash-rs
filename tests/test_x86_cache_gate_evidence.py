@@ -737,6 +737,15 @@ def test_workflow_is_valid_and_branch_scoped() -> None:
         r"(?m)^jobs:\n  x86-cache-gate-evidence:\n    runs-on: ubuntu-24\.04\n",
         source,
     )
+    assert re.search(
+        r"(?m)^    env:\n"
+        r"      ARTIFACT_BASE: cache-gate-\$\{\{ github\.run_id \}\}-"
+        r"\$\{\{ github\.run_attempt \}\}\n",
+        source,
+    )
+    assert (
+        source.count("cache-gate-${{ github.run_id }}-${{ github.run_attempt }}") == 1
+    )
 
 
 def test_workflow_uses_immutable_sibling_checkouts_and_native_tools() -> None:
@@ -825,10 +834,10 @@ def test_workflow_runs_proof_directly_with_durable_status() -> None:
         '--orchestrator "$GITHUB_WORKSPACE/orchestrator"',
         '--subject "$GITHUB_WORKSPACE/subject"',
         '--v1 "$GITHUB_WORKSPACE/v1"',
-        '--evidence "$RUNNER_TEMP/x86-cache-gate-evidence"',
+        '--evidence "$RUNNER_TEMP/$ARTIFACT_BASE"',
         '--run-id "${{ github.run_id }}"',
         '--run-attempt "${{ github.run_attempt }}"',
-        '--status-file "$RUNNER_TEMP/x86-cache-gate-evidence/proof.status"',
+        '--status-file "$RUNNER_TEMP/$ARTIFACT_BASE/proof.status"',
     ):
         assert literal in body
     assert all(token not in body for token in ("set +e", "|| true", "exit 0"))
@@ -870,17 +879,18 @@ def test_workflow_always_packages_and_uploads_only_archive_pair(
         r"        uses: actions/upload-artifact@"
         r"ea165f8d65b6e75b540449e92b4886f43607fa02\n"
         r"        with:\n"
-        r"          name: (?P<name>[^\n]+)\n"
+        r"          name: x86-cache-gate-evidence-\$\{\{ github\.run_id \}\}-"
+        r"\$\{\{ github\.run_attempt \}\}\n"
         r"          path: \|\n"
-        r"            \$\{\{ runner\.temp \}\}/x86-cache-gate-evidence\.tar\n"
-        r"            \$\{\{ runner\.temp \}\}/x86-cache-gate-evidence\.tar\.sha256\n"
+        r"            \$\{\{ runner\.temp \}\}/\$\{\{ env\.ARTIFACT_BASE \}\}\.tar\n"
+        r"            \$\{\{ runner\.temp \}\}/\$\{\{ env\.ARTIFACT_BASE \}\}"
+        r"\.tar\.sha256\n"
         r"          if-no-files-found: error\n"
         r"          overwrite: false\n",
         source,
     )
     assert upload
-    assert "${{ github.run_id }}" in upload.group("name")
-    assert "${{ github.run_attempt }}" in upload.group("name")
+    assert "x86-cache-gate-evidence.tar" not in source
 
     runner_temp = tmp_path / "runner-temp"
     workspace = tmp_path / "workspace"
@@ -898,14 +908,17 @@ def test_workflow_always_packages_and_uploads_only_archive_pair(
             "GITHUB_SHA": ORCHESTRATOR_COMMIT,
             "GITHUB_RUN_ID": "7",
             "GITHUB_RUN_ATTEMPT": "2",
+            "ARTIFACT_BASE": "cache-gate-7-2",
             "PROOF_OUTCOME": "skipped",
         },
     )
     assert completed.returncode == 0, completed.stderr
-    status = runner_temp / "x86-cache-gate-evidence/proof.status"
-    archive = runner_temp / "x86-cache-gate-evidence.tar"
-    checksum = runner_temp / "x86-cache-gate-evidence.tar.sha256"
+    status = runner_temp / "cache-gate-7-2/proof.status"
+    archive = runner_temp / "cache-gate-7-2.tar"
+    checksum = runner_temp / "cache-gate-7-2.tar.sha256"
     assert status.read_bytes() == b"125\n"
+    assert (runner_temp / "cache-gate-7-2-fallback/staging/bundle").is_dir()
+    assert not (runner_temp / "x86-cache-gate-fallback").exists()
     assert archive.is_file()
     assert checksum.read_text() == (
         f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
@@ -932,7 +945,7 @@ def test_workflow_packages_fallback_when_staging_is_partial(
 ) -> None:
     runner_temp = tmp_path / "runner-temp"
     workspace = tmp_path / "workspace"
-    evidence = runner_temp / "x86-cache-gate-evidence"
+    evidence = runner_temp / "cache-gate-7-2"
     (evidence / "staging/bundle").mkdir(parents=True)
     (evidence / "proof.status").write_text(raw_status)
     scripts = workspace / "orchestrator/scripts"
@@ -952,12 +965,13 @@ def test_workflow_packages_fallback_when_staging_is_partial(
             "GITHUB_SHA": ORCHESTRATOR_COMMIT,
             "GITHUB_RUN_ID": "7",
             "GITHUB_RUN_ATTEMPT": "2",
+            "ARTIFACT_BASE": "cache-gate-7-2",
             "PROOF_OUTCOME": proof_outcome,
         },
     )
     assert completed.returncode == expected_returncode, completed.stderr
-    archive = runner_temp / "x86-cache-gate-evidence.tar"
-    checksum = runner_temp / "x86-cache-gate-evidence.tar.sha256"
+    archive = runner_temp / "cache-gate-7-2.tar"
+    checksum = runner_temp / "cache-gate-7-2.tar.sha256"
     assert checksum.read_text() == (
         f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
     )
@@ -988,7 +1002,7 @@ def test_workflow_final_status_is_authoritative(
     proof_outcome: str,
     expected: int,
 ) -> None:
-    evidence = tmp_path / "x86-cache-gate-evidence"
+    evidence = tmp_path / "cache-gate-7-2"
     if payload is not None:
         evidence.mkdir()
         (evidence / "proof.status").write_bytes(payload)
@@ -1000,6 +1014,7 @@ def test_workflow_final_status_is_authoritative(
         env={
             **os.environ,
             "RUNNER_TEMP": str(tmp_path),
+            "ARTIFACT_BASE": "cache-gate-7-2",
             "PROOF_OUTCOME": proof_outcome,
         },
     )

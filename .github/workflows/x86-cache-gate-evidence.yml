@@ -10,6 +10,8 @@ permissions:
 jobs:
   x86-cache-gate-evidence:
     runs-on: ubuntu-24.04
+    env:
+      ARTIFACT_BASE: cache-gate-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout orchestration
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -57,10 +59,10 @@ jobs:
             --orchestrator "$GITHUB_WORKSPACE/orchestrator" \
             --subject "$GITHUB_WORKSPACE/subject" \
             --v1 "$GITHUB_WORKSPACE/v1" \
-            --evidence "$RUNNER_TEMP/x86-cache-gate-evidence" \
+            --evidence "$RUNNER_TEMP/$ARTIFACT_BASE" \
             --run-id "${{ github.run_id }}" \
             --run-attempt "${{ github.run_attempt }}" \
-            --status-file "$RUNNER_TEMP/x86-cache-gate-evidence/proof.status"
+            --status-file "$RUNNER_TEMP/$ARTIFACT_BASE/proof.status"
 
       - name: Package evidence
         if: ${{ always() }}
@@ -69,12 +71,12 @@ jobs:
           PROOF_OUTCOME: ${{ steps.proof.outcome }}
         run: |
           set -Eeuo pipefail
-          evidence="$RUNNER_TEMP/x86-cache-gate-evidence"
+          evidence="$RUNNER_TEMP/$ARTIFACT_BASE"
           status_file="$evidence/proof.status"
-          archive="$RUNNER_TEMP/x86-cache-gate-evidence.tar"
-          checksum="$RUNNER_TEMP/x86-cache-gate-evidence.tar.sha256"
+          archive="$RUNNER_TEMP/$ARTIFACT_BASE.tar"
+          checksum="$RUNNER_TEMP/$ARTIFACT_BASE.tar.sha256"
           package_staging="$evidence/staging"
-          fallback_staging="$RUNNER_TEMP/x86-cache-gate-fallback/staging"
+          fallback_staging="$RUNNER_TEMP/$ARTIFACT_BASE-fallback/staging"
           fallback_required=0
           prepare_fallback() {
             fallback_required=1
@@ -170,8 +172,8 @@ jobs:
         with:
           name: x86-cache-gate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/x86-cache-gate-evidence.tar
-            ${{ runner.temp }}/x86-cache-gate-evidence.tar.sha256
+            ${{ runner.temp }}/${{ env.ARTIFACT_BASE }}.tar
+            ${{ runner.temp }}/${{ env.ARTIFACT_BASE }}.tar.sha256
           if-no-files-found: error
           overwrite: false
 
@@ -182,7 +184,7 @@ jobs:
           PROOF_OUTCOME: ${{ steps.proof.outcome }}
         run: |
           set -Eeuo pipefail
-          status_file="$RUNNER_TEMP/x86-cache-gate-evidence/proof.status"
+          status_file="$RUNNER_TEMP/$ARTIFACT_BASE/proof.status"
           status=$(/usr/bin/python3 - "$status_file" <<'PY'
           import os
           import re

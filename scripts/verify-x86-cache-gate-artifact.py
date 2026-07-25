@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import tempfile
 import zipfile
 
 
@@ -53,10 +54,18 @@ def _expected_digest(expected_digest: str) -> str:
     return match.group(1)
 
 
-def _hash_zip(stream, expected_digest: str) -> None:
+def _snapshot_zip(stream, snapshot, expected_digest: str, expected_size: int) -> None:
     digest = hashlib.sha256()
-    for block in iter(lambda: stream.read(1024 * 1024), b""):
+    remaining = expected_size
+    while remaining:
+        block = stream.read(min(remaining, 1024 * 1024))
+        if not block:
+            raise EvidenceError("ZIP input size changed")
+        snapshot.write(block)
         digest.update(block)
+        remaining -= len(block)
+    if stream.read(1):
+        raise EvidenceError("ZIP input size changed")
     if digest.hexdigest() != expected_digest:
         raise EvidenceError("API digest mismatch")
 
@@ -66,13 +75,15 @@ def _verified_archive(zip_path: Path, expected_digest: str):
     expected_hash = _expected_digest(expected_digest)
     descriptor = os.open(zip_path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
             raise EvidenceError("ZIP input is not a regular file")
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            _hash_zip(stream, expected_hash)
-            stream.seek(0)
-            with zipfile.ZipFile(stream) as archive:
+        with tempfile.TemporaryFile("w+b") as snapshot:
+            with os.fdopen(descriptor, "rb") as stream:
+                descriptor = -1
+                _snapshot_zip(stream, snapshot, expected_hash, metadata.st_size)
+            snapshot.seek(0)
+            with zipfile.ZipFile(snapshot) as archive:
                 yield archive
     finally:
         if descriptor != -1:

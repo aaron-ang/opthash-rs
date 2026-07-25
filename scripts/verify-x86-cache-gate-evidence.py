@@ -1604,7 +1604,13 @@ def validate_concrete_route_values(
             )
         elif field_kind in {"rustc-options", "rustc-options-template"}:
             _require(isinstance(value, list), f"{label} route type mismatch")
-            validate_command(["rustc", *value], roots, rustc=True, cwd=command_cwd)
+            validate_command(
+                ["rustc", *value],
+                roots,
+                rustc=True,
+                cwd=command_cwd,
+                allow_linker_templates=field_kind == "rustc-options-template",
+            )
         elif field_kind == "linker-template":
             _require(
                 isinstance(value, list)
@@ -1732,48 +1738,23 @@ def _validate_gcc_resolution_file(value: str) -> None:
     )
 
 
-def _validate_link_arg(value: str, roots: PortableRoots, *, cwd: str | None) -> None:
+def _validate_link_arg(
+    value: str,
+    roots: PortableRoots,
+    *,
+    cwd: str | None,
+    allow_template: bool = False,
+) -> None:
+    if allow_template and value in {
+        "-Wl,-Map,<per-target-map>",
+        "-Wl,-T,<target-fragment>",
+    }:
+        return
     if value.startswith("-fresolution="):
         _validate_gcc_resolution_file(value.removeprefix("-fresolution="))
         return
-    if value.startswith("@"):
-        _map_command_path(value[1:], roots, cwd=cwd)
-        return
-    for prefix in ("-T", "-B", "-L"):
-        if value.startswith(prefix) and len(value) > len(prefix):
-            _map_command_path(value[len(prefix) :], roots, cwd=cwd)
-            return
-    for prefix in (
-        "--script=",
-        "--version-script=",
-        "--dynamic-linker=",
-        "-Map=",
-        "-Map,",
-        "-rpath=",
-        "-rpath,",
-    ):
-        if value.startswith(prefix):
-            _map_command_path(value[len(prefix) :], roots, cwd=cwd)
-            return
-    if value.startswith("/"):
-        _map_command_path(value, roots, cwd=cwd)
-        return
-    _require(not _looks_path_valued(value), "unclassified path-valued link argument")
-
-
-def _validate_wl_token(token: str, roots: PortableRoots, *, cwd: str | None) -> None:
-    values = token.removeprefix("-Wl,").split(",")
-    _require(all(values), "malformed -Wl argument")
-    index = 0
-    while index < len(values):
-        value = values[index]
-        if value in {"-T", "--script", "--version-script", "-Map", "-rpath"}:
-            _require(index + 1 < len(values), "path-valued linker flag lacks value")
-            _map_command_path(values[index + 1], roots, cwd=cwd)
-            index += 2
-            continue
-        _validate_link_arg(value, roots, cwd=cwd)
-        index += 1
+    parsed = _parse_effective_link_command([value])
+    _route_effective_link_operands(parsed, roots, cwd=cwd)
 
 
 def validate_command(
@@ -1783,6 +1764,7 @@ def validate_command(
     rustc: bool,
     has_program: bool = True,
     cwd: str | None = None,
+    allow_linker_templates: bool = False,
 ) -> None:
     _require(
         isinstance(command, list)
@@ -1793,6 +1775,15 @@ def validate_command(
         ),
         "command schema mismatch",
     )
+    if not rustc:
+        linker_arguments = command
+        if has_program:
+            _validate_linker_argv0(command[0], roots)
+            linker_arguments = command[1:]
+        parsed = _parse_effective_link_command(linker_arguments)
+        _route_effective_link_operands(parsed, roots, cwd=cwd)
+        return
+
     index = 0
     while index < len(command):
         token = command[index]
@@ -1851,7 +1842,12 @@ def validate_command(
             if option.startswith("linker="):
                 _map_command_path(option.removeprefix("linker="), roots, cwd=cwd)
             elif option.startswith("link-arg="):
-                _validate_link_arg(option.removeprefix("link-arg="), roots, cwd=cwd)
+                _validate_link_arg(
+                    option.removeprefix("link-arg="),
+                    roots,
+                    cwd=cwd,
+                    allow_template=allow_linker_templates,
+                )
             else:
                 _require(
                     not _looks_path_valued(option),
@@ -1862,11 +1858,26 @@ def validate_command(
         elif token.startswith("-Clinker="):
             _map_command_path(token.removeprefix("-Clinker="), roots, cwd=cwd)
         elif token.startswith("-Clink-arg="):
-            _validate_link_arg(token.removeprefix("-Clink-arg="), roots, cwd=cwd)
+            _validate_link_arg(
+                token.removeprefix("-Clink-arg="),
+                roots,
+                cwd=cwd,
+                allow_template=allow_linker_templates,
+            )
         elif token.startswith("-Wl,"):
-            _validate_wl_token(token, roots, cwd=cwd)
+            _validate_link_arg(
+                token,
+                roots,
+                cwd=cwd,
+                allow_template=allow_linker_templates,
+            )
         elif token.startswith("-plugin-opt="):
-            _validate_link_arg(token.removeprefix("-plugin-opt="), roots, cwd=cwd)
+            _validate_link_arg(
+                token.removeprefix("-plugin-opt="),
+                roots,
+                cwd=cwd,
+                allow_template=allow_linker_templates,
+            )
         elif token.startswith("-B") and token != "-B":
             _map_command_path(token[2:], roots, cwd=cwd)
         elif token == "-B":
@@ -1876,7 +1887,12 @@ def validate_command(
             continue
         elif token == "-Xlinker":
             _require(index + 1 < len(command), "-Xlinker lacks value")
-            _validate_link_arg(command[index + 1], roots, cwd=cwd)
+            _validate_link_arg(
+                command[index + 1],
+                roots,
+                cwd=cwd,
+                allow_template=allow_linker_templates,
+            )
             index += 2
             continue
         elif token.startswith("@"):
@@ -1908,18 +1924,6 @@ def validate_command(
                 not _looks_path_valued(value),
                 f"unclassified path-valued {token} value",
             )
-            index += 2
-            continue
-        elif not rustc and token in {"-m", "-plugin-opt", "-X", "-z"}:
-            _require(index + 1 < len(command), f"{token} lacks value")
-            value = command[index + 1]
-            if token == "-plugin-opt":
-                _validate_link_arg(value, roots, cwd=cwd)
-            else:
-                _require(
-                    not _looks_path_valued(value),
-                    f"unclassified path-valued {token} value",
-                )
             index += 2
             continue
         elif token.startswith("-"):
@@ -2024,7 +2028,12 @@ def validate_rustc_transcript(line: str, roots: PortableRoots) -> None:
                     if marker == "-Clinker=":
                         _map_command_path(option, roots, cwd=manifest_dir)
                     else:
-                        _validate_link_arg(option, roots, cwd=manifest_dir)
+                        _validate_link_arg(
+                            option,
+                            roots,
+                            cwd=manifest_dir,
+                            allow_template=False,
+                        )
                     residual = residual[:start]
                 _require(
                     not _looks_path_valued(residual),
@@ -2164,6 +2173,13 @@ class EffectiveLinkToken(NamedTuple):
     source_index: int
 
 
+class EffectiveLinkOperand(NamedTuple):
+    option: str | None
+    value: str
+    forwarded: bool
+    source_argument: str
+
+
 class EffectiveLinkOutput(NamedTuple):
     option: str
     value: str
@@ -2192,6 +2208,7 @@ class EffectiveLinkControls(NamedTuple):
 
 class EffectiveLinkCommand(NamedTuple):
     tokens: tuple[EffectiveLinkToken, ...]
+    operands: tuple[EffectiveLinkOperand, ...]
     output_controls: tuple[EffectiveLinkOutput, ...]
     inputs: EffectiveLinkInputs
     controls: EffectiveLinkControls
@@ -2201,102 +2218,94 @@ class EffectiveLinkCommand(NamedTuple):
         return tuple(control.value for control in self.output_controls)
 
 
-_LINK_OPTIONS_WITH_OPERAND = frozenset(
-    {
-        "-A",
-        "-B",
-        "-F",
-        "-G",
-        "-I",
-        "-L",
-        "-Map",
-        "-T",
-        "-Tbss",
-        "-Tdata",
-        "-Ttext",
-        "-Y",
-        "-b",
-        "-e",
-        "-f",
-        "-fuse-ld",
-        "-h",
-        "-m",
-        "-o",
-        "-rpath",
-        "-rpath-link",
-        "-soname",
-        "-u",
-        "-y",
-        "-z",
-        "--Map",
-        "--defsym",
-        "--dependency-file",
-        "--dynamic-linker",
-        "-dynamic-linker",
-        "--entry",
-        "--format",
-        "--library-path",
-        "--ld-path",
-        "--oformat",
-        "--output",
-        "--out-implib",
-        "--rpath",
-        "--rpath-link",
-        "--script",
-        "--section-start",
-        "--soname",
-        "--sysroot",
-        "--undefined",
-        "--wrap",
-    }
-)
-_LINK_JOINED_SHORT_OPTIONS = (
-    "-rpath-link=",
-    "-fuse-ld=",
-    "-rpath=",
-    "-soname=",
-    "-Map",
-    "-B",
-    "-I",
-    "-L",
-    "-T",
-    "-e",
-    "-h",
-    "-m",
-    "-o",
-    "-u",
-    "-z",
-)
-_LINK_MECHANISM_OPTIONS = frozenset(
-    {
-        "-plugin-opt",
-        "--plugin-opt",
-        "-plugin",
-        "--plugin",
-        "--remap-inputs-file",
-        "--remap-inputs",
-        "--retain-symbols-file",
-        "--export-dynamic-symbol-list",
-        "--dynamic-list",
-        "--version-script",
-        "--mri-script",
-        "--default-script",
-        "-dT",
-        "-c",
-    }
-)
-_JOINED_SHORT_LINK_MECHANISMS = (
-    "-plugin-opt",
-    "-plugin",
-    "-dT",
-    "-c",
+class _LinkOperandSpec(NamedTuple):
+    route: str
+    role: str
+    joined: str | None
+    split: bool
+
+
+_LINK_OPTION_OPERANDS: dict[str, _LinkOperandSpec] = {
+    "-A": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-B": _LinkOperandSpec("b-mode-or-path", "ordinary", "attached", True),
+    "-F": _LinkOperandSpec("search-path", "ordinary", "attached", True),
+    "-G": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-I": _LinkOperandSpec("path", "ordinary", "attached", True),
+    "-L": _LinkOperandSpec("search-path", "ordinary", "attached", True),
+    "-Map": _LinkOperandSpec("path", "ordinary", "attached", True),
+    "-R": _LinkOperandSpec("path", "direct-input", "attached", True),
+    "-T": _LinkOperandSpec("path", "ordinary", "attached", True),
+    "-Tbss": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-Tdata": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-Ttext": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-Y": _LinkOperandSpec("y-path-list", "ordinary", "attached", True),
+    "-b": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-c": _LinkOperandSpec("path", "mechanism", "attached", True),
+    "-dT": _LinkOperandSpec("path", "mechanism", "attached", True),
+    "-dynamic-linker": _LinkOperandSpec("path", "ordinary", "equals", True),
+    "-e": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-f": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-fuse-ld": _LinkOperandSpec("linker-selection", "ordinary", "equals", True),
+    "-h": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-l": _LinkOperandSpec("library", "library", "attached", True),
+    "-m": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-o": _LinkOperandSpec("path", "ordinary", "attached", True),
+    "-plugin": _LinkOperandSpec("path", "mechanism", "attached", True),
+    "-plugin-opt": _LinkOperandSpec("plugin-option", "mechanism", "attached", True),
+    "-rpath": _LinkOperandSpec("path-list", "ordinary", "equals", True),
+    "-rpath-link": _LinkOperandSpec("path-list", "ordinary", "equals", True),
+    "-soname": _LinkOperandSpec("scalar", "ordinary", "equals", True),
+    "-u": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-y": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "-z": _LinkOperandSpec("scalar", "ordinary", "attached", True),
+    "--Map": _LinkOperandSpec("path", "ordinary", None, True),
+    "--build-id": _LinkOperandSpec("scalar", "ordinary", "equals", False),
+    "--default-script": _LinkOperandSpec("path", "mechanism", None, True),
+    "--defsym": _LinkOperandSpec("scalar", "ordinary", None, True),
+    "--dependency-file": _LinkOperandSpec("path", "ordinary", None, True),
+    "--dynamic-linker": _LinkOperandSpec("path", "ordinary", None, True),
+    "--dynamic-list": _LinkOperandSpec("path", "mechanism", None, True),
+    "--entry": _LinkOperandSpec("scalar", "ordinary", None, True),
+    "--export-dynamic-symbol-list": _LinkOperandSpec("path", "mechanism", None, True),
+    "--format": _LinkOperandSpec("scalar", "ordinary", None, True),
+    "--hash-style": _LinkOperandSpec("scalar", "ordinary", None, True),
+    "--just-symbols": _LinkOperandSpec("path", "direct-input", None, True),
+    "--ld-path": _LinkOperandSpec("path", "ordinary", None, True),
+    "--library": _LinkOperandSpec("library", "library", None, True),
+    "--library-path": _LinkOperandSpec("search-path", "ordinary", None, True),
+    "--mri-script": _LinkOperandSpec("path", "mechanism", None, True),
+    "--oformat": _LinkOperandSpec("scalar", "ordinary", None, True),
+    "--output": _LinkOperandSpec("path", "ordinary", None, True),
+    "--out-implib": _LinkOperandSpec("path", "ordinary", None, True),
+    "--plugin": _LinkOperandSpec("path", "mechanism", None, True),
+    "--plugin-opt": _LinkOperandSpec("plugin-option", "mechanism", None, True),
+    "--remap-inputs": _LinkOperandSpec("unsupported", "mechanism", None, True),
+    "--remap-inputs-file": _LinkOperandSpec("path", "mechanism", None, True),
+    "--retain-symbols-file": _LinkOperandSpec("path", "mechanism", None, True),
+    "--rpath": _LinkOperandSpec("path-list", "ordinary", None, True),
+    "--rpath-link": _LinkOperandSpec("path-list", "ordinary", None, True),
+    "--script": _LinkOperandSpec("path", "ordinary", None, True),
+    "--section-start": _LinkOperandSpec("scalar", "ordinary", None, True),
+    "--soname": _LinkOperandSpec("scalar", "ordinary", None, True),
+    "--sysroot": _LinkOperandSpec("path", "ordinary", None, True),
+    "--undefined": _LinkOperandSpec("scalar", "ordinary", None, True),
+    "--version-script": _LinkOperandSpec("path", "mechanism", None, True),
+    "--wrap": _LinkOperandSpec("scalar", "ordinary", None, True),
+}
+_LINK_JOINED_SHORT_OPTIONS = tuple(
+    sorted(
+        (
+            option
+            for option, spec in _LINK_OPTION_OPERANDS.items()
+            if not option.startswith("--") and spec.joined is not None
+        ),
+        key=len,
+        reverse=True,
+    )
 )
 _KNOWN_LINK_LONG_OPTIONS = frozenset(
     {
-        *(option for option in _LINK_OPTIONS_WITH_OPERAND if option.startswith("--")),
-        "--just-symbols",
-        "--library",
-        *(option for option in _LINK_MECHANISM_OPTIONS if option.startswith("--")),
+        *(option for option in _LINK_OPTION_OPERANDS if option.startswith("--")),
     }
 )
 
@@ -2355,6 +2364,7 @@ def _parse_effective_link_command(argv: list[str]) -> EffectiveLinkCommand:
         not any(token.value.startswith("@") for token in tokens),
         "captured link command contains linker response files",
     )
+    operands: list[EffectiveLinkOperand] = []
     outputs: list[EffectiveLinkOutput] = []
     ordered_inputs: list[str] = []
     direct_files: list[str] = []
@@ -2426,125 +2436,82 @@ def _parse_effective_link_command(argv: list[str]) -> EffectiveLinkCommand:
             raise EvidenceError("abbreviated linker output control is unsafe")
         raise EvidenceError(f"abbreviated linker option is unsafe: {option}")
 
+    def parse_operand_option(
+        option_index: int, option_token: EffectiveLinkToken
+    ) -> tuple[str, str, int] | None:
+        value = option_token.value
+        spec = _LINK_OPTION_OPERANDS.get(value)
+        if spec is not None and spec.split:
+            return value, operand_after(option_index, option_token), 2
+        if value.startswith("--") and "=" in value:
+            option, operand = value.split("=", 1)
+            spec = _LINK_OPTION_OPERANDS.get(option)
+            _require(
+                spec is not None,
+                f"unsupported operand-bearing linker option: {option}",
+            )
+            _require(bool(operand), f"empty linker option operand: {option}")
+            return option, operand, 1
+        for option in _LINK_JOINED_SHORT_OPTIONS:
+            joined = _LINK_OPTION_OPERANDS[option].joined
+            prefix = f"{option}=" if joined == "equals" else option
+            if not value.startswith(prefix):
+                continue
+            _require(
+                len(value) > len(prefix),
+                f"empty linker option operand: {option}",
+            )
+            operand = value[len(prefix) :]
+            if joined == "attached":
+                operand = operand.removeprefix("=")
+            _require(bool(operand), f"empty linker option operand: {option}")
+            return option, operand, 1
+        _require(
+            not (value.startswith("-") and "=" in value),
+            f"unsupported operand-bearing linker option: {value.split('=', 1)[0]}",
+        )
+        return None
+
     index = 0
     while index < len(tokens):
         token = tokens[index]
         value = token.value
         reject_abbreviated_long_option(value)
 
-        if value in _LINK_MECHANISM_OPTIONS:
-            mechanisms.append(
-                EffectiveLinkControl(
-                    value,
-                    operand_after(index, token),
+        parsed_operand = parse_operand_option(index, token)
+        if parsed_operand is not None:
+            option, operand, consumed = parsed_operand
+            spec = _LINK_OPTION_OPERANDS[option]
+            operands.append(
+                EffectiveLinkOperand(
+                    option,
+                    operand,
                     token.forwarded,
                     token.source_argument,
                 )
             )
-            index += 2
-            continue
-        joined_mechanism: str | None = None
-        mechanism_operand = ""
-        if "=" in value:
-            candidate, candidate_operand = value.split("=", 1)
-            if candidate in _LINK_MECHANISM_OPTIONS:
-                joined_mechanism = candidate
-                mechanism_operand = candidate_operand
-        if joined_mechanism is None:
-            joined_mechanism = next(
-                (
-                    option
-                    for option in _JOINED_SHORT_LINK_MECHANISMS
-                    if value.startswith(option) and len(value) > len(option)
-                ),
-                None,
-            )
-            if joined_mechanism is not None:
-                mechanism_operand = value[len(joined_mechanism) :].removeprefix("=")
-        if joined_mechanism is not None:
-            _require(
-                bool(mechanism_operand),
-                f"empty linker option operand: {joined_mechanism}",
-            )
-            mechanisms.append(
-                EffectiveLinkControl(
-                    joined_mechanism,
-                    mechanism_operand,
-                    token.forwarded,
-                    token.source_argument,
-                )
-            )
-            index += 1
-            continue
-
-        if value in {"-l", "--library"}:
-            library = operand_after(index, token)
-            _require(
-                bool(library)
-                and not library.startswith("-")
-                and "/" not in library
-                and "\0" not in library,
-                "malformed linker library argument",
-            )
-            ordered_inputs.append(f"-l{library}")
-            index += 2
-            continue
-        if value.startswith("--library="):
-            library = value.split("=", 1)[1]
-            _require(
-                bool(library) and "/" not in library and "\0" not in library,
-                "malformed linker library argument",
-            )
-            ordered_inputs.append(f"-l{library}")
-            index += 1
-            continue
-        if value.startswith("-l") and len(value) > 2:
-            library = value[2:]
-            _require(
-                "/" not in library and "\0" not in library,
-                "malformed linker library argument",
-            )
-            ordered_inputs.append(value)
-            index += 1
-            continue
-
-        if value in {"-R", "--just-symbols"}:
-            record_direct_input(operand_after(index, token))
-            index += 2
-            continue
-        if value.startswith("--just-symbols="):
-            direct_input = value.split("=", 1)[1]
-            _require(bool(direct_input), "empty --just-symbols operand")
-            record_direct_input(direct_input)
-            index += 1
-            continue
-        if value.startswith("-R") and len(value) > 2:
-            direct_input = value[2:].removeprefix("=")
-            _require(bool(direct_input), "empty -R operand")
-            record_direct_input(direct_input)
-            index += 1
-            continue
-
-        if value in _LINK_OPTIONS_WITH_OPERAND:
-            operand = operand_after(index, token)
-            if value in {"-o", "--output"}:
-                outputs.append(
-                    EffectiveLinkOutput(
-                        value,
+            if spec.role == "mechanism":
+                mechanisms.append(
+                    EffectiveLinkControl(
+                        option,
                         operand,
                         token.forwarded,
                         token.source_argument,
                     )
                 )
-            record_control(token, value, operand)
-            index += 2
-            continue
-
-        if value.startswith("--") and "=" in value:
-            option, operand = value.split("=", 1)
-            if option in _LINK_OPTIONS_WITH_OPERAND:
-                _require(bool(operand), f"empty linker option operand: {option}")
-                if option == "--output":
+            elif spec.role == "library":
+                _require(
+                    bool(operand)
+                    and not operand.startswith("-")
+                    and "/" not in operand
+                    and "\0" not in operand,
+                    "malformed linker library argument",
+                )
+                ordered_inputs.append(f"-l{operand}")
+            elif spec.role == "direct-input":
+                record_direct_input(operand)
+            else:
+                if option in {"-o", "--output"}:
                     outputs.append(
                         EffectiveLinkOutput(
                             option,
@@ -2554,45 +2521,7 @@ def _parse_effective_link_command(argv: list[str]) -> EffectiveLinkCommand:
                         )
                     )
                 record_control(token, option, operand)
-                index += 1
-                continue
-
-        empty_joined_short = next(
-            (
-                prefix
-                for prefix in _LINK_JOINED_SHORT_OPTIONS
-                if prefix.endswith("=") and value == prefix
-            ),
-            None,
-        )
-        _require(
-            empty_joined_short is None,
-            f"empty linker option operand: {empty_joined_short}",
-        )
-        joined_short = next(
-            (
-                prefix
-                for prefix in _LINK_JOINED_SHORT_OPTIONS
-                if value.startswith(prefix) and len(value) > len(prefix)
-            ),
-            None,
-        )
-        if joined_short is not None:
-            operand = value[len(joined_short) :]
-            if joined_short != "-o":
-                operand = operand.removeprefix("=")
-            _require(bool(operand), f"empty linker option operand: {joined_short}")
-            if joined_short == "-o":
-                outputs.append(
-                    EffectiveLinkOutput(
-                        "-o",
-                        operand,
-                        token.forwarded,
-                        token.source_argument,
-                    )
-                )
-            record_control(token, joined_short.removesuffix("="), operand)
-            index += 1
+            index += consumed
             continue
 
         if value.startswith("-"):
@@ -2602,11 +2531,20 @@ def _parse_effective_link_command(argv: list[str]) -> EffectiveLinkCommand:
             )
             index += 1
             continue
+        operands.append(
+            EffectiveLinkOperand(
+                None,
+                value,
+                token.forwarded,
+                token.source_argument,
+            )
+        )
         record_direct_input(value)
         index += 1
 
     return EffectiveLinkCommand(
         tokens,
+        tuple(operands),
         tuple(outputs),
         EffectiveLinkInputs(
             tuple(ordered_inputs),
@@ -2619,6 +2557,76 @@ def _parse_effective_link_command(argv: list[str]) -> EffectiveLinkCommand:
             tuple(mechanisms),
         ),
     )
+
+
+def _map_link_path_list(
+    value: str,
+    roots: PortableRoots,
+    *,
+    cwd: str | None,
+) -> None:
+    paths = value.split(":")
+    _require(all(paths), "empty linker path-list element")
+    for path in paths:
+        _map_command_path(path, roots, cwd=cwd)
+
+
+def _route_effective_link_operands(
+    command: EffectiveLinkCommand,
+    roots: PortableRoots,
+    *,
+    cwd: str | None,
+) -> None:
+    for operand in command.operands:
+        if operand.option is None:
+            _map_command_path(operand.value, roots, cwd=cwd)
+            continue
+        spec = _LINK_OPTION_OPERANDS[operand.option]
+        route = spec.route
+        if route == "path":
+            _map_command_path(operand.value, roots, cwd=cwd)
+        elif route == "path-list":
+            _map_link_path_list(operand.value, roots, cwd=cwd)
+        elif route == "search-path":
+            _map_search_path(operand.value, roots, cwd=cwd)
+        elif route == "y-path-list":
+            _require(
+                operand.value.startswith("P,") and len(operand.value) > 2,
+                "malformed linker -Y operand",
+            )
+            _map_link_path_list(operand.value[2:], roots, cwd=cwd)
+        elif route == "b-mode-or-path":
+            if operand.value not in {"static", "dynamic"}:
+                _map_command_path(operand.value, roots, cwd=cwd)
+        elif route == "linker-selection":
+            if "/" in operand.value:
+                _map_command_path(operand.value, roots, cwd=cwd)
+            else:
+                _validate_linker_argv0(operand.value, roots)
+        elif route == "plugin-option":
+            if operand.value.startswith("-fresolution="):
+                _validate_gcc_resolution_file(
+                    operand.value.removeprefix("-fresolution=")
+                )
+            else:
+                _require(
+                    not operand.value.startswith("-"),
+                    "unsupported linker plugin option",
+                )
+                _map_command_path(operand.value, roots, cwd=cwd)
+        elif route == "scalar":
+            _require(
+                not _looks_path_valued(operand.value),
+                f"path-valued operand for scalar linker option: {operand.option}",
+            )
+        elif route == "library":
+            pass
+        elif route == "unsupported":
+            raise EvidenceError(
+                f"unsupported operand-bearing linker option: {operand.option}"
+            )
+        else:
+            raise AssertionError(f"unsupported linker operand route: {route}")
 
 
 def _raw_output_values(argv: list[str]) -> list[str]:

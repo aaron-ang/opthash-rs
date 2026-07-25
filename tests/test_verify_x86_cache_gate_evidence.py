@@ -2542,6 +2542,112 @@ def test_command_accepts_only_exact_gcc_resolution_transient_grammar(
         )
 
 
+LINKER_PATH_OPERAND_GRAMMAR_CASES = (
+    pytest.param(
+        ["--dynamic-linker", "relative-loader"],
+        id="split",
+    ),
+    pytest.param(
+        ["--dynamic-linker=relative-loader"],
+        id="joined-long-dynamic-linker",
+    ),
+    pytest.param(
+        ["--rpath=relative-lib"],
+        id="joined-long-rpath",
+    ),
+    pytest.param(
+        ["-rpath=relative-lib"],
+        id="joined-short",
+    ),
+    pytest.param(
+        ["-Wl,--rpath,relative-lib"],
+        id="wl-split",
+    ),
+    pytest.param(
+        ["-Wl,--rpath=relative-lib"],
+        id="wl-joined",
+    ),
+    pytest.param(
+        ["-Xlinker", "--rpath", "-Xlinker", "relative-lib"],
+        id="xlinker-split",
+    ),
+    pytest.param(
+        ["-Xlinker=--rpath", "-Xlinker=relative-lib"],
+        id="xlinker-joined",
+    ),
+    pytest.param(
+        ["--for-linker", "--rpath", "--for-linker", "relative-lib"],
+        id="for-linker-split",
+    ),
+    pytest.param(
+        ["--for-linker=--rpath", "--for-linker=relative-lib"],
+        id="for-linker-joined",
+    ),
+)
+
+
+@pytest.mark.parametrize("tokens", LINKER_PATH_OPERAND_GRAMMAR_CASES)
+def test_linker_path_operands_require_authenticated_cwd_across_every_grammar(
+    verify_module: ModuleType,
+    tokens: list[str],
+) -> None:
+    roots = verify_module.PortableRoots.from_document(
+        full_portable_paths(verify_module)
+    )
+    with pytest.raises(verify_module.EvidenceError, match="authenticated cwd"):
+        verify_module.validate_command(["ld", *tokens], roots, rustc=False)
+    verify_module.validate_command(
+        ["ld", *tokens],
+        roots,
+        rustc=False,
+        cwd="/host/subject",
+    )
+
+
+UNSUPPORTED_LINKER_OPERAND_GRAMMAR_CASES = (
+    pytest.param(
+        ["--remap-inputs", "source=relative"],
+        id="split",
+    ),
+    pytest.param(
+        ["--remap-inputs=source=relative"],
+        id="joined",
+    ),
+    pytest.param(
+        ["-Wl,--remap-inputs,source=relative"],
+        id="wl",
+    ),
+    pytest.param(
+        ["-Xlinker", "--remap-inputs", "-Xlinker", "source=relative"],
+        id="xlinker",
+    ),
+    pytest.param(
+        ["--for-linker", "--remap-inputs", "--for-linker", "source=relative"],
+        id="for-linker",
+    ),
+)
+
+
+@pytest.mark.parametrize("tokens", UNSUPPORTED_LINKER_OPERAND_GRAMMAR_CASES)
+def test_linker_rejects_unsupported_operand_bearing_options_across_every_grammar(
+    verify_module: ModuleType,
+    tokens: list[str],
+) -> None:
+    roots = verify_module.PortableRoots.from_document(
+        full_portable_paths(verify_module)
+    )
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="unsupported operand-bearing linker option",
+    ):
+        verify_module.validate_command(
+            ["ld", *tokens],
+            roots,
+            rustc=False,
+            cwd="/host/subject",
+        )
+
+
 def test_path_list_rejects_empty_and_cross_namespace_entries(
     verify_module: ModuleType,
 ) -> None:
