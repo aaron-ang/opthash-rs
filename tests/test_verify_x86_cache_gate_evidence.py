@@ -2448,6 +2448,86 @@ def test_hosted_transcript_must_match_manifest_link_proof(
         verify_module.verify_archive(archive, digest)
 
 
+UNSAFE_LINK_COMMAND_SUFFIXES = (
+    pytest.param(
+        ["--outp=redirected-output"],
+        id="direct-abbreviated-output",
+    ),
+    pytest.param(
+        ["-Wl,--outp=redirected-output"],
+        id="wl-abbreviated-output",
+    ),
+    pytest.param(
+        ["-Xlinker=--outp=redirected-output"],
+        id="xlinker-abbreviated-output",
+    ),
+    pytest.param(
+        ["--for-linker=--outp=redirected-output"],
+        id="for-linker-abbreviated-output",
+    ),
+    pytest.param(
+        ["--", "--outp=redirected-output"],
+        id="option-terminator",
+    ),
+)
+
+
+@pytest.mark.parametrize("suffix", UNSAFE_LINK_COMMAND_SUFFIXES)
+def test_hosted_transcript_rejects_unsafe_output_interpretation(
+    tmp_path: Path,
+    package_module: ModuleType,
+    verify_module: ModuleType,
+    suffix: list[str],
+) -> None:
+    staging = tmp_path / "staging"
+    documents = write_semantic_staging(staging, verify_module)
+    transcript = documents["transcripts"][0]
+    transcript["argv"].extend(suffix)
+    command = documents["manifests"][0]["build_proof"]["executables"][
+        transcript["executable"]
+    ]["link_command"]
+    command["argv"].extend(suffix)
+    trace_hosted = command["trace"]["absolute_path"]
+    trace_path = (
+        staging / "bundle/subject" / Path(trace_hosted).relative_to("/host/subject")
+    )
+    trace_record = json.loads(trace_path.read_bytes())
+    trace_record["argv"].extend(suffix)
+    trace_bytes = json_bytes(trace_record)
+    trace_path.write_bytes(trace_bytes)
+    command["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    transcript["trace"] = copy.deepcopy(command["trace"])
+    expected = {
+        (manifest["variant"], executable): proof["link_command"]
+        for manifest in documents["manifests"]
+        for executable, proof in manifest["build_proof"]["executables"].items()
+    }
+    archive = tmp_path / "evidence.tar"
+    digest = package_module.package_evidence(
+        staging, archive, tmp_path / "evidence.tar.sha256"
+    )
+    extracted = tmp_path / "extracted"
+    with tarfile.open(archive, mode="r:") as handle:
+        structure = verify_module._inspect(handle, digest)
+        verify_module.extract_validated_archive(
+            structure.members,
+            extracted,
+            handle,
+        )
+    roots = verify_module.PortableRoots.from_document(documents["portable_paths"])
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="abbreviated|terminator|unsafe|output",
+    ):
+        verify_module._verify_transcripts(
+            extracted,
+            structure.members,
+            roots,
+            documents["transcripts"],
+            expected,
+        )
+
+
 def test_full_immutable_capability_and_v2_schemas_accept_attempt_5(
     verify_module: ModuleType,
 ) -> None:
@@ -2953,6 +3033,61 @@ def test_link_command_inputs_exclude_non_input_option_operands(
 
 
 @pytest.mark.parametrize(
+    "loader_control",
+    [
+        pytest.param(
+            ["-dynamic-linker", "/lib64/ld-linux-x86-64.so.2"],
+            id="direct",
+        ),
+        pytest.param(
+            ["-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2"],
+            id="wl-forwarded",
+        ),
+    ],
+)
+def test_effective_link_command_excludes_dynamic_loader_operand_from_inputs(
+    verify_module: ModuleType,
+    loader_control: list[str],
+) -> None:
+    parsed = verify_module._parse_effective_link_command(
+        [
+            "/host/subject/input.o",
+            *loader_control,
+            "-o",
+            "/host/subject/output",
+        ]
+    )
+    assert parsed.outputs == ("/host/subject/output",)
+    assert parsed.inputs.ordered == ("input.o",)
+    assert parsed.inputs.direct_files == ("input.o",)
+
+
+def test_effective_link_command_preserves_known_lto_plugin_controls(
+    verify_module: ModuleType,
+) -> None:
+    argv = [
+        "-plugin",
+        "/usr/libexec/gcc/x86_64-linux-gnu/14/liblto_plugin.so",
+        "-plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/14/lto-wrapper",
+        "-plugin-opt=-fresolution=/tmp/ccAb12Cd.res",
+        "/host/subject/input.o",
+        "-o",
+        "/host/subject/output",
+    ]
+    parsed = verify_module._parse_effective_link_command(argv)
+    assert parsed.inputs.ordered == ("input.o",)
+    assert [
+        (control.option, control.operand) for control in parsed.controls.mechanisms
+    ] == [
+        ("-plugin", "/usr/libexec/gcc/x86_64-linux-gnu/14/liblto_plugin.so"),
+        ("-plugin-opt", "/usr/libexec/gcc/x86_64-linux-gnu/14/lto-wrapper"),
+        ("-plugin-opt", "-fresolution=/tmp/ccAb12Cd.res"),
+    ]
+    with pytest.raises(verify_module.EvidenceError, match="plugin"):
+        verify_module._link_command_inputs(argv)
+
+
+@pytest.mark.parametrize(
     ("tokens", "expected_input"),
     [
         pytest.param(
@@ -3188,6 +3323,196 @@ def test_manifest_replay_rejects_extra_aliased_linker_controls(
             capability,
             "elastic",
             manifest["executables"][executable],
+        )
+
+
+FORWARDED_OUTPUT_REDIRECT_CASES = (
+    pytest.param(
+        ["-Wl,-o,/host/subject/redirected-output"],
+        id="wl-comma",
+    ),
+    pytest.param(
+        ["-Xlinker", "-o", "-Xlinker", "/host/subject/redirected-output"],
+        id="xlinker-split",
+    ),
+    pytest.param(
+        ["-Xlinker=-o", "-Xlinker=/host/subject/redirected-output"],
+        id="xlinker-joined",
+    ),
+    pytest.param(
+        ["--for-linker", "-o", "--for-linker", "/host/subject/redirected-output"],
+        id="for-linker-split",
+    ),
+    pytest.param(
+        ["--for-linker=-o", "--for-linker=/host/subject/redirected-output"],
+        id="for-linker-joined",
+    ),
+)
+
+
+@pytest.mark.parametrize("suffix", UNSAFE_LINK_COMMAND_SUFFIXES)
+def test_raw_output_values_rejects_unsafe_output_interpretation(
+    verify_module: ModuleType,
+    suffix: list[str],
+) -> None:
+    expected = "/host/subject/expected-output"
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="abbreviated|terminator|unsafe|output",
+    ):
+        verify_module._raw_output_values(["-o", expected, *suffix])
+
+
+@pytest.mark.parametrize("redirect", FORWARDED_OUTPUT_REDIRECT_CASES)
+def test_raw_output_values_uses_fully_flattened_linker_stream(
+    verify_module: ModuleType,
+    redirect: list[str],
+) -> None:
+    expected = "/host/subject/expected-output"
+    assert verify_module._raw_output_values(["-o", expected, *redirect]) == [
+        expected,
+        "/host/subject/redirected-output",
+    ]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["-o"], id="direct-short-dangling"),
+        pytest.param(["--output"], id="direct-long-dangling"),
+        pytest.param(["--output="], id="direct-long-empty"),
+        pytest.param(["-Wl,-o"], id="wl-dangling"),
+        pytest.param(["-Wl,--output="], id="wl-empty"),
+        pytest.param(["-Xlinker=-o"], id="xlinker-dangling"),
+        pytest.param(["--for-linker=-o"], id="for-linker-dangling"),
+        pytest.param(
+            ["-Xlinker", "-o", "/host/subject/mixed-output"],
+            id="xlinker-mixed-origin",
+        ),
+        pytest.param(
+            ["--for-linker", "-o", "/host/subject/mixed-output"],
+            id="for-linker-mixed-origin",
+        ),
+        pytest.param(["-Wl,@hidden.rsp"], id="response-file"),
+    ],
+)
+def test_raw_output_values_rejects_malformed_or_opaque_controls(
+    verify_module: ModuleType,
+    argv: list[str],
+) -> None:
+    with pytest.raises(verify_module.EvidenceError):
+        verify_module._raw_output_values(argv)
+
+
+@pytest.mark.parametrize("suffix", UNSAFE_LINK_COMMAND_SUFFIXES)
+def test_manifest_trace_rejects_unsafe_output_interpretation(
+    verify_module: ModuleType,
+    suffix: list[str],
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifest = documents["manifests"][0]
+    executable = "elastic_cache_gate"
+    command = manifest["build_proof"]["executables"][executable]["link_command"]
+    command["argv"].extend(suffix)
+    trace_path = command["trace"]["absolute_path"]
+    trace_record = json.loads(documents["hosted_files"][trace_path])
+    trace_record["argv"] = copy.deepcopy(command["argv"])
+    trace_bytes = json_bytes(trace_record)
+    command["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="abbreviated|terminator|unsafe|output",
+    ):
+        verify_module.verify_manifest_link_command(
+            command,
+            trace_bytes,
+            capability,
+            "elastic",
+            manifest["executables"][executable],
+        )
+
+
+@pytest.mark.parametrize("redirect", FORWARDED_OUTPUT_REDIRECT_CASES)
+def test_manifest_trace_rejects_forwarded_output_redirect(
+    verify_module: ModuleType,
+    redirect: list[str],
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifest = documents["manifests"][0]
+    executable = "elastic_cache_gate"
+    command = manifest["build_proof"]["executables"][executable]["link_command"]
+    command["argv"].extend(redirect)
+    trace_path = command["trace"]["absolute_path"]
+    trace_record = json.loads(documents["hosted_files"][trace_path])
+    trace_record["argv"] = copy.deepcopy(command["argv"])
+    trace_bytes = json_bytes(trace_record)
+    command["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="producer|count|output",
+    ):
+        verify_module.verify_manifest_link_command(
+            command,
+            trace_bytes,
+            capability,
+            "elastic",
+            manifest["executables"][executable],
+        )
+
+
+@pytest.mark.parametrize("suffix", UNSAFE_LINK_COMMAND_SUFFIXES)
+def test_shape_trace_rejects_unsafe_output_interpretation(
+    verify_module: ModuleType,
+    suffix: list[str],
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    shape = capability["shapes"]["actual"]["elastic"]
+    execution_path = shape["linker_execution"]["absolute_path"]
+    execution = json.loads(documents["shape_files"][execution_path])
+    execution["argv"].extend(suffix)
+    trace_path = execution["trace"]["absolute_path"]
+    trace_record = json.loads(documents["shape_files"][trace_path])
+    trace_record["argv"] = copy.deepcopy(execution["argv"])
+    trace_bytes = json_bytes(trace_record)
+    execution["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="abbreviated|terminator|unsafe|output",
+    ):
+        verify_module._verify_shape_trace(
+            execution,
+            trace_bytes,
+            capability["linker"],
+        )
+
+
+@pytest.mark.parametrize("redirect", FORWARDED_OUTPUT_REDIRECT_CASES)
+def test_shape_trace_rejects_forwarded_output_redirect(
+    verify_module: ModuleType,
+    redirect: list[str],
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    shape = capability["shapes"]["actual"]["elastic"]
+    execution_path = shape["linker_execution"]["absolute_path"]
+    execution = json.loads(documents["shape_files"][execution_path])
+    execution["argv"].extend(redirect)
+    trace_path = execution["trace"]["absolute_path"]
+    trace_record = json.loads(documents["shape_files"][trace_path])
+    trace_record["argv"] = copy.deepcopy(execution["argv"])
+    trace_bytes = json_bytes(trace_record)
+    execution["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="producer|count|output",
+    ):
+        verify_module._verify_shape_trace(
+            execution,
+            trace_bytes,
+            capability["linker"],
         )
 
 
