@@ -843,10 +843,10 @@ def test_workflow_uses_immutable_sibling_checkouts_and_native_tools() -> None:
         source,
     )
     assert re.search(
-        r"(?m)^      - name: Install native LLD\n"
+        r"(?m)^      - name: Install native proof dependencies\n"
         r"        run: \|\n"
         r"          sudo apt-get update\n"
-        r"          sudo apt-get install --yes --no-install-recommends lld\n",
+        r"          sudo apt-get install --yes --no-install-recommends lld ripgrep\n",
         source,
     )
     assert all(
@@ -858,7 +858,7 @@ def test_workflow_uses_immutable_sibling_checkouts_and_native_tools() -> None:
     ]
     assert sudo_lines == [
         "sudo apt-get update",
-        "sudo apt-get install --yes --no-install-recommends lld",
+        "sudo apt-get install --yes --no-install-recommends lld ripgrep",
     ]
 
 

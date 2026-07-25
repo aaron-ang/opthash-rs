@@ -42,10 +42,10 @@ jobs:
         with:
           toolchain: 1.95.0
 
-      - name: Install native LLD
+      - name: Install native proof dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends lld
+          sudo apt-get install --yes --no-install-recommends lld ripgrep
 
       - name: Run native x86 proof
         id: proof
