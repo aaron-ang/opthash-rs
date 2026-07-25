@@ -49,6 +49,7 @@ V1_REPLAY_COMMIT = "b0d53234dc051af91fe0321450b3e8312a84e635"
 V1_REPLAY_TREE = "d77cc082fe48799f26ff4440bd1898a71d0dc8cc"
 X86_TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
 PINNED_CARGO_VERSION = "cargo 1.95.0 (f2d3ce0bd 2026-03-21)"
+PINNED_RUST_TOOLCHAIN = "1.95.0-x86_64-unknown-linux-gnu"
 PINNED_RUSTC_VERSION = (
     "rustc 1.95.0 (59807616e 2026-04-14)\n"
     "binary: rustc\n"
@@ -58,6 +59,13 @@ PINNED_RUSTC_VERSION = (
     "release: 1.95.0\n"
     "LLVM version: 22.1.2"
 )
+EXPECTED_GITHUB_REF = "refs/heads/ci/x86-cache-gate-evidence"
+ORCHESTRATION_SOURCE_PATHS = {
+    "workflow": "bundle/orchestrator/.github/workflows/x86-cache-gate-evidence.yml",
+    "runner": "bundle/orchestrator/scripts/run-x86-cache-gate-evidence.sh",
+    "packager": "bundle/orchestrator/scripts/package-x86-cache-gate-evidence.py",
+    "verifier": "bundle/orchestrator/scripts/verify-x86-cache-gate-evidence.py",
+}
 KERNEL_SENTINEL_STEMS = {
     "elastic_cache_gate_insert_kernel": "elastic_insert",
     "elastic_cache_gate_get_kernel": "elastic_get",
@@ -613,10 +621,44 @@ MANIFEST_V1_SCHEMA = {
     },
 }
 DOCUMENT_RECORD_SCHEMA = {"archive_path": STRING, "sha256": STRING}
+ROOT_RECORD_SCHEMA = {"name": STRING, "hosted": STRING, "archive": STRING}
+SYSTEM_LINK_SCHEMA = {"source": STRING, "raw_target": STRING}
 PROVENANCE_SCHEMA = {
     "version": INTEGER,
     "subject": {"commit": STRING, "tree": STRING},
+    "v1": {"commit": STRING, "tree": STRING},
+    "orchestration": {
+        "commit": STRING,
+        "tree": STRING,
+        "sources": {
+            name: DOCUMENT_RECORD_SCHEMA for name in ORCHESTRATION_SOURCE_PATHS
+        },
+    },
     "run": {"id": INTEGER, "attempt": INTEGER, "derived_attempt": INTEGER},
+    "github": {
+        "repository": STRING,
+        "ref": STRING,
+        "sha": STRING,
+        "run_id": INTEGER,
+        "run_attempt": INTEGER,
+    },
+    "rust": {
+        "toolchain": STRING,
+        "rustc_version": STRING,
+        "cargo_version": STRING,
+    },
+    "packages": ListSchema(
+        {
+            "name": STRING,
+            "architecture": STRING,
+            "version": STRING,
+            "verification_status": INTEGER,
+        },
+        nonempty=True,
+    ),
+    "roots": ListSchema(ROOT_RECORD_SCHEMA, nonempty=True),
+    "system_links": ListSchema(SYSTEM_LINK_SCHEMA),
+    "proof": {"status": INTEGER, "result": STRING},
     "documents": {
         "capability": DOCUMENT_RECORD_SCHEMA,
         "manifests": {
@@ -625,6 +667,9 @@ PROVENANCE_SCHEMA = {
             "adversary": DOCUMENT_RECORD_SCHEMA,
         },
         "v1_manifest": DOCUMENT_RECORD_SCHEMA,
+        "v1_reextractions": {
+            name: DOCUMENT_RECORD_SCHEMA for name in EXECUTABLE_TARGETS
+        },
         "transcripts": ListSchema(DOCUMENT_RECORD_SCHEMA, nonempty=True),
         "body_comparison": DOCUMENT_RECORD_SCHEMA,
         "portable_paths": DOCUMENT_RECORD_SCHEMA,
@@ -667,10 +712,8 @@ BODY_COMPARISON_SCHEMA = {
 }
 PORTABLE_PATHS_SCHEMA = {
     "version": INTEGER,
-    "roots": ListSchema(
-        {"name": STRING, "hosted": STRING, "archive": STRING}, nonempty=True
-    ),
-    "system_links": ListSchema({"source": STRING, "raw_target": STRING}),
+    "roots": ListSchema(ROOT_RECORD_SCHEMA, nonempty=True),
+    "system_links": ListSchema(SYSTEM_LINK_SCHEMA),
     "routing_records": ListSchema(
         {
             "document": STRING,
@@ -684,6 +727,7 @@ DOCUMENT_SCHEMAS: dict[str, object] = {
     "capability": CAPABILITY_SCHEMA,
     "manifest_v2": MANIFEST_V2_SCHEMA,
     "manifest_v1": MANIFEST_V1_SCHEMA,
+    "v1_reextraction": _symbol_document_schema(SYMBOL_V2_SCHEMA, veneers=True),
     "provenance": PROVENANCE_SCHEMA,
     "transcript": TRANSCRIPT_SCHEMA,
     "body_comparison": BODY_COMPARISON_SCHEMA,
@@ -712,6 +756,7 @@ PATH_ROUTES: dict[tuple[str, ...], str] = {
     ("v1-manifest", "control", "inputs", "*", "absolute_path"): "hashed-file",
     ("v1-manifest", "control", "provenance_path"): "hashed-file-pair",
     ("v1-manifest", "symbols", "*", "binary"): "duplicate-file",
+    ("v1-reextraction", "binary"): "duplicate-file",
     ("capability", "producer", "runner_root"): "root",
     ("capability", "producer", "artifact_root"): "root",
     ("capability", "fragments", "*", "absolute_path"): "hashed-file",
@@ -1006,6 +1051,13 @@ PATH_ROUTES: dict[tuple[str, ...], str] = {
     (
         "provenance",
         "documents",
+        "v1_reextractions",
+        "*",
+        "archive_path",
+    ): "archive-file",
+    (
+        "provenance",
+        "documents",
         "transcripts",
         "*",
         "archive_path",
@@ -1022,6 +1074,17 @@ PATH_ROUTES: dict[tuple[str, ...], str] = {
         "portable_paths",
         "archive_path",
     ): "archive-file",
+    (
+        "provenance",
+        "orchestration",
+        "sources",
+        "*",
+        "archive_path",
+    ): "archive-file",
+    ("provenance", "roots", "*", "hosted"): "root-definition",
+    ("provenance", "roots", "*", "archive"): "archive-root",
+    ("provenance", "system_links", "*", "source"): "system-link-source",
+    ("provenance", "system_links", "*", "raw_target"): "system-link-target",
     ("provenance", "hardlinks", "*", "path"): "archive-member",
     ("provenance", "hardlinks", "*", "target"): "archive-member",
     ("inventory", "entries", "*", "path"): "archive-member",
@@ -1239,7 +1302,7 @@ def _validate_versions_and_values(documents: dict[str, dict[str, Any]]) -> None:
         documents["manifest_v2"]["mode"] == "MANIFEST",
         "v2 manifest mode mismatch",
     )
-    _require(documents["provenance"]["version"] == 1, "provenance version mismatch")
+    _require(documents["provenance"]["version"] == 2, "provenance version mismatch")
     _require(documents["inventory"]["version"] == 1, "inventory version mismatch")
     _require(documents["transcript"]["version"] == 1, "transcript version mismatch")
     _require(
@@ -1275,6 +1338,7 @@ def validate_document_set(documents: dict[str, dict[str, Any]]) -> None:
         "capability",
         "manifest_v2",
         "manifest_v1",
+        "v1_reextraction",
         "provenance",
         "inventory",
         "transcript",
@@ -2749,6 +2813,7 @@ def verify_manifest_link_command(
     target: str,
     executable_record: dict[str, Any],
     *,
+    expected_fragment: str | None = None,
     roots: PortableRoots | None = None,
     subject_root: str | None = None,
 ) -> dict[str, Any]:
@@ -2756,13 +2821,24 @@ def verify_manifest_link_command(
     expected_driver = capability["linker"]
     expected_executable = executable_record["absolute_path"]
     capability_fragment = capability["fragments"][target]
-    expected_fragment = capability_fragment["absolute_path"]
+    private_fragment_required = expected_fragment is not None
+    if expected_fragment is None:
+        expected_fragment = capability_fragment["absolute_path"]
+    if private_fragment_required:
+        _require(
+            capability_fragment["absolute_path"] != expected_fragment,
+            "manifest private fragment aliases capability source fragment",
+        )
     expected_map = executable_record["link_map"]["absolute_path"]
     _require(
         command["driver"] == expected_driver, "manifest link command driver mismatch"
     )
     _require(
-        executable_record["linker_fragment"] == capability_fragment
+        executable_record["linker_fragment"]
+        == {
+            "absolute_path": expected_fragment,
+            "sha256": capability_fragment["sha256"],
+        }
         and command["fragment"] == expected_fragment,
         "manifest link command fragment mismatch",
     )
@@ -4799,14 +4875,7 @@ def _load_provenance_document(
     record: dict[str, Any],
     label: str,
 ) -> tuple[dict[str, Any], bytes]:
-    raw = record["archive_path"]
-    expected = _hex_sha(record["sha256"], f"{label} provenance SHA-256")
-    _canonical_member(raw)
-    data = _read_extracted(root, members, raw)
-    _require(
-        hashlib.sha256(data).hexdigest() == expected,
-        f"{label} document hash mismatch",
-    )
+    data = _load_provenance_bytes(root, members, record, label)
     try:
         document = _strict_json(data)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -4815,10 +4884,28 @@ def _load_provenance_document(
     return document, data
 
 
+def _load_provenance_bytes(
+    root: Path,
+    members: dict[str, MemberRecord],
+    record: dict[str, Any],
+    label: str,
+) -> bytes:
+    raw = record["archive_path"]
+    expected = _hex_sha(record["sha256"], f"{label} provenance SHA-256")
+    _canonical_member(raw)
+    data = _read_extracted(root, members, raw)
+    _require(
+        hashlib.sha256(data).hexdigest() == expected,
+        f"{label} document hash mismatch",
+    )
+    return data
+
+
 def _validate_all_structures(
     capability: dict[str, Any],
     manifests: list[dict[str, Any]],
     v1: dict[str, Any],
+    v1_reextractions: dict[str, dict[str, Any]],
     provenance: dict[str, Any],
     inventory: dict[str, Any],
     transcripts: list[dict[str, Any]],
@@ -4831,6 +4918,12 @@ def _validate_all_structures(
     for index, manifest in enumerate(manifests):
         _validate_schema(manifest, MANIFEST_V2_SCHEMA, f"manifest_v2[{index}]")
     _validate_schema(v1, MANIFEST_V1_SCHEMA, "manifest_v1")
+    for executable, document in v1_reextractions.items():
+        _validate_schema(
+            document,
+            _symbol_document_schema(SYMBOL_V2_SCHEMA, veneers=True),
+            f"v1_reextraction[{executable}]",
+        )
     _validate_schema(provenance, PROVENANCE_SCHEMA, "provenance")
     _validate_inventory_schema(inventory)
     for index, transcript in enumerate(transcripts):
@@ -4845,7 +4938,7 @@ def _validate_all_structures(
         all(manifest["mode"] == "MANIFEST" for manifest in manifests),
         "v2 manifest mode mismatch",
     )
-    _require(provenance["version"] == 1, "provenance version mismatch")
+    _require(provenance["version"] == 2, "provenance version mismatch")
     _require(inventory["version"] == 1, "inventory version mismatch")
     _require(
         all(item["version"] == 1 for item in transcripts), "transcript version mismatch"
@@ -4860,6 +4953,7 @@ def _validate_all_structures(
         "capability": capability,
         "manifest_v2": manifests[0],
         "manifest_v1": v1,
+        "v1_reextraction": next(iter(v1_reextractions.values())),
         "provenance": provenance,
         "inventory": inventory,
         "transcript": transcripts[0],
@@ -4908,6 +5002,117 @@ def _hex_sha(value: object, label: str, *, length: int = 64) -> str:
     return value
 
 
+def _verify_provenance_contract(
+    root: Path,
+    members: dict[str, MemberRecord],
+    provenance: dict[str, Any],
+    portable: dict[str, Any],
+    capability: dict[str, Any],
+    manifests: list[dict[str, Any]],
+    v1: dict[str, Any],
+) -> None:
+    _require(provenance["version"] == 2, "provenance version mismatch")
+    _require(
+        provenance["subject"] == {"commit": SUBJECT_COMMIT, "tree": SUBJECT_TREE},
+        "exact subject identity mismatch",
+    )
+    _require(
+        provenance["v1"] == {"commit": V1_REPLAY_COMMIT, "tree": V1_REPLAY_TREE},
+        "exact v1 replay identity mismatch",
+    )
+    orchestration = provenance["orchestration"]
+    orchestration_commit = _hex_sha(
+        orchestration["commit"], "orchestration commit", length=40
+    )
+    _hex_sha(orchestration["tree"], "orchestration tree", length=40)
+    for name, expected_path in ORCHESTRATION_SOURCE_PATHS.items():
+        record = orchestration["sources"][name]
+        _require(
+            record["archive_path"] == expected_path,
+            f"orchestration source path mismatch: {name}",
+        )
+        _load_provenance_bytes(
+            root,
+            members,
+            record,
+            f"orchestration source {name}",
+        )
+
+    run = provenance["run"]
+    _require(
+        1 <= run["id"] <= 9223372036854774
+        and 1 <= run["attempt"] <= 999
+        and run["derived_attempt"] == run["id"] * 1000 + run["attempt"],
+        "invalid run identity",
+    )
+    github = provenance["github"]
+    repository_parts = github["repository"].split("/")
+    _require(
+        len(repository_parts) == 2
+        and all(
+            re.fullmatch(r"[A-Za-z0-9_.-]+", part) is not None
+            and part not in {".", ".."}
+            for part in repository_parts
+        ),
+        "invalid GitHub repository identity",
+    )
+    _require(
+        github["ref"] == EXPECTED_GITHUB_REF
+        and github["sha"] == orchestration_commit
+        and github["run_id"] == run["id"]
+        and github["run_attempt"] == run["attempt"],
+        "GitHub provenance identity mismatch",
+    )
+
+    rust = provenance["rust"]
+    _require(
+        rust
+        == {
+            "toolchain": PINNED_RUST_TOOLCHAIN,
+            "rustc_version": PINNED_RUSTC_VERSION,
+            "cargo_version": PINNED_CARGO_VERSION,
+        }
+        and capability["rustc_version"] == rust["rustc_version"]
+        and capability["cargo_version"] == rust["cargo_version"]
+        and all(
+            manifest["control"]["rustc_version"] == rust["rustc_version"]
+            and manifest["control"]["cargo_version"] == rust["cargo_version"]
+            for manifest in manifests
+        )
+        and v1["control"]["rustc_version"] == rust["rustc_version"]
+        and v1["control"]["cargo_version"] == rust["cargo_version"],
+        "provenance Rust toolchain identity mismatch",
+    )
+    packages = provenance["packages"]
+    package_keys = [
+        (item["name"], item["architecture"], item["version"]) for item in packages
+    ]
+    _require(
+        all(
+            all(isinstance(item[field], str) and bool(item[field]) for field in key)
+            and item["verification_status"] == 0
+            for item in packages
+            for key in (("name", "architecture", "version"),)
+        )
+        and package_keys == sorted(package_keys)
+        and len(package_keys) == len(set(package_keys))
+        and any(item["name"] == "lld" for item in packages),
+        "package provenance must be sorted, unique, verified, and include lld",
+    )
+    _require(
+        provenance["roots"] == portable["roots"],
+        "provenance roots differ from portable paths",
+    )
+    _require(
+        provenance["system_links"] == portable["system_links"],
+        "provenance system links differ from portable paths",
+    )
+    _require(
+        provenance["proof"] == {"status": 0, "result": "PASS"},
+        "proof provenance is not PASS",
+    )
+
+
 def _verify_mapped_file(
     root: Path,
     members: dict[str, MemberRecord],
@@ -4920,6 +5125,22 @@ def _verify_mapped_file(
     data = _read_extracted(root, members, mapped.as_posix())
     _require(hashlib.sha256(data).hexdigest() == expected, f"{label} hash mismatch")
     return mapped
+
+
+def _archive_regular_file_identity(
+    root: Path,
+    members: dict[str, MemberRecord],
+    mapped: PurePosixPath,
+    label: str,
+    *,
+    direct_file: bool = False,
+) -> tuple[int, int]:
+    record, metadata = _stat_extracted(root, members, mapped.as_posix())
+    _require(
+        stat.S_ISREG(metadata.st_mode) and (not direct_file or record.kind == "file"),
+        f"{label} lacks independent regular file identity",
+    )
+    return metadata.st_dev, metadata.st_ino
 
 
 def _require_archived_path(
@@ -5280,6 +5501,29 @@ def _verify_capability(
     )
 
 
+def _manifest_fragment_path(manifest: dict[str, Any], target: str) -> str:
+    architecture = manifest["architecture"]
+    variant = manifest["variant"]
+    _require(
+        all(
+            isinstance(value, str)
+            and value not in {"", ".", ".."}
+            and PurePosixPath(value).name == value
+            for value in (architecture, variant, target)
+        ),
+        "manifest fragment namespace mismatch",
+    )
+    return (
+        _canonical_absolute(manifest["runner_root"], "manifest runner root")
+        / "target"
+        / "cache-gate"
+        / architecture
+        / variant
+        / "linker-fragments"
+        / f"{target}.ld"
+    ).as_posix()
+
+
 def _verify_manifests(
     root: Path,
     members: dict[str, MemberRecord],
@@ -5309,6 +5553,16 @@ def _verify_manifests(
         set(by_kind) == {"clean-a", "clean-b", "adversary"},
         "manifest kind set mismatch",
     )
+    source_fragment_identities = {
+        _archive_regular_file_identity(
+            root,
+            members,
+            roots.map_path(fragment["absolute_path"]),
+            f"capability source fragment {target}",
+        )
+        for target, fragment in capability["fragments"].items()
+    }
+    private_fragment_identities: set[tuple[int, int]] = set()
     subject_root = roots.by_name["subject"][0].as_posix()
     for manifest in manifests:
         _require(
@@ -5352,6 +5606,21 @@ def _verify_manifests(
             symbols = manifest["symbols"][executable]
             layout = manifest["elf_layout"][executable]
             proof = manifest["build_proof"]["executables"][executable]
+            target = EXECUTABLE_TARGETS[executable][0]
+            expected_fragment = _manifest_fragment_path(manifest, target)
+            private_identity = _archive_regular_file_identity(
+                root,
+                members,
+                roots.map_path(expected_fragment),
+                "manifest private fragment",
+                direct_file=True,
+            )
+            _require(
+                private_identity not in source_fragment_identities
+                and private_identity not in private_fragment_identities,
+                "manifest private fragment lacks distinct regular file identity",
+            )
+            private_fragment_identities.add(private_identity)
             _require(
                 symbols["binary"]
                 == layout["binary"]
@@ -5412,8 +5681,9 @@ def _verify_manifests(
                 command,
                 trace_bytes,
                 capability,
-                EXECUTABLE_TARGETS[executable][0],
+                target,
                 executable_record,
+                expected_fragment=expected_fragment,
                 roots=roots,
                 subject_root=manifest["runner_root"],
             )
@@ -5640,15 +5910,92 @@ def _body_records(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return records
 
 
+def _verify_v1_reextractions(
+    clean: dict[str, Any],
+    v1: dict[str, Any],
+    reextractions: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    _require(
+        set(reextractions) == set(EXECUTABLE_TARGETS),
+        "v1 re-extraction executable set mismatch",
+    )
+    relative, git_blob, sha256 = SUBJECT_TOOL_IDENTITIES["extractor"]
+    subject_root = clean["runner_root"]
+    _require(
+        clean["tools"]["extractor"]
+        == {
+            "absolute_path": _rooted_path(subject_root, relative),
+            "sha256": sha256,
+            "git_blob": git_blob,
+            "git_blob_sha256": sha256,
+            "reviewed_root": subject_root,
+            "reviewed_commit": SUBJECT_COMMIT,
+            "reviewed_tree": SUBJECT_TREE,
+        },
+        "v1 re-extraction current extractor identity mismatch",
+    )
+    all_kernels: list[str] = []
+    for executable, (_target, expected_kernels) in EXECUTABLE_TARGETS.items():
+        current = reextractions[executable]
+        _validate_schema(
+            current,
+            _symbol_document_schema(SYMBOL_V2_SCHEMA, veneers=True),
+            f"v1 re-extraction {executable}",
+        )
+        executable_record = v1["executables"][executable]
+        original = v1["symbols"][executable]
+        _require(
+            current["binary"]
+            == original["binary"]
+            == executable_record["absolute_path"]
+            and current["binary_sha256"]
+            == original["binary_sha256"]
+            == executable_record["sha256"],
+            f"v1 re-extraction binary identity mismatch: {executable}",
+        )
+        _require(
+            current["architecture"] == original["architecture"] == "x86_64",
+            f"v1 re-extraction architecture mismatch: {executable}",
+        )
+        original_selection = [
+            (symbol["name"], symbol["pattern"]) for symbol in original["symbols"]
+        ]
+        current_selection = [
+            (symbol["name"], symbol["pattern"]) for symbol in current["symbols"]
+        ]
+        _require(
+            len(current_selection) == len(expected_kernels)
+            and current_selection == original_selection,
+            f"v1 re-extraction selection/count mismatch: {executable}",
+        )
+        kernels = [name.rsplit("::", 1)[-1] for name, _pattern in current_selection]
+        _require(
+            len(kernels) == len(set(kernels)) and set(kernels) == set(expected_kernels),
+            f"v1 re-extraction exact kernel selection mismatch: {executable}",
+        )
+        all_kernels.extend(kernels)
+    _require(
+        len(all_kernels) == len(set(all_kernels)) == 8,
+        "v1 re-extraction must contain eight unique kernels",
+    )
+    return _body_records({"symbols": reextractions})
+
+
 def _verify_body_contract(
-    body: dict[str, Any], clean: dict[str, Any], v1: dict[str, Any]
+    body: dict[str, Any],
+    clean: dict[str, Any],
+    v1: dict[str, Any],
+    v1_reextractions: dict[str, dict[str, Any]],
 ) -> str:
     digest = verify_body_rows(body["rows"])
     clean_bodies = _body_records(clean)
-    v1_bodies = _body_records(v1)
+    v1_bodies = _verify_v1_reextractions(clean, v1, v1_reextractions)
     _require(len(clean_bodies) == 8, "clean manifest body set mismatch")
-    _require(len(v1_bodies) == 8, "v1 manifest body set mismatch")
-    _require(set(clean_bodies) == set(v1_bodies), "v1/v2 manifest body kernel mismatch")
+    _require(len(v1_bodies) == 8, "v1 re-extraction body set mismatch")
+    _require(
+        set(clean_bodies) == set(v1_bodies),
+        "v1 re-extraction/v2 manifest body kernel mismatch",
+    )
     rows = {record["kernel"]: record for record in body["rows"]}
     _require(set(rows) == set(clean_bodies), "body-comparison kernel set mismatch")
     for kernel, row in rows.items():
@@ -5680,11 +6027,14 @@ def _verify_extracted_documents(
         paths["manifests"]["clean_b"],
         paths["manifests"]["adversary"],
     ]
+    v1_reextraction_records = paths["v1_reextractions"]
     _require(len(paths["transcripts"]) == 9, "provenance must name nine transcripts")
     all_records = [
+        *provenance["orchestration"]["sources"].values(),
         paths["capability"],
         *manifest_records,
         paths["v1_manifest"],
+        *v1_reextraction_records.values(),
         *paths["transcripts"],
         paths["body_comparison"],
         paths["portable_paths"],
@@ -5705,6 +6055,15 @@ def _verify_extracted_documents(
     v1, _v1_bytes = _load_provenance_document(
         root, members, paths["v1_manifest"], "v1 manifest"
     )
+    v1_reextractions = {
+        executable: _load_provenance_document(
+            root,
+            members,
+            v1_reextraction_records[executable],
+            f"v1 re-extraction {executable}",
+        )[0]
+        for executable in EXECUTABLE_TARGETS
+    }
     transcripts = [
         _load_provenance_document(root, members, record, f"transcript {index}")[0]
         for index, record in enumerate(paths["transcripts"])
@@ -5717,6 +6076,14 @@ def _verify_extracted_documents(
         and paths["portable_paths"]["archive_path"] == "bundle/portable-paths.json",
         "provenance fixed document path mismatch",
     )
+    _require(
+        all(
+            v1_reextraction_records[executable]["archive_path"]
+            == f"bundle/evidence/v1-reextractions/{executable}.json"
+            for executable in EXECUTABLE_TARGETS
+        ),
+        "provenance v1 re-extraction path mismatch",
+    )
     body, _body_bytes = _load_provenance_document(
         root, members, paths["body_comparison"], "body comparison"
     )
@@ -5728,6 +6095,7 @@ def _verify_extracted_documents(
         capability,
         manifests,
         v1,
+        v1_reextractions,
         provenance,
         inventory,
         transcripts,
@@ -5755,6 +6123,7 @@ def _verify_extracted_documents(
         ("capability", capability),
         *(("manifest", manifest) for manifest in manifests),
         ("v1-manifest", v1),
+        *(("v1-reextraction", document) for document in v1_reextractions.values()),
         ("provenance", provenance),
         ("inventory", inventory),
         *(("transcript", transcript) for transcript in transcripts),
@@ -5762,6 +6131,15 @@ def _verify_extracted_documents(
     ):
         validate_concrete_route_values(kind, document, roots)
 
+    _verify_provenance_contract(
+        root,
+        members,
+        provenance,
+        portable,
+        capability,
+        manifests,
+        v1,
+    )
     verify_identity_contract(
         provenance,
         capability,
@@ -5782,7 +6160,7 @@ def _verify_extracted_documents(
         transcripts,
         replayed_commands,
     )
-    body_sha = _verify_body_contract(body, clean_a, v1)
+    body_sha = _verify_body_contract(body, clean_a, v1, v1_reextractions)
 
     subject = provenance["subject"]
     _hex_sha(subject["commit"], "subject commit", length=40)

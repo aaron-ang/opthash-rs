@@ -28,6 +28,20 @@ SUBJECT_COMMIT = "061d13da22b89208c801308efd578444c8e9caba"
 SUBJECT_TREE = "24921a941f8c3c26467465b99d6b45ee5912b2da"
 V1_REPLAY_COMMIT = "b0d53234dc051af91fe0321450b3e8312a84e635"
 V1_REPLAY_TREE = "d77cc082fe48799f26ff4440bd1898a71d0dc8cc"
+ORCHESTRATION_COMMIT = "a" * 40
+ORCHESTRATION_TREE = "b" * 40
+ORCHESTRATION_SOURCE_BYTES = {
+    "workflow": b"workflow\n",
+    "runner": b"runner\n",
+    "packager": b"packager\n",
+    "verifier": b"verifier\n",
+}
+ORCHESTRATION_SOURCE_PATHS = {
+    "workflow": "bundle/orchestrator/.github/workflows/x86-cache-gate-evidence.yml",
+    "runner": "bundle/orchestrator/scripts/run-x86-cache-gate-evidence.sh",
+    "packager": "bundle/orchestrator/scripts/package-x86-cache-gate-evidence.py",
+    "verifier": "bundle/orchestrator/scripts/verify-x86-cache-gate-evidence.py",
+}
 PINNED_CARGO_VERSION = "cargo 1.95.0 (f2d3ce0bd 2026-03-21)"
 PINNED_RUSTC_VERSION = (
     "rustc 1.95.0 (59807616e 2026-04-14)\n"
@@ -1279,6 +1293,14 @@ def set_linker_record(record: dict[str, Any], flavor: str, linker_sha: str) -> N
     )
 
 
+def private_fragment_path(manifest: dict[str, Any], target: str) -> str:
+    return (
+        f"{manifest['runner_root']}/target/cache-gate/"
+        f"{manifest['architecture']}/{manifest['variant']}/"
+        f"linker-fragments/{target}.ld"
+    )
+
+
 def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
     payload_sha = hashlib.sha256(b"payload").hexdigest()
     linker_sha = hashlib.sha256(b"linker").hexdigest()
@@ -1729,6 +1751,22 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
         }
         for executable, proof in document["build_proof"]["executables"].items():
             command = proof["link_command"]
+            target = verify_module.EXECUTABLE_TARGETS[executable][0]
+            source_fragment = capability["fragments"][target]
+            fragment_path = private_fragment_path(document, target)
+            hosted_files[fragment_path] = b"payload"
+            document["executables"][executable]["linker_fragment"] = {
+                "absolute_path": fragment_path,
+                "sha256": source_fragment["sha256"],
+            }
+            command["argv"] = [
+                token.replace(
+                    f"-Wl,-T,{command['fragment']}",
+                    f"-Wl,-T,{fragment_path}",
+                )
+                for token in command["argv"]
+            ]
+            command["fragment"] = fragment_path
             driver = command["driver"]
             trace_record = {
                 "argv": command["argv"],
@@ -1854,13 +1892,41 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
             }
         )
 
+    v1_reextractions: dict[str, dict[str, Any]] = {}
+    for executable, (_target, kernels) in verify_module.EXECUTABLE_TARGETS.items():
+        document = schema_sample(
+            verify_module._symbol_document_schema(
+                verify_module.SYMBOL_V2_SCHEMA, veneers=True
+            ),
+            verify_module,
+        )
+        document.update(
+            {
+                "binary": v1["executables"][executable]["absolute_path"],
+                "binary_sha256": v1["executables"][executable]["sha256"],
+                "architecture": "x86_64",
+                "linker_generated_veneer_thunks": [],
+                "symbols": [full_symbol(verify_module, kernel) for kernel in kernels],
+            }
+        )
+        for current, original in zip(
+            document["symbols"],
+            v1["symbols"][executable]["symbols"],
+            strict=True,
+        ):
+            current["name"] = original["name"]
+            current["pattern"] = original["pattern"]
+        v1_reextractions[executable] = document
+
     body_rows = [
         {
             "kernel": kernel,
             "v1": copy.deepcopy(v1_body),
             "v2": copy.deepcopy(verify_module._body_records(clean_a)[kernel]),
         }
-        for kernel, v1_body in sorted(verify_module._body_records(v1).items())
+        for kernel, v1_body in sorted(
+            verify_module._body_records({"symbols": v1_reextractions}).items()
+        )
     ]
     transcript_documents = []
     for hosted_manifest in (clean_a, clean_b, adversary):
@@ -1902,6 +1968,13 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
         }
         for index, document in enumerate(transcript_documents)
     ]
+    v1_reextraction_records = {
+        executable: {
+            "archive_path": (f"bundle/evidence/v1-reextractions/{executable}.json"),
+            "sha256": hashlib.sha256(json_bytes(document)).hexdigest(),
+        }
+        for executable, document in v1_reextractions.items()
+    }
     body_comparison = {
         "version": 1,
         "fields": list(verify_module.BODY_FIELDS),
@@ -1913,10 +1986,46 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
         "capability_bytes": capability_bytes,
         "manifests": [clean_a, clean_b, adversary],
         "manifest_v1": v1,
+        "v1_reextractions": v1_reextractions,
         "provenance": {
-            "version": 1,
+            "version": 2,
             "subject": {"commit": SUBJECT_COMMIT, "tree": SUBJECT_TREE},
+            "v1": {"commit": V1_REPLAY_COMMIT, "tree": V1_REPLAY_TREE},
+            "orchestration": {
+                "commit": ORCHESTRATION_COMMIT,
+                "tree": ORCHESTRATION_TREE,
+                "sources": {
+                    name: {
+                        "archive_path": ORCHESTRATION_SOURCE_PATHS[name],
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                    for name, data in ORCHESTRATION_SOURCE_BYTES.items()
+                },
+            },
             "run": {"id": 7, "attempt": 2, "derived_attempt": 7002},
+            "github": {
+                "repository": "owner/opthash",
+                "ref": "refs/heads/ci/x86-cache-gate-evidence",
+                "sha": ORCHESTRATION_COMMIT,
+                "run_id": 7,
+                "run_attempt": 2,
+            },
+            "rust": {
+                "toolchain": "1.95.0-x86_64-unknown-linux-gnu",
+                "rustc_version": PINNED_RUSTC_VERSION,
+                "cargo_version": PINNED_CARGO_VERSION,
+            },
+            "packages": [
+                {
+                    "name": "lld",
+                    "architecture": "amd64",
+                    "version": "1:18.1.3-1ubuntu1",
+                    "verification_status": 0,
+                }
+            ],
+            "roots": copy.deepcopy(portable_paths_document["roots"]),
+            "system_links": copy.deepcopy(portable_paths_document["system_links"]),
+            "proof": {"status": 0, "result": "PASS"},
             "documents": {
                 "capability": {
                     "archive_path": "bundle/evidence/capability.json",
@@ -1927,6 +2036,7 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
                     "archive_path": "bundle/evidence/v1.json",
                     "sha256": hashlib.sha256(json_bytes(v1)).hexdigest(),
                 },
+                "v1_reextractions": v1_reextraction_records,
                 "transcripts": transcript_records,
                 "body_comparison": {
                     "archive_path": "bundle/body-comparison.json",
@@ -1955,6 +2065,7 @@ def full_document_set(verify_module: ModuleType) -> dict[str, dict[str, Any]]:
         "capability": documents["capability"],
         "manifest_v2": documents["manifests"][0],
         "manifest_v1": documents["manifest_v1"],
+        "v1_reextraction": documents["v1_reextractions"]["elastic_cache_gate"],
         "provenance": documents["provenance"],
         "inventory": {
             "version": 1,
@@ -1972,6 +2083,78 @@ def full_document_set(verify_module: ModuleType) -> dict[str, dict[str, Any]]:
         "body_comparison": documents["body_comparison"],
         "portable_paths": documents["portable_paths"],
     }
+
+
+def test_ready_schema_requires_exact_provenance_v2_and_current_reextraction(
+    verify_module: ModuleType,
+) -> None:
+    documents = full_document_set(verify_module)
+    verify_module.validate_document_set(documents)
+
+    legacy = copy.deepcopy(documents)
+    legacy["provenance"]["version"] = 1
+    with pytest.raises(verify_module.EvidenceError, match="provenance version"):
+        verify_module.validate_document_set(legacy)
+
+
+def test_body_contract_uses_only_current_normalizer_v1_reextractions(
+    verify_module: ModuleType,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    v1 = documents["manifest_v1"]
+    reextractions = documents["v1_reextractions"]
+    body = documents["body_comparison"]
+    clean = documents["manifests"][0]
+
+    v1["symbols"]["elastic_cache_gate"]["symbols"][0][
+        "normalized_instructions_sha256"
+    ] = "f" * 64
+    reextractions["elastic_cache_gate"]["symbols"][0]["raw_sha256"] = "d" * 64
+    reextractions["elastic_cache_gate"]["symbols"][0]["start"] = 9999
+    reextractions["elastic_cache_gate"]["symbols"][0]["section"] = ".other"
+    verify_module._verify_body_contract(body, clean, v1, reextractions)
+
+    reextractions["elastic_cache_gate"]["symbols"][0][
+        "normalized_instructions_sha256"
+    ] = "e" * 64
+    with pytest.raises(verify_module.EvidenceError, match="v1 body contract"):
+        verify_module._verify_body_contract(body, clean, v1, reextractions)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["binary", "binary-hash", "architecture", "selection", "count", "extractor"],
+)
+def test_current_v1_reextractions_bind_binary_architecture_and_exact_selection(
+    verify_module: ModuleType,
+    mutation: str,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    reextractions = documents["v1_reextractions"]
+    current = reextractions["elastic_cache_gate"]
+    if mutation == "binary":
+        current["binary"] = "/host/v1/alternate"
+    elif mutation == "binary-hash":
+        current["binary_sha256"] = "f" * 64
+    elif mutation == "architecture":
+        current["architecture"] = "aarch64"
+    elif mutation == "selection":
+        current["symbols"][0]["pattern"] = "::attacker$"
+    elif mutation == "count":
+        current["symbols"].pop()
+    else:
+        documents["manifests"][0]["tools"]["extractor"]["sha256"] = "f" * 64
+
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="binary|architecture|selection|count|extractor",
+    ):
+        verify_module._verify_body_contract(
+            documents["body_comparison"],
+            documents["manifests"][0],
+            documents["manifest_v1"],
+            reextractions,
+        )
 
 
 def nested_objects(
@@ -2018,6 +2201,7 @@ def test_classifier_is_closed_and_covers_required_routes(
         "capability",
         "manifest_v2",
         "manifest_v1",
+        "v1_reextraction",
         "provenance",
         "inventory",
         "transcript",
@@ -2054,6 +2238,7 @@ def test_recursive_schema_rejects_unknown_key_before_routing(
         "capability",
         "manifest_v2",
         "manifest_v1",
+        "v1_reextraction",
         "provenance",
         "inventory",
         "transcript",
@@ -2123,6 +2308,7 @@ def test_full_document_set_passes_recursive_schema_and_routes(
         "capability",
         "manifest_v2",
         "manifest_v1",
+        "v1_reextraction",
         "provenance",
         "inventory",
         "transcript",
@@ -2341,6 +2527,10 @@ def write_semantic_staging(staging: Path, verify_module: ModuleType) -> dict[str
         "system-root/usr/bin",
     ):
         (bundle / root).mkdir(parents=True, exist_ok=True)
+    for name, data in ORCHESTRATION_SOURCE_BYTES.items():
+        destination = staging / ORCHESTRATION_SOURCE_PATHS[name]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
     for name in ("actual", "gnu", "lld"):
         (bundle / f"system-root/usr/bin/{name}").write_bytes(b"linker")
     (bundle / "subject/payload").write_bytes(b"payload")
@@ -2374,6 +2564,10 @@ def write_semantic_staging(staging: Path, verify_module: ModuleType) -> dict[str
     }
     for name, document in named_documents.items():
         (bundle / f"evidence/{name}").write_bytes(json_bytes(document))
+    for executable, document in documents["v1_reextractions"].items():
+        destination = bundle / f"evidence/v1-reextractions/{executable}.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(json_bytes(document))
     for index, transcript in enumerate(documents["transcripts"]):
         (bundle / f"evidence/transcript-{index}.json").write_bytes(
             json_bytes(transcript)
@@ -2407,6 +2601,166 @@ def test_verify_archive_returns_stable_ready_report(
         documents["body_comparison"]["rows"]
     )
     assert len(report.manifest_sha256s) == 3
+
+
+@pytest.mark.parametrize(
+    "alias_kind",
+    ["source-private", "source-private-reverse", "private-private"],
+)
+def test_ready_rejects_hardlink_aliased_private_fragments(
+    tmp_path: Path,
+    package_module: ModuleType,
+    verify_module: ModuleType,
+    alias_kind: str,
+) -> None:
+    staging = tmp_path / "staging"
+    documents = write_semantic_staging(staging, verify_module)
+    clean_a, clean_b, _adversary = documents["manifests"]
+    private_a = private_fragment_path(clean_a, "elastic")
+    source = documents["capability"]["fragments"]["elastic"]["absolute_path"]
+    if alias_kind == "source-private":
+        alias, target = private_a, source
+    elif alias_kind == "source-private-reverse":
+        alias, target = source, private_a
+    else:
+        alias = private_fragment_path(clean_b, "elastic")
+        target = private_a
+
+    def staged_path(absolute_path: str) -> Path:
+        return (
+            staging
+            / "bundle/subject"
+            / Path(absolute_path).relative_to("/host/subject")
+        )
+
+    alias_path = staged_path(alias)
+    alias_path.unlink()
+    os.link(staged_path(target), alias_path)
+    documents["provenance"]["hardlinks"] = [
+        {
+            "path": f"bundle/subject/{Path(alias).relative_to('/host/subject')}",
+            "target": f"bundle/subject/{Path(target).relative_to('/host/subject')}",
+        }
+    ]
+    (staging / "bundle/provenance.json").write_bytes(
+        json_bytes(documents["provenance"])
+    )
+    archive = tmp_path / "evidence.tar"
+    digest = package_module.package_evidence(
+        staging, archive, tmp_path / "evidence.tar.sha256"
+    )
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="manifest private fragment.*regular file identity",
+    ):
+        verify_module.verify_archive(archive, digest)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "v1",
+        "source-path",
+        "source-bytes",
+        "github-repository",
+        "github-ref",
+        "github-sha",
+        "github-run",
+        "rust",
+        "package-empty",
+        "package-status",
+        "package-order",
+        "package-duplicate",
+        "package-lld",
+        "roots",
+        "system-links",
+        "proof",
+    ],
+)
+def test_ready_provenance_v2_semantics_are_cross_bound(
+    tmp_path: Path,
+    package_module: ModuleType,
+    verify_module: ModuleType,
+    mutation: str,
+) -> None:
+    staging = tmp_path / "staging"
+    write_semantic_staging(staging, verify_module)
+    provenance_path = staging / "bundle/provenance.json"
+    provenance = json.loads(provenance_path.read_bytes())
+    if mutation == "v1":
+        provenance["v1"]["tree"] = "f" * 40
+    elif mutation == "source-path":
+        provenance["orchestration"]["sources"]["runner"]["archive_path"] = (
+            "bundle/orchestrator/scripts/alternate.sh"
+        )
+    elif mutation == "source-bytes":
+        (staging / ORCHESTRATION_SOURCE_PATHS["runner"]).write_bytes(b"changed\n")
+    elif mutation == "github-repository":
+        provenance["github"]["repository"] = "not-a-repository"
+    elif mutation == "github-ref":
+        provenance["github"]["ref"] = "refs/heads/other"
+    elif mutation == "github-sha":
+        provenance["github"]["sha"] = "f" * 40
+    elif mutation == "github-run":
+        provenance["github"]["run_id"] += 1
+    elif mutation == "rust":
+        provenance["rust"]["toolchain"] = "nightly"
+    elif mutation == "package-empty":
+        provenance["packages"][0]["version"] = ""
+    elif mutation == "package-status":
+        provenance["packages"][0]["verification_status"] = 1
+    elif mutation == "package-order":
+        provenance["packages"].append(
+            {
+                "name": "aaa",
+                "architecture": "amd64",
+                "version": "1",
+                "verification_status": 0,
+            }
+        )
+    elif mutation == "package-duplicate":
+        provenance["packages"].append(copy.deepcopy(provenance["packages"][0]))
+    elif mutation == "package-lld":
+        provenance["packages"][0]["name"] = "clang"
+    elif mutation == "roots":
+        provenance["roots"][0]["hosted"] = "/host/alternate"
+    elif mutation == "system-links":
+        provenance["system_links"].append(
+            {"source": "/usr/bin/ld", "raw_target": "x86_64-linux-gnu-ld"}
+        )
+    else:
+        provenance["proof"] = {"status": 1, "result": "FAIL"}
+    provenance_path.write_bytes(json_bytes(provenance))
+
+    archive = tmp_path / "evidence.tar"
+    digest = package_module.package_evidence(
+        staging, archive, tmp_path / "evidence.tar.sha256"
+    )
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match=(
+            "v1|orchestration|document hash|GitHub|Rust|package|roots|"
+            "system links|proof"
+        ),
+    ):
+        verify_module.verify_archive(archive, digest)
+
+
+def test_provenance_hash_binds_current_v1_reextraction_bytes(
+    tmp_path: Path,
+    package_module: ModuleType,
+    verify_module: ModuleType,
+) -> None:
+    staging = tmp_path / "staging"
+    write_semantic_staging(staging, verify_module)
+    path = staging / "bundle/evidence/v1-reextractions/elastic_cache_gate.json"
+    path.write_bytes(path.read_bytes() + b" ")
+    archive = tmp_path / "evidence.tar"
+    digest = package_module.package_evidence(
+        staging, archive, tmp_path / "evidence.tar.sha256"
+    )
+    with pytest.raises(verify_module.EvidenceError, match="document hash mismatch"):
+        verify_module.verify_archive(archive, digest)
 
 
 def test_provenance_binds_original_document_bytes(
@@ -3226,6 +3580,7 @@ def test_manifest_replay_rejects_undeclared_forwarded_linker_input(
             capability,
             "elastic",
             manifest["executables"][executable],
+            expected_fragment=private_fragment_path(manifest, "elastic"),
         )
 
 
@@ -3238,7 +3593,9 @@ def test_manifest_replay_rejects_same_hash_alternate_fragment_path(
     executable = "elastic_cache_gate"
     command = manifest["build_proof"]["executables"][executable]["link_command"]
     executable_record = manifest["executables"][executable]
-    authority = capability["fragments"]["elastic"]["absolute_path"]
+    authority = private_fragment_path(manifest, "elastic")
+    assert executable_record["linker_fragment"]["absolute_path"] == authority
+    assert command["fragment"] == authority
     alternate = "/host/subject/alternate-same-hash.ld"
     executable_record["linker_fragment"]["absolute_path"] = alternate
     command["fragment"] = alternate
@@ -3261,6 +3618,32 @@ def test_manifest_replay_rejects_same_hash_alternate_fragment_path(
             capability,
             "elastic",
             executable_record,
+            expected_fragment=authority,
+        )
+
+
+def test_manifest_replay_rejects_private_fragment_aliasing_source_fragment(
+    verify_module: ModuleType,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifest = documents["manifests"][0]
+    executable = "elastic_cache_gate"
+    authority = private_fragment_path(manifest, "elastic")
+    capability["fragments"]["elastic"]["absolute_path"] = authority
+    command = manifest["build_proof"]["executables"][executable]["link_command"]
+    trace_path = command["trace"]["absolute_path"]
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="private fragment aliases capability source fragment",
+    ):
+        verify_module.verify_manifest_link_command(
+            command,
+            documents["hosted_files"][trace_path],
+            capability,
+            "elastic",
+            manifest["executables"][executable],
+            expected_fragment=authority,
         )
 
 
@@ -3285,6 +3668,7 @@ def test_manifest_replay_rejects_alternate_executable_fragment_record_path(
             capability,
             "elastic",
             executable_record,
+            expected_fragment=private_fragment_path(manifest, "elastic"),
         )
 
 
@@ -3323,6 +3707,7 @@ def test_manifest_replay_rejects_extra_aliased_linker_controls(
             capability,
             "elastic",
             manifest["executables"][executable],
+            expected_fragment=private_fragment_path(manifest, "elastic"),
         )
 
 
@@ -3430,6 +3815,7 @@ def test_manifest_trace_rejects_unsafe_output_interpretation(
             capability,
             "elastic",
             manifest["executables"][executable],
+            expected_fragment=private_fragment_path(manifest, "elastic"),
         )
 
 
@@ -3459,6 +3845,7 @@ def test_manifest_trace_rejects_forwarded_output_redirect(
             capability,
             "elastic",
             manifest["executables"][executable],
+            expected_fragment=private_fragment_path(manifest, "elastic"),
         )
 
 
@@ -3574,6 +3961,7 @@ def test_manifest_link_command_is_independently_replayed(
             capability,
             target,
             executable_record,
+            expected_fragment=private_fragment_path(manifest, target),
         )
 
 
@@ -3608,6 +3996,7 @@ def test_manifest_link_trace_validates_every_record_and_unique_producer(
             capability,
             "elastic",
             manifest["executables"][executable],
+            expected_fragment=private_fragment_path(manifest, "elastic"),
         )
 
 
