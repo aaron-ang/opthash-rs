@@ -281,9 +281,24 @@ printf '%s\n' "${FAKE_ARCH:-x86_64}"
     write_executable(
         tools / "dpkg-query",
         """#!/usr/bin/env bash
-if [[ $1 == -S ]]; then printf 'lld: %s\n' "$2"; exit 0; fi
+printf 'dpkg-query %s\n' "$*" >>"$FAKE_LOG"
+if [[ $1 == -S ]]; then
+  if [[ $2 == "$FAKE_LLD_TOOL" ]]; then
+    owner=${FAKE_DPKG_OWNER:-lld}
+    owner_path=${FAKE_DPKG_OWNER_PATH:-$2}
+  else
+    owner=${FAKE_DPKG_CHAIN_OWNER:-lld}
+    owner_path=$2
+  fi
+  printf '%s: %s\n' "$owner" "$owner_path"
+  if [[ -n ${FAKE_DPKG_SECOND_OWNER:-} ]]; then
+    printf '%s: %s\n' "$FAKE_DPKG_SECOND_OWNER" "$2"
+  fi
+  exit 0
+fi
 if [[ $1 == -W ]]; then
-  printf 'install ok installed\tamd64\t18.1.3-1ubuntu1\n'
+  printf 'install ok installed\t%s\t18.1.3-1ubuntu1\n' \
+    "${FAKE_DPKG_PACKAGE_ARCH:-amd64}"
   exit 0
 fi
 exit 97
@@ -292,7 +307,8 @@ exit 97
     write_executable(
         tools / "dpkg",
         """#!/usr/bin/env bash
-[[ $1 == -V && $2 == lld ]] || exit 98
+printf 'dpkg %s\n' "$*" >>"$FAKE_LOG"
+[[ $1 == -V && ($2 == lld || $2 == lld:amd64) ]] || exit 98
 exit "${FAKE_DPKG_VERIFY_STATUS:-0}"
 """,
     )
@@ -655,6 +671,7 @@ cp -- "$FAKE_ASSETS/v1-reextractions/$(basename "$binary").json" "$output"
         "FAKE_CAPABILITY_TEMPLATE": str(capability_path),
         "FAKE_ASSETS": str(fake_assets),
         "FAKE_ELASTIC_FRAGMENT": str(chain_root / "elastic.ld"),
+        "FAKE_LLD_TOOL": str(tools / "ld.lld"),
     }
     return {
         "orchestrator": orchestrator,
@@ -1196,6 +1213,90 @@ def test_host_and_checkout_gates_precede_capability(
         hosted["log"].read_text() if hosted["log"].exists() else ""
     )
     assert hosted["status"].exists()
+
+
+@pytest.mark.parametrize("owner", ["lld", "lld:amd64"])
+def test_lld_owner_accepts_unqualified_or_exact_native_multiarch(
+    hosted: dict[str, Any], owner: str
+) -> None:
+    completed = invoke(
+        hosted,
+        env={
+            "FAKE_DPKG_OWNER": owner,
+            "FAKE_CAPABILITY_STATUS": "73",
+        },
+    )
+    assert completed.returncode == 73
+    assert "ld.lld is not owned" not in completed.stderr
+    assert "capability" in hosted["log"].read_text()
+    assert hosted["status"].read_text() == "73\n"
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"FAKE_DPKG_OWNER": "lld:arm64"},
+        {"FAKE_DPKG_OWNER": "lld-18:amd64"},
+        {"FAKE_DPKG_OWNER": "lld:amd64:extra"},
+        {"FAKE_DPKG_OWNER_PATH": "/usr/bin/not-ld.lld"},
+        {"FAKE_DPKG_SECOND_OWNER": "lld:amd64"},
+    ],
+)
+def test_lld_owner_rejects_foreign_malformed_or_ambiguous_ownership(
+    hosted: dict[str, Any], env: dict[str, str]
+) -> None:
+    completed = invoke(hosted, env=env)
+    assert completed.returncode != 0
+    assert "ld.lld is not owned by the Ubuntu lld package" in completed.stderr
+    assert "capability" not in hosted["log"].read_text()
+    assert hosted["status"].read_text() == "1\n"
+
+
+def test_native_multiarch_lld_owner_stages_base_package_provenance(
+    hosted: dict[str, Any],
+) -> None:
+    completed = invoke(
+        hosted,
+        env={
+            "FAKE_DPKG_OWNER": "lld:amd64",
+            "FAKE_DPKG_CHAIN_OWNER": "lld:amd64",
+            "FAKE_SUCCESS": "1",
+        },
+    )
+    assert completed.returncode == 0, completed.stderr
+    provenance = json.loads(
+        (hosted["evidence"] / "staging/bundle/provenance.json").read_text()
+    )
+    assert provenance["packages"] == [
+        {
+            "architecture": "amd64",
+            "name": "lld",
+            "verification_status": 0,
+            "version": "18.1.3-1ubuntu1",
+        }
+    ]
+    calls = hosted["log"].read_text()
+    assert re.search(r"(?m)^dpkg-query -W .* lld:amd64$", calls)
+    assert "dpkg -V lld:amd64\n" in calls
+
+
+def test_linker_chain_owner_qualifier_must_match_package_architecture(
+    hosted: dict[str, Any],
+) -> None:
+    completed = invoke(
+        hosted,
+        env={
+            "FAKE_DPKG_OWNER": "lld:amd64",
+            "FAKE_DPKG_CHAIN_OWNER": "lld:arm64",
+            "FAKE_SUCCESS": "1",
+        },
+    )
+    assert completed.returncode != 0
+    assert "linker package ownership architecture mismatch" in completed.stderr
+    calls = hosted["log"].read_text()
+    assert "capability" in calls
+    assert "subject-cache-gate" not in calls
+    assert not (hosted["evidence"] / "staging").exists()
 
 
 def test_existing_evidence_root_fails_before_finalizer(

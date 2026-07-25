@@ -422,7 +422,7 @@ mkdir -m 0700 "$evidence/logs"
 resolved_lld=$(command -v ld.lld || true)
 [[ $resolved_lld == "$LLD_TOOL" && -e $LLD_TOOL ]] || fail "ld.lld must resolve to $LLD_TOOL"
 lld_owner=$(dpkg-query -S "$LLD_TOOL") || fail "cannot identify ld.lld package"
-[[ $lld_owner == "lld: $LLD_TOOL" ]] || fail "ld.lld is not owned by the Ubuntu lld package"
+[[ $lld_owner == "lld: $LLD_TOOL" || $lld_owner == "lld:amd64: $LLD_TOOL" ]] || fail "ld.lld is not owned by the Ubuntu lld package"
 lld_package_record=$(dpkg-query -W '-f=${Status}\t${Architecture}\t${Version}\n' lld)
 [[ $lld_package_record == $'install ok installed\t'* ]] || fail "invalid lld package record"
 if ! dpkg -V lld >"$evidence/logs/lld.dpkg-verify.log" 2>&1; then
@@ -763,16 +763,24 @@ def package(path: str) -> dict:
     lines = [line for line in owned.stdout.splitlines() if line]
     if len(lines) != 1 or ": " not in lines[0]:
         raise RuntimeError(f"ambiguous linker package ownership: {path}")
-    name, owned_path = lines[0].split(": ", 1)
+    binary_package, owned_path = lines[0].split(": ", 1)
     if owned_path != path:
         raise RuntimeError(f"linker package ownership path mismatch: {path}")
-    package_name = name.split(":", 1)[0]
+    owner_parts = binary_package.split(":")
+    if (
+        len(owner_parts) not in {1, 2}
+        or not owner_parts[0]
+        or (len(owner_parts) == 2 and not owner_parts[1])
+    ):
+        raise RuntimeError(f"invalid linker package owner: {path}")
+    package_name = owner_parts[0]
+    owner_architecture = owner_parts[1] if len(owner_parts) == 2 else None
     queried = subprocess.run(
         [
             "dpkg-query",
             "-W",
             "-f=${Status}\\t${Architecture}\\t${Version}\\n",
-            package_name,
+            binary_package,
         ],
         text=True,
         capture_output=True,
@@ -781,8 +789,12 @@ def package(path: str) -> dict:
     fields = queried.stdout.rstrip("\n").split("\t")
     if queried.returncode != 0 or len(fields) != 3 or fields[0] != "install ok installed":
         raise RuntimeError(f"invalid package record for {package_name}")
+    if owner_architecture is not None and owner_architecture != fields[1]:
+        raise RuntimeError(
+            f"linker package ownership architecture mismatch: {path}"
+        )
     verified = subprocess.run(
-        ["dpkg", "-V", package_name], text=True, capture_output=True, check=False
+        ["dpkg", "-V", binary_package], text=True, capture_output=True, check=False
     )
     if verified.returncode != 0 or verified.stdout or verified.stderr:
         raise RuntimeError(f"dpkg -V failed for {package_name}")
