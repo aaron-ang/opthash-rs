@@ -476,8 +476,211 @@ for raw in sys.argv[1:]:
 PY
 
 mkdir -m 0700 "$evidence/work"
+exec 9<"$evidence/logs"
 capability_stdout="$evidence/logs/capability.stdout"
-"$subject/scripts/cache-gate-linker-capability.sh" >"$capability_stdout" 2>"$evidence/logs/capability.stderr"
+capability_stderr="$evidence/logs/capability.stderr"
+capability_status=0
+"$subject/scripts/cache-gate-linker-capability.sh" >"$capability_stdout" 2>"$capability_stderr" || capability_status=$?
+if ((capability_status != 0)); then
+	(
+		/usr/bin/python3 - "$evidence/logs" <<'PY'
+import os
+import stat
+import sys
+
+PREFIX = b"cache-gate capability diagnostic | "
+OMISSION = PREFIX + b"[... omitted ...]\n"
+UNAVAILABLE = PREFIX + b"diagnostic unavailable\n"
+HOLD = PREFIX + b"HOLD: native linker capability probe failed\n"
+SERIALIZED_LIMIT = 8 * 1024
+RAW_LIMIT = 8 * 1024
+RAW_HALF = RAW_LIMIT // 2
+LOGS_FD = 9
+CAPABILITY_STDERR = "capability.stderr"
+
+
+def identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def read_exact(descriptor: int, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            raise RuntimeError("capability diagnostic changed while reading")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def records(payload: bytes) -> list[bytes]:
+    if not payload:
+        return []
+    result = payload.split(b"\n")
+    if result[-1] == b"":
+        result.pop()
+    return result
+
+
+def token(value: int) -> bytes:
+    if 0x20 <= value <= 0x7E:
+        return bytes((value,))
+    return f"\\x{value:02x}".encode("ascii")
+
+
+def render_record(record: bytes) -> bytes:
+    return PREFIX + b"".join(token(value) for value in record) + b"\n"
+
+
+def render_full(payload: bytes) -> bytes:
+    return b"".join(render_record(record) for record in records(payload))
+
+
+def render_head(payload: bytes, budget: int) -> bytes:
+    output = bytearray()
+    overhead = len(PREFIX) + 1
+    for record in records(payload):
+        remaining = budget - len(output)
+        if remaining < overhead:
+            break
+        output.extend(PREFIX)
+        content_budget = remaining - overhead
+        complete = True
+        for value in record:
+            escaped = token(value)
+            if len(escaped) > content_budget:
+                complete = False
+                break
+            output.extend(escaped)
+            content_budget -= len(escaped)
+        output.append(0x0A)
+        if not complete:
+            break
+    return bytes(output)
+
+
+def render_tail(payload: bytes, budget: int) -> bytes:
+    selected = []
+    remaining = budget
+    overhead = len(PREFIX) + 1
+    for record in reversed(records(payload)):
+        if remaining < overhead:
+            break
+        escaped = [token(value) for value in record]
+        content_budget = remaining - overhead
+        start = len(escaped)
+        while start and len(escaped[start - 1]) <= content_budget:
+            start -= 1
+            content_budget -= len(escaped[start])
+        line = PREFIX + b"".join(escaped[start:]) + b"\n"
+        selected.append(line)
+        remaining -= len(line)
+        if start:
+            break
+    selected.reverse()
+    return b"".join(selected)
+
+
+def serialize(chunks: list[bytes]) -> bytes:
+    if len(chunks) == 1:
+        complete = render_full(chunks[0])
+        if len(complete) + len(HOLD) <= SERIALIZED_LIMIT:
+            return complete + HOLD
+    available = SERIALIZED_LIMIT - len(OMISSION) - len(HOLD)
+    head_budget = available // 2
+    tail_budget = available - head_budget
+    output = (
+        render_head(chunks[0], head_budget)
+        + OMISSION
+        + render_tail(chunks[-1], tail_budget)
+        + HOLD
+    )
+    if len(output) > SERIALIZED_LIMIT:
+        raise RuntimeError("serialized capability diagnostic exceeds limit")
+    return output
+
+
+def read_diagnostic(logs_path: str) -> list[bytes]:
+    logs_before = os.fstat(LOGS_FD)
+    if not stat.S_ISDIR(logs_before.st_mode):
+        raise RuntimeError("unsafe capability logs directory")
+    initial = os.stat(
+        CAPABILITY_STDERR,
+        dir_fd=LOGS_FD,
+        follow_symlinks=False,
+    )
+    if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
+        raise RuntimeError("unsafe capability diagnostic")
+    descriptor = os.open(
+        CAPABILITY_STDERR,
+        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=LOGS_FD,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or identity(initial) != identity(before)
+        ):
+            raise RuntimeError("unsafe capability diagnostic")
+        if before.st_size <= RAW_LIMIT:
+            chunks = [read_exact(descriptor, before.st_size)]
+        else:
+            first = read_exact(descriptor, RAW_HALF)
+            os.lseek(descriptor, before.st_size - RAW_HALF, os.SEEK_SET)
+            last = read_exact(descriptor, RAW_HALF)
+            chunks = [first, last]
+        after = os.fstat(descriptor)
+        final = os.stat(
+            CAPABILITY_STDERR,
+            dir_fd=LOGS_FD,
+            follow_symlinks=False,
+        )
+        if identity(before) != identity(after) or identity(after) != identity(final):
+            raise RuntimeError("capability diagnostic changed while reading")
+    finally:
+        os.close(descriptor)
+
+    logs_after = os.fstat(LOGS_FD)
+    visible_logs = os.lstat(logs_path)
+    if (
+        identity(logs_before) != identity(logs_after)
+        or identity(logs_after) != identity(visible_logs)
+    ):
+        raise RuntimeError("capability logs directory identity changed")
+    return chunks
+
+
+try:
+    diagnostic = serialize(read_diagnostic(sys.argv[1]))
+except Exception:
+    diagnostic = UNAVAILABLE + HOLD
+
+view = memoryview(diagnostic)
+while view:
+    try:
+        written = os.write(2, view)
+    except OSError:
+        break
+    if written <= 0:
+        break
+    view = view[written:]
+PY
+	) || :
+	exit "$capability_status"
+fi
+exec 9<&-
 mapfile -t capability_lines <"$capability_stdout"
 [[ ${#capability_lines[@]} == 1 && ${capability_lines[0]} == /* ]] || fail "capability emitted malformed stdout path"
 capability=${capability_lines[0]}

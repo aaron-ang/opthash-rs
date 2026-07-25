@@ -540,6 +540,21 @@ exit "${FAKE_DPKG_VERIFY_STATUS:-0}"
         subject / "scripts/cache-gate-linker-capability.sh",
         """#!/usr/bin/env bash
 printf 'capability\n' >>"$FAKE_LOG"
+if [[ -n ${FAKE_CAPABILITY_STDERR_FILE:-} ]]; then
+  /bin/cat -- "$FAKE_CAPABILITY_STDERR_FILE" >&2
+fi
+if [[ ${FAKE_CAPABILITY_STDERR_UNSAFE:-} == hardlink ]]; then
+  diagnostic=$(readlink -- "/proc/$$/fd/2")
+  ln -- "$diagnostic" "$diagnostic.peer"
+fi
+if [[ ${FAKE_CAPABILITY_LOGS_SWAP:-} == symlink ]]; then
+  diagnostic=$(readlink -- "/proc/$$/fd/2")
+  logs=${diagnostic%/*}
+  mv -- "$logs" "$logs.anchored"
+  mkdir -- "$logs.replacement"
+  printf '::error::attacker replacement\n' >"$logs.replacement/capability.stderr"
+  ln -s -- "$logs.replacement" "$logs"
+fi
 if [[ -n ${FAKE_CAPABILITY_STATUS:-} ]]; then
   exit "$FAKE_CAPABILITY_STATUS"
 fi
@@ -689,6 +704,35 @@ cp -- "$FAKE_ASSETS/v1-reextractions/$(basename "$binary").json" "$output"
     }
 
 
+def runner_arguments(
+    hosted: dict[str, Any],
+    *,
+    evidence: Path | None = None,
+    status: Path | None = None,
+    run_id: str = "7",
+    run_attempt: str = "2",
+) -> list[str]:
+    evidence = evidence or hosted["evidence"]
+    status = status or evidence / "proof.status"
+    return [
+        str(hosted["runner"]),
+        "--orchestrator",
+        str(hosted["orchestrator"]),
+        "--subject",
+        str(hosted["subject"]),
+        "--v1",
+        str(hosted["v1"]),
+        "--evidence",
+        str(evidence),
+        "--run-id",
+        run_id,
+        "--run-attempt",
+        run_attempt,
+        "--status-file",
+        str(status),
+    ]
+
+
 def invoke(
     hosted: dict[str, Any],
     *,
@@ -698,29 +742,17 @@ def invoke(
     run_attempt: str = "2",
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    evidence = evidence or hosted["evidence"]
-    status = status or evidence / "proof.status"
     merged = dict(hosted["env"])
     if env:
         merged.update(env)
     return subprocess.run(
-        [
-            str(hosted["runner"]),
-            "--orchestrator",
-            str(hosted["orchestrator"]),
-            "--subject",
-            str(hosted["subject"]),
-            "--v1",
-            str(hosted["v1"]),
-            "--evidence",
-            str(evidence),
-            "--run-id",
-            run_id,
-            "--run-attempt",
-            run_attempt,
-            "--status-file",
-            str(status),
-        ],
+        runner_arguments(
+            hosted,
+            evidence=evidence,
+            status=status,
+            run_id=run_id,
+            run_attempt=run_attempt,
+        ),
         text=True,
         capture_output=True,
         check=False,
@@ -944,6 +976,9 @@ def test_workflow_always_packages_and_uploads_only_archive_pair(
         names = evidence.getnames()
         assert "bundle/provenance.json" in names
         assert "bundle/proof.status" in names
+        assert not any(
+            name == "bundle/logs" or name.startswith("bundle/logs/") for name in names
+        )
 
 
 @pytest.mark.parametrize(
@@ -993,12 +1028,16 @@ def test_workflow_packages_fallback_when_staging_is_partial(
         f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
     )
     with tarfile.open(archive, mode="r:") as packaged:
+        names = packaged.getnames()
         provenance = json.load(packaged.extractfile("bundle/provenance.json"))
         packaged_status = packaged.extractfile("bundle/proof.status").read()
         assert provenance["proof"] == {"status": effective_status, "result": "FAIL"}
         assert packaged_status == f"{effective_status}\n".encode()
         assert provenance["diagnostic"]["reason"] == (
             "canonical staging bundle unavailable"
+        )
+        assert not any(
+            name == "bundle/logs" or name.startswith("bundle/logs/") for name in names
         )
 
 
@@ -1065,7 +1104,7 @@ def test_runner_source_contract_is_exact_and_never_times() -> None:
         "verifier.verify_manifest_link_command(",
     ):
         assert literal in source
-    assert source.count("/usr/bin/python3") == 9
+    assert source.count("/usr/bin/python3") == 10
     assert source.count("MANIFEST=1") >= 4
     assert source.count(" compare ") >= 2
     assert source.count(" validate-manifest ") >= 3
@@ -1625,6 +1664,175 @@ def test_later_failure_writes_atomic_status_and_never_times(
     calls = hosted["log"].read_text()
     assert "capability" in calls
     assert all(word not in calls for word in ("bench", "criterion", "perf"))
+
+
+def test_capability_failure_replays_bounded_sanitized_stderr(
+    hosted: dict[str, Any],
+) -> None:
+    prefix = b"::error::forged\r\x1b[31m\t\xc3\xa9\x00\n"
+    suffix = b"\n::warning::tail\r\x1b[0m\t\x7f"
+    first = prefix + (b"H" * (4096 - len(prefix)))
+    last = (b"T" * (4096 - len(suffix))) + suffix
+    payload = first + b"DO_NOT_REPLAY" + (b"M" * 2048) + b"\xff" + last
+    stderr_source = hosted["evidence"].parent / "capability-stderr.bin"
+    stderr_source.write_bytes(payload)
+
+    completed = invoke(
+        hosted,
+        env={
+            "FAKE_CAPABILITY_STATUS": "73",
+            "FAKE_CAPABILITY_STDERR_FILE": str(stderr_source),
+        },
+    )
+
+    inert_prefix = "cache-gate capability diagnostic | "
+    assert completed.returncode == 73
+    assert hosted["status"].read_bytes() == b"73\n"
+    assert (hosted["evidence"] / "logs/capability.stderr").read_bytes() == payload
+    assert completed.stderr.endswith(
+        f"{inert_prefix}HOLD: native linker capability probe failed\n"
+    )
+    assert completed.stderr.splitlines()
+    assert all(line.startswith(inert_prefix) for line in completed.stderr.splitlines())
+    assert f"{inert_prefix}::error::forged" in completed.stderr
+    assert f"{inert_prefix}::warning::tail" in completed.stderr
+    assert f"{inert_prefix}[... omitted ...]" in completed.stderr
+    assert "DO_NOT_REPLAY" not in completed.stderr
+    assert "\\xff" not in completed.stderr
+    assert "\\x0d\\x1b[31m\\x09\\xc3\\xa9\\x00" in completed.stderr
+    assert "\\x0d\\x1b[0m\\x09\\x7f" in completed.stderr
+    assert all(character not in completed.stderr for character in "\r\x1b\té\x00")
+    assert not any(line.startswith("::") for line in completed.stderr.splitlines())
+
+
+def test_unsafe_capability_diagnostic_read_preserves_original_status(
+    hosted: dict[str, Any],
+) -> None:
+    payload = b"unsafe diagnostic payload\n"
+    stderr_source = hosted["evidence"].parent / "capability-stderr.bin"
+    stderr_source.write_bytes(payload)
+
+    completed = invoke(
+        hosted,
+        env={
+            "FAKE_CAPABILITY_STATUS": "73",
+            "FAKE_CAPABILITY_STDERR_FILE": str(stderr_source),
+            "FAKE_CAPABILITY_STDERR_UNSAFE": "hardlink",
+        },
+    )
+
+    assert completed.returncode == 73
+    assert hosted["status"].read_bytes() == b"73\n"
+    assert (hosted["evidence"] / "logs/capability.stderr").read_bytes() == payload
+    assert completed.stderr == (
+        "cache-gate capability diagnostic | diagnostic unavailable\n"
+        "cache-gate capability diagnostic | "
+        "HOLD: native linker capability probe failed\n"
+    )
+
+
+@pytest.mark.parametrize("sink", ["closed-stderr", "closed-pipe"])
+def test_broken_diagnostic_sink_preserves_original_status(
+    hosted: dict[str, Any],
+    sink: str,
+) -> None:
+    environment = {
+        **hosted["env"],
+        "FAKE_CAPABILITY_STATUS": "73",
+    }
+    if sink == "closed-stderr":
+
+        def close_stderr() -> None:
+            os.close(2)
+
+        completed = subprocess.run(
+            runner_arguments(hosted),
+            text=True,
+            stdout=subprocess.PIPE,
+            check=False,
+            env=environment,
+            preexec_fn=close_stderr,
+        )
+    else:
+        reader, writer = os.pipe()
+        os.close(reader)
+        try:
+            completed = subprocess.run(
+                runner_arguments(hosted),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=writer,
+                check=False,
+                env=environment,
+            )
+        finally:
+            os.close(writer)
+
+    assert completed.returncode == 73
+    assert hosted["status"].read_bytes() == b"73\n"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"\x00" * 20_000, id="nul-heavy"),
+        pytest.param(b"\n" * 20_000, id="newline-heavy"),
+    ],
+)
+def test_serialized_capability_diagnostic_is_bounded(
+    hosted: dict[str, Any],
+    payload: bytes,
+) -> None:
+    stderr_source = hosted["evidence"].parent / "capability-stderr.bin"
+    stderr_source.write_bytes(payload)
+
+    completed = invoke(
+        hosted,
+        env={
+            "FAKE_CAPABILITY_STATUS": "73",
+            "FAKE_CAPABILITY_STDERR_FILE": str(stderr_source),
+        },
+    )
+
+    inert_prefix = "cache-gate capability diagnostic | "
+    serialized = completed.stderr.encode("ascii")
+    assert completed.returncode == 73
+    assert hosted["status"].read_bytes() == b"73\n"
+    assert (hosted["evidence"] / "logs/capability.stderr").read_bytes() == payload
+    assert 0 < len(serialized) <= 8192
+    assert serialized.endswith(
+        f"{inert_prefix}HOLD: native linker capability probe failed\n".encode()
+    )
+    assert all(line.startswith(inert_prefix) for line in completed.stderr.splitlines())
+
+
+def test_logs_symlink_swap_makes_diagnostic_unavailable(
+    hosted: dict[str, Any],
+) -> None:
+    payload = b"trusted captured diagnostic\n"
+    stderr_source = hosted["evidence"].parent / "capability-stderr.bin"
+    stderr_source.write_bytes(payload)
+
+    completed = invoke(
+        hosted,
+        env={
+            "FAKE_CAPABILITY_STATUS": "73",
+            "FAKE_CAPABILITY_STDERR_FILE": str(stderr_source),
+            "FAKE_CAPABILITY_LOGS_SWAP": "symlink",
+        },
+    )
+
+    anchored_logs = Path(f"{hosted['evidence']}/logs.anchored")
+    assert completed.returncode == 73
+    assert hosted["status"].read_bytes() == b"73\n"
+    assert (anchored_logs / "capability.stderr").read_bytes() == payload
+    assert (hosted["evidence"] / "logs").is_symlink()
+    assert "attacker replacement" not in completed.stderr
+    assert completed.stderr == (
+        "cache-gate capability diagnostic | diagnostic unavailable\n"
+        "cache-gate capability diagnostic | "
+        "HOLD: native linker capability probe failed\n"
+    )
 
 
 @pytest.mark.parametrize("fault", ["create", "rename"])
