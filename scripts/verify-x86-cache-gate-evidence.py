@@ -205,8 +205,6 @@ BODY_SCHEMA = {
     "indirect_calls": STRING_LIST,
     "frame_adjustment": INTEGER,
     "spills": STRING_LIST,
-    "raw_sha256": STRING,
-    "placement": {"section": STRING, "address": INTEGER},
 }
 
 EXECUTABLE_TARGETS = {
@@ -5892,21 +5890,7 @@ def _body_records(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
         for symbol in manifest["symbols"][executable]["symbols"]:
             kernel = symbol["name"].rsplit("::", 1)[-1]
             _require(kernel not in records, "duplicate body kernel")
-            records[kernel] = {
-                "size": symbol["size"],
-                "normalized_instructions_sha256": symbol[
-                    "normalized_instructions_sha256"
-                ],
-                "direct_calls": symbol["direct_calls"],
-                "indirect_calls": symbol["indirect_calls"],
-                "frame_adjustment": symbol["frame_adjustment"],
-                "spills": symbol["spills"],
-                "raw_sha256": symbol["raw_sha256"],
-                "placement": {
-                    "section": symbol["section"],
-                    "address": symbol["start"],
-                },
-            }
+            records[kernel] = {field: symbol[field] for field in BODY_FIELDS}
     return records
 
 
@@ -5987,6 +5971,11 @@ def _verify_body_contract(
     v1: dict[str, Any],
     v1_reextractions: dict[str, dict[str, Any]],
 ) -> str:
+    _validate_schema(body, BODY_COMPARISON_SCHEMA, "body comparison")
+    _require(
+        body["version"] == 1 and body["fields"] == list(BODY_FIELDS),
+        "body-comparison version or fields mismatch",
+    )
     digest = verify_body_rows(body["rows"])
     clean_bodies = _body_records(clean)
     v1_bodies = _verify_v1_reextractions(clean, v1, v1_reextractions)

@@ -336,9 +336,9 @@ exit "${FAKE_DPKG_VERIFY_STATUS:-0}"
         ),
     }
 
-    def symbol_record(kernel: str, index: int) -> dict[str, Any]:
+    def symbol_record(namespace: str, kernel: str, index: int) -> dict[str, Any]:
         return {
-            "name": f"fixture::{kernel}",
+            "name": f"{namespace}::{kernel}",
             "pattern": f"::{kernel}$",
             "start": 4096 * (index + 1),
             "end": 4096 * (index + 1) + 7,
@@ -352,13 +352,19 @@ exit "${FAKE_DPKG_VERIFY_STATUS:-0}"
             "spills": ["x19"],
         }
 
-    def symbols_document(binary: Path, binary_data: bytes, names: tuple[str, ...]):
+    def symbols_document(
+        binary: Path,
+        binary_data: bytes,
+        names: tuple[str, ...],
+        namespace: str,
+    ):
         return {
             "binary": str(binary),
             "binary_sha256": hashlib.sha256(binary_data).hexdigest(),
             "architecture": "x86_64",
             "symbols": [
-                symbol_record(kernel, index) for index, kernel in enumerate(names)
+                symbol_record(namespace, kernel, index)
+                for index, kernel in enumerate(names)
             ],
         }
 
@@ -436,6 +442,7 @@ exit "${FAKE_DPKG_VERIFY_STATUS:-0}"
                 binary,
                 binary_data,
                 executable_kernels,
+                executable,
             )
             manifest["executables"][executable] = {
                 "absolute_path": str(binary),
@@ -500,6 +507,7 @@ exit "${FAKE_DPKG_VERIFY_STATUS:-0}"
             binary,
             binary_data,
             executable_kernels,
+            executable,
         )
         v1_manifest["symbols"][executable] = symbol_document
         (reextraction_assets / f"{executable}.json").write_text(
@@ -574,6 +582,9 @@ if [[ ${MANIFEST:-0} == 1 ]]; then
   destination="$V1/target/cache-gate/x86_64/$CACHE_GATE_VARIANT"
   mkdir -p -- "$destination"
   cp -R -- "$FAKE_ASSETS/$CACHE_GATE_VARIANT/." "$destination/"
+  if [[ ${FAKE_TAMPER_V1_CONTROL_PROVENANCE:-0} == 1 ]]; then
+    printf 'tampered\n' >>"$V1/tools/cache-gate-control/target/release/opthash-cache-gate-control.provenance.json"
+  fi
   exit 0
 fi
 exit 99
@@ -653,6 +664,7 @@ cp -- "$FAKE_ASSETS/v1-reextractions/$(basename "$binary").json" "$output"
         "log": fake_log,
         "capability": capability_path,
         "chain_root": chain_root,
+        "assets": fake_assets,
     }
 
 
@@ -732,6 +744,9 @@ def test_runner_source_contract_is_exact_and_never_times() -> None:
         "perf stat",
         "ELASTIC=1",
         "FUNNEL=1",
+        '"raw_sha256": symbol["raw_sha256"]',
+        '"section": symbol["section"]',
+        '"address": symbol["start"]',
     ):
         assert forbidden not in source
 
@@ -791,6 +806,45 @@ def test_invalid_ids_write_bounded_failure_status(
     assert value.isdecimal()
     assert 0 <= int(value) <= 255
     assert not list(hosted["evidence"].glob(".proof.status.*"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("run_id", "18446744073709551617"),
+        ("run_attempt", "18446744073709551617"),
+        ("run_id", "9" * 10_000),
+        ("run_attempt", "9" * 10_000),
+    ],
+)
+def test_arbitrarily_large_ids_fail_before_shell_integer_conversion(
+    hosted: dict[str, Any], field: str, value: str
+) -> None:
+    arguments = {field: value}
+    completed = invoke(hosted, **arguments)
+    assert completed.returncode != 0
+    assert "too large" in completed.stderr
+    assert "capability" not in (
+        hosted["log"].read_text() if hosted["log"].exists() else ""
+    )
+    assert hosted["status"].read_text() == "1\n"
+
+
+@pytest.mark.parametrize("field", ["run_id", "run_attempt"])
+def test_non_ascii_digits_fail_under_utf8_locale_before_shell_arithmetic(
+    hosted: dict[str, Any], field: str
+) -> None:
+    completed = invoke(
+        hosted,
+        env={"LC_ALL": "en_US.utf8"},
+        **{field: "١"},
+    )
+    assert completed.returncode != 0
+    assert "must be a canonical positive decimal" in completed.stderr
+    assert "capability" not in (
+        hosted["log"].read_text() if hosted["log"].exists() else ""
+    )
+    assert hosted["status"].read_text() == "1\n"
 
 
 @pytest.mark.parametrize(
@@ -935,6 +989,20 @@ def test_success_path_stages_closed_provenance_and_zero_status(
     assert len(provenance["documents"]["transcripts"]) == 9
     assert (bundle / "body-comparison.json").is_file()
     assert (bundle / "portable-paths.json").is_file()
+    body_comparison = json.loads((bundle / "body-comparison.json").read_text())
+    expected_body_fields = {
+        "size",
+        "normalized_instructions_sha256",
+        "direct_calls",
+        "indirect_calls",
+        "frame_adjustment",
+        "spills",
+    }
+    assert len(body_comparison["rows"]) == 8
+    for row in body_comparison["rows"]:
+        assert set(row) == {"kernel", "v1", "v2"}
+        assert set(row["v1"]) == expected_body_fields
+        assert set(row["v2"]) == expected_body_fields
     private_fragments = []
     for suffix in ("clean-a", "clean-b", "adversary"):
         variant = f"x86_64-061d13da22b8-attempt-7002-{suffix}"
@@ -970,6 +1038,48 @@ def test_v1_exact_preflight_fails_before_current_extractor(
         env={"FAKE_SUCCESS": "1", "FAKE_V1_SCHEMA_FAIL": "1"},
     )
     assert completed.returncode != 0
+    calls = hosted["log"].read_text()
+    assert calls.count("v1-cache-gate") == 2
+    assert "extractor" not in calls
+    assert not (hosted["evidence"] / "staging").exists()
+
+
+def test_v1_control_provenance_hash_fails_before_current_extractor(
+    hosted: dict[str, Any],
+) -> None:
+    completed = invoke(
+        hosted,
+        env={
+            "FAKE_SUCCESS": "1",
+            "FAKE_TAMPER_V1_CONTROL_PROVENANCE": "1",
+        },
+    )
+    assert completed.returncode != 0
+    assert "control provenance hash mismatch" in completed.stderr
+    calls = hosted["log"].read_text()
+    assert calls.count("v1-cache-gate") == 2
+    assert "extractor" not in calls
+    assert not (hosted["evidence"] / "staging").exists()
+
+
+@pytest.mark.parametrize("fault", ["wrong-name", "duplicate-name"])
+def test_v1_exact_symbol_names_fail_before_current_extractor(
+    hosted: dict[str, Any], fault: str
+) -> None:
+    manifest_path = (
+        hosted["assets"] / "x86_64-v1-replay-run-7-attempt-2" / "manifest.json"
+    )
+    document = json.loads(manifest_path.read_text())
+    symbols = document["symbols"]["elastic_cache_gate"]["symbols"]
+    if fault == "wrong-name":
+        symbols[0]["name"] = "fixture::wrong_kernel"
+    else:
+        symbols[1]["name"] = symbols[0]["name"]
+    manifest_path.write_text(json.dumps(document, sort_keys=True) + "\n")
+
+    completed = invoke(hosted, env={"FAKE_SUCCESS": "1"})
+    assert completed.returncode != 0
+    assert "v1 exact symbol selection mismatch" in completed.stderr
     calls = hosted["log"].read_text()
     assert calls.count("v1-cache-gate") == 2
     assert "extractor" not in calls

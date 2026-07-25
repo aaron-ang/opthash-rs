@@ -52,6 +52,20 @@ PINNED_RUSTC_VERSION = (
     "release: 1.95.0\n"
     "LLVM version: 22.1.2"
 )
+EXPECTED_BODY_FIELDS = (
+    "size",
+    "normalized_instructions_sha256",
+    "direct_calls",
+    "indirect_calls",
+    "frame_adjustment",
+    "spills",
+)
+FORBIDDEN_BODY_FIELD_VALUES = (
+    ("raw_sha256", "2" * 64),
+    ("placement", {"section": ".text.one", "address": 4096}),
+    ("section", ".text.one"),
+    ("address", 4096),
+)
 KERNEL_SENTINEL_STEMS = {
     "elastic_cache_gate_insert_kernel": "elastic_insert",
     "elastic_cache_gate_get_kernel": "elastic_get",
@@ -909,8 +923,6 @@ def semantic_documents() -> dict[str, dict[str, Any]]:
         "indirect_calls": [],
         "frame_adjustment": 16,
         "spills": ["x19"],
-        "raw_sha256": "2" * 64,
-        "placement": {"section": ".text.one", "address": 4096},
     }
     body_rows = [
         {
@@ -1037,16 +1049,7 @@ def semantic_documents() -> dict[str, dict[str, Any]]:
         },
         "body_comparison": {
             "version": 1,
-            "fields": list(
-                (
-                    "size",
-                    "normalized_instructions_sha256",
-                    "direct_calls",
-                    "indirect_calls",
-                    "frame_adjustment",
-                    "spills",
-                )
-            ),
+            "fields": list(EXPECTED_BODY_FIELDS),
             "rows": body_rows,
         },
         "portable_paths": portable_paths(),
@@ -1150,6 +1153,26 @@ def full_symbol(
     else:
         symbol["declared_alignment"] = 16
     return symbol
+
+
+def fixture_body_records(
+    verify_module: ModuleType, manifest: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for executable in verify_module.EXECUTABLE_TARGETS:
+        for symbol in manifest["symbols"][executable]["symbols"]:
+            kernel = symbol["name"].rsplit("::", 1)[-1]
+            records[kernel] = {
+                "size": symbol["size"],
+                "normalized_instructions_sha256": symbol[
+                    "normalized_instructions_sha256"
+                ],
+                "direct_calls": copy.deepcopy(symbol["direct_calls"]),
+                "indirect_calls": copy.deepcopy(symbol["indirect_calls"]),
+                "frame_adjustment": symbol["frame_adjustment"],
+                "spills": copy.deepcopy(symbol["spills"]),
+            }
+    return records
 
 
 def bind_fixture_symbol_layout(
@@ -1918,15 +1941,15 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
             current["pattern"] = original["pattern"]
         v1_reextractions[executable] = document
 
+    v1_body_records = fixture_body_records(verify_module, {"symbols": v1_reextractions})
+    v2_body_records = fixture_body_records(verify_module, clean_a)
     body_rows = [
         {
             "kernel": kernel,
             "v1": copy.deepcopy(v1_body),
-            "v2": copy.deepcopy(verify_module._body_records(clean_a)[kernel]),
+            "v2": copy.deepcopy(v2_body_records[kernel]),
         }
-        for kernel, v1_body in sorted(
-            verify_module._body_records({"symbols": v1_reextractions}).items()
-        )
+        for kernel, v1_body in sorted(v1_body_records.items())
     ]
     transcript_documents = []
     for hosted_manifest in (clean_a, clean_b, adversary):
@@ -1977,7 +2000,7 @@ def full_semantic_documents(verify_module: ModuleType) -> dict[str, Any]:
     }
     body_comparison = {
         "version": 1,
-        "fields": list(verify_module.BODY_FIELDS),
+        "fields": list(EXPECTED_BODY_FIELDS),
         "rows": body_rows,
     }
     portable_paths_document = full_portable_paths(verify_module)
@@ -2112,6 +2135,9 @@ def test_body_contract_uses_only_current_normalizer_v1_reextractions(
     reextractions["elastic_cache_gate"]["symbols"][0]["raw_sha256"] = "d" * 64
     reextractions["elastic_cache_gate"]["symbols"][0]["start"] = 9999
     reextractions["elastic_cache_gate"]["symbols"][0]["section"] = ".other"
+    clean["symbols"]["elastic_cache_gate"]["symbols"][0]["raw_sha256"] = "c" * 64
+    clean["symbols"]["elastic_cache_gate"]["symbols"][0]["start"] = 8888
+    clean["symbols"]["elastic_cache_gate"]["symbols"][0]["section"] = ".different"
     verify_module._verify_body_contract(body, clean, v1, reextractions)
 
     reextractions["elastic_cache_gate"]["symbols"][0][
@@ -2119,6 +2145,36 @@ def test_body_contract_uses_only_current_normalizer_v1_reextractions(
     ] = "e" * 64
     with pytest.raises(verify_module.EvidenceError, match="v1 body contract"):
         verify_module._verify_body_contract(body, clean, v1, reextractions)
+
+
+def test_body_records_contain_exact_body_fields(
+    verify_module: ModuleType,
+) -> None:
+    clean = full_semantic_documents(verify_module)["manifests"][0]
+
+    assert verify_module.BODY_FIELDS == EXPECTED_BODY_FIELDS
+    for record in verify_module._body_records(clean).values():
+        assert tuple(record) == EXPECTED_BODY_FIELDS
+
+
+@pytest.mark.parametrize("side", ["v1", "v2"])
+@pytest.mark.parametrize(("field", "value"), FORBIDDEN_BODY_FIELD_VALUES)
+def test_body_contract_rejects_extra_body_fields(
+    verify_module: ModuleType,
+    side: str,
+    field: str,
+    value: Any,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    documents["body_comparison"]["rows"][0][side][field] = copy.deepcopy(value)
+
+    with pytest.raises(verify_module.EvidenceError, match="schema mismatch"):
+        verify_module._verify_body_contract(
+            documents["body_comparison"],
+            documents["manifests"][0],
+            documents["manifest_v1"],
+            documents["v1_reextractions"],
+        )
 
 
 @pytest.mark.parametrize(
@@ -2302,6 +2358,21 @@ def test_full_document_set_passes_recursive_schema_and_routes(
     verify_module.validate_document_set(full_document_set(verify_module))
 
 
+@pytest.mark.parametrize("side", ["v1", "v2"])
+@pytest.mark.parametrize(("field", "value"), FORBIDDEN_BODY_FIELD_VALUES)
+def test_body_schema_rejects_extra_body_fields(
+    verify_module: ModuleType,
+    side: str,
+    field: str,
+    value: Any,
+) -> None:
+    documents = full_document_set(verify_module)
+    documents["body_comparison"]["rows"][0][side][field] = copy.deepcopy(value)
+
+    with pytest.raises(verify_module.EvidenceError, match="schema mismatch"):
+        verify_module.validate_document_set(documents)
+
+
 @pytest.mark.parametrize(
     "kind",
     [
@@ -2346,14 +2417,19 @@ def test_every_recursive_object_shape_rejects_unknown_and_missing_keys_before_ro
         assert not called
 
 
-def test_body_comparison_ignores_raw_hash_and_placement(
+@pytest.mark.parametrize("side", ["v1", "v2"])
+@pytest.mark.parametrize(("field", "value"), FORBIDDEN_BODY_FIELD_VALUES)
+def test_body_comparison_rejects_extra_body_fields(
     verify_module: ModuleType,
+    side: str,
+    field: str,
+    value: Any,
 ) -> None:
     rows = semantic_documents()["body_comparison"]["rows"]
-    rows[0]["v2"]["raw_sha256"] = "f" * 64
-    rows[0]["v2"]["placement"] = {"section": ".other", "address": 9999}
-    digest = verify_module.verify_body_rows(rows)
-    assert len(digest) == 64
+    rows[0][side][field] = copy.deepcopy(value)
+
+    with pytest.raises(verify_module.EvidenceError, match="schema mismatch"):
+        verify_module.verify_body_rows(rows)
 
 
 @pytest.mark.parametrize(

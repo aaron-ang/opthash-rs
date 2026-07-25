@@ -366,10 +366,18 @@ fail() {
 	return 1
 }
 
+LC_ALL=C
+export LC_ALL
 [[ $run_id =~ ^[1-9][0-9]*$ ]] || fail "run ID must be a canonical positive decimal"
 [[ $run_attempt =~ ^[1-9][0-9]*$ ]] || fail "run attempt must be a canonical positive decimal"
-((run_id <= 9223372036854774)) || fail "run ID is too large"
-((run_attempt <= 999)) || fail "run attempt is too large"
+decimal_within_bound() {
+	local value=$1 maximum=$2
+	((${#value} < ${#maximum})) && return 0
+	((${#value} == ${#maximum})) || return 1
+	[[ $value == "$maximum" || $value < "$maximum" ]]
+}
+decimal_within_bound "$run_id" 9223372036854774 || fail "run ID is too large"
+decimal_within_bound "$run_attempt" 999 || fail "run attempt is too large"
 CACHE_GATE_ATTEMPT=$((run_id * 1000 + run_attempt))
 export CACHE_GATE_ATTEMPT
 
@@ -1092,6 +1100,48 @@ def verify_hash_records(value: object) -> None:
 for document in (capability, *manifests, v1):
     verify_hash_records(document)
 
+for label, control in (
+    *((f"v2 manifest {manifest['variant']}", manifest["control"]) for manifest in manifests),
+    ("v1 manifest", v1["control"]),
+):
+    provenance_data = read_regular(
+        control["provenance_path"],
+        f"{label} control provenance",
+    )
+    if hashlib.sha256(provenance_data).hexdigest() != control["provenance_sha256"]:
+        raise RuntimeError(f"{label} control provenance hash mismatch")
+
+all_symbol_names: set[str] = set()
+all_kernel_names: set[str] = set()
+for executable, (_target, expected_kernels) in verifier.EXECUTABLE_TARGETS.items():
+    symbols = v1["symbols"][executable]["symbols"]
+    expected_selection = [
+        (f"{executable}::{kernel}", f"::{kernel}$")
+        for kernel in expected_kernels
+    ]
+    observed_selection = [
+        (symbol["name"], symbol["pattern"])
+        for symbol in symbols
+    ]
+    full_names = [symbol["name"] for symbol in symbols]
+    observed_kernels = [
+        name.rsplit("::", 1)[-1] for name, _pattern in observed_selection
+    ]
+    if (
+        len(symbols) != len(expected_kernels)
+        or observed_selection != expected_selection
+        or len(full_names) != len(set(full_names))
+        or any(name in all_symbol_names for name in full_names)
+        or any(kernel in all_kernel_names for kernel in observed_kernels)
+    ):
+        raise RuntimeError(
+            f"v1 exact symbol selection mismatch: {executable}"
+        )
+    all_symbol_names.update(full_names)
+    all_kernel_names.update(observed_kernels)
+if len(all_symbol_names) != 8 or len(all_kernel_names) != 8:
+    raise RuntimeError("v1 exact symbol selection must contain eight unique names")
+
 fragment_identities: set[tuple[int, int]] = set()
 for target, fragment in capability["fragments"].items():
     metadata = os.lstat(fragment["absolute_path"])
@@ -1555,14 +1605,7 @@ if set(clean_by_kernel) != set(current_by_kernel):
 
 
 def body(symbol: dict[str, Any]) -> dict[str, Any]:
-    return {
-        **{field: symbol[field] for field in BODY_FIELDS},
-        "raw_sha256": symbol["raw_sha256"],
-        "placement": {
-            "section": symbol["section"],
-            "address": symbol["start"],
-        },
-    }
+    return {field: symbol[field] for field in BODY_FIELDS}
 
 
 rows = []
