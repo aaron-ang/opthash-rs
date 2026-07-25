@@ -2266,19 +2266,19 @@ def _printed_linker_controls(
     scripts: list[str] = []
     maps: list[str] = []
     for index, argument in enumerate(argv):
-        if index > 0 and argv[index - 1] == "-Xlinker":
+        if index > 0 and argv[index - 1] in {"-Xlinker", "--for-linker"}:
             continue
         forwarded = (
             argument.startswith("-Wl,")
-            or argument == "-Xlinker"
-            or argument.startswith("-Xlinker=")
+            or argument in {"-Xlinker", "--for-linker"}
+            or argument.startswith(("-Xlinker=", "--for-linker="))
         )
         candidates = [argument]
         if argument.startswith("-Wl,"):
             candidates = argument[4:].split(",")
-        elif argument == "-Xlinker" and index + 1 < len(argv):
+        elif argument in {"-Xlinker", "--for-linker"} and index + 1 < len(argv):
             candidates = [argv[index + 1]]
-        elif argument.startswith("-Xlinker="):
+        elif argument.startswith(("-Xlinker=", "--for-linker=")):
             candidates = [argument.split("=", 1)[1]]
         if any(
             candidate == "--ld-path"
@@ -2303,34 +2303,279 @@ def _printed_linker_controls(
 
 
 def _linker_response_files(argv: list[str]) -> bool:
-    for index, argument in enumerate(argv):
-        if index > 0 and argv[index - 1] == "-Xlinker":
-            continue
-        candidates = [argument]
+    return any(
+        token.startswith("@") for token, _forwarded in _effective_linker_tokens(argv)
+    )
+
+
+def _effective_linker_tokens(argv: list[str]) -> list[tuple[str, bool]]:
+    tokens: list[tuple[str, bool]] = []
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        _require(
+            bool(argument) and "\0" not in argument,
+            "malformed linker argument",
+        )
         if argument.startswith("-Wl,"):
-            candidates = argument[4:].split(",")
-        elif argument == "-Xlinker" and index + 1 < len(argv):
-            candidates = [argv[index + 1]]
-        elif argument.startswith("-Xlinker="):
-            candidates = [argument.split("=", 1)[1]]
-        if any(candidate.startswith("@") for candidate in candidates):
-            return True
-    return False
+            forwarded = argument[4:].split(",")
+            _require(
+                all(token and "\0" not in token for token in forwarded),
+                "malformed -Wl linker argument",
+            )
+            tokens.extend((token, True) for token in forwarded)
+        elif argument in {"-Xlinker", "--for-linker"}:
+            _require(index + 1 < len(argv), f"dangling {argument} argument")
+            forwarded_argument = argv[index + 1]
+            _require(
+                bool(forwarded_argument) and "\0" not in forwarded_argument,
+                f"malformed {argument} argument",
+            )
+            tokens.append((forwarded_argument, True))
+            index += 1
+        elif argument.startswith(("-Xlinker=", "--for-linker=")):
+            wrapper = argument.split("=", 1)[0]
+            forwarded_argument = argument.split("=", 1)[1]
+            _require(
+                bool(forwarded_argument) and "\0" not in forwarded_argument,
+                f"malformed {wrapper} argument",
+            )
+            tokens.append((forwarded_argument, True))
+        elif argument == "-Wl":
+            raise EvidenceError("malformed -Wl linker argument")
+        else:
+            tokens.append((argument, False))
+        index += 1
+    return tokens
 
 
 def _link_command_inputs(argv: list[str]) -> tuple[list[str], list[str]]:
-    file_suffix = re.compile(r"(?:\.o|\.rlib|\.a|\.so(?:\.[^/]+)*)$")
+    options_with_operand = frozenset(
+        {
+            "-A",
+            "-B",
+            "-F",
+            "-G",
+            "-I",
+            "-L",
+            "-Map",
+            "-T",
+            "-Tbss",
+            "-Tdata",
+            "-Ttext",
+            "-Y",
+            "-b",
+            "-e",
+            "-f",
+            "-fuse-ld",
+            "-h",
+            "-m",
+            "-o",
+            "-rpath",
+            "-rpath-link",
+            "-soname",
+            "-u",
+            "-y",
+            "-z",
+            "--Map",
+            "--defsym",
+            "--dependency-file",
+            "--dynamic-linker",
+            "--entry",
+            "--format",
+            "--library-path",
+            "--ld-path",
+            "--oformat",
+            "--output",
+            "--out-implib",
+            "--rpath",
+            "--rpath-link",
+            "--script",
+            "--section-start",
+            "--soname",
+            "--sysroot",
+            "--undefined",
+            "--wrap",
+        }
+    )
+    joined_short_options = (
+        "-rpath-link=",
+        "-fuse-ld=",
+        "-rpath=",
+        "-soname=",
+        "-Map",
+        "-B",
+        "-I",
+        "-L",
+        "-T",
+        "-e",
+        "-h",
+        "-m",
+        "-o",
+        "-u",
+        "-z",
+    )
+    unsupported_input_options = (
+        "-plugin-opt",
+        "--plugin-opt",
+        "-plugin",
+        "--plugin",
+        "--remap-inputs-file",
+        "--remap-inputs",
+        "--retain-symbols-file",
+        "--export-dynamic-symbol-list",
+        "--dynamic-list",
+        "--version-script",
+        "--mri-script",
+        "--default-script",
+        "-dT",
+        "-c",
+    )
     ordered: list[str] = []
     direct_files: list[str] = []
-    for token in argv:
-        if token.startswith("-l") and len(token) > 2:
-            ordered.append(token)
-            continue
-        if token.startswith("-") or not file_suffix.search(token):
-            continue
-        path = _canonical_absolute(token, "captured linker input")
+    tokens = _effective_linker_tokens(argv)
+    _require(
+        not any(token.startswith("@") for token, _forwarded in tokens),
+        "captured link command contains linker response files",
+    )
+
+    def operand_after(
+        option_index: int,
+        option: str,
+        forwarded: bool,
+    ) -> str:
+        _require(option_index + 1 < len(tokens), f"dangling linker option: {option}")
+        operand, operand_forwarded = tokens[option_index + 1]
+        _require(bool(operand), f"empty linker option operand: {option}")
+        _require(
+            operand_forwarded == forwarded,
+            f"mixed forwarding for linker option: {option}",
+        )
+        return operand
+
+    def record_direct_input(value: str) -> None:
+        path = _canonical_absolute(value, "captured linker input")
         ordered.append(path.name)
         direct_files.append(path.name)
+
+    index = 0
+    while index < len(tokens):
+        token, forwarded = tokens[index]
+        _require(
+            not any(
+                token == option
+                or token.startswith(f"{option}=")
+                or (
+                    option in {"-c", "-dT"}
+                    and token.startswith(option)
+                    and len(token) > len(option)
+                )
+                for option in unsupported_input_options
+            ),
+            f"unsupported linker input option: {token}",
+        )
+        if token in {"-l", "--library"}:
+            library = operand_after(index, token, forwarded)
+            _require(
+                bool(library)
+                and not library.startswith("-")
+                and "/" not in library
+                and "\0" not in library,
+                "malformed linker library argument",
+            )
+            ordered.append(f"-l{library}")
+            index += 2
+            continue
+        if token.startswith("--library="):
+            library = token.split("=", 1)[1]
+            _require(
+                bool(library) and "/" not in library and "\0" not in library,
+                "malformed linker library argument",
+            )
+            ordered.append(f"-l{library}")
+            index += 1
+            continue
+        if token.startswith("-l") and len(token) > 2:
+            library = token[2:]
+            _require(
+                "/" not in library and "\0" not in library,
+                "malformed linker library argument",
+            )
+            ordered.append(token)
+            index += 1
+            continue
+        if token in {"-R", "--just-symbols"}:
+            record_direct_input(operand_after(index, token, forwarded))
+            index += 2
+            continue
+        if token.startswith("--just-symbols="):
+            direct_input = token.split("=", 1)[1]
+            _require(bool(direct_input), "empty --just-symbols operand")
+            record_direct_input(direct_input)
+            index += 1
+            continue
+        if token.startswith("-R") and len(token) > 2:
+            direct_input = token[2:].removeprefix("=")
+            _require(bool(direct_input), "empty -R operand")
+            record_direct_input(direct_input)
+            index += 1
+            continue
+        if token in options_with_operand:
+            operand_after(index, token, forwarded)
+            index += 2
+            continue
+        joined_long = next(
+            (
+                option
+                for option in options_with_operand
+                if option.startswith("--") and token.startswith(f"{option}=")
+            ),
+            None,
+        )
+        if joined_long is not None:
+            _require(
+                bool(token[len(joined_long) + 1 :]),
+                f"empty linker option operand: {joined_long}",
+            )
+            index += 1
+            continue
+        empty_joined_short = next(
+            (
+                prefix
+                for prefix in joined_short_options
+                if prefix.endswith("=") and token == prefix
+            ),
+            None,
+        )
+        _require(
+            empty_joined_short is None,
+            f"empty linker option operand: {empty_joined_short}",
+        )
+        joined_short = next(
+            (
+                prefix
+                for prefix in joined_short_options
+                if token.startswith(prefix) and len(token) > len(prefix)
+            ),
+            None,
+        )
+        if joined_short is not None:
+            operand = token[len(joined_short) :].removeprefix("=")
+            _require(
+                bool(operand),
+                f"empty linker option operand: {joined_short}",
+            )
+            index += 1
+            continue
+        if token.startswith("-"):
+            _require(
+                "/" not in token,
+                f"unsupported file-bearing linker option: {token}",
+            )
+            index += 1
+            continue
+        record_direct_input(token)
+        index += 1
     _require(bool(ordered), "captured link command has no linker inputs")
     return ordered, sorted(set(direct_files))
 
@@ -2348,14 +2593,14 @@ def verify_manifest_link_command(
     _validate_schema(command, LINK_COMMAND_SCHEMA, "manifest link command")
     expected_driver = capability["linker"]
     expected_executable = executable_record["absolute_path"]
-    expected_fragment = executable_record["linker_fragment"]["absolute_path"]
+    capability_fragment = capability["fragments"][target]
+    expected_fragment = capability_fragment["absolute_path"]
     expected_map = executable_record["link_map"]["absolute_path"]
     _require(
         command["driver"] == expected_driver, "manifest link command driver mismatch"
     )
     _require(
-        executable_record["linker_fragment"]["sha256"]
-        == capability["fragments"][target]["sha256"]
+        executable_record["linker_fragment"] == capability_fragment
         and command["fragment"] == expected_fragment,
         "manifest link command fragment mismatch",
     )

@@ -21,7 +21,7 @@ REVIEWED_RECORDS = (
     ROOT / "tests/fixtures/x86_cache_gate_evidence" / "aarch64-attempt-5-records.tar.xz"
 )
 REVIEWED_RECORDS_SHA256 = (
-    "6338f010d568d891ea76ea63c1c954b441918a7b467903468736f71d35413af5"
+    "100920ab673be133a57cd193c9d02118c2feb7bdc470e37c09e53124ee05d6ee"
 )
 HEX = "0" * 64
 SUBJECT_COMMIT = "061d13da22b89208c801308efd578444c8e9caba"
@@ -101,9 +101,9 @@ CONTROL_INPUT_IDENTITIES = {
 }
 REVIEWED_RECORD_SHA256S = {
     "capability.json": "29a43afea6137683f8b8df0bcc6864c753697b1cc4de51276dd9ab7770558d6f",
-    "clean-a.json": "cd63cfa57dcb4c1aad06fb04af38657fdb639558e73f1b1398afdf27359b5e3b",
-    "clean-b.json": "d50367fd39a39630100a3ddaccdea9b00da8e66b8c8af8d4c3effb832b4c762e",
-    "adversary.json": "5b65f6bf6a4d996a09299bb0329c90986eac0b79219e322a70312a738020f95e",
+    "clean-a.json": "0f2af3d5f2aad807c00abf243f3a821da6bd2917a3174e69e679f1b438b0bfc9",
+    "clean-b.json": "d416c6e698e491a294807591c534e271b7a4ef42f6074dbd15675ef22f62a20d",
+    "adversary.json": "86fed381cc8a17b9b7fad3e4d90cb2cbbf845e01c8b265de90396e3fbca5567d",
     "v1.json": "b48df7e6221402b4e3d099262a1b3f1e8f3a13568c160f390b2ca735ee0fafd9",
 }
 
@@ -2848,6 +2848,346 @@ def test_manifest_layout_binds_executable_link_map_hash(
             records["clean_a"],
             records["clean_b"],
             records["adversary"],
+        )
+
+
+LINKER_INPUT_GRAMMAR_CASES = (
+    pytest.param(
+        ["-Wl,/host/subject/wl-hidden.o"],
+        "wl-hidden.o",
+        True,
+        id="wl-comma-object",
+    ),
+    pytest.param(
+        ["-Wl,-l,wl_hidden"],
+        "-lwl_hidden",
+        False,
+        id="wl-comma-library",
+    ),
+    pytest.param(
+        ["-Xlinker", "-l", "-Xlinker", "xsplit"],
+        "-lxsplit",
+        False,
+        id="xlinker-split-library",
+    ),
+    pytest.param(
+        ["-Xlinker=/host/subject/xjoined.a"],
+        "xjoined.a",
+        True,
+        id="xlinker-joined-archive",
+    ),
+    pytest.param(
+        ["-l", "split"],
+        "-lsplit",
+        False,
+        id="library-short-split",
+    ),
+    pytest.param(
+        ["-ljoined"],
+        "-ljoined",
+        False,
+        id="library-short-joined",
+    ),
+    pytest.param(
+        ["--library", "longsplit"],
+        "-llongsplit",
+        False,
+        id="library-long-split",
+    ),
+    pytest.param(
+        ["--library=longjoined"],
+        "-llongjoined",
+        False,
+        id="library-long-joined",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "expected_input", "is_direct"),
+    LINKER_INPUT_GRAMMAR_CASES,
+)
+def test_link_command_inputs_classify_every_forwarding_grammar(
+    verify_module: ModuleType,
+    tokens: list[str],
+    expected_input: str,
+    is_direct: bool,
+) -> None:
+    ordered, direct = verify_module._link_command_inputs(
+        ["/host/subject/input.o", *tokens]
+    )
+    assert ordered == ["input.o", expected_input]
+    assert direct == (sorted(["input.o", expected_input]) if is_direct else ["input.o"])
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        pytest.param(
+            ["-Wl,-Map,/host/subject/not-an-input.o"],
+            id="wl-map-operand",
+        ),
+        pytest.param(
+            ["-Wl,-T,/host/subject/not-an-input.a"],
+            id="wl-script-operand",
+        ),
+        pytest.param(
+            ["-Xlinker", "-o", "-Xlinker", "/host/subject/not-an-input.so"],
+            id="xlinker-output-operand",
+        ),
+        pytest.param(["-o", "/host/subject/not-an-input.o"], id="driver-output"),
+        pytest.param(
+            ["-L", "/host/subject/not-an-input.a"],
+            id="driver-library-search-path",
+        ),
+    ],
+)
+def test_link_command_inputs_exclude_non_input_option_operands(
+    verify_module: ModuleType,
+    tokens: list[str],
+) -> None:
+    assert verify_module._link_command_inputs(["/host/subject/input.o", *tokens]) == (
+        ["input.o"],
+        ["input.o"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "expected_input"),
+    [
+        pytest.param(
+            ["--for-linker=-lfor_joined"],
+            "-lfor_joined",
+            id="for-linker-joined-library",
+        ),
+        pytest.param(
+            ["--for-linker", "-l", "--for-linker", "for_split"],
+            "-lfor_split",
+            id="for-linker-split-library",
+        ),
+        pytest.param(
+            ["--for-linker=/host/subject/for-linker-input"],
+            "for-linker-input",
+            id="for-linker-direct-input",
+        ),
+        pytest.param(
+            ["/host/subject/extensionless"],
+            "extensionless",
+            id="extensionless-positional",
+        ),
+        pytest.param(
+            ["/host/subject/alternate.obj"],
+            "alternate.obj",
+            id="obj-positional",
+        ),
+        pytest.param(
+            ["/host/subject/alternate.lo"],
+            "alternate.lo",
+            id="lo-positional",
+        ),
+        pytest.param(
+            ["/host/subject/positional-script.ld"],
+            "positional-script.ld",
+            id="script-positional",
+        ),
+        pytest.param(
+            ["-R", "/host/subject/symbol-source"],
+            "symbol-source",
+            id="just-symbols-short-split",
+        ),
+        pytest.param(
+            ["--just-symbols=/host/subject/symbol-source"],
+            "symbol-source",
+            id="just-symbols-long-joined",
+        ),
+    ],
+)
+def test_link_command_inputs_classify_all_positional_and_alias_inputs(
+    verify_module: ModuleType,
+    tokens: list[str],
+    expected_input: str,
+) -> None:
+    ordered, direct = verify_module._link_command_inputs(
+        ["/host/subject/input.o", *tokens]
+    )
+    assert ordered == ["input.o", expected_input]
+    assert direct == (
+        ["input.o"]
+        if expected_input.startswith("-l")
+        else sorted(["input.o", expected_input])
+    )
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        pytest.param(["-l"], id="dangling-short-library"),
+        pytest.param(["--library"], id="dangling-long-library"),
+        pytest.param(["-Wl,-l"], id="dangling-wl-library"),
+        pytest.param(["-Xlinker"], id="dangling-xlinker"),
+        pytest.param(["-Xlinker="], id="empty-joined-xlinker"),
+        pytest.param(["-Wl,"], id="empty-wl"),
+        pytest.param(["-Wl,@hidden.rsp"], id="wl-response-file"),
+        pytest.param(["-Xlinker", "@hidden.rsp"], id="xlinker-response-file"),
+        pytest.param(
+            ["-Xlinker", "-o", "/host/subject/driver-input.o"],
+            id="mixed-origin-xlinker-operand",
+        ),
+        pytest.param(["--for-linker"], id="dangling-for-linker"),
+        pytest.param(["--for-linker="], id="empty-for-linker"),
+        pytest.param(["--output="], id="empty-long-option"),
+        pytest.param(["-Map="], id="empty-short-option"),
+        pytest.param(["-rpath="], id="empty-short-equals-option"),
+        pytest.param(
+            ["--remap-inputs=input.o=/host/subject/hidden.o"],
+            id="input-remap",
+        ),
+        pytest.param(
+            ["--remap-inputs-file=/host/subject/remaps.txt"],
+            id="input-remap-file",
+        ),
+        pytest.param(
+            ["--version-script=/host/subject/version.ld"],
+            id="version-script",
+        ),
+    ],
+)
+def test_link_command_inputs_reject_malformed_or_opaque_forwarding(
+    verify_module: ModuleType,
+    tokens: list[str],
+) -> None:
+    with pytest.raises(verify_module.EvidenceError):
+        verify_module._link_command_inputs(["/host/subject/input.o", *tokens])
+
+
+@pytest.mark.parametrize(
+    ("tokens", "_expected_input", "_is_direct"),
+    LINKER_INPUT_GRAMMAR_CASES,
+)
+def test_manifest_replay_rejects_undeclared_forwarded_linker_input(
+    verify_module: ModuleType,
+    tokens: list[str],
+    _expected_input: str,
+    _is_direct: bool,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifest = documents["manifests"][0]
+    executable = "elastic_cache_gate"
+    command = manifest["build_proof"]["executables"][executable]["link_command"]
+    trace_path = command["trace"]["absolute_path"]
+    trace_record = json.loads(documents["hosted_files"][trace_path])
+    command["argv"][1:1] = tokens
+    trace_record["argv"] = copy.deepcopy(command["argv"])
+    trace_bytes = json_bytes(trace_record)
+    command["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    with pytest.raises(
+        verify_module.EvidenceError,
+        match="input|link command",
+    ):
+        verify_module.verify_manifest_link_command(
+            command,
+            trace_bytes,
+            capability,
+            "elastic",
+            manifest["executables"][executable],
+        )
+
+
+def test_manifest_replay_rejects_same_hash_alternate_fragment_path(
+    verify_module: ModuleType,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifest = documents["manifests"][0]
+    executable = "elastic_cache_gate"
+    command = manifest["build_proof"]["executables"][executable]["link_command"]
+    executable_record = manifest["executables"][executable]
+    authority = capability["fragments"]["elastic"]["absolute_path"]
+    alternate = "/host/subject/alternate-same-hash.ld"
+    executable_record["linker_fragment"]["absolute_path"] = alternate
+    command["fragment"] = alternate
+    command["argv"] = [
+        token.replace(
+            f"-Wl,-T,{authority}",
+            f"-Wl,-T,{alternate}",
+        )
+        for token in command["argv"]
+    ]
+    trace_path = command["trace"]["absolute_path"]
+    trace_record = json.loads(documents["hosted_files"][trace_path])
+    trace_record["argv"] = copy.deepcopy(command["argv"])
+    trace_bytes = json_bytes(trace_record)
+    command["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    with pytest.raises(verify_module.EvidenceError, match="fragment"):
+        verify_module.verify_manifest_link_command(
+            command,
+            trace_bytes,
+            capability,
+            "elastic",
+            executable_record,
+        )
+
+
+def test_manifest_replay_rejects_alternate_executable_fragment_record_path(
+    verify_module: ModuleType,
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifest = documents["manifests"][0]
+    executable = "elastic_cache_gate"
+    command = manifest["build_proof"]["executables"][executable]["link_command"]
+    executable_record = manifest["executables"][executable]
+    executable_record["linker_fragment"]["absolute_path"] = (
+        "/host/subject/alternate-same-hash.ld"
+    )
+    trace_path = command["trace"]["absolute_path"]
+    trace_bytes = documents["hosted_files"][trace_path]
+    with pytest.raises(verify_module.EvidenceError, match="fragment"):
+        verify_module.verify_manifest_link_command(
+            command,
+            trace_bytes,
+            capability,
+            "elastic",
+            executable_record,
+        )
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        pytest.param(
+            ["--for-linker=-T", "--for-linker=/host/subject/extra.ld"],
+            id="for-linker-script",
+        ),
+        pytest.param(
+            ["-Xlinker=-Map", "-Xlinker=/host/subject/extra.map"],
+            id="xlinker-map",
+        ),
+    ],
+)
+def test_manifest_replay_rejects_extra_aliased_linker_controls(
+    verify_module: ModuleType,
+    tokens: list[str],
+) -> None:
+    documents = full_semantic_documents(verify_module)
+    capability = documents["capability"]
+    manifest = documents["manifests"][0]
+    executable = "elastic_cache_gate"
+    command = manifest["build_proof"]["executables"][executable]["link_command"]
+    command["argv"][1:1] = tokens
+    trace_path = command["trace"]["absolute_path"]
+    trace_record = json.loads(documents["hosted_files"][trace_path])
+    trace_record["argv"] = copy.deepcopy(command["argv"])
+    trace_bytes = json_bytes(trace_record)
+    command["trace"]["sha256"] = hashlib.sha256(trace_bytes).hexdigest()
+    with pytest.raises(verify_module.EvidenceError, match="controls"):
+        verify_module.verify_manifest_link_command(
+            command,
+            trace_bytes,
+            capability,
+            "elastic",
+            manifest["executables"][executable],
         )
 
 

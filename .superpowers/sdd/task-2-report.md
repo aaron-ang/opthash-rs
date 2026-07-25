@@ -306,3 +306,82 @@ pre-commit run --files \
 git diff --check
 # exit 0
 ```
+
+## Final Re-review Round 4 remediation
+
+Status: DONE
+
+The final manifest-replay finding is closed:
+
+1. Linker argv is decoded into one ordered semantic stream across direct
+   driver arguments, `-Wl,...`, split/joined `-Xlinker`, and GCC's equivalent
+   split/joined `--for-linker`. Forwarding origin is retained so an
+   operand-taking forwarded option cannot consume a driver positional input.
+2. Split/joined `-l` and `--library` forms normalize to one ordered `-l<name>`
+   representation. Every remaining positional argument is an absolute direct
+   input regardless of suffix; `-R`/`--just-symbols` inputs are also recorded.
+   Output, map, script, search, rpath, and other proven non-input operands are
+   consumed without being misclassified.
+3. Empty/dangling forwarding, response files, mixed-origin operands, input
+   remapping, unreviewed script mechanisms, and plugin pass-through are
+   rejected. Undeclared forwarded objects, archives, or libraries therefore
+   change the regenerated ordered/direct inputs and fingerprint or fail
+   closed.
+4. The authoritative fragment is exactly
+   `capability["fragments"][target]`: both the executable fragment record and
+   command fragment must equal that record, and the sole raw script control
+   remains exact `-Wl,-T,<capability absolute path>`. A same-hash alternate
+   path fails.
+5. The reviewed AArch64 fixture's nine executable fragment records and
+   corresponding command/trace `-T` tokens were normalized to that exact
+   capability path. All dependent hashes were recomputed. The deterministic
+   fixture SHA-256 is
+   `100920ab673be133a57cd193c9d02118c2feb7bdc470e37c09e53124ee05d6ee`.
+
+Regression-first evidence:
+
+```text
+# Required grammar, undeclared-input replay, and alternate fragment path
+15 failed, 2 passed, 180 deselected
+
+# Expanded option-operand, response-file, and fragment-record matrix
+8 failed, 6 passed, 197 deselected
+
+# Expanded alias, arbitrary positional, remap, and mixed-origin matrix
+17 failed, 8 passed, 203 deselected
+```
+
+Fresh final verification on the formatted tree:
+
+```text
+uv run pytest -q tests/test_verify_x86_cache_gate_evidence.py \
+  -k 'link_command_inputs or undeclared_forwarded or alternate_fragment or fragment_record_path or extra_aliased_linker_controls'
+51 passed, 180 deselected
+
+uv run pytest -q tests/test_verify_x86_cache_gate_evidence.py
+231 passed
+
+uv run pytest -q \
+  tests/test_verify_x86_cache_gate_artifact.py \
+  tests/test_verify_x86_cache_gate_evidence.py
+246 passed
+
+uv run python -m py_compile \
+  scripts/package-x86-cache-gate-evidence.py \
+  scripts/verify-x86-cache-gate-evidence.py \
+  tests/test_verify_x86_cache_gate_evidence.py
+# exit 0
+
+cargo test
+# exit 0
+
+pre-commit run --all-files
+# all applicable hooks passed
+
+git diff --check
+# exit 0
+```
+
+Fresh independent diff review: C0/I0/M0, PASS.
+
+No known Task 2 gaps remain.
