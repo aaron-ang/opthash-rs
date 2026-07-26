@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.4](https://github.com/aaron-ang/opthash-rs/compare/v0.10.3...v0.10.4) - 2026-07-26
+
+### Added
+
+- make paper-exact hashing the default ([#115](https://github.com/aaron-ang/opthash-rs/pull/115))
+
+### Fixed
+
+- update exclude paths in Cargo.toml
+
+### Other
+
+- cut wasted probing on both maps ([#132](https://github.com/aaron-ang/opthash-rs/pull/132))
+- pack Elastic probe counters ([#131](https://github.com/aaron-ang/opthash-rs/pull/131))
+- reduce Funnel probe preparation cost
+- accelerate elastic and funnel map operations ([#130](https://github.com/aaron-ang/opthash-rs/pull/130))
+- update README to clarify opthash features and usage
+- streamline exact probes and Elastic membership ([#129](https://github.com/aaron-ang/opthash-rs/pull/129))
+- *(x86)* retain sixteen-lane control groups for AVX-512 ([#128](https://github.com/aaron-ang/opthash-rs/pull/128))
+- explain hashing algorithms in more detail
+- preserve paper fidelity in hot paths ([#127](https://github.com/aaron-ang/opthash-rs/pull/127))
+- streamline paper-faithful hot paths ([#121](https://github.com/aaron-ang/opthash-rs/pull/121))
+- qualify exact probe functions ([#120](https://github.com/aaron-ang/opthash-rs/pull/120))
+- define exact-default benchmark methodology ([#116](https://github.com/aaron-ang/opthash-rs/pull/116))
+- remove benchmark plotting machinery ([#114](https://github.com/aaron-ang/opthash-rs/pull/114))
+
 ## [0.10.3](https://github.com/aaron-ang/opthash-rs/compare/v0.10.2...v0.10.3) - 2026-07-05
 
 ### Added
