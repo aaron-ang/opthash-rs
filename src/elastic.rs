@@ -2581,13 +2581,18 @@ mod tests {
 
     #[test]
     fn route_summary_conservatively_records_every_live_level() {
+        let (capacity, key_count, additional) = if cfg!(miri) {
+            (128, 128_u64, 1_024)
+        } else {
+            (4_096, 4_096_u64, 20_000)
+        };
         let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
-            ElasticHashMap::with_capacity_and_hasher(4_096, IdentityBuildHasher);
-        for key in 0..2_000_u64 {
+            ElasticHashMap::with_capacity_and_hasher(capacity, IdentityBuildHasher);
+        for key in 0..key_count {
             map.insert(key, key ^ 0x55);
         }
 
-        for key in 0..2_000_u64 {
+        for key in 0..key_count {
             let location = map
                 .table()
                 .levels
@@ -2610,14 +2615,23 @@ mod tests {
             );
             assert_eq!(map.get(&key), Some(&(key ^ 0x55)));
         }
+        assert!(
+            map.table()
+                .levels
+                .iter()
+                .filter(|level| level.len != 0)
+                .count()
+                > 1,
+            "route summary must cover more than one occupied level"
+        );
 
         let cloned = map.clone();
-        for key in 0..2_000_u64 {
+        for key in 0..key_count {
             assert_eq!(cloned.get(&key), Some(&(key ^ 0x55)));
         }
 
-        map.reserve(20_000);
-        for key in 0..2_000_u64 {
+        map.reserve(additional);
+        for key in 0..key_count {
             assert_eq!(map.get(&key), Some(&(key ^ 0x55)));
         }
 

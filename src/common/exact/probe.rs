@@ -833,6 +833,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "exhaustive integer packing is covered by native debug and release tests"
+    )]
     fn elastic_counter_pack_is_injective_and_checked() {
         let mut expected = 0_u32;
         for level in 0..ELASTIC_LEVEL_LIMIT {
@@ -857,6 +861,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "exhaustive integer parity is covered by native debug and release tests"
+    )]
     fn bounded_elastic_phi_matches_checked_encoder_for_every_hot_coordinate() {
         for i in 1..=u32::BITS {
             for j in 1..=4_096_u64 {
