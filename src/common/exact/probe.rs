@@ -60,12 +60,12 @@ pub(crate) trait ProbeOracle {
     ) -> u64;
 }
 
-/// A seeded, copyable counter mixer for reproducible exact probing.
+/// A seeded, copyable counter permutation for reproducible Elastic probing.
 ///
-/// The construction domain-separates every tuple component before applying a
-/// 64-bit avalanche mixer. It is an engineering random-oracle/PRF model only:
-/// its outputs are not evidence of statistical independence, and the
-/// construction is not claimed to be a universal hash family.
+/// The construction packs every supported Elastic tuple without collisions,
+/// then keys a 64-bit permutation. It is an engineering random-oracle model
+/// only: its outputs are not evidence of statistical independence, and the
+/// construction is not cryptographic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CounterPrf {
     seed: u64,
@@ -83,12 +83,7 @@ pub(crate) struct FunnelPrf {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedElasticProbe {
-    domain_state: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PreparedElasticLevelProbe {
-    level_state: u64,
+    key: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,16 +113,18 @@ pub(crate) const WYHASH_DEFAULT_SECRET: [u64; 4] = [
     0x4B33_A62E_D433_D4A3,
     0x4D5A_2DA5_1DE1_AA47,
 ];
-pub(crate) const W1RAND_INCREMENT: u64 = 0xD07E_BC63_2746_54C7;
 
 // Fixed separators from SplitMix64's increment and current upstream constants;
 // they do not instantiate either generator.
 const INITIAL_LANE: u64 = 0x9e37_79b9_7f4a_7c15;
 const KEY_LANE: u64 = WYHASH_DEFAULT_SECRET[0];
 const DOMAIN_KIND_LANE: u64 = WYHASH_DEFAULT_SECRET[1];
-const DOMAIN_LEVEL_LANE: u64 = WYHASH_DEFAULT_SECRET[2];
-const PROBE_LANE: u64 = WYHASH_DEFAULT_SECRET[3];
-const REJECTION_LANE: u64 = W1RAND_INCREMENT;
+const ELASTIC_LEVEL_SHIFT: u32 = 16;
+const ELASTIC_LOGICAL_SHIFT: u32 = 3;
+const ELASTIC_REJECTION_MASK: u32 = (1 << ELASTIC_LOGICAL_SHIFT) - 1;
+pub(crate) const ELASTIC_LEVEL_LIMIT: u64 = 1 << 5;
+pub(crate) const ELASTIC_LOGICAL_LIMIT: u64 = 1 << 13;
+pub(crate) const ELASTIC_REJECTION_LIMIT: u32 = 1 << ELASTIC_LOGICAL_SHIFT;
 const FUNNEL_LEVEL_LIMIT: u64 = 1 << 46;
 const FUNNEL_LOGICAL_LIMIT: u64 = 1 << 8;
 const FUNNEL_REJECTION_LIMIT: u32 = 1 << 8;
@@ -139,11 +136,11 @@ impl CounterPrf {
         Self { seed }
     }
 
+    #[inline]
     pub(crate) fn prepare_elastic(self, key_hash: u64) -> PreparedElasticProbe {
-        let state = mix64(self.seed.wrapping_add(INITIAL_LANE));
-        let state = absorb_counter_lane(state, key_hash, KEY_LANE);
-        let domain_state = absorb_counter_lane(state, 1, DOMAIN_KIND_LANE);
-        PreparedElasticProbe { domain_state }
+        PreparedElasticProbe {
+            key: mix64(key_hash.wrapping_add(self.seed).wrapping_add(INITIAL_LANE)),
+        }
     }
 }
 
@@ -177,20 +174,12 @@ impl ProbeOracle for CounterPrf {
         logical_probe_index: u64,
         rejection_index: u32,
     ) -> u64 {
-        let (domain_kind, level) = match domain {
-            ProbeDomain::ElasticOrdinary { level } => (1, level),
-            ProbeDomain::FunnelOrdinary { level } => (2, level),
-            ProbeDomain::FunnelSpecialPrimary => (3, 0),
-            ProbeDomain::FunnelSpecialFallbackChoiceA => (4, 0),
-            ProbeDomain::FunnelSpecialFallbackChoiceB => (5, 0),
+        let ProbeDomain::ElasticOrdinary { level } = domain else {
+            panic!("Elastic counter permutation used with a different domain");
         };
-
-        let mut state = mix64(self.seed.wrapping_add(INITIAL_LANE));
-        state = absorb_counter_lane(state, key_hash, KEY_LANE);
-        state = absorb_counter_lane(state, domain_kind, DOMAIN_KIND_LANE);
-        state = absorb_counter_lane(state, level, DOMAIN_LEVEL_LANE);
-        state = absorb_counter_lane(state, logical_probe_index, PROBE_LANE);
-        absorb_counter_lane(state, u64::from(rejection_index), REJECTION_LANE)
+        let counter = try_pack_elastic_counter(level, logical_probe_index, rejection_index)
+            .expect("Elastic counter tuple exceeds its checked library encoding");
+        self.prepare_elastic(key_hash).word_from_packed(counter)
     }
 }
 
@@ -221,47 +210,31 @@ impl ProbeOracle for PreparedElasticProbe {
         let ProbeDomain::ElasticOrdinary { level } = domain else {
             panic!("prepared Elastic probe used with a different domain");
         };
-        self.prepare_level_lane(Self::level_lane(level))
-            .word_from_probe_lane(
-                Self::logical_probe_lane(logical_probe_index),
-                rejection_index,
-            )
+        let counter = try_pack_elastic_counter(level, logical_probe_index, rejection_index)
+            .expect("Elastic counter tuple exceeds its checked library encoding");
+        self.word_from_packed(counter)
     }
 }
 
 impl PreparedElasticProbe {
     #[inline]
     pub(crate) const fn routing_signature(self) -> u64 {
-        self.domain_state
+        self.key
     }
 
-    pub(crate) const fn level_lane(level: u64) -> u64 {
-        mix64(level.wrapping_add(DOMAIN_LEVEL_LANE))
+    #[allow(clippy::inline_always)]
+    #[allow(clippy::cast_lossless)]
+    #[inline(always)]
+    const fn word_from_packed(self, counter: u32) -> u64 {
+        mix64(counter as u64 ^ self.key) ^ self.key
     }
 
-    pub(crate) const fn logical_probe_lane(logical_probe_index: u64) -> u64 {
-        mix64(logical_probe_index.wrapping_add(PROBE_LANE))
-    }
-
-    #[inline]
-    pub(crate) fn prepare_level_lane(self, level_lane: u64) -> PreparedElasticLevelProbe {
-        PreparedElasticLevelProbe {
-            level_state: mix64(self.domain_state.wrapping_add(level_lane)),
-        }
-    }
-}
-
-impl PreparedElasticLevelProbe {
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn word_from_probe_lane(self, logical_probe_lane: u64, rejection_index: u32) -> u64 {
-        let state = mix64(self.level_state.wrapping_add(logical_probe_lane));
-        let rejection_lane = if rejection_index == 0 {
-            mix64(REJECTION_LANE)
-        } else {
-            mix64(u64::from(rejection_index).wrapping_add(REJECTION_LANE))
-        };
-        mix64(state.wrapping_add(rejection_lane))
+    fn word_from_counter_base(self, counter_base: u32, rejection_index: u32) -> u64 {
+        debug_assert_eq!(counter_base & ELASTIC_REJECTION_MASK, 0);
+        debug_assert!(rejection_index < ELASTIC_REJECTION_LIMIT);
+        self.word_from_packed(counter_base | rejection_index)
     }
 }
 
@@ -313,6 +286,39 @@ impl PreparedFastFunnelDomainProbe {
             u8::try_from(rejection_index).expect("checked rejection retry must fit"),
         )
     }
+}
+
+/// Packs one production Elastic request into a collision-free narrow counter.
+///
+/// Bits 16..=20 hold the level, bits 3..=15 the logical probe, and bits
+/// 0..=2 the exact-reduction retry. Unsupported tuples fail instead of
+/// truncating.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) const fn try_pack_elastic_counter(
+    level: u64,
+    logical_probe_index: u64,
+    rejection_index: u32,
+) -> Option<u32> {
+    if level >= ELASTIC_LEVEL_LIMIT
+        || logical_probe_index >= ELASTIC_LOGICAL_LIMIT
+        || rejection_index >= ELASTIC_REJECTION_LIMIT
+    {
+        return None;
+    }
+    Some(elastic_counter_base(level as u32, logical_probe_index) | rejection_index)
+}
+
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) const fn elastic_counter_base(level: u32, logical_probe_index: u64) -> u32 {
+    debug_assert!((level as u64) < ELASTIC_LEVEL_LIMIT);
+    debug_assert!(logical_probe_index < ELASTIC_LOGICAL_LIMIT);
+    (level << ELASTIC_LEVEL_SHIFT) | ((logical_probe_index as u32) << ELASTIC_LOGICAL_SHIFT)
+}
+
+#[inline]
+pub(crate) const fn elastic_counter_level(counter: u32) -> u32 {
+    (counter >> ELASTIC_LEVEL_SHIFT) & 0x1f
 }
 
 /// Packs one Funnel request into a collision-free library counter.
@@ -429,18 +435,23 @@ pub(crate) fn unbiased_probe_index<O: ProbeOracle + ?Sized>(
 #[allow(clippy::cast_possible_truncation, clippy::inline_always)]
 #[inline(always)]
 pub(crate) fn unbiased_prepared_elastic_probe_index(
-    probe: PreparedElasticLevelProbe,
-    logical_probe_lane: u64,
+    probe: PreparedElasticProbe,
+    counter_base: u32,
     upper: usize,
     max_random_words: u32,
 ) -> Result<ProbeIndex, RangeReductionError> {
+    if max_random_words > ELASTIC_REJECTION_LIMIT {
+        return Err(RangeReductionError::RejectionLimitExceeded {
+            random_word_count: 0,
+        });
+    }
     if upper.is_power_of_two() {
         if max_random_words == 0 {
             return Err(RangeReductionError::RejectionLimitExceeded {
                 random_word_count: 0,
             });
         }
-        let word = probe.word_from_probe_lane(logical_probe_lane, 0);
+        let word = probe.word_from_counter_base(counter_base, 0);
         let index = if upper == 1 {
             0
         } else {
@@ -452,7 +463,7 @@ pub(crate) fn unbiased_prepared_elastic_probe_index(
             random_word_count: 1,
         });
     }
-    reduce_prepared_elastic_non_power(probe, logical_probe_lane, upper, max_random_words)
+    reduce_prepared_elastic_non_power(probe, counter_base, upper, max_random_words)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::inline_always)]
@@ -514,13 +525,13 @@ fn reduce_prepared_funnel_retries(
 #[cold]
 #[inline(never)]
 fn reduce_prepared_elastic_non_power(
-    probe: PreparedElasticLevelProbe,
-    logical_probe_lane: u64,
+    probe: PreparedElasticProbe,
+    counter_base: u32,
     upper: usize,
     max_random_words: u32,
 ) -> Result<ProbeIndex, RangeReductionError> {
     reduce_probe_words(upper, max_random_words, |rejection_index| {
-        probe.word_from_probe_lane(logical_probe_lane, rejection_index)
+        probe.word_from_counter_base(counter_base, rejection_index)
     })
 }
 
@@ -795,10 +806,6 @@ const fn mix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-const fn absorb_counter_lane(state: u64, value: u64, lane: u64) -> u64 {
-    mix64(state.wrapping_add(mix64(value.wrapping_add(lane))))
-}
-
 fn append_bit(prefix: u128, bit: u128) -> Option<u128> {
     prefix
         .checked_mul(2)
@@ -826,6 +833,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn elastic_counter_pack_is_injective_and_checked() {
+        let mut expected = 0_u32;
+        for level in 0..ELASTIC_LEVEL_LIMIT {
+            for logical_probe in 0..ELASTIC_LOGICAL_LIMIT {
+                for rejection in 0..ELASTIC_REJECTION_LIMIT {
+                    let counter =
+                        try_pack_elastic_counter(level, logical_probe, rejection).unwrap();
+                    assert_eq!(counter, expected);
+                    assert_eq!(
+                        elastic_counter_level(counter),
+                        u32::try_from(level).unwrap()
+                    );
+                    expected += 1;
+                }
+            }
+        }
+        assert_eq!(expected, 1 << 21);
+
+        assert!(try_pack_elastic_counter(ELASTIC_LEVEL_LIMIT, 0, 0).is_none());
+        assert!(try_pack_elastic_counter(0, ELASTIC_LOGICAL_LIMIT, 0).is_none());
+        assert!(try_pack_elastic_counter(0, 0, ELASTIC_REJECTION_LIMIT).is_none());
+    }
+
+    #[test]
     fn bounded_elastic_phi_matches_checked_encoder_for_every_hot_coordinate() {
         for i in 1..=u32::BITS {
             for j in 1..=4_096_u64 {
@@ -849,10 +880,10 @@ mod tests {
         let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
         for key in [0, 1, u64::MAX, 0xd1b5_4a32_d192_ed03] {
             let prepared = oracle.prepare_elastic(key);
-            for level in [0, 1, 17, u64::from(u32::MAX)] {
+            for level in [0, 1, 17, ELASTIC_LEVEL_LIMIT - 1] {
                 let domain = ProbeDomain::ElasticOrdinary { level };
-                for logical_probe in [0, 1, 383, u64::MAX] {
-                    for rejection in [0, 1, 7, u32::MAX] {
+                for logical_probe in [0, 1, 383, ELASTIC_LOGICAL_LIMIT - 1] {
+                    for rejection in [0, 1, 7, ELASTIC_REJECTION_LIMIT - 1] {
                         assert_eq!(
                             prepared.word(0, domain, logical_probe, rejection),
                             oracle.word(key, domain, logical_probe, rejection)
@@ -868,24 +899,116 @@ mod tests {
         let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
         for key in [0, 1, u64::MAX, 0xd1b5_4a32_d192_ed03] {
             let prepared = oracle.prepare_elastic(key);
-            for level in [0, 1, 17, 63] {
+            for level in [0, 1, 17, ELASTIC_LEVEL_LIMIT - 1] {
                 let domain = ProbeDomain::ElasticOrdinary { level };
-                let level_lane = PreparedElasticProbe::level_lane(level);
-                let prepared_level = prepared.prepare_level_lane(level_lane);
                 for logical_probe in [0, 1, 383, 4_095] {
-                    let probe_lane = PreparedElasticProbe::logical_probe_lane(logical_probe);
-                    for upper in [1, 2, 4, 16, 1 << 20] {
+                    let counter_base = try_pack_elastic_counter(level, logical_probe, 0).unwrap();
+                    for upper in [1, 2, 3, 4, 16, 191, 1_237, 1 << 20] {
                         assert_eq!(
-                            unbiased_prepared_elastic_probe_index(
-                                prepared_level,
-                                probe_lane,
-                                upper,
-                                8,
-                            ),
+                            unbiased_prepared_elastic_probe_index(prepared, counter_base, upper, 8,),
                             unbiased_probe_index(&oracle, key, domain, logical_probe, upper, 8,)
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn elastic_counter_permutation_has_fixed_golden_vectors() {
+        let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
+        let cases = [
+            (0, 0, 0, 0, 0x0000_0000, 0xf0cb_0007_ca53_5abb),
+            (1, 31, 8_191, 7, 0x001f_ffff, 0x5a62_1f05_cd18_07c7),
+            (u64::MAX, 17, 383, 7, 0x0011_0bff, 0x7b70_60ae_c610_3d7b),
+            (
+                0xd1b5_4a32_d192_ed03,
+                7,
+                7_687,
+                0,
+                0x0007_f038,
+                0x0eb0_04e6_de14_634e,
+            ),
+        ];
+        for (key, level, logical_probe, rejection, counter, word) in cases {
+            assert_eq!(
+                try_pack_elastic_counter(level, logical_probe, rejection),
+                Some(counter)
+            );
+            let domain = ProbeDomain::ElasticOrdinary { level };
+            assert_eq!(oracle.word(key, domain, logical_probe, rejection), word);
+            assert_eq!(
+                oracle
+                    .prepare_elastic(key)
+                    .word(key, domain, logical_probe, rejection),
+                word
+            );
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn elastic_fixed_seed_distribution_smoke() {
+        const SAMPLES: u64 = 1 << 18;
+        let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
+        let mut one_counts = [0_u64; u64::BITS as usize];
+        let mut avalanche_bits = 0_u64;
+        let mut cross_level_equal_bits = 0_u64;
+        let mut cross_probe_equal_bits = 0_u64;
+
+        for key in 0..SAMPLES {
+            let ordinary = oracle.word(key, ProbeDomain::ElasticOrdinary { level: 7 }, 3, 0);
+            for bit in 0..u64::BITS {
+                one_counts[bit as usize] += (ordinary >> bit) & 1;
+            }
+            let flipped_key = key ^ (1_u64 << (key % u64::from(u64::BITS)));
+            avalanche_bits += u64::from(
+                (ordinary
+                    ^ oracle.word(flipped_key, ProbeDomain::ElasticOrdinary { level: 7 }, 3, 0))
+                .count_ones(),
+            );
+            cross_level_equal_bits += u64::from(
+                (!(ordinary ^ oracle.word(key, ProbeDomain::ElasticOrdinary { level: 8 }, 3, 0)))
+                    .count_ones(),
+            );
+            cross_probe_equal_bits += u64::from(
+                (!(ordinary ^ oracle.word(key, ProbeDomain::ElasticOrdinary { level: 7 }, 4, 0)))
+                    .count_ones(),
+            );
+        }
+
+        for count in one_counts {
+            assert!((SAMPLES * 48 / 100..=SAMPLES * 52 / 100).contains(&count));
+        }
+        assert!((SAMPLES * 30..=SAMPLES * 34).contains(&avalanche_bits));
+        assert!((SAMPLES * 30..=SAMPLES * 34).contains(&cross_level_equal_bits));
+        assert!((SAMPLES * 30..=SAMPLES * 34).contains(&cross_probe_equal_bits));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn elastic_awkward_ranges_have_no_large_fixed_seed_skew() {
+        const EXPECTED_PER_BUCKET: usize = 512;
+        let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
+        let counter_base = try_pack_elastic_counter(7, 3, 0).unwrap();
+        for upper in [3, 191, 1_237] {
+            let mut counts = alloc::vec![0_u32; upper];
+            for key in 0..(upper * EXPECTED_PER_BUCKET) as u64 {
+                let sample = unbiased_prepared_elastic_probe_index(
+                    oracle.prepare_elastic(key),
+                    counter_base,
+                    upper,
+                    8,
+                )
+                .unwrap();
+                counts[sample.index] += 1;
+            }
+            for count in counts {
+                assert!(
+                    (EXPECTED_PER_BUCKET - 128..=EXPECTED_PER_BUCKET + 128)
+                        .contains(&(count as usize)),
+                    "upper={upper} count={count}"
+                );
             }
         }
     }

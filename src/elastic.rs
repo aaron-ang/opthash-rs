@@ -13,9 +13,7 @@ use crate::common::config::{CACHE_LINE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{TryBuildError, TryReserveError};
 use crate::common::exact::geometry::PaperConfig;
-use crate::common::exact::probe::{
-    self, CounterPrf, PreparedElasticLevelProbe, PreparedElasticProbe,
-};
+use crate::common::exact::probe::{self, CounterPrf, PreparedElasticProbe};
 use crate::common::iter::RegionCursor;
 use crate::common::math::capacity;
 use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
@@ -33,35 +31,21 @@ const RANGE_WORD_CAP: u32 = 8;
 const UNIFORM_SEARCH_CAP: u64 = 4_096;
 const QUERY_POSITION_CAP: u128 = 1_000_000;
 const EXCEPTIONAL_PLACEMENT_FLAG: u32 = 1 << 31;
-const QUERY_PROBE_LANE_COUNT: usize = 384;
+const QUERY_PROBE_LIMIT: usize = 384;
+const MAX_CASE1_LOGICAL_PROBES: usize =
+    ELASTIC_PROBE_BUDGET_C * (u32::BITS as usize - 1) * (u32::BITS as usize - 1);
 const MAX_ELASTIC_SLOTS: usize = match 1_usize.checked_shl(u32::BITS) {
     Some(slots) => slots,
     None => usize::MAX,
 };
 const MEMBERSHIP_SLOTS_PER_WORD: usize = 10;
 const ROUTE_SUMMARY_LEVELS: usize = u16::BITS as usize;
-const ELASTIC_LEVEL_LANES: [u64; u32::BITS as usize] = elastic_level_lanes();
-const ELASTIC_QUERY_PROBE_LANES: [u64; QUERY_PROBE_LANE_COUNT] = elastic_query_probe_lanes();
+const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
-const fn elastic_level_lanes() -> [u64; u32::BITS as usize] {
-    let mut lanes = [0; u32::BITS as usize];
-    let mut level = 0;
-    while level < lanes.len() {
-        lanes[level] = PreparedElasticProbe::level_lane(level as u64);
-        level += 1;
-    }
-    lanes
-}
-
-const fn elastic_query_probe_lanes() -> [u64; QUERY_PROBE_LANE_COUNT] {
-    let mut lanes = [0; QUERY_PROBE_LANE_COUNT];
-    let mut logical_probe = 0;
-    while logical_probe < lanes.len() {
-        lanes[logical_probe] = PreparedElasticProbe::logical_probe_lane(logical_probe as u64);
-        logical_probe += 1;
-    }
-    lanes
-}
+const _: () = assert!(u32::BITS as u64 <= probe::ELASTIC_LEVEL_LIMIT);
+const _: () = assert!(UNIFORM_SEARCH_CAP <= probe::ELASTIC_LOGICAL_LIMIT);
+const _: () = assert!(MAX_CASE1_LOGICAL_PROBES as u64 <= probe::ELASTIC_LOGICAL_LIMIT);
+const _: () = assert!(RANGE_WORD_CAP <= probe::ELASTIC_REJECTION_LIMIT);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExactInsertionCase {
@@ -106,11 +90,18 @@ struct PhiRoute {
     /// Temporarily holds `phi` while a new suffix is sorted, then the exact
     /// level bound used by every lookup in the epoch.
     range_upper: u32,
-    logical_probe_index: u16,
-    level: u8,
+    /// Packed retry-zero `(level, logical probe)` counter.
+    counter_base: u32,
 }
 
 const _: () = assert!(mem::size_of::<PhiRoute>() == 8);
+
+impl PhiRoute {
+    #[inline]
+    const fn level(self) -> usize {
+        probe::elastic_counter_level(self.counter_base) as usize
+    }
+}
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
@@ -1063,22 +1054,24 @@ where
                     continue;
                 }
                 let logical_probe_index =
-                    u16::try_from(paper_probe - 1).expect("Elastic probe cap fits u16");
+                    u64::try_from(paper_probe - 1).expect("Elastic probe cap fits u64");
                 assert!(
-                    usize::from(logical_probe_index) < QUERY_PROBE_LANE_COUNT,
-                    "Elastic query-lane table exhausted"
+                    usize::try_from(logical_probe_index).unwrap() < QUERY_PROBE_LIMIT,
+                    "Elastic query-probe convention exhausted"
                 );
+                let counter_base =
+                    probe::try_pack_elastic_counter(level as u64, logical_probe_index, 0)
+                        .expect("Elastic query tuple fits the production counter");
                 self.probe_schedule.push(PhiRoute {
                     range_upper: u32::try_from(phi).expect("Elastic query cap fits u32"),
-                    logical_probe_index,
-                    level: u8::try_from(level).expect("Elastic level count fits u8"),
+                    counter_base,
                 });
                 paper_probe += 1;
             }
         }
         self.probe_schedule[old_len..].sort_unstable_by_key(|route| route.range_upper);
         for route in &mut self.probe_schedule[old_len..] {
-            route.range_upper = self.levels[usize::from(route.level)].capacity;
+            route.range_upper = self.levels[route.level()].capacity;
         }
         self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
             | u32::try_from(high_water).expect("Elastic query cap fits u32");
@@ -1574,8 +1567,7 @@ where
         }
         let (case, level, slot, paper_probe) = match target {
             BatchTarget::Bootstrap => {
-                let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[0]);
-                let (slot, paper_probe) = self.uniform_vacancy(level_probe, 0)?;
+                let (slot, paper_probe) = self.uniform_vacancy(probe, 0)?;
                 (
                     ExactInsertionCase::Batch0 { level: 0 },
                     0,
@@ -1596,8 +1588,7 @@ where
                 let next_low = free_next.saturating_mul(4) <= next_level.capacity();
 
                 if current_low {
-                    let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[next]);
-                    let (slot, paper_probe) = self.uniform_vacancy(level_probe, next)?;
+                    let (slot, paper_probe) = self.uniform_vacancy(probe, next)?;
                     (
                         ExactInsertionCase::Case2 {
                             batch: next,
@@ -1611,8 +1602,7 @@ where
                         paper_probe,
                     )
                 } else if next_low {
-                    let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[current]);
-                    let (slot, paper_probe) = self.uniform_vacancy(level_probe, current)?;
+                    let (slot, paper_probe) = self.uniform_vacancy(probe, current)?;
                     (
                         ExactInsertionCase::Case3 {
                             batch: next,
@@ -1641,16 +1631,14 @@ where
                         free_next,
                         budget,
                     };
-                    let current_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[current]);
                     if let Some((slot, probe)) = (0..budget).find_map(|logical_index| {
                         let logical_index = u64::try_from(logical_index).ok()?;
-                        self.vacancy(current, current_probe, logical_index)
+                        self.vacancy(current, probe, logical_index)
                             .map(|slot| (slot, logical_index + 1))
                     }) {
                         (case, current, slot, probe)
                     } else {
-                        let next_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[next]);
-                        let (slot, paper_probe) = self.uniform_vacancy(next_probe, next)?;
+                        let (slot, paper_probe) = self.uniform_vacancy(probe, next)?;
                         (case, next, slot, paper_probe)
                     }
                 }
@@ -1670,11 +1658,7 @@ where
         })
     }
 
-    fn uniform_vacancy(
-        &self,
-        probe: PreparedElasticLevelProbe,
-        level: usize,
-    ) -> Option<(usize, u64)> {
+    fn uniform_vacancy(&self, probe: PreparedElasticProbe, level: usize) -> Option<(usize, u64)> {
         for logical_index in 0..UNIFORM_SEARCH_CAP {
             if let Some(slot) = self.vacancy(level, probe, logical_index) {
                 return Some((slot, logical_index + 1));
@@ -1686,7 +1670,7 @@ where
     fn vacancy(
         &self,
         level: usize,
-        probe: PreparedElasticLevelProbe,
+        probe: PreparedElasticProbe,
         logical_index: u64,
     ) -> Option<usize> {
         let slot = self.route_prepared(level, probe, logical_index)?;
@@ -1699,40 +1683,36 @@ where
     fn route_prepared(
         &self,
         level: usize,
-        probe: PreparedElasticLevelProbe,
+        probe: PreparedElasticProbe,
         logical_index: u64,
     ) -> Option<usize> {
-        let logical_probe_lane = PreparedElasticProbe::logical_probe_lane(logical_index);
-        self.route_prepared_lane(level, probe, logical_probe_lane)
+        let level = u32::try_from(level).ok()?;
+        let counter_base = probe::elastic_counter_base(level, logical_index);
+        self.route_prepared_counter(level as usize, probe, counter_base)
     }
 
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn route_prepared_lane(
+    fn route_prepared_counter(
         &self,
         level: usize,
-        probe: PreparedElasticLevelProbe,
-        logical_probe_lane: u64,
+        probe: PreparedElasticProbe,
+        counter_base: u32,
     ) -> Option<usize> {
         let upper = self.levels.get(level)?.capacity();
-        Self::route_prepared_lane_for_upper(probe, logical_probe_lane, upper)
+        Self::route_prepared_counter_for_upper(probe, counter_base, upper)
     }
 
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn route_prepared_lane_for_upper(
-        prepared: PreparedElasticLevelProbe,
-        logical_probe_lane: u64,
+    fn route_prepared_counter_for_upper(
+        prepared: PreparedElasticProbe,
+        counter_base: u32,
         upper: usize,
     ) -> Option<usize> {
-        probe::unbiased_prepared_elastic_probe_index(
-            prepared,
-            logical_probe_lane,
-            upper,
-            RANGE_WORD_CAP,
-        )
-        .ok()
-        .map(|probe| probe.index)
+        probe::unbiased_prepared_elastic_probe_index(prepared, counter_base, upper, RANGE_WORD_CAP)
+            .ok()
+            .map(|probe| probe.index)
     }
 
     /// SAFETY: `level_idx` < `self.levels.len()` and `slot_idx` references an
@@ -1789,15 +1769,9 @@ where
         if self.len == 0 || self.levels.is_empty() {
             return None;
         }
-        let mut level_probes =
-            [MaybeUninit::<PreparedElasticLevelProbe>::uninit(); u32::BITS as usize];
-        let level_zero_probe = prepared.probe.prepare_level_lane(ELASTIC_LEVEL_LANES[0]);
-        level_probes[0].write(level_zero_probe);
-        let mut prepared_levels = 1_u32;
-
-        let Some(h11_slot) = Self::route_prepared_lane_for_upper(
-            level_zero_probe,
-            ELASTIC_QUERY_PROBE_LANES[0],
+        let Some(h11_slot) = Self::route_prepared_counter_for_upper(
+            prepared.probe,
+            H11_COUNTER_BASE,
             self.levels[0].capacity(),
         ) else {
             return self.find_by_full_scan(key, key_fingerprint, on_hit);
@@ -1808,31 +1782,14 @@ where
 
         let summary_level_mask = self.summary_level_mask(prepared);
         for route in &self.probe_schedule {
-            let level = usize::from(route.level);
+            let level = route.level();
             let level_bit = 1_u32 << level;
             if summary_level_mask & level_bit == 0 {
                 continue;
             }
-            let logical_probe = usize::from(route.logical_probe_index);
-            let level_probe = if prepared_levels & level_bit == 0 {
-                // SAFETY: this path is selected only for geometries with at
-                // most 32 levels, and routes come from that level slice.
-                let level_lane = unsafe { *ELASTIC_LEVEL_LANES.get_unchecked(level) };
-                let level_probe = prepared.probe.prepare_level_lane(level_lane);
-                unsafe { level_probes.get_unchecked_mut(level) }.write(level_probe);
-                prepared_levels |= level_bit;
-                level_probe
-            } else {
-                // SAFETY: the bit is set only after this slot is written.
-                unsafe { level_probes.get_unchecked(level).assume_init() }
-            };
-            // SAFETY: routes are admitted only after proving their logical
-            // probe index is within the fixed lane table.
-            let logical_probe_lane =
-                unsafe { *ELASTIC_QUERY_PROBE_LANES.get_unchecked(logical_probe) };
             let upper = route.range_upper as usize;
             let Some(slot) =
-                Self::route_prepared_lane_for_upper(level_probe, logical_probe_lane, upper)
+                Self::route_prepared_counter_for_upper(prepared.probe, route.counter_base, upper)
             else {
                 return self.find_by_full_scan(key, key_fingerprint, on_hit);
             };
@@ -1912,9 +1869,8 @@ where
 {
     fn route_exact(&self, level: usize, key_hash: u64, logical_index: u64) -> Option<usize> {
         let probe = CounterPrf::new(ELASTIC_PROBE_SEED).prepare_elastic(key_hash);
-        let level_lane = *ELASTIC_LEVEL_LANES.get(level)?;
-        let level_probe = probe.prepare_level_lane(level_lane);
-        self.route_prepared(level, level_probe, logical_index)
+        self.levels.get(level)?;
+        self.route_prepared(level, probe, logical_index)
     }
 }
 
@@ -2168,14 +2124,14 @@ mod tests {
     }
 
     #[test]
-    fn compact_query_lane_tables_cover_every_supported_geometry() {
-        assert_eq!(ELASTIC_LEVEL_LANES.len(), u32::BITS as usize);
+    fn compact_query_counters_cover_every_supported_geometry() {
+        assert_eq!(MAX_CASE1_LOGICAL_PROBES, 7_688);
         assert_eq!(
             PaperConfig::new(MAX_ELASTIC_SLOTS, ReserveFraction::DEFAULT.exponent())
                 .unwrap()
                 .elastic_plan()
                 .level_count(),
-            ELASTIC_LEVEL_LANES.len()
+            u32::BITS as usize
         );
         #[cfg(target_pointer_width = "64")]
         {
@@ -2194,10 +2150,10 @@ mod tests {
         }
         assert!(probe::elastic_phi(1, 383).unwrap() <= QUERY_POSITION_CAP);
         assert!(probe::elastic_phi(1, 384).unwrap() > QUERY_POSITION_CAP);
-        for level in 1..=u128::from(u64::BITS) {
+        for level in 1..=u128::from(u32::BITS) {
             let mut paper_probe = 1_u128;
             while probe::elastic_phi(level, paper_probe).unwrap() <= QUERY_POSITION_CAP {
-                assert!(usize::try_from(paper_probe - 1).unwrap() < QUERY_PROBE_LANE_COUNT);
+                assert!(usize::try_from(paper_probe - 1).unwrap() < QUERY_PROBE_LIMIT);
                 paper_probe += 1;
             }
         }
@@ -2215,7 +2171,7 @@ mod tests {
             table
                 .probe_schedule
                 .iter()
-                .all(|route| route.level != 0 || route.logical_probe_index != 0)
+                .all(|route| route.counter_base != H11_COUNTER_BASE)
         );
     }
 
@@ -2255,7 +2211,7 @@ mod tests {
         for route in &table.probe_schedule {
             assert_eq!(
                 route.range_upper as usize,
-                table.levels[usize::from(route.level)].capacity()
+                table.levels[route.level()].capacity()
             );
         }
     }
