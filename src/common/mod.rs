@@ -6,6 +6,7 @@ pub(crate) mod error;
 pub(crate) mod exact;
 pub(crate) mod iter;
 pub(crate) mod math;
+pub(crate) mod membership;
 pub(crate) mod reserve;
 pub(crate) mod simd;
 

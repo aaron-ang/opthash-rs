@@ -14,9 +14,11 @@ use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{TryBuildError, TryReserveError};
 use crate::common::exact::geometry::PaperConfig;
 use crate::common::exact::probe::{
-    self, FunnelPrf, PreparedFastFunnelDomainProbe, PreparedProbeRange, ProbeDomain,
+    self, FunnelPrf, PreparedFastFunnelDomainProbe, PreparedFastFunnelProbe, PreparedProbeRange,
+    ProbeDomain,
 };
 use crate::common::math::capacity;
+use crate::common::membership::{self, MembershipKey, MembershipRegion};
 use crate::common::simd;
 use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
 use crate::{macros, map};
@@ -214,34 +216,99 @@ impl<T> arena::RegionSet for FlatStorage<T> {
     }
 }
 
+/// One word of the membership filter tail.
+type MembershipWord = u64;
+
+/// A loaded filter word paired with the key's bits, split from the test so the
+/// load can be issued before the work that hides its latency. An absent tail
+/// yields a gate that never passes, matching an empty table.
+#[derive(Clone, Copy)]
+struct MembershipGate {
+    word: MembershipWord,
+    bits: u64,
+}
+
+impl MembershipGate {
+    /// `false` proves no insert ever recorded this key.
+    #[inline]
+    const fn passes(self) -> bool {
+        self.word & self.bits == self.bits
+    }
+}
+
+/// Where each region of one Funnel epoch's arena lives.
+struct FunnelLayout {
+    layout: Layout,
+    data_offset: usize,
+    control_bytes: usize,
+    membership: MembershipRegion,
+}
+
+type FunnelStorageBuild<K, V> = (Arena, FlatStorage<SlotEntry<K, V>>, MembershipRegion);
+
+/// `Layout::extend` aligns the filter tail for [`MembershipWord`], so casting
+/// the arena base plus that offset is aligned by construction.
+#[allow(clippy::cast_ptr_alignment)]
 fn try_allocate_storage<K, V, A: Allocator>(
     n: usize,
     alloc: &A,
-) -> Result<(Arena, FlatStorage<SlotEntry<K, V>>), TryReserveError> {
-    let (layout, data_offset, control_bytes) = funnel_layout::<K, V>(n)?;
-    let arena = Arena::try_allocate_with_ctrl_zeroed(layout, control_bytes, alloc)?;
+) -> Result<FunnelStorageBuild<K, V>, TryReserveError> {
+    let shape = funnel_layout::<K, V>(n)?;
+    let arena = Arena::try_allocate_with_ctrl_zeroed(shape.layout, shape.control_bytes, alloc)?;
+    if shape.membership.words != 0 {
+        // The arena zeroes control bytes only; an empty filter must read as
+        // "nothing recorded".
+        unsafe {
+            core::ptr::write_bytes(
+                arena
+                    .as_ptr()
+                    .add(shape.membership.offset)
+                    .cast::<MembershipWord>(),
+                0,
+                shape.membership.words,
+            );
+        }
+    }
     let storage = FlatStorage {
         ctrl_ptr: arena.as_ptr(),
         data_ptr: unsafe {
             arena
                 .as_ptr()
-                .add(data_offset)
+                .add(shape.data_offset)
                 .cast::<MaybeUninit<SlotEntry<K, V>>>()
         },
         capacity: n,
     };
-    Ok((arena, storage))
+    Ok((arena, storage, shape.membership))
 }
 
-fn funnel_layout<K, V>(n: usize) -> Result<(Layout, usize, usize), TryReserveError> {
+fn funnel_layout<K, V>(n: usize) -> Result<FunnelLayout, TryReserveError> {
     let control_bytes = if n == 0 {
         0
     } else {
         n.checked_add(GROUP_SIZE - 1)
             .ok_or(TryReserveError::CapacityOverflow)?
     };
-    let (layout, data_offset) = arena::layout_for_extents::<K, V>(control_bytes, n)?;
-    Ok((layout, data_offset, control_bytes))
+    let (base_layout, data_offset) = arena::layout_for_extents::<K, V>(control_bytes, n)?;
+    let words = membership::word_count(n);
+    if words == 0 {
+        return Ok(FunnelLayout {
+            layout: base_layout,
+            data_offset,
+            control_bytes,
+            membership: MembershipRegion::EMPTY,
+        });
+    }
+    let tail = Layout::array::<MembershipWord>(words).map_err(|_| TryReserveError::AllocError)?;
+    let (layout, offset) = base_layout
+        .extend(tail)
+        .map_err(|_| TryReserveError::AllocError)?;
+    Ok(FunnelLayout {
+        layout: layout.pad_to_align(),
+        data_offset,
+        control_bytes,
+        membership: MembershipRegion { offset, words },
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,8 +333,7 @@ enum BucketScanResult<T> {
 /// `ctrl_ptr.add(start)` must be readable for `GROUP_SIZE` bytes,
 /// `logical_lanes <= GROUP_SIZE`, and every slot passed to `inspect_match`
 /// must be valid for the corresponding data arena.
-#[allow(clippy::inline_always)]
-#[inline(always)]
+#[inline]
 unsafe fn scan_funnel_group<T>(
     ctrl_ptr: *const u8,
     start: usize,
@@ -379,8 +445,7 @@ unsafe fn scan_funnel_bucket_multi_group<T>(
 ///
 /// The bounds requirements are identical to [`scan_funnel_group`], and the
 /// logical group must contain no tombstones.
-#[allow(clippy::inline_always)]
-#[inline(always)]
+#[inline]
 unsafe fn scan_clean_funnel_group<T>(
     ctrl_ptr: *const u8,
     start: usize,
@@ -463,6 +528,9 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     arena: Arena,
     epoch: EpochState,
     exceptional_placement: bool,
+    /// Cached location of the membership filter tail. Lookups load one word
+    /// from it before probing; see [`crate::common::membership`].
+    membership: MembershipRegion,
 }
 
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
@@ -534,7 +602,7 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let (arena, storage) = try_allocate_storage(shape.n, &alloc)?;
+        let (arena, storage, membership) = try_allocate_storage(shape.n, &alloc)?;
         Ok(Self {
             shape,
             storage,
@@ -546,6 +614,7 @@ where
             arena,
             epoch: EpochState::initial(),
             exceptional_placement: false,
+            membership,
         })
     }
 
@@ -599,11 +668,21 @@ where
         None
     }
 
-    fn search_exact<Q>(&self, key: &Q, key_hash: u64, key_fingerprint: u8) -> SearchResult
+    /// Lookup-side search over a probe the caller already prepared.
+    ///
+    /// Always the general scan, even with no tombstones: the clean-epoch variant
+    /// drops the `first_tombstone` accumulator but needs a second mask walk to
+    /// find the terminating EMPTY, which measured worse on this walk.
+    fn search_exact_prepared<Q>(
+        &self,
+        key: &Q,
+        probe: PreparedFastFunnelProbe,
+        key_fingerprint: u8,
+    ) -> SearchResult
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.search_exact_mode::<Q, false>(key, key_hash, key_fingerprint)
+        self.search_exact_mode::<Q, false>(key, probe, key_fingerprint)
     }
 
     fn search_exact_for_insert<Q>(
@@ -615,17 +694,18 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
+        let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
         if self.tombstones == 0 {
-            self.search_exact_mode::<Q, true>(key, key_hash, key_fingerprint)
+            self.search_exact_mode::<Q, true>(key, probe, key_fingerprint)
         } else {
-            self.search_exact_mode::<Q, false>(key, key_hash, key_fingerprint)
+            self.search_exact_mode::<Q, false>(key, probe, key_fingerprint)
         }
     }
 
     fn search_exact_mode<Q, const CLEAN_EPOCH: bool>(
         &self,
         key: &Q,
-        key_hash: u64,
+        probe: PreparedFastFunnelProbe,
         key_fingerprint: u8,
     ) -> SearchResult
     where
@@ -634,9 +714,22 @@ where
         if self.shape.n == 0 {
             return SearchResult::Full;
         }
-        let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
         let mut first_tombstone = None;
 
+        // The walk stays strictly serial. Fetching the next level's control
+        // group one iteration ahead is legal — a bucket address depends only on
+        // the key — but the buckets are already L1-resident, so hiding that
+        // latency does not pay for the extra level of probe math a lookahead
+        // computes and usually discards.
+        //
+        // The membership gate stays out of this loop too, and out of the walk
+        // entirely. Deferring it behind the first level so a hit there never pays
+        // for the load lost every way it was built: as a shared level helper the
+        // walk cost 65%, as a per-level test misses cost 137%, and as a peeled
+        // first iteration hits cost 108% and misses 180%. The caller's eager load
+        // overlaps the probe's mix chain for free, while a deferred one serializes
+        // behind the level's control bytes and keeps a live word, a branch, and
+        // the level scan's second copy across the rest of the walk.
         for level in &self.shape.levels {
             let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
             let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) else {
@@ -678,6 +771,9 @@ where
             }
         }
 
+        // The special-array tail stays inline. Outlining it as a `#[cold]` call
+        // costs the ordinary walk more in call setup than it recovers in
+        // register pressure, on hits and misses alike.
         let primary_probe = probe
             .prepare_domain(ProbeDomain::FunnelSpecialPrimary)
             .expect("fixed Funnel primary domain must fit its counter encoding");
@@ -746,11 +842,98 @@ where
         })
     }
 
+    #[inline]
+    #[allow(clippy::cast_ptr_alignment)]
+    fn membership_ptr(&self) -> *mut MembershipWord {
+        unsafe {
+            self.arena
+                .as_ptr()
+                .add(self.membership.offset)
+                .cast::<MembershipWord>()
+        }
+    }
+
+    /// `false` proves no insert ever recorded this key.
+    #[cfg(test)]
+    #[inline]
+    fn membership_maybe_contains(&self, key_hash: u64) -> bool {
+        let words = self.membership.words;
+        if words == 0 {
+            return false;
+        }
+        let bits = MembershipKey::from_signature(key_hash).bits();
+        let word = MembershipKey::word(key_hash, words);
+        // SAFETY: `word` is a multiply-high reduction below `words`, and the
+        // arena's tail holds exactly that many zero-initialized words.
+        unsafe { *self.membership_ptr().add(word) & bits == bits }
+    }
+
+    /// Loads this key's filter word without testing it, so a lookup can run the
+    /// probe's mix chain while the load is in flight.
+    #[inline]
+    fn membership_gate(&self, key_hash: u64) -> MembershipGate {
+        let words = self.membership.words;
+        if words == 0 {
+            return MembershipGate {
+                word: 0,
+                bits: u64::MAX,
+            };
+        }
+        let word = MembershipKey::word(key_hash, words);
+        MembershipGate {
+            // SAFETY: as in `membership_maybe_contains`.
+            word: unsafe { *self.membership_ptr().add(word) },
+            bits: MembershipKey::from_signature(key_hash).bits(),
+        }
+    }
+
+    /// Records a key, including entries exceptional recovery places outside
+    /// their funnel.
+    #[inline]
+    fn record_membership(&mut self, key_hash: u64) {
+        let words = self.membership.words;
+        if words != 0 {
+            let bits = MembershipKey::from_signature(key_hash).bits();
+            let word = MembershipKey::word(key_hash, words);
+            // SAFETY: as in `membership_maybe_contains`.
+            unsafe { *self.membership_ptr().add(word) |= bits };
+        }
+    }
+
+    fn clear_membership(&mut self) {
+        let words = self.membership.words;
+        if words != 0 {
+            unsafe { core::ptr::write_bytes(self.membership_ptr(), 0, words) };
+        }
+    }
+
+    fn copy_membership_from(&mut self, source: &Self) {
+        let words = self.membership.words;
+        debug_assert_eq!(words, source.membership.words);
+        if words != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source.membership_ptr(),
+                    self.membership_ptr(),
+                    words,
+                );
+            }
+        }
+    }
+
     fn find_location<Q>(&self, key: &Q, key_hash: u64, key_fingerprint: u8) -> Option<usize>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        match self.search_exact(key, key_hash, key_fingerprint) {
+        // Issue the filter load, then prepare the probe while it is in flight. A
+        // key the filter never recorded was never inserted, so neither the walk
+        // nor the exceptional full scan can find it.
+        let gate = self.membership_gate(key_hash);
+        let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
+        if !gate.passes() {
+            return None;
+        }
+        match self.search_exact_prepared(key, probe, key_fingerprint) {
             SearchResult::Hit(slot) => Some(slot),
             _ if self.exceptional_placement => self.find_by_full_scan(key, key_fingerprint),
             _ => None,
@@ -779,12 +962,14 @@ where
         slot: usize,
         key: K,
         value: V,
+        key_hash: u64,
         key_fingerprint: u8,
         exceptional: bool,
     ) -> usize {
         let was_tombstone = self.storage.control_at(slot) == CTRL_TOMBSTONE;
         self.storage
             .write_with_control(slot, SlotEntry { key, value }, key_fingerprint);
+        self.record_membership(key_hash);
         self.len += 1;
         if was_tombstone {
             self.tombstones -= 1;
@@ -808,7 +993,7 @@ where
             ),
             SearchResult::Hit(_) => unreachable!("rebuild input contains duplicate keys"),
         };
-        self.place_new_entry(slot, key, value, key_fingerprint, exceptional);
+        self.place_new_entry(slot, key, value, key_hash, key_fingerprint, exceptional);
         exceptional
     }
 
@@ -838,6 +1023,7 @@ where
         &mut self,
         key: K,
         value: V,
+        key_hash: u64,
         key_fingerprint: u8,
         exact: SearchResult,
     ) -> usize {
@@ -850,7 +1036,8 @@ where
                 true,
             ),
         };
-        let location = self.place_new_entry(slot, key, value, key_fingerprint, exceptional);
+        let location =
+            self.place_new_entry(slot, key, value, key_hash, key_fingerprint, exceptional);
         if exceptional {
             self.epoch.start_placement_recovery(self.len);
         }
@@ -861,21 +1048,21 @@ where
         self.prepare_vacant_insert();
         let key_fingerprint = control::control_fingerprint(key_hash);
         let exact = self.search_exact_for_insert(&key, key_hash, key_fingerprint);
-        self.place_absent_after_search(key, value, key_fingerprint, exact)
+        self.place_absent_after_search(key, value, key_hash, key_fingerprint, exact)
     }
 
     fn resize_with_transition(&mut self, slots: usize, transition: EpochTransition) {
         let shape = FunnelShape::from_slots(slots, self.reserve_fraction)
             .expect("compatible Funnel resize geometry");
-        let (new_arena, new_storage) =
-            try_allocate_storage(shape.n, &self.alloc).unwrap_or_else(|_| {
-                let (layout, _, _) =
-                    funnel_layout::<K, V>(shape.n).expect("constructed Funnel layout");
-                allocator_api2::alloc::handle_alloc_error(layout)
+        let (new_arena, new_storage, new_membership) = try_allocate_storage(shape.n, &self.alloc)
+            .unwrap_or_else(|_| {
+                let shape = funnel_layout::<K, V>(shape.n).expect("constructed Funnel layout");
+                allocator_api2::alloc::handle_alloc_error(shape.layout)
             });
 
         let old_arena = mem::replace(&mut self.arena, new_arena);
         let old_storage = mem::replace(&mut self.storage, new_storage);
+        self.membership = new_membership;
         self.shape = shape;
         self.len = 0;
         self.tombstones = 0;
@@ -1031,7 +1218,7 @@ where
         if self.prepare_vacant_insert() {
             exact = self.search_exact_for_insert(&key, hash, fingerprint);
         }
-        self.place_absent_after_search(key, value, fingerprint, exact);
+        self.place_absent_after_search(key, value, hash, fingerprint, exact);
         None
     }
 
@@ -1146,6 +1333,7 @@ where
         });
         debug_assert_eq!(self.len, 0);
         self.exceptional_placement = false;
+        self.clear_membership();
         self.epoch.start(EpochTransition::Clear, 0);
     }
 
@@ -1154,6 +1342,7 @@ where
         self.len = 0;
         self.tombstones = 0;
         self.exceptional_placement = false;
+        self.clear_membership();
         self.epoch.start(EpochTransition::Clear, 0);
     }
 
@@ -1183,6 +1372,8 @@ where
         cloned.tombstones = self.tombstones;
         cloned.epoch = self.epoch;
         cloned.exceptional_placement = self.exceptional_placement;
+        // Slots are copied rather than reinserted, so the filter comes with them.
+        cloned.copy_membership_from(self);
         cloned
     }
 }
@@ -1321,8 +1512,9 @@ mod tests {
         for key in 0..256_u64 {
             let hash = table.hash_builder.hash_one(key);
             let fingerprint = control::control_fingerprint(hash);
-            let clean = table.search_exact_mode::<_, true>(&key, hash, fingerprint);
-            let dirty = table.search_exact_mode::<_, false>(&key, hash, fingerprint);
+            let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(hash);
+            let clean = table.search_exact_mode::<_, true>(&key, probe, fingerprint);
+            let dirty = table.search_exact_mode::<_, false>(&key, probe, fingerprint);
             assert_eq!(clean, dirty, "key={key}");
         }
     }
@@ -1470,6 +1662,8 @@ mod tests {
                 table
                     .storage
                     .write_with_control(slot, SlotEntry { key, value: key }, fingerprint);
+                // Placing a slot directly still owes the filter its record.
+                table.record_membership(key);
                 table.len += 1;
             }
         }
@@ -1596,6 +1790,105 @@ mod tests {
             direct,
             table.storage.slot_ptr(second_bucket_slot_one).cast_const()
         );
+    }
+
+    #[test]
+    fn membership_filter_records_every_inserted_key() {
+        let mut table = raw_table(512, 3);
+        for key in 0..200_u64 {
+            table.insert_for_vacant_entry(key, key, key);
+        }
+        for key in 0..200_u64 {
+            assert!(
+                table.membership_maybe_contains(key),
+                "inserted key {key} must pass its own filter"
+            );
+            assert_eq!(
+                table.find_location(&key, key, control::control_fingerprint(key)),
+                Some(
+                    table
+                        .find_by_full_scan(&key, control::control_fingerprint(key))
+                        .unwrap()
+                ),
+                "filter must not hide key {key}"
+            );
+        }
+        // Identity hashing here, so absent keys must carry their own spread the
+        // way a real hasher's output would.
+        let absent = (1..=500_u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let rejected = absent
+            .filter(|&key| !table.membership_maybe_contains(key))
+            .count();
+        assert!(
+            rejected > 400,
+            "filter rejected only {rejected} of 500 absent keys"
+        );
+    }
+
+    #[test]
+    fn membership_filter_keeps_survivors_after_removals() {
+        let mut table = raw_table(512, 3);
+        for key in 0..200_u64 {
+            table.insert_for_vacant_entry(key, key, key);
+        }
+        for key in (0..200_u64).step_by(2) {
+            let slot = table
+                .find_location(&key, key, control::control_fingerprint(key))
+                .expect("inserted key is present");
+            <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::remove(&mut table, slot);
+        }
+        for key in (1..200_u64).step_by(2) {
+            assert!(
+                table
+                    .find_location(&key, key, control::control_fingerprint(key))
+                    .is_some(),
+                "removals must not clear the filter bits of surviving key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_filter_survives_growth_and_clone() {
+        let mut table = raw_table(512, 3);
+        let start_slots = table.shape.n;
+        let mut key = 0_u64;
+        while table.shape.n == start_slots {
+            table.insert_for_vacant_entry(key, key, key);
+            key += 1;
+        }
+        assert!(table.shape.n > start_slots, "growth must have happened");
+        let cloned = <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clone_table(&table);
+        for probe in 0..key {
+            assert!(
+                table.membership_maybe_contains(probe),
+                "growth must rebuild the filter for key {probe}"
+            );
+            assert!(
+                cloned
+                    .find_location(&probe, probe, control::control_fingerprint(probe))
+                    .is_some(),
+                "clone must carry the filter for key {probe}"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_filter_is_reset_by_clear_and_wipe() {
+        for wipe in [false, true] {
+            let mut table = raw_table(512, 3);
+            for key in 0..200_u64 {
+                table.insert_for_vacant_entry(key, key, key);
+            }
+            if wipe {
+                <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::wipe_all(&mut table);
+            } else {
+                <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clear(&mut table);
+            }
+            let recorded = (0..200_u64)
+                .filter(|&key| table.membership_maybe_contains(key))
+                .count();
+            assert_eq!(recorded, 0, "reset must clear every filter word");
+        }
     }
 
     #[test]

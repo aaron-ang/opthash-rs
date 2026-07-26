@@ -222,15 +222,13 @@ impl PreparedElasticProbe {
         self.key
     }
 
-    #[allow(clippy::inline_always)]
     #[allow(clippy::cast_lossless)]
-    #[inline(always)]
+    #[inline]
     const fn word_from_packed(self, counter: u32) -> u64 {
         mix64(counter as u64 ^ self.key) ^ self.key
     }
 
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
+    #[inline]
     fn word_from_counter_base(self, counter_base: u32, rejection_index: u32) -> u64 {
         debug_assert_eq!(counter_base & ELASTIC_REJECTION_MASK, 0);
         debug_assert!(rejection_index < ELASTIC_REJECTION_LIMIT);
@@ -248,8 +246,7 @@ impl PreparedFastFunnelProbe {
         Some(self.prepare_counter_base(counter_base))
     }
 
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
+    #[inline]
     pub(crate) const fn prepare_counter_base(
         self,
         counter_base: u64,
@@ -263,8 +260,7 @@ impl PreparedFastFunnelProbe {
 }
 
 impl PreparedFastFunnelDomainProbe {
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
+    #[inline]
     fn word_from_indices(self, logical_probe_index: u8, rejection_index: u8) -> u64 {
         let counter =
             self.counter_base | (u64::from(logical_probe_index) << 8) | u64::from(rejection_index);
@@ -432,8 +428,8 @@ pub(crate) fn unbiased_probe_index<O: ProbeOracle + ?Sized>(
     })
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::inline_always)]
-#[inline(always)]
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
 pub(crate) fn unbiased_prepared_elastic_probe_index(
     probe: PreparedElasticProbe,
     counter_base: u32,
@@ -466,8 +462,8 @@ pub(crate) fn unbiased_prepared_elastic_probe_index(
     reduce_prepared_elastic_non_power(probe, counter_base, upper, max_random_words)
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::inline_always)]
-#[inline(always)]
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
 pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
     probe: &PreparedFastFunnelDomainProbe,
     logical_probe_index: u8,
@@ -535,8 +531,8 @@ fn reduce_prepared_elastic_non_power(
     })
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::inline_always)]
-#[inline(always)]
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
 fn reduce_probe_words(
     upper: usize,
     max_random_words: u32,
@@ -814,8 +810,7 @@ fn append_bit(prefix: u128, bit: u128) -> Option<u128> {
 
 #[cfg(test)]
 impl PreparedFastFunnelProbe {
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
+    #[inline]
     fn word_from_counter(self, counter: u64) -> u64 {
         mix64(counter ^ self.key_in) ^ self.key_out
     }
