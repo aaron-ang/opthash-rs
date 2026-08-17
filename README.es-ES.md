@@ -1,5 +1,3 @@
-
-
 # opthash
 
 [![Crates.io](https://img.shields.io/crates/v/opthash?logo=rust&label=crates.io)](https://crates.io/crates/opthash)
