@@ -527,12 +527,9 @@ unsafe fn scan_clean_funnel_bucket<T>(
     BucketScanResult::Full
 }
 
-/// First free (EMPTY or TOMBSTONE) slot among `length` logical controls.
-///
-/// This is the slot the general scan returns as `Vacant` for a key that is
-/// not in the bucket: the earliest tombstone if one precedes the terminating
-/// EMPTY, otherwise that EMPTY. It skips the fingerprint mask and the key
-/// compares because the caller already knows the key is absent.
+/// First free (EMPTY or TOMBSTONE) slot among `length` logical controls: the
+/// slot the general scan reports as `Vacant` for a key absent from the bucket,
+/// without the fingerprint mask or key compares.
 ///
 /// # Safety
 ///
@@ -894,20 +891,17 @@ where
         first_tombstone.map_or(SearchResult::Full, SearchResult::Vacant)
     }
 
-    /// Placement walk for a key already known to be absent.
+    /// Placement walk for a key already known to be absent: the buckets of
+    /// `search_exact_mode` in the same order, returning the first free slot,
+    /// which is the `Vacant` slot the exact search reports for an absent key.
+    /// No fingerprint mask, no key compares, never `Hit`.
     ///
-    /// Visits the same buckets in the same order as `search_exact_mode` and
-    /// returns the first free slot it meets, which is exactly the `Vacant`
-    /// slot the exact search reports for an absent key: the earliest tombstone
-    /// on the walk if one precedes the terminating EMPTY, otherwise that
-    /// EMPTY. Because the key cannot be present, the walk never loads a
-    /// fingerprint mask or compares a key, and never returns `Hit`.
-    ///
-    /// The ordinary-level loop is forced inline into each insert path: it
-    /// keeps ten registers plus a vector constant live, so as a call it spent
-    /// more on its prologue and epilogue than on the walk itself. The
-    /// special-array tail stays out of line because almost every insert finds
-    /// its slot in the funnel.
+    /// Forced inline: the loop keeps ten registers plus a vector constant
+    /// live, so as a call it spent more on prologue and epilogue than on the
+    /// walk. The special-array tail stays out of line because almost every
+    /// insert finds its slot in the funnel. It duplicates the exact search's
+    /// special leg on purpose: routing both through one closure-driven walker
+    /// cost the exact search instructions on every miss at full load.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn search_vacancy(&self, probe: PreparedFastFunnelProbe) -> SearchResult {

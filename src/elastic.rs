@@ -467,11 +467,9 @@ fn clone_probe_schedule(source: &[PhiRoute], level_count: usize) -> Vec<PhiRoute
 /// Schedule paper batches and allocation-epoch boundaries.
 ///
 /// The active batch is a function of the live count alone: batch `i` covers
-/// the insertions whose position lies in `[batch_ends[i-1], batch_ends[i])`,
-/// the same prefix-sum test the scalar oracle applies. Under deletion the
-/// batch therefore tracks occupancy rather than an insert tally that only
-/// grows. The active index and its bounds are cached, so a placement costs
-/// two compares against `len` and no per-insert store.
+/// positions in `[batch_ends[i-1], batch_ends[i])`, the prefix-sum test the
+/// scalar oracle applies, so under deletion it tracks occupancy rather than
+/// an insert tally. The active window is cached: two compares per placement.
 #[derive(Clone)]
 pub(crate) struct BatchScheduler {
     /// Cumulative quota through each batch: the exclusive `len` bound at
@@ -534,12 +532,6 @@ impl BatchScheduler {
             return InsertAction::Resize(new_cap);
         }
         InsertAction::Continue
-    }
-
-    /// Batch quota of the first paper batch (the bootstrap batch).
-    #[cfg(test)]
-    fn bootstrap_quota(&self) -> usize {
-        self.batch_ends.first().copied().unwrap_or(0)
     }
 
     /// [`Self::target`] on a copy, for assertions through a shared borrow.
@@ -1251,11 +1243,7 @@ where
     fn remove(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
         let kv = self.take_and_tombstone(level_idx, slot_idx);
         self.stale_membership += 1;
-        if self.levels[level_idx].needs_cleanup() {
-            self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
-        } else if self.stale_membership > membership::refresh_deletes(self.max_insertions) {
-            self.refresh_membership();
-        }
+        self.settle_after_deletes(self.levels[level_idx].needs_cleanup());
         kv
     }
 
@@ -1278,11 +1266,7 @@ where
     }
 
     fn finish_deferred_removals(&mut self) {
-        if self.levels.iter().any(Level::needs_cleanup) {
-            self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
-        } else if self.stale_membership > membership::refresh_deletes(self.max_insertions) {
-            self.refresh_membership();
-        }
+        self.settle_after_deletes(self.levels.iter().any(Level::needs_cleanup));
     }
 
     // -- Iterate --
@@ -1436,6 +1420,17 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
+    /// Same-size cleanup when a level passed its tombstone threshold; otherwise
+    /// a filter refresh once departed keys passed theirs. The cleanup rebuilds
+    /// the filter too, so the two never stack.
+    fn settle_after_deletes(&mut self, needs_cleanup: bool) {
+        if needs_cleanup {
+            self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
+        } else if self.stale_membership > membership::refresh_deletes(self.max_insertions) {
+            self.refresh_membership();
+        }
+    }
+
     /// Re-record the filter from the live entries, dropping the bits departed
     /// keys left behind. Entries stay put; only the metadata tail is rewritten.
     #[cold]
@@ -2541,7 +2536,7 @@ mod tests {
     #[test]
     fn normal_inserts_advance_batch_scheduler() {
         let mut map: ElasticHashMap<usize, usize> = ElasticHashMap::with_capacity(1024);
-        let initial_quota = map.table().scheduler.bootstrap_quota();
+        let initial_quota = map.table().scheduler.batch_ends[0];
         assert!(
             initial_quota > 0,
             "test requires a non-empty bootstrap batch"
@@ -2570,7 +2565,7 @@ mod tests {
     #[test]
     fn batch_target_follows_the_live_count_in_both_directions() {
         let mut map: ElasticHashMap<usize, usize> = ElasticHashMap::with_capacity(1024);
-        let quota = map.table().scheduler.bootstrap_quota();
+        let quota = map.table().scheduler.batch_ends[0];
         assert!(quota > 0);
 
         for key in 0..=quota {
@@ -3271,7 +3266,7 @@ mod tests {
                 DefaultHashBuilder::default(),
                 Global,
             );
-        let initial_quota = table.scheduler.bootstrap_quota();
+        let initial_quota = table.scheduler.batch_ends[0];
         assert!(
             initial_quota > 0,
             "test requires a non-empty bootstrap batch"
