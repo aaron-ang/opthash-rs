@@ -2,15 +2,6 @@ import collections.abc as abc
 
 import pytest
 
-import opthash
-
-SET_CLASSES = [opthash.ElasticHashSet, opthash.FunnelHashSet]
-
-
-@pytest.fixture(params=SET_CLASSES, ids=["elastic", "funnel"])
-def set_cls(request):
-    return request.param
-
 
 def test_registered_as_mutable_set(set_cls):
     assert issubclass(set_cls, abc.MutableSet)

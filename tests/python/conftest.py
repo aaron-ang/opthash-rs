@@ -11,6 +11,14 @@ def map_cls(request):
     return request.param
 
 
+@pytest.fixture(
+    params=[opthash.ElasticHashSet, opthash.FunnelHashSet],
+    ids=["elastic", "funnel"],
+)
+def set_cls(request):
+    return request.param
+
+
 @pytest.fixture
 def m(map_cls):
     return map_cls(capacity=16)
