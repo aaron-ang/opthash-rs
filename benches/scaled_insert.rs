@@ -26,7 +26,7 @@ fn bench_scaled_insert(c: &mut Criterion) {
         let mut group = c.benchmark_group(&workload);
         group.sample_size(harness::scaled_insert_sample_size(size));
         group.throughput(Throughput::Elements(size as u64));
-        bench_insert_reuse_named!(group, &workload, size, &pairs);
+        bench_insert_reuse!(group, &workload, size, &pairs);
         group.finish();
     }
 }
