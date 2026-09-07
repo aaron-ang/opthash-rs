@@ -136,10 +136,13 @@ impl CounterPrf {
         Self { seed }
     }
 
+    /// Keys the hash without a finaliser. Every probe word still passes through
+    /// `mix64` against the counter, so the permutation keeps its avalanche; the
+    /// routing signature is the keyed hash itself, like the Funnel `key_in`.
     #[inline]
     pub(crate) fn prepare_elastic(self, key_hash: u64) -> PreparedElasticProbe {
         PreparedElasticProbe {
-            key: mix64(key_hash.wrapping_add(self.seed).wrapping_add(INITIAL_LANE)),
+            key: key_hash.wrapping_add(self.seed).wrapping_add(INITIAL_LANE),
         }
     }
 }
@@ -921,16 +924,16 @@ mod tests {
     fn elastic_counter_permutation_has_fixed_golden_vectors() {
         let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
         let cases = [
-            (0, 0, 0, 0, 0x0000_0000, 0xf0cb_0007_ca53_5abb),
-            (1, 31, 8_191, 7, 0x001f_ffff, 0x5a62_1f05_cd18_07c7),
-            (u64::MAX, 17, 383, 7, 0x0011_0bff, 0x7b70_60ae_c610_3d7b),
+            (0, 0, 0, 0, 0x0000_0000, 0xa672_f2f4_5fc9_0bed),
+            (1, 31, 8_191, 7, 0x001f_ffff, 0x728c_b5c3_2967_b861),
+            (u64::MAX, 17, 383, 7, 0x0011_0bff, 0x3472_0d88_ba17_9868),
             (
                 0xd1b5_4a32_d192_ed03,
                 7,
                 7_687,
                 0,
                 0x0007_f038,
-                0x0eb0_04e6_de14_634e,
+                0x8778_e64f_a636_f5ca,
             ),
         ];
         for (key, level, logical_probe, rejection, counter, word) in cases {
