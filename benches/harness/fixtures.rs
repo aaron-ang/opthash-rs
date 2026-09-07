@@ -184,14 +184,3 @@ pairs_builders!(BigVal;
     build_elastic_big_map => ElasticHashMap,
     build_funnel_big_map => FunnelHashMap,
 );
-
-#[must_use]
-pub fn size_label(size: usize) -> String {
-    if size >= 1_000_000 {
-        format!("{}M", size / 1_000_000)
-    } else if size >= 1_000 {
-        format!("{}K", size / 1_000)
-    } else {
-        format!("{size}")
-    }
-}
