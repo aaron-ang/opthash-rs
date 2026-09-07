@@ -731,7 +731,7 @@ where
         alloc: A,
     ) -> Result<Self, TryBuildError> {
         let geometry = ElasticGeometry::for_insert_budget(capacity, reserve_fraction)
-            .ok_or(TryBuildError::CapacityOverflow)?;
+            .ok_or(TryBuildError::Reserve(TryReserveError::CapacityOverflow))?;
         Self::try_from_geometry(&geometry, reserve_fraction, hash_builder, alloc)
             .map_err(Into::into)
     }
@@ -2673,7 +2673,10 @@ mod tests {
                 IdentityBuildHasher,
                 alloc.clone(),
             );
-        assert!(matches!(failed, Err(TryBuildError::AllocError)));
+        assert!(matches!(
+            failed,
+            Err(TryBuildError::Reserve(TryReserveError::AllocError))
+        ));
 
         fail.store(false, Ordering::SeqCst);
         let mut map = ElasticHashMap::<u64, u64, IdentityBuildHasher, ToggleAllocator>::
