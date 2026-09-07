@@ -20,11 +20,10 @@ pub(crate) fn word_count(total_slots: usize) -> usize {
 
 /// Deletes a filter tolerates before it is re-recorded from the live entries.
 ///
-/// Bits are never cleared one key at a time, so every departed key leaves its
-/// bits set and the filter's load grows with churn until nearly every gate
-/// passes. Once the departed records match the live capacity the load has
-/// doubled and false positives roughly tripled; re-recording then costs one
-/// hash per live entry, a few instructions per delete amortised.
+/// Bits are never cleared per key, so departed keys raise the filter's load
+/// until nearly every gate passes. One capacity's worth of departures doubles
+/// the load; re-recording then costs one hash per live entry, amortised to a
+/// few instructions per delete.
 #[inline]
 #[must_use]
 pub(crate) const fn refresh_deletes(max_insertions: usize) -> usize {
