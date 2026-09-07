@@ -1572,15 +1572,7 @@ where
             self.alloc.clone(),
         )
         .unwrap_or_else(|error| panic!("Funnel clone allocation failed: {error}"));
-        for slot in 0..self.shape.n {
-            let ctrl = self.storage.control_at(slot);
-            if ctrl.is_occupied() {
-                let entry = unsafe { self.storage.get_ref(slot) }.clone();
-                cloned.storage.write_with_control(slot, entry, ctrl);
-            } else if ctrl == CTRL_TOMBSTONE {
-                cloned.storage.mark_tombstone(slot);
-            }
-        }
+        cloned.storage.clone_region_from(&self.storage);
         cloned.len = self.len;
         cloned.tombstones = self.tombstones;
         cloned.epoch = self.epoch;
