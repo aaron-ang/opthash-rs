@@ -873,7 +873,7 @@ where
         }
     }
 
-    #[inline(never)]
+    #[inline]
     fn record_membership(
         &mut self,
         route: PreparedElasticRoute,
