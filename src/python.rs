@@ -764,22 +764,15 @@ macro_rules! define_map_classes {
                 )
             }
 
-            fn __iter__(slf: Bound<Self>) -> $KeyIter {
+            fn __iter__(slf: &Bound<Self>) -> $KeyIter {
                 let py = slf.py();
-                let m = slf.borrow();
-                let snapshot = m
+                let snapshot = slf
+                    .borrow()
                     .inner
                     .iter()
                     .map(|(k, _)| Some(k.obj_clone_ref(py)))
                     .collect();
-                let expected_gen = m.generation;
-                drop(m);
-                $KeyIter {
-                    map: slf.unbind(),
-                    snapshot,
-                    expected_gen,
-                    pos: 0,
-                }
+                $KeyIter::new(slf, snapshot)
             }
 
             fn keys(slf: Bound<Self>) -> $KeysView {
@@ -914,18 +907,14 @@ macro_rules! define_map_classes {
         #[pymethods]
         impl $KeysView {
             fn __iter__(&self, py: Python) -> $KeyIter {
-                let m = self.map.borrow(py);
-                let snapshot = m
+                let owner = self.map.bind(py);
+                let snapshot = owner
+                    .borrow()
                     .inner
                     .iter()
                     .map(|(k, _)| Some(k.obj_clone_ref(py)))
                     .collect();
-                $KeyIter {
-                    map: self.map.clone_ref(py),
-                    snapshot,
-                    expected_gen: m.generation,
-                    pos: 0,
-                }
+                $KeyIter::new(owner, snapshot)
             }
             fn __len__(&self, py: Python) -> usize {
                 self.map.borrow(py).inner.len()
@@ -985,14 +974,14 @@ macro_rules! define_map_classes {
         #[pymethods]
         impl $ValuesView {
             fn __iter__(&self, py: Python) -> $ValueIter {
-                let m = self.map.borrow(py);
-                let snapshot = m.inner.iter().map(|(_, v)| Some(v.clone_ref(py))).collect();
-                $ValueIter {
-                    map: self.map.clone_ref(py),
-                    snapshot,
-                    expected_gen: m.generation,
-                    pos: 0,
-                }
+                let owner = self.map.bind(py);
+                let snapshot = owner
+                    .borrow()
+                    .inner
+                    .iter()
+                    .map(|(_, v)| Some(v.clone_ref(py)))
+                    .collect();
+                $ValueIter::new(owner, snapshot)
             }
             fn __len__(&self, py: Python) -> usize {
                 self.map.borrow(py).inner.len()
@@ -1030,8 +1019,9 @@ macro_rules! define_map_classes {
         #[pymethods]
         impl $ItemsView {
             fn __iter__(&self, py: Python) -> PyResult<$ItemIter> {
-                let m = self.map.borrow(py);
-                let snapshot: PyResult<Vec<Option<Py<PyAny>>>> = m
+                let owner = self.map.bind(py);
+                let snapshot: PyResult<Vec<Option<Py<PyAny>>>> = owner
+                    .borrow()
                     .inner
                     .iter()
                     .map(|(k, v)| {
@@ -1039,12 +1029,7 @@ macro_rules! define_map_classes {
                         Ok(Some(tup.into_any().unbind()))
                     })
                     .collect();
-                Ok($ItemIter {
-                    map: self.map.clone_ref(py),
-                    snapshot: snapshot?,
-                    expected_gen: m.generation,
-                    pos: 0,
-                })
+                Ok($ItemIter::new(owner, snapshot?))
             }
             fn __len__(&self, py: Python) -> usize {
                 self.map.borrow(py).inner.len()
@@ -1127,6 +1112,18 @@ macro_rules! define_iter {
             snapshot: Vec<Option<Py<PyAny>>>,
             expected_gen: u64,
             pos: usize,
+        }
+
+        impl $Iter {
+            /// Pin `snapshot` to `owner`'s current generation.
+            fn new(owner: &Bound<$PyMap>, snapshot: Vec<Option<Py<PyAny>>>) -> Self {
+                Self {
+                    map: owner.clone().unbind(),
+                    snapshot,
+                    expected_gen: owner.borrow().generation,
+                    pos: 0,
+                }
+            }
         }
 
         #[pymethods]
@@ -1529,18 +1526,15 @@ macro_rules! define_set_classes {
                 Ok(self.inner.contains(probe.as_key()))
             }
 
-            fn __iter__(slf: Bound<Self>) -> $KeyIter {
+            fn __iter__(slf: &Bound<Self>) -> $KeyIter {
                 let py = slf.py();
-                let m = slf.borrow();
-                let snapshot = m.inner.iter().map(|k| Some(k.obj_clone_ref(py))).collect();
-                let expected_gen = m.generation;
-                drop(m);
-                $KeyIter {
-                    map: slf.unbind(),
-                    snapshot,
-                    expected_gen,
-                    pos: 0,
-                }
+                let snapshot = slf
+                    .borrow()
+                    .inner
+                    .iter()
+                    .map(|k| Some(k.obj_clone_ref(py)))
+                    .collect();
+                $KeyIter::new(slf, snapshot)
             }
 
             fn __repr__(&self) -> String {
