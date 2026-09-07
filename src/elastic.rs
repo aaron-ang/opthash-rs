@@ -195,6 +195,9 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     probe_schedule: Vec<PhiRoute>,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
+    /// Deletes since the filter last matched the live set; see
+    /// [`membership::refresh_deletes`].
+    stale_membership: usize,
 }
 
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
@@ -396,17 +399,32 @@ const _: () = assert!(mem::size_of::<PreparedElasticKey>() == 16);
 struct ElasticRouteFilter {
     /// `false` proves no insert ever recorded this key's route.
     maybe_present: bool,
-    /// Levels this route bin has occupied, or every level when the geometry has
-    /// more levels than the summary tracks.
+    /// Summary bits of the levels this route bin has occupied. Bit `i` covers
+    /// level `i` for `i < ROUTE_SUMMARY_LEVELS - 1`; the last bit is saturating
+    /// and covers every deeper level.
     level_mask: u32,
 }
 
+impl ElasticRouteFilter {
+    /// Widens the saturating last summary bit over every level index it stands
+    /// for, so a lookup tests `1 << level` directly instead of clamping the
+    /// level on each schedule step.
+    #[inline]
+    const fn expanded_level_mask(self) -> u32 {
+        let saturated = (self.level_mask >> (ROUTE_SUMMARY_LEVELS - 1)) & 1;
+        self.level_mask | (0_u32.wrapping_sub(saturated) << (ROUTE_SUMMARY_LEVELS - 1))
+    }
+}
+
+/// Maps a level index onto its route-summary bit. Levels past the summary's
+/// width share the last bit, so a wide geometry still narrows every shallow
+/// level instead of disabling the summary outright.
 #[inline]
-const fn expand_summary_level_mask(mask: u16, level_count: usize) -> u32 {
-    if level_count > ROUTE_SUMMARY_LEVELS {
-        u32::MAX
+const fn summary_level(level: usize) -> usize {
+    if level < ROUTE_SUMMARY_LEVELS - 1 {
+        level
     } else {
-        mask as u32
+        ROUTE_SUMMARY_LEVELS - 1
     }
 }
 
@@ -447,11 +465,23 @@ fn clone_probe_schedule(source: &[PhiRoute], level_count: usize) -> Vec<PhiRoute
 }
 
 /// Schedule paper batches and allocation-epoch boundaries.
+///
+/// The active batch is a function of the live count alone: batch `i` covers
+/// the insertions whose position lies in `[batch_ends[i-1], batch_ends[i])`,
+/// the same prefix-sum test the scalar oracle applies. Under deletion the
+/// batch therefore tracks occupancy rather than an insert tally that only
+/// grows. The active index and its bounds are cached, so a placement costs
+/// two compares against `len` and no per-insert store.
 #[derive(Clone)]
 pub(crate) struct BatchScheduler {
-    batch_plan: Box<[usize]>,
+    /// Cumulative quota through each batch: the exclusive `len` bound at
+    /// which the batch ends. Zero-quota batches repeat the previous end.
+    batch_ends: Box<[usize]>,
     current_batch_index: usize,
-    batch_remaining: usize,
+    /// `batch_ends[current_batch_index - 1]`, or zero for the first batch.
+    batch_start: usize,
+    /// `batch_ends[current_batch_index]`, or `usize::MAX` for an empty plan.
+    batch_end: usize,
 }
 
 /// Direct the structural work required before insertion.
@@ -469,52 +499,63 @@ enum BatchTarget {
 }
 
 impl BatchScheduler {
-    pub(crate) fn new(batch_plan: Box<[usize]>) -> Self {
-        let initial_remaining = batch_plan.first().copied().unwrap_or(0);
-        Self {
-            batch_plan,
+    pub(crate) fn new(batch_plan: &[usize]) -> Self {
+        let mut total = 0_usize;
+        let batch_ends = batch_plan
+            .iter()
+            .map(|&quota| {
+                total = total.saturating_add(quota);
+                total
+            })
+            .collect::<Box<[usize]>>();
+        let mut scheduler = Self {
+            batch_ends,
             current_batch_index: 0,
-            batch_remaining: initial_remaining,
-        }
+            batch_start: 0,
+            batch_end: usize::MAX,
+        };
+        scheduler.reset();
+        scheduler
     }
 
     /// Select structural work for the next insert.
     #[inline]
     pub(crate) fn on_insert(
-        &mut self,
         current_len: usize,
         total_slots: usize,
         max_insertions: usize,
     ) -> InsertAction {
-        let structural_action =
-            Self::structural_action_for_next_insert(current_len, total_slots, max_insertions);
-        if let Some(action) = structural_action {
-            return action;
-        }
-        self.advance_batch_window();
-        InsertAction::Continue
-    }
-
-    #[inline]
-    fn structural_action_for_next_insert(
-        current_len: usize,
-        total_slots: usize,
-        max_insertions: usize,
-    ) -> Option<InsertAction> {
         if current_len >= max_insertions {
             let new_cap = if total_slots == 0 {
                 INITIAL_CAPACITY
             } else {
                 total_slots.saturating_mul(2)
             };
-            return Some(InsertAction::Resize(new_cap));
+            return InsertAction::Resize(new_cap);
         }
-        None
+        InsertAction::Continue
     }
 
-    /// Distinguish bootstrap placement from the level pair for later batches.
+    /// Batch quota of the first paper batch (the bootstrap batch).
+    #[cfg(test)]
+    fn bootstrap_quota(&self) -> usize {
+        self.batch_ends.first().copied().unwrap_or(0)
+    }
+
+    /// [`Self::target`] on a copy, for assertions through a shared borrow.
+    #[cfg(test)]
+    fn target_at(&self, len: usize) -> BatchTarget {
+        self.clone().target(len)
+    }
+
+    /// Distinguish bootstrap placement from the level pair for later batches,
+    /// for a table holding `len` live entries. Re-syncs the cached batch when
+    /// `len` has left its window; the common case is two compares.
     #[inline]
-    fn target(&self) -> BatchTarget {
+    fn target(&mut self, len: usize) -> BatchTarget {
+        if len >= self.batch_end || len < self.batch_start {
+            self.sync(len);
+        }
         if self.current_batch_index == 0 {
             BatchTarget::Bootstrap
         } else {
@@ -522,26 +563,26 @@ impl BatchScheduler {
         }
     }
 
-    /// Consume one insertion from the active batch.
-    #[inline]
-    fn complete_insert(&mut self) {
-        self.batch_remaining = self.batch_remaining.saturating_sub(1);
-    }
-
-    /// Skip exhausted and zero-quota batches.
-    #[inline]
-    pub(crate) fn advance_batch_window(&mut self) {
-        while self.batch_remaining == 0 && self.current_batch_index + 1 < self.batch_plan.len() {
-            self.current_batch_index += 1;
-            self.batch_remaining = self.batch_plan[self.current_batch_index];
+    /// Move the cached window to the batch covering `len`. Zero-quota batches
+    /// are never selected because their window is empty. Beyond the last end,
+    /// the last batch stays active.
+    #[cold]
+    #[inline(never)]
+    fn sync(&mut self, len: usize) {
+        let ends = &self.batch_ends;
+        if ends.is_empty() {
+            return;
         }
+        let index = ends.partition_point(|&end| end <= len).min(ends.len() - 1);
+        self.current_batch_index = index;
+        self.batch_start = if index == 0 { 0 } else { ends[index - 1] };
+        self.batch_end = ends[index];
     }
 
     /// Reset batch progress after resize or clear.
     #[inline]
     pub(crate) fn reset(&mut self) {
-        self.current_batch_index = 0;
-        self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
+        self.sync(0);
     }
 }
 
@@ -738,7 +779,7 @@ where
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(geometry.batch_plan),
+            scheduler: BatchScheduler::new(&geometry.batch_plan),
             hash_builder,
             alloc,
             arena,
@@ -746,6 +787,7 @@ where
             probe_high_water: 0,
             probe_schedule,
             membership,
+            stale_membership: 0,
         }
     }
 
@@ -768,7 +810,7 @@ where
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(geometry.batch_plan),
+            scheduler: BatchScheduler::new(&geometry.batch_plan),
             hash_builder,
             alloc,
             arena,
@@ -776,6 +818,7 @@ where
             probe_high_water: 0,
             probe_schedule,
             membership,
+            stale_membership: 0,
         })
     }
 
@@ -809,10 +852,7 @@ where
         let bits = prepared.membership.bits();
         ElasticRouteFilter {
             maybe_present: metadata.membership & bits == bits,
-            level_mask: expand_summary_level_mask(
-                metadata.route_bins[prepared.route.summary_bin()],
-                self.levels.len(),
-            ),
+            level_mask: u32::from(metadata.route_bins[prepared.route.summary_bin()]),
         }
     }
 
@@ -833,7 +873,7 @@ where
         }
     }
 
-    #[inline(never)]
+    #[inline]
     fn record_membership(
         &mut self,
         route: PreparedElasticRoute,
@@ -845,9 +885,7 @@ where
             let word = MembershipKey::word(route.signature(), words);
             let metadata = unsafe { &mut *self.membership_ptr().add(word) };
             metadata.membership |= membership.bits();
-            if self.levels.len() <= ROUTE_SUMMARY_LEVELS {
-                metadata.route_bins[route.summary_bin()] |= 1_u16 << level;
-            }
+            metadata.route_bins[route.summary_bin()] |= 1_u16 << summary_level(level);
         }
     }
 
@@ -856,6 +894,7 @@ where
         if words != 0 {
             unsafe { ptr::write_bytes(self.membership_ptr(), 0, words) };
         }
+        self.stale_membership = 0;
     }
 
     fn copy_membership_from(&mut self, source: &Self) {
@@ -911,28 +950,20 @@ where
         prepared: PreparedElasticKey,
         key_fingerprint: u8,
     ) -> (usize, usize) {
-        match self
-            .scheduler
-            .on_insert(self.len, self.total_slots, self.max_insertions)
+        if let InsertAction::Resize(cap) =
+            BatchScheduler::on_insert(self.len, self.total_slots, self.max_insertions)
         {
-            InsertAction::Resize(cap) => {
-                self.resize_with_transition(cap, EpochTransition::Growth);
-                self.scheduler.advance_batch_window();
-            }
-            InsertAction::Continue => {}
+            self.resize_with_transition(cap, EpochTransition::Growth);
         }
 
-        if let Some(placement) =
-            self.choose_slot_for_new_key(prepared.route.probe, self.scheduler.target())
-        {
+        let target = self.scheduler.target(self.len);
+        if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             return self.place_new_entry(key, value, prepared, key_fingerprint, placement);
         }
 
         self.resize_with_transition(self.total_slots, EpochTransition::PlacementRecovery);
-        self.scheduler.advance_batch_window();
-        if let Some(placement) =
-            self.choose_slot_for_new_key(prepared.route.probe, self.scheduler.target())
-        {
+        let target = self.scheduler.target(self.len);
+        if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             self.place_new_entry(key, value, prepared, key_fingerprint, placement)
         } else {
             self.place_exceptional_entry(key, value, prepared, key_fingerprint)
@@ -1007,7 +1038,6 @@ where
         }
         self.record_membership(prepared.route, prepared.membership, level_idx);
         self.len += 1;
-        self.scheduler.complete_insert();
         (level_idx, slot_idx)
     }
 
@@ -1220,9 +1250,11 @@ where
 
     fn remove(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
         let kv = self.take_and_tombstone(level_idx, slot_idx);
-        let needs_resize = self.levels[level_idx].needs_cleanup();
-        if needs_resize {
+        self.stale_membership += 1;
+        if self.levels[level_idx].needs_cleanup() {
             self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
+        } else if self.stale_membership > membership::refresh_deletes(self.max_insertions) {
+            self.refresh_membership();
         }
         kv
     }
@@ -1241,12 +1273,15 @@ where
             level.tombstones += 1;
         }
         self.len -= 1;
+        self.stale_membership += 1;
         self.epoch.note_delete();
     }
 
     fn finish_deferred_removals(&mut self) {
         if self.levels.iter().any(Level::needs_cleanup) {
             self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
+        } else if self.stale_membership > membership::refresh_deletes(self.max_insertions) {
+            self.refresh_membership();
         }
     }
 
@@ -1381,6 +1416,7 @@ where
             probe_high_water: self.probe_high_water,
             probe_schedule,
             membership,
+            stale_membership: self.stale_membership,
         };
         cloned.copy_membership_from(self);
         cloned
@@ -1400,6 +1436,27 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
+    /// Re-record the filter from the live entries, dropping the bits departed
+    /// keys left behind. Entries stay put; only the metadata tail is rewritten.
+    #[cold]
+    #[inline(never)]
+    fn refresh_membership(&mut self) {
+        self.clear_membership();
+        for level_idx in 0..self.levels.len() {
+            for slot_idx in 0..self.levels[level_idx].capacity() {
+                if !self.levels[level_idx].control_at(slot_idx).is_occupied() {
+                    continue;
+                }
+                let hash = {
+                    let entry = unsafe { self.levels[level_idx].get_ref(slot_idx) };
+                    self.hash_key(&entry.key)
+                };
+                let prepared = PreparedElasticKey::new(hash);
+                self.record_membership(prepared.route, prepared.membership, level_idx);
+            }
+        }
+    }
+
     /// Insert `(key, value)` known to be new. Skips the existence check and
     /// capacity check in `insert`; resize loops drain old levels into fresh
     /// (all-EMPTY) ones, so neither check can succeed.
@@ -1410,8 +1467,7 @@ where
         let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
 
-        self.scheduler.advance_batch_window();
-        let target = self.scheduler.target();
+        let target = self.scheduler.target(self.len);
         if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             self.place_new_entry(key, value, prepared, key_fingerprint, placement);
             false
@@ -1443,8 +1499,9 @@ where
         let old_levels = mem::replace(&mut self.levels, new_levels);
         self.total_slots = geometry.total_slots;
         self.membership = MembershipRegion::for_arena::<K, V>(&self.arena, self.total_slots);
+        self.stale_membership = 0;
         self.max_insertions = geometry.max_insertions;
-        self.scheduler = BatchScheduler::new(geometry.batch_plan);
+        self.scheduler = BatchScheduler::new(&geometry.batch_plan);
         self.len = 0;
         self.probe_high_water = 0;
         self.probe_schedule.clear();
@@ -1554,7 +1611,7 @@ where
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(geometry.batch_plan),
+            scheduler: BatchScheduler::new(&geometry.batch_plan),
             hash_builder,
             alloc,
             arena,
@@ -1562,6 +1619,7 @@ where
             probe_high_water: 0,
             probe_schedule,
             membership,
+            stale_membership: 0,
         })
     }
 
@@ -1802,10 +1860,10 @@ where
             return None;
         }
 
+        let level_mask = filter.expanded_level_mask();
         for route in &self.probe_schedule {
             let level = route.level();
-            let level_bit = 1_u32 << level;
-            if filter.level_mask & level_bit == 0 {
+            if level_mask & (1_u32 << level) == 0 {
                 continue;
             }
             let upper = route.range_upper as usize;
@@ -2063,8 +2121,13 @@ mod tests {
             plan.level_lengths().collect::<Vec<_>>()
         );
         assert_eq!(
-            table.scheduler.batch_plan.as_ref(),
-            plan.batch_quotas().collect::<Vec<_>>()
+            table.scheduler.batch_ends.as_ref(),
+            plan.batch_quotas()
+                .scan(0_usize, |total, quota| {
+                    *total += quota;
+                    Some(*total)
+                })
+                .collect::<Vec<_>>()
         );
 
         let limits = ScalarElasticLimits::new(
@@ -2079,13 +2142,12 @@ mod tests {
             let prepared = PreparedElasticKey::new(identity);
             assert_eq!(table.hash_key(&identity), identity);
             assert!(matches!(
-                table
-                    .scheduler
-                    .on_insert(table.len, table.total_slots, table.max_insertions,),
+                BatchScheduler::on_insert(table.len, table.total_slots, table.max_insertions),
                 InsertAction::Continue
             ));
+            let target = table.scheduler.target(table.len);
             let placement = table
-                .choose_slot_for_new_key(prepared.route.probe, table.scheduler.target())
+                .choose_slot_for_new_key(prepared.route.probe, target)
                 .unwrap();
             let expected = scalar.insert(identity);
             let global_slot = table.levels[..placement.level]
@@ -2479,18 +2541,136 @@ mod tests {
     #[test]
     fn normal_inserts_advance_batch_scheduler() {
         let mut map: ElasticHashMap<usize, usize> = ElasticHashMap::with_capacity(1024);
-        let initial_quota = map.table().scheduler.batch_remaining;
+        let initial_quota = map.table().scheduler.bootstrap_quota();
         assert!(
             initial_quota > 0,
             "test requires a non-empty bootstrap batch"
         );
 
-        for key in 0..=initial_quota {
+        for key in 0..initial_quota {
             map.insert(key, key);
         }
+        // Positions `0..quota` were bootstrap placements; position `quota`,
+        // the next insert, opens the first level pair.
+        assert_eq!(
+            map.table().scheduler.target_at(initial_quota - 1),
+            BatchTarget::Bootstrap
+        );
+        assert_eq!(map.table().scheduler.current_batch_index, 0);
 
+        map.insert(initial_quota, initial_quota);
+        let len = map.len();
+        assert_eq!(
+            map.table().scheduler.target_at(len),
+            BatchTarget::LevelPair(0)
+        );
         assert!(map.table().scheduler.current_batch_index > 0);
-        assert_eq!(map.table().scheduler.target(), BatchTarget::LevelPair(0));
+    }
+
+    #[test]
+    fn batch_target_follows_the_live_count_in_both_directions() {
+        let mut map: ElasticHashMap<usize, usize> = ElasticHashMap::with_capacity(1024);
+        let quota = map.table().scheduler.bootstrap_quota();
+        assert!(quota > 0);
+
+        for key in 0..=quota {
+            map.insert(key, key);
+        }
+        let len = map.len();
+        assert_eq!(
+            map.table().scheduler.target_at(len),
+            BatchTarget::LevelPair(0)
+        );
+
+        // Two removals put the live count back inside the bootstrap window.
+        assert_eq!(map.remove(&0), Some(0));
+        assert_eq!(map.remove(&1), Some(1));
+        let len = map.len();
+        assert_eq!(map.table().scheduler.target_at(len), BatchTarget::Bootstrap);
+
+        // The scalar oracle's prefix-sum rule, restated: batch `i` holds the
+        // positions in `[ends[i-1], ends[i])`.
+        let ends = map.table().scheduler.batch_ends.clone();
+        let mut scheduler = map.table().scheduler.clone();
+        for len in 0..*ends.last().unwrap() {
+            let expected = ends.iter().position(|&end| len < end).unwrap();
+            let target = scheduler.target(len);
+            let index = match target {
+                BatchTarget::Bootstrap => 0,
+                BatchTarget::LevelPair(pair) => pair + 1,
+            };
+            assert_eq!(index, expected, "len {len}");
+        }
+    }
+
+    /// Churn past the refresh threshold must re-record the filter from the
+    /// live entries: departed keys stop passing the gate, live keys still do,
+    /// and their route summaries survive.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn deletes_past_the_threshold_refresh_the_membership_filter() {
+        let mut map: ElasticHashMap<u64, u64> = ElasticHashMap::with_capacity(2_048);
+        let live = map.capacity() as u64;
+        let threshold = membership::refresh_deletes(map.capacity()) as u64;
+        for key in 0..live {
+            map.insert(key, key);
+        }
+        let gate_passes = |map: &ElasticHashMap<u64, u64>, key: u64| {
+            let table = map.table();
+            let prepared = PreparedElasticKey::new(table.hash_key(&key));
+            table.route_filter(prepared).maybe_present
+        };
+
+        // A third of the keys: enough to matter, below every cleanup threshold.
+        let departed = (0..live).filter(|key| key % 3 == 0).collect::<Vec<_>>();
+        for &key in &departed {
+            assert_eq!(map.remove(&key), Some(key));
+        }
+        let generation = map.epoch().generation;
+        assert!(departed.iter().all(|&key| gate_passes(&map, key)));
+        assert_eq!(map.table().stale_membership as u64, departed.len() as u64);
+
+        // Cycling one fresh key re-takes the tombstone it left, so tombstones
+        // stay flat and no cleanup rebuild can run before the threshold.
+        let churn = live;
+        let mut cycles = 0_u64;
+        loop {
+            map.insert(churn, churn);
+            assert_eq!(map.remove(&churn), Some(churn));
+            cycles += 1;
+            if map.table().stale_membership == 0 {
+                break;
+            }
+            assert!(cycles <= threshold, "refresh never ran");
+        }
+        assert_eq!(cycles + departed.len() as u64, threshold + 1);
+        assert_eq!(map.epoch().generation, generation, "no rebuild ran");
+        assert_eq!(map.table().stale_membership, 0, "refresh resets the count");
+
+        for key in (0..live).filter(|key| key % 3 != 0) {
+            assert!(gate_passes(&map, key));
+            assert_eq!(map.get(&key), Some(&key));
+        }
+        let false_positives = departed
+            .iter()
+            .filter(|&&key| gate_passes(&map, key))
+            .count();
+        assert!(
+            false_positives * 4 < departed.len(),
+            "{false_positives} of {} departed keys still pass",
+            departed.len()
+        );
+
+        map.retain(|_, _| false);
+        for _ in 0..=threshold {
+            if map.table().stale_membership == 0 {
+                break;
+            }
+            map.insert(churn, churn);
+            map.remove(&churn);
+        }
+        assert_eq!(map.table().stale_membership, 0);
+        assert!((0..live).all(|key| !gate_passes(&map, key)));
     }
 
     #[test]
@@ -2498,12 +2678,14 @@ mod tests {
         let mut map: ElasticHashMap<u64, u64> = ElasticHashMap::with_capacity(64);
         assert_eq!(map.insert(7, 11), None);
         let batch = map.table().scheduler.current_batch_index;
-        let remaining = map.table().scheduler.batch_remaining;
+        let len = map.len();
+        let target = map.table().scheduler.target_at(len);
 
         assert_eq!(map.insert(7, 13), Some(11));
         assert_eq!(map.len(), 1);
         assert_eq!(map.table().scheduler.current_batch_index, batch);
-        assert_eq!(map.table().scheduler.batch_remaining, remaining);
+        let len = map.len();
+        assert_eq!(map.table().scheduler.target_at(len), target);
         assert_eq!(map.get(&7), Some(&13));
     }
 
@@ -2536,10 +2718,66 @@ mod tests {
     }
 
     #[test]
-    fn route_summary_filter_disables_above_its_sixteen_level_encoding() {
-        assert_eq!(expand_summary_level_mask(0x1234, 16), 0x1234);
-        assert_eq!(expand_summary_level_mask(0, 17), u32::MAX);
-        assert_eq!(expand_summary_level_mask(0, 32), u32::MAX);
+    fn route_summary_saturates_deep_levels_into_the_last_bit() {
+        assert_eq!(summary_level(0), 0);
+        assert_eq!(
+            summary_level(ROUTE_SUMMARY_LEVELS - 2),
+            ROUTE_SUMMARY_LEVELS - 2
+        );
+        assert_eq!(
+            summary_level(ROUTE_SUMMARY_LEVELS - 1),
+            ROUTE_SUMMARY_LEVELS - 1
+        );
+        assert_eq!(
+            summary_level(ROUTE_SUMMARY_LEVELS),
+            ROUTE_SUMMARY_LEVELS - 1
+        );
+        assert_eq!(summary_level(40), ROUTE_SUMMARY_LEVELS - 1);
+
+        // Expansion is the inverse view: the saturating bit covers every level
+        // index at or past it, and a clear bit widens to nothing.
+        let filter = |level_mask| ElasticRouteFilter {
+            maybe_present: true,
+            level_mask,
+        };
+        assert_eq!(filter(0).expanded_level_mask(), 0);
+        assert_eq!(filter(0b101).expanded_level_mask(), 0b101);
+        assert_eq!(
+            filter(1 << (ROUTE_SUMMARY_LEVELS - 1)).expanded_level_mask(),
+            u32::MAX << (ROUTE_SUMMARY_LEVELS - 1)
+        );
+        let level_limit = usize::try_from(probe::ELASTIC_LEVEL_LIMIT).unwrap();
+        for level in 0..level_limit {
+            let recorded = filter(1 << summary_level(level)).expanded_level_mask();
+            assert_ne!(recorded & (1 << level), 0, "level {level} lost its bit");
+        }
+    }
+
+    #[test]
+    fn route_summary_still_narrows_shallow_levels_on_wide_geometries() {
+        // Enough levels that the old encoding fell back to an all-ones mask.
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(1 << 20, IdentityBuildHasher);
+        assert!(
+            map.table().levels.len() > ROUTE_SUMMARY_LEVELS,
+            "fixture needs more levels than the summary width, got {}",
+            map.table().levels.len()
+        );
+        let key_count = if cfg!(miri) { 64_u64 } else { 4_096_u64 };
+        for key in 0..key_count {
+            map.insert(key, key);
+        }
+        for key in 0..key_count {
+            let prepared = PreparedElasticKey::new(key);
+            let mask = map.table().route_filter(prepared).level_mask;
+            assert!(mask != 0 && u16::try_from(mask).is_ok(), "mask {mask:#x}");
+            assert!(
+                mask.count_ones() < u32::try_from(ROUTE_SUMMARY_LEVELS).unwrap(),
+                "key {key} mask {mask:#x} must exclude at least one level"
+            );
+            assert_eq!(map.get(&key), Some(&key));
+        }
+        assert_eq!(map.get(&(key_count + 1)), None);
     }
 
     #[test]
@@ -2630,7 +2868,8 @@ mod tests {
                 .unwrap();
             let prepared = PreparedElasticKey::new(key);
             assert_ne!(
-                map.table().route_filter(prepared).level_mask & (1_u32 << location.0),
+                map.table().route_filter(prepared).level_mask
+                    & (1_u32 << summary_level(location.0)),
                 0,
                 "key {key} at level {}",
                 location.0
@@ -3032,7 +3271,7 @@ mod tests {
                 DefaultHashBuilder::default(),
                 Global,
             );
-        let initial_quota = table.scheduler.batch_remaining;
+        let initial_quota = table.scheduler.bootstrap_quota();
         assert!(
             initial_quota > 0,
             "test requires a non-empty bootstrap batch"
@@ -3042,8 +3281,9 @@ mod tests {
             table.insert_unique(key, key);
         }
 
+        let len = table.len;
+        assert_eq!(table.scheduler.target(len), BatchTarget::LevelPair(0));
         assert!(table.scheduler.current_batch_index > 0);
-        assert_eq!(table.scheduler.target(), BatchTarget::LevelPair(0));
     }
 
     #[test]
@@ -3071,8 +3311,9 @@ mod tests {
         table.insert_for_vacant_entry(key, key, hash);
 
         assert!(table.total_slots > previous_slots);
+        let len = table.len;
+        assert_eq!(table.scheduler.target(len), BatchTarget::LevelPair(0));
         assert!(table.scheduler.current_batch_index > 0);
-        assert_eq!(table.scheduler.target(), BatchTarget::LevelPair(0));
     }
 
     #[test]

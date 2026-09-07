@@ -18,6 +18,19 @@ pub(crate) fn word_count(total_slots: usize) -> usize {
     total_slots.div_ceil(SLOTS_PER_WORD)
 }
 
+/// Deletes a filter tolerates before it is re-recorded from the live entries.
+///
+/// Bits are never cleared one key at a time, so every departed key leaves its
+/// bits set and the filter's load grows with churn until nearly every gate
+/// passes. Once the departed records match the live capacity the load has
+/// doubled and false positives roughly tripled; re-recording then costs one
+/// hash per live entry, a few instructions per delete amortised.
+#[inline]
+#[must_use]
+pub(crate) const fn refresh_deletes(max_insertions: usize) -> usize {
+    max_insertions
+}
+
 /// One key's filter bits, derived once per operation.
 #[derive(Clone, Copy)]
 pub(crate) struct MembershipKey {
@@ -26,8 +39,8 @@ pub(crate) struct MembershipKey {
 
 impl MembershipKey {
     /// Two bits of one word, from disjoint signature fields. Two rather than
-    /// four: at ten keys per word false positives rise 5% → 7%, a fraction of a
-    /// probe walk, and every insert and gated lookup drops two shifted adds.
+    /// four: at ten keys per word the extra false positives cost a fraction of
+    /// a probe walk, and every insert and gated lookup drops two shifted adds.
     #[inline]
     pub(crate) fn from_signature(signature: u64) -> Self {
         let first = signature & 63;
