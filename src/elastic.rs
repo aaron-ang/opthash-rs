@@ -462,11 +462,23 @@ fn clone_probe_schedule(source: &[PhiRoute], level_count: usize) -> Vec<PhiRoute
 }
 
 /// Schedule paper batches and allocation-epoch boundaries.
+///
+/// The active batch is a function of the live count alone: batch `i` covers
+/// the insertions whose position lies in `[batch_ends[i-1], batch_ends[i])`,
+/// the same prefix-sum test the scalar oracle applies. Under deletion the
+/// batch therefore tracks occupancy rather than an insert tally that only
+/// grows. The active index and its bounds are cached, so a placement costs
+/// two compares against `len` and no per-insert store.
 #[derive(Clone)]
 pub(crate) struct BatchScheduler {
-    batch_plan: Box<[usize]>,
+    /// Cumulative quota through each batch: the exclusive `len` bound at
+    /// which the batch ends. Zero-quota batches repeat the previous end.
+    batch_ends: Box<[usize]>,
     current_batch_index: usize,
-    batch_remaining: usize,
+    /// `batch_ends[current_batch_index - 1]`, or zero for the first batch.
+    batch_start: usize,
+    /// `batch_ends[current_batch_index]`, or `usize::MAX` for an empty plan.
+    batch_end: usize,
 }
 
 /// Direct the structural work required before insertion.
@@ -484,52 +496,63 @@ enum BatchTarget {
 }
 
 impl BatchScheduler {
-    pub(crate) fn new(batch_plan: Box<[usize]>) -> Self {
-        let initial_remaining = batch_plan.first().copied().unwrap_or(0);
-        Self {
-            batch_plan,
+    pub(crate) fn new(batch_plan: &[usize]) -> Self {
+        let mut total = 0_usize;
+        let batch_ends = batch_plan
+            .iter()
+            .map(|&quota| {
+                total = total.saturating_add(quota);
+                total
+            })
+            .collect::<Box<[usize]>>();
+        let mut scheduler = Self {
+            batch_ends,
             current_batch_index: 0,
-            batch_remaining: initial_remaining,
-        }
+            batch_start: 0,
+            batch_end: usize::MAX,
+        };
+        scheduler.reset();
+        scheduler
     }
 
     /// Select structural work for the next insert.
     #[inline]
     pub(crate) fn on_insert(
-        &mut self,
         current_len: usize,
         total_slots: usize,
         max_insertions: usize,
     ) -> InsertAction {
-        let structural_action =
-            Self::structural_action_for_next_insert(current_len, total_slots, max_insertions);
-        if let Some(action) = structural_action {
-            return action;
-        }
-        self.advance_batch_window();
-        InsertAction::Continue
-    }
-
-    #[inline]
-    fn structural_action_for_next_insert(
-        current_len: usize,
-        total_slots: usize,
-        max_insertions: usize,
-    ) -> Option<InsertAction> {
         if current_len >= max_insertions {
             let new_cap = if total_slots == 0 {
                 INITIAL_CAPACITY
             } else {
                 total_slots.saturating_mul(2)
             };
-            return Some(InsertAction::Resize(new_cap));
+            return InsertAction::Resize(new_cap);
         }
-        None
+        InsertAction::Continue
     }
 
-    /// Distinguish bootstrap placement from the level pair for later batches.
+    /// Batch quota of the first paper batch (the bootstrap batch).
+    #[cfg(test)]
+    fn bootstrap_quota(&self) -> usize {
+        self.batch_ends.first().copied().unwrap_or(0)
+    }
+
+    /// [`Self::target`] on a copy, for assertions through a shared borrow.
+    #[cfg(test)]
+    fn target_at(&self, len: usize) -> BatchTarget {
+        self.clone().target(len)
+    }
+
+    /// Distinguish bootstrap placement from the level pair for later batches,
+    /// for a table holding `len` live entries. Re-syncs the cached batch when
+    /// `len` has left its window; the common case is two compares.
     #[inline]
-    fn target(&self) -> BatchTarget {
+    fn target(&mut self, len: usize) -> BatchTarget {
+        if len >= self.batch_end || len < self.batch_start {
+            self.sync(len);
+        }
         if self.current_batch_index == 0 {
             BatchTarget::Bootstrap
         } else {
@@ -537,26 +560,26 @@ impl BatchScheduler {
         }
     }
 
-    /// Consume one insertion from the active batch.
-    #[inline]
-    fn complete_insert(&mut self) {
-        self.batch_remaining = self.batch_remaining.saturating_sub(1);
-    }
-
-    /// Skip exhausted and zero-quota batches.
-    #[inline]
-    pub(crate) fn advance_batch_window(&mut self) {
-        while self.batch_remaining == 0 && self.current_batch_index + 1 < self.batch_plan.len() {
-            self.current_batch_index += 1;
-            self.batch_remaining = self.batch_plan[self.current_batch_index];
+    /// Move the cached window to the batch covering `len`. Zero-quota batches
+    /// are never selected because their window is empty. Beyond the last end,
+    /// the last batch stays active.
+    #[cold]
+    #[inline(never)]
+    fn sync(&mut self, len: usize) {
+        let ends = &self.batch_ends;
+        if ends.is_empty() {
+            return;
         }
+        let index = ends.partition_point(|&end| end <= len).min(ends.len() - 1);
+        self.current_batch_index = index;
+        self.batch_start = if index == 0 { 0 } else { ends[index - 1] };
+        self.batch_end = ends[index];
     }
 
     /// Reset batch progress after resize or clear.
     #[inline]
     pub(crate) fn reset(&mut self) {
-        self.current_batch_index = 0;
-        self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
+        self.sync(0);
     }
 }
 
@@ -753,7 +776,7 @@ where
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(geometry.batch_plan),
+            scheduler: BatchScheduler::new(&geometry.batch_plan),
             hash_builder,
             alloc,
             arena,
@@ -783,7 +806,7 @@ where
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(geometry.batch_plan),
+            scheduler: BatchScheduler::new(&geometry.batch_plan),
             hash_builder,
             alloc,
             arena,
@@ -921,28 +944,20 @@ where
         prepared: PreparedElasticKey,
         key_fingerprint: u8,
     ) -> (usize, usize) {
-        match self
-            .scheduler
-            .on_insert(self.len, self.total_slots, self.max_insertions)
+        if let InsertAction::Resize(cap) =
+            BatchScheduler::on_insert(self.len, self.total_slots, self.max_insertions)
         {
-            InsertAction::Resize(cap) => {
-                self.resize_with_transition(cap, EpochTransition::Growth);
-                self.scheduler.advance_batch_window();
-            }
-            InsertAction::Continue => {}
+            self.resize_with_transition(cap, EpochTransition::Growth);
         }
 
-        if let Some(placement) =
-            self.choose_slot_for_new_key(prepared.route.probe, self.scheduler.target())
-        {
+        let target = self.scheduler.target(self.len);
+        if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             return self.place_new_entry(key, value, prepared, key_fingerprint, placement);
         }
 
         self.resize_with_transition(self.total_slots, EpochTransition::PlacementRecovery);
-        self.scheduler.advance_batch_window();
-        if let Some(placement) =
-            self.choose_slot_for_new_key(prepared.route.probe, self.scheduler.target())
-        {
+        let target = self.scheduler.target(self.len);
+        if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             self.place_new_entry(key, value, prepared, key_fingerprint, placement)
         } else {
             self.place_exceptional_entry(key, value, prepared, key_fingerprint)
@@ -1017,7 +1032,6 @@ where
         }
         self.record_membership(prepared.route, prepared.membership, level_idx);
         self.len += 1;
-        self.scheduler.complete_insert();
         (level_idx, slot_idx)
     }
 
@@ -1420,8 +1434,7 @@ where
         let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
 
-        self.scheduler.advance_batch_window();
-        let target = self.scheduler.target();
+        let target = self.scheduler.target(self.len);
         if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             self.place_new_entry(key, value, prepared, key_fingerprint, placement);
             false
@@ -1454,7 +1467,7 @@ where
         self.total_slots = geometry.total_slots;
         self.membership = MembershipRegion::for_arena::<K, V>(&self.arena, self.total_slots);
         self.max_insertions = geometry.max_insertions;
-        self.scheduler = BatchScheduler::new(geometry.batch_plan);
+        self.scheduler = BatchScheduler::new(&geometry.batch_plan);
         self.len = 0;
         self.probe_high_water = 0;
         self.probe_schedule.clear();
@@ -1564,7 +1577,7 @@ where
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(geometry.batch_plan),
+            scheduler: BatchScheduler::new(&geometry.batch_plan),
             hash_builder,
             alloc,
             arena,
@@ -2073,8 +2086,13 @@ mod tests {
             plan.level_lengths().collect::<Vec<_>>()
         );
         assert_eq!(
-            table.scheduler.batch_plan.as_ref(),
-            plan.batch_quotas().collect::<Vec<_>>()
+            table.scheduler.batch_ends.as_ref(),
+            plan.batch_quotas()
+                .scan(0_usize, |total, quota| {
+                    *total += quota;
+                    Some(*total)
+                })
+                .collect::<Vec<_>>()
         );
 
         let limits = ScalarElasticLimits::new(
@@ -2089,13 +2107,12 @@ mod tests {
             let prepared = PreparedElasticKey::new(identity);
             assert_eq!(table.hash_key(&identity), identity);
             assert!(matches!(
-                table
-                    .scheduler
-                    .on_insert(table.len, table.total_slots, table.max_insertions,),
+                BatchScheduler::on_insert(table.len, table.total_slots, table.max_insertions),
                 InsertAction::Continue
             ));
+            let target = table.scheduler.target(table.len);
             let placement = table
-                .choose_slot_for_new_key(prepared.route.probe, table.scheduler.target())
+                .choose_slot_for_new_key(prepared.route.probe, target)
                 .unwrap();
             let expected = scalar.insert(identity);
             let global_slot = table.levels[..placement.level]
@@ -2489,18 +2506,66 @@ mod tests {
     #[test]
     fn normal_inserts_advance_batch_scheduler() {
         let mut map: ElasticHashMap<usize, usize> = ElasticHashMap::with_capacity(1024);
-        let initial_quota = map.table().scheduler.batch_remaining;
+        let initial_quota = map.table().scheduler.bootstrap_quota();
         assert!(
             initial_quota > 0,
             "test requires a non-empty bootstrap batch"
         );
 
-        for key in 0..=initial_quota {
+        for key in 0..initial_quota {
             map.insert(key, key);
         }
+        // Positions `0..quota` were bootstrap placements; position `quota`,
+        // the next insert, opens the first level pair.
+        assert_eq!(
+            map.table().scheduler.target_at(initial_quota - 1),
+            BatchTarget::Bootstrap
+        );
+        assert_eq!(map.table().scheduler.current_batch_index, 0);
 
+        map.insert(initial_quota, initial_quota);
+        let len = map.len();
+        assert_eq!(
+            map.table().scheduler.target_at(len),
+            BatchTarget::LevelPair(0)
+        );
         assert!(map.table().scheduler.current_batch_index > 0);
-        assert_eq!(map.table().scheduler.target(), BatchTarget::LevelPair(0));
+    }
+
+    #[test]
+    fn batch_target_follows_the_live_count_in_both_directions() {
+        let mut map: ElasticHashMap<usize, usize> = ElasticHashMap::with_capacity(1024);
+        let quota = map.table().scheduler.bootstrap_quota();
+        assert!(quota > 0);
+
+        for key in 0..=quota {
+            map.insert(key, key);
+        }
+        let len = map.len();
+        assert_eq!(
+            map.table().scheduler.target_at(len),
+            BatchTarget::LevelPair(0)
+        );
+
+        // Two removals put the live count back inside the bootstrap window.
+        assert_eq!(map.remove(&0), Some(0));
+        assert_eq!(map.remove(&1), Some(1));
+        let len = map.len();
+        assert_eq!(map.table().scheduler.target_at(len), BatchTarget::Bootstrap);
+
+        // The scalar oracle's prefix-sum rule, restated: batch `i` holds the
+        // positions in `[ends[i-1], ends[i])`.
+        let ends = map.table().scheduler.batch_ends.clone();
+        let mut scheduler = map.table().scheduler.clone();
+        for len in 0..*ends.last().unwrap() {
+            let expected = ends.iter().position(|&end| len < end).unwrap();
+            let target = scheduler.target(len);
+            let index = match target {
+                BatchTarget::Bootstrap => 0,
+                BatchTarget::LevelPair(pair) => pair + 1,
+            };
+            assert_eq!(index, expected, "len {len}");
+        }
     }
 
     #[test]
@@ -2508,12 +2573,14 @@ mod tests {
         let mut map: ElasticHashMap<u64, u64> = ElasticHashMap::with_capacity(64);
         assert_eq!(map.insert(7, 11), None);
         let batch = map.table().scheduler.current_batch_index;
-        let remaining = map.table().scheduler.batch_remaining;
+        let len = map.len();
+        let target = map.table().scheduler.target_at(len);
 
         assert_eq!(map.insert(7, 13), Some(11));
         assert_eq!(map.len(), 1);
         assert_eq!(map.table().scheduler.current_batch_index, batch);
-        assert_eq!(map.table().scheduler.batch_remaining, remaining);
+        let len = map.len();
+        assert_eq!(map.table().scheduler.target_at(len), target);
         assert_eq!(map.get(&7), Some(&13));
     }
 
@@ -3099,7 +3166,7 @@ mod tests {
                 DefaultHashBuilder::default(),
                 Global,
             );
-        let initial_quota = table.scheduler.batch_remaining;
+        let initial_quota = table.scheduler.bootstrap_quota();
         assert!(
             initial_quota > 0,
             "test requires a non-empty bootstrap batch"
@@ -3109,8 +3176,9 @@ mod tests {
             table.insert_unique(key, key);
         }
 
+        let len = table.len;
+        assert_eq!(table.scheduler.target(len), BatchTarget::LevelPair(0));
         assert!(table.scheduler.current_batch_index > 0);
-        assert_eq!(table.scheduler.target(), BatchTarget::LevelPair(0));
     }
 
     #[test]
@@ -3138,8 +3206,9 @@ mod tests {
         table.insert_for_vacant_entry(key, key, hash);
 
         assert!(table.total_slots > previous_slots);
+        let len = table.len;
+        assert_eq!(table.scheduler.target(len), BatchTarget::LevelPair(0));
         assert!(table.scheduler.current_batch_index > 0);
-        assert_eq!(table.scheduler.target(), BatchTarget::LevelPair(0));
     }
 
     #[test]
