@@ -15,10 +15,8 @@ pub enum TryBuildError {
         /// Smallest exponent supported by Funnel Hashing.
         minimum: u32,
     },
-    /// Capacity computation overflowed `usize`.
-    CapacityOverflow,
-    /// Allocator failed.
-    AllocError,
+    /// Capacity computation overflowed or the allocator failed.
+    Reserve(TryReserveError),
 }
 
 impl fmt::Display for TryBuildError {
@@ -32,13 +30,20 @@ impl fmt::Display for TryBuildError {
                 f,
                 "Funnel reserve exponent {reserve_exponent} is below the minimum {minimum}"
             ),
-            Self::CapacityOverflow => f.write_str("capacity overflow"),
-            Self::AllocError => f.write_str("memory allocation failed"),
+            Self::Reserve(error) => error.fmt(f),
         }
     }
 }
 
-impl Error for TryBuildError {}
+impl Error for TryBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidReserveFraction(error) => Some(error),
+            Self::Reserve(error) => Some(error),
+            Self::FunnelExponentBelowMinimum { .. } => None,
+        }
+    }
+}
 
 impl From<ReserveFractionError> for TryBuildError {
     fn from(error: ReserveFractionError) -> Self {
@@ -48,10 +53,7 @@ impl From<ReserveFractionError> for TryBuildError {
 
 impl From<TryReserveError> for TryBuildError {
     fn from(error: TryReserveError) -> Self {
-        match error {
-            TryReserveError::CapacityOverflow => Self::CapacityOverflow,
-            TryReserveError::AllocError => Self::AllocError,
-        }
+        Self::Reserve(error)
     }
 }
 

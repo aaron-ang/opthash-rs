@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- merge `TryBuildError::{CapacityOverflow, AllocError}` into `TryBuildError::Reserve(TryReserveError)`
+
 ## [0.10.4](https://github.com/aaron-ang/opthash-rs/compare/v0.10.3...v0.10.4) - 2026-07-26
 
 ### Added
