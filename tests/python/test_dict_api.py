@@ -1,6 +1,10 @@
 """Coverage for dict-parity API: iteration, bulk ops, equality, merge."""
 
+import collections.abc as abc
+
 import pytest
+
+import opthash
 
 
 def _populate(m, n=10):
@@ -135,6 +139,20 @@ def test_items_view_iter_during_mutation_raises(m):
     m["new"] = 99
     with pytest.raises(RuntimeError, match="changed size"):
         next(it)
+
+
+def test_views_register_with_collections_abc(m):
+    assert isinstance(m.keys(), abc.KeysView)
+    assert isinstance(m.values(), abc.ValuesView)
+    assert isinstance(m.items(), abc.ItemsView)
+    assert isinstance(m, abc.MutableMapping)
+
+
+def test_helper_classes_are_not_module_attributes():
+    exported = {name for name in dir(opthash) if not name.startswith("__")}
+    assert exported == set(opthash.__all__) | {"opthash"}  # extension submodule
+    ext = {name for name in dir(opthash.opthash) if not name.startswith("__")}
+    assert ext == set(opthash.__all__)
 
 
 def test_view_repr_contains_class_name(m):
