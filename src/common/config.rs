@@ -1,10 +1,9 @@
 /// Portable SWAR and NEON groups fit eight control bytes in one `u64` mask.
 #[cfg(any(opthash_scalar_group, opthash_neon_group))]
-pub(crate) const GROUP_SIZE_U32: u32 = 8;
+pub(crate) const GROUP_SIZE: usize = 8;
 /// SSE scans sixteen control bytes at a time.
 #[cfg(opthash_x86_16_group)]
-pub(crate) const GROUP_SIZE_U32: u32 = 16;
-pub(crate) const GROUP_SIZE: usize = GROUP_SIZE_U32 as usize;
+pub(crate) const GROUP_SIZE: usize = 16;
 /// Align arena allocations so memset can use cache-line fast paths.
 pub(crate) const CACHE_LINE: usize = 64;
 /// First-allocation slot count when a map grows from empty.

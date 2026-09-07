@@ -303,7 +303,7 @@ impl ElasticPlan {
     /// Returns the paper's exact `ceil(log2(n))` number of non-empty levels.
     #[must_use]
     pub(crate) const fn level_count(&self) -> usize {
-        (usize::BITS - (self.config.n - 1).leading_zeros()) as usize
+        ceil_log2(self.config.n)
     }
 
     /// Iterates over logical level lengths in paper order.
