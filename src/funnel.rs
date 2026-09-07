@@ -1594,7 +1594,7 @@ mod tests {
 
     use super::*;
     use crate::common::exact::probe;
-    use crate::common::exact::reference::{ScalarFunnel, ScalarFunnelInsert};
+    use crate::common::exact::reference::{ScalarFunnel, ScalarFunnelInsert, ScalarFunnelLocation};
     use crate::common::test_support::{
         self, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
     };
@@ -1735,6 +1735,36 @@ mod tests {
         assert_eq!(headline.max_insertions, 28_672);
     }
 
+    /// Rebuilds a scalar location's global slot from `shape`, checking each
+    /// component against the region it names.
+    fn decompose_scalar_location(shape: &FunnelShape, location: ScalarFunnelLocation) -> usize {
+        match location {
+            ScalarFunnelLocation::Ordinary {
+                level,
+                bucket,
+                slot_in_bucket,
+                ..
+            } => {
+                assert!(bucket < shape.levels[level].bucket_range.upper());
+                assert!(slot_in_bucket < shape.beta);
+                shape.levels[level].offset + bucket * shape.beta + slot_in_bucket
+            }
+            ScalarFunnelLocation::SpecialPrimary { slot, .. } => {
+                assert!(slot < shape.primary_range.upper());
+                shape.primary_offset + slot
+            }
+            ScalarFunnelLocation::SpecialFallback {
+                bucket,
+                slot_in_bucket,
+                ..
+            } => {
+                assert!(bucket < shape.fallback_bucket_range.upper());
+                assert!(slot_in_bucket < shape.fallback_bucket_width);
+                shape.fallback_offset + bucket * shape.fallback_bucket_width + slot_in_bucket
+            }
+        }
+    }
+
     #[test]
     #[cfg_attr(miri, ignore)]
     fn funnel_locations_match_the_independent_scalar_oracle() {
@@ -1776,6 +1806,16 @@ mod tests {
                 );
             }
             assert_eq!(table.len, scalar.len());
+            assert_eq!(scalar.locations().count(), locations.len());
+            for (expected, identity) in scalar.locations() {
+                let global_slot = locations[usize::try_from(identity).unwrap()].1;
+                assert_eq!(expected.global_slot(), global_slot, "n={n} key={identity}");
+                assert_eq!(
+                    decompose_scalar_location(&table.shape, expected),
+                    global_slot,
+                    "n={n} key={identity} {expected:?}"
+                );
+            }
             for &(identity, location, pointer) in &locations {
                 assert_eq!(
                     table.find_location(
