@@ -108,6 +108,28 @@ pairs_builders!(u64;
     build_funnel_map => FunnelHashMap,
 );
 
+/// The four `(u64, u64)` maps built once from one pair set. Construct outside
+/// Criterion routines so every group in a target reuses the same populated
+/// tables instead of rebuilding per sample.
+pub struct MapQuad {
+    pub std: StdHashMap<u64, u64>,
+    pub hashbrown: HashbrownMap<u64, u64>,
+    pub elastic: ElasticHashMap<u64, u64>,
+    pub funnel: FunnelHashMap<u64, u64>,
+}
+
+impl MapQuad {
+    #[must_use]
+    pub fn new(pairs: &[(u64, u64)]) -> Self {
+        Self {
+            std: build_std_map(pairs),
+            hashbrown: build_hashbrown_map(pairs),
+            elastic: build_elastic_map(pairs),
+            funnel: build_funnel_map(pairs),
+        }
+    }
+}
+
 /// Side-effect sink for [`DropU64::drop`]; defeats LLVM elision of drop loops.
 pub static DROP_SINK: AtomicU64 = AtomicU64::new(0);
 

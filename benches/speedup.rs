@@ -19,10 +19,7 @@ fn bench_insert(c: &mut Criterion) {
 
 fn bench_lookups(c: &mut Criterion) {
     let pairs = harness::make_pairs(MAP_SIZE);
-    let std_map = harness::build_std_map(&pairs);
-    let hb_map = harness::build_hashbrown_map(&pairs);
-    let el_map = harness::build_elastic_map(&pairs);
-    let fn_map = harness::build_funnel_map(&pairs);
+    let maps = harness::MapQuad::new(&pairs);
 
     let hit_keys = harness::shuffled_hit_keys(&pairs, OP_COUNT);
     let sequential_hit_keys = harness::sequential_hit_keys(&pairs, OP_COUNT);
@@ -30,19 +27,9 @@ fn bench_lookups(c: &mut Criterion) {
         .map(|idx| harness::key_at(idx + MAP_SIZE + 10_000_000))
         .collect();
 
-    harness::bench_one_lookup_group(c, "get_hit", &hit_keys, &std_map, &hb_map, &el_map, &fn_map);
-    harness::bench_one_lookup_group(
-        c,
-        "get_hit_sequential",
-        &sequential_hit_keys,
-        &std_map,
-        &hb_map,
-        &el_map,
-        &fn_map,
-    );
-    harness::bench_one_lookup_group(
-        c, "get_miss", &miss_keys, &std_map, &hb_map, &el_map, &fn_map,
-    );
+    harness::bench_one_lookup_group(c, "get_hit", &hit_keys, &maps);
+    harness::bench_one_lookup_group(c, "get_hit_sequential", &sequential_hit_keys, &maps);
+    harness::bench_one_lookup_group(c, "get_miss", &miss_keys, &maps);
 }
 
 fn bench_tiny_lookup(c: &mut Criterion) {
@@ -56,19 +43,8 @@ fn bench_tiny_lookup(c: &mut Criterion) {
             }
         })
         .collect();
-    let std_map = harness::build_std_map(&pairs);
-    let hb_map = harness::build_hashbrown_map(&pairs);
-    let el_map = harness::build_elastic_map(&pairs);
-    let fn_map = harness::build_funnel_map(&pairs);
-    harness::bench_one_lookup_group(
-        c,
-        "tiny_lookup",
-        &query_keys,
-        &std_map,
-        &hb_map,
-        &el_map,
-        &fn_map,
-    );
+    let maps = harness::MapQuad::new(&pairs);
+    harness::bench_one_lookup_group(c, "tiny_lookup", &query_keys, &maps);
 }
 
 fn bench_mixed(c: &mut Criterion) {

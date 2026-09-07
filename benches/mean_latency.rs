@@ -12,30 +12,12 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-struct LatencyMaps {
-    std: harness::StdHashMap<u64, u64>,
-    hashbrown: harness::HashbrownMap<u64, u64>,
-    elastic: harness::ElasticHashMap<u64, u64>,
-    funnel: harness::FunnelHashMap<u64, u64>,
-}
-
-impl LatencyMaps {
-    fn new(pairs: &[(u64, u64)]) -> Self {
-        Self {
-            std: harness::build_std_map(pairs),
-            hashbrown: harness::build_hashbrown_map(pairs),
-            elastic: harness::build_elastic_map(pairs),
-            funnel: harness::build_funnel_map(pairs),
-        }
-    }
-}
-
 fn bench_get_hit_latency(c: &mut Criterion) {
     for &size in harness::LATENCY_SIZES {
         let pairs = harness::make_pairs(size);
         let query_keys = harness::shuffled_hit_keys(&pairs, size);
         let sequential_query_keys = harness::sequential_hit_keys(&pairs, size);
-        let maps = LatencyMaps::new(&pairs);
+        let maps = harness::MapQuad::new(&pairs);
 
         let label = harness::size_label(size);
         let workload = format!("get_hit_latency_{label}");
@@ -46,7 +28,12 @@ fn bench_get_hit_latency(c: &mut Criterion) {
     }
 }
 
-fn bench_latency_group(c: &mut Criterion, workload: &str, maps: &LatencyMaps, query_keys: &[u64]) {
+fn bench_latency_group(
+    c: &mut Criterion,
+    workload: &str,
+    maps: &harness::MapQuad,
+    query_keys: &[u64],
+) {
     let mut group = c.benchmark_group(workload);
 
     // Bench id `<workload>_<impl>`, matching speedup.rs (see benches/README.md).

@@ -2,48 +2,36 @@
 
 use criterion::{Criterion, Throughput};
 
-use super::{ElasticHashMap, FunnelHashMap, HashbrownMap, StdHashMap};
+use super::MapQuad;
 
-#[allow(clippy::too_many_arguments)]
+/// Bulk-lookup group: one Criterion sample walks every key in `query_keys`.
+/// Bench id `<group_name>_<impl>` (see benches/README.md).
 pub fn bench_one_lookup_group(
     c: &mut Criterion,
     group_name: &str,
     query_keys: &[u64],
-    std_map: &StdHashMap<u64, u64>,
-    hb_map: &HashbrownMap<u64, u64>,
-    el_map: &ElasticHashMap<u64, u64>,
-    fn_map: &FunnelHashMap<u64, u64>,
+    maps: &MapQuad,
 ) {
     let mut group = c.benchmark_group(group_name);
     group.throughput(Throughput::Elements(query_keys.len() as u64));
-    group.bench_function(format!("{group_name}_std"), |b| {
-        b.iter(|| {
-            for key in query_keys {
-                std::hint::black_box(std_map.get(std::hint::black_box(key)));
-            }
-        });
-    });
-    group.bench_function(format!("{group_name}_hashbrown"), |b| {
-        b.iter(|| {
-            for key in query_keys {
-                std::hint::black_box(hb_map.get(std::hint::black_box(key)));
-            }
-        });
-    });
-    group.bench_function(format!("{group_name}_elastic"), |b| {
-        b.iter(|| {
-            for key in query_keys {
-                std::hint::black_box(el_map.get(std::hint::black_box(key)));
-            }
-        });
-    });
-    group.bench_function(format!("{group_name}_funnel"), |b| {
-        b.iter(|| {
-            for key in query_keys {
-                std::hint::black_box(fn_map.get(std::hint::black_box(key)));
-            }
-        });
-    });
+
+    macro_rules! lookup_arm {
+        ($impl:literal, $map:expr) => {
+            group.bench_function(format!("{group_name}_{}", $impl), |b| {
+                b.iter(|| {
+                    for key in query_keys {
+                        std::hint::black_box($map.get(std::hint::black_box(key)));
+                    }
+                });
+            });
+        };
+    }
+
+    lookup_arm!("std", maps.std);
+    lookup_arm!("hashbrown", maps.hashbrown);
+    lookup_arm!("elastic", maps.elastic);
+    lookup_arm!("funnel", maps.funnel);
+
     group.finish();
 }
 
