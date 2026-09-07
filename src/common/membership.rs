@@ -39,8 +39,8 @@ pub(crate) struct MembershipKey {
 
 impl MembershipKey {
     /// Two bits of one word, from disjoint signature fields. Two rather than
-    /// four: at ten keys per word false positives rise 5% → 7%, a fraction of a
-    /// probe walk, and every insert and gated lookup drops two shifted adds.
+    /// four: at ten keys per word the extra false positives cost a fraction of
+    /// a probe walk, and every insert and gated lookup drops two shifted adds.
     #[inline]
     pub(crate) fn from_signature(signature: u64) -> Self {
         let first = signature & 63;

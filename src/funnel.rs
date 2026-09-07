@@ -786,12 +786,12 @@ where
         //
         // The membership gate stays out of this loop too, and out of the walk
         // entirely. Deferring it behind the first level so a hit there never pays
-        // for the load lost every way it was built: as a shared level helper the
-        // walk cost 65%, as a per-level test misses cost 137%, and as a peeled
-        // first iteration hits cost 108% and misses 180%. The caller's eager load
-        // overlaps the probe's mix chain for free, while a deferred one serializes
-        // behind the level's control bytes and keeps a live word, a branch, and
-        // the level scan's second copy across the rest of the walk.
+        // for the load lost every way it was built: as a shared level helper, as
+        // a per-level test, and as a peeled first iteration, each slower for hits
+        // and misses alike. The caller's eager load overlaps the probe's mix chain
+        // for free, while a deferred one serializes behind the level's control
+        // bytes and keeps a live word, a branch, and the level scan's second copy
+        // across the rest of the walk.
         for level in &self.shape.levels {
             let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
             let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) else {
