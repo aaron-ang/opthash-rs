@@ -2,7 +2,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::num::{NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
 
-use super::geometry::{self, ElasticCase, FunnelPlan, PaperConfig};
+use super::geometry::{self, FunnelPlan, PaperConfig};
 use super::probe::{self, ProbeDomain, ProbeOracle, RangeReductionError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +44,39 @@ impl ScalarElasticLocation {
             global_slot,
         }
     }
+}
+
+/// Which paper §4 insertion rule placed an Elastic key, with the level pair
+/// and free-slot counts that rule saw. The library carries only the rule's
+/// outcome (level, slot, phi); the oracle keeps the label so its own traces
+/// can be checked rule by rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ElasticCase {
+    Batch0 {
+        level: usize,
+    },
+    Case1 {
+        batch: usize,
+        current_level: usize,
+        next_level: usize,
+        free_current: usize,
+        free_next: usize,
+        budget: usize,
+    },
+    Case2 {
+        batch: usize,
+        current_level: usize,
+        next_level: usize,
+        free_current: usize,
+        free_next: usize,
+    },
+    Case3 {
+        batch: usize,
+        current_level: usize,
+        next_level: usize,
+        free_current: usize,
+        free_next: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -601,11 +634,11 @@ mod tests {
     use core::num::{NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
 
     use super::{
-        ScalarElastic, ScalarElasticInsertion, ScalarElasticLimits, ScalarElasticLocation,
-        ScalarElasticQuery, ScalarFunnel, ScalarFunnelInsert, ScalarFunnelLocation,
-        ScalarFunnelSearch,
+        ElasticCase, ScalarElastic, ScalarElasticInsertion, ScalarElasticLimits,
+        ScalarElasticLocation, ScalarElasticQuery, ScalarFunnel, ScalarFunnelInsert,
+        ScalarFunnelLocation, ScalarFunnelSearch,
     };
-    use crate::common::exact::geometry::{ElasticCase, PaperConfig};
+    use crate::common::exact::geometry::PaperConfig;
     use crate::common::exact::probe::{ProbeDomain, ProbeOracle};
 
     #[derive(Debug)]

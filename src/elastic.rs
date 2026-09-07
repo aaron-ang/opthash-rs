@@ -12,7 +12,7 @@ use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::INITIAL_CAPACITY;
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{TryBuildError, TryReserveError};
-use crate::common::exact::geometry::{ElasticCase, PaperConfig};
+use crate::common::exact::geometry::PaperConfig;
 use crate::common::exact::probe::{self, CounterPrf, PreparedElasticProbe};
 use crate::common::iter::RegionCursor;
 use crate::common::math::capacity;
@@ -47,10 +47,10 @@ const _: () = assert!(MAX_CASE1_LOGICAL_PROBES as u64 <= probe::ELASTIC_LOGICAL_
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExactPlacement {
-    case: ElasticCase,
     level: usize,
     slot: usize,
-    paper_probe: u64,
+    /// Paper position of the chosen slot, `elastic_phi(level + 1, probe)`;
+    /// the lookup schedule is extended to cover it.
     phi: u128,
 }
 
@@ -1488,10 +1488,14 @@ where
         if self.levels.is_empty() {
             return None;
         }
-        let (case, level, slot, paper_probe) = match target {
+        // The paper's insertion cases, in order: Batch 0 fills level 0; then,
+        // for the active pair, Case 2 (current nearly full) places in `next`,
+        // Case 3 (next nearly full) in `current`, and Case 1 gives `current`
+        // a bounded probe budget before falling back to `next`.
+        let (level, slot, paper_probe) = match target {
             BatchTarget::Bootstrap => {
                 let (slot, paper_probe) = self.uniform_vacancy(probe, 0)?;
-                (ElasticCase::Batch0 { level: 0 }, 0, slot, paper_probe)
+                (0, slot, paper_probe)
             }
             BatchTarget::LevelPair(current) => {
                 let next = current.checked_add(1)?;
@@ -1507,32 +1511,10 @@ where
 
                 if current_low {
                     let (slot, paper_probe) = self.uniform_vacancy(probe, next)?;
-                    (
-                        ElasticCase::Case2 {
-                            batch: next,
-                            current_level: current,
-                            next_level: next,
-                            free_current,
-                            free_next,
-                        },
-                        next,
-                        slot,
-                        paper_probe,
-                    )
+                    (next, slot, paper_probe)
                 } else if next_low {
                     let (slot, paper_probe) = self.uniform_vacancy(probe, current)?;
-                    (
-                        ElasticCase::Case3 {
-                            batch: next,
-                            current_level: current,
-                            next_level: next,
-                            free_current,
-                            free_next,
-                        },
-                        current,
-                        slot,
-                        paper_probe,
-                    )
+                    (current, slot, paper_probe)
                 } else {
                     let budget = probe::elastic_dyadic_probe_budget(
                         free_current,
@@ -1541,23 +1523,15 @@ where
                         ELASTIC_PROBE_BUDGET_C,
                     )
                     .ok()?;
-                    let case = ElasticCase::Case1 {
-                        batch: next,
-                        current_level: current,
-                        next_level: next,
-                        free_current,
-                        free_next,
-                        budget,
-                    };
                     if let Some((slot, probe)) = (0..budget).find_map(|logical_index| {
                         let logical_index = u64::try_from(logical_index).ok()?;
                         self.vacancy(current, probe, logical_index)
                             .map(|slot| (slot, logical_index + 1))
                     }) {
-                        (case, current, slot, probe)
+                        (current, slot, probe)
                     } else {
                         let (slot, paper_probe) = self.uniform_vacancy(probe, next)?;
-                        (case, next, slot, paper_probe)
+                        (next, slot, paper_probe)
                     }
                 }
             }
@@ -1567,13 +1541,7 @@ where
         if phi > QUERY_POSITION_CAP {
             return None;
         }
-        Some(ExactPlacement {
-            case,
-            level,
-            slot,
-            paper_probe,
-            phi,
-        })
+        Some(ExactPlacement { level, slot, phi })
     }
 
     fn uniform_vacancy(&self, probe: PreparedElasticProbe, level: usize) -> Option<(usize, u64)> {
@@ -1909,12 +1877,20 @@ mod tests {
                 .sum::<usize>()
                 + placement.slot;
 
-            assert_eq!(placement.case, expected.case);
+            // The oracle's case label is not carried by the table; its
+            // observable outcome (level, slot, and paper position) is.
             assert_eq!(placement.level, expected.location.level);
             assert_eq!(placement.slot, expected.location.slot_in_level);
             assert_eq!(global_slot, expected.location.global_slot);
-            assert_eq!(placement.paper_probe, expected.paper_probe);
             assert_eq!(placement.phi, expected.phi);
+            assert_eq!(
+                placement.phi,
+                probe::elastic_phi(
+                    expected.location.level as u128 + 1,
+                    u128::from(expected.paper_probe)
+                )
+                .unwrap()
+            );
 
             assert_eq!(
                 table.place_new_entry(

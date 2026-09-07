@@ -177,38 +177,6 @@ pub(crate) enum FunnelPlanError {
     },
 }
 
-/// Which paper §4 insertion rule placed an Elastic key, with the level pair
-/// and free-slot counts that rule saw. Shared by the library's placement and
-/// the scalar oracle so their traces compare directly.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ElasticCase {
-    Batch0 {
-        level: usize,
-    },
-    Case1 {
-        batch: usize,
-        current_level: usize,
-        next_level: usize,
-        free_current: usize,
-        free_next: usize,
-        budget: usize,
-    },
-    Case2 {
-        batch: usize,
-        current_level: usize,
-        next_level: usize,
-        free_current: usize,
-        free_next: usize,
-    },
-    Case3 {
-        batch: usize,
-        current_level: usize,
-        next_level: usize,
-        free_current: usize,
-        free_next: usize,
-    },
-}
-
 /// A pure logical Elastic geometry and insertion-batch plan.
 ///
 /// No table storage is allocated. Level lengths and batch quotas are exposed
