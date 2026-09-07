@@ -10,6 +10,23 @@ pub(crate) const BITMASK_STRIDE: u32 = 1;
 #[derive(Debug, Clone)]
 pub(crate) struct BitMask(pub(crate) BitMaskWord);
 
+impl BitMask {
+    /// Lowest set slot if it lies below `limit`, without iterating.
+    ///
+    /// Slots come out in ascending order, so once the lowest one is at or past
+    /// `limit` no later one can qualify. Equivalent to
+    /// `self.find(|&lane| lane < limit)` minus the loop.
+    #[inline]
+    #[must_use]
+    pub(crate) fn first_below(&self, limit: usize) -> Option<usize> {
+        if self.0 == 0 {
+            return None;
+        }
+        let slot = (self.0.trailing_zeros() / BITMASK_STRIDE) as usize;
+        (slot < limit).then_some(slot)
+    }
+}
+
 impl Iterator for BitMask {
     type Item = usize;
 
