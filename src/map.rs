@@ -792,9 +792,7 @@ where
 
     /// Inserts `value` for the entry's key, returning `&mut V`.
     pub fn insert(self, value: V) -> &'a mut V {
-        let loc = self.map.table.insert_for_vacant(self.key, value, self.hash);
-        // SAFETY: `loc` was just inserted into this table.
-        unsafe { &mut self.map.slot_entry_mut(loc).value }
+        self.insert_entry(value).into_mut()
     }
 
     /// Inserts `value` and returns the resulting [`OccupiedEntry`].
@@ -811,18 +809,12 @@ where
 {
     /// Returns `&mut V`, inserting `default` if vacant.
     pub fn or_insert(self, default: V) -> &'a mut V {
-        match self {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(default),
-        }
+        self.or_insert_with_key(|_| default)
     }
 
     /// Like [`or_insert`](Self::or_insert) with a lazily-computed default.
     pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V {
-        match self {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(default()),
-        }
+        self.or_insert_with_key(|_| default())
     }
 
     /// Like [`or_insert_with`](Self::or_insert_with); the closure gets the key.
@@ -865,10 +857,7 @@ where
 {
     /// Returns `&mut V`, inserting `V::default()` if vacant.
     pub fn or_default(self) -> &'a mut V {
-        match self {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(V::default()),
-        }
+        self.or_insert_with_key(|_| V::default())
     }
 }
 
@@ -890,12 +879,7 @@ where
     /// Creates an empty map with at least `capacity` slots.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_and_reserve_and_hasher_in(
-            capacity,
-            ReserveFraction::DEFAULT,
-            DefaultHashBuilder::default(),
-            Global,
-        )
+        Self::with_capacity_and_hasher(capacity, DefaultHashBuilder::default())
     }
 
     /// Creates an empty map with the exact dyadic `reserve`.
@@ -941,12 +925,7 @@ where
     /// Panics for non-dyadic input, unsupported reserve, or allocation failure.
     #[must_use]
     pub fn with_reserve_fraction(reserve_fraction: f64) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
-            0,
-            reserve_fraction,
-            DefaultHashBuilder::default(),
-            Global,
-        )
+        Self::with_capacity_and_reserve_fraction(0, reserve_fraction)
     }
 
     /// Compatibility constructor for capacity and an exact dyadic `f64` reserve.
@@ -955,11 +934,10 @@ where
     /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
     pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
+        Self::with_capacity_and_reserve_fraction_and_hasher(
             capacity,
             reserve_fraction,
             DefaultHashBuilder::default(),
-            Global,
         )
     }
 
@@ -988,23 +966,13 @@ where
     /// Creates an empty map that uses `hash_builder`.
     #[must_use]
     pub fn with_hasher(hash_builder: P::Hasher) -> Self {
-        Self::with_capacity_and_reserve_and_hasher_in(
-            0,
-            ReserveFraction::DEFAULT,
-            hash_builder,
-            Global,
-        )
+        Self::with_capacity_and_hasher(0, hash_builder)
     }
 
     /// Creates an empty map with the given capacity and hasher.
     #[must_use]
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: P::Hasher) -> Self {
-        Self::with_capacity_and_reserve_and_hasher_in(
-            capacity,
-            ReserveFraction::DEFAULT,
-            hash_builder,
-            Global,
-        )
+        Self::with_capacity_and_reserve_and_hasher(capacity, ReserveFraction::DEFAULT, hash_builder)
     }
 
     /// Creates an empty map with an exact reserve and custom hasher.
@@ -1029,12 +997,7 @@ where
         reserve_fraction: f64,
         hash_builder: P::Hasher,
     ) -> Self {
-        Self::with_capacity_and_reserve_fraction_and_hasher_in(
-            0,
-            reserve_fraction,
-            hash_builder,
-            Global,
-        )
+        Self::with_capacity_and_reserve_fraction_and_hasher(0, reserve_fraction, hash_builder)
     }
 
     /// Compatibility constructor for capacity, exact dyadic reserve, and hasher.
@@ -1064,12 +1027,7 @@ where
     /// Creates an empty map in the given allocator.
     #[must_use]
     pub fn new_in(alloc: P::Alloc) -> Self {
-        Self::with_capacity_and_reserve_and_hasher_in(
-            0,
-            ReserveFraction::DEFAULT,
-            DefaultHashBuilder::default(),
-            alloc,
-        )
+        Self::with_capacity_in(0, alloc)
     }
 
     /// Creates an empty map with the given capacity in the given allocator.
