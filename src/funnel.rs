@@ -1594,114 +1594,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use core::hash::{BuildHasher, Hasher};
     use core::mem::ManuallyDrop;
     use core::num::NonZeroU32;
-    use core::ptr::NonNull;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use alloc::sync::Arc;
-    use allocator_api2::alloc::AllocError as RawAllocError;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::*;
     use crate::common::exact::probe;
     use crate::common::exact::reference::{ScalarFunnel, ScalarFunnelInsert};
-
-    #[derive(Clone, Copy, Default)]
-    struct IdentityBuildHasher;
-
-    struct IdentityHasher(u64);
-
-    struct PanicOnFirstDrop {
-        drops: Arc<AtomicUsize>,
-    }
-
-    struct PanicHashKey {
-        id: u64,
-        armed: Arc<AtomicBool>,
-        drops: Arc<AtomicUsize>,
-    }
-
-    #[derive(Clone)]
-    struct ToggleAllocator {
-        fail: Arc<AtomicBool>,
-        allocations: Arc<AtomicUsize>,
-        deallocations: Arc<AtomicUsize>,
-    }
-
-    unsafe impl Allocator for ToggleAllocator {
-        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, RawAllocError> {
-            if self.fail.load(Ordering::SeqCst) {
-                Err(RawAllocError)
-            } else {
-                let allocation = Global.allocate(layout)?;
-                self.allocations.fetch_add(1, Ordering::SeqCst);
-                Ok(allocation)
-            }
-        }
-
-        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-            self.deallocations.fetch_add(1, Ordering::SeqCst);
-            unsafe { Global.deallocate(ptr, layout) };
-        }
-    }
-
-    impl PartialEq for PanicHashKey {
-        fn eq(&self, other: &Self) -> bool {
-            self.id == other.id
-        }
-    }
-
-    impl Eq for PanicHashKey {}
-
-    impl Hash for PanicHashKey {
-        fn hash<H: Hasher>(&self, state: &mut H) {
-            assert!(!self.armed.load(Ordering::SeqCst), "armed key hash");
-            state.write_u64(self.id);
-        }
-    }
-
-    impl Drop for PanicHashKey {
-        fn drop(&mut self) {
-            self.drops.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    impl Drop for PanicOnFirstDrop {
-        fn drop(&mut self) {
-            assert!(
-                self.drops.fetch_add(1, Ordering::SeqCst) != 0,
-                "first value drop"
-            );
-        }
-    }
-
-    impl Hasher for IdentityHasher {
-        fn finish(&self) -> u64 {
-            self.0
-        }
-
-        fn write(&mut self, bytes: &[u8]) {
-            let mut value = 0_u64;
-            for (index, byte) in bytes.iter().take(8).enumerate() {
-                value |= u64::from(*byte) << (index * 8);
-            }
-            self.0 = value;
-        }
-
-        fn write_u64(&mut self, value: u64) {
-            self.0 = value;
-        }
-    }
-
-    impl BuildHasher for IdentityBuildHasher {
-        type Hasher = IdentityHasher;
-
-        fn build_hasher(&self) -> Self::Hasher {
-            IdentityHasher(0)
-        }
-    }
+    use crate::common::test_support::{
+        IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
+    };
 
     fn raw_table(n: usize, d: u32) -> FunnelTable<u64, u64, IdentityBuildHasher> {
         let reserve = ReserveFraction::from_exponent(d).unwrap();
@@ -2329,13 +2234,7 @@ mod tests {
             .unwrap(),
         );
         for key in 0..3 {
-            table.insert_for_vacant_entry(
-                key,
-                PanicOnFirstDrop {
-                    drops: drops.clone(),
-                },
-                key,
-            );
+            table.insert_for_vacant_entry(key, PanicOnFirstDrop(drops.clone()), key);
         }
         let first_occupied = (0..table.shape.n)
             .find(|&slot| table.storage.control_at(slot).is_occupied())

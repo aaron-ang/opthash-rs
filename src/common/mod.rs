@@ -9,6 +9,8 @@ pub(crate) mod math;
 pub(crate) mod membership;
 pub(crate) mod reserve;
 pub(crate) mod simd;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 /// Default `BuildHasher` for the maps' `S` type parameter.
 ///
