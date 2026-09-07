@@ -24,7 +24,6 @@ use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
 use crate::{macros, map};
 
 const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
-const RANGE_WORD_CAP: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LevelShape {
@@ -683,7 +682,7 @@ where
             prepared,
             logical_probe,
             range,
-            RANGE_WORD_CAP,
+            probe::RANGE_WORD_CAP,
         )
         .ok()
         .map(|probe| probe.index)
@@ -1744,7 +1743,7 @@ mod tests {
             let mut scalar = ScalarFunnel::new(
                 config,
                 FunnelPrf::new(FUNNEL_PROBE_SEED),
-                NonZeroU32::new(RANGE_WORD_CAP).unwrap(),
+                NonZeroU32::new(probe::RANGE_WORD_CAP).unwrap(),
             );
             let mut table = raw_table(n, d);
             let mut locations = Vec::with_capacity(config.target_insertions());
@@ -1829,7 +1828,7 @@ mod tests {
                 domain,
                 logical,
                 upper,
-                RANGE_WORD_CAP,
+                probe::RANGE_WORD_CAP,
             )
             .unwrap()
             .index

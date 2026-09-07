@@ -125,6 +125,10 @@ const ELASTIC_REJECTION_MASK: u32 = (1 << ELASTIC_LOGICAL_SHIFT) - 1;
 pub(crate) const ELASTIC_LEVEL_LIMIT: u64 = 1 << 5;
 pub(crate) const ELASTIC_LOGICAL_LIMIT: u64 = 1 << 13;
 pub(crate) const ELASTIC_REJECTION_LIMIT: u32 = 1 << ELASTIC_LOGICAL_SHIFT;
+/// Random words both backends spend per rejection-sampled probe before the
+/// deterministic fallback.
+pub(crate) const RANGE_WORD_CAP: u32 = 8;
+const _: () = assert!(RANGE_WORD_CAP <= ELASTIC_REJECTION_LIMIT);
 const FUNNEL_LEVEL_LIMIT: u64 = 1 << 46;
 const FUNNEL_LOGICAL_LIMIT: u64 = 1 << 8;
 const FUNNEL_REJECTION_LIMIT: u32 = 1 << 8;
