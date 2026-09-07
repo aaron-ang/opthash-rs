@@ -40,7 +40,7 @@ impl PaperConfig {
 
     /// Returns the paper experiment's exact insertion count.
     #[must_use]
-    pub(crate) const fn target_insertions(&self) -> usize {
+    pub(crate) const fn max_insertions(&self) -> usize {
         self.n - self.floor_delta_n()
     }
 
@@ -321,7 +321,7 @@ impl ElasticPlan {
     }
 
     /// Iterates over the exact Elastic batch quotas from paper §4, capped in
-    /// order at [`PaperConfig::target_insertions`].
+    /// order at [`PaperConfig::max_insertions`].
     ///
     /// `B_0` is `ceil(3|A_1|/4)`. Each later quota is:
     ///
@@ -338,7 +338,7 @@ impl ElasticPlan {
                 remaining_levels: self.level_count(),
             },
             previous_level: None,
-            remaining_insertions: self.config.target_insertions(),
+            remaining_insertions: self.config.max_insertions(),
             reserve_exponent: self.config.reserve_exponent,
         }
     }
@@ -713,7 +713,7 @@ impl FunnelPlan {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, FunnelPlanError, FunnelPlanParameter, PaperConfig};
+    use super::{ConfigError, FunnelPlanError, FunnelPlanParameter, PaperConfig, floor_div_pow2};
 
     #[test]
     fn rejects_invalid_configuration_inputs() {
@@ -728,7 +728,7 @@ mod tests {
         assert_eq!(config.n(), 32_768);
         assert_eq!(config.reserve_exponent(), 3);
         assert_eq!(config.floor_delta_n(), 4_096);
-        assert_eq!(config.target_insertions(), 28_672);
+        assert_eq!(config.max_insertions(), 28_672);
     }
 
     #[test]
@@ -737,7 +737,7 @@ mod tests {
             let config = PaperConfig::new(32_768, reserve_exponent).unwrap();
 
             assert_eq!(config.floor_delta_n(), 0);
-            assert_eq!(config.target_insertions(), 32_768);
+            assert_eq!(config.max_insertions(), 32_768);
         }
     }
 
@@ -787,7 +787,7 @@ mod tests {
                     );
                 }
 
-                let mut remaining = config.target_insertions();
+                let mut remaining = config.max_insertions();
                 let expected: Vec<_> = raw
                     .into_iter()
                     .map(|quota| {
@@ -803,7 +803,7 @@ mod tests {
                 );
                 assert_eq!(
                     actual.iter().sum::<usize>(),
-                    config.target_insertions(),
+                    config.max_insertions(),
                     "n={n}, reserve_exponent={reserve_exponent}"
                 );
             }
@@ -826,7 +826,7 @@ mod tests {
         assert_eq!(plan.special_primary_len(), 1_528);
         assert_eq!(plan.special_fallback_len(), 1_528);
         assert_eq!(plan.fallback_bucket_count(), 191);
-        assert_eq!(config.target_insertions(), 28_672);
+        assert_eq!(config.max_insertions(), 28_672);
         assert_eq!(counts.len(), 22);
         assert_eq!(counts[0], 1_238);
         assert_eq!(
@@ -1122,7 +1122,7 @@ mod tests {
             "n={n}, reserve_exponent={reserve_exponent}"
         );
         assert_eq!(
-            config.target_insertions(),
+            config.max_insertions(),
             expected_target,
             "n={n}, reserve_exponent={reserve_exponent}"
         );
@@ -1314,13 +1314,5 @@ mod tests {
 
     fn ceil_three_quarters(value: usize) -> usize {
         usize::try_from(((value as u128) * 3).div_ceil(4)).unwrap()
-    }
-
-    fn floor_div_pow2(value: usize, exponent: u32) -> usize {
-        if exponent >= usize::BITS {
-            0
-        } else {
-            value >> exponent
-        }
     }
 }

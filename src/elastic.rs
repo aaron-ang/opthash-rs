@@ -561,7 +561,7 @@ impl ElasticGeometry {
         let batch_plan = plan.batch_quotas().collect::<Vec<_>>().into_boxed_slice();
         Self {
             total_slots,
-            max_insertions: config.target_insertions(),
+            max_insertions: config.max_insertions(),
             level_capacities,
             batch_plan,
         }
@@ -1981,7 +1981,7 @@ mod tests {
         for &(n, reserve_exponent) in &[(31, 4), (65, 6), (257, 8)] {
             let target = PaperConfig::new(n, reserve_exponent)
                 .unwrap()
-                .target_insertions();
+                .max_insertions();
             assert_exact_trace(
                 n,
                 reserve_exponent,
