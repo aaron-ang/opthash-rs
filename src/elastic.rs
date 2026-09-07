@@ -28,7 +28,6 @@ type ElasticScanItem<K, V> = (*mut SlotEntry<K, V>, (usize, usize));
 // Fixed construction seed shared by placement, lookup, and membership.
 const ELASTIC_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[0];
 const ELASTIC_PROBE_BUDGET_C: usize = 8;
-const RANGE_WORD_CAP: u32 = 8;
 const UNIFORM_SEARCH_CAP: u64 = 4_096;
 const QUERY_POSITION_CAP: u128 = 1_000_000;
 const EXCEPTIONAL_PLACEMENT_FLAG: u32 = 1 << 31;
@@ -45,7 +44,6 @@ const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 const _: () = assert!(u32::BITS as u64 <= probe::ELASTIC_LEVEL_LIMIT);
 const _: () = assert!(UNIFORM_SEARCH_CAP <= probe::ELASTIC_LOGICAL_LIMIT);
 const _: () = assert!(MAX_CASE1_LOGICAL_PROBES as u64 <= probe::ELASTIC_LOGICAL_LIMIT);
-const _: () = assert!(RANGE_WORD_CAP <= probe::ELASTIC_REJECTION_LIMIT);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExactPlacement {
@@ -1356,7 +1354,7 @@ where
                 }
                 let hash = {
                     let entry = unsafe { self.levels[level_idx].get_ref(slot_idx) };
-                    self.hash_key(&entry.key)
+                    self.hash_builder.hash_one(&entry.key)
                 };
                 let prepared = PreparedElasticKey::new(hash);
                 self.record_membership(prepared.route, prepared.membership, level_idx);
@@ -1370,7 +1368,7 @@ where
     ///
     #[inline]
     fn insert_unique(&mut self, key: K, value: V) -> bool {
-        let key_hash = self.hash_key(&key);
+        let key_hash = self.hash_builder.hash_one(&key);
         let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
 
@@ -1509,14 +1507,6 @@ where
         }
         let geometry = ElasticGeometry::for_slots(slots, reserve_fraction);
         Self::try_from_geometry(&geometry, reserve_fraction, hash_builder, alloc)
-    }
-
-    #[inline]
-    fn hash_key<Q>(&self, key: &Q) -> u64
-    where
-        Q: Hash + ?Sized,
-    {
-        self.hash_builder.hash_one(key)
     }
 
     fn choose_slot_for_new_key(
@@ -1665,9 +1655,14 @@ where
         counter_base: u32,
         upper: usize,
     ) -> Option<usize> {
-        probe::unbiased_prepared_elastic_probe_index(prepared, counter_base, upper, RANGE_WORD_CAP)
-            .ok()
-            .map(|probe| probe.index)
+        probe::unbiased_prepared_elastic_probe_index(
+            prepared,
+            counter_base,
+            upper,
+            probe::RANGE_WORD_CAP,
+        )
+        .ok()
+        .map(|probe| probe.index)
     }
 
     /// SAFETY: `level_idx` < `self.levels.len()` and `slot_idx` references an
@@ -1919,7 +1914,7 @@ mod tests {
 
         let limits = ScalarElasticLimits::new(
             NonZeroUsize::new(ELASTIC_PROBE_BUDGET_C).unwrap(),
-            NonZeroU32::new(RANGE_WORD_CAP).unwrap(),
+            NonZeroU32::new(probe::RANGE_WORD_CAP).unwrap(),
             NonZeroU64::new(UNIFORM_SEARCH_CAP).unwrap(),
             NonZeroU128::new(QUERY_POSITION_CAP).unwrap(),
         );
@@ -1927,7 +1922,7 @@ mod tests {
 
         for identity in identities {
             let prepared = PreparedElasticKey::new(identity);
-            assert_eq!(table.hash_key(&identity), identity);
+            assert_eq!(table.hash_builder.hash_one(identity), identity);
             assert!(matches!(
                 BatchScheduler::on_insert(table.len, table.total_slots, table.max_insertions),
                 InsertAction::Continue
@@ -2343,7 +2338,7 @@ mod tests {
     fn deletes_past_the_threshold_refresh_the_membership_filter() {
         test_support::assert_deletes_past_threshold_refresh_filter::<ElasticTable<u64, u64>>(
             |table, key| {
-                let prepared = PreparedElasticKey::new(table.hash_key(&key));
+                let prepared = PreparedElasticKey::new(table.hash_builder.hash_one(key));
                 table.route_filter(prepared).maybe_present
             },
             |table| table.stale_membership,
@@ -2599,7 +2594,7 @@ mod tests {
     fn membership_filter_never_forgets_live_or_deleted_hashes() {
         let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
             ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
-        let inserted_hash = map.table().hash_key(&7_u64);
+        let inserted_hash = map.table().hash_builder.hash_one(7_u64);
         let prepared = PreparedElasticKey::new(inserted_hash);
         assert!(!membership_maybe_contains_prepared(map.table(), prepared));
 
@@ -2658,7 +2653,7 @@ mod tests {
 
         let mut cloned = map.clone();
         for key in 0_u64..96 {
-            let hash = cloned.table().hash_key(&key);
+            let hash = cloned.table().hash_builder.hash_one(key);
             assert!(membership_maybe_contains_prepared(
                 cloned.table(),
                 PreparedElasticKey::new(hash),
@@ -2668,7 +2663,7 @@ mod tests {
 
         cloned.clear();
         for key in 0_u64..96 {
-            let hash = cloned.table().hash_key(&key);
+            let hash = cloned.table().hash_builder.hash_one(key);
             assert!(!membership_maybe_contains_prepared(
                 cloned.table(),
                 PreparedElasticKey::new(hash),
@@ -2680,7 +2675,7 @@ mod tests {
         }
         cloned.reserve(512);
         for key in 256_u64..384 {
-            let hash = cloned.table().hash_key(&key);
+            let hash = cloned.table().hash_builder.hash_one(key);
             assert!(membership_maybe_contains_prepared(
                 cloned.table(),
                 PreparedElasticKey::new(hash),
@@ -2699,7 +2694,7 @@ mod tests {
         map.get_or_insert_key_with(&33_u64, 3, |key| *key);
 
         for key in [11_u64, 22, 33] {
-            let hash = map.table().hash_key(&key);
+            let hash = map.table().hash_builder.hash_one(key);
             assert!(membership_maybe_contains_prepared(
                 map.table(),
                 PreparedElasticKey::new(hash)
@@ -2717,7 +2712,7 @@ mod tests {
         }
         assert!(map.try_reserve(usize::MAX).is_err());
         for key in 0_u64..64 {
-            let hash = map.table().hash_key(&key);
+            let hash = map.table().hash_builder.hash_one(key);
             assert!(membership_maybe_contains_prepared(
                 map.table(),
                 PreparedElasticKey::new(hash)
@@ -2728,7 +2723,7 @@ mod tests {
         map.drain().for_each(drop);
         assert!(map.is_empty());
         for key in 0_u64..64 {
-            let hash = map.table().hash_key(&key);
+            let hash = map.table().hash_builder.hash_one(key);
             assert!(!membership_maybe_contains_prepared(
                 map.table(),
                 PreparedElasticKey::new(hash)
@@ -2764,7 +2759,7 @@ mod tests {
         fail.store(true, Ordering::SeqCst);
         assert_eq!(map.try_reserve(4_096), Err(TryReserveError::AllocError));
         for key in 0_u64..64 {
-            let hash = map.table().hash_key(&key);
+            let hash = map.table().hash_builder.hash_one(key);
             assert!(membership_maybe_contains_prepared(
                 map.table(),
                 PreparedElasticKey::new(hash)
@@ -2876,7 +2871,7 @@ mod tests {
         );
 
         for key in 0..insertion_count {
-            let hash = table.hash_key(&key);
+            let hash = table.hash_builder.hash_one(key);
             let prepared = PreparedElasticKey::new(hash);
             let fingerprint = control::control_fingerprint(hash);
             let location = table
@@ -2890,7 +2885,7 @@ mod tests {
         }
 
         let missing = usize::MAX;
-        let hash = table.hash_key(&missing);
+        let hash = table.hash_builder.hash_one(missing);
         let prepared = PreparedElasticKey::new(hash);
         let fingerprint = control::control_fingerprint(hash);
         assert!(
@@ -2908,7 +2903,7 @@ mod tests {
         }
         let before: Vec<_> = (1..100)
             .map(|key| {
-                let hash = map.table().hash_key(&key);
+                let hash = map.table().hash_builder.hash_one(key);
                 map.table()
                     .find_slot_indices_prepared(
                         &key,
@@ -2923,7 +2918,7 @@ mod tests {
 
         let after: Vec<_> = (1..100)
             .map(|key| {
-                let hash = map.table().hash_key(&key);
+                let hash = map.table().hash_builder.hash_one(key);
                 map.table()
                     .find_slot_indices_prepared(
                         &key,
@@ -2981,7 +2976,7 @@ mod tests {
         let previous_slots = table.total_slots;
 
         let key = bootstrap_quota;
-        let hash = table.hash_key(&key);
+        let hash = table.hash_builder.hash_one(key);
         table.insert_for_vacant_entry(key, key, hash);
 
         assert!(table.total_slots > previous_slots);
