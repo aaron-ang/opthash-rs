@@ -244,7 +244,7 @@ impl PreparedElasticProbe {
 }
 
 impl PreparedFastFunnelProbe {
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn prepare_domain(
         self,
         domain: ProbeDomain,
@@ -348,6 +348,23 @@ pub(crate) const fn try_pack_funnel_counter(
         ProbeDomain::ElasticOrdinary { .. } => return None,
     };
     Some((tag << 62) | (level << 16) | (logical_probe_index << 8) | rejection_index as u64)
+}
+
+/// Counter bases of the three Funnel special-array domains: the domain tag
+/// alone, since their level and starting indices are zero. Fixed by the
+/// encoding, so the walks start from them without a fallible pack.
+pub(crate) const FUNNEL_SPECIAL_PRIMARY_BASE: u64 =
+    funnel_special_base(ProbeDomain::FunnelSpecialPrimary);
+pub(crate) const FUNNEL_SPECIAL_FALLBACK_A_BASE: u64 =
+    funnel_special_base(ProbeDomain::FunnelSpecialFallbackChoiceA);
+pub(crate) const FUNNEL_SPECIAL_FALLBACK_B_BASE: u64 =
+    funnel_special_base(ProbeDomain::FunnelSpecialFallbackChoiceB);
+
+const fn funnel_special_base(domain: ProbeDomain) -> u64 {
+    match try_pack_funnel_counter(domain, 0, 0) {
+        Some(base) => base,
+        None => panic!("Funnel special domains fit their counter encoding"),
+    }
 }
 
 impl PreparedProbeRange {
