@@ -13,6 +13,11 @@ pre-commit run --all-files                  # Runs formatters, clippy, ruff, myp
 
 For performance-sensitive changes, run the relevant benchmark A/B workflow in [Benchmarks](#benchmarks) and read the JSON results.
 
+Do not edit `CHANGELOG.md`. release-plz generates it from conventional commit
+messages on release. Put user-facing detail in the commit body and mark
+breaking changes with `!` on the type (`refactor!: ...`) so they land in the
+right changelog section and version bump.
+
 One-time setup (after cloning):
 
 ```bash
