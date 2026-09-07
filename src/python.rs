@@ -112,17 +112,10 @@ impl HashedAny {
         }
     }
 
-    /// Compute `__hash__` once and bump the object's refcount. Uses raw
-    /// `Py_INCREF` rather than `Bound::clone().unbind() + forget` to avoid
-    /// `Py<PyAny>` moves the optimizer doesn't always elide.
+    /// Compute `__hash__` once and take a strong ref. See
+    /// [`ProbeKey::into_owned`] for why the refcount bump is a raw `Py_INCREF`.
     fn from_bound(ob: &Bound<PyAny>) -> PyResult<Self> {
-        let hash = ob.hash()?;
-        let kind = Self::detect_kind(ob);
-        let raw = ob.as_ptr();
-        // SAFETY: `Bound` guarantees `raw` is non-null and the GIL is held.
-        unsafe { ffi::Py_INCREF(raw) };
-        let tagged = Self::pack(raw, kind);
-        Ok(Self { tagged, hash })
+        Ok(ProbeKey::from_bound(ob)?.into_owned())
     }
 
     /// Refcount-bumping clone. Reuses cached hash and tag.
@@ -207,6 +200,16 @@ impl<'a> ProbeKey<'a> {
 
     fn as_key(&self) -> &HashedAny {
         &self.inner
+    }
+
+    /// Upgrade to an owning [`HashedAny`], reusing the cached hash and tag so
+    /// `__hash__` runs once per key even on a probe-then-insert path. Uses raw
+    /// `Py_INCREF` rather than `Bound::clone().unbind() + forget` to avoid
+    /// `Py<PyAny>` moves the optimizer doesn't always elide.
+    fn into_owned(self) -> HashedAny {
+        // SAFETY: the `'a` borrow keeps the object live and the GIL held.
+        unsafe { ffi::Py_INCREF(self.inner.obj_ptr()) };
+        ManuallyDrop::into_inner(self.inner)
     }
 }
 
@@ -847,9 +850,8 @@ macro_rules! define_map_classes {
                 if let Some(v) = self.inner.get(probe.as_key()) {
                     return Ok(v.clone_ref(py));
                 }
-                let k = HashedAny::from_bound(key)?;
                 let value = default.unwrap_or_else(|| py.None());
-                self.inner.insert(k, value.clone_ref(py));
+                self.inner.insert(probe.into_owned(), value.clone_ref(py));
                 self.bump();
                 Ok(value)
             }
