@@ -17,9 +17,6 @@ const LOAD_FRACTIONS: &[f64] = &[0.45, 0.55, 0.65, 0.75, 0.85];
     clippy::cast_sign_loss
 )]
 fn bench_load_factor(c: &mut Criterion) {
-    use hashbrown::HashMap as HashbrownMap;
-    use opthash::{ElasticHashMap, FunnelHashMap};
-
     // Generous pool: the largest fill is the top fraction of the largest
     // `capacity()`, which stays well under this even at high reserve fractions.
     let pairs = harness::make_pairs(CAP_HINT * 2);
@@ -30,10 +27,12 @@ fn bench_load_factor(c: &mut Criterion) {
         let mut group = c.benchmark_group(&workload);
 
         // Bench id `<workload>_<impl>`, matching speedup.rs / mean_latency.rs.
+        // Maps come from the harness constructors so every arm shares the
+        // fixed-seed `BenchHasher` used by the rest of the suite.
         macro_rules! arm {
-            ($impl:literal, $Map:ty) => {
+            ($impl:literal, $ctor:ident) => {
                 group.bench_function(format!("{workload}_{}", $impl), |b| {
-                    let mut map = <$Map>::with_capacity(CAP_HINT);
+                    let mut map = harness::$ctor(CAP_HINT);
                     // Fill to `frac` of this map's resize threshold so the load
                     // axis is stable across reserve-policy changes.
                     // `frac < 1`, so no arm rehashes mid-fill.
@@ -48,9 +47,9 @@ fn bench_load_factor(c: &mut Criterion) {
             };
         }
 
-        arm!("hashbrown", HashbrownMap<u64, u64>);
-        arm!("elastic", ElasticHashMap<u64, u64>);
-        arm!("funnel", FunnelHashMap<u64, u64>);
+        arm!("hashbrown", hashbrown_map_cap);
+        arm!("elastic", elastic_map_cap);
+        arm!("funnel", funnel_map_cap);
 
         group.finish();
     }
