@@ -35,7 +35,7 @@ impl PaperConfig {
     /// Returns `floor(delta * n)` using exact integer arithmetic.
     #[must_use]
     pub(crate) const fn floor_delta_n(&self) -> usize {
-        floor_div_pow2(self.n, self.reserve_exponent)
+        floor_div_pow2(self.n, self.reserve_exponent as u64)
     }
 
     /// Returns the paper experiment's exact insertion count.
@@ -392,7 +392,7 @@ impl Iterator for BatchQuotas {
         let level = self.levels.next()?;
         let raw_quota = if let Some(previous) = self.previous_level {
             previous
-                - floor_div_pow2(previous, self.reserve_exponent.saturating_add(1))
+                - floor_div_pow2(previous, u64::from(self.reserve_exponent) + 1)
                 - ceil_three_quarters(previous)
                 + ceil_three_quarters(level)
         } else {
@@ -623,8 +623,10 @@ const fn floor_three_div_pow2(value: usize, exponent: u64) -> usize {
     }
 }
 
-pub(crate) const fn floor_div_pow2(value: usize, exponent: u32) -> usize {
-    if exponent >= usize::BITS {
+/// Returns `floor(value / 2^exponent)`; the wide exponent lets callers pass
+/// `d + 1` without an overflow check.
+pub(crate) const fn floor_div_pow2(value: usize, exponent: u64) -> usize {
+    if exponent >= usize::BITS as u64 {
         0
     } else {
         value >> exponent
@@ -749,7 +751,7 @@ mod tests {
                     let next = adjacent[1];
                     raw.push(
                         current
-                            - floor_div_pow2(current, reserve_exponent.saturating_add(1))
+                            - floor_div_pow2(current, u64::from(reserve_exponent) + 1)
                             - ceil_three_quarters(current)
                             + ceil_three_quarters(next),
                     );

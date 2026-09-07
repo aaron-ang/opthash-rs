@@ -1,6 +1,8 @@
 use core::error::Error;
 use core::fmt;
 
+use crate::common::exact::geometry;
+
 /// An exact dyadic reserve fraction `delta = 1 / 2^d`.
 ///
 /// The exponent is stored directly so capacity calculations never depend on
@@ -36,13 +38,13 @@ impl ReserveFraction {
     /// Returns `floor(delta * n)` using exact integer arithmetic.
     #[must_use]
     pub const fn floor_reserved(self, n: usize) -> usize {
-        floor_div_pow2(n, self.exponent as u64)
+        geometry::floor_div_pow2(n, self.exponent as u64)
     }
 
     /// Returns `floor(delta * n / 2)` using exact integer arithmetic.
     #[must_use]
     pub const fn floor_half_reserved(self, n: usize) -> usize {
-        floor_div_pow2(n, self.exponent as u64 + 1)
+        geometry::floor_div_pow2(n, self.exponent as u64 + 1)
     }
 
     /// Returns the exact `f64` representation when one exists.
@@ -129,14 +131,6 @@ impl fmt::Display for ReserveFractionError {
 }
 
 impl Error for ReserveFractionError {}
-
-const fn floor_div_pow2(value: usize, exponent: u64) -> usize {
-    if exponent >= usize::BITS as u64 {
-        0
-    } else {
-        value >> exponent
-    }
-}
 
 #[cfg(test)]
 mod tests {
