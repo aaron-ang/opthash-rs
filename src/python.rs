@@ -30,10 +30,6 @@ fn parse_reserve(reserve_exponent: Option<u32>) -> PyResult<ReserveFraction> {
     Ok(ReserveFraction::DEFAULT)
 }
 
-fn validate_elastic_reserve(reserve_exponent: Option<u32>) -> PyResult<ReserveFraction> {
-    parse_reserve(reserve_exponent)
-}
-
 fn validate_funnel_reserve(reserve_exponent: Option<u32>) -> PyResult<ReserveFraction> {
     let reserve = parse_reserve(reserve_exponent)?;
     if reserve.exponent() < 3 {
@@ -421,30 +417,6 @@ fn map_eq<P: TableBackend<HashedAny, Py<PyAny>>>(
     true
 }
 
-/// `dict.fromkeys` body: insert each key from `iterable`, all mapped to `value`.
-fn map_from_keys<P: TableBackend<HashedAny, Py<PyAny>>>(
-    inner: &mut HashMap<HashedAny, Py<PyAny>, P>,
-    iterable: &Bound<PyAny>,
-    value: &Py<PyAny>,
-    py: Python,
-) -> PyResult<()> {
-    for k in iterable.try_iter()? {
-        let key = HashedAny::from_bound(&k?)?;
-        inner.insert(key, value.clone_ref(py));
-    }
-    Ok(())
-}
-
-/// `dict.popitem` body: remove and return one `(key_obj, value)` pair, or
-/// `None` if empty (the caller raises `KeyError`).
-fn map_popitem<P: TableBackend<HashedAny, Py<PyAny>>>(
-    inner: &mut HashMap<HashedAny, Py<PyAny>, P>,
-    py: Python,
-) -> Option<(Py<PyAny>, Py<PyAny>)> {
-    let (k, v) = inner.extract_if(|_, _| true).next()?;
-    Some((k.obj_clone_ref(py), v))
-}
-
 /// `dict.keys() & other`: keys present in both, as a fresh `set`.
 fn keys_view_intersection<P: TableBackend<HashedAny, Py<PyAny>>>(
     inner: &HashMap<HashedAny, Py<PyAny>, P>,
@@ -627,6 +599,29 @@ macro_rules! define_map_classes {
                 }
                 Ok(())
             }
+
+            /// Fresh map holding `self` and `other`. The side inserted last
+            /// wins duplicate keys, so `other_first` selects `other | self`.
+            fn merged(
+                &self,
+                other: &Bound<PyAny>,
+                other_first: bool,
+                py: Python,
+            ) -> PyResult<Self> {
+                let cap = self.inner.len().saturating_add(other.len().unwrap_or(0));
+                let mut new = Self {
+                    inner: $Inner::with_capacity(cap),
+                    generation: 0,
+                };
+                if other_first {
+                    new.update(Some(other), None, py)?;
+                }
+                map_extend_cloned(&mut new.inner, &self.inner, py);
+                if !other_first {
+                    new.update(Some(other), None, py)?;
+                }
+                Ok(new)
+            }
         }
 
         #[pymethods]
@@ -677,8 +672,10 @@ macro_rules! define_map_classes {
                     generation: 0,
                 };
                 let val = value.unwrap_or_else(|| py.None());
-                map_from_keys(&mut me.inner, iterable, &val, py)?;
-                me.bump();
+                for k in iterable.try_iter()? {
+                    me.inner
+                        .insert(HashedAny::from_bound(&k?)?, val.clone_ref(py));
+                }
                 Ok(me)
             }
 
@@ -797,13 +794,11 @@ macro_rules! define_map_classes {
                 kwargs: Option<&Bound<PyDict>>,
                 py: Python,
             ) -> PyResult<()> {
-                let touched = match other.and_then(|o| o.cast::<Self>().ok()) {
-                    Some(o) => {
-                        let peer = o.borrow();
-                        map_update(&mut self.inner, other, kwargs, py, Some(&peer.inner))
-                    }
-                    None => map_update(&mut self.inner, other, kwargs, py, None),
-                };
+                let peer = other
+                    .and_then(|o| o.cast::<Self>().ok())
+                    .map(|o| o.borrow());
+                let same_inner = peer.as_ref().map(|p| &p.inner);
+                let touched = map_update(&mut self.inner, other, kwargs, py, same_inner);
                 self.bump_if_changed(touched)
             }
 
@@ -824,13 +819,11 @@ macro_rules! define_map_classes {
             }
 
             fn popitem<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-                match map_popitem(&mut self.inner, py) {
-                    Some((key_obj, value)) => {
-                        self.bump();
-                        PyTuple::new(py, [key_obj, value])
-                    }
-                    None => Err(PyKeyError::new_err("popitem(): map is empty")),
-                }
+                let Some((k, v)) = self.inner.extract_if(|_, _| true).next() else {
+                    return Err(PyKeyError::new_err("popitem(): map is empty"));
+                };
+                self.bump();
+                PyTuple::new(py, [k.obj_clone_ref(py), v])
             }
 
             #[pyo3(signature = (key, default = None))]
@@ -864,28 +857,11 @@ macro_rules! define_map_classes {
             }
 
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
-                let other_hint = other.len().unwrap_or(0);
-                let cap = self.inner.len().saturating_add(other_hint);
-                let mut new = Self {
-                    inner: $Inner::with_capacity(cap),
-                    generation: 0,
-                };
-                map_extend_cloned(&mut new.inner, &self.inner, py);
-                new.update(Some(other), None, py)?;
-                Ok(new)
+                self.merged(other, false, py)
             }
 
             fn __ror__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
-                let other_hint = other.len().unwrap_or(0);
-                let cap = self.inner.len().saturating_add(other_hint);
-                let mut new = Self {
-                    inner: $Inner::with_capacity(cap),
-                    generation: 0,
-                };
-                new.update(Some(other), None, py)?;
-                map_extend_cloned(&mut new.inner, &self.inner, py);
-                new.bump();
-                Ok(new)
+                self.merged(other, true, py)
             }
 
             fn __ior__(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<()> {
@@ -1384,20 +1360,6 @@ fn set_eq<P: TableBackend<HashedAny, ()>>(
     Ok(true)
 }
 
-/// `other - self`: fill the empty `dst` from `other`, then drop every element of
-/// `this`. Caller supplies `dst` empty so the result keeps this backend.
-fn set_rsub_into<P: TableBackend<HashedAny, ()>>(
-    dst: &mut HashSet<HashedAny, P>,
-    this: &HashSet<HashedAny, P>,
-    other: &Bound<PyAny>,
-) -> PyResult<()> {
-    set_add_all(dst, other, None)?;
-    for value in this {
-        dst.remove(value);
-    }
-    Ok(())
-}
-
 /// Emits one Python-facing set surface (class + element iterator) per backend.
 /// Mirrors `define_map_classes!`: invoked once each for `Elastic` and `Funnel`.
 macro_rules! define_set_classes {
@@ -1692,12 +1654,17 @@ macro_rules! define_set_classes {
                 Ok(new)
             }
 
+            /// `other - self`: fill a fresh set of this backend from `other`,
+            /// then drop every element of `self`.
             fn __rsub__(&self, other: &Bound<PyAny>) -> PyResult<Self> {
                 let mut new = Self {
                     inner: $Inner::new(),
                     generation: 0,
                 };
-                set_rsub_into(&mut new.inner, &self.inner, other)?;
+                set_add_all(&mut new.inner, other, None)?;
+                for value in &self.inner {
+                    new.inner.remove(value);
+                }
                 Ok(new)
             }
 
@@ -1737,7 +1704,7 @@ define_set_classes! {
     py_set = PyElasticHashSet,
     py_set_name = "ElasticHashSet",
     inner = ElasticHashSet,
-    validate_rf = validate_elastic_reserve,
+    validate_rf = parse_reserve,
     key_iter = PyElasticSetIter,
     key_iter_name = "_ElasticSetIter",
 }
@@ -1755,7 +1722,7 @@ define_map_classes! {
     py_map = PyElasticHashMap,
     py_map_name = "ElasticHashMap",
     inner = ElasticHashMap,
-    validate_rf = validate_elastic_reserve,
+    validate_rf = parse_reserve,
     key_iter = PyElasticKeyIter,
     key_iter_name = "_ElasticKeyIter",
     value_iter = PyElasticValueIter,
