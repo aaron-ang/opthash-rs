@@ -8,6 +8,26 @@ macro_rules! common_suite {
             use opthash::$Entry as Entry;
             use opthash::$TestMap as HashMap;
 
+            /// Value whose drop bumps a shared counter; used by the
+            /// consuming-iterator tests to prove every element is dropped once.
+            struct DropCounter {
+                counter: Arc<AtomicUsize>,
+            }
+
+            impl DropCounter {
+                fn new(counter: &Arc<AtomicUsize>) -> Self {
+                    Self {
+                        counter: Arc::clone(counter),
+                    }
+                }
+            }
+
+            impl Drop for DropCounter {
+                fn drop(&mut self) {
+                    self.counter.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
             #[test]
             fn entry_and_modify_runs_on_occupied() {
                 let mut map: HashMap<i32, i32> = HashMap::new();
@@ -329,25 +349,11 @@ macro_rules! common_suite {
 
             #[test]
             fn into_iter_partial_drop_drops_remaining() {
-                struct DropCounter {
-                    counter: Arc<AtomicUsize>,
-                }
-                impl Drop for DropCounter {
-                    fn drop(&mut self) {
-                        self.counter.fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-
                 let counter = Arc::new(AtomicUsize::new(0));
                 let n: usize = 50;
                 let mut map: HashMap<usize, DropCounter> = HashMap::with_capacity(128);
                 for i in 0..n {
-                    map.insert(
-                        i,
-                        DropCounter {
-                            counter: Arc::clone(&counter),
-                        },
-                    );
+                    map.insert(i, DropCounter::new(&counter));
                 }
                 let take = 12;
                 let mut it = map.into_iter();
@@ -389,25 +395,11 @@ macro_rules! common_suite {
 
             #[test]
             fn into_keys_drops_values() {
-                struct DropCounter {
-                    counter: Arc<AtomicUsize>,
-                }
-                impl Drop for DropCounter {
-                    fn drop(&mut self) {
-                        self.counter.fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-
                 let counter = Arc::new(AtomicUsize::new(0));
                 let n: usize = 32;
                 let mut map: HashMap<usize, DropCounter> = HashMap::with_capacity(64);
                 for i in 0..n {
-                    map.insert(
-                        i,
-                        DropCounter {
-                            counter: Arc::clone(&counter),
-                        },
-                    );
+                    map.insert(i, DropCounter::new(&counter));
                 }
                 let keys: Vec<usize> = map.into_keys().collect();
                 assert_eq!(keys.len(), n);
