@@ -1756,25 +1756,34 @@ define_map_classes! {
     items_view_name = "funnel_items",
 }
 
+/// Register the four public collections and their `collections.abc`
+/// membership. Iterator and view pyclasses are implementation types:
+/// instances flow out of `__iter__`/`keys()`/… without being module
+/// attributes, and the views are registered as ABC virtual subclasses here
+/// so `isinstance(m.keys(), KeysView)` holds.
 #[pymodule]
 fn opthash(m: &Bound<PyModule>) -> PyResult<()> {
+    let py = m.py();
     m.add_class::<PyElasticHashMap>()?;
     m.add_class::<PyFunnelHashMap>()?;
     m.add_class::<PyElasticHashSet>()?;
     m.add_class::<PyFunnelHashSet>()?;
-    m.add_class::<PyElasticSetIter>()?;
-    m.add_class::<PyFunnelSetIter>()?;
-    m.add_class::<PyElasticKeysView>()?;
-    m.add_class::<PyElasticValuesView>()?;
-    m.add_class::<PyElasticItemsView>()?;
-    m.add_class::<PyElasticKeyIter>()?;
-    m.add_class::<PyElasticValueIter>()?;
-    m.add_class::<PyElasticItemIter>()?;
-    m.add_class::<PyFunnelKeysView>()?;
-    m.add_class::<PyFunnelValuesView>()?;
-    m.add_class::<PyFunnelItemsView>()?;
-    m.add_class::<PyFunnelKeyIter>()?;
-    m.add_class::<PyFunnelValueIter>()?;
-    m.add_class::<PyFunnelItemIter>()?;
+
+    let abc = py.import("collections.abc")?;
+    let registrations: [(&str, Bound<PyType>); 10] = [
+        ("MutableMapping", py.get_type::<PyElasticHashMap>()),
+        ("MutableMapping", py.get_type::<PyFunnelHashMap>()),
+        ("MutableSet", py.get_type::<PyElasticHashSet>()),
+        ("MutableSet", py.get_type::<PyFunnelHashSet>()),
+        ("KeysView", py.get_type::<PyElasticKeysView>()),
+        ("KeysView", py.get_type::<PyFunnelKeysView>()),
+        ("ValuesView", py.get_type::<PyElasticValuesView>()),
+        ("ValuesView", py.get_type::<PyFunnelValuesView>()),
+        ("ItemsView", py.get_type::<PyElasticItemsView>()),
+        ("ItemsView", py.get_type::<PyFunnelItemsView>()),
+    ];
+    for (abc_name, ty) in registrations {
+        abc.getattr(abc_name)?.call_method1("register", (ty,))?;
+    }
     Ok(())
 }
