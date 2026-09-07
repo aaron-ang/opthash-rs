@@ -705,23 +705,6 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
-    #[must_use]
-    pub fn with_capacity_and_reserve_fraction_and_hasher_in(
-        capacity: usize,
-        reserve_fraction: f64,
-        hash_builder: S,
-        alloc: A,
-    ) -> Self {
-        let reserve_fraction = ReserveFraction::try_from(reserve_fraction)
-            .unwrap_or_else(|error| panic!("invalid reserve fraction: {error}"));
-        Self::with_capacity_and_reserve_and_hasher_in(
-            capacity,
-            reserve_fraction,
-            hash_builder,
-            alloc,
-        )
-    }
-
     /// Full constructor using an exact dyadic reserve.
     #[must_use]
     pub fn with_capacity_and_reserve_and_hasher_in(
