@@ -1182,7 +1182,8 @@ where
         let location =
             self.place_new_entry(slot, key, value, membership, key_fingerprint, exceptional);
         if exceptional {
-            self.epoch.start_placement_recovery(self.len);
+            self.epoch
+                .start_with_placement_recovery(EpochTransition::PlacementRecovery);
         }
         location
     }
@@ -1223,10 +1224,9 @@ where
         });
         drop(guard);
         if recovered {
-            self.epoch
-                .start_with_placement_recovery(transition, self.len);
+            self.epoch.start_with_placement_recovery(transition);
         } else {
-            self.epoch.start(transition, self.len);
+            self.epoch.start(transition);
         }
     }
 
@@ -1251,9 +1251,9 @@ where
         self.epoch = prior_epoch;
         if recovered {
             self.epoch
-                .start_with_placement_recovery(EpochTransition::ExplicitResize, self.len);
+                .start_with_placement_recovery(EpochTransition::ExplicitResize);
         } else {
-            self.epoch.start(EpochTransition::ExplicitResize, self.len);
+            self.epoch.start(EpochTransition::ExplicitResize);
         }
         Ok(())
     }
@@ -1492,7 +1492,7 @@ where
         debug_assert_eq!(self.len, 0);
         self.exceptional_placement = false;
         self.clear_membership();
-        self.epoch.start(EpochTransition::Clear, 0);
+        self.epoch.start(EpochTransition::Clear);
     }
 
     fn wipe_all(&mut self) {
@@ -1501,7 +1501,7 @@ where
         self.tombstones = 0;
         self.exceptional_placement = false;
         self.clear_membership();
-        self.epoch.start(EpochTransition::Clear, 0);
+        self.epoch.start(EpochTransition::Clear);
     }
 
     fn clone_table(&self) -> Self

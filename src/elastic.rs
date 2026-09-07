@@ -831,7 +831,7 @@ where
         self.probe_high_water = 0;
         self.probe_schedule.clear();
         self.clear_membership();
-        self.epoch.start(EpochTransition::Clear, 0);
+        self.epoch.start(EpochTransition::Clear);
     }
 
     /// Post-lookup insert for a key known to be absent. Returns the chosen
@@ -1233,7 +1233,7 @@ where
         self.probe_high_water = 0;
         self.probe_schedule.clear();
         self.clear_membership();
-        self.epoch.start(EpochTransition::Clear, 0);
+        self.epoch.start(EpochTransition::Clear);
     }
 
     fn clone_table(&self) -> Self
@@ -1399,10 +1399,9 @@ where
         // are CTRL_EMPTY so `drop_values` is a no-op on success.
         drop(guard);
         if transition == EpochTransition::PlacementRecovery || used_exceptional_placement {
-            self.epoch
-                .start_with_placement_recovery(transition, self.len);
+            self.epoch.start_with_placement_recovery(transition);
         } else {
-            self.epoch.start(transition, self.len);
+            self.epoch.start(transition);
         }
     }
 
@@ -1438,9 +1437,9 @@ where
         self.epoch = prior_epoch;
         if used_exceptional_placement {
             self.epoch
-                .start_with_placement_recovery(EpochTransition::ExplicitResize, self.len);
+                .start_with_placement_recovery(EpochTransition::ExplicitResize);
         } else {
-            self.epoch.start(EpochTransition::ExplicitResize, self.len);
+            self.epoch.start(EpochTransition::ExplicitResize);
         }
         Ok(())
     }

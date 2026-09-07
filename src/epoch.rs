@@ -66,7 +66,7 @@ impl EpochState {
         self.lifecycle |= HAD_DELETE_MASK;
     }
 
-    pub(crate) fn start(&mut self, transition: EpochTransition, _survivor_insertions: usize) {
+    pub(crate) fn start(&mut self, transition: EpochTransition) {
         let generation = self.generation().saturating_add(1);
         self.lifecycle = (self.lifecycle & RECOVERY_MASK)
             | u64::from(generation)
@@ -74,19 +74,11 @@ impl EpochState {
         self.deletions = 0;
     }
 
-    pub(crate) fn start_placement_recovery(&mut self, survivor_insertions: usize) {
-        self.start_with_placement_recovery(EpochTransition::PlacementRecovery, survivor_insertions);
-    }
-
-    pub(crate) fn start_with_placement_recovery(
-        &mut self,
-        transition: EpochTransition,
-        survivor_insertions: usize,
-    ) {
+    pub(crate) fn start_with_placement_recovery(&mut self, transition: EpochTransition) {
         let recoveries = self.placement_recoveries().saturating_add(1);
         self.lifecycle =
             (self.lifecycle & !RECOVERY_MASK) | (u64::from(recoveries) << RECOVERY_SHIFT);
-        self.start(transition, survivor_insertions);
+        self.start(transition);
     }
 
     pub(crate) const fn snapshot(self, live_entries: usize) -> EpochSnapshot {
