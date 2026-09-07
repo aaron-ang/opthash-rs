@@ -23,6 +23,33 @@ impl BuildHasher for ConstantBuildHasher {
     }
 }
 
+/// Inserts `key => key` for every key in `range`, asserting each is new.
+macro_rules! fill_identity {
+    ($map:expr, $range:expr) => {
+        for key in $range {
+            assert_eq!($map.insert(key, key), None);
+        }
+    };
+}
+
+/// Fills a fresh map up to its resize threshold and returns that capacity.
+macro_rules! fill_to_capacity {
+    ($map:expr) => {{
+        let capacity = $map.capacity();
+        fill_identity!($map, 0..capacity);
+        capacity
+    }};
+}
+
+/// Asserts `key => key` is still readable for every key in `range`.
+macro_rules! assert_identity_present {
+    ($map:expr, $range:expr) => {
+        for key in $range {
+            assert_eq!($map.get(&key), Some(&key));
+        }
+    };
+}
+
 #[test]
 fn compact_observability_exposes_epoch_and_reserve() {
     let elastic = ElasticHashMap::<usize, usize>::new();
@@ -42,10 +69,7 @@ fn duplicate_at_capacity_does_not_start_a_new_epoch() {
     macro_rules! check {
         ($map:expr) => {{
             let mut map = $map;
-            let capacity = map.capacity();
-            for key in 0..capacity {
-                assert_eq!(map.insert(key, key), None);
-            }
+            let capacity = fill_to_capacity!(map);
             let before = map.epoch();
 
             let duplicate = capacity / 2;
@@ -77,10 +101,7 @@ fn duplicate_set_insert_at_capacity_does_not_grow() {
 #[test]
 fn first_absent_insert_beyond_capacity_grows_once() {
     let mut map = FunnelHashMap::<usize, usize>::with_capacity(64);
-    let capacity = map.capacity();
-    for key in 0..capacity {
-        map.insert(key, key);
-    }
+    let capacity = fill_to_capacity!(map);
     let before = map.epoch();
 
     map.insert(capacity, capacity);
@@ -88,17 +109,13 @@ fn first_absent_insert_beyond_capacity_grows_once() {
     assert!(map.capacity() > capacity);
     assert_eq!(after.generation, before.generation + 1);
     assert_eq!(after.transition, EpochTransition::Growth);
-    for key in 0..=capacity {
-        assert_eq!(map.get(&key), Some(&key));
-    }
+    assert_identity_present!(map, 0..=capacity);
 }
 
 #[test]
 fn ordinary_delete_marks_the_epoch_without_moving_to_a_new_one() {
     let mut map = ElasticHashMap::<usize, usize>::with_capacity(512);
-    for key in 0..100 {
-        map.insert(key, key);
-    }
+    fill_identity!(map, 0..100);
     let before = map.epoch();
 
     assert_eq!(map.remove(&0), Some(0));
@@ -106,9 +123,7 @@ fn ordinary_delete_marks_the_epoch_without_moving_to_a_new_one() {
     assert_eq!(after.generation, before.generation);
     assert!(after.had_delete);
     assert_eq!(after.distinct_insertions, before.distinct_insertions);
-    for key in 1..100 {
-        assert_eq!(map.get(&key), Some(&key));
-    }
+    assert_identity_present!(map, 1..100);
 }
 
 #[test]
@@ -116,10 +131,7 @@ fn insert_after_a_full_epoch_reuses_space_without_an_eager_rebuild() {
     macro_rules! check {
         ($map:expr) => {{
             let mut map = $map;
-            let capacity = map.capacity();
-            for key in 0..capacity {
-                map.insert(key, key);
-            }
+            let capacity = fill_to_capacity!(map);
             assert_eq!(map.remove(&0), Some(0));
             let before = map.epoch();
 
@@ -130,9 +142,7 @@ fn insert_after_a_full_epoch_reuses_space_without_an_eager_rebuild() {
             assert!(after.had_delete);
             assert_eq!(after.distinct_insertions, before.distinct_insertions + 1);
             assert!(after.distinct_insertions > capacity);
-            for key in 1..=capacity {
-                assert_eq!(map.get(&key), Some(&key));
-            }
+            assert_identity_present!(map, 1..=capacity);
         }};
     }
 
@@ -144,10 +154,7 @@ fn insert_after_a_full_epoch_reuses_space_without_an_eager_rebuild() {
 #[cfg_attr(miri, ignore)]
 fn tombstone_cleanup_is_an_observable_same_size_epoch_boundary() {
     let mut map = ElasticHashMap::<usize, usize>::with_capacity(512);
-    let capacity = map.capacity();
-    for key in 0..capacity {
-        map.insert(key, key);
-    }
+    let capacity = fill_to_capacity!(map);
     let before = map.epoch();
 
     let mut removed = 0;
@@ -174,10 +181,7 @@ fn bulk_removal_cleans_tombstones_after_iteration_finishes() {
     macro_rules! check {
         ($map:expr) => {{
             let mut map = $map;
-            let capacity = map.capacity();
-            for key in 0..capacity {
-                map.insert(key, key);
-            }
+            let capacity = fill_to_capacity!(map);
             let before = map.epoch();
 
             map.retain(|key, _| *key == capacity - 1);
@@ -201,10 +205,7 @@ fn partial_extract_drop_finishes_deferred_tombstone_cleanup() {
     macro_rules! check {
         ($map:expr) => {{
             let mut map = $map;
-            let capacity = map.capacity();
-            for key in 0..capacity {
-                map.insert(key, key);
-            }
+            let capacity = fill_to_capacity!(map);
             let before = map.epoch();
 
             {
@@ -284,9 +285,7 @@ fn below_capacity_funnel_placement_recovery_is_observable() {
         EpochTransition::PlacementRecovery
     );
 
-    for key in 0..next_key {
-        assert_eq!(map.get(&key), Some(&key));
-    }
+    assert_identity_present!(map, 0..next_key);
 
     let recovered_key = next_key - 1;
     let before_replacement = map.epoch();
@@ -298,9 +297,7 @@ fn below_capacity_funnel_placement_recovery_is_observable() {
 
     let mut rebuilt = map.clone();
     assert_eq!(rebuilt.epoch(), map.epoch());
-    for key in 0..recovered_key {
-        assert_eq!(rebuilt.get(&key), Some(&key));
-    }
+    assert_identity_present!(rebuilt, 0..recovered_key);
 
     let before_reserve = rebuilt.epoch();
     let old_capacity = rebuilt.capacity();
@@ -322,7 +319,5 @@ fn below_capacity_funnel_placement_recovery_is_observable() {
     assert_eq!(after_shrink.transition, EpochTransition::ExplicitResize);
     assert!(after_shrink.placement_recoveries > before_shrink.placement_recoveries);
 
-    for key in 0..recovered_key {
-        assert_eq!(rebuilt.get(&key), Some(&key));
-    }
+    assert_identity_present!(rebuilt, 0..recovered_key);
 }
