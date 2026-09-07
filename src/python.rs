@@ -553,9 +553,50 @@ macro_rules! dispatch_same_type {
     };
 }
 
+/// Emits the pyclass state struct and its generation-bump helpers, shared by
+/// the map and set surfaces. `PyO3` can't `#[pyclass]` over a generic, hence
+/// the macro. The `#[pymethods]` the two kinds share (`with_options`,
+/// `__len__`, `capacity`, `__repr__`, `clear`, `__class_getitem__`) stay in
+/// each kind's single block: pyo3 allows one block per class unless the
+/// `multiple-pymethods` feature is on, and that feature's `inventory`
+/// constructors break `cargo test --features python` linking.
+macro_rules! define_pyclass_state {
+    (
+        py = $Py:ident,
+        py_name = $py_name:literal,
+        inner = $Inner:ty,
+    ) => {
+        /// `PyO3` wrapper around the Rust collection.
+        #[pyclass(name = $py_name, module = "opthash")]
+        struct $Py {
+            inner: $Inner,
+            /// Mutation counter snapshotted by iterators; mismatch on
+            /// `__next__` raises `RuntimeError`.
+            generation: u64,
+        }
+
+        impl $Py {
+            /// Invalidate active iterator snapshots. Call after every mutation.
+            #[inline]
+            fn bump(&mut self) {
+                self.generation = self.generation.wrapping_add(1);
+            }
+
+            /// Bump once if an in-place op reported a change; propagate its error.
+            #[inline]
+            fn bump_if_changed(&mut self, changed: PyResult<bool>) -> PyResult<()> {
+                if changed? {
+                    self.bump();
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
 /// Emits one Python-facing map surface (class + iterators + views) per
-/// backend. `PyO3` can't `#[pyclass]` over a generic, hence the macro;
-/// invoked once each for `Elastic` and `Funnel` to keep behavior in sync.
+/// backend; invoked once each for `Elastic` and `Funnel` to keep behavior in
+/// sync. State and bump helpers come from [`define_pyclass_state!`].
 macro_rules! define_map_classes {
     (
         py_map = $PyMap:ident,
@@ -575,31 +616,13 @@ macro_rules! define_map_classes {
         items_view = $ItemsView:ident,
         items_view_name = $items_view_name:literal,
     ) => {
-        /// `PyO3` wrapper around the Rust hash map.
-        #[pyclass(name = $py_map_name, module = "opthash")]
-        struct $PyMap {
-            inner: $Inner<HashedAny, Py<PyAny>>,
-            /// Mutation counter snapshotted by iterators; mismatch on
-            /// `__next__` raises `RuntimeError`.
-            generation: u64,
+        define_pyclass_state! {
+            py = $PyMap,
+            py_name = $py_map_name,
+            inner = $Inner<HashedAny, Py<PyAny>>,
         }
 
         impl $PyMap {
-            /// Invalidate active iterator snapshots. Call after every mutation.
-            #[inline]
-            fn bump(&mut self) {
-                self.generation = self.generation.wrapping_add(1);
-            }
-
-            /// Bump once if an in-place op reported a change; propagate its error.
-            #[inline]
-            fn bump_if_changed(&mut self, changed: PyResult<bool>) -> PyResult<()> {
-                if changed? {
-                    self.bump();
-                }
-                Ok(())
-            }
-
             /// Fresh map holding `self` and `other`. The side inserted last
             /// wins duplicate keys, so `other_first` selects `other | self`.
             fn merged(
@@ -1361,7 +1384,8 @@ fn set_eq<P: TableBackend<HashedAny, ()>>(
 }
 
 /// Emits one Python-facing set surface (class + element iterator) per backend.
-/// Mirrors `define_map_classes!`: invoked once each for `Elastic` and `Funnel`.
+/// Mirrors `define_map_classes!`: invoked once each for `Elastic` and `Funnel`;
+/// state and bump helpers come from [`define_pyclass_state!`].
 macro_rules! define_set_classes {
     (
         py_set = $PySet:ident,
@@ -1371,31 +1395,13 @@ macro_rules! define_set_classes {
         key_iter = $KeyIter:ident,
         key_iter_name = $key_iter_name:literal,
     ) => {
-        /// `PyO3` wrapper around the Rust hash set.
-        #[pyclass(name = $py_set_name, module = "opthash")]
-        struct $PySet {
-            inner: $Inner<HashedAny>,
-            /// Mutation counter snapshotted by iterators; mismatch on
-            /// `__next__` raises `RuntimeError`.
-            generation: u64,
+        define_pyclass_state! {
+            py = $PySet,
+            py_name = $py_set_name,
+            inner = $Inner<HashedAny>,
         }
 
         impl $PySet {
-            /// Invalidate active iterator snapshots. Call after every mutation.
-            #[inline]
-            fn bump(&mut self) {
-                self.generation = self.generation.wrapping_add(1);
-            }
-
-            /// Bump once if an in-place op reported a change; propagate its error.
-            #[inline]
-            fn bump_if_changed(&mut self, changed: PyResult<bool>) -> PyResult<()> {
-                if changed? {
-                    self.bump();
-                }
-                Ok(())
-            }
-
             /// Apply `op` to each element of `others`; report whether any changed.
             fn fold_each(
                 &mut self,
