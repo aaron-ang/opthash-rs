@@ -381,10 +381,6 @@ fn probe_schedule_capacity(level_count: usize) -> usize {
     count
 }
 
-fn probe_schedule(level_count: usize) -> Vec<PhiRoute> {
-    Vec::with_capacity(probe_schedule_capacity(level_count))
-}
-
 fn try_probe_schedule(level_count: usize) -> Result<Vec<PhiRoute>, TryReserveError> {
     let mut schedule = Vec::new();
     schedule
@@ -394,7 +390,7 @@ fn try_probe_schedule(level_count: usize) -> Result<Vec<PhiRoute>, TryReserveErr
 }
 
 fn clone_probe_schedule(source: &[PhiRoute], level_count: usize) -> Vec<PhiRoute> {
-    let mut schedule = probe_schedule(level_count);
+    let mut schedule = Vec::with_capacity(probe_schedule_capacity(level_count));
     schedule.extend_from_slice(source);
     schedule
 }
@@ -639,18 +635,24 @@ fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
     level_capacities: &[usize],
     alloc: &A,
 ) -> ElasticArenaBuild<K, V> {
-    try_alloc_elastic_arena(level_capacities, alloc).unwrap_or_else(|_| {
-        let layout = level_capacities
-            .iter()
-            .try_fold(0_usize, |total, &capacity| total.checked_add(capacity))
-            .and_then(|total_ctrl| {
-                elastic_arena_layout::<K, V>(total_ctrl)
-                    .ok()
-                    .map(|layout| layout.layout)
-            })
-            .unwrap_or_else(|| Layout::from_size_align(1, 1).unwrap());
-        allocator_api2::alloc::handle_alloc_error(layout)
-    })
+    try_alloc_elastic_arena(level_capacities, alloc)
+        .unwrap_or_else(|_| handle_elastic_alloc_error::<K, V>(level_capacities))
+}
+
+/// Reports the failed allocation for `level_capacities`, or a placeholder
+/// layout when the geometry itself does not fit.
+#[cold]
+fn handle_elastic_alloc_error<K, V>(level_capacities: &[usize]) -> ! {
+    let layout = level_capacities
+        .iter()
+        .try_fold(0_usize, |total, &capacity| total.checked_add(capacity))
+        .and_then(|total_ctrl| {
+            elastic_arena_layout::<K, V>(total_ctrl)
+                .ok()
+                .map(|layout| layout.layout)
+        })
+        .unwrap_or_else(|| Layout::from_size_align(1, 1).unwrap());
+    allocator_api2::alloc::handle_alloc_error(layout)
 }
 
 /// Drops every level's live values, backing [`arena::ArenaDropGuard`]'s
@@ -669,46 +671,13 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
-    /// Full constructor using an exact dyadic reserve.
-    #[must_use]
-    pub fn with_capacity_and_reserve_and_hasher_in(
-        capacity: usize,
+    /// Allocates an empty table for `geometry`. Every constructor ends here.
+    fn try_from_geometry(
+        geometry: &ElasticGeometry,
         reserve_fraction: ReserveFraction,
         hash_builder: S,
         alloc: A,
-    ) -> Self {
-        let geometry = ElasticGeometry::for_insert_budget(capacity, reserve_fraction)
-            .expect("capacity overflow");
-        let probe_schedule = probe_schedule(geometry.level_capacities.len());
-        let (arena, levels, membership) = alloc_elastic_arena(&geometry.level_capacities, &alloc);
-
-        Self {
-            levels,
-            len: 0,
-            total_slots: geometry.total_slots,
-            max_insertions: geometry.max_insertions,
-            reserve_fraction,
-            scheduler: BatchScheduler::new(&geometry.batch_plan),
-            hash_builder,
-            alloc,
-            arena,
-            epoch: EpochState::initial(),
-            probe_high_water: 0,
-            probe_schedule,
-            membership,
-            stale_membership: 0,
-        }
-    }
-
-    /// Fallible full constructor using an exact dyadic reserve.
-    fn try_with_capacity_and_reserve_and_hasher_in(
-        capacity: usize,
-        reserve_fraction: ReserveFraction,
-        hash_builder: S,
-        alloc: A,
-    ) -> Result<Self, TryBuildError> {
-        let geometry = ElasticGeometry::for_insert_budget(capacity, reserve_fraction)
-            .ok_or(TryBuildError::CapacityOverflow)?;
+    ) -> Result<Self, TryReserveError> {
         let probe_schedule = try_probe_schedule(geometry.level_capacities.len())?;
         let (arena, levels, membership) =
             try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
@@ -729,6 +698,33 @@ where
             membership,
             stale_membership: 0,
         })
+    }
+
+    /// Full constructor using an exact dyadic reserve.
+    #[must_use]
+    pub fn with_capacity_and_reserve_and_hasher_in(
+        capacity: usize,
+        reserve_fraction: ReserveFraction,
+        hash_builder: S,
+        alloc: A,
+    ) -> Self {
+        let geometry = ElasticGeometry::for_insert_budget(capacity, reserve_fraction)
+            .expect("capacity overflow");
+        Self::try_from_geometry(&geometry, reserve_fraction, hash_builder, alloc)
+            .unwrap_or_else(|_| handle_elastic_alloc_error::<K, V>(&geometry.level_capacities))
+    }
+
+    /// Fallible full constructor using an exact dyadic reserve.
+    fn try_with_capacity_and_reserve_and_hasher_in(
+        capacity: usize,
+        reserve_fraction: ReserveFraction,
+        hash_builder: S,
+        alloc: A,
+    ) -> Result<Self, TryBuildError> {
+        let geometry = ElasticGeometry::for_insert_budget(capacity, reserve_fraction)
+            .ok_or(TryBuildError::CapacityOverflow)?;
+        Self::try_from_geometry(&geometry, reserve_fraction, hash_builder, alloc)
+            .map_err(Into::into)
     }
 
     #[inline]
@@ -1512,27 +1508,7 @@ where
             return Err(TryReserveError::CapacityOverflow);
         }
         let geometry = ElasticGeometry::for_slots(slots, reserve_fraction);
-
-        let probe_schedule = try_probe_schedule(geometry.level_capacities.len())?;
-        let (arena, levels, membership) =
-            try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
-
-        Ok(Self {
-            levels,
-            len: 0,
-            total_slots: geometry.total_slots,
-            max_insertions: geometry.max_insertions,
-            reserve_fraction,
-            scheduler: BatchScheduler::new(&geometry.batch_plan),
-            hash_builder,
-            alloc,
-            arena,
-            epoch: EpochState::initial(),
-            probe_high_water: 0,
-            probe_schedule,
-            membership,
-            stale_membership: 0,
-        })
+        Self::try_from_geometry(&geometry, reserve_fraction, hash_builder, alloc)
     }
 
     #[inline]
