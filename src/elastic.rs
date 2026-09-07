@@ -1962,7 +1962,7 @@ mod tests {
 
     use crate::common::exact::reference::{ScalarElastic, ScalarElasticCase, ScalarElasticLimits};
     use crate::common::test_support::{
-        CountDrop, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
+        self, CountDrop, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
     };
     use alloc::sync::Arc;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -2497,74 +2497,16 @@ mod tests {
         }
     }
 
-    /// Churn past the refresh threshold must re-record the filter from the
-    /// live entries: departed keys stop passing the gate, live keys still do,
-    /// and their route summaries survive.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn deletes_past_the_threshold_refresh_the_membership_filter() {
-        let mut map: ElasticHashMap<u64, u64> = ElasticHashMap::with_capacity(2_048);
-        let live = map.capacity() as u64;
-        let threshold = membership::refresh_deletes(map.capacity()) as u64;
-        for key in 0..live {
-            map.insert(key, key);
-        }
-        let gate_passes = |map: &ElasticHashMap<u64, u64>, key: u64| {
-            let table = map.table();
-            let prepared = PreparedElasticKey::new(table.hash_key(&key));
-            table.route_filter(prepared).maybe_present
-        };
-
-        // A third of the keys: enough to matter, below every cleanup threshold.
-        let departed = (0..live).filter(|key| key % 3 == 0).collect::<Vec<_>>();
-        for &key in &departed {
-            assert_eq!(map.remove(&key), Some(key));
-        }
-        let generation = map.epoch().generation;
-        assert!(departed.iter().all(|&key| gate_passes(&map, key)));
-        assert_eq!(map.table().stale_membership as u64, departed.len() as u64);
-
-        // Cycling one fresh key re-takes the tombstone it left, so tombstones
-        // stay flat and no cleanup rebuild can run before the threshold.
-        let churn = live;
-        let mut cycles = 0_u64;
-        loop {
-            map.insert(churn, churn);
-            assert_eq!(map.remove(&churn), Some(churn));
-            cycles += 1;
-            if map.table().stale_membership == 0 {
-                break;
-            }
-            assert!(cycles <= threshold, "refresh never ran");
-        }
-        assert_eq!(cycles + departed.len() as u64, threshold + 1);
-        assert_eq!(map.epoch().generation, generation, "no rebuild ran");
-        assert_eq!(map.table().stale_membership, 0, "refresh resets the count");
-
-        for key in (0..live).filter(|key| key % 3 != 0) {
-            assert!(gate_passes(&map, key));
-            assert_eq!(map.get(&key), Some(&key));
-        }
-        let false_positives = departed
-            .iter()
-            .filter(|&&key| gate_passes(&map, key))
-            .count();
-        assert!(
-            false_positives * 4 < departed.len(),
-            "{false_positives} of {} departed keys still pass",
-            departed.len()
+        test_support::assert_deletes_past_threshold_refresh_filter::<ElasticTable<u64, u64>>(
+            |table, key| {
+                let prepared = PreparedElasticKey::new(table.hash_key(&key));
+                table.route_filter(prepared).maybe_present
+            },
+            |table| table.stale_membership,
         );
-
-        map.retain(|_, _| false);
-        for _ in 0..=threshold {
-            if map.table().stale_membership == 0 {
-                break;
-            }
-            map.insert(churn, churn);
-            map.remove(&churn);
-        }
-        assert_eq!(map.table().stale_membership, 0);
-        assert!((0..live).all(|key| !gate_passes(&map, key)));
     }
 
     #[test]
