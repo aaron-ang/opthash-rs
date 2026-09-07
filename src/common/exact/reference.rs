@@ -154,7 +154,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
             let free_next = self.levels[next] - self.occupancy[next];
             let current_threshold = geometry::floor_div_pow2(
                 self.levels[current],
-                self.config.reserve_exponent().saturating_add(1),
+                u64::from(self.config.reserve_exponent()) + 1,
             );
             let next_threshold = self.levels[next] / 4;
             let current_low = free_current <= current_threshold;
