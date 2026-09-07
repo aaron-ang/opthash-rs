@@ -1126,6 +1126,29 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
 // Iterators
 // ---------------------------------------------------------------------------
 
+/// Implement `ExactSizeIterator` (from the `remaining` counter) and
+/// `FusedIterator` for scanning iterators whose `next` decrements `remaining`
+/// once per yielded entry.
+macro_rules! exact_scan_iters {
+    ($($name:ident<$($gen:tt),*>),* $(,)?) => {
+        $(
+            impl<K, V, P: TableBackend<K, V>> ExactSizeIterator for $name<$($gen),*> {
+                fn len(&self) -> usize {
+                    self.remaining
+                }
+            }
+            impl<K, V, P: TableBackend<K, V>> FusedIterator for $name<$($gen),*> {}
+        )*
+    };
+}
+
+exact_scan_iters! {
+    Iter<'_, K, V, P>,
+    IterMut<'_, K, V, P>,
+    IntoIter<K, V, P>,
+    Drain<'_, K, V, P>,
+}
+
 /// Borrowing iterator over `(&K, &V)`.
 pub struct Iter<'a, K, V, P: TableBackend<K, V>> {
     table: &'a P,
@@ -1148,13 +1171,6 @@ impl<'a, K, V, P: TableBackend<K, V>> Iterator for Iter<'a, K, V, P> {
         (self.remaining, Some(self.remaining))
     }
 }
-
-impl<K, V, P: TableBackend<K, V>> ExactSizeIterator for Iter<'_, K, V, P> {
-    fn len(&self) -> usize {
-        self.remaining
-    }
-}
-impl<K, V, P: TableBackend<K, V>> FusedIterator for Iter<'_, K, V, P> {}
 
 impl<K, V, P> Clone for Iter<'_, K, V, P>
 where
@@ -1205,13 +1221,6 @@ impl<'a, K, V, P: TableBackend<K, V>> Iterator for IterMut<'a, K, V, P> {
     }
 }
 
-impl<K, V, P: TableBackend<K, V>> ExactSizeIterator for IterMut<'_, K, V, P> {
-    fn len(&self) -> usize {
-        self.remaining
-    }
-}
-impl<K, V, P: TableBackend<K, V>> FusedIterator for IterMut<'_, K, V, P> {}
-
 /// Consuming iterator over owned `(K, V)`.
 pub struct IntoIter<K, V, P: TableBackend<K, V>> {
     table: P,
@@ -1234,13 +1243,6 @@ impl<K, V, P: TableBackend<K, V>> Iterator for IntoIter<K, V, P> {
         (self.remaining, Some(self.remaining))
     }
 }
-
-impl<K, V, P: TableBackend<K, V>> ExactSizeIterator for IntoIter<K, V, P> {
-    fn len(&self) -> usize {
-        self.remaining
-    }
-}
-impl<K, V, P: TableBackend<K, V>> FusedIterator for IntoIter<K, V, P> {}
 
 /// Draining iterator; empties the map on consumption or drop.
 pub struct Drain<'a, K, V, P: TableBackend<K, V>> {
@@ -1266,13 +1268,6 @@ impl<K, V, P: TableBackend<K, V>> Iterator for Drain<'_, K, V, P> {
         (self.remaining, Some(self.remaining))
     }
 }
-
-impl<K, V, P: TableBackend<K, V>> ExactSizeIterator for Drain<'_, K, V, P> {
-    fn len(&self) -> usize {
-        self.remaining
-    }
-}
-impl<K, V, P: TableBackend<K, V>> FusedIterator for Drain<'_, K, V, P> {}
 
 impl<K, V, P: TableBackend<K, V>> Drop for Drain<'_, K, V, P> {
     fn drop(&mut self) {
