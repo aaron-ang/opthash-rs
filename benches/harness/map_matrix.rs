@@ -121,37 +121,8 @@ macro_rules! bench_with_cap {
 /// Per-impl insert bench using `iter_custom` + map reuse via `clear()`.
 /// Timed region excludes setup so allocation-induced cache pollution
 /// doesn't bleed into the measurement (unlike [`bench_with_cap!`]).
+/// `$op` may be a literal or any `Display` expression (size-labelled groups).
 macro_rules! bench_insert_reuse {
-    ($group:expr, $op:literal, $cap:expr, $pairs:expr $(,)?) => {{
-        bench_insert_reuse_one!(
-            $group,
-            concat!($op, "_std"),
-            $crate::harness::std_map_cap($cap),
-            $pairs
-        );
-        bench_insert_reuse_one!(
-            $group,
-            concat!($op, "_hashbrown"),
-            $crate::harness::hashbrown_map_cap($cap),
-            $pairs
-        );
-        bench_insert_reuse_one!(
-            $group,
-            concat!($op, "_elastic"),
-            $crate::harness::elastic_map_cap($cap),
-            $pairs
-        );
-        bench_insert_reuse_one!(
-            $group,
-            concat!($op, "_funnel"),
-            $crate::harness::funnel_map_cap($cap),
-            $pairs
-        );
-    }};
-}
-
-/// Dynamic-name variant of [`bench_insert_reuse`] for size-labelled groups.
-macro_rules! bench_insert_reuse_named {
     ($group:expr, $op:expr, $cap:expr, $pairs:expr $(,)?) => {{
         bench_insert_reuse_one!(
             $group,
