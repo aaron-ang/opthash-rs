@@ -252,6 +252,22 @@ def test_setdefault_default_is_none(m):
     assert m["a"] is None
 
 
+def test_setdefault_miss_hashes_key_once(m):
+    calls = 0
+
+    class Key:
+        def __hash__(self):
+            nonlocal calls
+            calls += 1
+            return 7
+
+        def __eq__(self, other):
+            return isinstance(other, Key)
+
+    m.setdefault(Key(), 1)
+    assert calls == 1
+
+
 def test_copy_independent(m):
     _populate(m, 3)
     c = m.copy()
