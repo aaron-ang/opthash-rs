@@ -1388,11 +1388,7 @@ where
 
     fn remove(&mut self, slot: usize) -> (K, V) {
         let entry = unsafe { self.storage.take(slot) };
-        self.storage.mark_tombstone(slot);
-        self.len -= 1;
-        self.tombstones += 1;
-        self.stale_membership += 1;
-        self.epoch.note_delete();
+        self.extract_finish(slot);
         self.settle_after_deletes();
         (entry.key, entry.value)
     }
