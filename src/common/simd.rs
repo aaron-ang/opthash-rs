@@ -15,13 +15,19 @@ mod neon {
     use super::BitMask;
     use crate::common::control::FINGERPRINT_MASK;
 
+    /// Collapses an 8-lane compare into its `BitMask` bit pattern.
+    #[inline]
+    #[must_use]
+    unsafe fn lane_mask(cmp: aarch64::uint8x8_t) -> BitMask {
+        BitMask(unsafe { aarch64::vget_lane_u64(aarch64::vreinterpret_u64_u8(cmp), 0) })
+    }
+
     #[inline]
     #[must_use]
     pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
         unsafe {
             let bytes = aarch64::vld1_u8(ptr);
-            let cmp = aarch64::vceq_u8(bytes, aarch64::vdup_n_u8(target));
-            BitMask(aarch64::vget_lane_u64(aarch64::vreinterpret_u64_u8(cmp), 0))
+            lane_mask(aarch64::vceq_u8(bytes, aarch64::vdup_n_u8(target)))
         }
     }
 
@@ -31,11 +37,7 @@ mod neon {
         unsafe {
             let bytes = aarch64::vld1_u8(ptr);
             let masked = aarch64::vand_u8(bytes, aarch64::vdup_n_u8(FINGERPRINT_MASK));
-            let free_cmp = aarch64::vceq_u8(masked, aarch64::vdup_n_u8(0));
-            BitMask(aarch64::vget_lane_u64(
-                aarch64::vreinterpret_u64_u8(free_cmp),
-                0,
-            ))
+            lane_mask(aarch64::vceq_u8(masked, aarch64::vdup_n_u8(0)))
         }
     }
 
@@ -45,10 +47,9 @@ mod neon {
     pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
         unsafe {
             let bytes = aarch64::vld1_u8(ptr);
-            let occ_cmp = aarch64::vtst_u8(bytes, aarch64::vdup_n_u8(FINGERPRINT_MASK));
-            BitMask(aarch64::vget_lane_u64(
-                aarch64::vreinterpret_u64_u8(occ_cmp),
-                0,
+            lane_mask(aarch64::vtst_u8(
+                bytes,
+                aarch64::vdup_n_u8(FINGERPRINT_MASK),
             ))
         }
     }
@@ -95,15 +96,31 @@ mod sse2 {
     use super::BitMask;
     use crate::common::control::FINGERPRINT_MASK;
 
+    /// Loads a 16-byte control group with only the fingerprint bits kept.
+    #[inline]
+    #[must_use]
+    unsafe fn load_fingerprints(ptr: *const u8) -> __m128i {
+        unsafe {
+            let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
+            x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()))
+        }
+    }
+
+    /// Collapses a 16-lane compare into its `BitMask` bit pattern.
+    #[inline]
+    #[must_use]
+    unsafe fn lane_mask(cmp: __m128i) -> BitMask {
+        let bits = unsafe { x86_64::_mm_movemask_epi8(cmp) }.cast_unsigned() & 0xFFFF;
+        BitMask(u64::from(bits))
+    }
+
     #[inline]
     #[must_use]
     pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
         unsafe {
             let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
             let target_vec = x86_64::_mm_set1_epi8(target.cast_signed());
-            let cmp = x86_64::_mm_cmpeq_epi8(data, target_vec);
-            let bits = x86_64::_mm_movemask_epi8(cmp).cast_unsigned() & 0xFFFF;
-            BitMask(u64::from(bits))
+            lane_mask(x86_64::_mm_cmpeq_epi8(data, target_vec))
         }
     }
 
@@ -111,12 +128,8 @@ mod sse2 {
     #[must_use]
     pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
         unsafe {
-            let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
-            let masked =
-                x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()));
-            let free = x86_64::_mm_cmpeq_epi8(masked, x86_64::_mm_setzero_si128());
-            let bits = x86_64::_mm_movemask_epi8(free).cast_unsigned() & 0xFFFF;
-            BitMask(u64::from(bits))
+            let masked = load_fingerprints(ptr);
+            lane_mask(x86_64::_mm_cmpeq_epi8(masked, x86_64::_mm_setzero_si128()))
         }
     }
 
@@ -125,12 +138,8 @@ mod sse2 {
     #[must_use]
     pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
         unsafe {
-            let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
-            let masked =
-                x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()));
-            let occ = x86_64::_mm_cmpgt_epi8(masked, x86_64::_mm_setzero_si128());
-            let bits = x86_64::_mm_movemask_epi8(occ).cast_unsigned() & 0xFFFF;
-            BitMask(u64::from(bits))
+            let masked = load_fingerprints(ptr);
+            lane_mask(x86_64::_mm_cmpgt_epi8(masked, x86_64::_mm_setzero_si128()))
         }
     }
 }
