@@ -55,7 +55,7 @@ impl Arena {
     }
 
     /// Size of the already-stored allocator layout backing this arena.
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn layout_size(&self) -> usize {
         self.layout.size()
     }

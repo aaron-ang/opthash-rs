@@ -9,7 +9,7 @@ use equivalent::Equivalent;
 use crate::ReserveFraction;
 use crate::common::DefaultHashBuilder;
 use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
-use crate::common::config::{CACHE_LINE, INITIAL_CAPACITY};
+use crate::common::config::INITIAL_CAPACITY;
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{TryBuildError, TryReserveError};
 use crate::common::exact::geometry::{ElasticCase, PaperConfig};
@@ -242,7 +242,8 @@ macros::declare_backend_aliases! {
 
 /// Boxed slice of levels for one `(K, V)` parameterization.
 type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
-type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>);
+/// A fresh arena, its level descriptors, and the metadata tail they share.
+type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>, MembershipRegion);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -282,43 +283,6 @@ fn elastic_arena_layout<K, V>(total_slots: usize) -> Result<ElasticArenaLayout, 
         membership_offset,
         membership_words,
     })
-}
-
-/// Locates the Elastic metadata tail, whose words carry the shared membership
-/// filter plus this backend's per-route level summary.
-trait ElasticMembershipRegion {
-    fn for_arena<K, V>(arena: &Arena, total_slots: usize) -> Self;
-}
-
-impl ElasticMembershipRegion for MembershipRegion {
-    /// Mirrors the arena layout's own tail placement: the metadata words occupy
-    /// the last [`membership_tail_span`] bytes of the allocation.
-    fn for_arena<K, V>(arena: &Arena, total_slots: usize) -> Self {
-        let words = membership::word_count(total_slots);
-        if words == 0 {
-            return Self::EMPTY;
-        }
-        let tail_span = membership_tail_span::<K, V>(total_slots);
-        debug_assert!(tail_span <= arena.layout_size());
-        Self {
-            offset: arena.layout_size() - tail_span,
-            words,
-        }
-    }
-}
-
-fn membership_tail_span<K, V>(total_slots: usize) -> usize {
-    let bytes = membership::word_count(total_slots)
-        .checked_mul(mem::size_of::<ElasticMetadataWord>())
-        .expect("constructed Elastic membership size");
-    if bytes == 0 {
-        return 0;
-    }
-    let alignment = CACHE_LINE.max(mem::align_of::<SlotEntry<K, V>>());
-    bytes
-        .checked_add(alignment - 1)
-        .expect("constructed Elastic membership padding")
-        & !(alignment - 1)
 }
 
 #[derive(Clone, Copy)]
@@ -641,10 +605,6 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
         .try_fold(0_usize, |total, &capacity| total.checked_add(capacity));
     let total_ctrl = total_ctrl.ok_or(TryReserveError::CapacityOverflow)?;
     let arena_layout = elastic_arena_layout::<K, V>(total_ctrl)?;
-    debug_assert_eq!(
-        arena_layout.membership_offset,
-        arena_layout.layout.size() - membership_tail_span::<K, V>(total_ctrl)
-    );
     let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout.layout, total_ctrl, alloc)?;
     if arena_layout.membership_words != 0 {
         unsafe {
@@ -661,9 +621,13 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
 
     // `Arena` has no `Drop`, so a bare `?` would leak the allocation if
     // level construction fails. Deallocate explicitly on `Err`.
+    let membership = MembershipRegion {
+        offset: arena_layout.membership_offset,
+        words: arena_layout.membership_words,
+    };
     match build_elastic_levels::<K, V>(arena.as_ptr(), arena_layout.data_base_off, level_capacities)
     {
-        Ok(levels) => Ok((arena, levels)),
+        Ok(levels) => Ok((arena, levels, membership)),
         Err(e) => {
             arena.deallocate(alloc);
             Err(e)
@@ -716,8 +680,7 @@ where
         let geometry = ElasticGeometry::for_insert_budget(capacity, reserve_fraction)
             .expect("capacity overflow");
         let probe_schedule = probe_schedule(geometry.level_capacities.len());
-        let (arena, levels) = alloc_elastic_arena(&geometry.level_capacities, &alloc);
-        let membership = MembershipRegion::for_arena::<K, V>(&arena, geometry.total_slots);
+        let (arena, levels, membership) = alloc_elastic_arena(&geometry.level_capacities, &alloc);
 
         Self {
             levels,
@@ -747,8 +710,8 @@ where
         let geometry = ElasticGeometry::for_insert_budget(capacity, reserve_fraction)
             .ok_or(TryBuildError::CapacityOverflow)?;
         let probe_schedule = try_probe_schedule(geometry.level_capacities.len())?;
-        let (arena, levels) = try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
-        let membership = MembershipRegion::for_arena::<K, V>(&arena, geometry.total_slots);
+        let (arena, levels, membership) =
+            try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
 
         Ok(Self {
             levels,
@@ -1322,7 +1285,7 @@ where
         let probe_schedule = clone_probe_schedule(&self.probe_schedule, self.levels.len());
         let level_capacities: Vec<usize> =
             self.levels.iter().map(|l| l.capacity as usize).collect();
-        let (arena, levels) = alloc_elastic_arena(&level_capacities, &self.alloc);
+        let (arena, levels, membership) = alloc_elastic_arena(&level_capacities, &self.alloc);
 
         // Drop guard for the half-built clone: if any user `K::clone` /
         // `V::clone` panics, drop the already-cloned values (OCCUPIED on
@@ -1338,7 +1301,6 @@ where
 
         // Success: reclaim arena + levels so the guard's Drop no-ops.
         let (arena, levels) = guard.disarm();
-        let membership = MembershipRegion::for_arena::<K, V>(&arena, self.total_slots);
 
         let mut cloned = Self {
             levels,
@@ -1441,13 +1403,14 @@ where
                 .reserve_exact(required_schedule_capacity - self.probe_schedule.len());
         }
 
-        let (new_arena, new_levels) = alloc_elastic_arena(&geometry.level_capacities, &self.alloc);
+        let (new_arena, new_levels, new_membership) =
+            alloc_elastic_arena(&geometry.level_capacities, &self.alloc);
 
         // Swap in fresh arena; keep old one alive until drain completes.
         let old_arena = mem::replace(&mut self.arena, new_arena);
         let old_levels = mem::replace(&mut self.levels, new_levels);
         self.total_slots = geometry.total_slots;
-        self.membership = MembershipRegion::for_arena::<K, V>(&self.arena, self.total_slots);
+        self.membership = new_membership;
         self.stale_membership = 0;
         self.max_insertions = geometry.max_insertions;
         self.scheduler = BatchScheduler::new(&geometry.batch_plan);
@@ -1551,8 +1514,8 @@ where
         let geometry = ElasticGeometry::for_slots(slots, reserve_fraction);
 
         let probe_schedule = try_probe_schedule(geometry.level_capacities.len())?;
-        let (arena, levels) = try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
-        let membership = MembershipRegion::for_arena::<K, V>(&arena, geometry.total_slots);
+        let (arena, levels, membership) =
+            try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
 
         Ok(Self {
             levels,
