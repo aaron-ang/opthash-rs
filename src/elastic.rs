@@ -1,6 +1,5 @@
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
-use core::ptr;
 
 use alloc::{boxed::Box, vec::Vec};
 use allocator_api2::alloc::{Allocator, Global, Layout};
@@ -134,6 +133,25 @@ impl<T> Level<T> {
     #[inline]
     fn needs_cleanup(&self) -> bool {
         self.tombstones as usize > capacity::tombstone_cleanup_threshold(self.capacity as usize)
+    }
+
+    /// Moves every live entry out through `visit` and resets the level to
+    /// empty. Each slot's control and the counters are updated before `visit`
+    /// runs, so a panic inside it leaves the level consistent: the entries not
+    /// yet visited stay live and counted, and the moved ones are `EMPTY`.
+    fn drain_reset(&mut self, mut visit: impl FnMut(T)) {
+        for slot in 0..self.capacity() {
+            let control = self.control_at(slot);
+            if control == CTRL_TOMBSTONE {
+                self.set_control(slot, CTRL_EMPTY);
+                self.tombstones -= 1;
+            } else if control.is_occupied() {
+                let entry = unsafe { self.take(slot) };
+                self.set_control(slot, CTRL_EMPTY);
+                self.len -= 1;
+                visit(entry);
+            }
+        }
     }
 }
 
@@ -803,22 +821,10 @@ where
     /// Removes all entries, keeping allocated capacity.
     fn clear(&mut self) {
         for level in &mut self.levels {
-            for slot in 0..level.capacity() {
-                let control = level.control_at(slot);
-                if control == CTRL_TOMBSTONE {
-                    level.set_control(slot, CTRL_EMPTY);
-                    level.tombstones -= 1;
-                    continue;
-                }
-                if !control.is_occupied() {
-                    continue;
-                }
-                let entry = level.slot_ptr(slot);
-                level.set_control(slot, CTRL_EMPTY);
-                level.len -= 1;
+            level.drain_reset(|entry| {
                 self.len -= 1;
-                unsafe { ptr::drop_in_place(entry) };
-            }
+                drop(entry);
+            });
         }
         debug_assert_eq!(self.len, 0);
         self.scheduler.reset();
@@ -946,22 +952,6 @@ where
         // SAFETY: shared `&Level` only — never `&mut` — so no aliasing tag.
         let level = unsafe { &*levels_ptr.add(level_idx) };
         level.slot_ptr(slot_idx)
-    }
-
-    /// Take + tombstone + decrement counters for the slot at `loc`. Backs
-    /// [`map::TableBackend::remove`], which adds a resize pass.
-    fn take_and_tombstone(&mut self, level_idx: usize, slot_idx: usize) -> (K, V) {
-        let removed = {
-            let level = &mut self.levels[level_idx];
-            let removed = unsafe { level.take(slot_idx) };
-            level.mark_tombstone(slot_idx);
-            level.len -= 1;
-            level.tombstones += 1;
-            removed
-        };
-        self.len -= 1;
-        self.epoch.note_delete();
-        (removed.key, removed.value)
     }
 
     fn extend_probe_schedule(&mut self, high_water: u128) {
@@ -1131,10 +1121,10 @@ where
     }
 
     fn remove(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
-        let kv = self.take_and_tombstone(level_idx, slot_idx);
-        self.stale_membership += 1;
+        let removed = unsafe { self.levels[level_idx].take(slot_idx) };
+        self.extract_finish((level_idx, slot_idx));
         self.settle_after_deletes(self.levels[level_idx].needs_cleanup());
-        kv
+        (removed.key, removed.value)
     }
 
     #[inline]
@@ -1437,28 +1427,11 @@ where
         // already-moved ones are EMPTY, so both `self.drop_values` and
         // `new_map.drop_values` are sound on unwind.
         let mut used_exceptional_placement = false;
-        for level_index in 0..self.levels.len() {
-            let capacity = self.levels[level_index].capacity();
-            for slot in 0..capacity {
-                let control = self.levels[level_index].control_at(slot);
-                if control == CTRL_TOMBSTONE {
-                    self.levels[level_index].set_control(slot, CTRL_EMPTY);
-                    self.levels[level_index].tombstones -= 1;
-                    continue;
-                }
-                if !control.is_occupied() {
-                    continue;
-                }
-                let entry = {
-                    let level = &mut self.levels[level_index];
-                    let entry = unsafe { level.take(slot) };
-                    level.set_control(slot, CTRL_EMPTY);
-                    level.len -= 1;
-                    entry
-                };
+        for level in &mut self.levels {
+            level.drain_reset(|entry| {
                 self.len -= 1;
                 used_exceptional_placement |= new_map.insert_unique(entry.key, entry.value);
-            }
+            });
         }
         debug_assert_eq!(self.len, 0);
         *self = new_map;
