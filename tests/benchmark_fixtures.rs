@@ -133,7 +133,7 @@ fn scaled_insert_uses_minimum_samples_only_for_the_10m_tier() {
 fn mean_latency_builds_each_map_once_per_size_not_once_per_sample() {
     let source = include_str!("../benches/mean_latency.rs");
     assert!(
-        source.contains("let maps = LatencyMaps::new(&pairs);")
+        source.contains("let maps = harness::MapQuad::new(&pairs);")
             && source.contains("bench_latency_group(c, &workload, &maps"),
         "latency maps must be constructed outside Criterion routines and reused by both traces"
     );
