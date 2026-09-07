@@ -956,35 +956,32 @@ mod tests {
         }
     }
 
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn elastic_fixed_seed_distribution_smoke() {
-        const SAMPLES: u64 = 1 << 18;
-        let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
+    const FIXED_SEED: u64 = 0x1234_5678_9abc_def0;
+    const DISTRIBUTION_SAMPLES: u64 = 1 << 18;
+    const EXPECTED_PER_BUCKET: usize = 512;
+
+    /// Checks `word(key, level)` over `DISTRIBUTION_SAMPLES` keys for balanced
+    /// bits, single-bit avalanche, and level independence. Every key is also
+    /// handed to `per_key` so a caller can tally backend-specific statistics
+    /// over the same sample.
+    fn assert_fixed_seed_word_distribution(
+        word: impl Fn(u64, u64) -> u64,
+        mut per_key: impl FnMut(u64),
+    ) {
+        const SAMPLES: u64 = DISTRIBUTION_SAMPLES;
         let mut one_counts = [0_u64; u64::BITS as usize];
         let mut avalanche_bits = 0_u64;
         let mut cross_level_equal_bits = 0_u64;
-        let mut cross_probe_equal_bits = 0_u64;
 
         for key in 0..SAMPLES {
-            let ordinary = oracle.word(key, ProbeDomain::ElasticOrdinary { level: 7 }, 3, 0);
+            let ordinary = word(key, 7);
             for bit in 0..u64::BITS {
                 one_counts[bit as usize] += (ordinary >> bit) & 1;
             }
             let flipped_key = key ^ (1_u64 << (key % u64::from(u64::BITS)));
-            avalanche_bits += u64::from(
-                (ordinary
-                    ^ oracle.word(flipped_key, ProbeDomain::ElasticOrdinary { level: 7 }, 3, 0))
-                .count_ones(),
-            );
-            cross_level_equal_bits += u64::from(
-                (!(ordinary ^ oracle.word(key, ProbeDomain::ElasticOrdinary { level: 8 }, 3, 0)))
-                    .count_ones(),
-            );
-            cross_probe_equal_bits += u64::from(
-                (!(ordinary ^ oracle.word(key, ProbeDomain::ElasticOrdinary { level: 7 }, 4, 0)))
-                    .count_ones(),
-            );
+            avalanche_bits += u64::from((ordinary ^ word(flipped_key, 7)).count_ones());
+            cross_level_equal_bits += u64::from((!(ordinary ^ word(key, 8))).count_ones());
+            per_key(key);
         }
 
         for count in one_counts {
@@ -992,26 +989,16 @@ mod tests {
         }
         assert!((SAMPLES * 30..=SAMPLES * 34).contains(&avalanche_bits));
         assert!((SAMPLES * 30..=SAMPLES * 34).contains(&cross_level_equal_bits));
-        assert!((SAMPLES * 30..=SAMPLES * 34).contains(&cross_probe_equal_bits));
     }
 
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn elastic_awkward_ranges_have_no_large_fixed_seed_skew() {
-        const EXPECTED_PER_BUCKET: usize = 512;
-        let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
-        let counter_base = try_pack_elastic_counter(7, 3, 0).unwrap();
+    /// Draws `upper * EXPECTED_PER_BUCKET` samples through `sample(key, upper)`
+    /// for awkward non-power-of-two ranges and rejects any bucket that lands
+    /// more than a quarter off its expectation.
+    fn assert_awkward_ranges_have_no_large_skew(sample: impl Fn(u64, usize) -> usize) {
         for upper in [3, 191, 1_237] {
             let mut counts = alloc::vec![0_u32; upper];
             for key in 0..(upper * EXPECTED_PER_BUCKET) as u64 {
-                let sample = unbiased_prepared_elastic_probe_index(
-                    oracle.prepare_elastic(key),
-                    counter_base,
-                    upper,
-                    8,
-                )
-                .unwrap();
-                counts[sample.index] += 1;
+                counts[sample(key, upper)] += 1;
             }
             for count in counts {
                 assert!(
@@ -1021,6 +1008,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn elastic_fixed_seed_distribution_smoke() {
+        let oracle = CounterPrf::new(FIXED_SEED);
+        let word = |key, level| oracle.word(key, ProbeDomain::ElasticOrdinary { level }, 3, 0);
+        let mut cross_probe_equal_bits = 0_u64;
+        assert_fixed_seed_word_distribution(word, |key| {
+            let next_probe = oracle.word(key, ProbeDomain::ElasticOrdinary { level: 7 }, 4, 0);
+            cross_probe_equal_bits += u64::from((!(word(key, 7) ^ next_probe)).count_ones());
+        });
+        assert!(
+            (DISTRIBUTION_SAMPLES * 30..=DISTRIBUTION_SAMPLES * 34)
+                .contains(&cross_probe_equal_bits)
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn elastic_awkward_ranges_have_no_large_fixed_seed_skew() {
+        let oracle = CounterPrf::new(FIXED_SEED);
+        let counter_base = try_pack_elastic_counter(7, 3, 0).unwrap();
+        assert_awkward_ranges_have_no_large_skew(|key, upper| {
+            unbiased_prepared_elastic_probe_index(
+                oracle.prepare_elastic(key),
+                counter_base,
+                upper,
+                8,
+            )
+            .unwrap()
+            .index
+        });
     }
 
     #[test]
@@ -1288,65 +1308,30 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn fast_funnel_fixed_seed_distribution_smoke() {
-        const SAMPLES: u64 = 1 << 18;
-        let oracle = FunnelPrf::new(0x1234_5678_9abc_def0);
-        let mut one_counts = [0_u64; u64::BITS as usize];
-        let mut avalanche_bits = 0_u64;
-        let mut cross_level_equal_bits = 0_u64;
-        let mut fallback_same_bucket = 0_u64;
+        let oracle = FunnelPrf::new(FIXED_SEED);
         let fallback_range = PreparedProbeRange::new(257).unwrap();
+        let mut fallback_same_bucket = 0_u64;
         let mut first_fallback_counts = alloc::vec![0_u32; fallback_range.upper()];
         let mut second_fallback_counts = alloc::vec![0_u32; fallback_range.upper()];
+        let fallback_index = |key: u64, domain: ProbeDomain| {
+            let prepared = oracle.prepare(key).prepare_domain(domain).unwrap();
+            unbiased_prepared_funnel_probe_index_in_range(&prepared, 0, fallback_range, 8)
+                .unwrap()
+                .index
+        };
 
-        for key in 0..SAMPLES {
-            let ordinary = oracle.word(key, ProbeDomain::FunnelOrdinary { level: 7 }, 0, 0);
-            for bit in 0..u64::BITS {
-                one_counts[bit as usize] += (ordinary >> bit) & 1;
-            }
-            let flipped_key = key ^ (1_u64 << (key % u64::from(u64::BITS)));
-            avalanche_bits += u64::from(
-                (ordinary
-                    ^ oracle.word(flipped_key, ProbeDomain::FunnelOrdinary { level: 7 }, 0, 0))
-                .count_ones(),
-            );
-            cross_level_equal_bits += u64::from(
-                (!(ordinary ^ oracle.word(key, ProbeDomain::FunnelOrdinary { level: 8 }, 0, 0)))
-                    .count_ones(),
-            );
+        assert_fixed_seed_word_distribution(
+            |key, level| oracle.word(key, ProbeDomain::FunnelOrdinary { level }, 0, 0),
+            |key| {
+                let a = fallback_index(key, ProbeDomain::FunnelSpecialFallbackChoiceA);
+                let b = fallback_index(key, ProbeDomain::FunnelSpecialFallbackChoiceB);
+                first_fallback_counts[a] += 1;
+                second_fallback_counts[b] += 1;
+                fallback_same_bucket += u64::from(a == b);
+            },
+        );
 
-            let prepared = oracle.prepare(key);
-            let a = unbiased_prepared_funnel_probe_index_in_range(
-                &prepared
-                    .prepare_domain(ProbeDomain::FunnelSpecialFallbackChoiceA)
-                    .unwrap(),
-                0,
-                fallback_range,
-                8,
-            )
-            .unwrap()
-            .index;
-            let b = unbiased_prepared_funnel_probe_index_in_range(
-                &prepared
-                    .prepare_domain(ProbeDomain::FunnelSpecialFallbackChoiceB)
-                    .unwrap(),
-                0,
-                fallback_range,
-                8,
-            )
-            .unwrap()
-            .index;
-            first_fallback_counts[a] += 1;
-            second_fallback_counts[b] += 1;
-            fallback_same_bucket += u64::from(a == b);
-        }
-
-        for count in one_counts {
-            assert!((SAMPLES * 48 / 100..=SAMPLES * 52 / 100).contains(&count));
-        }
-        assert!((SAMPLES * 30..=SAMPLES * 34).contains(&avalanche_bits));
-        assert!((SAMPLES * 30..=SAMPLES * 34).contains(&cross_level_equal_bits));
-
-        let expected_bucket_count = SAMPLES / fallback_range.upper() as u64;
+        let expected_bucket_count = DISTRIBUTION_SAMPLES / fallback_range.upper() as u64;
         let bucket_min = expected_bucket_count * 3 / 4;
         let bucket_max = expected_bucket_count * 5 / 4;
         assert!((bucket_min..=bucket_max).contains(&fallback_same_bucket));
@@ -1361,27 +1346,16 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn fast_funnel_awkward_ranges_have_no_large_fixed_seed_skew() {
-        const EXPECTED_PER_BUCKET: usize = 512;
-        let oracle = FunnelPrf::new(0x1234_5678_9abc_def0);
-        for upper in [3, 191, 1_237] {
+        let oracle = FunnelPrf::new(FIXED_SEED);
+        assert_awkward_ranges_have_no_large_skew(|key, upper| {
             let range = PreparedProbeRange::new(upper).unwrap();
-            let mut counts = alloc::vec![0_u32; upper];
-            for key in 0..(upper * EXPECTED_PER_BUCKET) as u64 {
-                let prepared = oracle
-                    .prepare(key)
-                    .prepare_domain(ProbeDomain::FunnelSpecialPrimary)
-                    .unwrap();
-                let sample =
-                    unbiased_prepared_funnel_probe_index_in_range(&prepared, 3, range, 8).unwrap();
-                counts[sample.index] += 1;
-            }
-            for count in counts {
-                assert!(
-                    (EXPECTED_PER_BUCKET - 128..=EXPECTED_PER_BUCKET + 128)
-                        .contains(&(count as usize)),
-                    "upper={upper} count={count}"
-                );
-            }
-        }
+            let prepared = oracle
+                .prepare(key)
+                .prepare_domain(ProbeDomain::FunnelSpecialPrimary)
+                .unwrap();
+            unbiased_prepared_funnel_probe_index_in_range(&prepared, 3, range, 8)
+                .unwrap()
+                .index
+        });
     }
 }
