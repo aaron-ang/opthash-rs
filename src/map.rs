@@ -112,19 +112,10 @@ pub trait TableBackend<K, V>: Sized {
     /// (valid per [`Location`](TableBackend::Location)).
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> Self::Location;
 
-    /// Insert `key` → `value` and return the previous value. Backends may
-    /// override this two-probe default with single-pass insertion.
+    /// Insert `key` → `value` and return the previous value.
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
     where
-        K: Hash + Eq,
-    {
-        let fp = fingerprint(hash);
-        if let Some(loc) = self.find(&key, hash, fp) {
-            return Some(self.replace_value(loc, value));
-        }
-        self.insert_for_vacant(key, value, hash);
-        None
-    }
+        K: Hash + Eq;
 
     /// Remove the entry at `loc` (valid per [`Location`](TableBackend::Location)),
     /// update bookkeeping, and resize if needed.
@@ -622,11 +613,7 @@ where
         let fp = fingerprint(hash);
         if let Some(loc) = self.table.find(&key, hash, fp) {
             return Err(OccupiedError {
-                entry: OccupiedEntry {
-                    map: self,
-                    loc,
-                    _marker: PhantomData,
-                },
+                entry: OccupiedEntry { map: self, loc },
                 value,
             });
         }
@@ -639,11 +626,7 @@ where
     pub fn entry(&mut self, key: K) -> Entry<'_, K, V, P> {
         let hash = self.table.hash(&key);
         match self.table.find(&key, hash, fingerprint(hash)) {
-            Some(loc) => Entry::Occupied(OccupiedEntry {
-                map: self,
-                loc,
-                _marker: PhantomData,
-            }),
+            Some(loc) => Entry::Occupied(OccupiedEntry { map: self, loc }),
             None => Entry::Vacant(VacantEntry {
                 map: self,
                 key,
@@ -677,7 +660,6 @@ pub enum Entry<'a, K, V, P: TableBackend<K, V>> {
 pub struct OccupiedEntry<'a, K, V, P: TableBackend<K, V>> {
     map: &'a mut HashMap<K, V, P>,
     loc: P::Location,
-    _marker: PhantomData<K>,
 }
 
 /// View of a vacant entry.
@@ -818,11 +800,7 @@ where
     /// Inserts `value` and returns the resulting [`OccupiedEntry`].
     pub(crate) fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, P> {
         let loc = self.map.table.insert_for_vacant(self.key, value, self.hash);
-        OccupiedEntry {
-            map: self.map,
-            loc,
-            _marker: PhantomData,
-        }
+        OccupiedEntry { map: self.map, loc }
     }
 }
 
