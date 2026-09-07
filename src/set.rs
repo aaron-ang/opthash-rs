@@ -18,265 +18,305 @@ use crate::{EpochSnapshot, ReserveFraction};
 /// nameable; the allocation is once per `extract_if` call, off the hot path.
 type SetExtractPred<'a, T> = Box<dyn FnMut(&T, &mut ()) -> bool + 'a>;
 
+/// Forward a family of [`HashSet`] constructors to the same-named
+/// [`map::HashMap`] constructor. `-> Self` items wrap the map directly;
+/// `-> Result<Self, TryBuildError>` items wrap the `Ok` value.
+macro_rules! forward_constructors {
+    () => {};
+    (
+        $(#[$attr:meta])*
+        pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> Self;
+        $($rest:tt)*
+    ) => {
+        $(#[$attr])*
+        pub fn $name($($arg: $ty),*) -> Self {
+            Self {
+                map: map::HashMap::$name($($arg),*),
+            }
+        }
+        forward_constructors! { $($rest)* }
+    };
+    (
+        $(#[$attr:meta])*
+        pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> Result<Self, TryBuildError>;
+        $($rest:tt)*
+    ) => {
+        $(#[$attr])*
+        pub fn $name($($arg: $ty),*) -> Result<Self, TryBuildError> {
+            map::HashMap::$name($($arg),*).map(|map| Self { map })
+        }
+        forward_constructors! { $($rest)* }
+    };
+}
+
+/// Declare a [`HashSet`] iterator that wraps map-level iterators.
+///
+/// Emits the struct, its `Iterator` impl from the given `next` and
+/// `size_hint` bodies, and `FusedIterator`. `bounds [..]` lists extra
+/// `where` clauses shared by every `Iterator`-dependent impl. Trailing flags
+/// add `exact_size` (`len` forwards to the first field), `clone` (fieldwise,
+/// requiring `P::Scan: Clone`), and either `debug_list` (prints the
+/// remaining values from a clone) or `debug_opaque` (prints the type name).
+macro_rules! set_iter {
+    (
+        $(#[$attr:meta])*
+        pub struct $name:ident<$($lt:lifetime,)? T, P> { $($field:ident: $fty:ty),+ $(,)? }
+        $(bounds [$($bound:tt)*])?
+        type Item = $item:ty;
+        fn next(&mut $this:ident) $next:block
+        fn size_hint(&$this_ref:ident) $size_hint:block
+        $($flag:ident)*
+    ) => {
+        $(#[$attr])*
+        pub struct $name<$($lt,)? T, P: TableBackend<T, ()>> {
+            $($field: $fty),+
+        }
+
+        impl<$($lt,)? T, P> Iterator for $name<$($lt,)? T, P>
+        where
+            P: TableBackend<T, ()>,
+            $($($bound)*)?
+        {
+            type Item = $item;
+            fn next(&mut $this) -> Option<$item> $next
+            fn size_hint(&$this_ref) -> (usize, Option<usize>) $size_hint
+        }
+
+        impl<$($lt,)? T, P> FusedIterator for $name<$($lt,)? T, P>
+        where
+            P: TableBackend<T, ()>,
+            $($($bound)*)?
+        {
+        }
+
+        set_iter!(@flags [$($flag)*] $name<$($lt,)? T, P> [$($($bound)*)?] { $($field),+ });
+    };
+    (@flags [] $($rest:tt)*) => {};
+    (
+        @flags [$flag:ident $($more:ident)*]
+        $name:ident<$($lt:lifetime,)? T, P> [$($bound:tt)*] { $($field:ident),+ }
+    ) => {
+        set_iter!(@$flag $name<$($lt,)? T, P> [$($bound)*] { $($field),+ });
+        set_iter!(@flags [$($more)*] $name<$($lt,)? T, P> [$($bound)*] { $($field),+ });
+    };
+    (@exact_size $name:ident<$($lt:lifetime,)? T, P> [$($bound:tt)*] { $first:ident $(, $rest:ident)* }) => {
+        impl<$($lt,)? T, P> ExactSizeIterator for $name<$($lt,)? T, P>
+        where
+            P: TableBackend<T, ()>,
+            $($bound)*
+        {
+            fn len(&self) -> usize {
+                self.$first.len()
+            }
+        }
+    };
+    (@clone $name:ident<$($lt:lifetime,)? T, P> [$($bound:tt)*] { $($field:ident),+ }) => {
+        impl<$($lt,)? T, P> Clone for $name<$($lt,)? T, P>
+        where
+            P: TableBackend<T, ()>,
+            P::Scan: Clone,
+        {
+            fn clone(&self) -> Self {
+                Self {
+                    $($field: self.$field.clone()),+
+                }
+            }
+        }
+    };
+    (@debug_list $name:ident<$($lt:lifetime,)? T, P> [$($bound:tt)*] { $($field:ident),+ }) => {
+        impl<$($lt,)? T, P> fmt::Debug for $name<$($lt,)? T, P>
+        where
+            T: fmt::Debug,
+            P: TableBackend<T, ()>,
+            P::Scan: Clone,
+            $($bound)*
+        {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_list().entries(self.clone()).finish()
+            }
+        }
+    };
+    (@debug_opaque $name:ident<$($lt:lifetime,)? T, P> [$($bound:tt)*] { $($field:ident),+ }) => {
+        impl<$($lt,)? T, P> fmt::Debug for $name<$($lt,)? T, P>
+        where
+            P: TableBackend<T, ()>,
+        {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct(stringify!($name)).finish_non_exhaustive()
+            }
+        }
+    };
+}
+
 /// Use a [`TableBackend`] backend to store unique values.
-pub struct HashSet<T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
+pub struct HashSet<T, P: TableBackend<T, ()>> {
     map: map::HashMap<T, (), P>,
 }
 
 #[cfg(feature = "default-hasher")]
 impl<T, P> HashSet<T, P>
 where
-    T: Eq + Hash,
     P: TableBackend<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
 {
-    /// Creates an empty set.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            map: map::HashMap::new(),
-        }
-    }
+    forward_constructors! {
+        /// Creates an empty set.
+        #[must_use]
+        pub fn new() -> Self;
 
-    /// Creates an empty set with at least `capacity` slots.
-    #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            map: map::HashMap::with_capacity(capacity),
-        }
-    }
+        /// Creates an empty set with at least `capacity` slots.
+        #[must_use]
+        pub fn with_capacity(capacity: usize) -> Self;
 
-    /// Creates an empty set with the exact dyadic `reserve`.
-    ///
-    /// # Panics
-    /// Panics if the backend rejects `reserve` or allocation fails.
-    #[must_use]
-    pub fn with_reserve(reserve: ReserveFraction) -> Self {
-        Self {
-            map: map::HashMap::with_reserve(reserve),
-        }
-    }
+        /// Creates an empty set with the exact dyadic `reserve`.
+        ///
+        /// # Panics
+        /// Panics if the backend rejects `reserve` or allocation fails.
+        #[must_use]
+        pub fn with_reserve(reserve: ReserveFraction) -> Self;
 
-    /// Creates an empty set with `capacity` and the exact dyadic `reserve`.
-    ///
-    /// # Panics
-    /// Panics if the backend rejects the inputs or allocation fails.
-    #[must_use]
-    pub fn with_capacity_and_reserve(capacity: usize, reserve: ReserveFraction) -> Self {
-        Self {
-            map: map::HashMap::with_capacity_and_reserve(capacity, reserve),
-        }
-    }
+        /// Creates an empty set with `capacity` and the exact dyadic `reserve`.
+        ///
+        /// # Panics
+        /// Panics if the backend rejects the inputs or allocation fails.
+        #[must_use]
+        pub fn with_capacity_and_reserve(capacity: usize, reserve: ReserveFraction) -> Self;
 
-    /// Fallible exact-reserve constructor.
-    ///
-    /// # Errors
-    /// Returns [`TryBuildError`] for policy, capacity, or allocation failures.
-    pub fn try_with_capacity_and_reserve(
-        capacity: usize,
-        reserve: ReserveFraction,
-    ) -> Result<Self, TryBuildError> {
-        map::HashMap::try_with_capacity_and_reserve(capacity, reserve).map(|map| Self { map })
-    }
+        /// Fallible exact-reserve constructor.
+        ///
+        /// # Errors
+        /// Returns [`TryBuildError`] for policy, capacity, or allocation failures.
+        pub fn try_with_capacity_and_reserve(
+            capacity: usize,
+            reserve: ReserveFraction,
+        ) -> Result<Self, TryBuildError>;
 
-    /// Compatibility constructor for an exact dyadic `f64` reserve.
-    ///
-    /// # Panics
-    /// Panics for non-dyadic input, unsupported reserve, or allocation failure.
-    #[must_use]
-    pub fn with_reserve_fraction(reserve_fraction: f64) -> Self {
-        Self {
-            map: map::HashMap::with_reserve_fraction(reserve_fraction),
-        }
-    }
+        /// Compatibility constructor for an exact dyadic `f64` reserve.
+        ///
+        /// # Panics
+        /// Panics for non-dyadic input, unsupported reserve, or allocation failure.
+        #[must_use]
+        pub fn with_reserve_fraction(reserve_fraction: f64) -> Self;
 
-    /// Compatibility constructor for capacity and an exact dyadic `f64` reserve.
-    ///
-    /// # Panics
-    /// Panics for non-dyadic input, unsupported reserve, or construction failure.
-    #[must_use]
-    pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self {
-        Self {
-            map: map::HashMap::with_capacity_and_reserve_fraction(capacity, reserve_fraction),
-        }
-    }
+        /// Compatibility constructor for capacity and an exact dyadic `f64` reserve.
+        ///
+        /// # Panics
+        /// Panics for non-dyadic input, unsupported reserve, or construction failure.
+        #[must_use]
+        pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self;
 
-    /// Fallible compatibility constructor for an exact dyadic `f64` reserve.
-    ///
-    /// # Errors
-    /// Returns [`TryBuildError`] for invalid input or construction failure.
-    pub fn try_with_capacity_and_reserve_fraction(
-        capacity: usize,
-        reserve_fraction: f64,
-    ) -> Result<Self, TryBuildError> {
-        map::HashMap::try_with_capacity_and_reserve_fraction(capacity, reserve_fraction)
-            .map(|map| Self { map })
+        /// Fallible compatibility constructor for an exact dyadic `f64` reserve.
+        ///
+        /// # Errors
+        /// Returns [`TryBuildError`] for invalid input or construction failure.
+        pub fn try_with_capacity_and_reserve_fraction(
+            capacity: usize,
+            reserve_fraction: f64,
+        ) -> Result<Self, TryBuildError>;
     }
 }
 
 impl<T, P> HashSet<T, P>
 where
-    T: Eq + Hash,
     P: TableBackend<T, (), Alloc = Global>,
 {
-    /// Creates an empty set that uses `hash_builder` to hash values.
-    #[must_use]
-    pub fn with_hasher(hash_builder: P::Hasher) -> Self {
-        Self {
-            map: map::HashMap::with_hasher(hash_builder),
-        }
-    }
+    forward_constructors! {
+        /// Creates an empty set that uses `hash_builder` to hash values.
+        #[must_use]
+        pub fn with_hasher(hash_builder: P::Hasher) -> Self;
 
-    /// Creates an empty set with the given capacity and hasher.
-    #[must_use]
-    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: P::Hasher) -> Self {
-        Self {
-            map: map::HashMap::with_capacity_and_hasher(capacity, hash_builder),
-        }
-    }
+        /// Creates an empty set with the given capacity and hasher.
+        #[must_use]
+        pub fn with_capacity_and_hasher(capacity: usize, hash_builder: P::Hasher) -> Self;
 
-    /// Compatibility constructor for an exact dyadic `f64` reserve and hasher.
-    ///
-    /// # Panics
-    /// Panics for non-dyadic input, unsupported reserve, or construction failure.
-    #[must_use]
-    pub fn with_reserve_fraction_and_hasher(
-        reserve_fraction: f64,
-        hash_builder: P::Hasher,
-    ) -> Self {
-        Self {
-            map: map::HashMap::with_reserve_fraction_and_hasher(reserve_fraction, hash_builder),
-        }
-    }
+        /// Compatibility constructor for an exact dyadic `f64` reserve and hasher.
+        ///
+        /// # Panics
+        /// Panics for non-dyadic input, unsupported reserve, or construction failure.
+        #[must_use]
+        pub fn with_reserve_fraction_and_hasher(
+            reserve_fraction: f64,
+            hash_builder: P::Hasher,
+        ) -> Self;
 
-    /// Compatibility constructor for capacity, exact dyadic reserve, and hasher.
-    ///
-    /// # Panics
-    /// Panics for non-dyadic input, unsupported reserve, or construction failure.
-    #[must_use]
-    pub fn with_capacity_and_reserve_fraction_and_hasher(
-        capacity: usize,
-        reserve_fraction: f64,
-        hash_builder: P::Hasher,
-    ) -> Self {
-        Self {
-            map: map::HashMap::with_capacity_and_reserve_fraction_and_hasher(
-                capacity,
-                reserve_fraction,
-                hash_builder,
-            ),
-        }
-    }
+        /// Compatibility constructor for capacity, exact dyadic reserve, and hasher.
+        ///
+        /// # Panics
+        /// Panics for non-dyadic input, unsupported reserve, or construction failure.
+        #[must_use]
+        pub fn with_capacity_and_reserve_fraction_and_hasher(
+            capacity: usize,
+            reserve_fraction: f64,
+            hash_builder: P::Hasher,
+        ) -> Self;
 
-    /// Creates an empty set with exact reserve and custom hasher.
-    ///
-    /// # Panics
-    /// Panics if the backend rejects the inputs or allocation fails.
-    #[must_use]
-    pub fn with_capacity_and_reserve_and_hasher(
-        capacity: usize,
-        reserve: ReserveFraction,
-        hash_builder: P::Hasher,
-    ) -> Self {
-        Self {
-            map: map::HashMap::with_capacity_and_reserve_and_hasher(
-                capacity,
-                reserve,
-                hash_builder,
-            ),
-        }
+        /// Creates an empty set with exact reserve and custom hasher.
+        ///
+        /// # Panics
+        /// Panics if the backend rejects the inputs or allocation fails.
+        #[must_use]
+        pub fn with_capacity_and_reserve_and_hasher(
+            capacity: usize,
+            reserve: ReserveFraction,
+            hash_builder: P::Hasher,
+        ) -> Self;
     }
 }
 
 #[cfg(feature = "default-hasher")]
 impl<T, P> HashSet<T, P>
 where
-    T: Eq + Hash,
     P: TableBackend<T, (), Hasher = DefaultHashBuilder>,
 {
-    /// Creates an empty set in the given allocator.
-    #[must_use]
-    pub fn new_in(alloc: P::Alloc) -> Self {
-        Self {
-            map: map::HashMap::new_in(alloc),
-        }
-    }
+    forward_constructors! {
+        /// Creates an empty set in the given allocator.
+        #[must_use]
+        pub fn new_in(alloc: P::Alloc) -> Self;
 
-    /// Creates an empty set with the given capacity in the given allocator.
-    #[must_use]
-    pub fn with_capacity_in(capacity: usize, alloc: P::Alloc) -> Self {
-        Self {
-            map: map::HashMap::with_capacity_in(capacity, alloc),
-        }
+        /// Creates an empty set with the given capacity in the given allocator.
+        #[must_use]
+        pub fn with_capacity_in(capacity: usize, alloc: P::Alloc) -> Self;
     }
 }
 
 impl<T, P> HashSet<T, P>
 where
-    T: Eq + Hash,
     P: TableBackend<T, ()>,
 {
-    /// Full constructor: capacity, reserve fraction, hasher, and allocator.
-    ///
-    /// # Panics
-    /// Panics for non-dyadic input, unsupported reserve, or construction failure.
-    #[must_use]
-    pub fn with_capacity_and_reserve_fraction_and_hasher_in(
-        capacity: usize,
-        reserve_fraction: f64,
-        hash_builder: P::Hasher,
-        alloc: P::Alloc,
-    ) -> Self {
-        Self {
-            map: map::HashMap::with_capacity_and_reserve_fraction_and_hasher_in(
-                capacity,
-                reserve_fraction,
-                hash_builder,
-                alloc,
-            ),
-        }
-    }
+    forward_constructors! {
+        /// Full constructor: capacity, reserve fraction, hasher, and allocator.
+        ///
+        /// # Panics
+        /// Panics for non-dyadic input, unsupported reserve, or construction failure.
+        #[must_use]
+        pub fn with_capacity_and_reserve_fraction_and_hasher_in(
+            capacity: usize,
+            reserve_fraction: f64,
+            hash_builder: P::Hasher,
+            alloc: P::Alloc,
+        ) -> Self;
 
-    /// Full exact constructor: capacity, reserve, hasher, and allocator.
-    ///
-    /// # Panics
-    /// Panics if the backend rejects the inputs or allocation fails.
-    #[must_use]
-    pub fn with_capacity_and_reserve_and_hasher_in(
-        capacity: usize,
-        reserve: ReserveFraction,
-        hash_builder: P::Hasher,
-        alloc: P::Alloc,
-    ) -> Self {
-        Self {
-            map: map::HashMap::with_capacity_and_reserve_and_hasher_in(
-                capacity,
-                reserve,
-                hash_builder,
-                alloc,
-            ),
-        }
-    }
+        /// Full exact constructor: capacity, reserve, hasher, and allocator.
+        ///
+        /// # Panics
+        /// Panics if the backend rejects the inputs or allocation fails.
+        #[must_use]
+        pub fn with_capacity_and_reserve_and_hasher_in(
+            capacity: usize,
+            reserve: ReserveFraction,
+            hash_builder: P::Hasher,
+            alloc: P::Alloc,
+        ) -> Self;
 
-    /// Fallible full exact constructor.
-    ///
-    /// # Errors
-    /// Returns [`TryBuildError`] for policy, capacity, or allocation failures.
-    pub fn try_with_capacity_and_reserve_and_hasher_in(
-        capacity: usize,
-        reserve: ReserveFraction,
-        hash_builder: P::Hasher,
-        alloc: P::Alloc,
-    ) -> Result<Self, TryBuildError> {
-        map::HashMap::try_with_capacity_and_reserve_and_hasher_in(
-            capacity,
-            reserve,
-            hash_builder,
-            alloc,
-        )
-        .map(|map| Self { map })
+        /// Fallible full exact constructor.
+        ///
+        /// # Errors
+        /// Returns [`TryBuildError`] for policy, capacity, or allocation failures.
+        pub fn try_with_capacity_and_reserve_and_hasher_in(
+            capacity: usize,
+            reserve: ReserveFraction,
+            hash_builder: P::Hasher,
+            alloc: P::Alloc,
+        ) -> Result<Self, TryBuildError>;
     }
 
     /// Reference to the set's allocator.
@@ -343,6 +383,44 @@ where
         self.map.shrink_to(min_capacity);
     }
 
+    /// Removes all values, keeping allocated capacity.
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    /// Borrowing iterator over the set's values, in arbitrary order.
+    pub fn iter(&self) -> Iter<'_, T, P> {
+        Iter {
+            inner: self.map.keys(),
+        }
+    }
+
+    /// Draining iterator. Removes and yields every value.
+    pub fn drain(&mut self) -> Drain<'_, T, P> {
+        Drain {
+            inner: self.map.drain(),
+        }
+    }
+
+    /// Removes and yields values for which `f` returns `true`. Retains the
+    /// rest, and retains any unvisited values if the iterator is dropped early.
+    pub fn extract_if<'s, F>(&'s mut self, mut f: F) -> ExtractIf<'s, T, P>
+    where
+        T: 's,
+        F: FnMut(&T) -> bool + 's,
+    {
+        let pred: SetExtractPred<'s, T> = Box::new(move |value, ()| f(value));
+        ExtractIf {
+            inner: self.map.extract_if(pred),
+        }
+    }
+}
+
+impl<T, P> HashSet<T, P>
+where
+    T: Eq + Hash,
+    P: TableBackend<T, ()>,
+{
     /// Returns `true` if the set contains a value equal to `value`.
     pub fn contains<Q>(&self, value: &Q) -> bool
     where
@@ -403,38 +481,6 @@ where
         Q: Hash + Equivalent<T> + ?Sized,
     {
         self.map.remove_entry(value).map(|(k, ())| k)
-    }
-
-    /// Removes all values, keeping allocated capacity.
-    pub fn clear(&mut self) {
-        self.map.clear();
-    }
-
-    /// Borrowing iterator over the set's values, in arbitrary order.
-    pub fn iter(&self) -> Iter<'_, T, P> {
-        Iter {
-            inner: self.map.keys(),
-        }
-    }
-
-    /// Draining iterator. Removes and yields every value.
-    pub fn drain(&mut self) -> Drain<'_, T, P> {
-        Drain {
-            inner: self.map.drain(),
-        }
-    }
-
-    /// Removes and yields values for which `f` returns `true`. Retains the
-    /// rest, and retains any unvisited values if the iterator is dropped early.
-    pub fn extract_if<'s, F>(&'s mut self, mut f: F) -> ExtractIf<'s, T, P>
-    where
-        T: 's,
-        F: FnMut(&T) -> bool + 's,
-    {
-        let pred: SetExtractPred<'s, T> = Box::new(move |value, ()| f(value));
-        ExtractIf {
-            inner: self.map.extract_if(pred),
-        }
     }
 
     /// Retains only the values for which `f` returns `true`.
@@ -516,7 +562,6 @@ where
 #[cfg(feature = "default-hasher")]
 impl<T, P> Default for HashSet<T, P>
 where
-    T: Eq + Hash,
     P: TableBackend<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
 {
     fn default() -> Self {
@@ -526,7 +571,7 @@ where
 
 impl<T, P> Clone for HashSet<T, P>
 where
-    T: Clone + Eq + Hash,
+    T: Clone,
     P: TableBackend<T, ()>,
     P::Hasher: Clone,
 {
@@ -539,7 +584,7 @@ where
 
 impl<T, P> fmt::Debug for HashSet<T, P>
 where
-    T: fmt::Debug + Eq + Hash,
+    T: fmt::Debug,
     P: TableBackend<T, ()>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -610,7 +655,6 @@ where
 
 impl<'a, T, P> IntoIterator for &'a HashSet<T, P>
 where
-    T: Eq + Hash,
     P: TableBackend<T, ()>,
 {
     type Item = &'a T;
@@ -622,7 +666,6 @@ where
 
 impl<T, P> IntoIterator for HashSet<T, P>
 where
-    T: Eq + Hash,
     P: TableBackend<T, ()>,
 {
     type Item = T;
@@ -738,439 +781,140 @@ where
     }
 }
 
-/// Borrowing iterator over [`HashSet`] values.
-pub struct Iter<'a, T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
-    inner: map::Keys<'a, T, (), P>,
-}
+// ---------------------------------------------------------------------------
+// Iterators
+// ---------------------------------------------------------------------------
 
-impl<T, P> Clone for Iter<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-    P::Scan: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<'a, T, P> Iterator for Iter<'a, T, P>
-where
-    T: 'a + Eq + Hash,
-    P: TableBackend<T, ()>,
-{
+set_iter! {
+    /// Borrowing iterator over [`HashSet`] values.
+    pub struct Iter<'a, T, P> { inner: map::Keys<'a, T, (), P> }
     type Item = &'a T;
-    fn next(&mut self) -> Option<&'a T> {
+    fn next(&mut self) {
         self.inner.next()
     }
-    fn size_hint(&self) -> (usize, Option<usize>) {
+    fn size_hint(&self) {
         self.inner.size_hint()
     }
+    exact_size clone debug_list
 }
 
-impl<'a, T, P> ExactSizeIterator for Iter<'a, T, P>
-where
-    T: 'a + Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<'a, T, P> FusedIterator for Iter<'a, T, P>
-where
-    T: 'a + Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-}
-
-impl<T, P> fmt::Debug for Iter<'_, T, P>
-where
-    T: fmt::Debug + Eq + Hash,
-    P: TableBackend<T, ()>,
-    P::Scan: Clone,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.clone()).finish()
-    }
-}
-
-/// Consuming iterator over [`HashSet`] values.
-pub struct IntoIter<T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
-    inner: map::IntoKeys<T, (), P>,
-}
-
-impl<T, P> Iterator for IntoIter<T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
+set_iter! {
+    /// Consuming iterator over [`HashSet`] values.
+    pub struct IntoIter<T, P> { inner: map::IntoKeys<T, (), P> }
     type Item = T;
-    fn next(&mut self) -> Option<T> {
+    fn next(&mut self) {
         self.inner.next()
     }
-    fn size_hint(&self) -> (usize, Option<usize>) {
+    fn size_hint(&self) {
         self.inner.size_hint()
     }
+    exact_size debug_opaque
 }
 
-impl<T, P> ExactSizeIterator for IntoIter<T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<T, P> FusedIterator for IntoIter<T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-}
-
-impl<T, P> fmt::Debug for IntoIter<T, P>
-where
-    T: fmt::Debug + Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IntoIter").finish_non_exhaustive()
-    }
-}
-
-/// Draining iterator over [`HashSet`] values.
-pub struct Drain<'a, T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
-    inner: map::Drain<'a, T, (), P>,
-}
-
-impl<T, P> Iterator for Drain<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
+set_iter! {
+    /// Draining iterator over [`HashSet`] values.
+    pub struct Drain<'a, T, P> { inner: map::Drain<'a, T, (), P> }
     type Item = T;
-    fn next(&mut self) -> Option<T> {
+    fn next(&mut self) {
         self.inner.next().map(|(value, ())| value)
     }
-    fn size_hint(&self) -> (usize, Option<usize>) {
+    fn size_hint(&self) {
         self.inner.size_hint()
     }
+    exact_size debug_opaque
 }
 
-impl<T, P> ExactSizeIterator for Drain<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<T, P> FusedIterator for Drain<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-}
-
-impl<T, P> fmt::Debug for Drain<'_, T, P>
-where
-    T: fmt::Debug + Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Drain").finish_non_exhaustive()
-    }
-}
-
-/// Iterator yielding the extracted values of a [`HashSet`].
-pub struct ExtractIf<'a, T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
-    inner: map::ExtractIf<'a, T, (), P, SetExtractPred<'a, T>>,
-}
-
-impl<T, P> Iterator for ExtractIf<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
+set_iter! {
+    /// Iterator yielding the extracted values of a [`HashSet`].
+    pub struct ExtractIf<'a, T, P> { inner: map::ExtractIf<'a, T, (), P, SetExtractPred<'a, T>> }
     type Item = T;
-    fn next(&mut self) -> Option<T> {
+    fn next(&mut self) {
         self.inner.next().map(|(value, ())| value)
     }
-    fn size_hint(&self) -> (usize, Option<usize>) {
+    fn size_hint(&self) {
         (0, self.inner.size_hint().1)
     }
+    debug_opaque
 }
 
-impl<T, P> FusedIterator for ExtractIf<'_, T, P>
+/// Advances `iter` to the next value whose membership in `other` equals
+/// `present`. Shared filter behind [`Difference`] and [`Intersection`].
+fn next_by_membership<'a, T, P>(
+    iter: &mut Iter<'a, T, P>,
+    other: &HashSet<T, P>,
+    present: bool,
+) -> Option<&'a T>
 where
     T: Eq + Hash,
     P: TableBackend<T, ()>,
 {
+    iter.find(|value| other.contains(*value) == present)
 }
 
-impl<T, P> fmt::Debug for ExtractIf<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExtractIf").finish_non_exhaustive()
-    }
-}
-
-/// Iterator over the difference of two [`HashSet`]s.
-pub struct Difference<'a, T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
-    iter: Iter<'a, T, P>,
-    other: &'a HashSet<T, P>,
-}
-
-impl<T, P> Clone for Difference<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-    P::Scan: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            iter: self.iter.clone(),
-            other: self.other,
-        }
-    }
-}
-
-impl<'a, T, P> Iterator for Difference<'a, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
+set_iter! {
+    /// Iterator over the difference of two [`HashSet`]s.
+    pub struct Difference<'a, T, P> { iter: Iter<'a, T, P>, other: &'a HashSet<T, P> }
+    bounds [T: Eq + Hash]
     type Item = &'a T;
-    fn next(&mut self) -> Option<&'a T> {
-        loop {
-            let value = self.iter.next()?;
-            if !self.other.contains(value) {
-                return Some(value);
-            }
-        }
+    fn next(&mut self) {
+        next_by_membership(&mut self.iter, self.other, false)
     }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let (_, upper) = self.iter.size_hint();
-        (0, upper)
+    fn size_hint(&self) {
+        (0, self.iter.size_hint().1)
     }
+    clone debug_list
 }
 
-impl<T, P> FusedIterator for Difference<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-}
-
-impl<T, P> fmt::Debug for Difference<'_, T, P>
-where
-    T: fmt::Debug + Eq + Hash,
-    P: TableBackend<T, ()>,
-    P::Scan: Clone,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.clone()).finish()
-    }
-}
-
-/// Iterator over the intersection of two [`HashSet`]s.
-pub struct Intersection<'a, T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
-    iter: Iter<'a, T, P>,
-    other: &'a HashSet<T, P>,
-}
-
-impl<T, P> Clone for Intersection<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-    P::Scan: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            iter: self.iter.clone(),
-            other: self.other,
-        }
-    }
-}
-
-impl<'a, T, P> Iterator for Intersection<'a, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
+set_iter! {
+    /// Iterator over the intersection of two [`HashSet`]s.
+    pub struct Intersection<'a, T, P> { iter: Iter<'a, T, P>, other: &'a HashSet<T, P> }
+    bounds [T: Eq + Hash]
     type Item = &'a T;
-    fn next(&mut self) -> Option<&'a T> {
-        loop {
-            let value = self.iter.next()?;
-            if self.other.contains(value) {
-                return Some(value);
-            }
-        }
+    fn next(&mut self) {
+        next_by_membership(&mut self.iter, self.other, true)
     }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let (_, upper) = self.iter.size_hint();
-        (0, upper)
+    fn size_hint(&self) {
+        (0, self.iter.size_hint().1)
     }
+    clone debug_list
 }
 
-impl<T, P> FusedIterator for Intersection<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-}
-
-impl<T, P> fmt::Debug for Intersection<'_, T, P>
-where
-    T: fmt::Debug + Eq + Hash,
-    P: TableBackend<T, ()>,
-    P::Scan: Clone,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.clone()).finish()
+set_iter! {
+    /// Iterator over the symmetric difference of two [`HashSet`]s.
+    pub struct SymmetricDifference<'a, T, P> {
+        iter: Chain<Difference<'a, T, P>, Difference<'a, T, P>>,
     }
-}
-
-/// Iterator over the symmetric difference of two [`HashSet`]s.
-pub struct SymmetricDifference<'a, T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
-    iter: Chain<Difference<'a, T, P>, Difference<'a, T, P>>,
-}
-
-impl<T, P> Clone for SymmetricDifference<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-    P::Scan: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            iter: self.iter.clone(),
-        }
-    }
-}
-
-impl<'a, T, P> Iterator for SymmetricDifference<'a, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
+    bounds [T: Eq + Hash]
     type Item = &'a T;
-    fn next(&mut self) -> Option<&'a T> {
+    fn next(&mut self) {
         self.iter.next()
     }
-    fn size_hint(&self) -> (usize, Option<usize>) {
+    fn size_hint(&self) {
         self.iter.size_hint()
     }
+    clone debug_list
 }
 
-impl<T, P> FusedIterator for SymmetricDifference<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-}
-
-impl<T, P> fmt::Debug for SymmetricDifference<'_, T, P>
-where
-    T: fmt::Debug + Eq + Hash,
-    P: TableBackend<T, ()>,
-    P::Scan: Clone,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.clone()).finish()
-    }
-}
-
-/// Iterator over the union of two [`HashSet`]s.
-pub struct Union<'a, T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
-    iter: Chain<Iter<'a, T, P>, Difference<'a, T, P>>,
-}
-
-impl<T, P> Clone for Union<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-    P::Scan: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            iter: self.iter.clone(),
-        }
-    }
-}
-
-impl<'a, T, P> Iterator for Union<'a, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
+set_iter! {
+    /// Iterator over the union of two [`HashSet`]s.
+    pub struct Union<'a, T, P> { iter: Chain<Iter<'a, T, P>, Difference<'a, T, P>> }
+    bounds [T: Eq + Hash]
     type Item = &'a T;
-    fn next(&mut self) -> Option<&'a T> {
+    fn next(&mut self) {
         self.iter.next()
     }
-    fn size_hint(&self) -> (usize, Option<usize>) {
+    fn size_hint(&self) {
         self.iter.size_hint()
     }
+    clone debug_list
 }
 
-impl<T, P> FusedIterator for Union<'_, T, P>
-where
-    T: Eq + Hash,
-    P: TableBackend<T, ()>,
-{
-}
-
-impl<T, P> fmt::Debug for Union<'_, T, P>
-where
-    T: fmt::Debug + Eq + Hash,
-    P: TableBackend<T, ()>,
-    P::Scan: Clone,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.clone()).finish()
-    }
-}
+// ---------------------------------------------------------------------------
+// Entry API
+// ---------------------------------------------------------------------------
 
 /// A view into a single [`HashSet`] entry.
-pub enum Entry<'a, T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
+pub enum Entry<'a, T, P: TableBackend<T, ()>> {
     /// Value already present.
     Occupied(OccupiedEntry<'a, T, P>),
     /// Value absent.
@@ -1178,18 +922,12 @@ where
 }
 
 /// View of an occupied [`HashSet`] entry.
-pub struct OccupiedEntry<'a, T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
+pub struct OccupiedEntry<'a, T, P: TableBackend<T, ()>> {
     inner: map::OccupiedEntry<'a, T, (), P>,
 }
 
 /// View of a vacant [`HashSet`] entry.
-pub struct VacantEntry<'a, T, P: TableBackend<T, ()>>
-where
-    T: Eq + Hash,
-{
+pub struct VacantEntry<'a, T, P: TableBackend<T, ()>> {
     inner: map::VacantEntry<'a, T, (), P>,
 }
 
