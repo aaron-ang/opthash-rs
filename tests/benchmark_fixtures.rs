@@ -4,8 +4,8 @@ mod harness;
 use std::collections::HashSet;
 
 use harness::{
-    DEFAULT_HIT_QUERY_SEED, exact_size_label, parse_positive_sizes, scaled_insert_sample_size,
-    sequential_hit_keys, shuffled_hit_keys, shuffled_hit_keys_with_seed,
+    DEFAULT_HIT_QUERY_SEED, LATENCY_SIZES, exact_size_label, parse_positive_sizes,
+    scaled_insert_sample_size, sequential_hit_keys, shuffled_hit_keys, shuffled_hit_keys_with_seed,
 };
 
 fn pairs(count: usize) -> Vec<(u64, u64)> {
@@ -118,6 +118,12 @@ fn scaled_size_labels_are_exact_and_unambiguous() {
     assert_eq!(exact_size_label(1_000_000), "1M");
     assert_eq!(exact_size_label(10_000_000), "10M");
     assert_eq!(exact_size_label(1_500), "1500");
+}
+
+#[test]
+fn latency_sizes_keep_their_round_labels() {
+    let labels: Vec<String> = LATENCY_SIZES.iter().map(|&n| exact_size_label(n)).collect();
+    assert_eq!(labels, ["1K", "10K", "100K", "1M", "10M"]);
 }
 
 #[test]

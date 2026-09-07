@@ -19,7 +19,7 @@ fn bench_get_hit_latency(c: &mut Criterion) {
         let sequential_query_keys = harness::sequential_hit_keys(&pairs, size);
         let maps = harness::MapQuad::new(&pairs);
 
-        let label = harness::size_label(size);
+        let label = harness::exact_size_label(size);
         let workload = format!("get_hit_latency_{label}");
         bench_latency_group(c, &workload, &maps, &query_keys);
 
