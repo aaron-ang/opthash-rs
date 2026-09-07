@@ -6,6 +6,9 @@ const TRANSITION_MASK: u64 = 0b111 << TRANSITION_SHIFT;
 const HAD_DELETE_MASK: u64 = 1_u64 << 63;
 
 /// Cause of the current allocation epoch.
+///
+/// The discriminant is the value packed into the lifecycle word's
+/// transition field; `transition_from_bits` is its inverse.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum EpochTransition {
@@ -67,7 +70,7 @@ impl EpochState {
         let generation = self.generation().saturating_add(1);
         self.lifecycle = (self.lifecycle & RECOVERY_MASK)
             | u64::from(generation)
-            | (transition_bits(transition) << TRANSITION_SHIFT);
+            | ((transition as u64) << TRANSITION_SHIFT);
         self.deletions = 0;
     }
 
@@ -107,17 +110,6 @@ impl EpochState {
     }
 }
 
-const fn transition_bits(transition: EpochTransition) -> u64 {
-    match transition {
-        EpochTransition::Initial => 0,
-        EpochTransition::Growth => 1,
-        EpochTransition::TombstoneCleanup => 2,
-        EpochTransition::ExplicitResize => 3,
-        EpochTransition::Clear => 4,
-        EpochTransition::PlacementRecovery => 5,
-    }
-}
-
 const fn transition_from_bits(bits: u64) -> EpochTransition {
     match bits {
         1 => EpochTransition::Growth,
@@ -126,5 +118,26 @@ const fn transition_from_bits(bits: u64) -> EpochTransition {
         4 => EpochTransition::Clear,
         5 => EpochTransition::PlacementRecovery,
         _ => EpochTransition::Initial,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transition_bits_round_trip() {
+        for transition in [
+            EpochTransition::Initial,
+            EpochTransition::Growth,
+            EpochTransition::TombstoneCleanup,
+            EpochTransition::ExplicitResize,
+            EpochTransition::Clear,
+            EpochTransition::PlacementRecovery,
+        ] {
+            let bits = transition as u64;
+            assert_eq!(bits & !(TRANSITION_MASK >> TRANSITION_SHIFT), 0);
+            assert_eq!(transition_from_bits(bits), transition);
+        }
     }
 }
