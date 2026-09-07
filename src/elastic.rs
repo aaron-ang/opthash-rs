@@ -1958,12 +1958,13 @@ mod tests {
     use core::mem::ManuallyDrop;
     use core::num::{NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
     use core::ptr;
-    use core::ptr::NonNull;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::common::exact::reference::{ScalarElastic, ScalarElasticCase, ScalarElasticLimits};
+    use crate::common::test_support::{
+        CountDrop, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
+    };
     use alloc::sync::Arc;
-    use allocator_api2::alloc::AllocError as RawAllocError;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[derive(Clone, Copy)]
@@ -1987,62 +1988,12 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct IdentityBuildHasher;
-
     #[derive(Clone, Copy, Eq, Hash, PartialEq)]
     struct Zst;
 
     #[repr(align(256))]
     #[derive(Clone, Copy, Eq, Hash, PartialEq)]
     struct OverAligned(u64);
-
-    #[derive(Clone)]
-    struct ToggleAllocator {
-        fail: Arc<AtomicBool>,
-    }
-
-    unsafe impl Allocator for ToggleAllocator {
-        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, RawAllocError> {
-            if self.fail.load(Ordering::Relaxed) {
-                Err(RawAllocError)
-            } else {
-                Global.allocate(layout)
-            }
-        }
-
-        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-            unsafe { Global.deallocate(ptr, layout) };
-        }
-    }
-
-    #[derive(Default)]
-    struct IdentityHasher(u64);
-
-    impl Hasher for IdentityHasher {
-        fn finish(&self) -> u64 {
-            self.0
-        }
-
-        fn write(&mut self, bytes: &[u8]) {
-            assert_eq!(bytes.len(), 8);
-            let mut word = [0; 8];
-            word.copy_from_slice(bytes);
-            self.0 = u64::from_ne_bytes(word);
-        }
-
-        fn write_u64(&mut self, value: u64) {
-            self.0 = value;
-        }
-    }
-
-    impl BuildHasher for IdentityBuildHasher {
-        type Hasher = IdentityHasher;
-
-        fn build_hasher(&self) -> Self::Hasher {
-            IdentityHasher::default()
-        }
-    }
 
     fn exact_case(case: ScalarElasticCase) -> ExactInsertionCase {
         match case {
@@ -2330,55 +2281,12 @@ mod tests {
         }
     }
 
-    struct ElasticPanicHashKey {
-        value: u64,
-        panic: Arc<AtomicBool>,
-    }
-
-    impl PartialEq for ElasticPanicHashKey {
-        fn eq(&self, other: &Self) -> bool {
-            self.value == other.value
-        }
-    }
-
-    impl Eq for ElasticPanicHashKey {}
-
-    impl Hash for ElasticPanicHashKey {
-        fn hash<H: Hasher>(&self, state: &mut H) {
-            assert!(
-                !self.panic.load(Ordering::SeqCst),
-                "Elastic test hash panic"
-            );
-            self.value.hash(state);
-        }
-    }
-
-    struct ElasticCountDrop(Arc<AtomicUsize>);
-
-    impl Drop for ElasticCountDrop {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    struct ElasticPanicOnFirstDrop(Arc<AtomicUsize>);
-
-    impl Drop for ElasticPanicOnFirstDrop {
-        fn drop(&mut self) {
-            assert!(
-                self.0.fetch_add(1, Ordering::SeqCst) != 0,
-                "first value drop"
-            );
-        }
-    }
-
     #[test]
     fn clear_marks_each_slot_empty_before_dropping_its_value() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut map =
-            ManuallyDrop::new(ElasticHashMap::<u64, ElasticPanicOnFirstDrop>::with_capacity(32));
+        let mut map = ManuallyDrop::new(ElasticHashMap::<u64, PanicOnFirstDrop>::with_capacity(32));
         for key in 0..3 {
-            map.insert(key, ElasticPanicOnFirstDrop(drops.clone()));
+            map.insert(key, PanicOnFirstDrop(drops.clone()));
         }
         let first_occupied = map
             .table()
@@ -2426,15 +2334,15 @@ mod tests {
     fn caught_hash_panic_during_try_resize_leaves_counters_valid() {
         let panic = Arc::new(AtomicBool::new(false));
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut map = ElasticHashMap::<ElasticPanicHashKey, ElasticCountDrop>::with_capacity(32);
-        for value in 0..16_u64 {
-            map.insert(
-                ElasticPanicHashKey {
-                    value,
-                    panic: panic.clone(),
-                },
-                ElasticCountDrop(drops.clone()),
-            );
+        let key_drops = Arc::new(AtomicUsize::new(0));
+        let key = |id: u64| PanicHashKey {
+            id,
+            armed: panic.clone(),
+            drops: key_drops.clone(),
+        };
+        let mut map = ElasticHashMap::<PanicHashKey, CountDrop>::with_capacity(32);
+        for id in 0..16_u64 {
+            map.insert(key(id), CountDrop(drops.clone()));
         }
 
         panic.store(true, Ordering::SeqCst);
@@ -2461,20 +2369,11 @@ mod tests {
         }));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
 
-        let live_keys = map.keys().map(|key| key.value).collect::<Vec<_>>();
-        map.insert(
-            ElasticPanicHashKey {
-                value: 100,
-                panic: panic.clone(),
-            },
-            ElasticCountDrop(drops.clone()),
-        );
+        let live_keys = map.keys().map(|key| key.id).collect::<Vec<_>>();
+        map.insert(key(100), CountDrop(drops.clone()));
         map.try_reserve(4_096).unwrap();
-        for value in live_keys.into_iter().chain([100]) {
-            assert!(map.contains_key(&ElasticPanicHashKey {
-                value,
-                panic: panic.clone(),
-            }));
+        for id in live_keys.into_iter().chain([100]) {
+            assert!(map.contains_key(&key(id)));
         }
         drop(map);
         assert_eq!(drops.load(Ordering::SeqCst), 17);
@@ -3057,32 +2956,29 @@ mod tests {
     #[test]
     fn allocator_failure_does_not_publish_or_forget_membership() {
         let fail = Arc::new(AtomicBool::new(true));
+        let alloc = ToggleAllocator::new(Arc::clone(&fail));
         let failed = ElasticHashMap::<u64, u64, IdentityBuildHasher, ToggleAllocator>::
             try_with_capacity_and_reserve_and_hasher_in(
                 128,
                 ReserveFraction::DEFAULT,
                 IdentityBuildHasher,
-                ToggleAllocator {
-                    fail: Arc::clone(&fail),
-                },
+                alloc.clone(),
             );
         assert!(matches!(failed, Err(TryBuildError::AllocError)));
 
-        fail.store(false, Ordering::Relaxed);
+        fail.store(false, Ordering::SeqCst);
         let mut map = ElasticHashMap::<u64, u64, IdentityBuildHasher, ToggleAllocator>::
             with_capacity_and_reserve_and_hasher_in(
                 128,
                 ReserveFraction::DEFAULT,
                 IdentityBuildHasher,
-                ToggleAllocator {
-                    fail: Arc::clone(&fail),
-                },
+                alloc,
             );
         for key in 0_u64..64 {
             map.insert(key, key ^ 0x5a);
         }
 
-        fail.store(true, Ordering::Relaxed);
+        fail.store(true, Ordering::SeqCst);
         assert_eq!(map.try_reserve(4_096), Err(TryReserveError::AllocError));
         for key in 0_u64..64 {
             let hash = map.table().hash_key(&key);
