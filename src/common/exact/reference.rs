@@ -2,7 +2,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::num::{NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
 
-use super::geometry::{FunnelPlan, PaperConfig};
+use super::geometry::{ElasticCase, FunnelPlan, PaperConfig};
 use super::probe::{self, ProbeDomain, ProbeOracle, RangeReductionError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,35 +30,6 @@ impl ScalarElasticLimits {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ScalarElasticCase {
-    Batch0 {
-        level: usize,
-    },
-    Case1 {
-        batch: usize,
-        current_level: usize,
-        next_level: usize,
-        free_current: usize,
-        free_next: usize,
-        budget: usize,
-    },
-    Case2 {
-        batch: usize,
-        current_level: usize,
-        next_level: usize,
-        free_current: usize,
-        free_next: usize,
-    },
-    Case3 {
-        batch: usize,
-        current_level: usize,
-        next_level: usize,
-        free_current: usize,
-        free_next: usize,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ScalarElasticLocation {
     pub(crate) level: usize,
     pub(crate) slot_in_level: usize,
@@ -77,7 +48,7 @@ impl ScalarElasticLocation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ScalarElasticInsertion {
-    pub(crate) case: ScalarElasticCase,
+    pub(crate) case: ElasticCase,
     pub(crate) location: ScalarElasticLocation,
     pub(crate) paper_probe: u64,
     pub(crate) phi: u128,
@@ -140,7 +111,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
             .expect("scalar Elastic insertion exceeded the exact target");
         let (case, level, slot_in_level, paper_probe) = if batch == 0 {
             let (slot, probe) = self.uniform_vacancy(0, identity);
-            (ScalarElasticCase::Batch0 { level: 0 }, 0, slot, probe)
+            (ElasticCase::Batch0 { level: 0 }, 0, slot, probe)
         } else {
             let current = batch - 1;
             let next = batch;
@@ -160,7 +131,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
             if current_low {
                 let (slot, probe) = self.uniform_vacancy(next, identity);
                 (
-                    ScalarElasticCase::Case2 {
+                    ElasticCase::Case2 {
                         batch,
                         current_level: current,
                         next_level: next,
@@ -174,7 +145,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
             } else if next_low {
                 let (slot, probe) = self.uniform_vacancy(current, identity);
                 (
-                    ScalarElasticCase::Case3 {
+                    ElasticCase::Case3 {
                         batch,
                         current_level: current,
                         next_level: next,
@@ -193,7 +164,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
                     self.limits.probe_budget_c.get(),
                 )
                 .expect("scalar Elastic probe budget must be representable");
-                let case = ScalarElasticCase::Case1 {
+                let case = ElasticCase::Case1 {
                     batch,
                     current_level: current,
                     next_level: next,
@@ -631,11 +602,11 @@ mod tests {
     use core::num::{NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
 
     use super::{
-        ScalarElastic, ScalarElasticCase, ScalarElasticInsertion, ScalarElasticLimits,
-        ScalarElasticLocation, ScalarElasticQuery, ScalarFunnel, ScalarFunnelInsert,
-        ScalarFunnelLocation, ScalarFunnelSearch,
+        ScalarElastic, ScalarElasticInsertion, ScalarElasticLimits, ScalarElasticLocation,
+        ScalarElasticQuery, ScalarFunnel, ScalarFunnelInsert, ScalarFunnelLocation,
+        ScalarFunnelSearch,
     };
-    use crate::common::exact::geometry::PaperConfig;
+    use crate::common::exact::geometry::{ElasticCase, PaperConfig};
     use crate::common::exact::probe::{ProbeDomain, ProbeOracle};
 
     #[derive(Debug)]
@@ -727,25 +698,25 @@ mod tests {
             insertions,
             vec![
                 ScalarElasticInsertion {
-                    case: ScalarElasticCase::Batch0 { level: 0 },
+                    case: ElasticCase::Batch0 { level: 0 },
                     location: ScalarElasticLocation::new(0, 0, 0),
                     paper_probe: 1,
                     phi: 13,
                 },
                 ScalarElasticInsertion {
-                    case: ScalarElasticCase::Batch0 { level: 0 },
+                    case: ElasticCase::Batch0 { level: 0 },
                     location: ScalarElasticLocation::new(0, 1, 1),
                     paper_probe: 2,
                     phi: 57,
                 },
                 ScalarElasticInsertion {
-                    case: ScalarElasticCase::Batch0 { level: 0 },
+                    case: ElasticCase::Batch0 { level: 0 },
                     location: ScalarElasticLocation::new(0, 2, 2),
                     paper_probe: 3,
                     phi: 61,
                 },
                 ScalarElasticInsertion {
-                    case: ScalarElasticCase::Case1 {
+                    case: ElasticCase::Case1 {
                         batch: 1,
                         current_level: 0,
                         next_level: 1,
@@ -758,7 +729,7 @@ mod tests {
                     phi: 26,
                 },
                 ScalarElasticInsertion {
-                    case: ScalarElasticCase::Case1 {
+                    case: ElasticCase::Case1 {
                         batch: 1,
                         current_level: 0,
                         next_level: 1,
@@ -771,7 +742,7 @@ mod tests {
                     phi: 114,
                 },
                 ScalarElasticInsertion {
-                    case: ScalarElasticCase::Case3 {
+                    case: ElasticCase::Case3 {
                         batch: 1,
                         current_level: 0,
                         next_level: 1,
@@ -783,7 +754,7 @@ mod tests {
                     phi: 233,
                 },
                 ScalarElasticInsertion {
-                    case: ScalarElasticCase::Case2 {
+                    case: ElasticCase::Case2 {
                         batch: 2,
                         current_level: 1,
                         next_level: 2,
