@@ -255,29 +255,15 @@ struct FunnelLayout {
 
 type FunnelStorageBuild<K, V> = (Arena, FlatStorage<SlotEntry<K, V>>, MembershipRegion);
 
-/// `Layout::extend` aligns the filter tail for [`MembershipWord`], so casting
-/// the arena base plus that offset is aligned by construction.
-#[allow(clippy::cast_ptr_alignment)]
 fn try_allocate_storage<K, V, A: Allocator>(
     n: usize,
     alloc: &A,
 ) -> Result<FunnelStorageBuild<K, V>, TryReserveError> {
     let shape = funnel_layout::<K, V>(n)?;
     let arena = Arena::try_allocate_with_ctrl_zeroed(shape.layout, shape.control_bytes, alloc)?;
-    if shape.membership.words != 0 {
-        // The arena zeroes control bytes only; an empty filter must read as
-        // "nothing recorded".
-        unsafe {
-            core::ptr::write_bytes(
-                arena
-                    .as_ptr()
-                    .add(shape.membership.offset)
-                    .cast::<MembershipWord>(),
-                0,
-                shape.membership.words,
-            );
-        }
-    }
+    // The arena zeroes control bytes only; an empty filter must read as
+    // "nothing recorded".
+    unsafe { shape.membership.clear::<MembershipWord>(arena.as_ptr()) };
     let storage = FlatStorage {
         ctrl_ptr: arena.as_ptr(),
         data_ptr: unsafe {
@@ -299,24 +285,12 @@ fn funnel_layout<K, V>(n: usize) -> Result<FunnelLayout, TryReserveError> {
             .ok_or(TryReserveError::CapacityOverflow)?
     };
     let (base_layout, data_offset) = arena::layout_for_extents::<K, V>(control_bytes, n)?;
-    let words = membership::word_count(n);
-    if words == 0 {
-        return Ok(FunnelLayout {
-            layout: base_layout,
-            data_offset,
-            control_bytes,
-            membership: MembershipRegion::EMPTY,
-        });
-    }
-    let tail = Layout::array::<MembershipWord>(words).map_err(|_| TryReserveError::AllocError)?;
-    let (layout, offset) = base_layout
-        .extend(tail)
-        .map_err(|_| TryReserveError::AllocError)?;
+    let (layout, membership) = MembershipRegion::extend::<MembershipWord>(base_layout, n)?;
     Ok(FunnelLayout {
-        layout: layout.pad_to_align(),
+        layout,
         data_offset,
         control_bytes,
-        membership: MembershipRegion { offset, words },
+        membership,
     })
 }
 
@@ -980,14 +954,8 @@ where
     }
 
     #[inline]
-    #[allow(clippy::cast_ptr_alignment)]
     fn membership_ptr(&self) -> *mut MembershipWord {
-        unsafe {
-            self.arena
-                .as_ptr()
-                .add(self.membership.offset)
-                .cast::<MembershipWord>()
-        }
+        unsafe { self.membership.ptr::<MembershipWord>(self.arena.as_ptr()) }
     }
 
     /// `false` proves no insert ever recorded this key.
@@ -1051,10 +1019,7 @@ where
     }
 
     fn clear_membership(&mut self) {
-        let words = self.membership.words;
-        if words != 0 {
-            unsafe { core::ptr::write_bytes(self.membership_ptr(), 0, words) };
-        }
+        unsafe { self.membership.clear::<MembershipWord>(self.arena.as_ptr()) };
         self.stale_membership = 0;
     }
 
@@ -1089,17 +1054,13 @@ where
     }
 
     fn copy_membership_from(&mut self, source: &Self) {
-        let words = self.membership.words;
-        debug_assert_eq!(words, source.membership.words);
-        if words != 0 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    source.membership_ptr(),
-                    self.membership_ptr(),
-                    words,
-                );
-            }
-        }
+        unsafe {
+            self.membership.copy_from::<MembershipWord>(
+                self.arena.as_ptr(),
+                source.membership,
+                source.arena.as_ptr(),
+            );
+        };
     }
 
     fn find_location<Q>(&self, key: &Q, key_hash: u64, key_fingerprint: u8) -> Option<usize>

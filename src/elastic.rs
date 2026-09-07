@@ -255,31 +255,17 @@ const _: () = assert!(mem::size_of::<ElasticMetadataWord>() == 16);
 struct ElasticArenaLayout {
     layout: Layout,
     data_base_off: usize,
-    membership_offset: usize,
-    membership_words: usize,
+    membership: MembershipRegion,
 }
 
 fn elastic_arena_layout<K, V>(total_slots: usize) -> Result<ElasticArenaLayout, TryReserveError> {
     let (base_layout, data_base_off) = arena::layout_for::<K, V>(total_slots)?;
-    let membership_words = membership::word_count(total_slots);
-    if membership_words == 0 {
-        return Ok(ElasticArenaLayout {
-            layout: base_layout,
-            data_base_off,
-            membership_offset: 0,
-            membership_words: 0,
-        });
-    }
-    let membership_layout = Layout::array::<ElasticMetadataWord>(membership_words)
-        .map_err(|_| TryReserveError::AllocError)?;
-    let (layout, membership_offset) = base_layout
-        .extend(membership_layout)
-        .map_err(|_| TryReserveError::AllocError)?;
+    let (layout, membership) =
+        MembershipRegion::extend::<ElasticMetadataWord>(base_layout, total_slots)?;
     Ok(ElasticArenaLayout {
-        layout: layout.pad_to_align(),
+        layout,
         data_base_off,
-        membership_offset,
-        membership_words,
+        membership,
     })
 }
 
@@ -600,25 +586,13 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     let total_ctrl = total_ctrl.ok_or(TryReserveError::CapacityOverflow)?;
     let arena_layout = elastic_arena_layout::<K, V>(total_ctrl)?;
     let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout.layout, total_ctrl, alloc)?;
-    if arena_layout.membership_words != 0 {
-        unsafe {
-            ptr::write_bytes(
-                arena
-                    .as_ptr()
-                    .add(arena_layout.membership_offset)
-                    .cast::<ElasticMetadataWord>(),
-                0,
-                arena_layout.membership_words,
-            );
-        };
-    }
+    let membership = arena_layout.membership;
+    // The arena zeroes control bytes only; an empty filter must read as
+    // "nothing recorded".
+    unsafe { membership.clear::<ElasticMetadataWord>(arena.as_ptr()) };
 
     // `Arena` has no `Drop`, so a bare `?` would leak the allocation if
     // level construction fails. Deallocate explicitly on `Err`.
-    let membership = MembershipRegion {
-        offset: arena_layout.membership_offset,
-        words: arena_layout.membership_words,
-    };
     match build_elastic_levels::<K, V>(arena.as_ptr(), arena_layout.data_base_off, level_capacities)
     {
         Ok(levels) => Ok((arena, levels, membership)),
@@ -726,13 +700,10 @@ where
     }
 
     #[inline]
-    #[allow(clippy::cast_ptr_alignment)]
     fn membership_ptr(&self) -> *mut ElasticMetadataWord {
         unsafe {
-            self.arena
-                .as_ptr()
-                .add(self.membership.offset)
-                .cast::<ElasticMetadataWord>()
+            self.membership
+                .ptr::<ElasticMetadataWord>(self.arena.as_ptr())
         }
     }
 
@@ -793,21 +764,21 @@ where
     }
 
     fn clear_membership(&mut self) {
-        let words = self.membership.words;
-        if words != 0 {
-            unsafe { ptr::write_bytes(self.membership_ptr(), 0, words) };
+        unsafe {
+            self.membership
+                .clear::<ElasticMetadataWord>(self.arena.as_ptr());
         }
         self.stale_membership = 0;
     }
 
     fn copy_membership_from(&mut self, source: &Self) {
-        let words = self.membership.words;
-        debug_assert_eq!(words, source.membership.words);
-        if words != 0 {
-            unsafe {
-                ptr::copy_nonoverlapping(source.membership_ptr(), self.membership_ptr(), words);
-            };
-        }
+        unsafe {
+            self.membership.copy_from::<ElasticMetadataWord>(
+                self.arena.as_ptr(),
+                source.membership,
+                source.arena.as_ptr(),
+            );
+        };
     }
 
     /// Removes all entries, keeping allocated capacity.
@@ -2232,11 +2203,11 @@ mod tests {
                 assert_eq!(extended.data_base_off, data_offset);
                 if slots == 0 {
                     assert_eq!(extended.layout.size(), 0);
-                    assert_eq!(extended.membership_words, 0);
+                    assert_eq!(extended.membership.words, 0);
                 } else {
-                    assert_eq!(extended.membership_offset, base.size());
+                    assert_eq!(extended.membership.offset, base.size());
                     assert_eq!(
-                        extended.membership_words,
+                        extended.membership.words,
                         slots.div_ceil(membership::SLOTS_PER_WORD)
                     );
                     assert!(extended.layout.size() > base.size());
@@ -2259,7 +2230,7 @@ mod tests {
         let layout = elastic_arena_layout::<OverAligned, OverAligned>(table.total_slots).unwrap();
         assert_eq!(
             table.membership_ptr().addr(),
-            unsafe { table.arena.as_ptr().add(layout.membership_offset) }.addr()
+            unsafe { table.arena.as_ptr().add(layout.membership.offset) }.addr()
         );
         assert_eq!(
             table.membership_ptr().addr() % mem::align_of::<ElasticMetadataWord>(),
