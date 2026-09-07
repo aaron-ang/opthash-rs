@@ -44,36 +44,23 @@ impl PaperConfig {
         self.n - self.floor_delta_n()
     }
 
-    /// Checks Funnel's concrete `delta <= 1/8` restriction and reports the
-    /// remaining unquantified asymptotic precondition.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FunnelDomainError::ExponentBelowMinimum`] when
-    /// `reserve_exponent < 3`.
-    pub(crate) const fn funnel_domain_status(
-        &self,
-    ) -> Result<TheoremDomainStatus, FunnelDomainError> {
-        if self.reserve_exponent < 3 {
-            return Err(FunnelDomainError::ExponentBelowMinimum {
-                reserve_exponent: self.reserve_exponent,
-                minimum: 3,
-            });
-        }
-        Ok(TheoremDomainStatus::UnquantifiedAsymptoticPrecondition)
-    }
-
     /// Creates a pure logical Funnel geometry plan.
     ///
     /// # Errors
     ///
-    /// Returns [`FunnelPlanError`] when the concrete Funnel domain is not met,
-    /// a derived parameter overflows, the paper's special-array interval has
-    /// no compatible length, or the ordinary levels have no positive exact
-    /// partition.
+    /// Returns [`FunnelPlanError`] when the concrete Funnel domain
+    /// (`delta <= 1/8`, or equivalently `reserve_exponent >= 3`) is not met, a
+    /// derived parameter overflows, the paper's special-array interval has no
+    /// compatible length, or the ordinary levels have no positive exact
+    /// partition. The paper's remaining preconditions are asymptotic and carry
+    /// no concrete constant to check.
     pub(crate) fn funnel_plan(&self) -> Result<FunnelPlan, FunnelPlanError> {
-        self.funnel_domain_status()
-            .map_err(FunnelPlanError::Domain)?;
+        if self.reserve_exponent < 3 {
+            return Err(FunnelPlanError::ExponentBelowMinimum {
+                reserve_exponent: self.reserve_exponent,
+                minimum: 3,
+            });
+        }
 
         let reserve_exponent = u128::from(self.reserve_exponent);
         let alpha = reserve_exponent
@@ -144,18 +131,6 @@ pub(crate) enum ConfigError {
     ExponentZero,
 }
 
-/// A concrete Funnel-domain restriction failed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FunnelDomainError {
-    /// Funnel requires `delta <= 1/8`, or equivalently `reserve_exponent >= 3`.
-    ExponentBelowMinimum {
-        /// The rejected exponent.
-        reserve_exponent: u32,
-        /// The smallest accepted exponent.
-        minimum: u32,
-    },
-}
-
 /// A derived Funnel geometry parameter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FunnelPlanParameter {
@@ -168,8 +143,13 @@ pub(crate) enum FunnelPlanParameter {
 /// A failure to construct the paper's exact logical Funnel geometry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FunnelPlanError {
-    /// Funnel's concrete `delta <= 1/8` restriction failed.
-    Domain(FunnelDomainError),
+    /// Funnel requires `delta <= 1/8`, or equivalently `reserve_exponent >= 3`.
+    ExponentBelowMinimum {
+        /// The rejected exponent.
+        reserve_exponent: u32,
+        /// The smallest accepted exponent.
+        minimum: u32,
+    },
     /// A derived parameter cannot be represented exactly.
     DerivedParameterOverflow {
         /// The parameter whose checked derivation failed.
@@ -195,13 +175,6 @@ pub(crate) enum FunnelPlanError {
         /// The exact fallback bucket width `2 * loglog_ceiling`.
         fallback_bucket_width: usize,
     },
-}
-
-/// The status of an algorithm's asymptotic theorem preconditions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TheoremDomainStatus {
-    /// The paper uses big-O notation without a concrete constant to check.
-    UnquantifiedAsymptoticPrecondition,
 }
 
 /// Which paper §4 insertion rule placed an Elastic key, with the level pair
@@ -740,10 +713,7 @@ impl FunnelPlan {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ConfigError, FunnelDomainError, FunnelPlanError, FunnelPlanParameter, PaperConfig,
-        TheoremDomainStatus,
-    };
+    use super::{ConfigError, FunnelPlanError, FunnelPlanParameter, PaperConfig};
 
     #[test]
     fn rejects_invalid_configuration_inputs() {
@@ -769,24 +739,6 @@ mod tests {
             assert_eq!(config.floor_delta_n(), 0);
             assert_eq!(config.target_insertions(), 32_768);
         }
-    }
-
-    #[test]
-    fn funnel_domain_checks_do_not_claim_the_theorem_applies() {
-        let below_funnel_domain = PaperConfig::new(32_768, 2).unwrap();
-        assert_eq!(
-            below_funnel_domain.funnel_domain_status(),
-            Err(FunnelDomainError::ExponentBelowMinimum {
-                reserve_exponent: 2,
-                minimum: 3,
-            })
-        );
-
-        let accepted_by_funnel = PaperConfig::new(32_768, 3).unwrap();
-        assert_eq!(
-            accepted_by_funnel.funnel_domain_status(),
-            Ok(TheoremDomainStatus::UnquantifiedAsymptoticPrecondition)
-        );
     }
 
     #[test]
@@ -942,12 +894,10 @@ mod tests {
 
         assert_eq!(
             config.funnel_plan(),
-            Err(FunnelPlanError::Domain(
-                FunnelDomainError::ExponentBelowMinimum {
-                    reserve_exponent: 2,
-                    minimum: 3,
-                }
-            ))
+            Err(FunnelPlanError::ExponentBelowMinimum {
+                reserve_exponent: 2,
+                minimum: 3,
+            })
         );
     }
 
