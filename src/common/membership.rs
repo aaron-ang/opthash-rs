@@ -8,6 +8,12 @@
 //! It is an accelerator, not paper geometry: candidate order is unchanged, only
 //! whether the candidates are worth visiting.
 
+use core::ptr;
+
+use allocator_api2::alloc::Layout;
+
+use crate::common::error::TryReserveError;
+
 /// Logical slots covered by one filter word. Ten keeps the tail under a byte per
 /// slot while leaving words sparse enough for two bits per key to stay selective.
 pub(crate) const SLOTS_PER_WORD: usize = 10;
@@ -80,4 +86,63 @@ impl MembershipRegion {
         offset: 0,
         words: 0,
     };
+
+    /// Appends a `W`-word tail covering `total_slots` to `base`, returning the
+    /// padded arena layout and where the tail sits inside it. An empty geometry
+    /// keeps `base` unchanged and yields [`Self::EMPTY`].
+    pub(crate) fn extend<W>(
+        base: Layout,
+        total_slots: usize,
+    ) -> Result<(Layout, Self), TryReserveError> {
+        let words = word_count(total_slots);
+        if words == 0 {
+            return Ok((base, Self::EMPTY));
+        }
+        let tail = Layout::array::<W>(words).map_err(|_| TryReserveError::AllocError)?;
+        let (layout, offset) = base.extend(tail).map_err(|_| TryReserveError::AllocError)?;
+        Ok((layout.pad_to_align(), Self { offset, words }))
+    }
+
+    /// Base of the word tail inside the arena at `base`. `Layout::extend`
+    /// aligned the tail for `W`, so the cast is aligned by construction.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be the arena this region was laid out for.
+    #[inline]
+    #[allow(clippy::cast_ptr_alignment)]
+    pub(crate) unsafe fn ptr<W>(self, base: *mut u8) -> *mut W {
+        unsafe { base.add(self.offset).cast::<W>() }
+    }
+
+    /// Zeroes every word, so the filter reads as "nothing recorded".
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::ptr`].
+    #[inline]
+    pub(crate) unsafe fn clear<W>(self, base: *mut u8) {
+        if self.words != 0 {
+            unsafe { ptr::write_bytes(self.ptr::<W>(base), 0, self.words) };
+        }
+    }
+
+    /// Copies `source`'s words from `source_base` into this region at `base`.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::ptr`], for both arenas; the regions must not overlap.
+    #[inline]
+    pub(crate) unsafe fn copy_from<W>(self, base: *mut u8, source: Self, source_base: *mut u8) {
+        debug_assert_eq!(self.words, source.words);
+        if self.words != 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    source.ptr::<W>(source_base),
+                    self.ptr::<W>(base),
+                    self.words,
+                );
+            };
+        }
+    }
 }
