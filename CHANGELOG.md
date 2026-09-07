@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/aaron-ang/opthash-rs/compare/v0.10.4...v0.11.0) - 2026-09-07
+
+### Other
+
+- [**breaking**] leave CHANGELOG.md to release-plz
+- share SIMD lane-mask and fingerprint-load helpers
+- share one floor_div_pow2 between reserve and geometry
+- drop unused survivor count from epoch transitions
+- wrap reserve failures in TryBuildError::Reserve
+- replace ControlByte trait with free control-byte predicates
+- share the delete tail and the level drain between callers
+- walk Elastic phi routes through one shared visitor
+- start the Funnel special-array walks from const counter bases
+- carry only the placement outcome out of Elastic slot selection
+- share the membership tail layout and word helpers between backends
+- check the scalar oracles' lookup and occupancy views against both backends
+- group the control-scan backends into cfg-selected simd modules
+- define GROUP_SIZE directly and derive level_count from ceil_log2
+- reuse geometry::floor_div_pow2 and name the paper budget max_insertions
+- share the fixed-seed distribution checks between probe oracles
+- fold the Funnel domain check into funnel_plan
+- share RANGE_WORD_CAP through exact::probe and drop Elastic hash_key
+- clone Funnel storage through ArenaSlots::clone_region_from
+- build every ElasticTable constructor through try_from_geometry
+- return the Elastic membership region from the arena allocator
+- drop the unused f64 reserve constructor on ElasticTable
+- define the Elastic insertion case once in exact::geometry
+- share the membership refresh-threshold test between backends
+- share backend test fixtures through common::test_support
+- *(python)* share pyclass state and bump helpers between map and set
+- *(python)* [**breaking**] stop exporting iterator and view helper classes
+- *(python)* inline single-use wrappers and merge map __or__ bodies
+- *(python)* share one constructor across iterator classes
+- *(python)* route set mutation through one bump helper
+- *(python)* hash probe key once on setdefault miss
+- emit the map scan iterators' size impls from one macro
+- consolidate the HashSet shell around two local macros
+- pack the epoch transition from the enum discriminant
+- chain map constructors and entry helpers through one general form
+- make TableBackend::insert required and drop OccupiedEntry marker
+- generate the key/value projection iterators from one macro
+- fold the post-delete settle and trim the probe-walk docs
+- cut wasted probing and filter work in both maps ([#135](https://github.com/aaron-ang/opthash-rs/pull/135))
+- add Spanish README ([#133](https://github.com/aaron-ang/opthash-rs/pull/133))
+
 ## [0.10.4](https://github.com/aaron-ang/opthash-rs/compare/v0.10.3...v0.10.4) - 2026-07-26
 
 ### Added
