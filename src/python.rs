@@ -619,11 +619,13 @@ macro_rules! define_map_classes {
                 self.generation = self.generation.wrapping_add(1);
             }
 
+            /// Bump once if an in-place op reported a change; propagate its error.
             #[inline]
-            fn bump_if_changed(&mut self, changed: bool) {
-                if changed {
+            fn bump_if_changed(&mut self, changed: PyResult<bool>) -> PyResult<()> {
+                if changed? {
                     self.bump();
                 }
+                Ok(())
             }
         }
 
@@ -805,12 +807,11 @@ macro_rules! define_map_classes {
                 let touched = match other.and_then(|o| o.cast::<Self>().ok()) {
                     Some(o) => {
                         let peer = o.borrow();
-                        map_update(&mut self.inner, other, kwargs, py, Some(&peer.inner))?
+                        map_update(&mut self.inner, other, kwargs, py, Some(&peer.inner))
                     }
-                    None => map_update(&mut self.inner, other, kwargs, py, None)?,
+                    None => map_update(&mut self.inner, other, kwargs, py, None),
                 };
-                self.bump_if_changed(touched);
-                Ok(())
+                self.bump_if_changed(touched)
             }
 
             #[pyo3(signature = (key, default = None))]
@@ -1427,11 +1428,26 @@ macro_rules! define_set_classes {
                 self.generation = self.generation.wrapping_add(1);
             }
 
+            /// Bump once if an in-place op reported a change; propagate its error.
             #[inline]
-            fn bump_if_changed(&mut self, changed: bool) {
-                if changed {
+            fn bump_if_changed(&mut self, changed: PyResult<bool>) -> PyResult<()> {
+                if changed? {
                     self.bump();
                 }
+                Ok(())
+            }
+
+            /// Apply `op` to each element of `others`; report whether any changed.
+            fn fold_each(
+                &mut self,
+                others: &Bound<PyTuple>,
+                mut op: impl FnMut(&mut Self, &Bound<PyAny>) -> PyResult<bool>,
+            ) -> PyResult<bool> {
+                let mut touched = false;
+                for other in others.try_iter()? {
+                    touched |= op(self, &other?)?;
+                }
+                Ok(touched)
             }
 
             /// Inserts every element of `other` (an opthash set or any iterable).
@@ -1604,70 +1620,51 @@ macro_rules! define_set_classes {
             #[pyo3(signature = (*others))]
             fn union(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                for other in others.try_iter()? {
-                    new.add_all(&other?)?;
-                }
+                new.update(others)?;
                 Ok(new)
             }
 
             #[pyo3(signature = (*others))]
             fn intersection(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                for other in others.try_iter()? {
-                    new.retain_in(&other?, py)?;
-                }
+                new.intersection_update(others, py)?;
                 Ok(new)
             }
 
             #[pyo3(signature = (*others))]
             fn difference(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                for other in others.try_iter()? {
-                    new.remove_all(&other?)?;
-                }
+                new.difference_update(others)?;
                 Ok(new)
             }
 
             fn symmetric_difference(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.symmetric_difference_with(other)?;
+                new.symmetric_difference_update(other)?;
                 Ok(new)
             }
 
             #[pyo3(signature = (*others))]
             fn update(&mut self, others: &Bound<PyTuple>) -> PyResult<()> {
-                let mut touched = false;
-                for other in others.try_iter()? {
-                    touched |= self.add_all(&other?)?;
-                }
-                self.bump_if_changed(touched);
-                Ok(())
+                let changed = self.fold_each(others, |s, o| s.add_all(o));
+                self.bump_if_changed(changed)
             }
 
             #[pyo3(signature = (*others))]
             fn intersection_update(&mut self, others: &Bound<PyTuple>, py: Python) -> PyResult<()> {
-                let mut touched = false;
-                for other in others.try_iter()? {
-                    touched |= self.retain_in(&other?, py)?;
-                }
-                self.bump_if_changed(touched);
-                Ok(())
+                let changed = self.fold_each(others, |s, o| s.retain_in(o, py));
+                self.bump_if_changed(changed)
             }
 
             #[pyo3(signature = (*others))]
             fn difference_update(&mut self, others: &Bound<PyTuple>) -> PyResult<()> {
-                let mut touched = false;
-                for other in others.try_iter()? {
-                    touched |= self.remove_all(&other?)?;
-                }
-                self.bump_if_changed(touched);
-                Ok(())
+                let changed = self.fold_each(others, |s, o| s.remove_all(o));
+                self.bump_if_changed(changed)
             }
 
             fn symmetric_difference_update(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                let touched = self.symmetric_difference_with(other)?;
-                self.bump_if_changed(touched);
-                Ok(())
+                let changed = self.symmetric_difference_with(other);
+                self.bump_if_changed(changed)
             }
 
             fn __eq__(&self, other: &Bound<PyAny>) -> PyResult<bool> {
@@ -1676,7 +1673,7 @@ macro_rules! define_set_classes {
 
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.add_all(other)?;
+                new.__ior__(other)?;
                 Ok(new)
             }
 
@@ -1687,7 +1684,7 @@ macro_rules! define_set_classes {
 
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.retain_in(other, py)?;
+                new.__iand__(other, py)?;
                 Ok(new)
             }
 
@@ -1697,7 +1694,7 @@ macro_rules! define_set_classes {
 
             fn __sub__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.remove_all(other)?;
+                new.__isub__(other)?;
                 Ok(new)
             }
 
@@ -1719,31 +1716,22 @@ macro_rules! define_set_classes {
             }
 
             fn __ior__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                if self.add_all(other)? {
-                    self.bump();
-                }
-                Ok(())
+                let changed = self.add_all(other);
+                self.bump_if_changed(changed)
             }
 
             fn __iand__(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<()> {
-                if self.retain_in(other, py)? {
-                    self.bump();
-                }
-                Ok(())
+                let changed = self.retain_in(other, py);
+                self.bump_if_changed(changed)
             }
 
             fn __isub__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                if self.remove_all(other)? {
-                    self.bump();
-                }
-                Ok(())
+                let changed = self.remove_all(other);
+                self.bump_if_changed(changed)
             }
 
             fn __ixor__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                if self.symmetric_difference_with(other)? {
-                    self.bump();
-                }
-                Ok(())
+                self.symmetric_difference_update(other)
             }
         }
 
