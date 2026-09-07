@@ -14,8 +14,9 @@ use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{TryBuildError, TryReserveError};
 use crate::common::exact::geometry::PaperConfig;
 use crate::common::exact::probe::{
-    self, FunnelPrf, PreparedFastFunnelDomainProbe, PreparedFastFunnelProbe, PreparedProbeRange,
-    ProbeDomain,
+    self, FUNNEL_SPECIAL_FALLBACK_A_BASE, FUNNEL_SPECIAL_FALLBACK_B_BASE,
+    FUNNEL_SPECIAL_PRIMARY_BASE, FunnelPrf, PreparedFastFunnelDomainProbe, PreparedFastFunnelProbe,
+    PreparedProbeRange,
 };
 use crate::common::math::capacity;
 use crate::common::membership::{self, MembershipKey, MembershipRegion};
@@ -806,9 +807,7 @@ where
         // The special-array tail stays inline. Outlining it as a `#[cold]` call
         // costs the ordinary walk more in call setup than it recovers in
         // register pressure, on hits and misses alike.
-        let primary_probe = probe
-            .prepare_domain(ProbeDomain::FunnelSpecialPrimary)
-            .expect("fixed Funnel primary domain must fit its counter encoding");
+        let primary_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_PRIMARY_BASE);
         for logical_probe in 0..self.shape.loglog_ceiling {
             let Some(local) = Self::sample(
                 &primary_probe,
@@ -829,16 +828,12 @@ where
             }
         }
 
-        let first_probe = probe
-            .prepare_domain(ProbeDomain::FunnelSpecialFallbackChoiceA)
-            .expect("fixed Funnel fallback-A domain must fit its counter encoding");
+        let first_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_A_BASE);
         let Some(first_bucket) = Self::sample(&first_probe, 0, self.shape.fallback_bucket_range)
         else {
             return SearchResult::RangeFailure;
         };
-        let second_probe = probe
-            .prepare_domain(ProbeDomain::FunnelSpecialFallbackChoiceB)
-            .expect("fixed Funnel fallback-B domain must fit its counter encoding");
+        let second_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_B_BASE);
         let Some(second_bucket) = Self::sample(&second_probe, 0, self.shape.fallback_bucket_range)
         else {
             return SearchResult::RangeFailure;
@@ -899,9 +894,7 @@ where
     /// two fallback buckets, in the exact search's order.
     #[inline(never)]
     fn search_vacancy_special(&self, probe: PreparedFastFunnelProbe) -> SearchResult {
-        let primary_probe = probe
-            .prepare_domain(ProbeDomain::FunnelSpecialPrimary)
-            .expect("fixed Funnel primary domain must fit its counter encoding");
+        let primary_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_PRIMARY_BASE);
         for logical_probe in 0..self.shape.loglog_ceiling {
             let Some(local) = Self::sample(
                 &primary_probe,
@@ -916,16 +909,12 @@ where
             }
         }
 
-        let first_probe = probe
-            .prepare_domain(ProbeDomain::FunnelSpecialFallbackChoiceA)
-            .expect("fixed Funnel fallback-A domain must fit its counter encoding");
+        let first_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_A_BASE);
         let Some(first_bucket) = Self::sample(&first_probe, 0, self.shape.fallback_bucket_range)
         else {
             return SearchResult::RangeFailure;
         };
-        let second_probe = probe
-            .prepare_domain(ProbeDomain::FunnelSpecialFallbackChoiceB)
-            .expect("fixed Funnel fallback-B domain must fit its counter encoding");
+        let second_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_B_BASE);
         let Some(second_bucket) = Self::sample(&second_probe, 0, self.shape.fallback_bucket_range)
         else {
             return SearchResult::RangeFailure;
@@ -1554,7 +1543,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::*;
-    use crate::common::exact::probe;
+    use crate::common::exact::probe::{self, ProbeDomain};
     use crate::common::exact::reference::{ScalarFunnel, ScalarFunnelInsert, ScalarFunnelLocation};
     use crate::common::test_support::{
         self, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
