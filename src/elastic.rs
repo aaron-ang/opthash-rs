@@ -195,6 +195,9 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     probe_schedule: Vec<PhiRoute>,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
+    /// Deletes since the filter last matched the live set; see
+    /// [`membership::refresh_deletes`].
+    stale_membership: usize,
 }
 
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
@@ -784,6 +787,7 @@ where
             probe_high_water: 0,
             probe_schedule,
             membership,
+            stale_membership: 0,
         }
     }
 
@@ -814,6 +818,7 @@ where
             probe_high_water: 0,
             probe_schedule,
             membership,
+            stale_membership: 0,
         })
     }
 
@@ -889,6 +894,7 @@ where
         if words != 0 {
             unsafe { ptr::write_bytes(self.membership_ptr(), 0, words) };
         }
+        self.stale_membership = 0;
     }
 
     fn copy_membership_from(&mut self, source: &Self) {
@@ -1244,9 +1250,11 @@ where
 
     fn remove(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
         let kv = self.take_and_tombstone(level_idx, slot_idx);
-        let needs_resize = self.levels[level_idx].needs_cleanup();
-        if needs_resize {
+        self.stale_membership += 1;
+        if self.levels[level_idx].needs_cleanup() {
             self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
+        } else if self.stale_membership > membership::refresh_deletes(self.max_insertions) {
+            self.refresh_membership();
         }
         kv
     }
@@ -1265,12 +1273,15 @@ where
             level.tombstones += 1;
         }
         self.len -= 1;
+        self.stale_membership += 1;
         self.epoch.note_delete();
     }
 
     fn finish_deferred_removals(&mut self) {
         if self.levels.iter().any(Level::needs_cleanup) {
             self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
+        } else if self.stale_membership > membership::refresh_deletes(self.max_insertions) {
+            self.refresh_membership();
         }
     }
 
@@ -1405,6 +1416,7 @@ where
             probe_high_water: self.probe_high_water,
             probe_schedule,
             membership,
+            stale_membership: self.stale_membership,
         };
         cloned.copy_membership_from(self);
         cloned
@@ -1424,6 +1436,27 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
+    /// Re-record the filter from the live entries, dropping the bits departed
+    /// keys left behind. Entries stay put; only the metadata tail is rewritten.
+    #[cold]
+    #[inline(never)]
+    fn refresh_membership(&mut self) {
+        self.clear_membership();
+        for level_idx in 0..self.levels.len() {
+            for slot_idx in 0..self.levels[level_idx].capacity() {
+                if !self.levels[level_idx].control_at(slot_idx).is_occupied() {
+                    continue;
+                }
+                let hash = {
+                    let entry = unsafe { self.levels[level_idx].get_ref(slot_idx) };
+                    self.hash_key(&entry.key)
+                };
+                let prepared = PreparedElasticKey::new(hash);
+                self.record_membership(prepared.route, prepared.membership, level_idx);
+            }
+        }
+    }
+
     /// Insert `(key, value)` known to be new. Skips the existence check and
     /// capacity check in `insert`; resize loops drain old levels into fresh
     /// (all-EMPTY) ones, so neither check can succeed.
@@ -1466,6 +1499,7 @@ where
         let old_levels = mem::replace(&mut self.levels, new_levels);
         self.total_slots = geometry.total_slots;
         self.membership = MembershipRegion::for_arena::<K, V>(&self.arena, self.total_slots);
+        self.stale_membership = 0;
         self.max_insertions = geometry.max_insertions;
         self.scheduler = BatchScheduler::new(&geometry.batch_plan);
         self.len = 0;
@@ -1585,6 +1619,7 @@ where
             probe_high_water: 0,
             probe_schedule,
             membership,
+            stale_membership: 0,
         })
     }
 
@@ -2566,6 +2601,76 @@ mod tests {
             };
             assert_eq!(index, expected, "len {len}");
         }
+    }
+
+    /// Churn past the refresh threshold must re-record the filter from the
+    /// live entries: departed keys stop passing the gate, live keys still do,
+    /// and their route summaries survive.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn deletes_past_the_threshold_refresh_the_membership_filter() {
+        let mut map: ElasticHashMap<u64, u64> = ElasticHashMap::with_capacity(2_048);
+        let live = map.capacity() as u64;
+        let threshold = membership::refresh_deletes(map.capacity()) as u64;
+        for key in 0..live {
+            map.insert(key, key);
+        }
+        let gate_passes = |map: &ElasticHashMap<u64, u64>, key: u64| {
+            let table = map.table();
+            let prepared = PreparedElasticKey::new(table.hash_key(&key));
+            table.route_filter(prepared).maybe_present
+        };
+
+        // A third of the keys: enough to matter, below every cleanup threshold.
+        let departed = (0..live).filter(|key| key % 3 == 0).collect::<Vec<_>>();
+        for &key in &departed {
+            assert_eq!(map.remove(&key), Some(key));
+        }
+        let generation = map.epoch().generation;
+        assert!(departed.iter().all(|&key| gate_passes(&map, key)));
+        assert_eq!(map.table().stale_membership as u64, departed.len() as u64);
+
+        // Cycling one fresh key re-takes the tombstone it left, so tombstones
+        // stay flat and no cleanup rebuild can run before the threshold.
+        let churn = live;
+        let mut cycles = 0_u64;
+        loop {
+            map.insert(churn, churn);
+            assert_eq!(map.remove(&churn), Some(churn));
+            cycles += 1;
+            if map.table().stale_membership == 0 {
+                break;
+            }
+            assert!(cycles <= threshold, "refresh never ran");
+        }
+        assert_eq!(cycles + departed.len() as u64, threshold + 1);
+        assert_eq!(map.epoch().generation, generation, "no rebuild ran");
+        assert_eq!(map.table().stale_membership, 0, "refresh resets the count");
+
+        for key in (0..live).filter(|key| key % 3 != 0) {
+            assert!(gate_passes(&map, key));
+            assert_eq!(map.get(&key), Some(&key));
+        }
+        let false_positives = departed
+            .iter()
+            .filter(|&&key| gate_passes(&map, key))
+            .count();
+        assert!(
+            false_positives * 4 < departed.len(),
+            "{false_positives} of {} departed keys still pass",
+            departed.len()
+        );
+
+        map.retain(|_, _| false);
+        for _ in 0..=threshold {
+            if map.table().stale_membership == 0 {
+                break;
+            }
+            map.insert(churn, churn);
+            map.remove(&churn);
+        }
+        assert_eq!(map.table().stale_membership, 0);
+        assert!((0..live).all(|key| !gate_passes(&map, key)));
     }
 
     #[test]

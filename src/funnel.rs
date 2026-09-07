@@ -569,6 +569,9 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// Cached location of the membership filter tail. Lookups load one word
     /// from it before probing; see [`crate::common::membership`].
     membership: MembershipRegion,
+    /// Deletes since the filter last matched the live set; see
+    /// [`membership::refresh_deletes`].
+    stale_membership: usize,
 }
 
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
@@ -653,6 +656,7 @@ where
             epoch: EpochState::initial(),
             exceptional_placement: false,
             membership,
+            stale_membership: 0,
         })
     }
 
@@ -1058,6 +1062,37 @@ where
         if words != 0 {
             unsafe { core::ptr::write_bytes(self.membership_ptr(), 0, words) };
         }
+        self.stale_membership = 0;
+    }
+
+    /// Re-record the filter from the live entries, dropping the bits departed
+    /// keys left behind. Entries stay put; only the filter tail is rewritten.
+    #[cold]
+    #[inline(never)]
+    fn refresh_membership(&mut self) {
+        self.clear_membership();
+        for slot in 0..self.shape.n {
+            if !self.storage.control_at(slot).is_occupied() {
+                continue;
+            }
+            let hash = {
+                let entry = unsafe { self.storage.get_ref(slot) };
+                self.hash_builder.hash_one(&entry.key)
+            };
+            let membership = self.membership_slot(hash);
+            self.record_membership(membership);
+        }
+    }
+
+    /// Same-size cleanup once tombstones pass their threshold; otherwise a
+    /// filter refresh once departed keys pass theirs. The cleanup rebuilds
+    /// the filter too, so the two never stack.
+    fn settle_after_deletes(&mut self) {
+        if self.tombstones > capacity::tombstone_cleanup_threshold(self.shape.n) {
+            self.resize_with_transition(self.shape.n, EpochTransition::TombstoneCleanup);
+        } else if self.stale_membership > membership::refresh_deletes(self.shape.max_insertions) {
+            self.refresh_membership();
+        }
     }
 
     fn copy_membership_from(&mut self, source: &Self) {
@@ -1232,6 +1267,7 @@ where
         let old_arena = mem::replace(&mut self.arena, new_arena);
         let old_storage = mem::replace(&mut self.storage, new_storage);
         self.membership = new_membership;
+        self.stale_membership = 0;
         self.shape = shape;
         self.len = 0;
         self.tombstones = 0;
@@ -1412,10 +1448,9 @@ where
         self.storage.mark_tombstone(slot);
         self.len -= 1;
         self.tombstones += 1;
+        self.stale_membership += 1;
         self.epoch.note_delete();
-        if self.tombstones > capacity::tombstone_cleanup_threshold(self.shape.n) {
-            self.resize_with_transition(self.shape.n, EpochTransition::TombstoneCleanup);
-        }
+        self.settle_after_deletes();
         (entry.key, entry.value)
     }
 
@@ -1429,13 +1464,12 @@ where
         self.storage.mark_tombstone(slot);
         self.len -= 1;
         self.tombstones += 1;
+        self.stale_membership += 1;
         self.epoch.note_delete();
     }
 
     fn finish_deferred_removals(&mut self) {
-        if self.tombstones > capacity::tombstone_cleanup_threshold(self.shape.n) {
-            self.resize_with_transition(self.shape.n, EpochTransition::TombstoneCleanup);
-        }
+        self.settle_after_deletes();
     }
 
     #[inline]
@@ -1559,6 +1593,7 @@ where
         cloned.exceptional_placement = self.exceptional_placement;
         // Slots are copied rather than reinserted, so the filter comes with them.
         cloned.copy_membership_from(self);
+        cloned.stale_membership = self.stale_membership;
         cloned
     }
 }
@@ -1736,6 +1771,81 @@ mod tests {
         }
         assert!(table.tombstones > 0);
         check(&table, "tombstoned table");
+    }
+
+    /// Churn past the refresh threshold must re-record the filter from the
+    /// live entries: departed keys stop passing the gate, live keys still do.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn deletes_past_the_threshold_refresh_the_membership_filter() {
+        let mut map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity(2_048);
+        let live = map.capacity() as u64;
+        let threshold = membership::refresh_deletes(map.capacity()) as u64;
+        for key in 0..live {
+            map.insert(key, key);
+        }
+        let gate_passes = |map: &FunnelHashMap<u64, u64>, key: u64| {
+            let table = map.table();
+            table
+                .membership_gate(table.hash_builder.hash_one(key))
+                .passes()
+        };
+
+        // Delete two thirds; every departed key still passes the gate.
+        // A third of the keys: enough to matter, below every cleanup threshold.
+        let departed = (0..live).filter(|key| key % 3 == 0).collect::<Vec<_>>();
+        for &key in &departed {
+            assert_eq!(map.remove(&key), Some(key));
+        }
+        assert!(departed.iter().all(|&key| gate_passes(&map, key)));
+        assert_eq!(map.table().stale_membership as u64, departed.len() as u64);
+        assert_eq!(map.table().epoch.snapshot(map.len()).generation, 0);
+
+        // Push the departed count past the threshold with fresh keys that are
+        // inserted and removed again; no rebuild may run.
+        // Cycling one fresh key re-takes the tombstone it left, so tombstones
+        // stay flat and no cleanup rebuild can run before the threshold.
+        let churn = live;
+        let mut cycles = 0_u64;
+        loop {
+            map.insert(churn, churn);
+            assert_eq!(map.remove(&churn), Some(churn));
+            cycles += 1;
+            if map.table().stale_membership == 0 {
+                break;
+            }
+            assert!(cycles <= threshold, "refresh never ran");
+        }
+        assert_eq!(cycles + departed.len() as u64, threshold + 1);
+        assert_eq!(map.table().epoch.snapshot(map.len()).generation, 0);
+        assert_eq!(map.table().stale_membership, 0, "refresh resets the count");
+
+        // Live keys are still recorded and found; departed keys mostly are not.
+        for key in (0..live).filter(|key| key % 3 != 0) {
+            assert!(gate_passes(&map, key));
+            assert_eq!(map.get(&key), Some(&key));
+        }
+        let false_positives = departed
+            .iter()
+            .filter(|&&key| gate_passes(&map, key))
+            .count();
+        assert!(
+            false_positives * 4 < departed.len(),
+            "{false_positives} of {} departed keys still pass",
+            departed.len()
+        );
+
+        // Clearing every entry and refreshing empties the filter completely.
+        map.retain(|_, _| false);
+        for _ in 0..=threshold {
+            if map.table().stale_membership == 0 {
+                break;
+            }
+            map.insert(churn, churn);
+            map.remove(&churn);
+        }
+        assert_eq!(map.table().stale_membership, 0);
+        assert!((0..live).all(|key| !gate_passes(&map, key)));
     }
 
     #[test]
