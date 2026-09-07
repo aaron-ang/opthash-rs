@@ -347,20 +347,39 @@ const fn summary_level(level: usize) -> usize {
     }
 }
 
+/// Walks `level`'s probes in paper order from `from_probe`, visiting each
+/// `(paper_probe, phi)` with `phi <= position_cap` inside the uniform search
+/// cap. Level 0's first probe is skipped: the H11 fast path covers it, so no
+/// route is ever scheduled for it.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn for_each_phi_route(
+    level: usize,
+    from_probe: u128,
+    position_cap: u128,
+    mut visit: impl FnMut(u128, u128),
+) {
+    let paper_level = level as u128 + 1;
+    let mut paper_probe = if level == 0 && from_probe == 1 {
+        2
+    } else {
+        from_probe
+    };
+    while paper_probe <= u128::from(UNIFORM_SEARCH_CAP) {
+        let phi =
+            probe::elastic_phi(paper_level, paper_probe).expect("bounded Elastic query coordinate");
+        if phi > position_cap {
+            break;
+        }
+        visit(paper_probe, phi);
+        paper_probe += 1;
+    }
+}
+
 fn probe_schedule_capacity(level_count: usize) -> usize {
     let mut count = 0;
     for level in 0..level_count {
-        let paper_level = level as u128 + 1;
-        for paper_probe in 1..=u128::from(UNIFORM_SEARCH_CAP) {
-            let phi = probe::elastic_phi(paper_level, paper_probe)
-                .expect("bounded Elastic query coordinate");
-            if phi > QUERY_POSITION_CAP {
-                break;
-            }
-            if level != 0 || paper_probe != 1 {
-                count += 1;
-            }
-        }
+        for_each_phi_route(level, 1, QUERY_POSITION_CAP, |_, _| count += 1);
     }
     count
 }
@@ -956,19 +975,9 @@ where
         }
         let old_len = self.probe_schedule.len();
         for level in 0..self.levels.len() {
-            let paper_level = level as u128 + 1;
-            let mut paper_probe =
-                first_paper_probe_after(paper_level, u128::from(prior_high_water));
-            while paper_probe <= u128::from(UNIFORM_SEARCH_CAP) {
-                let phi = probe::elastic_phi(paper_level, paper_probe)
-                    .expect("bounded Elastic query coordinate");
-                if phi > high_water {
-                    break;
-                }
-                if level == 0 && paper_probe == 1 {
-                    paper_probe += 1;
-                    continue;
-                }
+            let from_probe =
+                first_paper_probe_after(level as u128 + 1, u128::from(prior_high_water));
+            for_each_phi_route(level, from_probe, high_water, |paper_probe, phi| {
                 let logical_probe_index =
                     u64::try_from(paper_probe - 1).expect("Elastic probe cap fits u64");
                 assert!(
@@ -982,8 +991,7 @@ where
                     range_upper: u32::try_from(phi).expect("Elastic query cap fits u32"),
                     counter_base,
                 });
-                paper_probe += 1;
-            }
+            });
         }
         self.probe_schedule[old_len..].sort_unstable_by_key(|route| route.range_upper);
         for route in &mut self.probe_schedule[old_len..] {
@@ -1972,12 +1980,10 @@ mod tests {
         }
         assert!(probe::elastic_phi(1, 383).unwrap() <= QUERY_POSITION_CAP);
         assert!(probe::elastic_phi(1, 384).unwrap() > QUERY_POSITION_CAP);
-        for level in 1..=u128::from(u32::BITS) {
-            let mut paper_probe = 1_u128;
-            while probe::elastic_phi(level, paper_probe).unwrap() <= QUERY_POSITION_CAP {
+        for level in 0..u32::BITS as usize {
+            for_each_phi_route(level, 1, QUERY_POSITION_CAP, |paper_probe, _| {
                 assert!(usize::try_from(paper_probe - 1).unwrap() < QUERY_PROBE_LIMIT);
-                paper_probe += 1;
-            }
+            });
         }
 
         let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
