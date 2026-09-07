@@ -1,7 +1,4 @@
-import pytest
-from hypothesis import given, settings, strategies as st
-
-import opthash
+from hypothesis import HealthCheck, given, settings, strategies as st
 
 
 KEYS = st.one_of(
@@ -21,16 +18,16 @@ OPS = st.lists(
 )
 
 
-@pytest.mark.parametrize(
-    "cls",
-    [opthash.ElasticHashMap, opthash.FunnelHashMap],
-    ids=["elastic", "funnel"],
-)
 @given(ops=OPS)
-@settings(max_examples=100, deadline=None)
-def test_parity_with_dict(cls, ops):
+# `map_cls` only yields a class, so reusing it across examples is safe.
+@settings(
+    max_examples=100,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+def test_parity_with_dict(map_cls, ops):
     ref: dict = {}
-    m = cls(capacity=8)
+    m = map_cls(capacity=8)
 
     for op, k, v in ops:
         if op == "set":
