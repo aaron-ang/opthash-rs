@@ -396,17 +396,32 @@ const _: () = assert!(mem::size_of::<PreparedElasticKey>() == 16);
 struct ElasticRouteFilter {
     /// `false` proves no insert ever recorded this key's route.
     maybe_present: bool,
-    /// Levels this route bin has occupied, or every level when the geometry has
-    /// more levels than the summary tracks.
+    /// Summary bits of the levels this route bin has occupied. Bit `i` covers
+    /// level `i` for `i < ROUTE_SUMMARY_LEVELS - 1`; the last bit is saturating
+    /// and covers every deeper level.
     level_mask: u32,
 }
 
+impl ElasticRouteFilter {
+    /// Widens the saturating last summary bit over every level index it stands
+    /// for, so a lookup tests `1 << level` directly instead of clamping the
+    /// level on each schedule step.
+    #[inline]
+    const fn expanded_level_mask(self) -> u32 {
+        let saturated = (self.level_mask >> (ROUTE_SUMMARY_LEVELS - 1)) & 1;
+        self.level_mask | (0_u32.wrapping_sub(saturated) << (ROUTE_SUMMARY_LEVELS - 1))
+    }
+}
+
+/// Maps a level index onto its route-summary bit. Levels past the summary's
+/// width share the last bit, so a wide geometry still narrows every shallow
+/// level instead of disabling the summary outright.
 #[inline]
-const fn expand_summary_level_mask(mask: u16, level_count: usize) -> u32 {
-    if level_count > ROUTE_SUMMARY_LEVELS {
-        u32::MAX
+const fn summary_level(level: usize) -> usize {
+    if level < ROUTE_SUMMARY_LEVELS - 1 {
+        level
     } else {
-        mask as u32
+        ROUTE_SUMMARY_LEVELS - 1
     }
 }
 
@@ -809,10 +824,7 @@ where
         let bits = prepared.membership.bits();
         ElasticRouteFilter {
             maybe_present: metadata.membership & bits == bits,
-            level_mask: expand_summary_level_mask(
-                metadata.route_bins[prepared.route.summary_bin()],
-                self.levels.len(),
-            ),
+            level_mask: u32::from(metadata.route_bins[prepared.route.summary_bin()]),
         }
     }
 
@@ -845,9 +857,7 @@ where
             let word = MembershipKey::word(route.signature(), words);
             let metadata = unsafe { &mut *self.membership_ptr().add(word) };
             metadata.membership |= membership.bits();
-            if self.levels.len() <= ROUTE_SUMMARY_LEVELS {
-                metadata.route_bins[route.summary_bin()] |= 1_u16 << level;
-            }
+            metadata.route_bins[route.summary_bin()] |= 1_u16 << summary_level(level);
         }
     }
 
@@ -1802,10 +1812,10 @@ where
             return None;
         }
 
+        let level_mask = filter.expanded_level_mask();
         for route in &self.probe_schedule {
             let level = route.level();
-            let level_bit = 1_u32 << level;
-            if filter.level_mask & level_bit == 0 {
+            if level_mask & (1_u32 << level) == 0 {
                 continue;
             }
             let upper = route.range_upper as usize;
@@ -2536,10 +2546,66 @@ mod tests {
     }
 
     #[test]
-    fn route_summary_filter_disables_above_its_sixteen_level_encoding() {
-        assert_eq!(expand_summary_level_mask(0x1234, 16), 0x1234);
-        assert_eq!(expand_summary_level_mask(0, 17), u32::MAX);
-        assert_eq!(expand_summary_level_mask(0, 32), u32::MAX);
+    fn route_summary_saturates_deep_levels_into_the_last_bit() {
+        assert_eq!(summary_level(0), 0);
+        assert_eq!(
+            summary_level(ROUTE_SUMMARY_LEVELS - 2),
+            ROUTE_SUMMARY_LEVELS - 2
+        );
+        assert_eq!(
+            summary_level(ROUTE_SUMMARY_LEVELS - 1),
+            ROUTE_SUMMARY_LEVELS - 1
+        );
+        assert_eq!(
+            summary_level(ROUTE_SUMMARY_LEVELS),
+            ROUTE_SUMMARY_LEVELS - 1
+        );
+        assert_eq!(summary_level(40), ROUTE_SUMMARY_LEVELS - 1);
+
+        // Expansion is the inverse view: the saturating bit covers every level
+        // index at or past it, and a clear bit widens to nothing.
+        let filter = |level_mask| ElasticRouteFilter {
+            maybe_present: true,
+            level_mask,
+        };
+        assert_eq!(filter(0).expanded_level_mask(), 0);
+        assert_eq!(filter(0b101).expanded_level_mask(), 0b101);
+        assert_eq!(
+            filter(1 << (ROUTE_SUMMARY_LEVELS - 1)).expanded_level_mask(),
+            u32::MAX << (ROUTE_SUMMARY_LEVELS - 1)
+        );
+        let level_limit = usize::try_from(probe::ELASTIC_LEVEL_LIMIT).unwrap();
+        for level in 0..level_limit {
+            let recorded = filter(1 << summary_level(level)).expanded_level_mask();
+            assert_ne!(recorded & (1 << level), 0, "level {level} lost its bit");
+        }
+    }
+
+    #[test]
+    fn route_summary_still_narrows_shallow_levels_on_wide_geometries() {
+        // Enough levels that the old encoding fell back to an all-ones mask.
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(1 << 20, IdentityBuildHasher);
+        assert!(
+            map.table().levels.len() > ROUTE_SUMMARY_LEVELS,
+            "fixture needs more levels than the summary width, got {}",
+            map.table().levels.len()
+        );
+        let key_count = if cfg!(miri) { 64_u64 } else { 4_096_u64 };
+        for key in 0..key_count {
+            map.insert(key, key);
+        }
+        for key in 0..key_count {
+            let prepared = PreparedElasticKey::new(key);
+            let mask = map.table().route_filter(prepared).level_mask;
+            assert!(mask != 0 && u16::try_from(mask).is_ok(), "mask {mask:#x}");
+            assert!(
+                mask.count_ones() < u32::try_from(ROUTE_SUMMARY_LEVELS).unwrap(),
+                "key {key} mask {mask:#x} must exclude at least one level"
+            );
+            assert_eq!(map.get(&key), Some(&key));
+        }
+        assert_eq!(map.get(&(key_count + 1)), None);
     }
 
     #[test]
@@ -2630,7 +2696,8 @@ mod tests {
                 .unwrap();
             let prepared = PreparedElasticKey::new(key);
             assert_ne!(
-                map.table().route_filter(prepared).level_mask & (1_u32 << location.0),
+                map.table().route_filter(prepared).level_mask
+                    & (1_u32 << summary_level(location.0)),
                 0,
                 "key {key} at level {}",
                 location.0
