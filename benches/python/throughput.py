@@ -38,6 +38,13 @@ IMPLS = [
 ]
 
 
+def _fill(m, keys, value=0):
+    """Setup-time prelude: map every key to `value`; returns `m`."""
+    for k in keys:
+        m[k] = value
+    return m
+
+
 @pytest.fixture(scope="module")
 def keys() -> list[str]:
     return [f"key_{i}" for i in range(N)]
@@ -89,9 +96,7 @@ def test_insert(benchmark, factory, keys):
 @pytest.mark.benchmark(group="get_hit")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_get_hit(benchmark, factory, keys):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
 
     def run():
         for k in keys:
@@ -103,9 +108,7 @@ def test_get_hit(benchmark, factory, keys):
 @pytest.mark.benchmark(group="get_miss")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_get_miss(benchmark, factory, keys, miss_keys):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
 
     def run():
         for k in miss_keys:
@@ -117,9 +120,7 @@ def test_get_miss(benchmark, factory, keys, miss_keys):
 @pytest.mark.benchmark(group="mixed")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_mixed(benchmark, factory, keys, mixed_indices):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
 
     def run():
         for i in mixed_indices:
@@ -148,9 +149,7 @@ def test_delete(benchmark, factory, keys):
 @pytest.mark.benchmark(group="tiny_lookup")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_tiny_lookup(benchmark, factory, tiny_keys, tiny_query_keys):
-    m = factory(TINY_N)
-    for k in tiny_keys:
-        m[k] = 0
+    m = _fill(factory(TINY_N), tiny_keys)
 
     def run():
         for k in tiny_query_keys:
@@ -173,9 +172,7 @@ def test_resize(benchmark, factory, resize_keys):
 @pytest.mark.benchmark(group="setdefault_hit")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_setdefault_hit(benchmark, factory, keys):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
 
     def run():
         for k in keys:
@@ -200,9 +197,7 @@ def test_setdefault_miss(benchmark, factory, keys, miss_keys):
 @pytest.mark.benchmark(group="keys_contains_hit")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_keys_contains_hit(benchmark, factory, keys):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
     view = m.keys()
 
     def run():
@@ -215,9 +210,7 @@ def test_keys_contains_hit(benchmark, factory, keys):
 @pytest.mark.benchmark(group="keys_contains_miss")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_keys_contains_miss(benchmark, factory, keys, miss_keys):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
     view = m.keys()
 
     def run():
@@ -230,9 +223,7 @@ def test_keys_contains_miss(benchmark, factory, keys, miss_keys):
 @pytest.mark.benchmark(group="items_contains_hit")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_items_contains_hit(benchmark, factory, keys):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
     view = m.items()
     pairs = [(k, 0) for k in keys]
 
@@ -246,9 +237,7 @@ def test_items_contains_hit(benchmark, factory, keys):
 @pytest.mark.benchmark(group="union")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_union(benchmark, factory, keys, miss_keys):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
     other = {k: 1 for k in miss_keys}
 
     def run():
@@ -260,9 +249,7 @@ def test_union(benchmark, factory, keys, miss_keys):
 @pytest.mark.benchmark(group="runion")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_runion(benchmark, factory, keys, miss_keys):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
     other = {k: 1 for k in miss_keys}
 
     def run():
@@ -274,9 +261,7 @@ def test_runion(benchmark, factory, keys, miss_keys):
 @pytest.mark.benchmark(group="eq_dict")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_eq_dict(benchmark, factory, keys):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
     other = {k: 0 for k in keys}
 
     def run():
@@ -300,12 +285,8 @@ def test_fromkeys(benchmark, factory, keys):
 @pytest.mark.parametrize("factory", IMPLS)
 def test_update_same(benchmark, factory, keys, miss_keys):
     cls = factory(0).__class__
-    a = factory(N)
-    for k in keys:
-        a[k] = 0
-    b = cls()
-    for k in miss_keys:
-        b[k] = 1
+    a = _fill(factory(N), keys)
+    b = _fill(cls(), miss_keys, 1)
 
     def run():
         m = cls(a)
@@ -318,12 +299,8 @@ def test_update_same(benchmark, factory, keys, miss_keys):
 @pytest.mark.parametrize("factory", IMPLS)
 def test_eq_same(benchmark, factory, keys):
     cls = factory(0).__class__
-    a = factory(N)
-    for k in keys:
-        a[k] = 0
-    b = cls()
-    for k in keys:
-        b[k] = 0
+    a = _fill(factory(N), keys)
+    b = _fill(cls(), keys)
 
     def run():
         _ = a == b
@@ -348,10 +325,8 @@ def test_update_dict(benchmark, factory, keys, miss_keys):
 @pytest.mark.benchmark(group="values_contains_hit")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_values_contains_hit(benchmark, factory, keys):
-    m = factory(N)
     sentinel = object()
-    for k in keys:
-        m[k] = sentinel
+    m = _fill(factory(N), keys, sentinel)
     view = m.values()
 
     def run():
@@ -363,9 +338,7 @@ def test_values_contains_hit(benchmark, factory, keys):
 @pytest.mark.benchmark(group="values_contains_miss")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_values_contains_miss(benchmark, factory, keys):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
     view = m.values()
     target = object()
 
@@ -378,9 +351,7 @@ def test_values_contains_miss(benchmark, factory, keys):
 @pytest.mark.benchmark(group="copy")
 @pytest.mark.parametrize("factory", IMPLS)
 def test_copy(benchmark, factory, keys):
-    m = factory(N)
-    for k in keys:
-        m[k] = 0
+    m = _fill(factory(N), keys)
 
     def run():
         _ = m.copy()
