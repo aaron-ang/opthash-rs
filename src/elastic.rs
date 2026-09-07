@@ -1971,6 +1971,14 @@ mod tests {
                 ),
                 Some((placement.level, placement.slot))
             );
+            let query = scalar.query(identity);
+            assert_eq!(query.global_slot, global_slot);
+            assert!(
+                query.found_position <= placement.phi,
+                "lookup order visits phi={} no later than placement phi={}",
+                query.found_position,
+                placement.phi
+            );
         }
     }
 

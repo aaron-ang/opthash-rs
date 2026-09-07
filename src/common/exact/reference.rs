@@ -54,15 +54,17 @@ pub(crate) struct ScalarElasticInsertion {
     pub(crate) phi: u128,
 }
 
+/// Where a scalar lookup found its identity and how much work the walk cost.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ScalarElasticQuery {
-    found_position: u128,
-    global_slot: usize,
-    logical_positions: u128,
-    mapped_positions: u128,
-    gap_positions: u128,
-    scalar_inspections: u128,
-    random_words: u128,
+pub(crate) struct ScalarElasticQuery {
+    /// The phi position at which the identity was found.
+    pub(crate) found_position: u128,
+    pub(crate) global_slot: usize,
+    pub(crate) logical_positions: u128,
+    pub(crate) mapped_positions: u128,
+    pub(crate) gap_positions: u128,
+    pub(crate) scalar_inspections: u128,
+    pub(crate) random_words: u128,
 }
 
 pub(crate) struct ScalarElastic<O> {
@@ -203,7 +205,8 @@ impl<O: ProbeOracle> ScalarElastic<O> {
         }
     }
 
-    fn query(&self, identity: u64) -> ScalarElasticQuery {
+    /// Walks phi positions in lookup order until `identity` is found.
+    pub(crate) fn query(&self, identity: u64) -> ScalarElasticQuery {
         let mut h11 = None;
         let mut random_words = 0_u128;
         let mut mapped_positions = 0_u128;
