@@ -2,7 +2,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::num::{NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
 
-use super::geometry::{ElasticCase, FunnelPlan, PaperConfig};
+use super::geometry::{self, ElasticCase, FunnelPlan, PaperConfig};
 use super::probe::{self, ProbeDomain, ProbeOracle, RangeReductionError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,7 +117,7 @@ impl<O: ProbeOracle> ScalarElastic<O> {
             let next = batch;
             let free_current = self.levels[current] - self.occupancy[current];
             let free_next = self.levels[next] - self.occupancy[next];
-            let current_threshold = scalar_floor_div_pow2(
+            let current_threshold = geometry::floor_div_pow2(
                 self.levels[current],
                 self.config.reserve_exponent().saturating_add(1),
             );
@@ -298,10 +298,6 @@ impl<O: ProbeOracle> ScalarElastic<O> {
             sampled.random_word_count,
         )
     }
-}
-
-fn scalar_floor_div_pow2(value: usize, exponent: u32) -> usize {
-    value.checked_shr(exponent).unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -535,7 +531,7 @@ impl<O: ProbeOracle> ScalarFunnel<O> {
         let result = match search {
             ScalarFunnelSearch::Hit(location) => ScalarFunnelInsert::Duplicate(location),
             ScalarFunnelSearch::Vacant(_) | ScalarFunnelSearch::Full
-                if self.len >= self.plan.config().target_insertions() =>
+                if self.len >= self.plan.config().max_insertions() =>
             {
                 ScalarFunnelInsert::TargetExhausted
             }

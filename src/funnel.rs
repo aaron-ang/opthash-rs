@@ -123,7 +123,7 @@ impl FunnelShape {
             u8::try_from(plan.loglog_ceiling()).map_err(|_| TryReserveError::CapacityOverflow)?;
         Ok(Self {
             n,
-            max_insertions: config.target_insertions(),
+            max_insertions: config.max_insertions(),
             levels: levels.into_boxed_slice(),
             beta: plan.beta(),
             loglog_ceiling: usize::from(loglog_ceiling),
@@ -1746,8 +1746,8 @@ mod tests {
                 NonZeroU32::new(probe::RANGE_WORD_CAP).unwrap(),
             );
             let mut table = raw_table(n, d);
-            let mut locations = Vec::with_capacity(config.target_insertions());
-            for identity in 0..config.target_insertions() as u64 {
+            let mut locations = Vec::with_capacity(config.max_insertions());
+            for identity in 0..config.max_insertions() as u64 {
                 let (result, _) = scalar.insert(identity).unwrap();
                 let ScalarFunnelInsert::Inserted(expected) = result else {
                     panic!("scalar insertion failed at {identity}");
@@ -1789,7 +1789,7 @@ mod tests {
                 assert_eq!(table.storage.slot_ptr(location) as usize, pointer);
             }
 
-            let duplicate = config.target_insertions() as u64 / 2;
+            let duplicate = config.max_insertions() as u64 / 2;
             let len = table.len;
             assert_eq!(
                 <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::insert(
@@ -1810,7 +1810,7 @@ mod tests {
                 Some(locations[duplicate as usize].1)
             );
 
-            let absent = config.target_insertions() as u64 + 1_000_000;
+            let absent = config.max_insertions() as u64 + 1_000_000;
             assert_eq!(
                 table.find_location(&absent, absent, control::control_fingerprint(absent)),
                 None
