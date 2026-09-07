@@ -5,7 +5,7 @@ use core::ptr;
 use allocator_api2::alloc::{Allocator, Layout};
 
 use super::config::{CACHE_LINE, GROUP_SIZE};
-use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
+use super::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use super::error::TryReserveError;
 use super::simd;
 
@@ -322,7 +322,7 @@ pub(crate) trait ArenaSlots<T> {
 
     #[inline]
     fn write_with_control(&mut self, idx: usize, entry: T, ctrl: u8) {
-        debug_assert!(self.control_at(idx).is_free());
+        debug_assert!(control::is_free(self.control_at(idx)));
         unsafe { self.slot_ptr(idx).write(entry) }
         self.set_control(idx, ctrl);
     }
@@ -331,7 +331,7 @@ pub(crate) trait ArenaSlots<T> {
     #[inline]
     unsafe fn get_ref(&self, idx: usize) -> &T {
         debug_assert!(idx < self.capacity());
-        debug_assert!(self.control_at(idx).is_occupied());
+        debug_assert!(control::is_occupied(self.control_at(idx)));
         unsafe { &*self.slot_ptr(idx) }
     }
 
@@ -342,7 +342,7 @@ pub(crate) trait ArenaSlots<T> {
     #[inline]
     unsafe fn get_mut(&mut self, idx: usize) -> &mut T {
         debug_assert!(idx < self.capacity());
-        debug_assert!(self.control_at(idx).is_occupied());
+        debug_assert!(control::is_occupied(self.control_at(idx)));
         unsafe { &mut *self.slot_ptr(idx) }
     }
 
@@ -351,7 +351,7 @@ pub(crate) trait ArenaSlots<T> {
     #[inline]
     unsafe fn take(&mut self, idx: usize) -> T {
         debug_assert!(idx < self.capacity());
-        debug_assert!(self.control_at(idx).is_occupied());
+        debug_assert!(control::is_occupied(self.control_at(idx)));
         unsafe { self.slot_ptr(idx).read() }
     }
 
@@ -362,7 +362,7 @@ pub(crate) trait ArenaSlots<T> {
         }
         let ctrl = self.ctrl_ptr();
         for idx in 0..self.capacity() {
-            if unsafe { (*ctrl.add(idx)).is_occupied() } {
+            if unsafe { control::is_occupied(*ctrl.add(idx)) } {
                 unsafe { ptr::drop_in_place(self.slot_ptr(idx)) }
             }
         }
@@ -385,7 +385,7 @@ pub(crate) trait ArenaSlots<T> {
         let dst_slots = self.data_ptr();
         for idx in 0..capacity {
             let ctrl = unsafe { *src_ctrl.add(idx) };
-            if ctrl.is_occupied() {
+            if control::is_occupied(ctrl) {
                 let cloned = unsafe { (*src_slots.add(idx)).assume_init_ref() }.clone();
                 unsafe { dst_slots.add(idx).write(MaybeUninit::new(cloned)) };
                 unsafe { *dst_ctrl.add(idx) = ctrl };
@@ -424,7 +424,7 @@ pub(crate) trait ArenaSlots<T> {
             unsafe {
                 let prev = *ctrl.add(idx);
                 *ctrl.add(idx) = CTRL_EMPTY;
-                if prev.is_occupied() {
+                if control::is_occupied(prev) {
                     visit(self.slot_ptr(idx));
                 }
             }

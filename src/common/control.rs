@@ -8,21 +8,18 @@ pub(crate) const FINGERPRINT_MASK: u8 = 0x7F;
 /// Shift that pulls the 7 high bits of a 64-bit hash into bits [6:0].
 const FINGERPRINT_SHIFT: u32 = 57;
 
-pub(crate) trait ControlByte {
-    fn is_occupied(&self) -> bool;
-    fn is_free(&self) -> bool;
+/// True when the control byte carries a fingerprint (slot holds a live entry).
+#[inline]
+#[must_use]
+pub(crate) fn is_occupied(byte: u8) -> bool {
+    (byte & FINGERPRINT_MASK) != 0
 }
 
-impl ControlByte for u8 {
-    #[inline]
-    fn is_occupied(&self) -> bool {
-        (*self & FINGERPRINT_MASK) != 0
-    }
-
-    #[inline]
-    fn is_free(&self) -> bool {
-        (*self & FINGERPRINT_MASK) == 0
-    }
+/// True for `CTRL_EMPTY` and `CTRL_TOMBSTONE`: the slot holds no live entry.
+#[inline]
+#[must_use]
+pub(crate) fn is_free(byte: u8) -> bool {
+    (byte & FINGERPRINT_MASK) == 0
 }
 
 #[inline]
@@ -56,14 +53,14 @@ mod tests {
 
     #[test]
     fn control_byte_occupied_vs_free() {
-        assert!(CTRL_EMPTY.is_free());
-        assert!(!CTRL_EMPTY.is_occupied());
+        assert!(is_free(CTRL_EMPTY));
+        assert!(!is_occupied(CTRL_EMPTY));
         // Tombstone's fingerprint bits are zero: free, not occupied.
-        assert!(CTRL_TOMBSTONE.is_free());
-        assert!(!CTRL_TOMBSTONE.is_occupied());
+        assert!(is_free(CTRL_TOMBSTONE));
+        assert!(!is_occupied(CTRL_TOMBSTONE));
         for fp in 1..=FINGERPRINT_MASK {
-            assert!(fp.is_occupied(), "fp byte {fp} should read occupied");
-            assert!(!fp.is_free());
+            assert!(is_occupied(fp), "fp byte {fp} should read occupied");
+            assert!(!is_free(fp));
         }
     }
 }

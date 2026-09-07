@@ -9,7 +9,7 @@ use crate::ReserveFraction;
 use crate::common::DefaultHashBuilder;
 use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::INITIAL_CAPACITY;
-use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
+use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::common::error::{TryBuildError, TryReserveError};
 use crate::common::exact::geometry::PaperConfig;
 use crate::common::exact::probe::{self, CounterPrf, PreparedElasticProbe};
@@ -145,7 +145,7 @@ impl<T> Level<T> {
             if control == CTRL_TOMBSTONE {
                 self.set_control(slot, CTRL_EMPTY);
                 self.tombstones -= 1;
-            } else if control.is_occupied() {
+            } else if control::is_occupied(control) {
                 let entry = unsafe { self.take(slot) };
                 self.set_control(slot, CTRL_EMPTY);
                 self.len -= 1;
@@ -911,7 +911,7 @@ where
             .enumerate()
             .find_map(|(level_index, level)| {
                 (0..level.capacity())
-                    .find(|&slot| level.control_at(slot).is_free())
+                    .find(|&slot| control::is_free(level.control_at(slot)))
                     .map(|slot| (level_index, slot))
             })
     }
@@ -1318,7 +1318,7 @@ where
         self.clear_membership();
         for level_idx in 0..self.levels.len() {
             for slot_idx in 0..self.levels[level_idx].capacity() {
-                if !self.levels[level_idx].control_at(slot_idx).is_occupied() {
+                if !control::is_occupied(self.levels[level_idx].control_at(slot_idx)) {
                     continue;
                 }
                 let hash = {
@@ -1541,10 +1541,7 @@ where
         logical_index: u64,
     ) -> Option<usize> {
         let slot = self.route_prepared(level, probe, logical_index)?;
-        self.levels[level]
-            .control_at(slot)
-            .is_free()
-            .then_some(slot)
+        control::is_free(self.levels[level].control_at(slot)).then_some(slot)
     }
 
     fn route_prepared(
@@ -2065,7 +2062,7 @@ mod tests {
             .enumerate()
             .find_map(|(level_index, level)| {
                 (0..level.capacity())
-                    .find(|&slot| level.control_at(slot).is_occupied())
+                    .find(|&slot| control::is_occupied(level.control_at(slot)))
                     .map(|slot| (level_index, slot))
             })
             .unwrap();
@@ -2082,7 +2079,7 @@ mod tests {
             .iter()
             .map(|level| {
                 (0..level.capacity())
-                    .filter(|&slot| level.control_at(slot).is_occupied())
+                    .filter(|&slot| control::is_occupied(level.control_at(slot)))
                     .count()
             })
             .sum::<usize>();
@@ -2090,7 +2087,7 @@ mod tests {
         assert!(map.table().levels.iter().all(|level| {
             level.len as usize
                 == (0..level.capacity())
-                    .filter(|&slot| level.control_at(slot).is_occupied())
+                    .filter(|&slot| control::is_occupied(level.control_at(slot)))
                     .count()
         }));
 
@@ -2126,7 +2123,7 @@ mod tests {
             .iter()
             .map(|level| {
                 (0..level.capacity())
-                    .filter(|&slot| level.control_at(slot).is_occupied())
+                    .filter(|&slot| control::is_occupied(level.control_at(slot)))
                     .count()
             })
             .sum::<usize>();
@@ -2134,7 +2131,7 @@ mod tests {
         assert!(map.table().levels.iter().all(|level| {
             level.len as usize
                 == (0..level.capacity())
-                    .filter(|&slot| level.control_at(slot).is_occupied())
+                    .filter(|&slot| control::is_occupied(level.control_at(slot)))
                     .count()
         }));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -2466,7 +2463,7 @@ mod tests {
                 .enumerate()
                 .find_map(|(level_index, level)| {
                     (0..level.capacity()).find_map(|slot| {
-                        (level.control_at(slot).is_occupied()
+                        (control::is_occupied(level.control_at(slot))
                             && unsafe { level.get_ref(slot) }.key == key)
                             .then_some((level_index, slot))
                     })
@@ -2741,7 +2738,7 @@ mod tests {
                 break;
             }
             let slot = table.route_exact(0, 0, logical_index).unwrap();
-            if table.levels[0].control_at(slot).is_free() {
+            if control::is_free(table.levels[0].control_at(slot)) {
                 table.levels[0].write_with_control(
                     slot,
                     SlotEntry {
