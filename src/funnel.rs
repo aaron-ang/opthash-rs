@@ -10,7 +10,7 @@ use crate::ReserveFraction;
 use crate::common::DefaultHashBuilder;
 use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::GROUP_SIZE;
-use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
+use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::common::error::{TryBuildError, TryReserveError};
 use crate::common::exact::geometry::PaperConfig;
 use crate::common::exact::probe::{
@@ -904,7 +904,7 @@ where
                 return SearchResult::RangeFailure;
             };
             let slot = self.shape.primary_offset + local;
-            if self.storage.control_at(slot).is_free() {
+            if control::is_free(self.storage.control_at(slot)) {
                 return SearchResult::Vacant(slot);
             }
         }
@@ -924,7 +924,7 @@ where
                 let slot = self.shape.fallback_offset
                     + bucket * self.shape.fallback_bucket_width
                     + slot_in_bucket;
-                if self.storage.control_at(slot).is_free() {
+                if control::is_free(self.storage.control_at(slot)) {
                     return SearchResult::Vacant(slot);
                 }
             }
@@ -1019,7 +1019,7 @@ where
     fn refresh_membership(&mut self) {
         self.clear_membership();
         for slot in 0..self.shape.n {
-            if !self.storage.control_at(slot).is_occupied() {
+            if !control::is_occupied(self.storage.control_at(slot)) {
                 continue;
             }
             let hash = {
@@ -1085,7 +1085,7 @@ where
     }
 
     fn first_free_global(&self) -> Option<usize> {
-        (0..self.shape.n).find(|&slot| self.storage.control_at(slot).is_free())
+        (0..self.shape.n).find(|&slot| control::is_free(self.storage.control_at(slot)))
     }
 
     fn place_new_entry(
@@ -1420,7 +1420,7 @@ where
         while *scan < self.shape.n {
             let slot = *scan;
             *scan += 1;
-            if self.storage.control_at(slot).is_occupied() {
+            if control::is_occupied(self.storage.control_at(slot)) {
                 return Some((self.storage.slot_ptr(slot), slot));
             }
         }
@@ -1826,7 +1826,7 @@ mod tests {
             key: u64,
             fingerprint: u8,
         ) {
-            if table.storage.control_at(slot).is_free() {
+            if control::is_free(table.storage.control_at(slot)) {
                 table
                     .storage
                     .write_with_control(slot, SlotEntry { key, value: key }, fingerprint);
@@ -2152,7 +2152,7 @@ mod tests {
             table.insert_for_vacant_entry(key, PanicOnFirstDrop(drops.clone()), key);
         }
         let first_occupied = (0..table.shape.n)
-            .find(|&slot| table.storage.control_at(slot).is_occupied())
+            .find(|&slot| control::is_occupied(table.storage.control_at(slot)))
             .unwrap();
 
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -2163,7 +2163,7 @@ mod tests {
         assert_eq!(
             table.len,
             (0..table.shape.n)
-                .filter(|&slot| table.storage.control_at(slot).is_occupied())
+                .filter(|&slot| control::is_occupied(table.storage.control_at(slot)))
                 .count()
         );
 
@@ -2210,7 +2210,7 @@ mod tests {
         assert_eq!(
             table.len,
             (0..table.shape.n)
-                .filter(|&slot| table.storage.control_at(slot).is_occupied())
+                .filter(|&slot| control::is_occupied(table.storage.control_at(slot)))
                 .count()
         );
 
@@ -2232,7 +2232,7 @@ mod tests {
         assert_eq!(
             table.len,
             (0..table.shape.n)
-                .filter(|&slot| table.storage.control_at(slot).is_occupied())
+                .filter(|&slot| control::is_occupied(table.storage.control_at(slot)))
                 .count()
         );
         drop(table);

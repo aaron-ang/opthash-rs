@@ -5,7 +5,7 @@ use core::ptr;
 use super::arena::ArenaSlots;
 use super::bitmask::{BITMASK_STRIDE, BitMask};
 use super::config::GROUP_SIZE;
-use super::control::ControlByte;
+use super::control;
 use super::simd;
 
 /// Generate a projection iterator over a `(K, V)`-yielding inner iterator.
@@ -145,7 +145,7 @@ impl OccupiedSlots {
                 let mut mask = 0_u64;
                 for index in 0..remaining {
                     let control = unsafe { *self.next_ctrl.add(index) };
-                    if control.is_occupied() {
+                    if control::is_occupied(control) {
                         let lane = u32::try_from(index).expect("control-group lane fits u32");
                         mask |= 1_u64 << (lane * BITMASK_STRIDE);
                     }
