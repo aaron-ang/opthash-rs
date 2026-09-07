@@ -12,7 +12,7 @@ use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::common::config::{CACHE_LINE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{TryBuildError, TryReserveError};
-use crate::common::exact::geometry::PaperConfig;
+use crate::common::exact::geometry::{ElasticCase, PaperConfig};
 use crate::common::exact::probe::{self, CounterPrf, PreparedElasticProbe};
 use crate::common::iter::RegionCursor;
 use crate::common::math::capacity;
@@ -48,37 +48,8 @@ const _: () = assert!(MAX_CASE1_LOGICAL_PROBES as u64 <= probe::ELASTIC_LOGICAL_
 const _: () = assert!(RANGE_WORD_CAP <= probe::ELASTIC_REJECTION_LIMIT);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExactInsertionCase {
-    Batch0 {
-        level: usize,
-    },
-    Case1 {
-        batch: usize,
-        current_level: usize,
-        next_level: usize,
-        free_current: usize,
-        free_next: usize,
-        budget: usize,
-    },
-    Case2 {
-        batch: usize,
-        current_level: usize,
-        next_level: usize,
-        free_current: usize,
-        free_next: usize,
-    },
-    Case3 {
-        batch: usize,
-        current_level: usize,
-        next_level: usize,
-        free_current: usize,
-        free_next: usize,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExactPlacement {
-    case: ExactInsertionCase,
+    case: ElasticCase,
     level: usize,
     slot: usize,
     paper_probe: u64,
@@ -1637,12 +1608,7 @@ where
         let (case, level, slot, paper_probe) = match target {
             BatchTarget::Bootstrap => {
                 let (slot, paper_probe) = self.uniform_vacancy(probe, 0)?;
-                (
-                    ExactInsertionCase::Batch0 { level: 0 },
-                    0,
-                    slot,
-                    paper_probe,
-                )
+                (ElasticCase::Batch0 { level: 0 }, 0, slot, paper_probe)
             }
             BatchTarget::LevelPair(current) => {
                 let next = current.checked_add(1)?;
@@ -1659,7 +1625,7 @@ where
                 if current_low {
                     let (slot, paper_probe) = self.uniform_vacancy(probe, next)?;
                     (
-                        ExactInsertionCase::Case2 {
+                        ElasticCase::Case2 {
                             batch: next,
                             current_level: current,
                             next_level: next,
@@ -1673,7 +1639,7 @@ where
                 } else if next_low {
                     let (slot, paper_probe) = self.uniform_vacancy(probe, current)?;
                     (
-                        ExactInsertionCase::Case3 {
+                        ElasticCase::Case3 {
                             batch: next,
                             current_level: current,
                             next_level: next,
@@ -1692,7 +1658,7 @@ where
                         ELASTIC_PROBE_BUDGET_C,
                     )
                     .ok()?;
-                    let case = ExactInsertionCase::Case1 {
+                    let case = ElasticCase::Case1 {
                         batch: next,
                         current_level: current,
                         next_level: next,
@@ -1960,7 +1926,7 @@ mod tests {
     use core::ptr;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use crate::common::exact::reference::{ScalarElastic, ScalarElasticCase, ScalarElasticLimits};
+    use crate::common::exact::reference::{ScalarElastic, ScalarElasticLimits};
     use crate::common::test_support::{
         self, CountDrop, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
     };
@@ -1994,53 +1960,6 @@ mod tests {
     #[repr(align(256))]
     #[derive(Clone, Copy, Eq, Hash, PartialEq)]
     struct OverAligned(u64);
-
-    fn exact_case(case: ScalarElasticCase) -> ExactInsertionCase {
-        match case {
-            ScalarElasticCase::Batch0 { level } => ExactInsertionCase::Batch0 { level },
-            ScalarElasticCase::Case1 {
-                batch,
-                current_level,
-                next_level,
-                free_current,
-                free_next,
-                budget,
-            } => ExactInsertionCase::Case1 {
-                batch,
-                current_level,
-                next_level,
-                free_current,
-                free_next,
-                budget,
-            },
-            ScalarElasticCase::Case2 {
-                batch,
-                current_level,
-                next_level,
-                free_current,
-                free_next,
-            } => ExactInsertionCase::Case2 {
-                batch,
-                current_level,
-                next_level,
-                free_current,
-                free_next,
-            },
-            ScalarElasticCase::Case3 {
-                batch,
-                current_level,
-                next_level,
-                free_current,
-                free_next,
-            } => ExactInsertionCase::Case3 {
-                batch,
-                current_level,
-                next_level,
-                free_current,
-                free_next,
-            },
-        }
-    }
 
     fn assert_exact_trace(
         n: usize,
@@ -2102,7 +2021,7 @@ mod tests {
                 .sum::<usize>()
                 + placement.slot;
 
-            assert_eq!(placement.case, exact_case(expected.case));
+            assert_eq!(placement.case, expected.case);
             assert_eq!(placement.level, expected.location.level);
             assert_eq!(placement.slot, expected.location.slot_in_level);
             assert_eq!(global_slot, expected.location.global_slot);
