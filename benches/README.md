@@ -93,6 +93,21 @@ For smoke runs only:
 SCALED_INSERT_SIZES=1000 cargo bench --bench scaled_insert -- insert_scale_1K
 ```
 
+## Memory footprint
+
+`examples/memory.rs` reports heap bytes per entry, peak bytes while building,
+and allocation counts for all four maps. Counts are deterministic, so it uses
+the release profile rather than the bench profile:
+
+```bash
+cargo run --release --example memory
+MEMORY_SIZES=1000,10000 cargo run --release --example memory
+```
+
+`prealloc` fills a `with_capacity(n)` map; `grow` fills an empty one. Default
+sizes straddle hashbrown's 7/8 · 2^20 capacity step to show the power-of-two
+sawtooth. Bytes are requested layouts, not RSS.
+
 ## Raw results
 
 Inspect the named Criterion estimates directly:
