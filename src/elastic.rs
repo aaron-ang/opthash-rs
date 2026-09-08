@@ -530,12 +530,53 @@ impl BatchScheduler {
     }
 }
 
+/// Most levels, and most batch quotas, any Elastic geometry can have: a table
+/// holds at most `MAX_ELASTIC_SLOTS = 2^32` slots and the paper uses
+/// `ceil(log2(n))` levels with one quota each.
+const MAX_LEVELS: usize = u32::BITS as usize;
+
+/// A geometry's level lengths or batch quotas, held on the stack so building
+/// or resizing a table allocates only what the table keeps.
+#[derive(Clone, Copy)]
+struct PlanBuffer {
+    items: [usize; MAX_LEVELS],
+    len: usize,
+}
+
+impl PlanBuffer {
+    const EMPTY: Self = Self {
+        items: [0; MAX_LEVELS],
+        len: 0,
+    };
+
+    fn from_iter(items: impl ExactSizeIterator<Item = usize>) -> Self {
+        let mut buffer = Self::EMPTY;
+        assert!(
+            items.len() <= MAX_LEVELS,
+            "Elastic plan exceeds {MAX_LEVELS} levels"
+        );
+        for item in items {
+            buffer.items[buffer.len] = item;
+            buffer.len += 1;
+        }
+        buffer
+    }
+}
+
+impl core::ops::Deref for PlanBuffer {
+    type Target = [usize];
+
+    fn deref(&self) -> &[usize] {
+        &self.items[..self.len]
+    }
+}
+
 /// Capacity shape and batch schedule for one elastic table allocation.
 struct ElasticGeometry {
     total_slots: usize,
     max_insertions: usize,
-    level_capacities: Vec<usize>,
-    batch_plan: Box<[usize]>,
+    level_capacities: PlanBuffer,
+    batch_plan: PlanBuffer,
 }
 
 impl ElasticGeometry {
@@ -560,8 +601,8 @@ impl ElasticGeometry {
             return Self {
                 total_slots: 0,
                 max_insertions: 0,
-                level_capacities: Vec::new(),
-                batch_plan: Box::new([]),
+                level_capacities: PlanBuffer::EMPTY,
+                batch_plan: PlanBuffer::EMPTY,
             };
         }
 
@@ -569,24 +610,23 @@ impl ElasticGeometry {
         // one slot is only an internal bootstrap shape outside the paper's
         // n >= 2 domain.
         if total_slots == 1 {
+            let single = PlanBuffer::from_iter(core::iter::once(1));
             return Self {
                 total_slots: 1,
                 max_insertions: 1,
-                level_capacities: alloc::vec![1],
-                batch_plan: Box::new([1]),
+                level_capacities: single,
+                batch_plan: single,
             };
         }
 
         let config = PaperConfig::new(total_slots, reserve_fraction.exponent())
             .expect("validated Elastic library geometry");
         let plan = config.elastic_plan();
-        let level_capacities = plan.level_lengths().collect();
-        let batch_plan = plan.batch_quotas().collect::<Vec<_>>().into_boxed_slice();
         Self {
             total_slots,
             max_insertions: config.max_insertions(),
-            level_capacities,
-            batch_plan,
+            level_capacities: PlanBuffer::from_iter(plan.level_lengths()),
+            batch_plan: PlanBuffer::from_iter(plan.batch_quotas()),
         }
     }
 }
@@ -2036,11 +2076,11 @@ mod tests {
                     PaperConfig::new(geometry.total_slots, reserve_fraction.exponent()).unwrap();
                 let plan = config.elastic_plan();
                 assert_eq!(
-                    geometry.level_capacities,
+                    &*geometry.level_capacities,
                     plan.level_lengths().collect::<Vec<_>>()
                 );
                 assert_eq!(
-                    geometry.batch_plan.as_ref(),
+                    &*geometry.batch_plan,
                     plan.batch_quotas().collect::<Vec<_>>()
                 );
             }
