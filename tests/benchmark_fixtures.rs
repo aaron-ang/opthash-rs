@@ -1,12 +1,16 @@
 #[path = "../benches/harness/mod.rs"]
 mod harness;
+#[path = "../benches/harness/memory.rs"]
+mod memory;
 
+use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashSet;
 
 use harness::{
     DEFAULT_HIT_QUERY_SEED, LATENCY_SIZES, exact_size_label, parse_positive_sizes,
     scaled_insert_sample_size, sequential_hit_keys, shuffled_hit_keys, shuffled_hit_keys_with_seed,
 };
+use memory::{AllocationCounters, AllocationMeasurement, AllocationSnapshot, CountingAllocator};
 
 fn pairs(count: usize) -> Vec<(u64, u64)> {
     (0..count)
@@ -133,6 +137,100 @@ fn scaled_insert_uses_minimum_samples_only_for_the_10m_tier() {
     assert_eq!(scaled_insert_sample_size(9_999_999), 100);
     assert_eq!(scaled_insert_sample_size(10_000_000), 10);
     assert_eq!(scaled_insert_sample_size(20_000_000), 10);
+}
+
+#[test]
+fn allocation_measurement_reports_map_delta_per_live_entry() {
+    let before = AllocationSnapshot {
+        live_bytes: 1_000,
+        peak_live_bytes: 1_000,
+        live_allocations: 10,
+        allocation_calls: 40,
+        allocated_bytes: 8_000,
+    };
+    let after = AllocationSnapshot {
+        live_bytes: 1_400,
+        peak_live_bytes: 1_900,
+        live_allocations: 12,
+        allocation_calls: 45,
+        allocated_bytes: 8_600,
+    };
+
+    let measured = AllocationMeasurement::between(before, after, 4);
+
+    assert_eq!(measured.live_entries, 4);
+    assert_eq!(measured.live_bytes, 400);
+    assert_eq!(measured.peak_live_bytes, 900);
+    assert_eq!(measured.live_allocations, 2);
+    assert_eq!(measured.allocation_calls, 5);
+    assert_eq!(measured.allocated_bytes, 600);
+    assert!((measured.per_entry(measured.live_bytes) - 100.0).abs() < f64::EPSILON);
+    assert!((measured.per_entry(measured.peak_live_bytes) - 225.0).abs() < f64::EPSILON);
+    assert!((measured.per_entry(measured.allocated_bytes) - 150.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn counting_allocator_tracks_successful_allocation_and_deallocation() {
+    static COUNTERS: AllocationCounters = AllocationCounters::new();
+    let allocator = CountingAllocator::new(&COUNTERS);
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let before = allocator.snapshot();
+
+    let ptr = unsafe { allocator.alloc(layout) };
+    assert!(!ptr.is_null());
+    let allocated = allocator.snapshot();
+
+    assert_eq!(allocated.live_bytes - before.live_bytes, 64);
+    assert_eq!(allocated.live_allocations - before.live_allocations, 1);
+    assert_eq!(allocated.allocation_calls - before.allocation_calls, 1);
+    assert_eq!(allocated.allocated_bytes - before.allocated_bytes, 64);
+
+    unsafe { allocator.dealloc(ptr, layout) };
+    let deallocated = allocator.snapshot();
+    assert_eq!(deallocated.live_bytes, before.live_bytes);
+    assert_eq!(deallocated.live_allocations, before.live_allocations);
+}
+
+#[test]
+fn counting_allocator_tracks_zeroed_and_reallocated_memory() {
+    static COUNTERS: AllocationCounters = AllocationCounters::new();
+    let allocator = CountingAllocator::new(&COUNTERS);
+    let initial_layout = Layout::from_size_align(32, 8).unwrap();
+    allocator.reset_peak();
+    let before = allocator.snapshot();
+
+    let ptr = unsafe { allocator.alloc_zeroed(initial_layout) };
+    assert!(!ptr.is_null());
+    assert!(
+        unsafe { std::slice::from_raw_parts(ptr, 32) }
+            .iter()
+            .all(|&byte| byte == 0)
+    );
+
+    let grown = unsafe { allocator.realloc(ptr, initial_layout, 96) };
+    assert!(!grown.is_null());
+    let grown_snapshot = allocator.snapshot();
+    assert_eq!(grown_snapshot.live_bytes - before.live_bytes, 96);
+    assert_eq!(grown_snapshot.live_allocations - before.live_allocations, 1);
+    // The default realloc allocates the new block before freeing the old one,
+    // so the peak holds both.
+    assert_eq!(grown_snapshot.peak_live_bytes - before.live_bytes, 32 + 96);
+
+    let grown_layout = Layout::from_size_align(96, 8).unwrap();
+    let shrunk = unsafe { allocator.realloc(grown, grown_layout, 16) };
+    assert!(!shrunk.is_null());
+    let shrunk_snapshot = allocator.snapshot();
+    assert_eq!(shrunk_snapshot.live_bytes - before.live_bytes, 16);
+    assert_eq!(
+        shrunk_snapshot.live_allocations - before.live_allocations,
+        1
+    );
+
+    let shrunk_layout = Layout::from_size_align(16, 8).unwrap();
+    unsafe { allocator.dealloc(shrunk, shrunk_layout) };
+    let after = allocator.snapshot();
+    assert_eq!(after.live_bytes, before.live_bytes);
+    assert_eq!(after.live_allocations, before.live_allocations);
 }
 
 #[test]
