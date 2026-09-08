@@ -57,9 +57,6 @@ criterion = { version = "4", package = "codspeed-criterion-compat", default-feat
 hashbrown = "0.17"
 
 [lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
-elided_lifetimes_in_paths = "warn"
-unused_extern_crates = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(codspeed)'] }
 
 [lints.clippy]
@@ -97,9 +94,7 @@ harness = false
 name = "scaled_insert"
 harness = false
 
-# Layout-stable measurement profile. With the default bench profile (16
-# codegen units, no LTO) function placement shifts between builds of
-# different trees and moves unchanged code in wallclock; one codegen unit
+# Layout-stable measurement profile: one codegen unit
 # plus fat LTO keeps placement fixed.
 [profile.bench]
 lto = "fat"
