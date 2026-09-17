@@ -42,6 +42,10 @@ history. The registered headline workloads live in
   algorithms should match its constant factors.
 - `std` uses its own fixed `DefaultHasher`; Funnel parity with `std` is a useful
   engineering target but is not a same-table-design comparison.
+- `MAP_SIZE` maps are not at equal load. Funnel sizes exactly, so it runs at
+  its full insert budget; Elastic and `hashbrown` round to a power of two and
+  sit below theirs. `load_factor` fills every map to the same fraction of its
+  own threshold; use it when the question is load, not size.
 - `get_hit` is the benchmark closest to the paper's positive-query objective.
 - `get_miss` measures a different regime: Funnel negatives follow insertion-like
   routing, while ordinary Elastic negatives exhaust the paper-derived exact
@@ -104,8 +108,8 @@ cargo run --release --example memory
 MEMORY_SIZES=1000,10000 cargo run --release --example memory
 ```
 
-`prealloc` fills a `with_capacity(n)` map; `grow` fills an empty one. Default
-sizes straddle hashbrown's 7/8 · 2^20 capacity step to show the power-of-two
+`prealloc` fills a `with_capacity(n)` map; `grow` fills an empty one; `shrink`
+is `grow` followed by `shrink_to_fit`. Default sizes straddle hashbrown's 7/8 · 2^20 capacity step to show the power-of-two
 sawtooth. Bytes are requested layouts, not RSS.
 
 ## Raw results
