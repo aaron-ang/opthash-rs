@@ -559,13 +559,13 @@ where
     }
 }
 
-#[cfg(feature = "default-hasher")]
 impl<T, P> Default for HashSet<T, P>
 where
-    P: TableBackend<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableBackend<T, (), Alloc = Global>,
+    P::Hasher: Default,
 {
     fn default() -> Self {
-        Self::new()
+        Self::with_hasher(P::Hasher::default())
     }
 }
 
@@ -622,11 +622,11 @@ where
     }
 }
 
-#[cfg(feature = "default-hasher")]
 impl<T, P, const N: usize> From<[T; N]> for HashSet<T, P>
 where
     T: Eq + Hash,
-    P: TableBackend<T, (), Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableBackend<T, (), Alloc = Global>,
+    P::Hasher: Default,
 {
     fn from(arr: [T; N]) -> Self {
         arr.into_iter().collect()

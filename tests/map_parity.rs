@@ -6,6 +6,8 @@
 //! Tests requiring APIs opthash lacks (`EntryRef`, `raw_entry`,
 //! `raw_capacity`, `insert_unique_unchecked`, `replace_entry_with`) are omitted.
 
+mod support;
+
 macro_rules! parity_suite {
     ($mod_name:ident, $TestMap:ident, $Entry:ident) => {
         mod $mod_name {
@@ -15,9 +17,10 @@ macro_rules! parity_suite {
                 clippy::items_after_statements
             )]
 
+            use crate::support::{Deterministic, $TestMap as HashMap};
             use core::cell::RefCell;
+            use opthash::DefaultHashBuilder;
             use opthash::$Entry as Entry;
-            use opthash::{DefaultHashBuilder, $TestMap as HashMap};
 
             thread_local! {
                 static DROP_VECTOR: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
@@ -53,7 +56,8 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_zero_capacities() {
-                type HM = HashMap<i32, i32>;
+                // Default-hasher constructor surface; no key is hashed here.
+                type HM = opthash::$TestMap<i32, i32>;
 
                 let m = HM::new();
                 assert_eq!(m.capacity(), 0);
@@ -70,7 +74,7 @@ macro_rules! parity_suite {
                 let m = HM::with_capacity_and_hasher(0, DefaultHashBuilder::default());
                 assert_eq!(m.capacity(), 0);
 
-                let mut m = HM::new();
+                let mut m = HashMap::new();
                 m.insert(1, 1);
                 m.insert(2, 2);
                 m.remove(&1);
@@ -78,7 +82,7 @@ macro_rules! parity_suite {
                 m.shrink_to_fit();
                 assert_eq!(m.capacity(), 0);
 
-                let mut m = HM::new();
+                let mut m: HashMap<i32, i32> = HashMap::new();
                 m.reserve(0);
                 assert_eq!(m.capacity(), 0);
             }
@@ -1073,12 +1077,29 @@ parity_suite!(funnel_parity, FunnelHashMap, FunnelEntry);
 macro_rules! clone_alloc_suite {
     ($mod_name:ident, $TestMap:ident) => {
         mod $mod_name {
+            use std::hash::Hash;
             use std::ptr::NonNull;
             use std::sync::Arc;
             use std::sync::atomic::{AtomicI8, Ordering};
 
             use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
-            use opthash::$TestMap as HashMap;
+            use opthash::ReserveFraction;
+
+            use crate::support::{FixedHashBuilder, fixed_hasher};
+
+            type HashMap<K, V, A = Global> = opthash::$TestMap<K, V, FixedHashBuilder, A>;
+
+            fn with_capacity_in<K: Eq + Hash, V>(
+                capacity: usize,
+                alloc: MyAlloc,
+            ) -> HashMap<K, V, MyAlloc> {
+                HashMap::with_capacity_and_reserve_and_hasher_in(
+                    capacity,
+                    ReserveFraction::DEFAULT,
+                    fixed_hasher(),
+                    alloc,
+                )
+            }
 
             struct MyAllocInner {
                 drop_count: Arc<AtomicI8>,
@@ -1116,7 +1137,7 @@ macro_rules! clone_alloc_suite {
             fn test_hashmap_into_iter_bug() {
                 let dropped: Arc<AtomicI8> = Arc::new(AtomicI8::new(1));
                 {
-                    let mut map = HashMap::with_capacity_in(10, MyAlloc::new(dropped.clone()));
+                    let mut map = with_capacity_in(10, MyAlloc::new(dropped.clone()));
                     for i in 0..10 {
                         map.entry(i).or_insert_with(|| "i".to_owned());
                     }
@@ -1185,11 +1206,11 @@ macro_rules! clone_alloc_suite {
                 drop_flags: [bool; 8],
                 mut fun: F,
                 alloc: MyAlloc,
-            ) -> HashMap<u64, CheckedCloneDrop<T>, opthash::DefaultHashBuilder, MyAlloc>
+            ) -> HashMap<u64, CheckedCloneDrop<T>, MyAlloc>
             where
                 F: FnMut(u64) -> T,
             {
-                let mut map = HashMap::with_capacity_in(clone_flags.len(), alloc);
+                let mut map = with_capacity_in(clone_flags.len(), alloc);
                 for (i, (c, d)) in clone_flags.into_iter().zip(drop_flags).enumerate() {
                     let i = i as u64;
                     map.insert(i, CheckedCloneDrop::new(c, d, fun(i)));
@@ -1273,7 +1294,7 @@ macro_rules! clone_alloc_suite {
                 {
                     // Source capacity differs from dest so clone_from falls
                     // through to the free + realloc path.
-                    let mut map = HashMap::with_capacity_in(8, MyAlloc::new(dropped.clone()));
+                    let mut map = with_capacity_in(8, MyAlloc::new(dropped.clone()));
                     map.insert(0, CheckedCloneDrop::new(DISARMED, DISARMED, vec![0u64]));
                     thread::scope(|s| {
                         let handle = s.spawn(|| {

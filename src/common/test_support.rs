@@ -8,13 +8,44 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
 
-use crate::common::DefaultHashBuilder;
 use crate::common::membership;
 use crate::map::{HashMap, TableBackend};
 
 /// Hashes a `u64` to itself, so test keys double as their own hashes.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct IdentityBuildHasher;
+
+/// Seeded foldhash state for every test that hashes real keys: the same key
+/// stream on every run, so probabilistic bounds and placement-dependent
+/// assertions either hold or fail deterministically instead of flaking with
+/// the process's random seed.
+pub(crate) use foldhash::fast::FixedState as FixedHashBuilder;
+pub(crate) const FIXED_HASH_SEED: u64 = 0xD1B5_4A32_D192_ED03;
+
+pub(crate) fn fixed_hasher() -> FixedHashBuilder {
+    FixedHashBuilder::with_seed(FIXED_HASH_SEED)
+}
+
+/// `with_capacity` for maps over [`FixedHashBuilder`]. The inherent
+/// constructors exist only for the default hasher; when that bound fails,
+/// resolution falls through to this trait, so tests read like production code.
+pub(crate) trait Deterministic: Sized {
+    fn with_capacity(capacity: usize) -> Self;
+}
+
+impl<K, V, P> Deterministic for HashMap<K, V, P>
+where
+    P: TableBackend<K, V, Hasher = FixedHashBuilder, Alloc = Global>,
+{
+    fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_hasher(capacity, fixed_hasher())
+    }
+}
+
+/// `ElasticHashMap` over [`FixedHashBuilder`]. Spelled as its own alias so
+/// `FixedElasticHashMap::with_capacity(n)` resolves to [`Deterministic`]; with
+/// the public alias's default hasher parameter the inherent constructor wins.
+pub(crate) type FixedElasticHashMap<K, V> = crate::ElasticHashMap<K, V, FixedHashBuilder>;
 
 pub(crate) struct IdentityHasher(u64);
 
@@ -139,9 +170,9 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
     gate_passes: impl Fn(&P, u64) -> bool,
     stale_membership: impl Fn(&P) -> usize,
 ) where
-    P: TableBackend<u64, u64, Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableBackend<u64, u64, Hasher = FixedHashBuilder, Alloc = Global>,
 {
-    let mut map: HashMap<u64, u64, P> = HashMap::with_capacity(2_048);
+    let mut map: HashMap<u64, u64, P> = Deterministic::with_capacity(2_048);
     let live = map.capacity() as u64;
     let threshold = membership::refresh_deletes(map.capacity()) as u64;
     for key in 0..live {

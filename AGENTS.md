@@ -25,6 +25,15 @@ uv tool install pre-commit
 pre-commit install
 ```
 
+## Tests
+
+Tests are deterministic. Build maps from the fixed-seed aliases with the
+`Deterministic` trait in scope (`test_support` in `src/`, `tests/support` in
+integration tests) so `HashMap::new()` / `with_capacity(n)` seed foldhash
+identically on every run; never use the random-seeded default except in
+constructor-surface tests that hash no key. Treat a flaky test as a
+determinism bug to fix, not a run to repeat.
+
 ## Benchmarks
 
 Criterion suite comparing `ElasticHashMap`, `FunnelHashMap`, `std::HashMap`, `hashbrown::HashMap` (SwissTable + foldhash — absolute ceiling).
@@ -100,7 +109,7 @@ evidence must go through the pinned `scripts/bench.sh` workflow.
 
 ### Python-side benchmarks
 
-`benches/python/throughput.py` — pytest-benchmark suite comparing `dict`, `ElasticHashMap`, and `FunnelHashMap` from Python across insert / get_hit / get_miss / mixed / delete workloads at N = 20K. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode.
+`benches/python/throughput.py` — pytest-benchmark suite comparing `dict`, `ElasticHashMap`, and `FunnelHashMap` from Python across insert / get_hit / get_miss / mixed / delete workloads at the Rust harness's `MAP_SIZE`. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode.
 
 ```bash
 pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json

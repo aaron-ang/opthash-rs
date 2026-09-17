@@ -1,5 +1,6 @@
 //! Heap footprint of the four maps: live bytes, the peak while building, and
-//! allocation traffic, for a preallocated fill and a grow-from-empty fill.
+//! allocation traffic, for a preallocated fill, a grow-from-empty fill, and a
+//! grow-from-empty fill followed by `shrink_to_fit`.
 //! Prints TSV. Counts are deterministic, so this runs under the release profile
 //! instead of the fat-LTO bench profile:
 //!
@@ -38,15 +39,18 @@ enum Mode {
     Prealloc,
     /// Empty map then `n` inserts: exercises each map's growth policy.
     Grow,
+    /// `Grow`, then `shrink_to_fit`: what a bulk load can reclaim.
+    Shrink,
 }
 
 impl Mode {
-    const ALL: [Self; 2] = [Self::Prealloc, Self::Grow];
+    const ALL: [Self; 3] = [Self::Prealloc, Self::Grow, Self::Shrink];
 
     fn label(self) -> &'static str {
         match self {
             Self::Prealloc => "prealloc",
             Self::Grow => "grow",
+            Self::Shrink => "shrink",
         }
     }
 }
@@ -57,6 +61,7 @@ trait MapUnderTest<K, V> {
     fn empty() -> Self;
     fn with_capacity(capacity: usize) -> Self;
     fn insert(&mut self, key: K, value: V);
+    fn shrink_to_fit(&mut self);
     fn len(&self) -> usize;
     fn capacity(&self) -> usize;
 }
@@ -73,6 +78,9 @@ macro_rules! maps_under_test {
             }
             fn insert(&mut self, key: K, value: V) {
                 <$Map<K, V>>::insert(self, key, value);
+            }
+            fn shrink_to_fit(&mut self) {
+                <$Map<K, V>>::shrink_to_fit(self);
             }
             fn len(&self) -> usize {
                 <$Map<K, V>>::len(self)
@@ -117,10 +125,13 @@ where
     let before = ALLOCATOR.snapshot();
     let mut map = match mode {
         Mode::Prealloc => M::with_capacity(pairs.len()),
-        Mode::Grow => M::empty(),
+        Mode::Grow | Mode::Shrink => M::empty(),
     };
     for &(key, value) in pairs {
         map.insert(key, value);
+    }
+    if let Mode::Shrink = mode {
+        map.shrink_to_fit();
     }
     black_box(&map);
     let after = ALLOCATOR.snapshot();

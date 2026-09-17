@@ -5,15 +5,19 @@
 //! constructors, hashbrown-internal `Equivalent` debug asserts) and ones that
 //! assert hashbrown-specific capacity growth (`rehash_in_place`) are omitted.
 
+mod support;
+
 macro_rules! set_suite {
     ($mod_name:ident, $TestSet:ident, $Entry:ident) => {
         mod $mod_name {
+            use crate::support::{Deterministic, $TestSet as HashSet};
+            use opthash::DefaultHashBuilder;
             use opthash::$Entry as Entry;
-            use opthash::{DefaultHashBuilder, $TestSet as HashSet};
 
             #[test]
             fn test_zero_capacities() {
-                type HS = HashSet<i32>;
+                // Default-hasher constructor surface; no key is hashed here.
+                type HS = opthash::$TestSet<i32>;
 
                 let s = HS::new();
                 assert_eq!(s.capacity(), 0);
@@ -30,7 +34,7 @@ macro_rules! set_suite {
                 let s = HS::with_capacity_and_hasher(0, DefaultHashBuilder::default());
                 assert_eq!(s.capacity(), 0);
 
-                let mut s = HS::new();
+                let mut s = HashSet::new();
                 s.insert(1);
                 s.insert(2);
                 s.remove(&1);
@@ -38,7 +42,7 @@ macro_rules! set_suite {
                 s.shrink_to_fit();
                 assert_eq!(s.capacity(), 0);
 
-                let mut s = HS::new();
+                let mut s: HashSet<i32> = HashSet::new();
                 s.reserve(0);
                 assert_eq!(s.capacity(), 0);
             }
@@ -435,7 +439,8 @@ macro_rules! set_suite {
                     }
                 }
 
-                let mut set: HashSet<u32, MyHasher> = HashSet::with_hasher(MyHasher);
+                let mut set: opthash::$TestSet<u32, MyHasher> =
+                    opthash::$TestSet::with_hasher(MyHasher);
                 set.insert(19);
                 assert!(set.contains(&19));
             }

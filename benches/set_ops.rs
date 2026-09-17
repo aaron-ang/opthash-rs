@@ -7,8 +7,9 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use hashbrown::HashSet as HashbrownHashSet;
 use opthash::{ElasticHashSet, FunnelHashSet};
 
-/// Elements per set in the set-wrapper benches.
-const SET_SIZE: usize = 20_000;
+/// Elements per set in the set-wrapper benches: the maps' `MAP_SIZE`, so every
+/// pre-sized set also sits at its full insert budget.
+const SET_SIZE: usize = harness::MAP_SIZE;
 
 /// `count` distinct keys from `harness::key_at`, starting at `offset`.
 fn set_keys(count: usize, offset: usize) -> Vec<u64> {

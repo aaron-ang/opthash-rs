@@ -5,7 +5,9 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
-use harness::{MAP_SIZE, OP_COUNT, RESIZE_INSERT_COUNT, TINY_MAP_SIZE, TINY_OP_COUNT};
+use harness::{
+    MAP_SIZE, MISS_KEY_OFFSET, OP_COUNT, RESIZE_INSERT_COUNT, TINY_MAP_SIZE, TINY_OP_COUNT,
+};
 
 /// Steady-state insert into a reused map (cap = `2 * OP_COUNT`).
 /// Reflects what a long-lived map pays per insert; excludes allocation cost.
@@ -24,7 +26,7 @@ fn bench_lookups(c: &mut Criterion) {
     let hit_keys = harness::shuffled_hit_keys(&pairs, OP_COUNT);
     let sequential_hit_keys = harness::sequential_hit_keys(&pairs, OP_COUNT);
     let miss_keys: Vec<u64> = (0..OP_COUNT)
-        .map(|idx| harness::key_at(idx + MAP_SIZE + 10_000_000))
+        .map(|idx| harness::key_at(idx + MISS_KEY_OFFSET))
         .collect();
 
     harness::bench_one_lookup_group(c, "get_hit", &hit_keys, &maps);
@@ -39,7 +41,7 @@ fn bench_tiny_lookup(c: &mut Criterion) {
             if idx % 2 == 0 {
                 pairs[idx % TINY_MAP_SIZE].0
             } else {
-                harness::key_at(idx + 5_000_000)
+                harness::key_at(idx + MISS_KEY_OFFSET)
             }
         })
         .collect();
@@ -47,11 +49,15 @@ fn bench_tiny_lookup(c: &mut Criterion) {
     harness::bench_one_lookup_group(c, "tiny_lookup", &query_keys, &maps);
 }
 
+/// Knuth's multiplicative hashing constant, `2^32 / phi`, scattering
+/// sequential op indices over the populated keys.
+const GOLDEN_RATIO_32: u32 = 2_654_435_761;
+
 fn bench_mixed(c: &mut Criterion) {
     let pairs = harness::make_pairs(MAP_SIZE);
     let ops: Vec<(usize, bool)> = (0..OP_COUNT)
         .map(|i| {
-            let mixed = u32::try_from(i).unwrap().wrapping_mul(2_654_435_761);
+            let mixed = u32::try_from(i).unwrap().wrapping_mul(GOLDEN_RATIO_32);
             let idx = mixed as usize % MAP_SIZE;
             (idx, i & 1 == 0)
         })

@@ -1,6 +1,9 @@
 use std::hash::{BuildHasher, Hasher};
 
-use opthash::{ElasticHashMap, ElasticHashSet, EpochTransition, FunnelHashMap, ReserveFraction};
+use opthash::{EpochTransition, ReserveFraction};
+
+mod support;
+use support::{Deterministic, ElasticHashMap, ElasticHashSet, FunnelHashMap};
 
 #[derive(Clone, Copy, Default)]
 struct ConstantBuildHasher;
@@ -248,10 +251,11 @@ fn clear_starts_a_fresh_epoch_in_the_same_allocation() {
 fn below_capacity_funnel_placement_recovery_is_observable() {
     const FOLLOW_UP_INSERTS: usize = 32;
 
-    let mut map = FunnelHashMap::<usize, usize, ConstantBuildHasher>::with_capacity_and_hasher(
-        1_024,
-        ConstantBuildHasher,
-    );
+    let mut map =
+        opthash::FunnelHashMap::<usize, usize, ConstantBuildHasher>::with_capacity_and_hasher(
+            1_024,
+            ConstantBuildHasher,
+        );
     let mut next_key = 0;
     let first_recovery = loop {
         assert!(next_key < map.capacity());

@@ -1,3 +1,5 @@
+mod support;
+
 macro_rules! common_suite {
     ($mod_name:ident, $TestMap:ident, $Entry:ident) => {
         mod $mod_name {
@@ -5,8 +7,8 @@ macro_rules! common_suite {
             use std::sync::Arc;
             use std::sync::atomic::{AtomicUsize, Ordering};
 
+            use crate::support::{Deterministic, $TestMap as HashMap};
             use opthash::$Entry as Entry;
-            use opthash::$TestMap as HashMap;
 
             /// Value whose drop bumps a shared counter; used by the
             /// consuming-iterator tests to prove every element is dropped once.
