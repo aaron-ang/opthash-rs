@@ -9,8 +9,10 @@ pub use fixtures::*;
 pub use map_matrix::bench_one_lookup_group;
 pub use queries::*;
 
-/// Pre-populated map size for the throughput benchmarks.
-pub const MAP_SIZE: usize = 20_000;
+/// Pre-populated map size for the throughput benchmarks: `7/8 * 2^15`, the
+/// exact insert budget of a 32,768-slot Elastic or hashbrown table and
+/// Funnel's exact size, so every map is measured at its full insert budget.
+pub const MAP_SIZE: usize = 28_672;
 /// Operations per iteration for throughput benchmarks.
 pub const OP_COUNT: usize = 100_000;
 /// Tiny map size; fits comfortably in L1.
