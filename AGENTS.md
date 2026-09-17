@@ -100,7 +100,7 @@ evidence must go through the pinned `scripts/bench.sh` workflow.
 
 ### Python-side benchmarks
 
-`benches/python/throughput.py` — pytest-benchmark suite comparing `dict`, `ElasticHashMap`, and `FunnelHashMap` from Python across insert / get_hit / get_miss / mixed / delete workloads at N = 20K. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode.
+`benches/python/throughput.py` — pytest-benchmark suite comparing `dict`, `ElasticHashMap`, and `FunnelHashMap` from Python across insert / get_hit / get_miss / mixed / delete workloads at the Rust harness's `MAP_SIZE`. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode.
 
 ```bash
 pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json

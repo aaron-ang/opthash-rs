@@ -20,6 +20,9 @@ pub const MAP_SLOTS: usize = 1 << 15;
 pub const MAP_SIZE: usize = MAP_SLOTS - ReserveFraction::DEFAULT.floor_reserved(MAP_SLOTS);
 /// Operations per iteration for throughput benchmarks.
 pub const OP_COUNT: usize = 100_000;
+/// `key_at` index offset for miss queries: past every populated index in any
+/// fixture, so a miss key never collides with a stored key.
+pub const MISS_KEY_OFFSET: usize = 10_000_000;
 /// Tiny map size; fits comfortably in L1.
 pub const TINY_MAP_SIZE: usize = 32;
 /// Tiny-map lookups per iteration.
