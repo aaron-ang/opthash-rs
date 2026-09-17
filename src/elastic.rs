@@ -799,7 +799,7 @@ where
         let word = MembershipKey::word(prepared.route.signature(), words);
         // SAFETY: `word` is a multiply-high reduction below `words`, and the
         // cached region covers exactly that many initialized words.
-        let metadata = unsafe { &*self.membership_ptr().add(word) };
+        let metadata = unsafe { *self.membership_ptr().add(word) };
         let bits = prepared.membership.bits();
         ElasticRouteFilter {
             maybe_present: metadata.membership & bits == bits,
@@ -2077,11 +2077,11 @@ mod tests {
                     PaperConfig::new(geometry.total_slots, reserve_fraction.exponent()).unwrap();
                 let plan = config.elastic_plan();
                 assert_eq!(
-                    &*geometry.level_capacities,
+                    *geometry.level_capacities,
                     plan.level_lengths().collect::<Vec<_>>()
                 );
                 assert_eq!(
-                    &*geometry.batch_plan,
+                    *geometry.batch_plan,
                     plan.batch_quotas().collect::<Vec<_>>()
                 );
             }
@@ -2238,7 +2238,7 @@ mod tests {
             0
         );
         for word in 0..table.membership.words {
-            let metadata = unsafe { &*table.membership_ptr().add(word) };
+            let metadata = unsafe { *table.membership_ptr().add(word) };
             assert_eq!(metadata.membership, 0);
             assert_eq!(metadata.route_bins, [0; 4]);
         }
