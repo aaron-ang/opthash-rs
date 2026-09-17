@@ -10,11 +10,9 @@ mod support;
 macro_rules! set_suite {
     ($mod_name:ident, $TestSet:ident, $Entry:ident) => {
         mod $mod_name {
-            use crate::support::{FixedHashBuilder, fixed_hasher};
+            use crate::support::{Deterministic, $TestSet as HashSet};
             use opthash::DefaultHashBuilder;
             use opthash::$Entry as Entry;
-
-            type HashSet<T> = opthash::$TestSet<T, FixedHashBuilder>;
 
             #[test]
             fn test_zero_capacities() {
@@ -36,7 +34,7 @@ macro_rules! set_suite {
                 let s = HS::with_capacity_and_hasher(0, DefaultHashBuilder::default());
                 assert_eq!(s.capacity(), 0);
 
-                let mut s = HashSet::with_hasher(fixed_hasher());
+                let mut s = HashSet::new();
                 s.insert(1);
                 s.insert(2);
                 s.remove(&1);
@@ -44,15 +42,15 @@ macro_rules! set_suite {
                 s.shrink_to_fit();
                 assert_eq!(s.capacity(), 0);
 
-                let mut s: HashSet<i32> = HashSet::with_hasher(fixed_hasher());
+                let mut s: HashSet<i32> = HashSet::new();
                 s.reserve(0);
                 assert_eq!(s.capacity(), 0);
             }
 
             #[test]
             fn test_disjoint() {
-                let mut xs = HashSet::with_hasher(fixed_hasher());
-                let mut ys = HashSet::with_hasher(fixed_hasher());
+                let mut xs = HashSet::new();
+                let mut ys = HashSet::new();
                 assert!(xs.is_disjoint(&ys));
                 assert!(ys.is_disjoint(&xs));
                 assert!(xs.insert(5));
@@ -73,13 +71,13 @@ macro_rules! set_suite {
 
             #[test]
             fn test_subset_and_superset() {
-                let mut a = HashSet::with_hasher(fixed_hasher());
+                let mut a = HashSet::new();
                 assert!(a.insert(0));
                 assert!(a.insert(5));
                 assert!(a.insert(11));
                 assert!(a.insert(7));
 
-                let mut b = HashSet::with_hasher(fixed_hasher());
+                let mut b = HashSet::new();
                 assert!(b.insert(0));
                 assert!(b.insert(7));
                 assert!(b.insert(19));
@@ -102,7 +100,7 @@ macro_rules! set_suite {
 
             #[test]
             fn test_iterate() {
-                let mut a = HashSet::with_hasher(fixed_hasher());
+                let mut a = HashSet::new();
                 for i in 0..32 {
                     assert!(a.insert(i));
                 }
@@ -115,8 +113,8 @@ macro_rules! set_suite {
 
             #[test]
             fn test_intersection() {
-                let mut a = HashSet::with_hasher(fixed_hasher());
-                let mut b = HashSet::with_hasher(fixed_hasher());
+                let mut a = HashSet::new();
+                let mut b = HashSet::new();
 
                 assert!(a.insert(11));
                 assert!(a.insert(1));
@@ -145,8 +143,8 @@ macro_rules! set_suite {
 
             #[test]
             fn test_difference() {
-                let mut a = HashSet::with_hasher(fixed_hasher());
-                let mut b = HashSet::with_hasher(fixed_hasher());
+                let mut a = HashSet::new();
+                let mut b = HashSet::new();
 
                 assert!(a.insert(1));
                 assert!(a.insert(3));
@@ -168,8 +166,8 @@ macro_rules! set_suite {
 
             #[test]
             fn test_symmetric_difference() {
-                let mut a = HashSet::with_hasher(fixed_hasher());
-                let mut b = HashSet::with_hasher(fixed_hasher());
+                let mut a = HashSet::new();
+                let mut b = HashSet::new();
 
                 assert!(a.insert(1));
                 assert!(a.insert(3));
@@ -210,8 +208,8 @@ macro_rules! set_suite {
 
             #[test]
             fn test_union() {
-                let mut a = HashSet::with_hasher(fixed_hasher());
-                let mut b = HashSet::with_hasher(fixed_hasher());
+                let mut a = HashSet::new();
+                let mut b = HashSet::new();
 
                 assert!(a.insert(1));
                 assert!(a.insert(3));
@@ -254,7 +252,7 @@ macro_rules! set_suite {
             #[test]
             fn test_move_iter() {
                 let hs = {
-                    let mut hs = HashSet::with_hasher(fixed_hasher());
+                    let mut hs = HashSet::new();
                     hs.insert('a');
                     hs.insert('b');
                     hs
@@ -266,12 +264,12 @@ macro_rules! set_suite {
 
             #[test]
             fn test_eq() {
-                let mut s1 = HashSet::with_hasher(fixed_hasher());
+                let mut s1 = HashSet::new();
                 s1.insert(1);
                 s1.insert(2);
                 s1.insert(3);
 
-                let mut s2 = HashSet::with_hasher(fixed_hasher());
+                let mut s2 = HashSet::new();
                 s2.insert(1);
                 s2.insert(2);
 
@@ -284,8 +282,8 @@ macro_rules! set_suite {
 
             #[test]
             fn test_show() {
-                let mut set = HashSet::with_hasher(fixed_hasher());
-                let empty = HashSet::<i32>::with_hasher(fixed_hasher());
+                let mut set = HashSet::new();
+                let empty = HashSet::<i32>::new();
 
                 set.insert(1);
                 set.insert(2);
@@ -298,12 +296,12 @@ macro_rules! set_suite {
 
             #[test]
             fn test_trivial_drain() {
-                let mut s = HashSet::<i32>::with_hasher(fixed_hasher());
+                let mut s = HashSet::<i32>::new();
                 for _ in s.drain() {}
                 assert!(s.is_empty());
                 drop(s);
 
-                let mut s = HashSet::<i32>::with_hasher(fixed_hasher());
+                let mut s = HashSet::<i32>::new();
                 drop(s.drain());
                 assert!(s.is_empty());
             }
@@ -358,7 +356,7 @@ macro_rules! set_suite {
                     }
                 }
 
-                let mut s = HashSet::with_hasher(fixed_hasher());
+                let mut s = HashSet::new();
                 assert_eq!(s.replace(Foo("a", 1)), None);
                 assert_eq!(s.len(), 1);
                 assert_eq!(s.replace(Foo("a", 2)), Some(Foo("a", 1)));
@@ -371,7 +369,7 @@ macro_rules! set_suite {
 
             #[test]
             fn test_extend_ref() {
-                let mut a = HashSet::with_hasher(fixed_hasher());
+                let mut a = HashSet::new();
                 a.insert(1);
 
                 a.extend([2, 3, 4]);
@@ -382,7 +380,7 @@ macro_rules! set_suite {
                 assert!(a.contains(&3));
                 assert!(a.contains(&4));
 
-                let mut b = HashSet::with_hasher(fixed_hasher());
+                let mut b = HashSet::new();
                 b.insert(5);
                 b.insert(6);
 
@@ -455,7 +453,7 @@ macro_rules! set_suite {
 
             #[test]
             fn duplicate_insert() {
-                let mut set = HashSet::with_hasher(fixed_hasher());
+                let mut set = HashSet::new();
                 set.insert(1);
                 set.get_or_insert_with(&1, |_| 1);
                 set.get_or_insert_with(&1, |_| 1);
@@ -466,7 +464,7 @@ macro_rules! set_suite {
             fn entry_api() {
                 // opthash-specific: hashbrown unit-tests the set `Entry` API only
                 // via its map; cover the set wrapper directly here.
-                let mut set: HashSet<&str> = HashSet::with_hasher(fixed_hasher());
+                let mut set: HashSet<&str> = HashSet::new();
                 match set.entry("a") {
                     Entry::Occupied(_) => unreachable!(),
                     Entry::Vacant(v) => {

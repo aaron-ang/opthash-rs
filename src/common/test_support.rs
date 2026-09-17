@@ -26,6 +26,27 @@ pub(crate) fn fixed_hasher() -> FixedHashBuilder {
     FixedHashBuilder::with_seed(FIXED_HASH_SEED)
 }
 
+/// `with_capacity` for maps over [`FixedHashBuilder`]. The inherent
+/// constructors exist only for the default hasher; when that bound fails,
+/// resolution falls through to this trait, so tests read like production code.
+pub(crate) trait Deterministic: Sized {
+    fn with_capacity(capacity: usize) -> Self;
+}
+
+impl<K, V, P> Deterministic for HashMap<K, V, P>
+where
+    P: TableBackend<K, V, Hasher = FixedHashBuilder, Alloc = Global>,
+{
+    fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_hasher(capacity, fixed_hasher())
+    }
+}
+
+/// `ElasticHashMap` over [`FixedHashBuilder`]. Spelled as its own alias so
+/// `FixedElasticHashMap::with_capacity(n)` resolves to [`Deterministic`]; with
+/// the public alias's default hasher parameter the inherent constructor wins.
+pub(crate) type FixedElasticHashMap<K, V> = crate::ElasticHashMap<K, V, FixedHashBuilder>;
+
 pub(crate) struct IdentityHasher(u64);
 
 impl Hasher for IdentityHasher {
@@ -151,7 +172,7 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
 ) where
     P: TableBackend<u64, u64, Hasher = FixedHashBuilder, Alloc = Global>,
 {
-    let mut map: HashMap<u64, u64, P> = HashMap::with_capacity_and_hasher(2_048, fixed_hasher());
+    let mut map: HashMap<u64, u64, P> = Deterministic::with_capacity(2_048);
     let live = map.capacity() as u64;
     let threshold = membership::refresh_deletes(map.capacity()) as u64;
     for key in 0..live {

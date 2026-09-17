@@ -1,9 +1,9 @@
 use std::hash::{BuildHasher, Hasher};
 
-use opthash::{ElasticHashMap, ElasticHashSet, EpochTransition, FunnelHashMap, ReserveFraction};
+use opthash::{EpochTransition, ReserveFraction};
 
 mod support;
-use support::{FixedHashBuilder, fixed_hasher};
+use support::{Deterministic, ElasticHashMap, ElasticHashSet, FunnelHashMap};
 
 #[derive(Clone, Copy, Default)]
 struct ConstantBuildHasher;
@@ -55,9 +55,9 @@ macro_rules! assert_identity_present {
 
 #[test]
 fn compact_observability_exposes_epoch_and_reserve() {
-    let elastic = ElasticHashMap::<usize, usize, FixedHashBuilder>::with_hasher(fixed_hasher());
-    let funnel = FunnelHashMap::<usize, usize, FixedHashBuilder>::with_hasher(fixed_hasher());
-    let set = ElasticHashSet::<usize, FixedHashBuilder>::with_hasher(fixed_hasher());
+    let elastic = ElasticHashMap::<usize, usize>::new();
+    let funnel = FunnelHashMap::<usize, usize>::new();
+    let set = ElasticHashSet::<usize>::new();
 
     assert_eq!(elastic.reserve_fraction(), ReserveFraction::DEFAULT);
     assert_eq!(funnel.reserve_fraction(), ReserveFraction::DEFAULT);
@@ -83,24 +83,13 @@ fn duplicate_at_capacity_does_not_start_a_new_epoch() {
         }};
     }
 
-    check!(
-        ElasticHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-            64,
-            fixed_hasher()
-        )
-    );
-    check!(
-        FunnelHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-            64,
-            fixed_hasher()
-        )
-    );
+    check!(ElasticHashMap::<usize, usize>::with_capacity(64));
+    check!(FunnelHashMap::<usize, usize>::with_capacity(64));
 }
 
 #[test]
 fn duplicate_set_insert_at_capacity_does_not_grow() {
-    let mut set =
-        ElasticHashSet::<usize, FixedHashBuilder>::with_capacity_and_hasher(64, fixed_hasher());
+    let mut set = ElasticHashSet::<usize>::with_capacity(64);
     let capacity = set.capacity();
     for key in 0..capacity {
         assert!(set.insert(key));
@@ -114,10 +103,7 @@ fn duplicate_set_insert_at_capacity_does_not_grow() {
 
 #[test]
 fn first_absent_insert_beyond_capacity_grows_once() {
-    let mut map = FunnelHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-        64,
-        fixed_hasher(),
-    );
+    let mut map = FunnelHashMap::<usize, usize>::with_capacity(64);
     let capacity = fill_to_capacity!(map);
     let before = map.epoch();
 
@@ -131,10 +117,7 @@ fn first_absent_insert_beyond_capacity_grows_once() {
 
 #[test]
 fn ordinary_delete_marks_the_epoch_without_moving_to_a_new_one() {
-    let mut map = ElasticHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-        512,
-        fixed_hasher(),
-    );
+    let mut map = ElasticHashMap::<usize, usize>::with_capacity(512);
     fill_identity!(map, 0..100);
     let before = map.epoch();
 
@@ -166,27 +149,14 @@ fn insert_after_a_full_epoch_reuses_space_without_an_eager_rebuild() {
         }};
     }
 
-    check!(
-        ElasticHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-            64,
-            fixed_hasher()
-        )
-    );
-    check!(
-        FunnelHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-            64,
-            fixed_hasher()
-        )
-    );
+    check!(ElasticHashMap::<usize, usize>::with_capacity(64));
+    check!(FunnelHashMap::<usize, usize>::with_capacity(64));
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn tombstone_cleanup_is_an_observable_same_size_epoch_boundary() {
-    let mut map = ElasticHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-        512,
-        fixed_hasher(),
-    );
+    let mut map = ElasticHashMap::<usize, usize>::with_capacity(512);
     let capacity = fill_to_capacity!(map);
     let before = map.epoch();
 
@@ -228,18 +198,8 @@ fn bulk_removal_cleans_tombstones_after_iteration_finishes() {
         }};
     }
 
-    check!(
-        ElasticHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-            512,
-            fixed_hasher()
-        )
-    );
-    check!(
-        FunnelHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-            512,
-            fixed_hasher()
-        )
-    );
+    check!(ElasticHashMap::<usize, usize>::with_capacity(512));
+    check!(FunnelHashMap::<usize, usize>::with_capacity(512));
 }
 
 #[test]
@@ -266,26 +226,13 @@ fn partial_extract_drop_finishes_deferred_tombstone_cleanup() {
         }};
     }
 
-    check!(
-        ElasticHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-            512,
-            fixed_hasher()
-        )
-    );
-    check!(
-        FunnelHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-            512,
-            fixed_hasher()
-        )
-    );
+    check!(ElasticHashMap::<usize, usize>::with_capacity(512));
+    check!(FunnelHashMap::<usize, usize>::with_capacity(512));
 }
 
 #[test]
 fn clear_starts_a_fresh_epoch_in_the_same_allocation() {
-    let mut map = FunnelHashMap::<usize, usize, FixedHashBuilder>::with_capacity_and_hasher(
-        64,
-        fixed_hasher(),
-    );
+    let mut map = FunnelHashMap::<usize, usize>::with_capacity(64);
     map.insert(1, 1);
     let capacity = map.capacity();
     let before = map.epoch();
@@ -304,10 +251,11 @@ fn clear_starts_a_fresh_epoch_in_the_same_allocation() {
 fn below_capacity_funnel_placement_recovery_is_observable() {
     const FOLLOW_UP_INSERTS: usize = 32;
 
-    let mut map = FunnelHashMap::<usize, usize, ConstantBuildHasher>::with_capacity_and_hasher(
-        1_024,
-        ConstantBuildHasher,
-    );
+    let mut map =
+        opthash::FunnelHashMap::<usize, usize, ConstantBuildHasher>::with_capacity_and_hasher(
+            1_024,
+            ConstantBuildHasher,
+        );
     let mut next_key = 0;
     let first_recovery = loop {
         assert!(next_key < map.capacity());

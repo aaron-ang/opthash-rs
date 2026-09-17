@@ -17,12 +17,10 @@ macro_rules! parity_suite {
                 clippy::items_after_statements
             )]
 
-            use crate::support::{FixedHashBuilder, fixed_hasher};
+            use crate::support::{Deterministic, $TestMap as HashMap};
             use core::cell::RefCell;
             use opthash::DefaultHashBuilder;
             use opthash::$Entry as Entry;
-
-            type HashMap<K, V> = opthash::$TestMap<K, V, FixedHashBuilder>;
 
             thread_local! {
                 static DROP_VECTOR: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
@@ -76,7 +74,7 @@ macro_rules! parity_suite {
                 let m = HM::with_capacity_and_hasher(0, DefaultHashBuilder::default());
                 assert_eq!(m.capacity(), 0);
 
-                let mut m = HashMap::with_hasher(fixed_hasher());
+                let mut m = HashMap::new();
                 m.insert(1, 1);
                 m.insert(2, 2);
                 m.remove(&1);
@@ -84,14 +82,14 @@ macro_rules! parity_suite {
                 m.shrink_to_fit();
                 assert_eq!(m.capacity(), 0);
 
-                let mut m: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
+                let mut m: HashMap<i32, i32> = HashMap::new();
                 m.reserve(0);
                 assert_eq!(m.capacity(), 0);
             }
 
             #[test]
             fn test_create_capacity_zero() {
-                let mut m = HashMap::with_capacity_and_hasher(0, fixed_hasher());
+                let mut m = HashMap::with_capacity(0);
 
                 assert!(m.insert(1, 1).is_none());
 
@@ -101,7 +99,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_insert() {
-                let mut m = HashMap::with_hasher(fixed_hasher());
+                let mut m = HashMap::new();
                 assert_eq!(m.len(), 0);
                 assert!(m.insert(1, 2).is_none());
                 assert_eq!(m.len(), 1);
@@ -118,7 +116,7 @@ macro_rules! parity_suite {
                 });
 
                 {
-                    let mut m = HashMap::with_hasher(fixed_hasher());
+                    let mut m = HashMap::new();
 
                     DROP_VECTOR.with(|v| {
                         for i in 0..200 {
@@ -177,7 +175,7 @@ macro_rules! parity_suite {
                 });
 
                 let hm = {
-                    let mut hm = HashMap::with_hasher(fixed_hasher());
+                    let mut hm = HashMap::new();
 
                     DROP_VECTOR.with(|v| {
                         for i in 0..200 {
@@ -231,13 +229,13 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_empty_remove() {
-                let mut m: HashMap<i32, bool> = HashMap::with_hasher(fixed_hasher());
+                let mut m: HashMap<i32, bool> = HashMap::new();
                 assert_eq!(m.remove(&0), None);
             }
 
             #[test]
             fn test_empty_entry() {
-                let mut m: HashMap<i32, bool> = HashMap::with_hasher(fixed_hasher());
+                let mut m: HashMap<i32, bool> = HashMap::new();
                 match m.entry(0) {
                     Entry::Occupied(_) => panic!(),
                     Entry::Vacant(_) => {}
@@ -248,7 +246,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_empty_iter() {
-                let mut m: HashMap<i32, bool> = HashMap::with_hasher(fixed_hasher());
+                let mut m: HashMap<i32, bool> = HashMap::new();
                 assert_eq!(m.drain().next(), None);
                 assert_eq!(m.keys().next(), None);
                 assert_eq!(m.values().next(), None);
@@ -263,7 +261,7 @@ macro_rules! parity_suite {
             #[test]
             #[cfg_attr(miri, ignore = "quadratic insertion stress test is too slow")]
             fn test_lots_of_insertions() {
-                let mut m = HashMap::with_hasher(fixed_hasher());
+                let mut m = HashMap::new();
 
                 for _ in 0..10 {
                     assert!(m.is_empty());
@@ -322,7 +320,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_find_mut() {
-                let mut m = HashMap::with_hasher(fixed_hasher());
+                let mut m = HashMap::new();
                 assert!(m.insert(1, 12).is_none());
                 assert!(m.insert(2, 8).is_none());
                 assert!(m.insert(5, 14).is_none());
@@ -340,7 +338,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_insert_overwrite() {
-                let mut m = HashMap::with_hasher(fixed_hasher());
+                let mut m = HashMap::new();
                 assert!(m.insert(1, 2).is_none());
                 assert_eq!(*m.get(&1).unwrap(), 2);
                 assert!(m.insert(1, 3).is_some());
@@ -349,7 +347,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_insert_conflicts() {
-                let mut m = HashMap::with_capacity_and_hasher(4, fixed_hasher());
+                let mut m = HashMap::with_capacity(4);
                 assert!(m.insert(1, 2).is_none());
                 assert!(m.insert(5, 3).is_none());
                 assert!(m.insert(9, 4).is_none());
@@ -360,7 +358,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_conflict_remove() {
-                let mut m = HashMap::with_capacity_and_hasher(4, fixed_hasher());
+                let mut m = HashMap::with_capacity(4);
                 assert!(m.insert(1, 2).is_none());
                 assert_eq!(*m.get(&1).unwrap(), 2);
                 assert!(m.insert(5, 3).is_none());
@@ -377,7 +375,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_is_empty() {
-                let mut m = HashMap::with_capacity_and_hasher(4, fixed_hasher());
+                let mut m = HashMap::with_capacity(4);
                 assert!(m.insert(1, 2).is_none());
                 assert!(!m.is_empty());
                 assert!(m.remove(&1).is_some());
@@ -386,7 +384,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_remove() {
-                let mut m = HashMap::with_hasher(fixed_hasher());
+                let mut m = HashMap::new();
                 m.insert(1, 2);
                 assert_eq!(m.remove(&1), Some(2));
                 assert_eq!(m.remove(&1), None);
@@ -394,7 +392,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_remove_entry() {
-                let mut m = HashMap::with_hasher(fixed_hasher());
+                let mut m = HashMap::new();
                 m.insert(1, 2);
                 assert_eq!(m.remove_entry(&1), Some((1, 2)));
                 assert_eq!(m.remove(&1), None);
@@ -402,7 +400,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_iterate() {
-                let mut m = HashMap::with_capacity_and_hasher(4, fixed_hasher());
+                let mut m = HashMap::with_capacity(4);
                 for i in 0..32 {
                     assert!(m.insert(i, i * 2).is_none());
                 }
@@ -419,7 +417,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_find() {
-                let mut m = HashMap::with_hasher(fixed_hasher());
+                let mut m = HashMap::new();
                 assert!(m.get(&1).is_none());
                 m.insert(1, 2);
                 match m.get(&1) {
@@ -490,12 +488,12 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_eq() {
-                let mut m1 = HashMap::with_hasher(fixed_hasher());
+                let mut m1 = HashMap::new();
                 m1.insert(1, 2);
                 m1.insert(2, 3);
                 m1.insert(3, 4);
 
-                let mut m2 = HashMap::with_hasher(fixed_hasher());
+                let mut m2 = HashMap::new();
                 m2.insert(1, 2);
                 m2.insert(2, 3);
 
@@ -521,7 +519,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_index() {
-                let mut map = HashMap::with_hasher(fixed_hasher());
+                let mut map = HashMap::new();
 
                 map.insert(1, 2);
                 map.insert(2, 1);
@@ -533,7 +531,7 @@ macro_rules! parity_suite {
             #[test]
             #[should_panic(expected = "no entry found for key")]
             fn test_index_nonexistent() {
-                let mut map = HashMap::with_hasher(fixed_hasher());
+                let mut map = HashMap::new();
 
                 map.insert(1, 2);
                 map.insert(2, 1);
@@ -594,9 +592,9 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_extend_ref_k_ref_v() {
-                let mut a = HashMap::with_hasher(fixed_hasher());
+                let mut a = HashMap::new();
                 a.insert(1, "one");
-                let mut b = HashMap::with_hasher(fixed_hasher());
+                let mut b = HashMap::new();
                 b.insert(2, "two");
                 b.insert(3, "three");
 
@@ -611,7 +609,7 @@ macro_rules! parity_suite {
             #[test]
             fn test_extend_ref_kv_tuple() {
                 use std::ops::AddAssign;
-                let mut a = HashMap::with_hasher(fixed_hasher());
+                let mut a = HashMap::new();
                 a.insert(0, 0);
 
                 fn create_arr<T: AddAssign<T> + Copy, const N: usize>(
@@ -644,7 +642,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_capacity_not_less_than_len() {
-                let mut a = HashMap::with_hasher(fixed_hasher());
+                let mut a = HashMap::new();
                 for i in 0..512 {
                     a.insert(i, 0);
                     assert!(a.capacity() >= a.len());
@@ -661,7 +659,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_occupied_entry_key() {
-                let mut a = HashMap::with_hasher(fixed_hasher());
+                let mut a = HashMap::new();
                 let key = "hello there";
                 let value = "value goes here";
                 assert!(a.is_empty());
@@ -679,7 +677,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_vacant_entry_key() {
-                let mut a = HashMap::with_hasher(fixed_hasher());
+                let mut a = HashMap::new();
                 let key = "hello there";
                 let value = "value goes here";
 
@@ -730,7 +728,7 @@ macro_rules! parity_suite {
 
                 const MAX_ISIZE: usize = isize::MAX as usize;
 
-                let mut empty_bytes: HashMap<u8, u8> = HashMap::with_hasher(fixed_hasher());
+                let mut empty_bytes: HashMap<u8, u8> = HashMap::new();
 
                 if let Err(CapacityOverflow) = empty_bytes.try_reserve(usize::MAX) {
                 } else {
@@ -747,11 +745,11 @@ macro_rules! parity_suite {
                     Err(AllocError | CapacityOverflow)
                 ) {
                 } else {
-                    let mut empty_bytes2: HashMap<u8, u8> = HashMap::with_hasher(fixed_hasher());
+                    let mut empty_bytes2: HashMap<u8, u8> = HashMap::new();
                     let _ = empty_bytes2.try_reserve(MAX_ISIZE / 5);
-                    let mut empty_bytes3: HashMap<u8, u8> = HashMap::with_hasher(fixed_hasher());
+                    let mut empty_bytes3: HashMap<u8, u8> = HashMap::new();
                     let _ = empty_bytes3.try_reserve(MAX_ISIZE / 5);
-                    let mut empty_bytes4: HashMap<u8, u8> = HashMap::with_hasher(fixed_hasher());
+                    let mut empty_bytes4: HashMap<u8, u8> = HashMap::new();
                     if matches!(
                         empty_bytes4.try_reserve(MAX_ISIZE / 5),
                         Err(AllocError | CapacityOverflow)
@@ -764,7 +762,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_get_disjoint_mut() {
-                let mut map = HashMap::with_hasher(fixed_hasher());
+                let mut map = HashMap::new();
                 map.insert("foo".to_owned(), 0);
                 map.insert("bar".to_owned(), 10);
                 map.insert("baz".to_owned(), 20);
@@ -796,7 +794,7 @@ macro_rules! parity_suite {
                 // "capacity unchanged across the next n inserts" is impl-specific
                 // (funnel's bucket+special arch can hit probe-budget exhaustion
                 // mid-fill), so omitted.
-                let mut m = HashMap::with_hasher(fixed_hasher());
+                let mut m = HashMap::new();
                 m.insert(0, 0);
                 m.remove(&0);
                 assert!(m.capacity() >= m.len());
@@ -833,7 +831,7 @@ macro_rules! parity_suite {
             #[test]
             #[should_panic(expected = "duplicate keys")]
             fn test_get_disjoint_mut_duplicate() {
-                let mut map = HashMap::with_hasher(fixed_hasher());
+                let mut map = HashMap::new();
                 map.insert("foo".to_owned(), 0);
 
                 let _xs = map.get_disjoint_mut(["foo", "foo"]);
@@ -893,7 +891,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_clone() {
-                let mut m = HashMap::with_hasher(fixed_hasher());
+                let mut m = HashMap::new();
                 assert_eq!(m.len(), 0);
                 assert!(m.insert(1, 2).is_none());
                 assert_eq!(m.len(), 1);
@@ -907,8 +905,8 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_clone_from() {
-                let mut m = HashMap::with_hasher(fixed_hasher());
-                let mut m2 = HashMap::with_hasher(fixed_hasher());
+                let mut m = HashMap::new();
+                let mut m2 = HashMap::new();
                 assert_eq!(m.len(), 0);
                 assert!(m.insert(1, 2).is_none());
                 assert_eq!(m.len(), 1);
@@ -949,13 +947,13 @@ macro_rules! parity_suite {
                     dropped: false,
                 };
 
-                let mut map1 = HashMap::with_hasher(fixed_hasher());
+                let mut map1 = HashMap::new();
                 map1.insert(1, DISARMED);
                 map1.insert(2, DISARMED);
                 map1.insert(3, DISARMED);
                 map1.insert(4, DISARMED);
 
-                let mut map2 = HashMap::with_hasher(fixed_hasher());
+                let mut map2 = HashMap::new();
                 map2.insert(1, DISARMED);
                 map2.insert(2, ARMED);
                 map2.insert(3, DISARMED);
@@ -982,7 +980,7 @@ macro_rules! parity_suite {
                         }
                     }
                 }
-                let mut map1 = HashMap::with_hasher(fixed_hasher());
+                let mut map1 = HashMap::new();
                 map1.insert(
                     1,
                     CheckedClone {
@@ -1009,7 +1007,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_clone_of_empty_map() {
-                let map: HashMap<u32, u32> = HashMap::with_hasher(fixed_hasher());
+                let map: HashMap<u32, u32> = HashMap::new();
                 let cloned = map.clone();
                 assert!(cloned.is_empty());
                 assert_eq!(cloned.len(), 0);
@@ -1017,7 +1015,7 @@ macro_rules! parity_suite {
 
             #[test]
             fn test_clone_is_independent_of_source() {
-                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
+                let mut map: HashMap<i32, i32> = HashMap::new();
                 for i in 0..40 {
                     map.insert(i, i * 7);
                 }
@@ -1058,8 +1056,7 @@ macro_rules! parity_suite {
                 }
 
                 let counter = Arc::new(AtomicUsize::new(0));
-                let mut map: HashMap<i32, DropCounter> =
-                    HashMap::with_capacity_and_hasher(32, fixed_hasher());
+                let mut map: HashMap<i32, DropCounter> = HashMap::with_capacity(32);
                 for i in 0..16 {
                     map.insert(i, DropCounter(Arc::clone(&counter)));
                 }

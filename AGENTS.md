@@ -27,9 +27,10 @@ pre-commit install
 
 ## Tests
 
-Tests are deterministic. Construct maps in tests with the fixed-seed hasher
-(`test_support::fixed_hasher()` in `src/`, `support::fixed_hasher()` in
-`tests/`), never the random-seeded default; the default hasher is only for
+Tests are deterministic. Build maps from the fixed-seed aliases with the
+`Deterministic` trait in scope (`test_support` in `src/`, `tests/support` in
+integration tests) so `HashMap::new()` / `with_capacity(n)` seed foldhash
+identically on every run; never use the random-seeded default except in
 constructor-surface tests that hash no key. Treat a flaky test as a
 determinism bug to fix, not a run to repeat.
 
