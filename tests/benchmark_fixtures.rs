@@ -7,8 +7,9 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashSet;
 
 use harness::{
-    DEFAULT_HIT_QUERY_SEED, LATENCY_SIZES, exact_size_label, parse_positive_sizes,
-    scaled_insert_sample_size, sequential_hit_keys, shuffled_hit_keys, shuffled_hit_keys_with_seed,
+    DEFAULT_HIT_QUERY_SEED, LATENCY_SIZES, MAP_SIZE, MAP_SLOTS, MapQuad, exact_size_label,
+    parse_positive_sizes, scaled_insert_sample_size, sequential_hit_keys, shuffled_hit_keys,
+    shuffled_hit_keys_with_seed,
 };
 use memory::{AllocationCounters, AllocationMeasurement, AllocationSnapshot, CountingAllocator};
 
@@ -137,6 +138,23 @@ fn scaled_insert_uses_minimum_samples_only_for_the_10m_tier() {
     assert_eq!(scaled_insert_sample_size(9_999_999), 100);
     assert_eq!(scaled_insert_sample_size(10_000_000), 10);
     assert_eq!(scaled_insert_sample_size(20_000_000), 10);
+}
+
+#[test]
+fn throughput_maps_sit_at_their_full_insert_budget() {
+    let maps = MapQuad::new(&pairs(MAP_SIZE));
+    for (name, capacity) in [
+        ("std", maps.std.capacity()),
+        ("hashbrown", maps.hashbrown.capacity()),
+        ("elastic", maps.elastic.capacity()),
+        ("funnel", maps.funnel.capacity()),
+    ] {
+        assert_eq!(capacity, MAP_SIZE, "{name} has slack above MAP_SIZE");
+    }
+    assert!(
+        MAP_SLOTS.is_power_of_two(),
+        "power-of-two maps only land exactly on MAP_SIZE from a power-of-two slot count"
+    );
 }
 
 #[test]
