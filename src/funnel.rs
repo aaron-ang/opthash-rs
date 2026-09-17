@@ -1612,7 +1612,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn deletes_past_the_threshold_refresh_the_membership_filter() {
-        test_support::assert_deletes_past_threshold_refresh_filter::<FunnelTable<u64, u64>>(
+        test_support::assert_deletes_past_threshold_refresh_filter::<
+            FunnelTable<u64, u64, test_support::FixedHashBuilder>,
+        >(
             |table, key| {
                 table
                     .membership_gate(table.hash_builder.hash_one(key))

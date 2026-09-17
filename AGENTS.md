@@ -25,6 +25,14 @@ uv tool install pre-commit
 pre-commit install
 ```
 
+## Tests
+
+Tests are deterministic. Construct maps in tests with the fixed-seed hasher
+(`test_support::fixed_hasher()` in `src/`, `support::fixed_hasher()` in
+`tests/`), never the random-seeded default; the default hasher is only for
+constructor-surface tests that hash no key. Treat a flaky test as a
+determinism bug to fix, not a run to repeat.
+
 ## Benchmarks
 
 Criterion suite comparing `ElasticHashMap`, `FunnelHashMap`, `std::HashMap`, `hashbrown::HashMap` (SwissTable + foldhash — absolute ceiling).

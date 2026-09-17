@@ -1,3 +1,5 @@
+mod support;
+
 macro_rules! common_suite {
     ($mod_name:ident, $TestMap:ident, $Entry:ident) => {
         mod $mod_name {
@@ -5,8 +7,10 @@ macro_rules! common_suite {
             use std::sync::Arc;
             use std::sync::atomic::{AtomicUsize, Ordering};
 
+            use crate::support::{FixedHashBuilder, fixed_hasher};
             use opthash::$Entry as Entry;
-            use opthash::$TestMap as HashMap;
+
+            type HashMap<K, V> = opthash::$TestMap<K, V, FixedHashBuilder>;
 
             /// Value whose drop bumps a shared counter; used by the
             /// consuming-iterator tests to prove every element is dropped once.
@@ -30,7 +34,7 @@ macro_rules! common_suite {
 
             #[test]
             fn entry_and_modify_runs_on_occupied() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 map.insert(1, 10);
                 let value = map.entry(1).and_modify(|v| *v += 5).or_insert(0);
                 assert_eq!(*value, 15);
@@ -39,7 +43,7 @@ macro_rules! common_suite {
 
             #[test]
             fn entry_and_modify_skips_on_vacant() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 let mut touched = false;
                 let value = map.entry(1).and_modify(|_| touched = true).or_insert(42);
                 assert_eq!(*value, 42);
@@ -49,7 +53,7 @@ macro_rules! common_suite {
 
             #[test]
             fn entry_occupied_get_mut_mutates() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 map.insert(1, 10);
                 if let Entry::Occupied(mut occ) = map.entry(1) {
                     *occ.get_mut() = 99;
@@ -62,7 +66,7 @@ macro_rules! common_suite {
 
             #[test]
             fn entry_occupied_insert_returns_old_and_replaces() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 map.insert(1, 10);
                 if let Entry::Occupied(mut occ) = map.entry(1) {
                     let old = occ.insert(99);
@@ -75,7 +79,7 @@ macro_rules! common_suite {
 
             #[test]
             fn entry_occupied_into_mut_outlives_entry_borrow() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 map.insert(1, 10);
                 let value: &mut i32 = match map.entry(1) {
                     Entry::Occupied(occ) => occ.into_mut(),
@@ -87,7 +91,7 @@ macro_rules! common_suite {
 
             #[test]
             fn entry_occupied_remove_returns_value() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 map.insert(1, 10);
                 map.insert(2, 20);
                 if let Entry::Occupied(occ) = map.entry(1) {
@@ -102,7 +106,7 @@ macro_rules! common_suite {
 
             #[test]
             fn entry_or_insert_creates_when_missing() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 let value = map.entry(1).or_insert(10);
                 assert_eq!(*value, 10);
                 assert_eq!(map.get(&1), Some(&10));
@@ -111,7 +115,7 @@ macro_rules! common_suite {
 
             #[test]
             fn entry_or_insert_returns_existing() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 map.insert(1, 10);
                 let value = map.entry(1).or_insert(99);
                 assert_eq!(*value, 10);
@@ -121,7 +125,7 @@ macro_rules! common_suite {
 
             #[test]
             fn entry_or_insert_with_key_uses_key_in_default() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 let value = map.entry(7).or_insert_with_key(|k| k * 100);
                 assert_eq!(*value, 700);
                 assert_eq!(map.get(&7), Some(&700));
@@ -129,7 +133,7 @@ macro_rules! common_suite {
 
             #[test]
             fn entry_or_insert_with_lazy_default_not_called_on_hit() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 map.insert(1, 10);
                 let mut called = false;
                 let value = map.entry(1).or_insert_with(|| {
@@ -142,7 +146,7 @@ macro_rules! common_suite {
 
             #[test]
             fn entry_vacant_insert_returns_mut_ref() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 let value: &mut i32 = match map.entry(5) {
                     Entry::Vacant(vac) => vac.insert(50),
                     Entry::Occupied(_) => panic!("expected vacant"),
@@ -153,7 +157,8 @@ macro_rules! common_suite {
 
             #[test]
             fn get_disjoint_mut_mutation_propagates() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(32);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(32, fixed_hasher());
                 for i in 0..8 {
                     map.insert(i, i);
                 }
@@ -168,7 +173,8 @@ macro_rules! common_suite {
 
             #[test]
             fn get_disjoint_mut_zero_keys_returns_empty_array() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(16);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(16, fixed_hasher());
                 map.insert(1, 1);
                 let got = map.get_disjoint_mut::<i32, 0>([]);
                 assert_eq!(got.len(), 0);
@@ -176,7 +182,8 @@ macro_rules! common_suite {
 
             #[test]
             fn get_disjoint_unchecked_mut_returns_all_refs_on_hits() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(64);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(64, fixed_hasher());
                 for i in 0..16 {
                     map.insert(i, i * 10);
                 }
@@ -190,7 +197,8 @@ macro_rules! common_suite {
 
             #[test]
             fn get_disjoint_unchecked_mut_yields_none_per_missing_key() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(32);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(32, fixed_hasher());
                 for i in 0..8 {
                     map.insert(i, i);
                 }
@@ -201,7 +209,8 @@ macro_rules! common_suite {
 
             #[test]
             fn get_key_value_returns_both_on_hit_none_on_miss() {
-                let mut map: HashMap<String, i32> = HashMap::with_capacity(16);
+                let mut map: HashMap<String, i32> =
+                    HashMap::with_capacity_and_hasher(16, fixed_hasher());
                 map.insert("alpha".to_string(), 1);
                 map.insert("beta".to_string(), 2);
 
@@ -214,7 +223,7 @@ macro_rules! common_suite {
 
             #[test]
             fn hasher_returns_consistent_handle() {
-                let map: HashMap<i32, i32> = HashMap::new();
+                let map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 let a: *const _ = map.hasher();
                 let b: *const _ = map.hasher();
                 assert!(std::ptr::eq(a, b));
@@ -222,7 +231,7 @@ macro_rules! common_suite {
 
             #[test]
             fn insert_resizes_from_zero_capacity() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 map.insert(1, 10);
                 assert_eq!(map.get(&1), Some(&10));
                 assert!(map.capacity() > 0);
@@ -232,7 +241,7 @@ macro_rules! common_suite {
             #[cfg_attr(miri, ignore = "large-map stress test is too slow")]
             fn large_map_correctness() {
                 let n = 10_000;
-                let mut map = HashMap::with_capacity(n * 2);
+                let mut map = HashMap::with_capacity_and_hasher(n * 2, fixed_hasher());
                 for i in 0..n {
                     assert_eq!(map.insert(i, i), None);
                 }
@@ -244,7 +253,7 @@ macro_rules! common_suite {
 
             #[test]
             fn retain_with_empty_map_is_noop() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 let mut called = false;
                 map.retain(|_, _| {
                     called = true;
@@ -256,7 +265,7 @@ macro_rules! common_suite {
 
             #[test]
             fn try_insert_fails_with_occupied_error_when_present() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 map.insert(1, 10);
                 let err = map.try_insert(1, 99).expect_err("occupied must error");
                 assert_eq!(err.entry.key(), &1);
@@ -266,7 +275,7 @@ macro_rules! common_suite {
 
             #[test]
             fn try_insert_occupied_error_carries_rejected_value() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 map.insert(1, 10);
                 let err = map.try_insert(1, 99).expect_err("occupied must error");
                 assert_eq!(err.value, 99);
@@ -274,7 +283,7 @@ macro_rules! common_suite {
 
             #[test]
             fn try_insert_succeeds_when_missing() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 let value = map.try_insert(1, 10).expect("vacant should succeed");
                 assert_eq!(*value, 10);
                 assert_eq!(map.get(&1), Some(&10));
@@ -282,7 +291,7 @@ macro_rules! common_suite {
 
             #[test]
             fn try_reserve_grows_when_needed() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
+                let mut map: HashMap<i32, i32> = HashMap::with_hasher(fixed_hasher());
                 assert_eq!(map.capacity(), 0);
                 map.try_reserve(1024).expect("alloc should succeed");
                 let cap = map.capacity();
@@ -298,7 +307,8 @@ macro_rules! common_suite {
 
             #[test]
             fn drain_partial_consume_then_drop_still_empties_map() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(256);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(256, fixed_hasher());
                 for i in 0..60 {
                     map.insert(i, i);
                 }
@@ -314,7 +324,8 @@ macro_rules! common_suite {
 
             #[test]
             fn drain_yields_all_entries_then_empties_map() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(256);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(256, fixed_hasher());
                 for i in 0..60 {
                     map.insert(i, i * 7);
                 }
@@ -330,7 +341,8 @@ macro_rules! common_suite {
 
             #[test]
             fn extract_if_partial_consume_then_drop_keeps_remaining_in_map() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(256);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(256, fixed_hasher());
                 for i in 0..60 {
                     map.insert(i, i);
                 }
@@ -351,7 +363,8 @@ macro_rules! common_suite {
             fn into_iter_partial_drop_drops_remaining() {
                 let counter = Arc::new(AtomicUsize::new(0));
                 let n: usize = 50;
-                let mut map: HashMap<usize, DropCounter> = HashMap::with_capacity(128);
+                let mut map: HashMap<usize, DropCounter> =
+                    HashMap::with_capacity_and_hasher(128, fixed_hasher());
                 for i in 0..n {
                     map.insert(i, DropCounter::new(&counter));
                 }
@@ -369,7 +382,8 @@ macro_rules! common_suite {
 
             #[test]
             fn into_iter_skips_tombstones() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(128, fixed_hasher());
                 for i in 0..60 {
                     map.insert(i, i);
                 }
@@ -383,7 +397,8 @@ macro_rules! common_suite {
 
             #[test]
             fn into_iter_yields_all_entries() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(128, fixed_hasher());
                 for i in 0..60 {
                     map.insert(i, i * 11);
                 }
@@ -397,7 +412,8 @@ macro_rules! common_suite {
             fn into_keys_drops_values() {
                 let counter = Arc::new(AtomicUsize::new(0));
                 let n: usize = 32;
-                let mut map: HashMap<usize, DropCounter> = HashMap::with_capacity(64);
+                let mut map: HashMap<usize, DropCounter> =
+                    HashMap::with_capacity_and_hasher(64, fixed_hasher());
                 for i in 0..n {
                     map.insert(i, DropCounter::new(&counter));
                 }
@@ -431,7 +447,8 @@ macro_rules! common_suite {
 
                 let counter = Arc::new(AtomicUsize::new(0));
                 let n: usize = 32;
-                let mut map: HashMap<DropKey, usize> = HashMap::with_capacity(64);
+                let mut map: HashMap<DropKey, usize> =
+                    HashMap::with_capacity_and_hasher(64, fixed_hasher());
                 for i in 0..n {
                     map.insert(
                         DropKey {
@@ -448,7 +465,8 @@ macro_rules! common_suite {
 
             #[test]
             fn iter_mut_partial_consume_then_drop() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(128, fixed_hasher());
                 for i in 0..40 {
                     map.insert(i, i);
                 }
@@ -468,7 +486,8 @@ macro_rules! common_suite {
 
             #[test]
             fn iter_mut_skips_tombstones() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(64);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(64, fixed_hasher());
                 for i in 0..40 {
                     map.insert(i, i);
                 }
@@ -481,7 +500,8 @@ macro_rules! common_suite {
 
             #[test]
             fn iter_mut_yields_each_entry_exactly_once() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(128, fixed_hasher());
                 for i in 0..80 {
                     map.insert(i, i * 3);
                 }
@@ -494,7 +514,8 @@ macro_rules! common_suite {
 
             #[test]
             fn iter_skips_tombstones_after_remove() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(64);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(64, fixed_hasher());
                 for i in 0..40 {
                     map.insert(i, i);
                 }
@@ -507,7 +528,8 @@ macro_rules! common_suite {
 
             #[test]
             fn iter_yields_every_inserted_pair_once() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(128, fixed_hasher());
                 for i in 0..80 {
                     map.insert(i, i * 7);
                 }
@@ -519,7 +541,8 @@ macro_rules! common_suite {
 
             #[test]
             fn keys_yields_inserted_keys_only() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(128, fixed_hasher());
                 for i in 0..50 {
                     map.insert(i, i * 7);
                 }
@@ -530,7 +553,8 @@ macro_rules! common_suite {
 
             #[test]
             fn retain_can_mutate_values_in_place() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(256);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(256, fixed_hasher());
                 for i in 0..40 {
                     map.insert(i, i);
                 }
@@ -546,7 +570,8 @@ macro_rules! common_suite {
 
             #[test]
             fn shrink_then_insert_works() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(2048);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(2048, fixed_hasher());
                 for i in 0..400 {
                     map.insert(i, i * 3);
                 }
@@ -567,7 +592,8 @@ macro_rules! common_suite {
 
             #[test]
             fn shrink_to_above_capacity_is_noop() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(256);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(256, fixed_hasher());
                 for i in 0..20 {
                     map.insert(i, i);
                 }
@@ -578,7 +604,8 @@ macro_rules! common_suite {
 
             #[test]
             fn shrink_to_below_len_clamps_to_len() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(4096);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(4096, fixed_hasher());
                 for i in 0..200 {
                     map.insert(i, i);
                 }
@@ -595,7 +622,8 @@ macro_rules! common_suite {
             #[test]
             #[cfg_attr(miri, ignore = "broad resize and drop workload is too slow")]
             fn shrink_to_fit_reduces_capacity_when_sparse() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(4096);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(4096, fixed_hasher());
                 for i in 0..2000 {
                     map.insert(i, i);
                 }
@@ -612,7 +640,8 @@ macro_rules! common_suite {
 
             #[test]
             fn try_reserve_zero_additional_is_noop() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(128, fixed_hasher());
                 let cap_before = map.capacity();
                 map.try_reserve(0).expect("noop");
                 assert_eq!(map.capacity(), cap_before);
@@ -620,7 +649,8 @@ macro_rules! common_suite {
 
             #[test]
             fn values_yields_inserted_values_only() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(128, fixed_hasher());
                 for i in 0..50 {
                     map.insert(i, i * 7);
                 }
@@ -633,13 +663,14 @@ macro_rules! common_suite {
             fn options_constructor_fits_requested_capacity() {
                 // `capacity` arg is the insertion budget; the map allocates
                 // at least enough slots so `capacity() >= requested`.
-                let map: HashMap<i32, i32> = HashMap::with_capacity(320);
+                let map: HashMap<i32, i32> = HashMap::with_capacity_and_hasher(320, fixed_hasher());
                 assert!(map.capacity() >= 320);
             }
 
             #[test]
             fn insert_resizes_when_threshold_is_reached() {
-                let mut map: HashMap<usize, usize> = HashMap::with_capacity(64);
+                let mut map: HashMap<usize, usize> =
+                    HashMap::with_capacity_and_hasher(64, fixed_hasher());
                 // `capacity()` returns max_insertions for the current allocation.
                 let max_insertions = map.capacity();
                 for key in 0..max_insertions + 10 {
@@ -658,7 +689,7 @@ macro_rules! common_suite {
                 let trials = if cfg!(miri) { 5 } else { 10 };
                 let cutoff = (n * 4) / 5;
                 for trial in 0..trials {
-                    let mut map = HashMap::new();
+                    let mut map = HashMap::with_hasher(fixed_hasher());
                     for i in 0..n {
                         map.insert(i, i * 10);
                     }
@@ -692,7 +723,7 @@ macro_rules! common_suite {
 
             #[test]
             fn clear_removes_all_entries_and_resets_map() {
-                let mut map = HashMap::with_capacity(64);
+                let mut map = HashMap::with_capacity_and_hasher(64, fixed_hasher());
                 for key in 0..10 {
                     assert_eq!(map.insert(key, key * 10), None);
                 }
@@ -709,7 +740,7 @@ macro_rules! common_suite {
 
             #[test]
             fn interleaved_insert_delete_correctness() {
-                let mut map = HashMap::with_capacity(256);
+                let mut map = HashMap::with_capacity_and_hasher(256, fixed_hasher());
                 // Insert 100, delete odd keys, verify even keys survive.
                 for i in 0..100 {
                     map.insert(i, i);
@@ -727,7 +758,8 @@ macro_rules! common_suite {
 
             #[test]
             fn iter_mut_yields_mutable_values_in_some_order() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
+                let mut map: HashMap<i32, i32> =
+                    HashMap::with_capacity_and_hasher(128, fixed_hasher());
                 for i in 0..50 {
                     map.insert(i, i);
                 }
