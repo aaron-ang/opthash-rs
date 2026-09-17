@@ -1354,13 +1354,13 @@ pub(crate) type IntoValues<K, V, P> = CommonIntoValues<IntoIter<K, V, P>>;
 // Trait impls
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "default-hasher")]
 impl<K, V, P> Default for HashMap<K, V, P>
 where
-    P: TableBackend<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableBackend<K, V, Alloc = Global>,
+    P::Hasher: Default,
 {
     fn default() -> Self {
-        Self::with_capacity(0)
+        Self::with_hasher(P::Hasher::default())
     }
 }
 
@@ -1457,15 +1457,15 @@ where
     }
 }
 
-#[cfg(feature = "default-hasher")]
 impl<K, V, P> FromIterator<(K, V)> for HashMap<K, V, P>
 where
     K: Eq + Hash,
-    P: TableBackend<K, V, Hasher = DefaultHashBuilder, Alloc = Global>,
+    P: TableBackend<K, V, Alloc = Global>,
+    P::Hasher: Default,
 {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
         let iter = iter.into_iter();
-        let mut map = Self::with_capacity(iter.size_hint().0);
+        let mut map = Self::with_capacity_and_hasher(iter.size_hint().0, P::Hasher::default());
         map.extend(iter);
         map
     }

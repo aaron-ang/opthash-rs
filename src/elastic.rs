@@ -1801,7 +1801,8 @@ mod tests {
 
     use crate::common::exact::reference::{ScalarElastic, ScalarElasticLimits};
     use crate::common::test_support::{
-        self, CountDrop, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
+        self, CountDrop, FixedHashBuilder, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop,
+        ToggleAllocator, fixed_hasher,
     };
     use alloc::sync::Arc;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -2090,7 +2091,12 @@ mod tests {
     #[test]
     fn clear_marks_each_slot_empty_before_dropping_its_value() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut map = ManuallyDrop::new(ElasticHashMap::<u64, PanicOnFirstDrop>::with_capacity(32));
+        let mut map = ManuallyDrop::new(
+            ElasticHashMap::<u64, PanicOnFirstDrop, FixedHashBuilder>::with_capacity_and_hasher(
+                32,
+                fixed_hasher(),
+            ),
+        );
         for key in 0..3 {
             map.insert(key, PanicOnFirstDrop(drops.clone()));
         }
@@ -2146,7 +2152,11 @@ mod tests {
             armed: panic.clone(),
             drops: key_drops.clone(),
         };
-        let mut map = ElasticHashMap::<PanicHashKey, CountDrop>::with_capacity(32);
+        let mut map =
+            ElasticHashMap::<PanicHashKey, CountDrop, FixedHashBuilder>::with_capacity_and_hasher(
+                32,
+                fixed_hasher(),
+            );
         for id in 0..16_u64 {
             map.insert(key(id), CountDrop(drops.clone()));
         }
@@ -2212,10 +2222,10 @@ mod tests {
         assert!(mem::size_of::<ElasticMetadataWord>() <= 2 * membership::SLOTS_PER_WORD);
 
         let table =
-            ElasticTable::<OverAligned, OverAligned>::with_capacity_and_reserve_and_hasher_in(
+            ElasticTable::<OverAligned, OverAligned, FixedHashBuilder>::with_capacity_and_reserve_and_hasher_in(
                 64,
                 ReserveFraction::DEFAULT,
-                DefaultHashBuilder::default(),
+                fixed_hasher(),
                 Global,
             );
         let layout = elastic_arena_layout::<OverAligned, OverAligned>(table.total_slots).unwrap();
@@ -2240,7 +2250,8 @@ mod tests {
 
     #[test]
     fn normal_inserts_advance_batch_scheduler() {
-        let mut map: ElasticHashMap<usize, usize> = ElasticHashMap::with_capacity(1024);
+        let mut map: ElasticHashMap<usize, usize, FixedHashBuilder> =
+            ElasticHashMap::with_capacity_and_hasher(1024, fixed_hasher());
         let initial_quota = map.table().scheduler.batch_ends[0];
         assert!(
             initial_quota > 0,
@@ -2269,7 +2280,8 @@ mod tests {
 
     #[test]
     fn batch_target_follows_the_live_count_in_both_directions() {
-        let mut map: ElasticHashMap<usize, usize> = ElasticHashMap::with_capacity(1024);
+        let mut map: ElasticHashMap<usize, usize, FixedHashBuilder> =
+            ElasticHashMap::with_capacity_and_hasher(1024, fixed_hasher());
         let quota = map.table().scheduler.batch_ends[0];
         assert!(quota > 0);
 
@@ -2306,7 +2318,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn deletes_past_the_threshold_refresh_the_membership_filter() {
-        test_support::assert_deletes_past_threshold_refresh_filter::<ElasticTable<u64, u64>>(
+        test_support::assert_deletes_past_threshold_refresh_filter::<
+            ElasticTable<u64, u64, FixedHashBuilder>,
+        >(
             |table, key| {
                 let prepared = PreparedElasticKey::new(table.hash_builder.hash_one(key));
                 table.route_filter(prepared).maybe_present
@@ -2317,7 +2331,8 @@ mod tests {
 
     #[test]
     fn duplicate_insert_does_not_advance_the_paper_schedule() {
-        let mut map: ElasticHashMap<u64, u64> = ElasticHashMap::with_capacity(64);
+        let mut map: ElasticHashMap<u64, u64, FixedHashBuilder> =
+            ElasticHashMap::with_capacity_and_hasher(64, fixed_hasher());
         assert_eq!(map.insert(7, 11), None);
         let batch = map.table().scheduler.current_batch_index;
         let len = map.len();
@@ -2823,11 +2838,11 @@ mod tests {
 
     #[test]
     fn direct_lookup_returns_the_compared_slot_reference() {
-        let mut table: ElasticTable<usize, usize> =
+        let mut table: ElasticTable<usize, usize, FixedHashBuilder> =
             ElasticTable::with_capacity_and_reserve_and_hasher_in(
                 1024,
                 ReserveFraction::DEFAULT,
-                DefaultHashBuilder::default(),
+                fixed_hasher(),
                 Global,
             );
         let mut insertion_count = 0;
@@ -2870,7 +2885,8 @@ mod tests {
 
     #[test]
     fn delete_below_cleanup_threshold_preserves_survivor_locations() {
-        let mut map: ElasticHashMap<usize, usize> = ElasticHashMap::with_capacity(512);
+        let mut map: ElasticHashMap<usize, usize, FixedHashBuilder> =
+            ElasticHashMap::with_capacity_and_hasher(512, fixed_hasher());
         for key in 0..100 {
             map.insert(key, key);
         }
@@ -2906,11 +2922,11 @@ mod tests {
 
     #[test]
     fn rebuild_inserts_advance_batch_scheduler() {
-        let mut table: ElasticTable<usize, usize> =
+        let mut table: ElasticTable<usize, usize, FixedHashBuilder> =
             ElasticTable::with_capacity_and_reserve_and_hasher_in(
                 1024,
                 ReserveFraction::DEFAULT,
-                DefaultHashBuilder::default(),
+                fixed_hasher(),
                 Global,
             );
         let initial_quota = table.scheduler.batch_ends[0];
@@ -2931,11 +2947,11 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn vacant_insert_uses_the_table_insertion_limit() {
-        let mut table: ElasticTable<usize, usize> =
+        let mut table: ElasticTable<usize, usize, FixedHashBuilder> =
             ElasticTable::with_capacity_and_reserve_and_hasher_in(
                 1024,
                 ReserveFraction::DEFAULT,
-                DefaultHashBuilder::default(),
+                fixed_hasher(),
                 Global,
             );
         let rebuild_slots = table.total_slots * 2;
@@ -2961,7 +2977,8 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn clone_and_clear_preserve_elastic_lookups() {
-        let mut map: ElasticHashMap<u64, u64> = ElasticHashMap::with_capacity(512);
+        let mut map: ElasticHashMap<u64, u64, FixedHashBuilder> =
+            ElasticHashMap::with_capacity_and_hasher(512, fixed_hasher());
         for i in 0..384 {
             map.insert(i, i ^ 0xa5a5);
         }
@@ -2988,7 +3005,8 @@ mod tests {
 
     #[test]
     fn retain_does_not_trigger_mid_iter_resize_with_clustered_tombstones() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(256);
+        let mut map: ElasticHashMap<i32, i32, FixedHashBuilder> =
+            ElasticHashMap::with_capacity_and_hasher(256, fixed_hasher());
         let cap = i32::try_from(map.capacity()).expect("test capacity fits i32");
         let n = cap * 2 / 3;
         for i in 0..n {
@@ -3016,7 +3034,8 @@ mod tests {
     #[test]
     fn inserts_spill_to_deeper_levels_at_high_load() {
         // Paper §4: batches push later inserts into deeper levels.
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(512);
+        let mut map: ElasticHashMap<i32, i32, FixedHashBuilder> =
+            ElasticHashMap::with_capacity_and_hasher(512, fixed_hasher());
         assert!(
             map.table().levels.len() > 1,
             "test requires multi-level layout"
@@ -3037,7 +3056,8 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn removing_every_entry_empties_every_level() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(512);
+        let mut map: ElasticHashMap<i32, i32, FixedHashBuilder> =
+            ElasticHashMap::with_capacity_and_hasher(512, fixed_hasher());
         let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
         for i in 0..max {
             map.insert(i, i);
