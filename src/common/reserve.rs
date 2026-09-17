@@ -12,6 +12,14 @@ pub struct ReserveFraction {
     exponent: u32,
 }
 
+/// Binary64 exponent bias: `2^-d` for `d < F64_EXPONENT_BIAS` is a normal
+/// value with biased exponent `F64_EXPONENT_BIAS - d`.
+const F64_EXPONENT_BIAS: u32 = (f64::MAX_EXP - 1) as u32;
+/// Fraction bits below the binary64 exponent field.
+const F64_MANTISSA_BITS: u32 = f64::MANTISSA_DIGITS - 1;
+/// `2^-1074` is the smallest binary64 subnormal; larger `d` has no representation.
+const F64_MIN_SUBNORMAL_EXPONENT: u32 = F64_EXPONENT_BIAS + F64_MANTISSA_BITS - 1;
+
 impl ReserveFraction {
     /// The default reserve fraction `1/8`.
     pub const DEFAULT: Self = Self { exponent: 3 };
@@ -54,12 +62,12 @@ impl ReserveFraction {
     #[must_use]
     pub const fn as_f64(self) -> Option<f64> {
         match self.exponent {
-            1..=1_022 => {
-                let biased_exponent = 1_023_u64 - self.exponent as u64;
-                Some(f64::from_bits(biased_exponent << 52))
+            1..F64_EXPONENT_BIAS => {
+                let biased_exponent = (F64_EXPONENT_BIAS - self.exponent) as u64;
+                Some(f64::from_bits(biased_exponent << F64_MANTISSA_BITS))
             }
-            1_023..=1_074 => {
-                let significand_bit = 1_074_u32 - self.exponent;
+            F64_EXPONENT_BIAS..=F64_MIN_SUBNORMAL_EXPONENT => {
+                let significand_bit = F64_MIN_SUBNORMAL_EXPONENT - self.exponent;
                 Some(f64::from_bits(1_u64 << significand_bit))
             }
             _ => None,
@@ -82,19 +90,19 @@ impl TryFrom<f64> for ReserveFraction {
         }
 
         let bits = value.to_bits();
-        let biased_exponent = ((bits >> 52) & 0x7ff) as u32;
-        let significand = bits & ((1_u64 << 52) - 1);
+        let biased_exponent = ((bits >> F64_MANTISSA_BITS) & 0x7ff) as u32;
+        let significand = bits & ((1_u64 << F64_MANTISSA_BITS) - 1);
 
         let exponent = if biased_exponent == 0 {
             if !significand.is_power_of_two() {
                 return Err(ReserveFractionError::NotInversePowerOfTwo);
             }
-            1_074 - significand.trailing_zeros()
+            F64_MIN_SUBNORMAL_EXPONENT - significand.trailing_zeros()
         } else {
             if significand != 0 {
                 return Err(ReserveFractionError::NotInversePowerOfTwo);
             }
-            1_023 - biased_exponent
+            F64_EXPONENT_BIAS - biased_exponent
         };
 
         Self::from_exponent(exponent)
