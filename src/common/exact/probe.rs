@@ -796,18 +796,16 @@ pub(crate) const fn elastic_dyadic_probe_budget(
         return Err(ElasticProbeBudgetError::ZeroConstant);
     }
 
-    let level_bits = usize::BITS - level_slots.leading_zeros();
-    let free_bits = usize::BITS - free_slots.leading_zeros();
-    let log_floor_difference = level_bits - free_bits;
-    let Some(scaled_free_slots) = free_slots.checked_shl(log_floor_difference) else {
-        return Err(ElasticProbeBudgetError::Overflow);
-    };
-    let log_ceiling = log_floor_difference as usize
-        + if level_slots > scaled_free_slots {
-            1
-        } else {
-            0
+    let quotient = level_slots / free_slots;
+    let ratio_ceiling = if level_slots.is_multiple_of(free_slots) {
+        quotient
+    } else {
+        let Some(rounded) = quotient.checked_add(1) else {
+            return Err(ElasticProbeBudgetError::Overflow);
         };
+        rounded
+    };
+    let log_ceiling = (usize::BITS - (ratio_ceiling - 1).leading_zeros()) as usize;
     let Some(log_squared) = log_ceiling.checked_mul(log_ceiling) else {
         return Err(ElasticProbeBudgetError::Overflow);
     };
@@ -852,87 +850,6 @@ impl PreparedProbeRange {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn division_reference(
-        free_slots: usize,
-        level_slots: usize,
-        reserve_exponent: u32,
-        c: usize,
-    ) -> Result<usize, ElasticProbeBudgetError> {
-        if free_slots == 0 || free_slots > level_slots {
-            return Err(ElasticProbeBudgetError::InvalidFreeSlots {
-                free_slots,
-                level_slots,
-            });
-        }
-        if c == 0 {
-            return Err(ElasticProbeBudgetError::ZeroConstant);
-        }
-
-        let quotient = level_slots / free_slots;
-        let ratio_ceiling = quotient + usize::from(!level_slots.is_multiple_of(free_slots));
-        let log_ceiling = (usize::BITS - (ratio_ceiling - 1).leading_zeros()) as usize;
-        let log_squared = log_ceiling
-            .checked_mul(log_ceiling)
-            .ok_or(ElasticProbeBudgetError::Overflow)?;
-        let capped = log_squared.min(reserve_exponent as usize);
-        c.checked_mul(capped)
-            .ok_or(ElasticProbeBudgetError::Overflow)
-    }
-
-    #[test]
-    fn elastic_probe_budget_matches_division_reference_at_boundaries() {
-        let word_max = usize::MAX;
-        let cases = [
-            (0, 0, 3, 8),
-            (0, 1, 3, 8),
-            (2, 1, 3, 8),
-            (1, 1, 0, 8),
-            (1, 1, 3, 0),
-            (1, 1, 3, word_max),
-            (word_max, word_max, u32::MAX, word_max),
-            (word_max / 2 + 1, word_max, 3, 8),
-            (word_max / 2, word_max, 3, 8),
-            (1, word_max, 3, 8),
-        ];
-        for (free_slots, level_slots, reserve_exponent, c) in cases {
-            assert_eq!(
-                elastic_dyadic_probe_budget(free_slots, level_slots, reserve_exponent, c),
-                division_reference(free_slots, level_slots, reserve_exponent, c),
-                "free_slots={free_slots}, level_slots={level_slots}, reserve_exponent={reserve_exponent}, c={c}",
-            );
-        }
-    }
-
-    #[test]
-    fn elastic_probe_budget_matches_division_reference_broadly() {
-        for level_slots in 1..=2_048 {
-            for free_slots in 1..=level_slots {
-                assert_eq!(
-                    elastic_dyadic_probe_budget(free_slots, level_slots, 3, 8),
-                    division_reference(free_slots, level_slots, 3, 8),
-                    "free_slots={free_slots}, level_slots={level_slots}",
-                );
-            }
-        }
-
-        let mut state = 0xd1b5_4a32_d192_ed03_u64;
-        for _ in 0..100_000 {
-            state = state
-                .wrapping_mul(2_862_933_555_777_941_757)
-                .wrapping_add(3_039);
-            let level_slots = usize::try_from(state).unwrap_or(usize::MAX).max(1);
-            state = state.rotate_left(17);
-            let free_slots = (usize::try_from(state).unwrap_or(usize::MAX) % level_slots) + 1;
-            let reserve_exponent = u32::try_from(state).unwrap_or(u32::MAX) % 32;
-            let c = usize::try_from(state).unwrap_or(usize::MAX) | 1;
-            assert_eq!(
-                elastic_dyadic_probe_budget(free_slots, level_slots, reserve_exponent, c),
-                division_reference(free_slots, level_slots, reserve_exponent, c),
-                "free_slots={free_slots}, level_slots={level_slots}, reserve_exponent={reserve_exponent}, c={c}",
-            );
-        }
-    }
 
     #[test]
     #[cfg_attr(
