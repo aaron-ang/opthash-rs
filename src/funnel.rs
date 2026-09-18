@@ -30,7 +30,13 @@ const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
 /// Pointerless scan progress through Funnel's flat storage.
 #[derive(Clone)]
 pub struct FunnelScan {
-    cursor: OccupiedIndices,
+    mode: FunnelScanMode,
+}
+
+#[derive(Clone)]
+enum FunnelScanMode {
+    Dense(usize),
+    Sparse(OccupiedIndices),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1025,8 +1031,10 @@ where
     #[inline(never)]
     fn refresh_membership(&mut self) {
         self.clear_membership();
-        let mut scan = OccupiedIndices::new();
-        while let Some(slot) = scan.step(&self.storage) {
+        for slot in 0..self.shape.n {
+            if !control::is_occupied(self.storage.control_at(slot)) {
+                continue;
+            }
             let hash = {
                 let entry = unsafe { self.storage.get_ref(slot) };
                 self.hash_builder.hash_one(&entry.key)
@@ -1419,14 +1427,35 @@ where
     #[inline]
     fn scan(&self) -> FunnelScan {
         FunnelScan {
-            cursor: OccupiedIndices::new(),
+            // Dense scans avoid lane extraction for nearly every slot. Only
+            // sparse tables amortize masks over enough empty controls; choose
+            // once so draining cannot switch modes midway through a group.
+            mode: if self.len <= self.shape.n / 4 {
+                FunnelScanMode::Sparse(OccupiedIndices::new())
+            } else {
+                FunnelScanMode::Dense(0)
+            },
         }
     }
 
     #[inline]
     fn scan_next(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, usize)> {
-        let slot = scan.cursor.step(&self.storage)?;
-        Some((self.storage.slot_ptr(slot), slot))
+        match &mut scan.mode {
+            FunnelScanMode::Dense(next) => {
+                while *next < self.shape.n {
+                    let slot = *next;
+                    *next += 1;
+                    if control::is_occupied(self.storage.control_at(slot)) {
+                        return Some((self.storage.slot_ptr(slot), slot));
+                    }
+                }
+                None
+            }
+            FunnelScanMode::Sparse(cursor) => {
+                let slot = cursor.step(&self.storage)?;
+                Some((self.storage.slot_ptr(slot), slot))
+            }
+        }
     }
 
     fn with_capacity_and_reserve_and_hasher_in(
@@ -1556,6 +1585,35 @@ mod tests {
             Global,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn dense_scan_preserves_order_while_removals_make_the_table_sparse() {
+        let mut table = raw_table(344, 4);
+        let slots = (0..320).filter(|slot| slot % 11 != 0).collect::<Vec<_>>();
+        for &slot in &slots {
+            let key = slot as u64;
+            let hash = table.hash_builder.hash_one(key);
+            table.place_new_entry(
+                slot,
+                key,
+                key + 100,
+                table.membership_slot(hash),
+                control::control_fingerprint(hash),
+                true,
+            );
+        }
+        let mut scan = map::TableBackend::scan(&table);
+        for slot in slots {
+            let (ptr, found) = map::TableBackend::scan_next(&table, &mut scan).unwrap();
+            assert_eq!(found, slot);
+            let entry = unsafe { ptr.read() };
+            assert_eq!((entry.key, entry.value), (slot as u64, slot as u64 + 100));
+            map::TableBackend::extract_finish(&mut table, slot);
+        }
+        assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
+        assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
+        assert_eq!(table.len, 0);
     }
 
     #[test]
