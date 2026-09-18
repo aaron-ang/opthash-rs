@@ -785,9 +785,10 @@ where
         }
     }
 
-    /// Both filter answers from one word: `maybe_present == false` proves the key
-    /// was never recorded, and `level_mask` narrows the candidate levels. One
-    /// dependent load for the pair.
+    /// Reads the membership scalar and selected route-summary bin directly:
+    /// `maybe_present == false` proves the key was never recorded, and
+    /// `level_mask` narrows the candidate levels. The two field loads avoid
+    /// copying the whole metadata word for dynamic bin extraction.
     #[inline]
     fn route_filter(&self, prepared: PreparedElasticKey) -> ElasticRouteFilter {
         let words = self.membership.words;
