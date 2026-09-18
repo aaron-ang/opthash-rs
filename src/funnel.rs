@@ -18,6 +18,7 @@ use crate::common::exact::probe::{
     FUNNEL_SPECIAL_PRIMARY_BASE, FunnelPrf, PreparedFastFunnelDomainProbe, PreparedFastFunnelProbe,
     PreparedProbeRange,
 };
+use crate::common::iter::OccupiedIndices;
 use crate::common::math::capacity;
 use crate::common::membership::{self, MembershipKey, MembershipRegion};
 use crate::common::simd;
@@ -25,6 +26,12 @@ use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
 use crate::{macros, map};
 
 const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
+
+/// Pointerless scan progress through Funnel's flat storage.
+#[derive(Clone)]
+pub struct FunnelScan {
+    cursor: OccupiedIndices,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LevelShape {
@@ -1018,10 +1025,8 @@ where
     #[inline(never)]
     fn refresh_membership(&mut self) {
         self.clear_membership();
-        for slot in 0..self.shape.n {
-            if !control::is_occupied(self.storage.control_at(slot)) {
-                continue;
-            }
+        let mut scan = OccupiedIndices::new();
+        while let Some(slot) = scan.step(&self.storage) {
             let hash = {
                 let entry = unsafe { self.storage.get_ref(slot) };
                 self.hash_builder.hash_one(&entry.key)
@@ -1269,7 +1274,7 @@ where
     type Location = usize;
     type Hasher = S;
     type Alloc = A;
-    type Scan = usize;
+    type Scan = FunnelScan;
 
     #[inline]
     fn hasher(&self) -> &S {
@@ -1412,19 +1417,16 @@ where
     }
 
     #[inline]
-    fn scan(&self) -> usize {
-        0
+    fn scan(&self) -> FunnelScan {
+        FunnelScan {
+            cursor: OccupiedIndices::new(),
+        }
     }
 
-    fn scan_next(&self, scan: &mut usize) -> Option<(*mut SlotEntry<K, V>, usize)> {
-        while *scan < self.shape.n {
-            let slot = *scan;
-            *scan += 1;
-            if control::is_occupied(self.storage.control_at(slot)) {
-                return Some((self.storage.slot_ptr(slot), slot));
-            }
-        }
-        None
+    #[inline]
+    fn scan_next(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, usize)> {
+        let slot = scan.cursor.step(&self.storage)?;
+        Some((self.storage.slot_ptr(slot), slot))
     }
 
     fn with_capacity_and_reserve_and_hasher_in(
@@ -1554,6 +1556,48 @@ mod tests {
             Global,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn sparse_scan_visits_group_boundaries_and_tail_once_in_slot_order() {
+        let mut table = raw_table(32_767, 3);
+        let slots = [0, GROUP_SIZE - 1, GROUP_SIZE, 3 * GROUP_SIZE + 2, 32_766];
+        for slot in slots {
+            let key = slot as u64;
+            let hash = table.hash_builder.hash_one(key);
+            table.place_new_entry(
+                slot,
+                key,
+                key + 100,
+                table.membership_slot(hash),
+                control::control_fingerprint(hash),
+                true,
+            );
+        }
+        // Include a deleted slot next to a live slot in a cached group.
+        table.storage.mark_tombstone(GROUP_SIZE + 1);
+        let recorded = unsafe {
+            core::slice::from_raw_parts(table.membership_ptr(), table.membership.words).to_vec()
+        };
+        table.clear_membership();
+        table.refresh_membership();
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(table.membership_ptr(), table.membership.words) },
+            recorded
+        );
+        let mut scan = map::TableBackend::scan(&table);
+        for slot in slots {
+            let (ptr, found) = map::TableBackend::scan_next(&table, &mut scan).unwrap();
+            assert_eq!(found, slot);
+            assert_eq!(unsafe { (*ptr).value }, slot as u64 + 100);
+            // Draining changes control bytes while the cursor holds its mask.
+            let entry = unsafe { ptr.read() };
+            assert_eq!(entry.key, slot as u64);
+            map::TableBackend::extract_finish(&mut table, slot);
+        }
+        assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
+        assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
+        assert_eq!(table.len, 0);
     }
 
     #[test]

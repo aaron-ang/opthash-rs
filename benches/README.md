@@ -74,6 +74,12 @@ post-delete state outside the timed region. Run only these groups with:
 BENCH=map_api scripts/bench.sh -- 'remove_burst|post_delete'
 ```
 
+`iter_sparse` and `drain_sparse` start from the same allocated maps as the
+dense `iter` and `drain` groups, then delete all but the first `MAP_SIZE / 10`
+keys without shrinking. Deletions and any automatic maintenance happen in
+untimed setup. Throughput counts the surviving entries; the timed fold visits
+every surviving key/value pair. These new groups require fresh baseline runs.
+
 `mean_latency` covers 1K, 10K, 100K, 1M, and 10M entries. Maps are built once
 per size outside Criterion's sampled callback. Results are batch mean
 nanoseconds per lookup, not single-operation tail percentiles.

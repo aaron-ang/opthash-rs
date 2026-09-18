@@ -121,6 +121,48 @@ macro_rules! sparse_setup {
     };
 }
 
+// Start with the dense fixture's allocation and retain one tenth of its keys.
+// Setup includes delete-triggered maintenance, but never shrinks the map.
+fn bench_iter_sparse(c: &mut Criterion) {
+    let pairs = harness::make_pairs(MAP_SIZE);
+    let keep = MAP_SIZE / 10;
+    let mut group = c.benchmark_group("iter_sparse");
+    group.throughput(Throughput::Elements(keep as u64));
+
+    bench_all_impls!(
+        group,
+        "iter_sparse",
+        BatchSize::LargeInput,
+        sparse_setup!(harness::build_std_map, &pairs, keep),
+        sparse_setup!(harness::build_hashbrown_map, &pairs, keep),
+        sparse_setup!(harness::build_elastic_map, &pairs, keep),
+        sparse_setup!(harness::build_funnel_map, &pairs, keep),
+        |map| black_box(map.iter().fold(0u64, |a, (k, v)| a ^ k ^ v)),
+    );
+
+    group.finish();
+}
+
+fn bench_drain_sparse(c: &mut Criterion) {
+    let pairs = harness::make_pairs(MAP_SIZE);
+    let keep = MAP_SIZE / 10;
+    let mut group = c.benchmark_group("drain_sparse");
+    group.throughput(Throughput::Elements(keep as u64));
+
+    bench_all_impls!(
+        group,
+        "drain_sparse",
+        BatchSize::PerIteration,
+        sparse_setup!(harness::build_std_map, &pairs, keep),
+        sparse_setup!(harness::build_hashbrown_map, &pairs, keep),
+        sparse_setup!(harness::build_elastic_map, &pairs, keep),
+        sparse_setup!(harness::build_funnel_map, &pairs, keep),
+        |map| black_box(map.drain().fold(0u64, |a, (k, v)| a ^ k ^ v)),
+    );
+
+    group.finish();
+}
+
 fn bench_shrink_to_fit(c: &mut Criterion) {
     let pairs = harness::make_pairs(MAP_SIZE);
     let keep: usize = MAP_SIZE / 10;
@@ -254,6 +296,8 @@ criterion_group!(
         bench_iter,
         bench_iter_mut,
         bench_drain,
+        bench_iter_sparse,
+        bench_drain_sparse,
         bench_extract_if,
         bench_clear_drop,
         bench_entry_or_insert,

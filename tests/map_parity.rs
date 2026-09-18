@@ -8,6 +8,17 @@
 
 mod support;
 
+#[test]
+fn funnel_shared_and_consuming_iterators_remain_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>(_: T) {}
+    let mut map = <support::FunnelHashMap<u64, u64> as support::Deterministic>::with_capacity(64);
+    map.insert(1, 2);
+    assert_send_sync(map.iter());
+    assert_send_sync(map.keys());
+    assert_send_sync(map.values());
+    assert_send_sync(map.into_iter());
+}
+
 macro_rules! parity_suite {
     ($mod_name:ident, $TestMap:ident, $Entry:ident) => {
         mod $mod_name {
@@ -85,6 +96,51 @@ macro_rules! parity_suite {
                 let mut m: HashMap<i32, i32> = HashMap::new();
                 m.reserve(0);
                 assert_eq!(m.capacity(), 0);
+            }
+
+            #[test]
+            fn sparse_iteration_and_drain_visit_every_survivor_once() {
+                let mut map = HashMap::with_capacity(1_024);
+                for key in 0..1_024 {
+                    map.insert(key, key + 10);
+                }
+                for key in 0..1_024 {
+                    if key % 97 != 0 {
+                        map.remove(&key);
+                    }
+                }
+                let expected = (0..1_024)
+                    .step_by(97)
+                    .map(|key| (key, key + 10))
+                    .collect::<Vec<_>>();
+                let order = map.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>();
+                let mut sorted = order.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, expected);
+                let mut cloned_iter = map.iter();
+                assert_eq!(cloned_iter.next().map(|(&k, &v)| (k, v)), Some(order[0]));
+                assert_eq!(
+                    cloned_iter
+                        .clone()
+                        .map(|(&k, &v)| (k, v))
+                        .collect::<Vec<_>>(),
+                    order[1..]
+                );
+                let mut owned = map.clone().into_iter();
+                assert_eq!(owned.next(), Some(order[0]));
+                // Move the owning iterator after it has cached a group mask.
+                assert_eq!(Box::new(owned).collect::<Vec<_>>(), order[1..]);
+                let mut drain = map.drain();
+                for (remaining, pair) in order.iter().enumerate() {
+                    assert_eq!(drain.len(), order.len() - remaining);
+                    assert_eq!(drain.next(), Some(*pair));
+                }
+                assert_eq!(drain.next(), None);
+                assert_eq!(drain.next(), None);
+                drop(drain);
+                assert!(map.is_empty());
+                assert_eq!(map.insert(2_000, 3_000), None);
+                assert_eq!(map.get(&2_000), Some(&3_000));
             }
 
             #[test]
