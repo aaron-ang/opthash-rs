@@ -107,6 +107,47 @@ fn bench_entry_or_insert(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_entry_reinsert(c: &mut Criterion) {
+    let pairs = harness::make_pairs(harness::ENTRY_REINSERT_FILL);
+    let removed = &pairs[..harness::ENTRY_REINSERT_COUNT];
+    let mut group = c.benchmark_group("entry_reinsert");
+    group.throughput(Throughput::Elements(removed.len() as u64));
+
+    // A small delete burst leaves the original membership bits in place.
+    // Every absent Funnel entry therefore walks the exact search, unlike
+    // fresh-key insertion where a negative filter often skips that walk.
+    macro_rules! setup {
+        ($builder:expr) => {
+            || {
+                let mut map = $builder(MAP_SIZE);
+                for &(key, value) in &pairs {
+                    map.insert(key, value);
+                }
+                for &(key, _) in removed {
+                    map.remove(&key);
+                }
+                map
+            }
+        };
+    }
+    bench_all_impls!(
+        group,
+        "entry_reinsert",
+        BatchSize::PerIteration,
+        setup!(harness::std_map_cap),
+        setup!(harness::hashbrown_map_cap),
+        setup!(harness::elastic_map_cap),
+        setup!(harness::funnel_map_cap),
+        |map| {
+            for &(key, value) in removed {
+                *map.entry(black_box(key)).or_insert(black_box(value)) ^= 1;
+            }
+            black_box(map.len())
+        },
+    );
+    group.finish();
+}
+
 /// Build a populated map then remove all but the first `keep` entries -
 /// the realistic precondition for `shrink_to_fit` (post-bulk-delete state).
 macro_rules! sparse_setup {
@@ -301,6 +342,7 @@ criterion_group!(
         bench_extract_if,
         bench_clear_drop,
         bench_entry_or_insert,
+        bench_entry_reinsert,
         bench_shrink_to_fit,
         bench_replace,
         bench_extend,

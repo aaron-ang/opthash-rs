@@ -290,6 +290,32 @@ macro_rules! parity_suite {
             }
 
             #[test]
+            fn vacant_entry_growth_preserves_all_keys_and_occupied_behavior() {
+                for use_try_insert in [false, true] {
+                    let mut map = HashMap::with_capacity(32);
+                    let capacity = map.capacity();
+                    for key in 0..capacity {
+                        map.insert(key, key);
+                    }
+                    if use_try_insert {
+                        assert_eq!(*map.try_insert(capacity, 123).unwrap(), 123);
+                        let error = map.try_insert(capacity, 456).unwrap_err();
+                        assert_eq!(error.value, 456);
+                        assert_eq!(*error.entry.get(), 123);
+                    } else {
+                        assert_eq!(*map.entry(capacity).or_insert(123), 123);
+                        assert_eq!(*map.entry(capacity).or_insert(456), 123);
+                    }
+                    assert!(map.capacity() > capacity);
+                    assert_eq!(map.len(), capacity + 1);
+                    for key in 0..capacity {
+                        assert_eq!(map.get(&key), Some(&key));
+                    }
+                    assert_eq!(map.get(&capacity), Some(&123));
+                }
+            }
+
+            #[test]
             fn test_empty_entry() {
                 let mut m: HashMap<i32, bool> = HashMap::new();
                 match m.entry(0) {
