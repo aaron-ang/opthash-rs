@@ -319,8 +319,15 @@ enum SearchResult {
 /// A known-absent search, retained only while the entry borrows its map.
 pub struct FunnelVacant {
     hash: u64,
-    probe: PreparedFastFunnelProbe,
-    exact: Option<SearchResult>,
+    // Allocated slot indices are below isize::MAX. Reserve the two largest
+    // usize values for unsearched and exhausted walks, keeping the token to
+    // a hash and one slot word instead of a prepared probe and enum payload.
+    exact: usize,
+}
+
+impl FunnelVacant {
+    const UNSEARCHED: usize = usize::MAX;
+    const EXHAUSTED: usize = usize::MAX - 1;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1216,8 +1223,7 @@ where
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> usize {
         let vacant = FunnelVacant {
             hash: key_hash,
-            probe: FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash),
-            exact: None,
+            exact: FunnelVacant::UNSEARCHED,
         };
         map::TableBackend::insert_for_vacant(self, key, value, vacant)
     }
@@ -1372,33 +1378,35 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let gate = self.membership_gate(hash);
-        let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(hash);
-        let mut exact = None;
+        let mut exact = FunnelVacant::UNSEARCHED;
         if gate.passes() {
+            let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(hash);
             let fingerprint = control::control_fingerprint(hash);
-            let searched = self.search_exact_prepared(key, probe, fingerprint);
-            if let SearchResult::Hit(slot) = searched {
-                return Ok(slot);
-            }
+            exact = match self.search_exact_prepared(key, probe, fingerprint) {
+                SearchResult::Hit(slot) => return Ok(slot),
+                SearchResult::Vacant(slot) => slot,
+                SearchResult::Full | SearchResult::RangeFailure => FunnelVacant::EXHAUSTED,
+            };
             if self.exceptional_placement
                 && let Some(slot) = self.find_by_full_scan(key, fingerprint)
             {
                 return Ok(slot);
             }
-            exact = Some(searched);
         }
-        Err(FunnelVacant { hash, probe, exact })
+        Err(FunnelVacant { hash, exact })
     }
 
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, vacant: FunnelVacant) -> usize {
-        let exact = if self.prepare_vacant_insert() {
+        let exact = if self.prepare_vacant_insert() || vacant.exact == FunnelVacant::UNSEARCHED {
             // Growth invalidates the old slot, including Full/RangeFailure.
-            self.search_vacancy(vacant.probe)
+            let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(vacant.hash);
+            self.search_vacancy(probe)
+        } else if vacant.exact == FunnelVacant::EXHAUSTED {
+            // Both exhaustion reasons use the same exceptional placement.
+            SearchResult::Full
         } else {
-            vacant
-                .exact
-                .unwrap_or_else(|| self.search_vacancy(vacant.probe))
+            SearchResult::Vacant(vacant.exact)
         };
         // Filter geometry may have changed during growth too.
         let membership = self.membership_slot(vacant.hash);
@@ -1799,6 +1807,57 @@ mod tests {
         assert_eq!(exact, SearchResult::Vacant(inserted));
         assert_eq!(table.find_location(&99, key, fingerprint), Some(inserted));
         assert_eq!(table.find_location(&key, key, fingerprint), Some(slot));
+    }
+
+    #[test]
+    fn vacant_entry_filter_rejection_still_searches_for_placement() {
+        let comparisons = Arc::new(AtomicUsize::new(0));
+        let key = CountingKey {
+            id: 1,
+            comparisons: comparisons.clone(),
+        };
+        let mut map = FunnelHashMap::with_capacity_and_hasher(64, test_support::fixed_hasher());
+        VACANCY_WALKS.with(|walks| walks.set(0));
+        assert_eq!(*map.entry(key.clone()).or_insert(10), 10);
+        assert_eq!(comparisons.load(Ordering::Relaxed), 0);
+        assert_eq!(VACANCY_WALKS.with(Cell::get), 1);
+        assert_eq!(map.get(&key), Some(&10));
+    }
+
+    #[test]
+    fn vacant_entry_reuses_exhausted_search_before_exceptional_placement() {
+        use crate::map::TableBackend;
+
+        let mut table = raw_table(512, 3);
+        let hash = 42;
+        let fingerprint = control::control_fingerprint(hash);
+        let absent = u64::MAX;
+        while let SearchResult::Vacant(_) =
+            table.search_exact_for_insert(&absent, hash, fingerprint)
+        {
+            let key = table.len as u64;
+            table.insert_for_vacant_entry(key, key, hash);
+            assert!(table.len < table.shape.max_insertions);
+        }
+        assert_eq!(
+            table.search_exact_for_insert(&absent, hash, fingerprint),
+            SearchResult::Full
+        );
+        let vacant = table.find_for_entry(&absent, hash).err().unwrap();
+        let old_len = table.len;
+        VACANCY_WALKS.with(|walks| walks.set(0));
+        let inserted = table.insert_for_vacant(absent, 99, vacant);
+        assert_eq!(
+            VACANCY_WALKS.with(Cell::get),
+            0,
+            "an exhausted exact search needs no second walk"
+        );
+        assert!(table.exceptional_placement);
+        assert_eq!(table.len, old_len + 1);
+        assert_eq!(
+            table.find_location(&absent, hash, fingerprint),
+            Some(inserted)
+        );
     }
 
     fn raw_table(n: usize, d: u32) -> FunnelTable<u64, u64, IdentityBuildHasher> {

@@ -318,12 +318,6 @@ struct PreparedElasticKey {
     membership: MembershipKey,
 }
 
-/// Geometry-independent preparation retained by the private entry contract.
-pub struct ElasticVacant {
-    prepared: PreparedElasticKey,
-    fingerprint: u8,
-}
-
 impl PreparedElasticKey {
     #[inline]
     fn new(hash: u64) -> Self {
@@ -897,7 +891,6 @@ where
 
     /// Post-lookup insert for a key known to be absent. Returns the chosen
     /// slot so the caller can borrow into it without re-probing.
-    #[cfg(test)]
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
@@ -1083,7 +1076,7 @@ where
     A: Allocator + Clone,
 {
     type Location = (usize, usize);
-    type Vacant = ElasticVacant;
+    type Vacant = u64;
     type Hasher = S;
     type Alloc = A;
 
@@ -1163,24 +1156,21 @@ where
     // -- Insert / remove --
 
     #[inline]
-    fn find_for_entry<Q>(&self, key: &Q, hash: u64) -> Result<Self::Location, ElasticVacant>
+    fn find_for_entry<Q>(&self, key: &Q, hash: u64) -> Result<Self::Location, u64>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let prepared = PreparedElasticKey::new(hash);
         let fingerprint = control::control_fingerprint(hash);
         self.find_slot_indices_prepared(key, prepared, fingerprint)
-            .ok_or(ElasticVacant {
-                prepared,
-                fingerprint,
-            })
+            .ok_or(hash)
     }
 
     #[inline]
-    fn insert_for_vacant(&mut self, key: K, value: V, vacant: ElasticVacant) -> (usize, usize) {
-        // Placement depends on the current batch and geometry. Only key
-        // preparation is reused; the insertion scheduler still runs normally.
-        self.insert_for_vacant_entry_prepared(key, value, vacant.prepared, vacant.fingerprint)
+    fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> (usize, usize) {
+        // Keep public entries compact: carrying prepared Elastic state across
+        // entry construction did not improve the measured entry workload.
+        self.insert_for_vacant_entry(key, value, hash)
     }
 
     #[inline]
