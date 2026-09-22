@@ -126,6 +126,31 @@ MEMORY_SIZES=1000,10000 cargo run --release --example memory
 is `grow` followed by `shrink_to_fit`. Default sizes straddle hashbrown's 7/8 · 2^20 capacity step to show the power-of-two
 sawtooth. Bytes are requested layouts, not RSS.
 
+## Deletion churn attribution
+
+Run the separate, untimed diagnostic with the throughput suite's fixed hash
+seed, key trace, `MAP_SIZE`, and `OP_COUNT`:
+
+```bash
+cargo test --release --test deletion_churn deletion_churn_attribution -- --ignored --nocapture
+```
+
+It checks every mutation result and reports remove/insert work separately:
+epoch transition reasons, survivors moved, filter-only refreshes, survivor
+rehashes, maximum rehashes in one operation, and key comparisons. Matched
+clean maps use the same capacity and live keys for lookup comparisons against
+steady churn and post-burst deletion. The regular test suite exercises a
+smaller deterministic fixture and verifies the counting key's hash identity.
+
+Hash counts above the one query hash identify maintenance. Epoch boundaries
+identify rebuilds; hashes without a boundary identify filter refreshes. The
+diagnostic asserts that each such operation rehashes exactly its survivors
+and crosses at most one epoch. Counters live only in this test binary. Key
+comparisons do not count control-byte probes, filter false positives, or
+Elastic schedule length, and these results are not timings or latency tails.
+Use pinned `delete_heavy`, `remove_burst`, `post_delete_lookup`, and
+`post_delete_insert` Criterion runs for performance decisions.
+
 ## Raw results
 
 Inspect the named Criterion estimates directly:
