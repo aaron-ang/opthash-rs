@@ -1168,8 +1168,6 @@ where
 
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> (usize, usize) {
-        // Keep public entries compact: carrying prepared Elastic state across
-        // entry construction did not improve the measured entry workload.
         self.insert_for_vacant_entry(key, value, hash)
     }
 

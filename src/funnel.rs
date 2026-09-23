@@ -709,10 +709,6 @@ where
     }
 
     /// Lookup-side search over a probe the caller already prepared.
-    ///
-    /// Always the general scan, even with no tombstones: the clean-epoch variant
-    /// drops the `first_tombstone` accumulator but needs a second mask walk to
-    /// find the terminating EMPTY, which measured worse on this walk.
     fn search_exact_prepared<Q>(
         &self,
         key: &Q,
@@ -776,20 +772,6 @@ where
         }
         let mut first_tombstone = None;
 
-        // The walk stays strictly serial. Fetching the next level's control
-        // group one iteration ahead is legal — a bucket address depends only on
-        // the key — but the buckets are already L1-resident, so hiding that
-        // latency does not pay for the extra level of probe math a lookahead
-        // computes and usually discards.
-        //
-        // The membership gate stays out of this loop too, and out of the walk
-        // entirely. Deferring it behind the first level so a hit there never pays
-        // for the load lost every way it was built: as a shared level helper, as
-        // a per-level test, and as a peeled first iteration, each slower for hits
-        // and misses alike. The caller's eager load overlaps the probe's mix chain
-        // for free, while a deferred one serializes behind the level's control
-        // bytes and keeps a live word, a branch, and the level scan's second copy
-        // across the rest of the walk.
         for level in &self.shape.levels {
             let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
             let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) else {
