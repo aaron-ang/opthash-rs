@@ -1,6 +1,5 @@
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
-use core::ptr;
 
 use alloc::{boxed::Box, vec::Vec};
 use allocator_api2::alloc::{Allocator, Global, Layout};
@@ -803,18 +802,11 @@ where
         let bits = prepared.membership.bits();
         // SAFETY: `word` is a multiply-high reduction below `words`, and the
         // cached region covers exactly that many initialized, properly aligned
-        // `ElasticMetadataWord`s. `summary_bin` masks the signature to `0..4`,
-        // so its `u16` offset stays within the initialized `route_bins` array.
-        // These raw field projections preserve the arena pointer provenance and
-        // do not form a reference or copy the surrounding metadata word.
+        // `ElasticMetadataWord`s. Place projections read the two fields without
+        // copying the surrounding metadata word.
         let (membership, route_bin) = unsafe {
             let metadata = self.membership_ptr().add(word);
-            let membership = ptr::addr_of!((*metadata).membership).read();
-            let route_bin = ptr::addr_of!((*metadata).route_bins)
-                .cast::<u16>()
-                .add(summary_bin)
-                .read();
-            (membership, route_bin)
+            ((*metadata).membership, (*metadata).route_bins[summary_bin])
         };
         ElasticRouteFilter {
             maybe_present: membership & bits == bits,
@@ -1160,9 +1152,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let prepared = PreparedElasticKey::new(hash);
-        let fingerprint = control::control_fingerprint(hash);
-        self.find_slot_indices_prepared(key, prepared, fingerprint)
+        self.find(key, hash, control::control_fingerprint(hash))
             .ok_or(hash)
     }
 

@@ -775,7 +775,7 @@ where
         for level in &self.shape.levels {
             let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
             let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) else {
-                return SearchResult::RangeFailure;
+                return first_tombstone.map_or(SearchResult::RangeFailure, SearchResult::Vacant);
             };
             let start = level.offset + bucket * self.shape.beta;
             let scan = if CLEAN_EPOCH {
@@ -823,7 +823,7 @@ where
                 self.shape.encode_logical_probe(logical_probe),
                 self.shape.primary_range,
             ) else {
-                return SearchResult::RangeFailure;
+                return first_tombstone.map_or(SearchResult::RangeFailure, SearchResult::Vacant);
             };
             let slot = self.shape.primary_offset + local;
             if self.storage.control_at(slot) == CTRL_TOMBSTONE {
@@ -840,12 +840,12 @@ where
         let first_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_A_BASE);
         let Some(first_bucket) = Self::sample(&first_probe, 0, self.shape.fallback_bucket_range)
         else {
-            return SearchResult::RangeFailure;
+            return first_tombstone.map_or(SearchResult::RangeFailure, SearchResult::Vacant);
         };
         let second_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_B_BASE);
         let Some(second_bucket) = Self::sample(&second_probe, 0, self.shape.fallback_bucket_range)
         else {
-            return SearchResult::RangeFailure;
+            return first_tombstone.map_or(SearchResult::RangeFailure, SearchResult::Vacant);
         };
         for slot_in_bucket in 0..self.shape.fallback_bucket_width {
             for bucket in [first_bucket, second_bucket] {
@@ -1067,18 +1067,37 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
+        self.locate(key, key_hash, key_fingerprint, |_| ()).ok()
+    }
+
+    /// Lookup protocol shared by reads and entries. `Err(None)` means the
+    /// filter rejected the key before any walk; `Err(Some(_))` maps the exact
+    /// walk's miss, which is never `Hit`, through `on_miss`.
+    #[inline]
+    fn locate<Q, R>(
+        &self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+        on_miss: impl FnOnce(SearchResult) -> R,
+    ) -> Result<usize, Option<R>>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
         // Issue the filter load, then prepare the probe while it is in flight. A
         // key the filter never recorded was never inserted, so neither the walk
         // nor the exceptional full scan can find it.
         let gate = self.membership_gate(key_hash);
         let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
         if !gate.passes() {
-            return None;
+            return Err(None);
         }
         match self.search_exact_prepared(key, probe, key_fingerprint) {
-            SearchResult::Hit(slot) => Some(slot),
-            _ if self.exceptional_placement => self.find_by_full_scan(key, key_fingerprint),
-            _ => None,
+            SearchResult::Hit(slot) => Ok(slot),
+            miss if self.exceptional_placement => self
+                .find_by_full_scan(key, key_fingerprint)
+                .ok_or_else(|| Some(on_miss(miss))),
+            miss => Err(Some(on_miss(miss))),
         }
     }
 
@@ -1182,7 +1201,13 @@ where
         exact: SearchResult,
     ) -> usize {
         let (slot, exceptional) = match exact {
-            SearchResult::Vacant(slot) => (slot, false),
+            SearchResult::Vacant(slot) => {
+                debug_assert!(
+                    control::is_free(self.storage.control_at(slot)),
+                    "stale Funnel vacancy at slot {slot}"
+                );
+                (slot, false)
+            }
             SearchResult::Hit(_) => unreachable!("known-absent Funnel insertion found a key"),
             SearchResult::Full | SearchResult::RangeFailure => (
                 self.first_free_global()
@@ -1359,22 +1384,19 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let gate = self.membership_gate(hash);
-        let mut exact = FunnelVacant::UNSEARCHED;
-        if gate.passes() {
-            let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(hash);
-            let fingerprint = control::control_fingerprint(hash);
-            exact = match self.search_exact_prepared(key, probe, fingerprint) {
-                SearchResult::Hit(slot) => return Ok(slot),
+        let found = self.locate(
+            key,
+            hash,
+            control::control_fingerprint(hash),
+            |miss| match miss {
                 SearchResult::Vacant(slot) => slot,
-                SearchResult::Full | SearchResult::RangeFailure => FunnelVacant::EXHAUSTED,
-            };
-            if self.exceptional_placement
-                && let Some(slot) = self.find_by_full_scan(key, fingerprint)
-            {
-                return Ok(slot);
-            }
-        }
+                _ => FunnelVacant::EXHAUSTED,
+            },
+        );
+        let exact = match found {
+            Ok(slot) => return Ok(slot),
+            Err(exact) => exact.unwrap_or(FunnelVacant::UNSEARCHED),
+        };
         Err(FunnelVacant { hash, exact })
     }
 
@@ -1900,15 +1922,6 @@ mod tests {
         }
         // Include a deleted slot next to a live slot in a cached group.
         table.storage.mark_tombstone(GROUP_SIZE + 1);
-        let recorded = unsafe {
-            core::slice::from_raw_parts(table.membership_ptr(), table.membership.words).to_vec()
-        };
-        table.clear_membership();
-        table.refresh_membership();
-        assert_eq!(
-            unsafe { core::slice::from_raw_parts(table.membership_ptr(), table.membership.words) },
-            recorded
-        );
         let mut scan = map::TableBackend::scan(&table);
         for slot in slots {
             let (ptr, found) = map::TableBackend::scan_next(&table, &mut scan).unwrap();
@@ -1922,6 +1935,23 @@ mod tests {
         assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
         assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
         assert_eq!(table.len, 0);
+    }
+
+    #[test]
+    fn refresh_membership_rebuilds_the_recorded_filter() {
+        let mut table = raw_table(32_767, 3);
+        for key in 0..64_u64 {
+            assert!(!table.insert_unique(key, key));
+        }
+        let recorded = unsafe {
+            core::slice::from_raw_parts(table.membership_ptr(), table.membership.words).to_vec()
+        };
+        table.clear_membership();
+        table.refresh_membership();
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(table.membership_ptr(), table.membership.words) },
+            recorded
+        );
     }
 
     #[test]
