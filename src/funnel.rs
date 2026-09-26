@@ -18,6 +18,7 @@ use crate::common::exact::probe::{
     FUNNEL_SPECIAL_PRIMARY_BASE, FunnelPrf, PreparedFastFunnelDomainProbe, PreparedFastFunnelProbe,
     PreparedProbeRange,
 };
+use crate::common::iter::OccupiedIndices;
 use crate::common::math::capacity;
 use crate::common::membership::{self, MembershipKey, MembershipRegion};
 use crate::common::simd;
@@ -25,6 +26,18 @@ use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
 use crate::{macros, map};
 
 const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
+
+/// Pointerless scan progress through Funnel's flat storage.
+#[derive(Clone)]
+pub struct FunnelScan {
+    mode: FunnelScanMode,
+}
+
+#[derive(Clone)]
+enum FunnelScanMode {
+    Dense(usize),
+    Sparse(OccupiedIndices),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LevelShape {
@@ -301,6 +314,20 @@ enum SearchResult {
     Vacant(usize),
     Full,
     RangeFailure,
+}
+
+/// A known-absent search, retained only while the entry borrows its map.
+pub struct FunnelVacant {
+    hash: u64,
+    // Allocated slot indices are below isize::MAX. Reserve the two largest
+    // usize values for unsearched and exhausted walks, keeping the token to
+    // a hash and one slot word instead of a prepared probe and enum payload.
+    exact: usize,
+}
+
+impl FunnelVacant {
+    const UNSEARCHED: usize = usize::MAX;
+    const EXHAUSTED: usize = usize::MAX - 1;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -682,10 +709,6 @@ where
     }
 
     /// Lookup-side search over a probe the caller already prepared.
-    ///
-    /// Always the general scan, even with no tombstones: the clean-epoch variant
-    /// drops the `first_tombstone` accumulator but needs a second mask walk to
-    /// find the terminating EMPTY, which measured worse on this walk.
     fn search_exact_prepared<Q>(
         &self,
         key: &Q,
@@ -749,24 +772,10 @@ where
         }
         let mut first_tombstone = None;
 
-        // The walk stays strictly serial. Fetching the next level's control
-        // group one iteration ahead is legal — a bucket address depends only on
-        // the key — but the buckets are already L1-resident, so hiding that
-        // latency does not pay for the extra level of probe math a lookahead
-        // computes and usually discards.
-        //
-        // The membership gate stays out of this loop too, and out of the walk
-        // entirely. Deferring it behind the first level so a hit there never pays
-        // for the load lost every way it was built: as a shared level helper, as
-        // a per-level test, and as a peeled first iteration, each slower for hits
-        // and misses alike. The caller's eager load overlaps the probe's mix chain
-        // for free, while a deferred one serializes behind the level's control
-        // bytes and keeps a live word, a branch, and the level scan's second copy
-        // across the rest of the walk.
         for level in &self.shape.levels {
             let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
             let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) else {
-                return SearchResult::RangeFailure;
+                return first_tombstone.map_or(SearchResult::RangeFailure, SearchResult::Vacant);
             };
             let start = level.offset + bucket * self.shape.beta;
             let scan = if CLEAN_EPOCH {
@@ -814,7 +823,7 @@ where
                 self.shape.encode_logical_probe(logical_probe),
                 self.shape.primary_range,
             ) else {
-                return SearchResult::RangeFailure;
+                return first_tombstone.map_or(SearchResult::RangeFailure, SearchResult::Vacant);
             };
             let slot = self.shape.primary_offset + local;
             if self.storage.control_at(slot) == CTRL_TOMBSTONE {
@@ -831,12 +840,12 @@ where
         let first_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_A_BASE);
         let Some(first_bucket) = Self::sample(&first_probe, 0, self.shape.fallback_bucket_range)
         else {
-            return SearchResult::RangeFailure;
+            return first_tombstone.map_or(SearchResult::RangeFailure, SearchResult::Vacant);
         };
         let second_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_B_BASE);
         let Some(second_bucket) = Self::sample(&second_probe, 0, self.shape.fallback_bucket_range)
         else {
-            return SearchResult::RangeFailure;
+            return first_tombstone.map_or(SearchResult::RangeFailure, SearchResult::Vacant);
         };
         for slot_in_bucket in 0..self.shape.fallback_bucket_width {
             for bucket in [first_bucket, second_bucket] {
@@ -873,6 +882,8 @@ where
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn search_vacancy(&self, probe: PreparedFastFunnelProbe) -> SearchResult {
+        #[cfg(test)]
+        tests::VACANCY_WALKS.with(|walks| walks.set(walks.get() + 1));
         if self.shape.n == 0 {
             return SearchResult::Full;
         }
@@ -1056,18 +1067,37 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
+        self.locate(key, key_hash, key_fingerprint, |_| ()).ok()
+    }
+
+    /// Lookup protocol shared by reads and entries. `Err(None)` means the
+    /// filter rejected the key before any walk; `Err(Some(_))` maps the exact
+    /// walk's miss, which is never `Hit`, through `on_miss`.
+    #[inline]
+    fn locate<Q, R>(
+        &self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+        on_miss: impl FnOnce(SearchResult) -> R,
+    ) -> Result<usize, Option<R>>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
         // Issue the filter load, then prepare the probe while it is in flight. A
         // key the filter never recorded was never inserted, so neither the walk
         // nor the exceptional full scan can find it.
         let gate = self.membership_gate(key_hash);
         let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
         if !gate.passes() {
-            return None;
+            return Err(None);
         }
         match self.search_exact_prepared(key, probe, key_fingerprint) {
-            SearchResult::Hit(slot) => Some(slot),
-            _ if self.exceptional_placement => self.find_by_full_scan(key, key_fingerprint),
-            _ => None,
+            SearchResult::Hit(slot) => Ok(slot),
+            miss if self.exceptional_placement => self
+                .find_by_full_scan(key, key_fingerprint)
+                .ok_or_else(|| Some(on_miss(miss))),
+            miss => Err(Some(on_miss(miss))),
         }
     }
 
@@ -1171,7 +1201,13 @@ where
         exact: SearchResult,
     ) -> usize {
         let (slot, exceptional) = match exact {
-            SearchResult::Vacant(slot) => (slot, false),
+            SearchResult::Vacant(slot) => {
+                debug_assert!(
+                    control::is_free(self.storage.control_at(slot)),
+                    "stale Funnel vacancy at slot {slot}"
+                );
+                (slot, false)
+            }
             SearchResult::Hit(_) => unreachable!("known-absent Funnel insertion found a key"),
             SearchResult::Full | SearchResult::RangeFailure => (
                 self.first_free_global()
@@ -1190,13 +1226,13 @@ where
 
     /// Inserts a key the caller has proven absent. Runs the placement walk
     /// only, which lands on the same slot the exact search would report.
+    #[cfg(test)]
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> usize {
-        self.prepare_vacant_insert();
-        let key_fingerprint = control::control_fingerprint(key_hash);
-        let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
-        let vacancy = self.search_vacancy(probe);
-        let membership = self.membership_slot(key_hash);
-        self.place_absent_after_search(key, value, membership, key_fingerprint, vacancy)
+        let vacant = FunnelVacant {
+            hash: key_hash,
+            exact: FunnelVacant::UNSEARCHED,
+        };
+        map::TableBackend::insert_for_vacant(self, key, value, vacant)
     }
 
     fn resize_with_transition(&mut self, slots: usize, transition: EpochTransition) {
@@ -1267,9 +1303,10 @@ where
     A: Allocator + Clone,
 {
     type Location = usize;
+    type Vacant = FunnelVacant;
     type Hasher = S;
     type Alloc = A;
-    type Scan = usize;
+    type Scan = FunnelScan;
 
     #[inline]
     fn hasher(&self) -> &S {
@@ -1343,8 +1380,42 @@ where
     }
 
     #[inline]
-    fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> usize {
-        self.insert_for_vacant_entry(key, value, hash)
+    fn find_for_entry<Q>(&self, key: &Q, hash: u64) -> Result<usize, FunnelVacant>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let found = self.locate(
+            key,
+            hash,
+            control::control_fingerprint(hash),
+            |miss| match miss {
+                SearchResult::Vacant(slot) => slot,
+                _ => FunnelVacant::EXHAUSTED,
+            },
+        );
+        let exact = match found {
+            Ok(slot) => return Ok(slot),
+            Err(exact) => exact.unwrap_or(FunnelVacant::UNSEARCHED),
+        };
+        Err(FunnelVacant { hash, exact })
+    }
+
+    #[inline]
+    fn insert_for_vacant(&mut self, key: K, value: V, vacant: FunnelVacant) -> usize {
+        let exact = if self.prepare_vacant_insert() || vacant.exact == FunnelVacant::UNSEARCHED {
+            // Growth invalidates the old slot, including Full/RangeFailure.
+            let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(vacant.hash);
+            self.search_vacancy(probe)
+        } else if vacant.exact == FunnelVacant::EXHAUSTED {
+            // Both exhaustion reasons use the same exceptional placement.
+            SearchResult::Full
+        } else {
+            SearchResult::Vacant(vacant.exact)
+        };
+        // Filter geometry may have changed during growth too.
+        let membership = self.membership_slot(vacant.hash);
+        let fingerprint = control::control_fingerprint(vacant.hash);
+        self.place_absent_after_search(key, value, membership, fingerprint, exact)
     }
 
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
@@ -1412,19 +1483,37 @@ where
     }
 
     #[inline]
-    fn scan(&self) -> usize {
-        0
+    fn scan(&self) -> FunnelScan {
+        FunnelScan {
+            // Dense scans avoid lane extraction for nearly every slot. Only
+            // sparse tables amortize masks over enough empty controls; choose
+            // once so draining cannot switch modes midway through a group.
+            mode: if self.len <= self.shape.n / 4 {
+                FunnelScanMode::Sparse(OccupiedIndices::new())
+            } else {
+                FunnelScanMode::Dense(0)
+            },
+        }
     }
 
-    fn scan_next(&self, scan: &mut usize) -> Option<(*mut SlotEntry<K, V>, usize)> {
-        while *scan < self.shape.n {
-            let slot = *scan;
-            *scan += 1;
-            if control::is_occupied(self.storage.control_at(slot)) {
-                return Some((self.storage.slot_ptr(slot), slot));
+    #[inline]
+    fn scan_next(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, usize)> {
+        match &mut scan.mode {
+            FunnelScanMode::Dense(next) => {
+                while *next < self.shape.n {
+                    let slot = *next;
+                    *next += 1;
+                    if control::is_occupied(self.storage.control_at(slot)) {
+                        return Some((self.storage.slot_ptr(slot), slot));
+                    }
+                }
+                None
+            }
+            FunnelScanMode::Sparse(cursor) => {
+                let slot = cursor.step(&self.storage)?;
+                Some((self.storage.slot_ptr(slot), slot))
             }
         }
-        None
     }
 
     fn with_capacity_and_reserve_and_hasher_in(
@@ -1531,6 +1620,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use core::cell::Cell;
     use core::mem::ManuallyDrop;
     use core::num::NonZeroU32;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1545,6 +1635,235 @@ mod tests {
         self, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
     };
 
+    std::thread_local! {
+        pub(super) static VACANCY_WALKS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[derive(Clone, Debug)]
+    struct CountingKey {
+        id: u64,
+        comparisons: Arc<AtomicUsize>,
+    }
+
+    impl PartialEq for CountingKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.comparisons.fetch_add(1, Ordering::Relaxed);
+            self.id == other.id
+        }
+    }
+
+    impl Eq for CountingKey {}
+
+    impl Hash for CountingKey {
+        fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+            // Each even key has an absent odd partner with the same hash.
+            (self.id / 2).hash(state);
+        }
+    }
+
+    #[test]
+    fn vacant_entry_reuses_filter_positive_search_without_growth() {
+        for (try_insert, tombstone) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let comparisons = Arc::new(AtomicUsize::new(0));
+            let key = |id| CountingKey {
+                id,
+                comparisons: comparisons.clone(),
+            };
+            let mut map = FunnelHashMap::with_capacity_and_hasher(64, test_support::fixed_hasher());
+            map.insert(key(0), 10);
+            if tombstone {
+                map.insert(key(1), 0);
+                map.remove(&key(1));
+                assert_eq!(map.table().tombstones, 1);
+            }
+            let capacity = map.capacity();
+            comparisons.store(0, Ordering::Relaxed);
+            VACANCY_WALKS.with(|walks| walks.set(0));
+            let value = if try_insert {
+                map.try_insert(key(1), 20).unwrap()
+            } else {
+                map.entry(key(1)).or_insert(20)
+            };
+            assert_eq!(*value, 20);
+            assert_eq!(comparisons.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                VACANCY_WALKS.with(Cell::get),
+                0,
+                "absent search already found the vacancy"
+            );
+            assert_eq!(map.capacity(), capacity);
+            assert_eq!(map.len(), 2);
+            assert_eq!(map.get(&key(0)), Some(&10));
+            assert_eq!(map.get(&key(1)), Some(&20));
+        }
+    }
+
+    #[test]
+    fn vacant_set_get_or_insert_reuses_filter_positive_search() {
+        for borrowed in [false, true] {
+            let comparisons = Arc::new(AtomicUsize::new(0));
+            let key = |id| CountingKey {
+                id,
+                comparisons: comparisons.clone(),
+            };
+            let mut set = FunnelHashSet::with_capacity_and_hasher(64, test_support::fixed_hasher());
+            set.insert(key(0));
+            comparisons.store(0, Ordering::Relaxed);
+            VACANCY_WALKS.with(|walks| walks.set(0));
+            let stored = if borrowed {
+                set.get_or_insert_with(&key(1), Clone::clone)
+            } else {
+                set.get_or_insert(key(1))
+            };
+            assert_eq!(stored.id, 1);
+            assert_eq!(comparisons.load(Ordering::Relaxed), 1);
+            assert_eq!(VACANCY_WALKS.with(Cell::get), 0);
+            assert_eq!(set.len(), 2);
+            assert!(set.contains(&key(0)));
+            assert!(set.contains(&key(1)));
+        }
+    }
+
+    #[test]
+    fn vacant_entry_growth_invalidates_prior_search() {
+        for try_insert in [false, true] {
+            let comparisons = Arc::new(AtomicUsize::new(0));
+            let key = |id| CountingKey {
+                id,
+                comparisons: comparisons.clone(),
+            };
+            let mut map = FunnelHashMap::with_capacity_and_hasher(32, test_support::fixed_hasher());
+            let capacity = map.capacity();
+            for id in 0..capacity as u64 {
+                map.insert(key(2 * id), id);
+            }
+            comparisons.store(0, Ordering::Relaxed);
+            VACANCY_WALKS.with(|walks| walks.set(0));
+            if try_insert {
+                assert_eq!(*map.try_insert(key(1), 99).unwrap(), 99);
+            } else {
+                assert_eq!(*map.entry(key(1)).or_insert(99), 99);
+            }
+            assert!(comparisons.load(Ordering::Relaxed) > 0);
+            // Rebuild places each old key; the new key needs its own fresh walk.
+            assert_eq!(VACANCY_WALKS.with(Cell::get), capacity + 1);
+            assert!(map.capacity() > capacity);
+            assert_eq!(map.len(), capacity + 1);
+            for id in 0..capacity as u64 {
+                assert_eq!(map.get(&key(2 * id)), Some(&id));
+            }
+            assert_eq!(map.get(&key(1)), Some(&99));
+        }
+    }
+
+    #[test]
+    fn vacant_set_growth_invalidates_prior_search() {
+        for borrowed in [false, true] {
+            let comparisons = Arc::new(AtomicUsize::new(0));
+            let key = |id| CountingKey {
+                id,
+                comparisons: comparisons.clone(),
+            };
+            let mut set = FunnelHashSet::with_capacity_and_hasher(32, test_support::fixed_hasher());
+            let capacity = set.capacity();
+            for id in 0..capacity as u64 {
+                set.insert(key(2 * id));
+            }
+            comparisons.store(0, Ordering::Relaxed);
+            VACANCY_WALKS.with(|walks| walks.set(0));
+            let stored = if borrowed {
+                set.get_or_insert_with(&key(1), Clone::clone)
+            } else {
+                set.get_or_insert(key(1))
+            };
+            assert_eq!(stored.id, 1);
+            assert!(comparisons.load(Ordering::Relaxed) > 0);
+            assert_eq!(VACANCY_WALKS.with(Cell::get), capacity + 1);
+            assert!(set.capacity() > capacity);
+            assert_eq!(set.len(), capacity + 1);
+            for id in 0..capacity as u64 {
+                assert!(set.contains(&key(2 * id)));
+            }
+            assert!(set.contains(&key(1)));
+        }
+    }
+
+    #[test]
+    fn entry_search_checks_exceptional_hits_before_reusing_vacancy() {
+        use crate::map::TableBackend;
+
+        let mut table = raw_table(512, 3);
+        let key = 42;
+        let fingerprint = control::control_fingerprint(key);
+        let exact = table.search_exact_for_insert(&key, key, fingerprint);
+        let slot = table.shape.n - 1;
+        assert_ne!(exact, SearchResult::Vacant(slot));
+        table.place_new_entry(slot, key, 7, table.membership_slot(key), fingerprint, true);
+        assert_eq!(table.find_for_entry(&key, key).ok(), Some(slot));
+
+        // A different key with the same hash must complete the exceptional
+        // scan before its exact-search vacancy is safe to reuse.
+        let vacant = table.find_for_entry(&99, key).err().unwrap();
+        VACANCY_WALKS.with(|walks| walks.set(0));
+        let inserted = table.insert_for_vacant(99, 8, vacant);
+        assert_eq!(VACANCY_WALKS.with(Cell::get), 0);
+        assert_eq!(exact, SearchResult::Vacant(inserted));
+        assert_eq!(table.find_location(&99, key, fingerprint), Some(inserted));
+        assert_eq!(table.find_location(&key, key, fingerprint), Some(slot));
+    }
+
+    #[test]
+    fn vacant_entry_filter_rejection_still_searches_for_placement() {
+        let comparisons = Arc::new(AtomicUsize::new(0));
+        let key = CountingKey {
+            id: 1,
+            comparisons: comparisons.clone(),
+        };
+        let mut map = FunnelHashMap::with_capacity_and_hasher(64, test_support::fixed_hasher());
+        VACANCY_WALKS.with(|walks| walks.set(0));
+        assert_eq!(*map.entry(key.clone()).or_insert(10), 10);
+        assert_eq!(comparisons.load(Ordering::Relaxed), 0);
+        assert_eq!(VACANCY_WALKS.with(Cell::get), 1);
+        assert_eq!(map.get(&key), Some(&10));
+    }
+
+    #[test]
+    fn vacant_entry_reuses_exhausted_search_before_exceptional_placement() {
+        use crate::map::TableBackend;
+
+        let mut table = raw_table(512, 3);
+        let hash = 42;
+        let fingerprint = control::control_fingerprint(hash);
+        let absent = u64::MAX;
+        while let SearchResult::Vacant(_) =
+            table.search_exact_for_insert(&absent, hash, fingerprint)
+        {
+            let key = table.len as u64;
+            table.insert_for_vacant_entry(key, key, hash);
+            assert!(table.len < table.shape.max_insertions);
+        }
+        assert_eq!(
+            table.search_exact_for_insert(&absent, hash, fingerprint),
+            SearchResult::Full
+        );
+        let vacant = table.find_for_entry(&absent, hash).err().unwrap();
+        let old_len = table.len;
+        VACANCY_WALKS.with(|walks| walks.set(0));
+        let inserted = table.insert_for_vacant(absent, 99, vacant);
+        assert_eq!(
+            VACANCY_WALKS.with(Cell::get),
+            0,
+            "an exhausted exact search needs no second walk"
+        );
+        assert!(table.exceptional_placement);
+        assert_eq!(table.len, old_len + 1);
+        assert_eq!(
+            table.find_location(&absent, hash, fingerprint),
+            Some(inserted)
+        );
+    }
+
     fn raw_table(n: usize, d: u32) -> FunnelTable<u64, u64, IdentityBuildHasher> {
         let reserve = ReserveFraction::from_exponent(d).unwrap();
         FunnelTable::try_from_shape(
@@ -1554,6 +1873,85 @@ mod tests {
             Global,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn dense_scan_preserves_order_while_removals_make_the_table_sparse() {
+        let mut table = raw_table(344, 4);
+        let slots = (0..320).filter(|slot| slot % 11 != 0).collect::<Vec<_>>();
+        for &slot in &slots {
+            let key = slot as u64;
+            let hash = table.hash_builder.hash_one(key);
+            table.place_new_entry(
+                slot,
+                key,
+                key + 100,
+                table.membership_slot(hash),
+                control::control_fingerprint(hash),
+                true,
+            );
+        }
+        let mut scan = map::TableBackend::scan(&table);
+        for slot in slots {
+            let (ptr, found) = map::TableBackend::scan_next(&table, &mut scan).unwrap();
+            assert_eq!(found, slot);
+            let entry = unsafe { ptr.read() };
+            assert_eq!((entry.key, entry.value), (slot as u64, slot as u64 + 100));
+            map::TableBackend::extract_finish(&mut table, slot);
+        }
+        assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
+        assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
+        assert_eq!(table.len, 0);
+    }
+
+    #[test]
+    fn sparse_scan_visits_group_boundaries_and_tail_once_in_slot_order() {
+        let mut table = raw_table(32_767, 3);
+        let slots = [0, GROUP_SIZE - 1, GROUP_SIZE, 3 * GROUP_SIZE + 2, 32_766];
+        for slot in slots {
+            let key = slot as u64;
+            let hash = table.hash_builder.hash_one(key);
+            table.place_new_entry(
+                slot,
+                key,
+                key + 100,
+                table.membership_slot(hash),
+                control::control_fingerprint(hash),
+                true,
+            );
+        }
+        // Include a deleted slot next to a live slot in a cached group.
+        table.storage.mark_tombstone(GROUP_SIZE + 1);
+        let mut scan = map::TableBackend::scan(&table);
+        for slot in slots {
+            let (ptr, found) = map::TableBackend::scan_next(&table, &mut scan).unwrap();
+            assert_eq!(found, slot);
+            assert_eq!(unsafe { (*ptr).value }, slot as u64 + 100);
+            // Draining changes control bytes while the cursor holds its mask.
+            let entry = unsafe { ptr.read() };
+            assert_eq!(entry.key, slot as u64);
+            map::TableBackend::extract_finish(&mut table, slot);
+        }
+        assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
+        assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
+        assert_eq!(table.len, 0);
+    }
+
+    #[test]
+    fn refresh_membership_rebuilds_the_recorded_filter() {
+        let mut table = raw_table(32_767, 3);
+        for key in 0..64_u64 {
+            assert!(!table.insert_unique(key, key));
+        }
+        let recorded = unsafe {
+            core::slice::from_raw_parts(table.membership_ptr(), table.membership.words).to_vec()
+        };
+        table.clear_membership();
+        table.refresh_membership();
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(table.membership_ptr(), table.membership.words) },
+            recorded
+        );
     }
 
     #[test]

@@ -30,6 +30,13 @@ Criterion options; otherwise the shared commit-hash baseline would be replaced.
 `BENCH=scaled_insert`. Pass Criterion filters and options after `--`.
 `map_api` and `scaled_insert` remain outside `BENCH=all`.
 
+`map_api` also includes `entry_reinsert`: allocate for `MAP_SIZE`, fill to
+`3 * MAP_SIZE / 4`, remove the first `MAP_SIZE / 32` keys during setup, then
+time their `entry().or_insert()` calls. Spare capacity keeps all controls from growing.
+The small delete burst stays below Funnel cleanup and filter-refresh thresholds,
+so every removed key remains filter-positive and exercises vacant-search reuse.
+Measure its baseline using the same fixture on the comparison revision.
+
 Criterion IDs use `<workload>_<implementation>`, where implementation is one
 of `std`, `hashbrown`, `elastic`, or `funnel`. Renaming an ID resets CodSpeed
 history. The registered headline workloads live in
@@ -74,6 +81,12 @@ post-delete state outside the timed region. Run only these groups with:
 BENCH=map_api scripts/bench.sh -- 'remove_burst|post_delete'
 ```
 
+`iter_sparse` and `drain_sparse` start from the same allocated maps as the
+dense `iter` and `drain` groups, then delete all but the first `MAP_SIZE / 10`
+keys without shrinking. Deletions and any automatic maintenance happen in
+untimed setup. Throughput counts the surviving entries; the timed fold visits
+every surviving key/value pair. These new groups require fresh baseline runs.
+
 `mean_latency` covers 1K, 10K, 100K, 1M, and 10M entries. Maps are built once
 per size outside Criterion's sampled callback. Results are batch mean
 nanoseconds per lookup, not single-operation tail percentiles.
@@ -112,6 +125,31 @@ MEMORY_SIZES=1000,10000 cargo run --release --example memory
 `prealloc` fills a `with_capacity(n)` map; `grow` fills an empty one; `shrink`
 is `grow` followed by `shrink_to_fit`. Default sizes straddle hashbrown's 7/8 · 2^20 capacity step to show the power-of-two
 sawtooth. Bytes are requested layouts, not RSS.
+
+## Deletion churn attribution
+
+Run the separate, untimed diagnostic with the throughput suite's fixed hash
+seed, key trace, `MAP_SIZE`, and `OP_COUNT`:
+
+```bash
+cargo test --release --test deletion_churn deletion_churn_attribution -- --ignored --nocapture
+```
+
+It checks every mutation result and reports remove/insert work separately:
+epoch transition reasons, survivors moved, filter-only refreshes, survivor
+rehashes, maximum rehashes in one operation, and key comparisons. Matched
+clean maps use the same capacity and live keys for lookup comparisons against
+steady churn and post-burst deletion. The regular test suite exercises a
+smaller deterministic fixture and verifies the counting key's hash identity.
+
+Hash counts above the one query hash identify maintenance. Epoch boundaries
+identify rebuilds; hashes without a boundary identify filter refreshes. The
+diagnostic asserts that each such operation rehashes exactly its survivors
+and crosses at most one epoch. Counters live only in this test binary. Key
+comparisons do not count control-byte probes, filter false positives, or
+Elastic schedule length, and these results are not timings or latency tails.
+Use pinned `delete_heavy`, `remove_burst`, `post_delete_lookup`, and
+`post_delete_insert` Criterion runs for performance decisions.
 
 ## Raw results
 

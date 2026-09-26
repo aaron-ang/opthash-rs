@@ -158,6 +158,53 @@ fn throughput_maps_sit_at_their_full_insert_budget() {
 }
 
 #[test]
+fn entry_reinsert_fixture_preserves_capacity_and_funnel_epoch() {
+    let pairs = harness::make_pairs(harness::ENTRY_REINSERT_FILL);
+    let mut maps = MapQuad {
+        std: harness::std_map_cap(MAP_SIZE),
+        hashbrown: harness::hashbrown_map_cap(MAP_SIZE),
+        elastic: harness::elastic_map_cap(MAP_SIZE),
+        funnel: harness::funnel_map_cap(MAP_SIZE),
+    };
+    for &(key, value) in &pairs {
+        maps.std.insert(key, value);
+        maps.hashbrown.insert(key, value);
+        maps.elastic.insert(key, value);
+        maps.funnel.insert(key, value);
+    }
+    let epoch = maps.funnel.epoch();
+    let removed = &pairs[..harness::ENTRY_REINSERT_COUNT];
+    for &(key, value) in removed {
+        assert_eq!(maps.std.remove(&key), Some(value));
+        assert_eq!(maps.hashbrown.remove(&key), Some(value));
+        assert_eq!(maps.elastic.remove(&key), Some(value));
+        assert_eq!(maps.funnel.remove(&key), Some(value));
+    }
+    assert_eq!(maps.funnel.epoch().generation, epoch.generation);
+    assert_eq!(maps.funnel.len(), pairs.len() - removed.len());
+    for &(key, value) in removed {
+        assert!(!maps.funnel.contains_key(&key));
+        assert_eq!(*maps.std.entry(key).or_insert(value), value);
+        assert_eq!(*maps.hashbrown.entry(key).or_insert(value), value);
+        assert_eq!(*maps.elastic.entry(key).or_insert(value), value);
+        assert_eq!(*maps.funnel.entry(key).or_insert(value), value);
+    }
+    for (name, len, capacity) in [
+        ("std", maps.std.len(), maps.std.capacity()),
+        ("hashbrown", maps.hashbrown.len(), maps.hashbrown.capacity()),
+        ("elastic", maps.elastic.len(), maps.elastic.capacity()),
+        ("funnel", maps.funnel.len(), maps.funnel.capacity()),
+    ] {
+        assert_eq!(len, pairs.len());
+        assert_eq!(capacity, MAP_SIZE, "{name}");
+    }
+    assert_eq!(maps.funnel.epoch().generation, epoch.generation);
+    for &(key, value) in &pairs {
+        assert_eq!(maps.funnel.get(&key), Some(&value));
+    }
+}
+
+#[test]
 fn allocation_measurement_reports_map_delta_per_live_entry() {
     let before = AllocationSnapshot {
         live_bytes: 1_000,
