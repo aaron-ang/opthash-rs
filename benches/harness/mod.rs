@@ -3,6 +3,7 @@
 mod fixtures;
 #[macro_use]
 mod map_matrix;
+pub mod memory;
 mod queries;
 
 pub use fixtures::*;

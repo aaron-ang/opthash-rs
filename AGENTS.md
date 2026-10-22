@@ -80,6 +80,8 @@ Run shape and options:
 - Other `[[bench]]` targets are not in `all`; run explicitly via
   `BENCH=<name>`: `set_ops`, `map_api`, `load_factor`, `payload_size`, and
   `scaled_insert` (100K/1M/10M insert sweep).
+- `memory` is a plain-`main` footprint report (TSV, deterministic counts), not
+  Criterion: `cargo bench --profile release --bench memory`.
 - Pass through Criterion flags with `--`: `SAVE=opt1 scripts/bench.sh -- --measurement-time 10`.
 - Filter by Criterion name: `SAVE=opt1 scripts/bench.sh -- "get_hit_latency"`. The script strips a leading `--`, so both forms work.
 

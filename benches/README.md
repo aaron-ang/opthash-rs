@@ -113,13 +113,13 @@ SCALED_INSERT_SIZES=1000 cargo bench --bench scaled_insert -- insert_scale_1K
 
 ## Memory footprint
 
-`examples/memory.rs` reports heap bytes per entry, peak bytes while building,
+`benches/memory.rs` reports heap bytes per entry, peak bytes while building,
 and allocation counts for all four maps. Counts are deterministic, so it uses
 the release profile rather than the bench profile:
 
 ```bash
-cargo run --release --example memory
-MEMORY_SIZES=1000,10000 cargo run --release --example memory
+cargo bench --profile release --bench memory
+MEMORY_SIZES=1000,10000 cargo bench --profile release --bench memory
 ```
 
 `prealloc` fills a `with_capacity(n)` map; `grow` fills an empty one; `shrink`

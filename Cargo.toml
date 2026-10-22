@@ -94,6 +94,10 @@ harness = false
 name = "scaled_insert"
 harness = false
 
+[[bench]]
+name = "memory"
+harness = false
+
 # Layout-stable measurement profile: one codegen unit
 # plus fat LTO keeps placement fixed.
 [profile.bench]
