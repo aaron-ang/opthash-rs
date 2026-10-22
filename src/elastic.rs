@@ -784,9 +784,10 @@ where
         }
     }
 
-    /// Both filter answers from one word: `maybe_present == false` proves the key
-    /// was never recorded, and `level_mask` narrows the candidate levels. One
-    /// dependent load for the pair.
+    /// Reads the membership scalar and selected route-summary bin directly:
+    /// `maybe_present == false` proves the key was never recorded, and
+    /// `level_mask` narrows the candidate levels. The two field loads avoid
+    /// copying the whole metadata word for dynamic bin extraction.
     #[inline]
     fn route_filter(&self, prepared: PreparedElasticKey) -> ElasticRouteFilter {
         let words = self.membership.words;
@@ -797,13 +798,19 @@ where
             };
         }
         let word = MembershipKey::word(prepared.route.signature(), words);
-        // SAFETY: `word` is a multiply-high reduction below `words`, and the
-        // cached region covers exactly that many initialized words.
-        let metadata = unsafe { *self.membership_ptr().add(word) };
+        let summary_bin = prepared.route.summary_bin();
         let bits = prepared.membership.bits();
+        // SAFETY: `word` is a multiply-high reduction below `words`, and the
+        // cached region covers exactly that many initialized, properly aligned
+        // `ElasticMetadataWord`s. Place projections read the two fields without
+        // copying the surrounding metadata word.
+        let (membership, route_bin) = unsafe {
+            let metadata = self.membership_ptr().add(word);
+            ((*metadata).membership, (*metadata).route_bins[summary_bin])
+        };
         ElasticRouteFilter {
-            maybe_present: metadata.membership & bits == bits,
-            level_mask: u32::from(metadata.route_bins[prepared.route.summary_bin()]),
+            maybe_present: membership & bits == bits,
+            level_mask: u32::from(route_bin),
         }
     }
 
@@ -1061,6 +1068,7 @@ where
     A: Allocator + Clone,
 {
     type Location = (usize, usize);
+    type Vacant = u64;
     type Hasher = S;
     type Alloc = A;
 
@@ -1138,6 +1146,15 @@ where
     }
 
     // -- Insert / remove --
+
+    #[inline]
+    fn find_for_entry<Q>(&self, key: &Q, hash: u64) -> Result<Self::Location, u64>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.find(key, hash, control::control_fingerprint(hash))
+            .ok_or(hash)
+    }
 
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> (usize, usize) {

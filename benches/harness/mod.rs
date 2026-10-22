@@ -18,6 +18,10 @@ pub const MAP_SLOTS: usize = 1 << 15;
 /// budget of a `MAP_SLOTS` table at the default reserve fraction, and Funnel's
 /// exact size, so every map is measured at its full insert budget.
 pub const MAP_SIZE: usize = MAP_SLOTS - ReserveFraction::DEFAULT.floor_reserved(MAP_SLOTS);
+/// Small delete burst for entry reinsertion, below either maintenance threshold.
+pub const ENTRY_REINSERT_COUNT: usize = MAP_SIZE / 32;
+/// Leave insertion slack so `SwissTable` controls do not grow after deletion.
+pub const ENTRY_REINSERT_FILL: usize = MAP_SIZE * 3 / 4;
 /// Operations per iteration for throughput benchmarks.
 pub const OP_COUNT: usize = 100_000;
 /// `key_at` index offset for miss queries: past every populated index in any

@@ -30,6 +30,13 @@ Criterion options; otherwise the shared commit-hash baseline would be replaced.
 `BENCH=scaled_insert`. Pass Criterion filters and options after `--`.
 `map_api` and `scaled_insert` remain outside `BENCH=all`.
 
+`map_api` also includes `entry_reinsert`: allocate for `MAP_SIZE`, fill to
+`3 * MAP_SIZE / 4`, remove the first `MAP_SIZE / 32` keys during setup, then
+time their `entry().or_insert()` calls. Spare capacity keeps all controls from growing.
+The small delete burst stays below Funnel cleanup and filter-refresh thresholds,
+so every removed key remains filter-positive and exercises vacant-search reuse.
+Measure its baseline using the same fixture on the comparison revision.
+
 Criterion IDs use `<workload>_<implementation>`, where implementation is one
 of `std`, `hashbrown`, `elastic`, or `funnel`. Renaming an ID resets CodSpeed
 history. The registered headline workloads live in
@@ -73,6 +80,12 @@ post-delete state outside the timed region. Run only these groups with:
 ```bash
 BENCH=map_api scripts/bench.sh -- 'remove_burst|post_delete'
 ```
+
+`iter_sparse` and `drain_sparse` start from the same allocated maps as the
+dense `iter` and `drain` groups, then delete all but the first `MAP_SIZE / 10`
+keys without shrinking. Deletions and any automatic maintenance happen in
+untimed setup. Throughput counts the surviving entries; the timed fold visits
+every surviving key/value pair. These new groups require fresh baseline runs.
 
 `mean_latency` covers 1K, 10K, 100K, 1M, and 10M entries. Maps are built once
 per size outside Criterion's sampled callback. Results are batch mean

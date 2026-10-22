@@ -257,7 +257,6 @@ impl FunnelPlan {
     /// buckets, and every adjacent pair satisfies
     /// `|4 * next - 3 * current| <= 4`, the exact integer form of
     /// `next = 3 * current / 4 +/- 1` over the reals.
-    #[must_use]
     pub(crate) fn ordinary_bucket_counts(&self) -> impl ExactSizeIterator<Item = usize> + Clone {
         FunnelBucketCounts {
             next_count: Some(self.first_bucket_count),
@@ -280,7 +279,6 @@ impl ElasticPlan {
     /// `ceil(remaining / 2)` slots and gives the final level all residual
     /// slots. Thus the lengths sum to `n`, are non-empty, and each next length
     /// is within one of half the preceding length in the real-valued sense.
-    #[must_use]
     pub(crate) fn level_lengths(&self) -> impl ExactSizeIterator<Item = usize> + Clone {
         LevelLengths {
             remaining_slots: self.config.n,
@@ -298,7 +296,6 @@ impl ElasticPlan {
     /// ```
     ///
     /// Trailing quotas are zero once the insertion target is reached.
-    #[must_use]
     pub(crate) fn batch_quotas(&self) -> impl ExactSizeIterator<Item = usize> + Clone {
         BatchQuotas {
             levels: LevelLengths {

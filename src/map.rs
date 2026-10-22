@@ -37,6 +37,11 @@ pub trait TableBackend<K, V>: Sized {
     /// valid; a stale or foreign location reads or writes the wrong slot.
     /// Consume it before the next mutation; never store it across one.
     type Location: Copy + PartialEq;
+    /// State from an absent entry search. Only pass it back to the same table
+    /// for the same key/hash, with no intervening structural mutation. The
+    /// entry's exclusive borrow enforces this; insertion must invalidate any
+    /// geometry-dependent state if it grows the table itself.
+    type Vacant;
     /// Build hashes for stored keys.
     type Hasher: BuildHasher;
     /// Allocate backing storage.
@@ -108,9 +113,14 @@ pub trait TableBackend<K, V>: Sized {
 
     // -- Insert / remove --
 
-    /// Insert a known-absent key, resize as needed, and return its location
-    /// (valid per [`Location`](TableBackend::Location)).
-    fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> Self::Location;
+    /// Find an entry, preserving reusable insertion state on absence.
+    fn find_for_entry<Q>(&self, key: &Q, hash: u64) -> Result<Self::Location, Self::Vacant>
+    where
+        Q: Hash + Equivalent<K> + ?Sized;
+
+    /// Insert a known-absent key using its search state, resize as needed, and
+    /// return its location (valid per [`Location`](TableBackend::Location)).
+    fn insert_for_vacant(&mut self, key: K, value: V, vacant: Self::Vacant) -> Self::Location;
 
     /// Insert `key` → `value` and return the previous value.
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
@@ -483,7 +493,7 @@ where
 
     /// Returns the stored key equal to `key`, inserting `f(key)` (with `value`)
     /// if absent, in one hit-path probe. The `Copy` location from
-    /// [`TableBackend::find`] frees the borrow before the key ref is re-derived —
+    /// [`TableBackend::find_for_entry`] frees the borrow before the key ref is re-derived —
     /// the naive `get`-then-insert needs Polonius. Backs set `get_or_insert_with`.
     pub(crate) fn get_or_insert_key_with<Q, F>(&mut self, key: &Q, value: V, f: F) -> &K
     where
@@ -491,11 +501,14 @@ where
         F: FnOnce(&Q) -> K,
     {
         let hash = self.table.hash(key);
-        if let Some(loc) = self.table.find(key, hash, fingerprint(hash)) {
-            // SAFETY: `find` returned a live location from this table.
-            return unsafe { &self.slot_entry(loc).key };
-        }
-        let loc = self.table.insert_for_vacant(f(key), value, hash);
+        let vacant = match self.table.find_for_entry(key, hash) {
+            Ok(loc) => {
+                // SAFETY: the search returned a live location from this table.
+                return unsafe { &self.slot_entry(loc).key };
+            }
+            Err(vacant) => vacant,
+        };
+        let loc = self.table.insert_for_vacant(f(key), value, vacant);
         // SAFETY: `loc` was just inserted into this table.
         unsafe { &self.slot_entry(loc).key }
     }
@@ -610,14 +623,16 @@ where
     /// [`OccupiedError`] when `key` is already present.
     pub fn try_insert(&mut self, key: K, value: V) -> Result<&mut V, OccupiedError<'_, K, V, P>> {
         let hash = self.table.hash(&key);
-        let fp = fingerprint(hash);
-        if let Some(loc) = self.table.find(&key, hash, fp) {
-            return Err(OccupiedError {
-                entry: OccupiedEntry { map: self, loc },
-                value,
-            });
-        }
-        let loc = self.table.insert_for_vacant(key, value, hash);
+        let vacant = match self.table.find_for_entry(&key, hash) {
+            Ok(loc) => {
+                return Err(OccupiedError {
+                    entry: OccupiedEntry { map: self, loc },
+                    value,
+                });
+            }
+            Err(vacant) => vacant,
+        };
+        let loc = self.table.insert_for_vacant(key, value, vacant);
         // SAFETY: `loc` was just inserted into this table.
         Ok(unsafe { &mut self.slot_entry_mut(loc).value })
     }
@@ -625,12 +640,12 @@ where
     /// Gets the [`Entry`] for `key` for in-place manipulation.
     pub fn entry(&mut self, key: K) -> Entry<'_, K, V, P> {
         let hash = self.table.hash(&key);
-        match self.table.find(&key, hash, fingerprint(hash)) {
-            Some(loc) => Entry::Occupied(OccupiedEntry { map: self, loc }),
-            None => Entry::Vacant(VacantEntry {
+        match self.table.find_for_entry(&key, hash) {
+            Ok(loc) => Entry::Occupied(OccupiedEntry { map: self, loc }),
+            Err(vacant) => Entry::Vacant(VacantEntry {
                 map: self,
                 key,
-                hash,
+                vacant,
             }),
         }
     }
@@ -666,7 +681,7 @@ pub struct OccupiedEntry<'a, K, V, P: TableBackend<K, V>> {
 pub struct VacantEntry<'a, K, V, P: TableBackend<K, V>> {
     map: &'a mut HashMap<K, V, P>,
     key: K,
-    hash: u64,
+    vacant: P::Vacant,
 }
 
 /// Error returned by [`HashMap::try_insert`] on key collision. Holds the
@@ -797,7 +812,10 @@ where
 
     /// Inserts `value` and returns the resulting [`OccupiedEntry`].
     pub(crate) fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, P> {
-        let loc = self.map.table.insert_for_vacant(self.key, value, self.hash);
+        let loc = self
+            .map
+            .table
+            .insert_for_vacant(self.key, value, self.vacant);
         OccupiedEntry { map: self.map, loc }
     }
 }

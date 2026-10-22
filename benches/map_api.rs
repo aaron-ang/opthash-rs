@@ -107,6 +107,47 @@ fn bench_entry_or_insert(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_entry_reinsert(c: &mut Criterion) {
+    let pairs = harness::make_pairs(harness::ENTRY_REINSERT_FILL);
+    let removed = &pairs[..harness::ENTRY_REINSERT_COUNT];
+    let mut group = c.benchmark_group("entry_reinsert");
+    group.throughput(Throughput::Elements(removed.len() as u64));
+
+    // A small delete burst leaves the original membership bits in place.
+    // Every absent Funnel entry therefore walks the exact search, unlike
+    // fresh-key insertion where a negative filter often skips that walk.
+    macro_rules! setup {
+        ($builder:expr) => {
+            || {
+                let mut map = $builder(MAP_SIZE);
+                for &(key, value) in &pairs {
+                    map.insert(key, value);
+                }
+                for &(key, _) in removed {
+                    map.remove(&key);
+                }
+                map
+            }
+        };
+    }
+    bench_all_impls!(
+        group,
+        "entry_reinsert",
+        BatchSize::PerIteration,
+        setup!(harness::std_map_cap),
+        setup!(harness::hashbrown_map_cap),
+        setup!(harness::elastic_map_cap),
+        setup!(harness::funnel_map_cap),
+        |map| {
+            for &(key, value) in removed {
+                *map.entry(black_box(key)).or_insert(black_box(value)) ^= 1;
+            }
+            black_box(map.len())
+        },
+    );
+    group.finish();
+}
+
 /// Build a populated map then remove all but the first `keep` entries -
 /// the realistic precondition for `shrink_to_fit` (post-bulk-delete state).
 macro_rules! sparse_setup {
@@ -119,6 +160,48 @@ macro_rules! sparse_setup {
             m
         }
     };
+}
+
+// Start with the dense fixture's allocation and retain one tenth of its keys.
+// Setup includes delete-triggered maintenance, but never shrinks the map.
+fn bench_iter_sparse(c: &mut Criterion) {
+    let pairs = harness::make_pairs(MAP_SIZE);
+    let keep = MAP_SIZE / 10;
+    let mut group = c.benchmark_group("iter_sparse");
+    group.throughput(Throughput::Elements(keep as u64));
+
+    bench_all_impls!(
+        group,
+        "iter_sparse",
+        BatchSize::LargeInput,
+        sparse_setup!(harness::build_std_map, &pairs, keep),
+        sparse_setup!(harness::build_hashbrown_map, &pairs, keep),
+        sparse_setup!(harness::build_elastic_map, &pairs, keep),
+        sparse_setup!(harness::build_funnel_map, &pairs, keep),
+        |map| black_box(map.iter().fold(0u64, |a, (k, v)| a ^ k ^ v)),
+    );
+
+    group.finish();
+}
+
+fn bench_drain_sparse(c: &mut Criterion) {
+    let pairs = harness::make_pairs(MAP_SIZE);
+    let keep = MAP_SIZE / 10;
+    let mut group = c.benchmark_group("drain_sparse");
+    group.throughput(Throughput::Elements(keep as u64));
+
+    bench_all_impls!(
+        group,
+        "drain_sparse",
+        BatchSize::PerIteration,
+        sparse_setup!(harness::build_std_map, &pairs, keep),
+        sparse_setup!(harness::build_hashbrown_map, &pairs, keep),
+        sparse_setup!(harness::build_elastic_map, &pairs, keep),
+        sparse_setup!(harness::build_funnel_map, &pairs, keep),
+        |map| black_box(map.drain().fold(0u64, |a, (k, v)| a ^ k ^ v)),
+    );
+
+    group.finish();
 }
 
 fn bench_shrink_to_fit(c: &mut Criterion) {
@@ -254,9 +337,12 @@ criterion_group!(
         bench_iter,
         bench_iter_mut,
         bench_drain,
+        bench_iter_sparse,
+        bench_drain_sparse,
         bench_extract_if,
         bench_clear_drop,
         bench_entry_or_insert,
+        bench_entry_reinsert,
         bench_shrink_to_fit,
         bench_replace,
         bench_extend,
