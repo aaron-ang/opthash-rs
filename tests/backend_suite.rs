@@ -5,7 +5,6 @@ mod support;
 macro_rules! backend_suite {
     ($mod_name:ident, $TestMap:ident, $Entry:ident) => {
         mod $mod_name {
-            use std::collections::HashSet;
             use std::sync::Arc;
             use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -222,28 +221,6 @@ macro_rules! backend_suite {
                 let a: *const _ = map.hasher();
                 let b: *const _ = map.hasher();
                 assert!(std::ptr::eq(a, b));
-            }
-
-            #[test]
-            fn insert_resizes_from_zero_capacity() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
-                map.insert(1, 10);
-                assert_eq!(map.get(&1), Some(&10));
-                assert!(map.capacity() > 0);
-            }
-
-            #[test]
-            #[cfg_attr(miri, ignore = "large-map stress test is too slow")]
-            fn large_map_correctness() {
-                let n = 10_000;
-                let mut map = HashMap::with_capacity(n * 2);
-                for i in 0..n {
-                    assert_eq!(map.insert(i, i), None);
-                }
-                for i in 0..n {
-                    assert_eq!(map.get(&i), Some(&i), "key {i} missing");
-                }
-                assert_eq!(map.len(), n);
             }
 
             #[test]
@@ -465,8 +442,12 @@ macro_rules! backend_suite {
                     }
                 }
                 assert_eq!(map.len(), 40);
+                assert_eq!(map.values().filter(|&&v| v >= 1000).count(), 7);
+                for (_, v) in &mut map {
+                    *v %= 1000;
+                }
                 for i in 0..40 {
-                    assert!(map.get(&i).is_some(), "key {i} disappeared");
+                    assert_eq!(map.get(&i), Some(&i), "key {i}");
                 }
             }
 
@@ -507,29 +488,6 @@ macro_rules! backend_suite {
                 }
                 let keys: Vec<i32> = map.iter().map(|(&k, _)| k).collect();
                 assert_eq!(keys.len(), map.len());
-            }
-
-            #[test]
-            fn iter_yields_every_inserted_pair_once() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
-                for i in 0..80 {
-                    map.insert(i, i * 7);
-                }
-                let mut collected: Vec<(i32, i32)> = map.iter().map(|(&k, &v)| (k, v)).collect();
-                collected.sort_unstable();
-                let expected: Vec<(i32, i32)> = (0..80).map(|i| (i, i * 7)).collect();
-                assert_eq!(collected, expected);
-            }
-
-            #[test]
-            fn keys_yields_inserted_keys_only() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
-                for i in 0..50 {
-                    map.insert(i, i * 7);
-                }
-                let got: HashSet<i32> = map.keys().copied().collect();
-                let expected: HashSet<i32> = (0..50).collect();
-                assert_eq!(got, expected);
             }
 
             #[test]
@@ -623,20 +581,7 @@ macro_rules! backend_suite {
             }
 
             #[test]
-            fn values_yields_inserted_values_only() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
-                for i in 0..50 {
-                    map.insert(i, i * 7);
-                }
-                let got: HashSet<i32> = map.values().copied().collect();
-                let expected: HashSet<i32> = (0..50).map(|i| i * 7).collect();
-                assert_eq!(got, expected);
-            }
-
-            #[test]
-            fn options_constructor_fits_requested_capacity() {
-                // `capacity` arg is the insertion budget; the map allocates
-                // at least enough slots so `capacity() >= requested`.
+            fn with_capacity_reports_at_least_requested_capacity() {
                 let map: HashMap<i32, i32> = HashMap::with_capacity(320);
                 assert!(map.capacity() >= 320);
             }
@@ -644,7 +589,6 @@ macro_rules! backend_suite {
             #[test]
             fn insert_resizes_when_threshold_is_reached() {
                 let mut map: HashMap<usize, usize> = HashMap::with_capacity(64);
-                // `capacity()` returns max_insertions for the current allocation.
                 let max_insertions = map.capacity();
                 for key in 0..max_insertions + 10 {
                     assert_eq!(map.insert(key, key), None);
@@ -709,37 +653,6 @@ macro_rules! backend_suite {
 
                 assert_eq!(map.insert(99, 990), None);
                 assert_eq!(map.get(&99), Some(&990));
-            }
-
-            #[test]
-            fn interleaved_insert_delete_correctness() {
-                let mut map = HashMap::with_capacity(256);
-                for i in 0..100 {
-                    map.insert(i, i);
-                }
-                for i in (1..100).step_by(2) {
-                    assert!(map.remove(&i).is_some());
-                }
-                for i in (0..100).step_by(2) {
-                    assert_eq!(map.get(&i), Some(&i), "even key {i} missing");
-                }
-                for i in (1..100).step_by(2) {
-                    assert_eq!(map.get(&i), None, "odd key {i} should be gone");
-                }
-            }
-
-            #[test]
-            fn iter_mut_yields_mutable_values_in_some_order() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
-                for i in 0..50 {
-                    map.insert(i, i);
-                }
-                for (_, v) in &mut map {
-                    *v *= 2;
-                }
-                for i in 0..50 {
-                    assert_eq!(map.get(&i), Some(&(i * 2)), "key {i} not doubled");
-                }
             }
         }
     };

@@ -175,14 +175,14 @@ def test_list_iter_snapshot(m):
     _populate(m, 3)
     snapshot = list(m)  # exhausts iterator before any mutation
     m["new"] = 99
-    assert "new" not in snapshot  # snapshot was taken before mutation
+    assert "new" not in snapshot
 
 
 def test_update_from_dict(m):
     _populate(m, 3)
     m.update({"k0": 100, "new": 42})
-    assert m["k0"] == 100  # overwrite
-    assert m["new"] == 42  # added
+    assert m["k0"] == 100
+    assert m["new"] == 42
     assert len(m) == 4
 
 
