@@ -1468,11 +1468,10 @@ where
         }
         // Every slot is now EMPTY, so dropping the guard only frees `old_arena`.
         drop(guard);
-        if transition == EpochTransition::PlacementRecovery || used_exceptional_placement {
-            self.epoch.start_with_placement_recovery(transition);
-        } else {
-            self.epoch.start(transition);
-        }
+        self.epoch.start_epoch(
+            transition,
+            transition == EpochTransition::PlacementRecovery || used_exceptional_placement,
+        );
     }
 
     /// Fallible counterpart to [`Self::resize`]. Allocates the new backing
@@ -1505,12 +1504,8 @@ where
         debug_assert_eq!(self.len, 0);
         *self = new_map;
         self.epoch = prior_epoch;
-        if used_exceptional_placement {
-            self.epoch
-                .start_with_placement_recovery(EpochTransition::ExplicitResize);
-        } else {
-            self.epoch.start(EpochTransition::ExplicitResize);
-        }
+        self.epoch
+            .start_epoch(EpochTransition::ExplicitResize, used_exceptional_placement);
         Ok(())
     }
 
