@@ -1,24 +1,11 @@
-use std::env;
-
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 use harness::bench_insert_reuse;
 
 const DEFAULT_SIZES: &[usize] = &[100_000, 1_000_000, 10_000_000];
 
-fn configured_sizes() -> Vec<usize> {
-    match env::var("SCALED_INSERT_SIZES") {
-        Ok(raw) => harness::parse_positive_sizes("SCALED_INSERT_SIZES", &raw)
-            .unwrap_or_else(|error| panic!("{error}")),
-        Err(env::VarError::NotPresent) => DEFAULT_SIZES.to_vec(),
-        Err(env::VarError::NotUnicode(_)) => {
-            panic!("SCALED_INSERT_SIZES must contain valid Unicode")
-        }
-    }
-}
-
 fn bench_scaled_insert(c: &mut Criterion) {
-    for size in configured_sizes() {
+    for size in harness::sizes_from_env("SCALED_INSERT_SIZES", DEFAULT_SIZES) {
         let pairs = harness::make_pairs(size);
         let label = harness::exact_size_label(size);
         let workload = format!("insert_scale_{label}");

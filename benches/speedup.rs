@@ -4,7 +4,7 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 
 use harness::{
     MAP_SIZE, MISS_KEY_OFFSET, OP_COUNT, RESIZE_INSERT_COUNT, TINY_MAP_SIZE, TINY_OP_COUNT,
-    bench_empty, bench_insert_reuse, bench_populated,
+    bench_insert_reuse, bench_populated, bench_with_cap,
 };
 
 /// Steady-state insert into a reused map (cap = `2 * OP_COUNT`).
@@ -107,7 +107,7 @@ fn bench_resize_heavy(c: &mut Criterion) {
     let mut group = c.benchmark_group("resize_heavy");
     group.throughput(Throughput::Elements(RESIZE_INSERT_COUNT as u64));
 
-    bench_empty!(group, "resize_heavy", BatchSize::PerIteration, |map| {
+    bench_with_cap!(group, "resize_heavy", BatchSize::PerIteration, 0, |map| {
         for &(key, value) in &pairs {
             black_box(map.insert(black_box(key), black_box(value)));
         }

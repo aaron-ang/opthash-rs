@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use harness::{MAP_SIZE, bench_all_impls, bench_empty, bench_populated, bench_with_cap};
+use harness::{MAP_SIZE, bench_all_impls, bench_populated, bench_with_cap};
 
 fn bench_iter(c: &mut Criterion) {
     let pairs = harness::make_pairs(MAP_SIZE);
@@ -82,8 +82,6 @@ fn bench_clear_drop(c: &mut Criterion) {
         || harness::build_funnel_drop_map(MAP_SIZE),
         |map| map.clear(),
     );
-    // Touch the sink so the drop side-effects can't be optimized out at
-    // module scope.
     black_box(harness::drop_sink_value());
 
     group.finish();
@@ -145,8 +143,9 @@ fn bench_entry_reinsert(c: &mut Criterion) {
     group.finish();
 }
 
-/// Build a populated map then remove all but the first `keep` entries -
-/// the realistic precondition for `shrink_to_fit` (post-bulk-delete state).
+/// Build a populated map then remove all but the first `keep` entries: the
+/// post-bulk-delete state shared by the sparse iteration, drain,
+/// `shrink_to_fit`, and post-delete benches.
 macro_rules! sparse_setup {
     ($builder:expr, $pairs:expr, $keep:expr) => {
         || {
@@ -159,7 +158,6 @@ macro_rules! sparse_setup {
     };
 }
 
-// Start with the dense fixture's allocation and retain one tenth of its keys.
 // Setup includes delete-triggered maintenance, but never shrinks the map.
 fn bench_iter_sparse(c: &mut Criterion) {
     let pairs = harness::make_pairs(MAP_SIZE);
@@ -246,7 +244,7 @@ fn bench_extend(c: &mut Criterion) {
     let mut group = c.benchmark_group("extend");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
-    bench_empty!(group, "extend", BatchSize::PerIteration, |map| {
+    bench_with_cap!(group, "extend", BatchSize::PerIteration, 0, |map| {
         map.extend(pairs.iter().copied());
         black_box(map.len())
     },);

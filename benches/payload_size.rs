@@ -1,9 +1,9 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use harness::{MAP_SIZE, OP_COUNT, bench_insert_reuse, bench_populated_big};
+use harness::{MAP_SIZE, OP_COUNT, bench_insert_reuse, bench_populated};
 
-/// Speedup's `insert` bench with the 32-byte `BigVal` payload.
+/// Steady-state reused-map insert with a 32-byte `BigVal` payload.
 fn bench_insert_big(c: &mut Criterion) {
     let pairs = harness::make_big_pairs(OP_COUNT);
     let mut group = c.benchmark_group("insert_big");
@@ -19,7 +19,7 @@ fn bench_get_hit_big(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_hit_big");
     group.throughput(Throughput::Elements(hit_keys.len() as u64));
 
-    bench_populated_big!(group, "get_hit_big", BatchSize::LargeInput, &pairs, |map| {
+    bench_populated!(group, "get_hit_big", BatchSize::LargeInput, &pairs, |map| {
         for key in &hit_keys {
             black_box(map.get(black_box(key)));
         }
@@ -33,7 +33,7 @@ fn bench_drain_big(c: &mut Criterion) {
     let mut group = c.benchmark_group("drain_big");
     group.throughput(Throughput::Elements(MAP_SIZE as u64));
 
-    bench_populated_big!(group, "drain_big", BatchSize::PerIteration, &pairs, |map| {
+    bench_populated!(group, "drain_big", BatchSize::PerIteration, &pairs, |map| {
         black_box(map.drain().fold(0u64, |a, (k, v)| a ^ k ^ v[0] ^ v[3]))
     },);
 

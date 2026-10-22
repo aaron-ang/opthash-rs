@@ -32,7 +32,6 @@ fn bench_latency_group(
 ) {
     let mut group = c.benchmark_group(workload);
 
-    // Bench id `<workload>_<impl>`, matching speedup.rs (see benches/README.md).
     macro_rules! latency_arm {
         ($impl:literal, $map:expr) => {
             group.bench_function(format!("{workload}_{}", $impl), |b| {

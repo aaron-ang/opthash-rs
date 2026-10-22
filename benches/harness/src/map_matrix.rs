@@ -77,40 +77,6 @@ macro_rules! bench_populated {
     };
 }
 
-/// Like [`bench_populated`] but using the `(u64, BigVal)` builders.
-#[macro_export]
-macro_rules! bench_populated_big {
-    ($group:expr, $op:literal, $batch:expr, $pairs:expr, $body:expr $(,)?) => {
-        $crate::bench_all_impls!(
-            $group,
-            $op,
-            $batch,
-            || $crate::build_std_big_map($pairs),
-            || $crate::build_hashbrown_big_map($pairs),
-            || $crate::build_elastic_big_map($pairs),
-            || $crate::build_funnel_big_map($pairs),
-            $body,
-        )
-    };
-}
-
-/// [`bench_all_impls!`] with empty-map constructors. For growth / extend.
-#[macro_export]
-macro_rules! bench_empty {
-    ($group:expr, $op:literal, $batch:expr, $body:expr $(,)?) => {
-        $crate::bench_all_impls!(
-            $group,
-            $op,
-            $batch,
-            || $crate::std_map_cap(0),
-            || $crate::hashbrown_map_cap(0),
-            || $crate::elastic_map_cap(0),
-            || $crate::funnel_map_cap(0),
-            $body,
-        )
-    };
-}
-
 /// [`bench_all_impls!`] with `with_capacity($cap)` constructors.
 #[macro_export]
 macro_rules! bench_with_cap {
@@ -128,10 +94,9 @@ macro_rules! bench_with_cap {
     };
 }
 
-/// Per-impl insert bench using `iter_custom` + map reuse via `clear()`.
-/// Timed region excludes setup so allocation-induced cache pollution
-/// doesn't bleed into the measurement (unlike [`bench_with_cap!`]).
-/// `$op` may be a literal or any `Display` expression (size-labelled groups).
+/// Reused-map insert bench over every impl; see [`bench_insert_reuse_one!`]
+/// for the timing strategy. `$op` may be a literal or any `Display`
+/// expression (size-labelled groups).
 #[macro_export]
 macro_rules! bench_insert_reuse {
     ($group:expr, $op:expr, $cap:expr, $pairs:expr $(,)?) => {{
