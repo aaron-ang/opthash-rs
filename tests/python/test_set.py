@@ -175,3 +175,47 @@ def test_iterator_mutation_detection(set_cls):
 def test_repr(set_cls):
     s = set_cls([1])
     assert repr(s).startswith(set_cls.__name__)
+
+
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [
+        (lambda s: s.update(s), {1, 2, 3}),
+        (lambda s: s.__ior__(s), {1, 2, 3}),
+        (lambda s: s.intersection_update(s), {1, 2, 3}),
+        (lambda s: s.__iand__(s), {1, 2, 3}),
+        (lambda s: s.difference_update(s), set()),
+        (lambda s: s.__isub__(s), set()),
+        (lambda s: s.symmetric_difference_update(s), set()),
+        (lambda s: s.__ixor__(s), set()),
+        (lambda s: s.update([4], s), {1, 2, 3, 4}),
+        (lambda s: s.difference_update([1], s), set()),
+    ],
+)
+def test_in_place_ops_with_self(set_cls, op, expected):
+    s = set_cls([1, 2, 3])
+    op(s)
+    assert set(s) == expected
+    assert s.issubset(s) and s.issuperset(s)
+    assert set(s | s) == set(s & s) == expected
+    assert set(s - s) == set(s ^ s) == set()
+
+
+def test_in_place_ops_with_self_bump_only_on_change(set_cls):
+    s = set_cls([1, 2])
+    it = iter(s)
+    s |= s
+    s &= s
+    assert next(it) in {1, 2}
+    s -= s
+    with pytest.raises(RuntimeError):
+        next(it)
+
+
+@pytest.mark.parametrize("other", [{2, 3, 4}, frozenset({2, 3, 4}), [2, 3, 4]])
+def test_intersection_and_issubset_accept_any_iterable(set_cls, other):
+    s = set_cls([1, 2, 3])
+    assert not s.issubset(other)
+    s.intersection_update(other)
+    assert set(s) == {2, 3}
+    assert s.issubset(other)

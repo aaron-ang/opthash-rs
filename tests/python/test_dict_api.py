@@ -335,3 +335,13 @@ def test_or_with_another_map(m, map_cls):
     new = m | other
     assert new["k0"] == 0
     assert new["x"] == 99
+
+
+def test_update_with_self(m):
+    _populate(m, 3)
+    expected = dict(m.items())
+    m.update(m)
+    m |= m
+    assert dict(m.items()) == expected
+    m.update(m, extra=1)
+    assert dict(m.items()) == {**expected, "extra": 1}

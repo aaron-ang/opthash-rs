@@ -6,7 +6,7 @@
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 
 use pyo3::Borrowed;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
@@ -572,13 +572,28 @@ macro_rules! define_map_classes {
                     generation: 0,
                 };
                 if other_first {
-                    new.update(Some(other), None, py)?;
+                    new.update_from(Some(other), None, py)?;
                 }
                 map_extend_cloned(&mut new.inner, &self.inner, py);
                 if !other_first {
-                    new.update(Some(other), None, py)?;
+                    new.update_from(Some(other), None, py)?;
                 }
                 Ok(new)
+            }
+
+            /// [`map_update`] from `other`, which must not be `self`.
+            fn update_from(
+                &mut self,
+                other: Option<&Bound<PyAny>>,
+                kwargs: Option<&Bound<PyDict>>,
+                py: Python,
+            ) -> PyResult<()> {
+                let peer = other
+                    .and_then(|o| o.cast::<Self>().ok())
+                    .map(|o| o.borrow());
+                let same_inner = peer.as_ref().map(|p| &p.inner);
+                let touched = map_update(&mut self.inner, other, kwargs, py, same_inner);
+                self.bump_if_changed(touched)
             }
         }
 
@@ -597,7 +612,7 @@ macro_rules! define_map_classes {
                     generation: 0,
                 };
                 if other.is_some() || kwargs.is_some() {
-                    me.update(other, kwargs, py)?;
+                    me.update_from(other, kwargs, py)?;
                 }
                 Ok(me)
             }
@@ -747,17 +762,16 @@ macro_rules! define_map_classes {
             /// iterators valid.
             #[pyo3(signature = (other = None, **kwargs))]
             fn update(
-                &mut self,
+                mut slf: PyRefMut<'_, Self>,
                 other: Option<&Bound<PyAny>>,
                 kwargs: Option<&Bound<PyDict>>,
                 py: Python,
             ) -> PyResult<()> {
-                let peer = other
-                    .and_then(|o| o.cast::<Self>().ok())
-                    .map(|o| o.borrow());
-                let same_inner = peer.as_ref().map(|p| &p.inner);
-                let touched = map_update(&mut self.inner, other, kwargs, py, same_inner);
-                self.bump_if_changed(touched)
+                // `slf` is mutably borrowed, so `other` must not be borrowed
+                // when it is `slf`; updating from itself only adds `kwargs`.
+                let me = slf.as_ptr();
+                let other = other.filter(|o| o.as_ptr() != me);
+                slf.update_from(other, kwargs, py)
             }
 
             #[pyo3(signature = (key, default = None))]
@@ -822,8 +836,8 @@ macro_rules! define_map_classes {
                 self.merged(other, true, py)
             }
 
-            fn __ior__(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<()> {
-                self.update(Some(other), None, py)
+            fn __ior__(slf: PyRefMut<'_, Self>, other: &Bound<PyAny>, py: Python) -> PyResult<()> {
+                Self::update(slf, Some(other), None, py)
             }
         }
 
@@ -1145,6 +1159,20 @@ fn set_remove_all<P: TableBackend<HashedAny, ()>>(
     Ok(inner.len() != before)
 }
 
+/// `other` itself if it is exactly a `set` or `frozenset`, else its elements
+/// collected into a new `set`. Subclasses are copied: they may override
+/// `__contains__`, which builtin set operations ignore.
+fn lookup_set<'py>(other: &Bound<'py, PyAny>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    if other.is_exact_instance_of::<PySet>() || other.is_exact_instance_of::<PyFrozenSet>() {
+        return Ok(other.clone());
+    }
+    let set = PySet::empty(py)?;
+    for item in other.try_iter()? {
+        set.add(item?)?;
+    }
+    Ok(set.into_any())
+}
+
 /// Retain only elements also in `other`; return whether it changed.
 fn set_retain_in<P: TableBackend<HashedAny, ()>>(
     inner: &mut HashSet<HashedAny, P>,
@@ -1157,10 +1185,7 @@ fn set_retain_in<P: TableBackend<HashedAny, ()>>(
         inner.retain(|value| peer.contains(value));
         return Ok(inner.len() != before);
     }
-    let other_set = PySet::empty(py)?;
-    for item in other.try_iter()? {
-        other_set.add(item?)?;
-    }
+    let other_set = lookup_set(other, py)?;
     inner.retain(|value| other_set.contains(value.obj_borrowed(py)).unwrap_or(false));
     Ok(inner.len() != before)
 }
@@ -1227,12 +1252,9 @@ fn set_issubset<P: TableBackend<HashedAny, ()>>(
     if let Some(peer) = same_inner {
         return Ok(inner.is_subset(peer));
     }
-    let other_set = PySet::empty(py)?;
-    for item in other.try_iter()? {
-        other_set.add(item?)?;
-    }
+    let other_set = lookup_set(other, py)?;
     // `inner` is a set, so it cannot be a subset of a smaller collection.
-    if other_set.len() < inner.len() {
+    if other_set.len()? < inner.len() {
         return Ok(false);
     }
     for value in inner {
@@ -1310,14 +1332,38 @@ macro_rules! define_set_classes {
         }
 
         impl $PySet {
+            /// Apply `op` to `other`. When `other` is this set's own object
+            /// `self_ptr`, it can't be borrowed while `self` is, so it is
+            /// handled here: difference ops (`clears_self`) clear the set, the
+            /// rest leave it unchanged. Ops on a copy pass a null `self_ptr`.
+            fn apply(
+                &mut self,
+                other: &Bound<PyAny>,
+                self_ptr: *mut ffi::PyObject,
+                clears_self: bool,
+                op: impl FnOnce(&mut Self, &Bound<PyAny>) -> PyResult<bool>,
+            ) -> PyResult<bool> {
+                if other.as_ptr() != self_ptr {
+                    return op(self, other);
+                }
+                let changed = clears_self && !self.inner.is_empty();
+                if changed {
+                    self.inner.clear();
+                }
+                Ok(changed)
+            }
+
+            /// [`Self::apply`] over each of `others`.
             fn fold_each(
                 &mut self,
                 others: &Bound<PyTuple>,
+                self_ptr: *mut ffi::PyObject,
+                clears_self: bool,
                 mut op: impl FnMut(&mut Self, &Bound<PyAny>) -> PyResult<bool>,
             ) -> PyResult<bool> {
                 let mut touched = false;
                 for other in others.try_iter()? {
-                    touched |= op(self, &other?)?;
+                    touched |= self.apply(&other?, self_ptr, clears_self, &mut op)?;
                 }
                 Ok(touched)
             }
@@ -1482,51 +1528,65 @@ macro_rules! define_set_classes {
             #[pyo3(signature = (*others))]
             fn union(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.update(others)?;
+                new.fold_each(others, ptr::null_mut(), false, |s, o| s.add_all(o))?;
                 Ok(new)
             }
 
             #[pyo3(signature = (*others))]
             fn intersection(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.intersection_update(others, py)?;
+                new.fold_each(others, ptr::null_mut(), false, |s, o| s.retain_in(o, py))?;
                 Ok(new)
             }
 
             #[pyo3(signature = (*others))]
             fn difference(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.difference_update(others)?;
+                new.fold_each(others, ptr::null_mut(), true, |s, o| s.remove_all(o))?;
                 Ok(new)
             }
 
             fn symmetric_difference(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.symmetric_difference_update(other)?;
+                new.symmetric_difference_with(other)?;
                 Ok(new)
             }
 
             #[pyo3(signature = (*others))]
-            fn update(&mut self, others: &Bound<PyTuple>) -> PyResult<()> {
-                let changed = self.fold_each(others, |s, o| s.add_all(o));
-                self.bump_if_changed(changed)
+            fn update(mut slf: PyRefMut<'_, Self>, others: &Bound<PyTuple>) -> PyResult<()> {
+                let me = slf.as_ptr();
+                let changed = slf.fold_each(others, me, false, |s, o| s.add_all(o));
+                slf.bump_if_changed(changed)
             }
 
             #[pyo3(signature = (*others))]
-            fn intersection_update(&mut self, others: &Bound<PyTuple>, py: Python) -> PyResult<()> {
-                let changed = self.fold_each(others, |s, o| s.retain_in(o, py));
-                self.bump_if_changed(changed)
+            fn intersection_update(
+                mut slf: PyRefMut<'_, Self>,
+                others: &Bound<PyTuple>,
+                py: Python,
+            ) -> PyResult<()> {
+                let me = slf.as_ptr();
+                let changed = slf.fold_each(others, me, false, |s, o| s.retain_in(o, py));
+                slf.bump_if_changed(changed)
             }
 
             #[pyo3(signature = (*others))]
-            fn difference_update(&mut self, others: &Bound<PyTuple>) -> PyResult<()> {
-                let changed = self.fold_each(others, |s, o| s.remove_all(o));
-                self.bump_if_changed(changed)
+            fn difference_update(
+                mut slf: PyRefMut<'_, Self>,
+                others: &Bound<PyTuple>,
+            ) -> PyResult<()> {
+                let me = slf.as_ptr();
+                let changed = slf.fold_each(others, me, true, |s, o| s.remove_all(o));
+                slf.bump_if_changed(changed)
             }
 
-            fn symmetric_difference_update(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                let changed = self.symmetric_difference_with(other);
-                self.bump_if_changed(changed)
+            fn symmetric_difference_update(
+                mut slf: PyRefMut<'_, Self>,
+                other: &Bound<PyAny>,
+            ) -> PyResult<()> {
+                let me = slf.as_ptr();
+                let changed = slf.apply(other, me, true, Self::symmetric_difference_with);
+                slf.bump_if_changed(changed)
             }
 
             fn __eq__(&self, other: &Bound<PyAny>) -> PyResult<bool> {
@@ -1535,7 +1595,7 @@ macro_rules! define_set_classes {
 
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.__ior__(other)?;
+                new.add_all(other)?;
                 Ok(new)
             }
 
@@ -1546,7 +1606,7 @@ macro_rules! define_set_classes {
 
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.__iand__(other, py)?;
+                new.retain_in(other, py)?;
                 Ok(new)
             }
 
@@ -1556,7 +1616,7 @@ macro_rules! define_set_classes {
 
             fn __sub__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.__isub__(other)?;
+                new.remove_all(other)?;
                 Ok(new)
             }
 
@@ -1582,23 +1642,30 @@ macro_rules! define_set_classes {
                 self.symmetric_difference(other, py)
             }
 
-            fn __ior__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                let changed = self.add_all(other);
-                self.bump_if_changed(changed)
+            fn __ior__(mut slf: PyRefMut<'_, Self>, other: &Bound<PyAny>) -> PyResult<()> {
+                let me = slf.as_ptr();
+                let changed = slf.apply(other, me, false, Self::add_all);
+                slf.bump_if_changed(changed)
             }
 
-            fn __iand__(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<()> {
-                let changed = self.retain_in(other, py);
-                self.bump_if_changed(changed)
+            fn __iand__(
+                mut slf: PyRefMut<'_, Self>,
+                other: &Bound<PyAny>,
+                py: Python,
+            ) -> PyResult<()> {
+                let me = slf.as_ptr();
+                let changed = slf.apply(other, me, false, |s, o| s.retain_in(o, py));
+                slf.bump_if_changed(changed)
             }
 
-            fn __isub__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                let changed = self.remove_all(other);
-                self.bump_if_changed(changed)
+            fn __isub__(mut slf: PyRefMut<'_, Self>, other: &Bound<PyAny>) -> PyResult<()> {
+                let me = slf.as_ptr();
+                let changed = slf.apply(other, me, true, Self::remove_all);
+                slf.bump_if_changed(changed)
             }
 
-            fn __ixor__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                self.symmetric_difference_update(other)
+            fn __ixor__(slf: PyRefMut<'_, Self>, other: &Bound<PyAny>) -> PyResult<()> {
+                Self::symmetric_difference_update(slf, other)
             }
         }
 
