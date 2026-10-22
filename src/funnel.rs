@@ -225,7 +225,7 @@ impl<T> ArenaSlots<T> for FlatStorage<T> {
 
 impl<T> arena::RegionSet for FlatStorage<T> {
     fn drop_all_values(&mut self) {
-        self.drop_values();
+        arena::drop_values(core::slice::from_mut(self));
     }
 }
 
@@ -583,7 +583,9 @@ unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
 impl<K, V, S, A: Allocator + Clone> Drop for FunnelTable<K, V, S, A> {
     fn drop(&mut self) {
         let storage = &mut self.storage;
-        self.arena.drop_table(&self.alloc, || storage.drop_values());
+        self.arena.drop_table(&self.alloc, || {
+            arena::drop_values(core::slice::from_mut(storage));
+        });
     }
 }
 
@@ -1087,10 +1089,8 @@ where
     #[inline(never)]
     fn refresh_membership(&mut self) {
         self.clear_membership();
-        for slot in 0..self.shape.n {
-            if !control::is_occupied(self.storage.control_at(slot)) {
-                continue;
-            }
+        let mut scan = OccupiedIndices::new();
+        while let Some(slot) = scan.step(&self.storage) {
             let hash = {
                 let entry = unsafe { self.storage.get_ref(slot) };
                 self.hash_builder.hash_one(&entry.key)
@@ -1400,24 +1400,19 @@ where
     }
 
     #[inline]
-    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<usize>
+    fn find<Q>(&self, key: &Q, hash: u64) -> Option<usize>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_location(key, hash, fingerprint)
+        self.find_location(key, hash, control::control_fingerprint(hash))
     }
 
     #[inline]
-    fn find_entry<'a, Q>(
-        &'a self,
-        key: &Q,
-        hash: u64,
-        fingerprint: u8,
-    ) -> Option<&'a SlotEntry<K, V>>
+    fn find_entry<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a SlotEntry<K, V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_entry_ref(key, hash, fingerprint)
+        self.find_entry_ref(key, hash, control::control_fingerprint(hash))
     }
 
     #[inline]

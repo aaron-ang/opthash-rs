@@ -16,7 +16,6 @@ use crate::error::{TryBuildError, TryReserveError};
 use crate::hasher::DefaultHashBuilder;
 use crate::raw::arena::{self, SlotEntry};
 use crate::raw::config::INITIAL_CAPACITY;
-use crate::raw::control;
 use crate::raw::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     Values as CommonValues,
@@ -90,22 +89,17 @@ pub trait TableBackend<K, V>: Sized {
 
     // -- Lookup --
 
-    /// Find the slot for `key` by precomputed hash and fingerprint; the
+    /// Find the slot for `key` by precomputed hash; the
     /// location is valid per [`Location`](TableBackend::Location).
-    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<Self::Location>
+    fn find<Q>(&self, key: &Q, hash: u64) -> Option<Self::Location>
     where
         Q: Hash + Equivalent<K> + ?Sized;
 
-    /// Find and borrow the occupied slot for `key` by precomputed hash and
-    /// fingerprint. Returning the slot reference formed during key comparison
+    /// Find and borrow the occupied slot for `key` by precomputed hash.
+    /// Returning the slot reference formed during key comparison
     /// avoids a second location-to-slot dispatch on read hits. The shared
     /// borrow of `self` blocks structural mutation while the reference lives.
-    fn find_entry<'a, Q>(
-        &'a self,
-        key: &Q,
-        hash: u64,
-        fingerprint: u8,
-    ) -> Option<&'a SlotEntry<K, V>>
+    fn find_entry<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a SlotEntry<K, V>>
     where
         Q: Hash + Equivalent<K> + ?Sized;
 
@@ -420,8 +414,7 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = self.table.hash(key);
-        self.table
-            .find(key, hash, control::control_fingerprint(hash))
+        self.table.find(key, hash)
     }
 
     /// Mutable reference to the slot at `loc`.
@@ -441,8 +434,7 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = self.table.hash(key);
-        self.table
-            .find_entry(key, hash, control::control_fingerprint(hash))
+        self.table.find_entry(key, hash)
     }
 
     /// Inserts `key`/`value`. Returns the previous value for `key`, if any.

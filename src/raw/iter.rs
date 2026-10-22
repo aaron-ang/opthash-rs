@@ -1,6 +1,5 @@
 use core::fmt;
 use core::iter::FusedIterator;
-use core::ptr;
 
 use super::arena::ArenaSlots;
 use super::bitmask::{BITMASK_STRIDE, BitMask};
@@ -148,110 +147,5 @@ impl OccupiedIndices {
                 )
             };
         }
-    }
-}
-
-/// Iterator over occupied slot indices in one arena region.
-///
-/// Map-level iterators reuse this as their group scanner while they decide
-/// which region to scan next.
-#[derive(Clone)]
-pub(crate) struct OccupiedSlots {
-    /// Ptr to the next group's first ctrl byte (or `end_ctrl` if done).
-    next_ctrl: *const u8,
-    /// One-past-end of the current region's ctrl bytes.
-    end_ctrl: *const u8,
-    /// Slot offset of the currently-loaded group.
-    current_group_slot: usize,
-    current_mask: BitMask,
-}
-
-impl OccupiedSlots {
-    #[inline]
-    pub(crate) fn empty() -> Self {
-        Self {
-            next_ctrl: ptr::null(),
-            end_ctrl: ptr::null(),
-            current_group_slot: GROUP_SLOT_INIT,
-            current_mask: BitMask(0),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn set_region<T, D: ArenaSlots<T> + ?Sized>(&mut self, region: &D) {
-        self.next_ctrl = region.ctrl_ptr();
-        // SAFETY: `ctrl_ptr() + capacity()` is one-past-end of the ctrl bytes.
-        self.end_ctrl = unsafe { region.ctrl_ptr().add(region.capacity()) };
-        self.current_group_slot = GROUP_SLOT_INIT;
-        self.current_mask = BitMask(0);
-    }
-
-    #[inline]
-    pub(crate) fn step(&mut self) -> Option<usize> {
-        loop {
-            if let Some(bit) = self.current_mask.next() {
-                return Some(self.current_group_slot.wrapping_add(bit));
-            }
-            if self.next_ctrl >= self.end_ctrl {
-                return None;
-            }
-            self.current_group_slot = self.current_group_slot.wrapping_add(GROUP_SIZE);
-            let remaining = usize::try_from(unsafe { self.end_ctrl.offset_from(self.next_ctrl) })
-                .expect("iterator control pointers remain ordered");
-            // SAFETY: `remaining` counts the controls up to `end_ctrl`.
-            self.current_mask = unsafe { occupied_mask(self.next_ctrl, remaining) };
-            if remaining >= GROUP_SIZE {
-                self.next_ctrl = unsafe { self.next_ctrl.add(GROUP_SIZE) };
-            } else {
-                self.next_ctrl = self.end_ctrl;
-            }
-        }
-    }
-}
-
-/// Per-region scan state shared by the backends' `Scan` cursors: an
-/// [`OccupiedSlots`] group scanner plus the current region's cached slot
-/// pointer. Owns the per-region mechanics; each backend keeps its own region
-/// ordering and location construction.
-#[derive(Clone)]
-pub(crate) struct RegionCursor {
-    cursor: OccupiedSlots,
-    /// Cached `data_ptr()` of the current region, refreshed by `enter`.
-    cur_data: *mut u8,
-    /// `false` until the first `enter`, keeping a fresh cursor pointer-free.
-    started: bool,
-}
-
-impl RegionCursor {
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self {
-            cursor: OccupiedSlots::empty(),
-            cur_data: ptr::null_mut(),
-            started: false,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn started(&self) -> bool {
-        self.started
-    }
-
-    /// Binds the scanner to `region` and caches its slot pointer.
-    #[inline]
-    pub(crate) fn enter<T, D: ArenaSlots<T> + ?Sized>(&mut self, region: &D) {
-        self.cursor.set_region(region);
-        self.cur_data = region.data_ptr().cast();
-        self.started = true;
-    }
-
-    /// Next occupied slot in the current region as `(slot pointer, index)`.
-    #[inline]
-    pub(crate) fn step<E>(&mut self) -> Option<(*mut E, usize)> {
-        let slot_idx = self.cursor.step()?;
-        // SAFETY: `cur_data` is the current region's slot array; `slot_idx` is
-        // in-bounds for it (`step` yields only valid slots).
-        let ptr = unsafe { self.cur_data.cast::<E>().add(slot_idx) };
-        Some((ptr, slot_idx))
     }
 }

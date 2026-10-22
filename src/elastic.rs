@@ -18,7 +18,7 @@ use crate::membership::{self, MembershipKey, MembershipRegion};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::INITIAL_CAPACITY;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
-use crate::raw::iter::RegionCursor;
+use crate::raw::iter::OccupiedIndices;
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -135,22 +135,20 @@ impl<T> Level<T> {
     }
 
     /// Moves every live entry out through `visit` and resets the level to
-    /// empty. Each slot's control and the counters are updated before `visit`
-    /// runs, so a panic inside it leaves the level consistent: the entries not
-    /// yet visited stay live and counted, and the moved ones are `EMPTY`.
+    /// empty. Each slot's control and `len` are updated before `visit` runs,
+    /// and tombstones are wiped only after the last entry, so a panic inside
+    /// `visit` leaves the level consistent: the entries not yet visited stay
+    /// live and counted, and the moved ones are `EMPTY`.
     fn drain_reset(&mut self, mut visit: impl FnMut(T)) {
-        for slot in 0..self.capacity() {
-            let control = self.control_at(slot);
-            if control == CTRL_TOMBSTONE {
-                self.set_control(slot, CTRL_EMPTY);
-                self.tombstones -= 1;
-            } else if control::is_occupied(control) {
-                let entry = unsafe { self.take(slot) };
-                self.set_control(slot, CTRL_EMPTY);
-                self.len -= 1;
-                visit(entry);
-            }
+        let mut scan = OccupiedIndices::new();
+        while let Some(slot) = scan.step(self) {
+            let entry = unsafe { self.take(slot) };
+            self.set_control(slot, CTRL_EMPTY);
+            self.len -= 1;
+            visit(entry);
         }
+        self.clear_all_controls();
+        self.tombstones = 0;
     }
 }
 
@@ -742,9 +740,7 @@ fn handle_elastic_alloc_error<K, V>(level_capacities: &[usize]) -> ! {
 /// panic-safe rollback in `resize`/`clone`.
 impl<K, V> arena::RegionSet for LevelSlice<K, V> {
     fn drop_all_values(&mut self) {
-        for level in self.iter_mut() {
-            level.drop_values();
-        }
+        arena::drop_values(self);
     }
 }
 
@@ -1063,27 +1059,6 @@ where
         self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
             | u32::try_from(high_water).expect("Elastic query cap fits u32");
     }
-
-    /// Prime the scan and cross level boundaries off the hot path.
-    #[cold]
-    fn scan_advance(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
-        if !scan.region.started() {
-            if self.levels.is_empty() {
-                return None;
-            }
-            scan.region.enter(&self.levels[0]);
-        }
-        loop {
-            if let Some((ptr, slot_idx)) = scan.region.step::<SlotEntry<K, V>>() {
-                return Some((ptr, (scan.level_idx, slot_idx)));
-            }
-            scan.level_idx += 1;
-            if scan.level_idx >= self.levels.len() {
-                return None;
-            }
-            scan.region.enter(&self.levels[scan.level_idx]);
-        }
-    }
 }
 
 #[allow(private_interfaces)]
@@ -1155,24 +1130,27 @@ where
     }
 
     #[inline]
-    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<(usize, usize)>
+    fn find<Q>(&self, key: &Q, hash: u64) -> Option<(usize, usize)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_slot_indices_prepared(key, PreparedElasticKey::new(hash), fingerprint)
+        self.find_slot_indices_prepared(
+            key,
+            PreparedElasticKey::new(hash),
+            control::control_fingerprint(hash),
+        )
     }
 
     #[inline]
-    fn find_entry<'a, Q>(
-        &'a self,
-        key: &Q,
-        hash: u64,
-        fingerprint: u8,
-    ) -> Option<&'a SlotEntry<K, V>>
+    fn find_entry<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a SlotEntry<K, V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_entry_prepared(key, PreparedElasticKey::new(hash), fingerprint)
+        self.find_entry_prepared(
+            key,
+            PreparedElasticKey::new(hash),
+            control::control_fingerprint(hash),
+        )
     }
 
     #[inline]
@@ -1180,8 +1158,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find(key, hash, control::control_fingerprint(hash))
-            .ok_or(hash)
+        self.find(key, hash).ok_or(hash)
     }
 
     #[inline]
@@ -1240,19 +1217,20 @@ where
     fn scan(&self) -> ElasticScan {
         ElasticScan {
             level_idx: 0,
-            region: RegionCursor::new(),
+            slots: OccupiedIndices::new(),
         }
     }
 
     #[inline]
     fn scan_next(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
-        // Hot path: another occupied slot in the level the cursor already holds.
-        if scan.region.started()
-            && let Some((ptr, slot_idx)) = scan.region.step::<SlotEntry<K, V>>()
-        {
-            return Some((ptr, (scan.level_idx, slot_idx)));
+        while let Some(level) = self.levels.get(scan.level_idx) {
+            if let Some(slot_idx) = scan.slots.step(level) {
+                return Some((level.slot_ptr(slot_idx), (scan.level_idx, slot_idx)));
+            }
+            scan.level_idx += 1;
+            scan.slots = OccupiedIndices::new();
         }
-        self.scan_advance(scan)
+        None
     }
 
     #[inline]
@@ -1362,7 +1340,7 @@ where
 #[derive(Clone)]
 pub struct ElasticScan {
     level_idx: usize,
-    region: RegionCursor,
+    slots: OccupiedIndices,
 }
 
 impl<K, V, S, A> ElasticTable<K, V, S, A>
@@ -1389,10 +1367,8 @@ where
     fn refresh_membership(&mut self) {
         self.clear_membership();
         for level_idx in 0..self.levels.len() {
-            for slot_idx in 0..self.levels[level_idx].capacity() {
-                if !control::is_occupied(self.levels[level_idx].control_at(slot_idx)) {
-                    continue;
-                }
+            let mut scan = OccupiedIndices::new();
+            while let Some(slot_idx) = scan.step(&self.levels[level_idx]) {
                 let hash = {
                     let entry = unsafe { self.levels[level_idx].get_ref(slot_idx) };
                     self.hash_builder.hash_one(&entry.key)
