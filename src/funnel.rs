@@ -466,9 +466,8 @@ unsafe fn scan_clean_funnel_group<T>(
 ) -> BucketScanResult<T> {
     let group = unsafe { ctrl_ptr.add(start) };
     let matches = unsafe { simd::eq_mask_group(group, fingerprint) };
-    // Left as an iterator search on purpose: `BitMask::first_below` is the same
-    // test, but here LLVM lowers it to a nine-instruction select chain on every
-    // level, where this form compiles to one test-and-branch.
+    // Iterator search on purpose: `BitMask::first_below` is the same test, but
+    // here LLVM lowers it to a select chain instead of one test-and-branch.
     let first_empty = unsafe { simd::free_mask_group(group) }
         .into_iter()
         .find(|&lane| lane < logical_lanes);
@@ -738,9 +737,8 @@ where
     /// Duplicate search ahead of an insert: the clean-epoch scan when no
     /// tombstone can sit on the walk, the general scan otherwise.
     ///
-    /// Kept out of line on purpose. Inlined next to the placement walk, LLVM
-    /// turns the per-level free-lane test into a select chain that costs ten
-    /// more instructions on every level than the branchy form it emits here.
+    /// Kept out of line on purpose: inlined next to the placement walk, LLVM
+    /// turns the per-level free-lane test into a costlier select chain.
     #[inline(never)]
     fn search_exact_prepared_for_insert<Q>(
         &self,
@@ -873,12 +871,11 @@ where
     /// which is the `Vacant` slot the exact search reports for an absent key.
     /// No fingerprint mask, no key compares, never `Hit`.
     ///
-    /// Forced inline: the loop keeps ten registers plus a vector constant
-    /// live, so as a call it spent more on prologue and epilogue than on the
-    /// walk. The special-array tail stays out of line because almost every
-    /// insert finds its slot in the funnel. It duplicates the exact search's
-    /// special leg on purpose: routing both through one closure-driven walker
-    /// cost the exact search instructions on every miss at full load.
+    /// Forced inline: the loop keeps many registers live, so a call costs more
+    /// in prologue and epilogue than the walk. The special-array tail stays out
+    /// of line because almost every insert finds its slot in the funnel. It
+    /// duplicates the exact search's special leg on purpose: a shared
+    /// closure-driven walker slows the exact search's misses.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn search_vacancy(&self, probe: PreparedFastFunnelProbe) -> SearchResult {
@@ -1403,7 +1400,8 @@ where
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, vacant: FunnelVacant) -> usize {
         let exact = if self.prepare_vacant_insert() || vacant.exact == FunnelVacant::UNSEARCHED {
-            // Growth invalidates the old slot, including Full/RangeFailure.
+            // Growth invalidates any recorded slot or exhaustion; an unsearched
+            // token never had one.
             let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(vacant.hash);
             self.search_vacancy(probe)
         } else if vacant.exact == FunnelVacant::EXHAUSTED {

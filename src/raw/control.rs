@@ -25,8 +25,7 @@ pub(crate) fn is_free(byte: u8) -> bool {
 #[inline]
 #[must_use]
 pub(crate) fn control_fingerprint(hash: u64) -> u8 {
-    // Masking with FINGERPRINT_MASK (0x7F) bounds the value to [0, 127];
-    // try_from succeeds unconditionally so the unwrap is unreachable.
+    // Masked to 7 bits, so `try_from` cannot fail; `.max(1)` keeps it off `CTRL_EMPTY`.
     let masked = (hash >> FINGERPRINT_SHIFT) & u64::from(FINGERPRINT_MASK);
     u8::try_from(masked).unwrap_or(0).max(1)
 }

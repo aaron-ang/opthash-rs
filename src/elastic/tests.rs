@@ -605,7 +605,7 @@ fn route_summary_saturates_deep_levels_into_the_last_bit() {
 
 #[test]
 fn route_summary_still_narrows_shallow_levels_on_wide_geometries() {
-    // Enough levels that the old encoding fell back to an all-ones mask.
+    // More levels than summary bits, so the last bit saturates.
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(1 << 20, IdentityBuildHasher);
     assert!(

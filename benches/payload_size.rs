@@ -3,7 +3,7 @@ use std::hint::black_box;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use harness::{MAP_SIZE, OP_COUNT, bench_insert_reuse, bench_populated_big};
 
-/// [`bench_insert`] equivalent with `BigVal` payload (32B).
+/// Speedup's `insert` bench with the 32-byte `BigVal` payload.
 fn bench_insert_big(c: &mut Criterion) {
     let pairs = harness::make_big_pairs(OP_COUNT);
     let mut group = c.benchmark_group("insert_big");

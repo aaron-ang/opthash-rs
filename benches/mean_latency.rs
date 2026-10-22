@@ -3,8 +3,6 @@
 //! ```sh
 //! SAVE=ref BENCH=mean_latency scripts/bench.sh
 //! ```
-//!
-//! The pinned run stores named Criterion estimates under `target/criterion/`.
 
 use std::hint::black_box;
 

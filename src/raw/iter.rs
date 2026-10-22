@@ -177,7 +177,6 @@ impl OccupiedSlots {
         }
     }
 
-    /// Set ctrl pointers + reset state for a new region.
     #[inline]
     pub(crate) fn set_region<T, D: ArenaSlots<T> + ?Sized>(&mut self, region: &D) {
         self.next_ctrl = region.ctrl_ptr();

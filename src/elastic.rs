@@ -82,9 +82,7 @@ struct Level<T> {
     /// Exact logical slot count. Bounded by the arena layout, so the counters
     /// fit in `u32` too.
     capacity: u32,
-    /// Live entry count.
     len: u32,
-    /// Deleted-slot count.
     tombstones: u32,
 }
 
@@ -207,13 +205,8 @@ impl<K, V, S, A: Allocator + Clone> Drop for ElasticTable<K, V, S, A> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Public type aliases. The generic [`map::HashMap`] shell supplies the public
-// API; these names keep `ElasticHashMap` and its iterator/entry types
-// nameable (and re-exportable from `lib.rs` / `set.rs`). The generic-argument
-// threading lives once in `declare_backend_aliases!`; each entry below is just
-// `doc`, alias name, and the unprefixed shell type.
-// ---------------------------------------------------------------------------
+// Public names for the generic shell instantiated over `ElasticTable`,
+// re-exported from `lib.rs` / `set.rs`.
 
 macros::declare_backend_aliases! {
     table = ElasticTable,
@@ -865,7 +858,6 @@ where
         };
     }
 
-    /// Removes all entries, keeping allocated capacity.
     fn clear(&mut self) {
         for level in &mut self.levels {
             level.drain_reset(|entry| {
@@ -1122,8 +1114,6 @@ where
         mem::replace(&mut slot.value, value)
     }
 
-    // -- Lookup --
-
     #[inline]
     fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<(usize, usize)>
     where
@@ -1144,8 +1134,6 @@ where
     {
         self.find_entry_prepared(key, PreparedElasticKey::new(hash), fingerprint)
     }
-
-    // -- Insert / remove --
 
     #[inline]
     fn find_for_entry<Q>(&self, key: &Q, hash: u64) -> Result<Self::Location, u64>
@@ -1206,8 +1194,6 @@ where
         self.settle_after_deletes(self.levels.iter().any(Level::needs_cleanup));
     }
 
-    // -- Iterate --
-
     type Scan = ElasticScan;
 
     #[inline]
@@ -1228,8 +1214,6 @@ where
         }
         self.scan_advance(scan)
     }
-
-    // -- Lifecycle --
 
     #[inline]
     fn with_capacity_and_reserve_and_hasher_in(
@@ -1390,8 +1374,8 @@ where
 
     /// Insert `(key, value)` known to be new. Skips the existence check and
     /// capacity check in `insert`; resize loops drain old levels into fresh
-    /// (all-EMPTY) ones, so neither check can succeed.
-    ///
+    /// (all-EMPTY) ones, so neither check can succeed. Returns `true` on
+    /// exceptional placement.
     #[inline]
     fn insert_unique(&mut self, key: K, value: V) -> bool {
         let key_hash = self.hash_builder.hash_one(&key);
@@ -1408,9 +1392,8 @@ where
         }
     }
 
-    /// Drain all live entries into a temp Vec, rebuild levels at
-    /// `new_capacity` in-place, reinsert. Passing the current capacity
-    /// performs a no-grow rehash that flushes accumulated tombstones.
+    /// Rebuilds levels at `new_capacity` and moves every live entry across.
+    /// Passing the current capacity flushes tombstones without growing.
     fn resize(&mut self, new_capacity: usize) {
         self.resize_with_transition(new_capacity, EpochTransition::ExplicitResize);
     }
@@ -1438,8 +1421,6 @@ where
         self.probe_high_water = 0;
         self.probe_schedule.clear();
 
-        // Move every live entry from old arena into the new levels.
-        //
         // Panic safety: clear each source ctrl before handing the moved entry
         // to `insert_unique`, so the guard's drop walks only un-moved slots.
         // If `insert_unique` panics, the guard unwinds: drops any survivors

@@ -265,13 +265,10 @@ impl PartialEq for HashedAny {
 
 impl Eq for HashedAny {}
 
-// ---------------------------------------------------------------------------
 // Backend-generic map operations. The per-backend `#[pyclass]` shims below
 // resolve the same-type fast path (`other.cast::<Self>()`) and pass the peer's
-// `inner` as `same_inner`; all the actual logic lives here, once, reachable by
-// rust-analyzer, unit tests, and coverage. `P` is the backend table; every op
-// works on the generic [`HashMap`] shell.
-// ---------------------------------------------------------------------------
+// `inner` as `same_inner`; the logic lives here once, generic over the backend
+// table `P`.
 
 /// Clone every entry of `src` into `dst` under `py`.
 fn map_extend_cloned<P: TableBackend<HashedAny, Py<PyAny>>>(
@@ -1157,13 +1154,7 @@ fn is_set_like(other: &Bound<PyAny>) -> PyResult<bool> {
     other.is_instance(&set_abc)
 }
 
-// ---------------------------------------------------------------------------
-// Backend-generic set operations. The per-backend `#[pyclass]` shims below
-// resolve the same-type fast path (`other.cast::<Self>()`) and pass the peer's
-// `inner` as `same_inner`; all the actual logic lives here, once, reachable by
-// rust-analyzer, unit tests, and coverage. `P` is the backend table; every op
-// works on the generic [`HashSet`] shell.
-// ---------------------------------------------------------------------------
+// Backend-generic set operations, shimmed like the map operations above.
 
 /// Insert every element of `other` into `inner`; return whether it changed.
 fn set_add_all<P: TableBackend<HashedAny, ()>>(

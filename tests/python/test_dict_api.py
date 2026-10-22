@@ -206,8 +206,7 @@ def test_update_accepts_list_of_lists(m):
 
 
 def test_eq_with_list_returns_false_even_if_indices_match(m):
-    # Without the hasattr("keys") guard, {0: 'a', 1: 'b'} == ['a', 'b'] would
-    # be True because list[0] == 'a' and list[1] == 'b'. Verify the guard.
+    # Without the hasattr("keys") guard, index-wise lookup would make this equal.
     m[0] = "a"
     m[1] = "b"
     assert m != ["a", "b"]

@@ -27,26 +27,13 @@ pub(crate) enum ProbeDomain {
 
 /// Supplies random words to dev-only scalar probe implementations.
 ///
-/// Implementations must be stable functions of the complete input tuple:
-/// repeated evaluation of the same tuple must return the same word. In the
-/// theorem-level random-oracle ideal, words attached to *distinct* tuples are
-/// independently and uniformly distributed; repeated evaluation of one tuple
-/// observes the same random variable rather than drawing a fresh word. An
-/// implementation may intentionally model weaker assumptions, but must report
-/// them; implementing this trait does not itself establish independence or
-/// uniformity.
-///
-/// For the theorem-level ideal, a finite instantiation must use `key_hash` as a
-/// collision-free identity over its logical keys. If it instead
-/// permits identity collisions, the collisions and resulting weaker
-/// randomness model must be reported with the experiment.
+/// Implementations must be stable functions of the complete input tuple. In the
+/// theorem-level random-oracle ideal, words for distinct tuples are independent
+/// and uniform, and `key_hash` is a collision-free identity over logical keys;
+/// implementing this trait does not itself establish either property.
 #[cfg(test)]
 pub(crate) trait ProbeOracle {
     /// Returns one word for a fully domain-separated logical counter tuple.
-    ///
-    /// Repeating this method with all four arguments unchanged must return the
-    /// same word. Two logical experiment keys must not share `key_hash` unless
-    /// that collision and the consequent shared counter stream are reported.
     ///
     /// `rejection_index` starts at zero and advances only when an exact range
     /// reduction needs another word. Such retries do not advance
@@ -424,8 +411,7 @@ pub(crate) enum RangeReductionError {
 /// Retry words increment only `rejection_index`; they do not create additional
 /// logical probes.
 ///
-/// Callers must surface a rejection-limit error and include its
-/// `random_word_count` in failure metrics. They must not recover by modulo
+/// Callers must surface a rejection-limit error, not recover by modulo
 /// reduction, by resetting the retry counter, or by treating the failure as a
 /// new logical probe.
 ///
@@ -434,10 +420,6 @@ pub(crate) enum RangeReductionError {
 /// Returns [`RangeReductionError::ZeroUpperBound`] when `upper == 0`, or
 /// [`RangeReductionError::RejectionLimitExceeded`] after consuming the allowed
 /// number of words without accepting one.
-// The low-half cast deliberately selects the low 64 bits. The high-half value
-// is strictly below `upper`, which originated as a `usize`, so it is also
-// representable on 32-bit targets.
-#[allow(clippy::cast_possible_truncation)]
 #[cfg(test)]
 pub(crate) fn unbiased_probe_index<O: ProbeOracle + ?Sized>(
     oracle: &O,
@@ -555,6 +537,9 @@ fn reduce_prepared_elastic_non_power(
     })
 }
 
+// The low-half cast deliberately selects the low 64 bits. The high-half value
+// is strictly below `upper`, which originated as a `usize`, so it is also
+// representable on 32-bit targets.
 #[allow(clippy::cast_possible_truncation)]
 #[inline]
 fn reduce_probe_words(
@@ -750,13 +735,11 @@ pub(crate) enum ElasticProbeBudgetError {
 /// Computes the conservative dyadic Elastic probe-budget convention.
 ///
 /// Let `k = ceil(log2(level_slots / free_slots))`, computed without floating
-/// point. This function returns `c * min(k^2, reserve_exponent)`. In particular, the
-/// ceiling is taken before squaring. Thus `k^2` is generally not
-/// `ceil(log2(level_slots / free_slots)^2)`, and this API does not claim to be
-/// the exact ceiling of the paper's real-valued formula. The paper leaves its
-/// finite rounding, logarithm base, and sufficiently-large constant
-/// unspecified; this function fixes the dyadic rounding convention only, and
-/// requires callers to supply `c` without a hidden default.
+/// point. Returns `c * min(k^2, reserve_exponent)`. The ceiling is taken before
+/// squaring, so this is not the exact ceiling of the paper's real-valued
+/// formula. The paper leaves finite rounding, logarithm base, and the
+/// sufficiently-large constant unspecified; this fixes only the dyadic
+/// rounding convention, and callers supply `c` explicitly.
 ///
 /// More precisely, let `L = log2(level_slots / free_slots)`. The dyadic term is
 /// always conservative because
@@ -766,12 +749,8 @@ pub(crate) enum ElasticProbeBudgetError {
 /// constant-factor relation over every valid free-slot count: as positive `L`
 /// approaches zero, `ceil(L)^2 / L^2` is unbounded.
 ///
-/// A fidelity report using this helper must record at least these fields:
-/// `probe_budget_convention = "dyadic-ceil-before-square"`,
-/// `probe_budget_c = c`, and
-/// `probe_budget_unit = "logical-slot-probes"`. The returned value counts
-/// individual logical slot probes, not random words, SIMD groups, or control
-/// byte scans.
+/// The result counts logical slot probes, not random words, SIMD groups, or
+/// control-byte scans.
 ///
 /// # Errors
 ///

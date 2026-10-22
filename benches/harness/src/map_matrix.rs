@@ -194,11 +194,10 @@ macro_rules! preflight_insert_reuse_map {
     }};
 }
 
-/// One impl variant of [`bench_insert_reuse`]. Native: `iter_custom` so
-/// only the insert loop is timed (no per-iter alloc pollution). Under
-/// `cfg(codspeed)` falls back to `iter_batched_ref` (codspeed-criterion-
-/// compat skips `iter_custom`); accept the realloc cost - instruction
-/// counts under callgrind are insensitive to cache state anyway.
+/// One impl variant of [`bench_insert_reuse`]. Under `cfg(codspeed)` falls
+/// back to `iter_batched_ref` because codspeed-criterion-compat skips
+/// `iter_custom`; callgrind instruction counts ignore the realloc's cache
+/// effects anyway.
 #[macro_export]
 macro_rules! bench_insert_reuse_one {
     ($group:expr, $name:expr, $setup:expr, $pairs:expr $(,)?) => {{

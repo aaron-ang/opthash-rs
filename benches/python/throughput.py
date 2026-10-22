@@ -2,8 +2,6 @@
 
 Run:
     uv run pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
-
-The raw benchmark result is written to .benchmarks/python.json.
 """
 
 import random

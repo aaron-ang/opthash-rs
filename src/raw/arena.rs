@@ -54,7 +54,6 @@ impl Arena {
         self.ptr.as_ptr()
     }
 
-    /// Size of the already-stored allocator layout backing this arena.
     #[cfg(test)]
     pub(crate) fn layout_size(&self) -> usize {
         self.layout.size()

@@ -20,7 +20,6 @@ KEYS_INT = list(range(N))
 
 
 def bench(name, fn):
-    # warmup
     for _ in range(3):
         fn()
     samples = []
