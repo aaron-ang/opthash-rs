@@ -215,6 +215,8 @@ fi
 echo "info: forwarding args: ${forward_args[*]}" >&2
 
 for target in "${bench_targets[@]}"; do
+	# Build unpinned so compilation uses every core; only the run is pinned.
+	"${launcher[@]}" cargo bench --no-run --bench "$target"
 	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" env "${criterion_env_args[@]}"
 		cargo bench --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
 	"${launcher[@]}" "${cmd[@]}"

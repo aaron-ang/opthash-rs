@@ -4,9 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  # Core Rust changes get cross-target coverage from `ci.yml`'s
+  # `cross-check`; wheels rebuild only when the bindings or packaging change.
   pull_request:
     paths:
-      - "src/**"
+      - "src/python.rs"
+      - "python/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "pyproject.toml"
@@ -37,7 +40,6 @@ jobs:
           path: dist
 
   linux:
-    needs: sdist
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       max-parallel: 3
@@ -59,7 +61,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: 3.9
+          python-version: "3.10"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -81,7 +83,6 @@ jobs:
           path: dist
 
   musllinux:
-    needs: sdist
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       max-parallel: 2
@@ -99,7 +100,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: 3.9
+          python-version: "3.10"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -121,7 +122,6 @@ jobs:
           path: dist
 
   windows:
-    needs: sdist
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       max-parallel: 2
@@ -165,7 +165,6 @@ jobs:
           path: dist
 
   macos:
-    needs: sdist
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       max-parallel: 2
@@ -179,7 +178,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: 3.9
+          python-version: "3.10"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:

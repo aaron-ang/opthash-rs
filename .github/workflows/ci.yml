@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   conclusion:
-    needs: [pre-commit, rust-test, msrv, python-test, miri]
+    needs: [pre-commit, rust-test, cross-check, msrv, python-test, miri]
     # Run even when a needed job fails or is skipped, so this gate reports it.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
@@ -64,6 +64,36 @@ jobs:
         if: matrix.channel == 'nightly'
         run: cargo test --features nightly
 
+  # Compile-only coverage for the wheel targets that `rust-test` doesn't
+  # run on.
+  cross-check:
+    needs: pre-commit
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - i686-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - s390x-unknown-linux-gnu
+          - powerpc64le-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+          - x86_64-apple-darwin
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+          - x86_64-unknown-linux-musl
+          - i686-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - i686-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --lib --target ${{ matrix.target }}
+
   msrv:
     needs: pre-commit
     runs-on: ubuntu-latest
@@ -93,8 +123,8 @@ jobs:
       - name: Pytest
         run: |
           uv venv
-          uv pip install dist/*.whl pytest hypothesis pytest-benchmark
-          uv run pytest tests/python/
+          uv pip install dist/*.whl pytest hypothesis
+          .venv/bin/pytest tests/python/
 
   miri:
     needs: rust-test

@@ -27,9 +27,6 @@ exclude = [
     "/uv.lock",
 ]
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [package.metadata.docs.rs]
 features = ["nightly"]
 rustdoc-args = ["--generate-link-to-definition"]
@@ -39,7 +36,7 @@ default = ["std", "default-hasher"]
 default-hasher = ["dep:foldhash"]
 std = ["foldhash?/std", "allocator-api2/std"]
 python = ["std", "dep:pyo3"]
-nightly = ["allocator-api2/nightly", "hashbrown/nightly", "foldhash?/nightly"]
+nightly = ["allocator-api2/nightly", "foldhash?/nightly"]
 
 [dependencies]
 allocator-api2 = { version = "0.2", default-features = false, features = [
@@ -67,6 +64,7 @@ workspace = true
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(codspeed)'] }
 
 [workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
 borrow_as_ptr = "warn"
 ptr_as_ptr = "warn"
 ptr_cast_constness = "warn"

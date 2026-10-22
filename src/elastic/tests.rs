@@ -702,26 +702,22 @@ fn route_summary_conservatively_records_every_live_level() {
         map.insert(key, key ^ 0x55);
     }
 
-    for key in 0..key_count {
-        let location = map
-            .table()
-            .levels
-            .iter()
-            .enumerate()
-            .find_map(|(level_index, level)| {
-                (0..level.capacity()).find_map(|slot| {
-                    (control::is_occupied(level.control_at(slot))
-                        && unsafe { level.get_ref(slot) }.key == key)
-                        .then_some((level_index, slot))
-                })
-            })
-            .unwrap();
+    let mut key_levels = vec![None; usize::try_from(key_count).unwrap()];
+    for (level_index, level) in map.table().levels.iter().enumerate() {
+        for slot in 0..level.capacity() {
+            if control::is_occupied(level.control_at(slot)) {
+                let key = unsafe { level.get_ref(slot) }.key;
+                key_levels[usize::try_from(key).unwrap()] = Some(level_index);
+            }
+        }
+    }
+    for (key, level_index) in (0..key_count).zip(key_levels) {
+        let level_index = level_index.unwrap();
         let prepared = PreparedElasticKey::new(key);
         assert_ne!(
-            map.table().route_filter(prepared).level_mask & (1_u32 << summary_level(location.0)),
+            map.table().route_filter(prepared).level_mask & (1_u32 << summary_level(level_index)),
             0,
-            "key {key} at level {}",
-            location.0
+            "key {key} at level {level_index}"
         );
         assert_eq!(map.get(&key), Some(&(key ^ 0x55)));
     }
