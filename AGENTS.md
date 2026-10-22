@@ -157,6 +157,7 @@ pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 - `benches/harness/` — unpublished `opthash-bench-harness` workspace crate (dev-dep `harness`): shared workload constants, deterministic fixtures,
   map constructors, and Criterion comparison helpers
 
+Modules with children use `foo.rs` + `foo/` (no `mod.rs`; `clippy::mod_module_files` enforces it). `tests/support/mod.rs` is the exception: a `tests/support.rs` would build as its own test crate.
 Large modules keep unit tests in a sibling `<module>/tests.rs` (`mod tests;`); small ones keep them inline.
 
 Don't duplicate primitives across `src/` and `benches/`.
