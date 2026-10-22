@@ -606,8 +606,9 @@ fn route_summary_saturates_deep_levels_into_the_last_bit() {
 #[test]
 fn route_summary_still_narrows_shallow_levels_on_wide_geometries() {
     // More levels than summary bits, so the last bit saturates.
+    let capacity = if cfg!(miri) { 1 << 16 } else { 1 << 20 };
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
-        ElasticHashMap::with_capacity_and_hasher(1 << 20, IdentityBuildHasher);
+        ElasticHashMap::with_capacity_and_hasher(capacity, IdentityBuildHasher);
     assert!(
         map.table().levels.len() > ROUTE_SUMMARY_LEVELS,
         "fixture needs more levels than the summary width, got {}",
@@ -792,10 +793,11 @@ fn membership_filter_never_forgets_live_or_deleted_hashes() {
 fn blocked_membership_never_forgets_inserted_hashes() {
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(2_048, IdentityBuildHasher);
-    for key in 0..1_024_u64 {
+    let key_count = if cfg!(miri) { 128_u64 } else { 1_024_u64 };
+    for key in 0..key_count {
         map.insert(key, key);
     }
-    for key in 0..1_024_u64 {
+    for key in 0..key_count {
         assert!(membership_maybe_contains_prepared(
             map.table(),
             PreparedElasticKey::new(key)

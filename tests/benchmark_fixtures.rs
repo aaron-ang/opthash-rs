@@ -141,6 +141,7 @@ fn scaled_insert_uses_minimum_samples_only_for_the_10m_tier() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "full-size bench fixture is too slow")]
 fn throughput_maps_sit_at_their_full_insert_budget() {
     let maps = MapQuad::new(&pairs(MAP_SIZE));
     for (name, capacity) in [
@@ -158,6 +159,7 @@ fn throughput_maps_sit_at_their_full_insert_budget() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "full-size bench fixture is too slow")]
 fn entry_reinsert_fixture_preserves_capacity_and_funnel_epoch() {
     let pairs = harness::make_pairs(harness::ENTRY_REINSERT_FILL);
     let mut maps = MapQuad {
