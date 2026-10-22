@@ -140,6 +140,11 @@ Large modules keep unit tests in a sibling `<module>/tests.rs` (`mod tests;`); s
 
 Don't duplicate primitives across `src/` and `benches/`.
 
+## Comments and Docs
+
+- Every item earns its place: no dead code, self-explanatory comments, or docs restating the signature. Keep SAFETY, invariants, and non-obvious "why".
+- No raw numbers, benchmark results, or experiment history in comments or docs; put them in commit bodies and PR descriptions.
+
 ## Worktree Naming
 
 When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-mut-iters`) and pass the same name to `git worktree add`.
