@@ -83,10 +83,7 @@ fn assert_exact_trace(n: usize, reserve_exponent: u32, identities: impl IntoIter
     for identity in identities {
         let prepared = PreparedElasticKey::new(identity);
         assert_eq!(table.hash_builder.hash_one(identity), identity);
-        assert!(matches!(
-            BatchScheduler::on_insert(table.len, table.total_slots, table.max_insertions),
-            InsertAction::Continue
-        ));
+        assert!(table.len < table.max_insertions);
         let target = table.scheduler.target(table.len);
         let placement = table
             .choose_slot_for_new_key(prepared.route.probe, target)
@@ -1064,7 +1061,7 @@ fn direct_lookup_returns_the_compared_slot_reference() {
         let direct = table
             .find_entry_prepared(&key, prepared, fingerprint)
             .expect("inserted key must have an entry reference");
-        let resolved = unsafe { table.slot_ref(location.0, location.1) };
+        let resolved = unsafe { table.levels[location.0].get_ref(location.1) };
         assert!(ptr::eq(direct, resolved), "key {key} returned a new slot");
     }
 
@@ -1150,7 +1147,8 @@ fn vacant_insert_uses_the_table_insertion_limit() {
             Global,
         );
     let rebuild_slots = table.total_slots * 2;
-    let rebuild_geometry = ElasticGeometry::for_slots(rebuild_slots, table.reserve_fraction);
+    let rebuild_geometry =
+        ElasticGeometry::for_slots(rebuild_slots, table.reserve_fraction).unwrap();
     let bootstrap_quota = rebuild_geometry.batch_plan[0];
 
     for key in 0..bootstrap_quota {
@@ -1263,9 +1261,9 @@ fn removing_every_entry_empties_every_level() {
 #[test]
 fn probe_schedule_capacity_table_matches_the_route_walk() {
     let mut walked = 0;
-    assert_eq!(probe_schedule_capacity(0), 0);
+    assert_eq!(PROBE_SCHEDULE_CAPACITY[0], 0);
     for level in 0..MAX_LEVELS {
         for_each_phi_route(level, 1, QUERY_POSITION_CAP, |_, _| walked += 1);
-        assert_eq!(probe_schedule_capacity(level + 1), walked);
+        assert_eq!(PROBE_SCHEDULE_CAPACITY[level + 1], walked);
     }
 }

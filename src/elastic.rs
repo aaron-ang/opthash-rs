@@ -159,8 +159,8 @@ impl<T> Level<T> {
 ///
 /// Splits capacity across geometrically shrinking `levels` and routes inserts
 /// through a `batch_plan`: early batches concentrate on level 0; later
-/// batches push toward deeper levels. Lookups probe every level whose
-/// `len > 0`.
+/// batches push toward deeper levels. Lookups walk a precomputed probe
+/// schedule, skipping levels the route summary rules out.
 ///
 /// Placement uses the paper's exact level schedule and uniform per-level
 /// probes. Query positions are compressed without changing their order.
@@ -198,16 +198,10 @@ unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
 impl<K, V, S, A: Allocator + Clone> Drop for ElasticTable<K, V, S, A> {
     fn drop(&mut self) {
         let levels = &mut self.levels;
-        self.arena.drop_table(&self.alloc, || {
-            for level in levels {
-                level.drop_values();
-            }
-        });
+        self.arena
+            .drop_table(&self.alloc, || arena::RegionSet::drop_all_values(levels));
     }
 }
-
-// Public names for the generic shell instantiated over `ElasticTable`,
-// re-exported from `lib.rs` / `set.rs`.
 
 macros::declare_backend_aliases! {
     table = ElasticTable,
@@ -474,22 +468,12 @@ const fn level_route_count(level: usize) -> usize {
     count
 }
 
-fn probe_schedule_capacity(level_count: usize) -> usize {
-    PROBE_SCHEDULE_CAPACITY[level_count]
-}
-
 fn try_probe_schedule(level_count: usize) -> Result<Vec<PhiRoute>, TryReserveError> {
     let mut schedule = Vec::new();
     schedule
-        .try_reserve_exact(probe_schedule_capacity(level_count))
+        .try_reserve_exact(PROBE_SCHEDULE_CAPACITY[level_count])
         .map_err(|_| TryReserveError::AllocError)?;
     Ok(schedule)
-}
-
-fn clone_probe_schedule(source: &[PhiRoute], level_count: usize) -> Vec<PhiRoute> {
-    let mut schedule = Vec::with_capacity(probe_schedule_capacity(level_count));
-    schedule.extend_from_slice(source);
-    schedule
 }
 
 /// Schedule paper batches and allocation-epoch boundaries.
@@ -497,7 +481,7 @@ fn clone_probe_schedule(source: &[PhiRoute], level_count: usize) -> Vec<PhiRoute
 /// The active batch is a function of the live count alone: batch `i` covers
 /// positions in `[batch_ends[i-1], batch_ends[i])`, the prefix-sum test the
 /// scalar oracle applies, so under deletion it tracks occupancy rather than
-/// an insert tally. The active window is cached: two compares per placement.
+/// an insert tally.
 #[derive(Clone)]
 pub(crate) struct BatchScheduler {
     /// Cumulative quota through each batch: the exclusive `len` bound at
@@ -508,14 +492,6 @@ pub(crate) struct BatchScheduler {
     batch_start: usize,
     /// `batch_ends[current_batch_index]`, or `usize::MAX` for an empty plan.
     batch_end: usize,
-}
-
-/// Direct the structural work required before insertion.
-pub(crate) enum InsertAction {
-    /// Resize to the specified slot count.
-    Resize(usize),
-    /// Continue without structural work.
-    Continue,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -542,24 +518,6 @@ impl BatchScheduler {
         };
         scheduler.reset();
         scheduler
-    }
-
-    /// Select structural work for the next insert.
-    #[inline]
-    pub(crate) fn on_insert(
-        current_len: usize,
-        total_slots: usize,
-        max_insertions: usize,
-    ) -> InsertAction {
-        if current_len >= max_insertions {
-            let new_cap = if total_slots == 0 {
-                INITIAL_CAPACITY
-            } else {
-                total_slots.saturating_mul(2)
-            };
-            return InsertAction::Resize(new_cap);
-        }
-        InsertAction::Continue
     }
 
     /// [`Self::target`] on a copy, for assertions through a shared borrow.
@@ -665,21 +623,21 @@ impl ElasticGeometry {
         } else {
             capacity::capacity_for(INITIAL_CAPACITY, requested_insertions, reserve_fraction)?
         };
+        Self::for_slots(total_slots, reserve_fraction)
+    }
+
+    /// `None` when `total_slots` exceeds `MAX_ELASTIC_SLOTS`.
+    fn for_slots(total_slots: usize, reserve_fraction: ReserveFraction) -> Option<Self> {
         if total_slots > MAX_ELASTIC_SLOTS {
             return None;
         }
-        Some(Self::for_slots(total_slots, reserve_fraction))
-    }
-
-    fn for_slots(total_slots: usize, reserve_fraction: ReserveFraction) -> Self {
-        assert!(total_slots <= MAX_ELASTIC_SLOTS, "capacity overflow");
         if total_slots == 0 {
-            return Self {
+            return Some(Self {
                 total_slots: 0,
                 max_insertions: 0,
                 level_capacities: PlanBuffer::EMPTY,
                 batch_plan: PlanBuffer::EMPTY,
-            };
+            });
         }
 
         // Public construction rounds positive maps up to INITIAL_CAPACITY, so
@@ -687,23 +645,23 @@ impl ElasticGeometry {
         // n >= 2 domain.
         if total_slots == 1 {
             let single = PlanBuffer::from_iter(core::iter::once(1));
-            return Self {
+            return Some(Self {
                 total_slots: 1,
                 max_insertions: 1,
                 level_capacities: single,
                 batch_plan: single,
-            };
+            });
         }
 
         let config = PaperConfig::new(total_slots, reserve_fraction.exponent())
             .expect("validated Elastic library geometry");
         let plan = config.elastic_plan();
-        Self {
+        Some(Self {
             total_slots,
             max_insertions: config.max_insertions(),
             level_capacities: PlanBuffer::from_iter(plan.level_lengths()),
             batch_plan: PlanBuffer::from_iter(plan.batch_quotas()),
-        }
+        })
     }
 }
 
@@ -728,15 +686,18 @@ fn build_elastic_levels<K, V>(
     Ok(levels.into_boxed_slice())
 }
 
+fn total_ctrl(level_capacities: &[usize]) -> Option<usize> {
+    level_capacities
+        .iter()
+        .try_fold(0_usize, |total, &capacity| total.checked_add(capacity))
+}
+
 #[allow(clippy::cast_ptr_alignment)]
 fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     level_capacities: &[usize],
     alloc: &A,
 ) -> Result<ElasticArenaBuild<K, V>, TryReserveError> {
-    let total_ctrl = level_capacities
-        .iter()
-        .try_fold(0_usize, |total, &capacity| total.checked_add(capacity));
-    let total_ctrl = total_ctrl.ok_or(TryReserveError::CapacityOverflow)?;
+    let total_ctrl = total_ctrl(level_capacities).ok_or(TryReserveError::CapacityOverflow)?;
     let arena_layout = elastic_arena_layout::<K, V>(total_ctrl)?;
     let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout.layout, total_ctrl, alloc)?;
     let membership = arena_layout.membership;
@@ -744,8 +705,7 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     // "nothing recorded".
     unsafe { membership.clear::<ElasticMetadataWord>(arena.as_ptr()) };
 
-    // `Arena` has no `Drop`, so a bare `?` would leak the allocation if
-    // level construction fails. Deallocate explicitly on `Err`.
+    // `Arena` has no `Drop`: deallocate explicitly if level construction fails.
     match build_elastic_levels::<K, V>(arena.as_ptr(), arena_layout.data_base_off, level_capacities)
     {
         Ok(levels) => Ok((arena, levels, membership)),
@@ -768,9 +728,7 @@ fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
 /// layout when the geometry itself does not fit.
 #[cold]
 fn handle_elastic_alloc_error<K, V>(level_capacities: &[usize]) -> ! {
-    let layout = level_capacities
-        .iter()
-        .try_fold(0_usize, |total, &capacity| total.checked_add(capacity))
+    let layout = total_ctrl(level_capacities)
         .and_then(|total_ctrl| {
             elastic_arena_layout::<K, V>(total_ctrl)
                 .ok()
@@ -878,8 +836,7 @@ where
         let bits = prepared.membership.bits();
         // SAFETY: `word` is a multiply-high reduction below `words`, and the
         // cached region covers exactly that many initialized, properly aligned
-        // `ElasticMetadataWord`s. Place projections read the two fields without
-        // copying the surrounding metadata word.
+        // `ElasticMetadataWord`s.
         let (membership, route_bin) = unsafe {
             let metadata = self.membership_ptr().add(word);
             ((*metadata).membership, (*metadata).route_bins[summary_bin])
@@ -949,6 +906,11 @@ where
             });
         }
         debug_assert_eq!(self.len, 0);
+        self.reset_after_clear();
+    }
+
+    /// Resets placement, lookup, and filter state once every level is empty.
+    fn reset_after_clear(&mut self) {
         self.scheduler.reset();
         self.probe_high_water = 0;
         self.probe_schedule.clear();
@@ -971,10 +933,13 @@ where
         prepared: PreparedElasticKey,
         key_fingerprint: u8,
     ) -> (usize, usize) {
-        if let InsertAction::Resize(cap) =
-            BatchScheduler::on_insert(self.len, self.total_slots, self.max_insertions)
-        {
-            self.resize_with_transition(cap, EpochTransition::Growth);
+        if self.len >= self.max_insertions {
+            let new_cap = if self.total_slots == 0 {
+                INITIAL_CAPACITY
+            } else {
+                self.total_slots.saturating_mul(2)
+            };
+            self.resize_with_transition(new_cap, EpochTransition::Growth);
         }
 
         let target = self.scheduler.target(self.len);
@@ -1060,20 +1025,6 @@ where
         self.record_membership(prepared.route, prepared.membership, level_idx);
         self.len += 1;
         (level_idx, slot_idx)
-    }
-
-    /// Raw pointer to the whole slot at `(level_idx, slot_idx)`. Projects
-    /// through raw pointers from `&self.levels`, forming no intermediate
-    /// `&mut Level`, so distinct locations yield non-aliasing `*mut`.
-    ///
-    /// # Safety
-    /// `level_idx` < `self.levels.len()` and `slot_idx` is a live slot there.
-    #[inline]
-    unsafe fn slot_ptr_at(&self, level_idx: usize, slot_idx: usize) -> *mut SlotEntry<K, V> {
-        let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
-        // SAFETY: shared `&Level` only — never `&mut` — so no aliasing tag.
-        let level = unsafe { &*levels_ptr.add(level_idx) };
-        level.slot_ptr(slot_idx)
     }
 
     fn extend_probe_schedule(&mut self, high_water: u128) {
@@ -1183,17 +1134,23 @@ where
 
     #[inline]
     unsafe fn slot_ref(&self, (level_idx, slot_idx): (usize, usize)) -> &SlotEntry<K, V> {
-        unsafe { self.slot_ref(level_idx, slot_idx) }
+        unsafe { self.levels[level_idx].get_ref(slot_idx) }
     }
 
+    /// Projects through raw pointers from `&self.levels`, forming no
+    /// intermediate `&mut Level`, so distinct locations yield non-aliasing
+    /// `*mut`.
     #[inline]
     unsafe fn slot_ptr(&self, (level_idx, slot_idx): (usize, usize)) -> *mut SlotEntry<K, V> {
-        unsafe { self.slot_ptr_at(level_idx, slot_idx) }
+        let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
+        // SAFETY: shared `&Level` only — never `&mut` — so no aliasing tag.
+        let level = unsafe { &*levels_ptr.add(level_idx) };
+        level.slot_ptr(slot_idx)
     }
 
     #[inline]
     fn replace_value(&mut self, (level_idx, slot_idx): (usize, usize), value: V) -> V {
-        let slot = unsafe { self.slot_mut(level_idx, slot_idx) };
+        let slot = unsafe { self.levels[level_idx].get_mut(slot_idx) };
         mem::replace(&mut slot.value, value)
     }
 
@@ -1353,11 +1310,7 @@ where
             level.tombstones = 0;
         }
         self.len = 0;
-        self.scheduler.reset();
-        self.probe_high_water = 0;
-        self.probe_schedule.clear();
-        self.clear_membership();
-        self.epoch.start(EpochTransition::Clear);
+        self.reset_after_clear();
     }
 
     fn clone_table(&self) -> Self
@@ -1369,15 +1322,13 @@ where
         let scheduler = self.scheduler.clone();
         let hash_builder = self.hash_builder.clone();
         let alloc = self.alloc.clone();
-        let probe_schedule = clone_probe_schedule(&self.probe_schedule, self.levels.len());
-        let level_capacities: Vec<usize> =
-            self.levels.iter().map(|l| l.capacity as usize).collect();
+        let mut probe_schedule = Vec::with_capacity(PROBE_SCHEDULE_CAPACITY[self.levels.len()]);
+        probe_schedule.extend_from_slice(&self.probe_schedule);
+        let level_capacities = PlanBuffer::from_iter(self.levels.iter().map(ArenaSlots::capacity));
         let (arena, levels, membership) = alloc_elastic_arena(&level_capacities, &self.alloc);
 
-        // Drop guard for the half-built clone: if any user `K::clone` /
-        // `V::clone` panics, drop the already-cloned values (OCCUPIED on
-        // `dst_arena`) and deallocate the partially-filled arena. `Arena`
-        // has no `Drop`, so without this the whole allocation would leak.
+        // If a user `K::clone` / `V::clone` panics, the guard drops the
+        // already-cloned values and frees the arena; see `ArenaDropGuard`.
         let mut guard = arena::ArenaDropGuard::new(arena, levels, self.alloc.clone());
 
         for (dst, src_lvl) in guard.regions_mut().iter_mut().zip(self.levels.iter()) {
@@ -1482,8 +1433,9 @@ where
     }
 
     fn resize_with_transition(&mut self, new_capacity: usize, transition: EpochTransition) {
-        let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction);
-        let required_schedule_capacity = probe_schedule_capacity(geometry.level_capacities.len());
+        let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction)
+            .expect("capacity overflow");
+        let required_schedule_capacity = PROBE_SCHEDULE_CAPACITY[geometry.level_capacities.len()];
         if self.probe_schedule.capacity() < required_schedule_capacity {
             self.probe_schedule
                 .reserve_exact(required_schedule_capacity - self.probe_schedule.len());
@@ -1504,11 +1456,9 @@ where
         self.probe_high_water = 0;
         self.probe_schedule.clear();
 
-        // Panic safety: clear each source ctrl before handing the moved entry
-        // to `insert_unique`, so the guard's drop walks only un-moved slots.
-        // If `insert_unique` panics, the guard unwinds: drops any survivors
-        // then deallocates `old_arena` — `Arena` has no `Drop`, so without the
-        // guard the backing allocation would leak.
+        // Panic safety: each source ctrl is cleared before the moved entry
+        // reaches `insert_unique`, so on unwind the guard drops only un-moved
+        // slots and frees `old_arena`; see `ArenaDropGuard`.
         let mut guard = arena::ArenaDropGuard::new(old_arena, old_levels, self.alloc.clone());
         let mut used_exceptional_placement = false;
         for level in guard.regions_mut().iter_mut() {
@@ -1516,8 +1466,7 @@ where
                 used_exceptional_placement |= self.insert_unique(entry.key, entry.value);
             });
         }
-        // guard drops at end of scope, deallocating old_arena. All slots
-        // are CTRL_EMPTY so `drop_values` is a no-op on success.
+        // Every slot is now EMPTY, so dropping the guard only frees `old_arena`.
         drop(guard);
         if transition == EpochTransition::PlacementRecovery || used_exceptional_placement {
             self.epoch.start_with_placement_recovery(transition);
@@ -1574,10 +1523,8 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        if slots > MAX_ELASTIC_SLOTS {
-            return Err(TryReserveError::CapacityOverflow);
-        }
-        let geometry = ElasticGeometry::for_slots(slots, reserve_fraction);
+        let geometry = ElasticGeometry::for_slots(slots, reserve_fraction)
+            .ok_or(TryReserveError::CapacityOverflow)?;
         Self::try_from_geometry(&geometry, reserve_fraction, hash_builder, alloc)
     }
 
@@ -1700,19 +1647,6 @@ where
         )
         .ok()
         .map(|probe| probe.index)
-    }
-
-    /// SAFETY: `level_idx` < `self.levels.len()` and `slot_idx` references an
-    /// occupied slot in that level.
-    #[inline]
-    unsafe fn slot_ref(&self, level_idx: usize, slot_idx: usize) -> &SlotEntry<K, V> {
-        unsafe { self.levels[level_idx].get_ref(slot_idx) }
-    }
-
-    /// SAFETY: same as [`Self::slot_ref`] plus caller holds exclusive access.
-    #[inline]
-    unsafe fn slot_mut(&mut self, level_idx: usize, slot_idx: usize) -> &mut SlotEntry<K, V> {
-        unsafe { self.levels[level_idx].get_mut(slot_idx) }
     }
 
     #[inline]
