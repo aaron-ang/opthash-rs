@@ -145,8 +145,8 @@ pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 - `src/map.rs` — generic `HashMap<K, V, P>` public shell and the single `TableBackend<K, V>` contract shared by both maps
 - `src/epoch.rs` — compact public epoch snapshot and private lifecycle state
 - `src/macros.rs` — `declare_backend_aliases!`, generating each backend's public type-alias surface
-- `src/elastic.rs` — `ElasticTable` (`TableBackend` implementation) + `ElasticHashMap` shell alias (tests inline)
-- `src/funnel.rs` — `FunnelTable` (`TableBackend` implementation) + `FunnelHashMap` shell alias (tests inline)
+- `src/elastic.rs` — `ElasticTable` (`TableBackend` implementation) + `ElasticHashMap` shell alias (tests in `src/elastic/tests.rs`)
+- `src/funnel.rs` — `FunnelTable` (`TableBackend` implementation) + `FunnelHashMap` shell alias (tests in `src/funnel/tests.rs`)
 - `src/set.rs` — `ElasticHashSet`/`FunnelHashSet` wrapping the maps; set algebra
 - `src/python.rs` — pyo3 bindings, `#[cfg(feature = "python")]`
 - `src/exact/` — paper geometry, probe primitives, and test-only scalar oracle
@@ -156,6 +156,8 @@ pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 - `src/reserve.rs`, `src/error.rs`, `src/hasher.rs` — public `ReserveFraction`, error types, and `DefaultHashBuilder`
 - `benches/harness/` — shared workload constants, deterministic fixtures,
   map constructors, and Criterion comparison helpers
+
+Large modules keep unit tests in a sibling `<module>/tests.rs` (`mod tests;`); small ones keep them inline.
 
 Don't duplicate primitives across `src/` and `benches/`.
 
