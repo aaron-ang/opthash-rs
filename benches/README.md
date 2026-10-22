@@ -25,10 +25,9 @@ SAVE=membership-v2 scripts/bench.sh
 An explicit name is also required when rerunning one commit with different
 Criterion options; otherwise the shared commit-hash baseline would be replaced.
 
-`BENCH=all` runs `speedup` followed by `mean_latency`. Select one target with
-`BENCH=speedup`, `BENCH=mean_latency`, `BENCH=map_api`, or
-`BENCH=scaled_insert`. Pass Criterion filters and options after `--`.
-`map_api` and `scaled_insert` remain outside `BENCH=all`.
+`BENCH=all` runs `speedup` followed by `mean_latency`; only those two are in
+`all`. Select any other `[[bench]]` target with `BENCH=<name>`. Pass Criterion
+filters and options after `--`.
 
 `map_api` also includes `entry_reinsert`: allocate for `MAP_SIZE`, fill to
 `3 * MAP_SIZE / 4`, remove the first `MAP_SIZE / 32` keys during setup, then
@@ -53,7 +52,6 @@ history. The registered headline workloads live in
   Funnel sizes exactly, and Elastic and `hashbrown` round to 32,768 slots whose
   budget is exactly that. `load_factor` fills every map to the same lower
   fraction of its own threshold; use it when the question is load, not size.
-  Baselines saved with the earlier 20K size are incompatible.
 - `get_hit` is the benchmark closest to the paper's positive-query objective.
 - `get_miss` measures a different regime: Funnel negatives follow insertion-like
   routing, while ordinary Elastic negatives exhaust the paper-derived exact
@@ -66,8 +64,6 @@ history. The registered headline workloads live in
 Randomized `get_hit` workloads cycle a full Fisher-Yates permutation generated
 by local SplitMix64 with seed `0xD1B54A32D192ED03`. Ordered controls use the
 same populated keys in input order and have `get_hit_sequential` in their IDs.
-Old baselines from before this fixture change are incompatible even though the
-headline IDs did not change.
 
 ## Deletion maintenance
 
@@ -85,7 +81,7 @@ BENCH=map_api scripts/bench.sh -- 'remove_burst|post_delete'
 dense `iter` and `drain` groups, then delete all but the first `MAP_SIZE / 10`
 keys without shrinking. Deletions and any automatic maintenance happen in
 untimed setup. Throughput counts the surviving entries; the timed fold visits
-every surviving key/value pair. These new groups require fresh baseline runs.
+every surviving key/value pair.
 
 `mean_latency` covers 1K, 10K, 100K, 1M, and 10M entries. Maps are built once
 per size outside Criterion's sampled callback. Results are batch mean
