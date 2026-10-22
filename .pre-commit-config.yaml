@@ -48,7 +48,7 @@ repos:
 
       - id: mypy-stub
         name: mypy stub
-        entry: uvx mypy --strict opthash/opthash/__init__.pyi
+        entry: uvx mypy --strict python/opthash/opthash.pyi
         language: system
         types: [pyi]
         pass_filenames: false
