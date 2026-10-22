@@ -1295,14 +1295,30 @@ where
     fn resize_with_transition(&mut self, slots: usize, transition: EpochTransition) {
         let shape = FunnelShape::from_slots(slots, self.reserve_fraction)
             .expect("compatible Funnel resize geometry");
-        let (new_arena, new_storage, new_membership) = try_allocate_storage(shape.n, &self.alloc)
-            .unwrap_or_else(|_| {
-                let shape = funnel_layout::<K, V>(shape.n).expect("constructed Funnel layout");
-                allocator_api2::alloc::handle_alloc_error(shape.layout)
-            });
+        let n = shape.n;
+        if self.try_resize_to(shape, transition).is_err() {
+            let layout = funnel_layout::<K, V>(n).expect("constructed Funnel layout");
+            allocator_api2::alloc::handle_alloc_error(layout.layout)
+        }
+    }
 
-        let old_arena = mem::replace(&mut self.arena, new_arena);
-        let old_storage = mem::replace(&mut self.storage, new_storage);
+    /// Moves every entry into fresh storage for `shape`. Allocates before
+    /// touching `self`, so `Err` leaves the table intact.
+    fn try_resize_to(
+        &mut self,
+        shape: FunnelShape,
+        transition: EpochTransition,
+    ) -> Result<(), TryReserveError> {
+        // Run user code (`A::clone`) before the swap: between the swap and
+        // the guard, a panic would leak the old arena.
+        let guard_alloc = self.alloc.clone();
+        let (new_arena, new_storage, new_membership) = try_allocate_storage(shape.n, &self.alloc)?;
+
+        let mut guard = arena::ArenaDropGuard::new(
+            mem::replace(&mut self.arena, new_arena),
+            mem::replace(&mut self.storage, new_storage),
+            guard_alloc,
+        );
         self.membership = new_membership;
         self.stale_membership = 0;
         self.shape = shape;
@@ -1310,13 +1326,13 @@ where
         self.tombstones = 0;
         self.exceptional_placement = false;
 
-        let mut guard = arena::ArenaDropGuard::new(old_arena, old_storage, self.alloc.clone());
         let mut recovered = false;
         guard.regions_mut().drain_values_and_clear(|entry| {
             recovered |= self.insert_unique(entry.key, entry.value);
         });
         drop(guard);
         self.epoch.start_epoch(transition, recovered);
+        Ok(())
     }
 }
 
@@ -1567,28 +1583,9 @@ where
         self.resize_with_transition(new_capacity, EpochTransition::ExplicitResize);
     }
 
-    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
-    where
-        S: Clone,
-    {
-        let prior_epoch = self.epoch;
+    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError> {
         let shape = FunnelShape::from_slots(new_capacity, self.reserve_fraction)?;
-        let mut old_map = Self::try_from_shape(
-            shape,
-            self.reserve_fraction,
-            self.hash_builder.clone(),
-            self.alloc.clone(),
-        )?;
-        mem::swap(self, &mut old_map);
-        let mut recovered = false;
-        old_map.storage.drain_values_and_clear(|entry| {
-            recovered |= self.insert_unique(entry.key, entry.value);
-        });
-        drop(old_map);
-        self.epoch = prior_epoch;
-        self.epoch
-            .start_epoch(EpochTransition::ExplicitResize, recovered);
-        Ok(())
+        self.try_resize_to(shape, EpochTransition::ExplicitResize)
     }
 
     fn shrink_to(&mut self, min_capacity: usize) {

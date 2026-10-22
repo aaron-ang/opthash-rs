@@ -189,9 +189,7 @@ pub trait TableBackend<K, V>: Sized {
     fn resize(&mut self, new_capacity: usize);
 
     /// Attempt to resize while leaving the table intact on `Err`.
-    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
-    where
-        Self::Hasher: Clone;
+    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>;
 
     /// Ensure room for `additional` entries.
     fn reserve(&mut self, additional: usize) {
@@ -204,10 +202,7 @@ pub trait TableBackend<K, V>: Sized {
     }
 
     /// Attempt to reserve room for `additional` entries.
-    fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
-    where
-        Self::Hasher: Clone,
-    {
+    fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
         let needed = self
             .len()
             .checked_add(additional)
@@ -387,10 +382,7 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     ///
     /// # Errors
     /// Returns [`TryReserveError`] on capacity overflow or allocator failure.
-    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
-    where
-        P::Hasher: Clone,
-    {
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
         self.table.try_reserve(additional)
     }
 

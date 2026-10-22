@@ -375,7 +375,10 @@ fn caught_hash_panic_during_try_resize_leaves_counters_valid() {
                 .filter(|&slot| control::is_occupied(level.control_at(slot)))
                 .count()
     }));
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    // The first moved key panics, so the resize drops every entry once,
+    // including the ones not yet moved.
+    assert_eq!(map.len(), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 16);
 
     let live_keys = map.keys().map(|key| key.id).collect::<Vec<_>>();
     map.insert(key(100), CountDrop(drops.clone()));
