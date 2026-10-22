@@ -1153,24 +1153,27 @@ where
     }
 
     #[inline]
-    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<(usize, usize)>
+    fn find<Q>(&self, key: &Q, hash: u64) -> Option<(usize, usize)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_slot_indices_prepared(key, PreparedElasticKey::new(hash), fingerprint)
+        self.find_slot_indices_prepared(
+            key,
+            PreparedElasticKey::new(hash),
+            control::control_fingerprint(hash),
+        )
     }
 
     #[inline]
-    fn find_entry<'a, Q>(
-        &'a self,
-        key: &Q,
-        hash: u64,
-        fingerprint: u8,
-    ) -> Option<&'a SlotEntry<K, V>>
+    fn find_entry<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a SlotEntry<K, V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_entry_prepared(key, PreparedElasticKey::new(hash), fingerprint)
+        self.find_entry_prepared(
+            key,
+            PreparedElasticKey::new(hash),
+            control::control_fingerprint(hash),
+        )
     }
 
     #[inline]
@@ -1178,8 +1181,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find(key, hash, control::control_fingerprint(hash))
-            .ok_or(hash)
+        self.find(key, hash).ok_or(hash)
     }
 
     #[inline]

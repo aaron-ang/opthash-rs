@@ -1398,24 +1398,19 @@ where
     }
 
     #[inline]
-    fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<usize>
+    fn find<Q>(&self, key: &Q, hash: u64) -> Option<usize>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_location(key, hash, fingerprint)
+        self.find_location(key, hash, control::control_fingerprint(hash))
     }
 
     #[inline]
-    fn find_entry<'a, Q>(
-        &'a self,
-        key: &Q,
-        hash: u64,
-        fingerprint: u8,
-    ) -> Option<&'a SlotEntry<K, V>>
+    fn find_entry<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a SlotEntry<K, V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_entry_ref(key, hash, fingerprint)
+        self.find_entry_ref(key, hash, control::control_fingerprint(hash))
     }
 
     #[inline]
