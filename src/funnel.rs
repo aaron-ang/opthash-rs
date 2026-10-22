@@ -7,22 +7,22 @@ use allocator_api2::alloc::{Allocator, Global, Layout};
 use equivalent::Equivalent;
 
 use crate::ReserveFraction;
-use crate::common::DefaultHashBuilder;
-use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
-use crate::common::config::GROUP_SIZE;
-use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
-use crate::common::error::{TryBuildError, TryReserveError};
-use crate::common::exact::geometry::PaperConfig;
-use crate::common::exact::probe::{
+use crate::capacity;
+use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
+use crate::error::{TryBuildError, TryReserveError};
+use crate::exact::geometry::PaperConfig;
+use crate::exact::probe::{
     self, FUNNEL_SPECIAL_FALLBACK_A_BASE, FUNNEL_SPECIAL_FALLBACK_B_BASE,
     FUNNEL_SPECIAL_PRIMARY_BASE, FunnelPrf, PreparedFastFunnelDomainProbe, PreparedFastFunnelProbe,
     PreparedProbeRange,
 };
-use crate::common::iter::OccupiedIndices;
-use crate::common::math::capacity;
-use crate::common::membership::{self, MembershipKey, MembershipRegion};
-use crate::common::simd;
-use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
+use crate::hasher::DefaultHashBuilder;
+use crate::membership::{self, MembershipKey, MembershipRegion};
+use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
+use crate::raw::config::GROUP_SIZE;
+use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
+use crate::raw::iter::OccupiedIndices;
+use crate::raw::simd;
 use crate::{macros, map};
 
 const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
@@ -565,7 +565,7 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     epoch: EpochState,
     exceptional_placement: bool,
     /// Cached location of the membership filter tail. Lookups load one word
-    /// from it before probing; see [`crate::common::membership`].
+    /// from it before probing; see [`crate::membership`].
     membership: MembershipRegion,
     /// Deletes since the filter last matched the live set; see
     /// [`membership::refresh_deletes`].
@@ -1629,9 +1629,9 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::*;
-    use crate::common::exact::probe::{self, ProbeDomain};
-    use crate::common::exact::reference::{ScalarFunnel, ScalarFunnelInsert, ScalarFunnelLocation};
-    use crate::common::test_support::{
+    use crate::exact::probe::{self, ProbeDomain};
+    use crate::exact::reference::{ScalarFunnel, ScalarFunnelInsert, ScalarFunnelLocation};
+    use crate::test_support::{
         self, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
     };
 
@@ -2660,7 +2660,7 @@ mod tests {
         let states = [CTRL_EMPTY, CTRL_TOMBSTONE, OTHER, FP];
 
         for encoded in 0..PATTERN_COUNT {
-            let mut controls = [FP; WIDTH + crate::common::config::GROUP_SIZE - 1];
+            let mut controls = [FP; WIDTH + crate::raw::config::GROUP_SIZE - 1];
             let mut value = encoded;
             for control in &mut controls[..WIDTH] {
                 *control = states[value & 3];

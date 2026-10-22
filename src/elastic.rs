@@ -6,19 +6,19 @@ use allocator_api2::alloc::{Allocator, Global, Layout};
 use equivalent::Equivalent;
 
 use crate::ReserveFraction;
-use crate::common::DefaultHashBuilder;
-use crate::common::arena::{self, Arena, ArenaSlots, SlotEntry};
-use crate::common::config::INITIAL_CAPACITY;
-use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
-use crate::common::error::{TryBuildError, TryReserveError};
-use crate::common::exact::geometry::PaperConfig;
-use crate::common::exact::probe::{self, CounterPrf, PreparedElasticProbe};
-use crate::common::iter::RegionCursor;
-use crate::common::math::capacity;
-use crate::common::membership::{self, MembershipKey, MembershipRegion};
+use crate::capacity;
 use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
+use crate::error::{TryBuildError, TryReserveError};
+use crate::exact::geometry::PaperConfig;
+use crate::exact::probe::{self, CounterPrf, PreparedElasticProbe};
+use crate::hasher::DefaultHashBuilder;
 use crate::macros;
 use crate::map;
+use crate::membership::{self, MembershipKey, MembershipRegion};
+use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
+use crate::raw::config::INITIAL_CAPACITY;
+use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
+use crate::raw::iter::RegionCursor;
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -1816,8 +1816,8 @@ mod tests {
     use core::ptr;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use crate::common::exact::reference::{ScalarElastic, ScalarElasticLimits};
-    use crate::common::test_support::{
+    use crate::exact::reference::{ScalarElastic, ScalarElasticLimits};
+    use crate::test_support::{
         self, CountDrop, Deterministic, FixedElasticHashMap, FixedHashBuilder, IdentityBuildHasher,
         PanicHashKey, PanicOnFirstDrop, ToggleAllocator, fixed_hasher,
     };

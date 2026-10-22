@@ -149,8 +149,11 @@ pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 - `src/funnel.rs` — `FunnelTable` (`TableBackend` implementation) + `FunnelHashMap` shell alias (tests inline)
 - `src/set.rs` — `ElasticHashSet`/`FunnelHashSet` wrapping the maps; set algebra
 - `src/python.rs` — pyo3 bindings, `#[cfg(feature = "python")]`
-- `src/common/exact/` — paper geometry, probe primitives, and test-only scalar oracle
-- `src/common/` — shared arena, reserve, control-byte SIMD, layout math, config, and errors
+- `src/exact/` — paper geometry, probe primitives, and test-only scalar oracle
+- `src/raw/` — slot storage shared by both tables: arena, control bytes, SIMD group scans, slot iterators, group-size config
+- `src/membership.rs` — Bloom-style membership filter gating lookups in both backends
+- `src/capacity.rs` — capacity and tombstone-cleanup arithmetic
+- `src/reserve.rs`, `src/error.rs`, `src/hasher.rs` — public `ReserveFraction`, error types, and `DefaultHashBuilder`
 - `benches/harness/` — shared workload constants, deterministic fixtures,
   map constructors, and Criterion comparison helpers
 

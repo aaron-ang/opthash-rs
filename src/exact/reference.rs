@@ -638,8 +638,8 @@ mod tests {
         ScalarElasticLocation, ScalarElasticQuery, ScalarFunnel, ScalarFunnelInsert,
         ScalarFunnelLocation, ScalarFunnelSearch,
     };
-    use crate::common::exact::geometry::PaperConfig;
-    use crate::common::exact::probe::{ProbeDomain, ProbeOracle};
+    use crate::exact::geometry::PaperConfig;
+    use crate::exact::probe::{ProbeDomain, ProbeOracle};
 
     #[derive(Debug)]
     struct ElasticCycleOracle {

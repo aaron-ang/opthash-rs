@@ -8,8 +8,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
 
-use crate::common::membership;
 use crate::map::{HashMap, TableBackend};
+use crate::membership;
 
 /// Hashes a `u64` to itself, so test keys double as their own hashes.
 #[derive(Clone, Copy, Default)]

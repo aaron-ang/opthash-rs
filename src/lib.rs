@@ -13,23 +13,31 @@
 
 extern crate alloc;
 
-mod common;
+mod capacity;
 mod elastic;
 mod epoch;
+mod error;
+mod exact;
 mod funnel;
+mod hasher;
 mod macros;
 mod map;
+mod membership;
+mod raw;
+mod reserve;
 mod set;
+#[cfg(test)]
+mod test_support;
 
 #[cfg(feature = "python")]
 mod python;
 
 pub use equivalent::Equivalent;
 
-pub use common::DefaultHashBuilder;
-pub use common::error::{TryBuildError, TryReserveError};
-pub use common::reserve::{ReserveFraction, ReserveFractionError};
 pub use epoch::{EpochSnapshot, EpochTransition};
+pub use error::{TryBuildError, TryReserveError};
+pub use hasher::DefaultHashBuilder;
+pub use reserve::{ReserveFraction, ReserveFractionError};
 
 pub use elastic::{
     ElasticDifference, ElasticDrain, ElasticEntry, ElasticExtractIf, ElasticHashMap,

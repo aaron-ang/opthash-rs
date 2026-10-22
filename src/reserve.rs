@@ -1,7 +1,7 @@
 use core::error::Error;
 use core::fmt;
 
-use crate::common::exact::geometry;
+use crate::exact::geometry;
 
 /// An exact dyadic reserve fraction `delta = 1 / 2^d`.
 ///
