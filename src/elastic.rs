@@ -211,41 +211,95 @@ impl<K, V, S, A: Allocator + Clone> Drop for ElasticTable<K, V, S, A> {
 macros::declare_backend_aliases! {
     table = ElasticTable,
     map_no_lifetime {
-        "Open-addressed hash map using elastic hashing." ElasticHashMap => HashMap,
-        "Consuming iterator over owned `(K, V)`." ElasticIntoIter => IntoIter,
-        "Owned `K` iterator." ElasticIntoKeys => IntoKeys,
-        "Owned `V` iterator." ElasticIntoValues => IntoValues,
+        /// Open-addressed hash map using elastic hashing.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use opthash::ElasticHashMap;
+        ///
+        /// let mut stock = ElasticHashMap::with_capacity(16);
+        /// stock.insert("apples", 3);
+        /// *stock.entry("pears").or_insert(0) += 5;
+        ///
+        /// assert_eq!(stock.get("apples"), Some(&3));
+        /// assert_eq!(stock.remove("pears"), Some(5));
+        /// assert_eq!(stock.len(), 1);
+        /// ```
+        ElasticHashMap => HashMap,
+        /// Consuming iterator over owned `(K, V)`.
+        ElasticIntoIter => IntoIter,
+        /// Owned `K` iterator.
+        ElasticIntoKeys => IntoKeys,
+        /// Owned `V` iterator.
+        ElasticIntoValues => IntoValues,
     },
     map_ref {
-        "A view into a single entry, occupied or vacant." ElasticEntry => Entry,
-        "View of an occupied entry." ElasticOccupiedEntry => OccupiedEntry,
-        "View of a vacant entry." ElasticVacantEntry => VacantEntry,
-        "Error returned by `try_insert` on key collision." ElasticOccupiedError => OccupiedError,
-        "Borrowing iterator over `(&K, &V)`." ElasticIter => Iter,
-        "Borrowing iterator over `(&K, &mut V)`." ElasticIterMut => IterMut,
-        "`&K` iterator." ElasticKeys => Keys,
-        "`&V` iterator." ElasticValues => Values,
-        "`&mut V` iterator." ElasticValuesMut => ValuesMut,
-        "Draining iterator that empties the map." ElasticDrain => Drain,
+        /// A view into a single entry, occupied or vacant.
+        ElasticEntry => Entry,
+        /// View of an occupied entry.
+        ElasticOccupiedEntry => OccupiedEntry,
+        /// View of a vacant entry.
+        ElasticVacantEntry => VacantEntry,
+        /// Error returned by `try_insert` on key collision.
+        ElasticOccupiedError => OccupiedError,
+        /// Borrowing iterator over `(&K, &V)`.
+        ElasticIter => Iter,
+        /// Borrowing iterator over `(&K, &mut V)`.
+        ElasticIterMut => IterMut,
+        /// `&K` iterator.
+        ElasticKeys => Keys,
+        /// `&V` iterator.
+        ElasticValues => Values,
+        /// `&mut V` iterator.
+        ElasticValuesMut => ValuesMut,
+        /// Draining iterator that empties the map.
+        ElasticDrain => Drain,
     },
     map_extract_if {
-        "Iterator yielding entries removed by `extract_if`." ElasticExtractIf
+        /// Iterator yielding entries removed by `extract_if`.
+        ElasticExtractIf
     },
     set_no_lifetime {
-        "Hash set using elastic hashing." ElasticHashSet => HashSet,
-        "Consuming iterator over set values." ElasticSetIntoIter => IntoIter,
+        /// Hash set using elastic hashing.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use opthash::ElasticHashSet;
+        ///
+        /// let evens: ElasticHashSet<u32> = (0..10).step_by(2).collect();
+        /// let small: ElasticHashSet<u32> = (0..5).collect();
+        ///
+        /// let mut both: Vec<_> = evens.intersection(&small).copied().collect();
+        /// both.sort_unstable();
+        /// assert_eq!(both, [0, 2, 4]);
+        /// ```
+        ElasticHashSet => HashSet,
+        /// Consuming iterator over set values.
+        ElasticSetIntoIter => IntoIter,
     },
     set_ref {
-        "Borrowing iterator over set values." ElasticSetIter => Iter,
-        "Draining iterator that empties the set." ElasticSetDrain => Drain,
-        "Iterator yielding values removed by set `extract_if`." ElasticSetExtractIf => ExtractIf,
-        "Iterator over values present only in the first set." ElasticDifference => Difference,
-        "Iterator over values present in both sets." ElasticIntersection => Intersection,
-        "Iterator over values present in exactly one set." ElasticSymmetricDifference => SymmetricDifference,
-        "Iterator over values present in either set." ElasticUnion => Union,
-        "A view into a single set entry." ElasticSetEntry => Entry,
-        "View of an occupied set entry." ElasticSetOccupiedEntry => OccupiedEntry,
-        "View of a vacant set entry." ElasticSetVacantEntry => VacantEntry,
+        /// Borrowing iterator over set values.
+        ElasticSetIter => Iter,
+        /// Draining iterator that empties the set.
+        ElasticSetDrain => Drain,
+        /// Iterator yielding values removed by set `extract_if`.
+        ElasticSetExtractIf => ExtractIf,
+        /// Iterator over values present only in the first set.
+        ElasticDifference => Difference,
+        /// Iterator over values present in both sets.
+        ElasticIntersection => Intersection,
+        /// Iterator over values present in exactly one set.
+        ElasticSymmetricDifference => SymmetricDifference,
+        /// Iterator over values present in either set.
+        ElasticUnion => Union,
+        /// A view into a single set entry.
+        ElasticSetEntry => Entry,
+        /// View of an occupied set entry.
+        ElasticSetOccupiedEntry => OccupiedEntry,
+        /// View of a vacant set entry.
+        ElasticSetVacantEntry => VacantEntry,
     },
 }
 

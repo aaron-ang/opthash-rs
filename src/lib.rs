@@ -32,6 +32,11 @@ mod test_support;
 #[cfg(feature = "python")]
 mod python;
 
+/// Compiles and runs the README's Rust snippets as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 pub use equivalent::Equivalent;
 
 pub use epoch::{EpochSnapshot, EpochTransition};

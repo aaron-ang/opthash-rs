@@ -590,41 +590,95 @@ impl<K, V, S, A: Allocator + Clone> Drop for FunnelTable<K, V, S, A> {
 macros::declare_backend_aliases! {
     table = FunnelTable,
     map_no_lifetime {
-        "Open-addressed hash map using funnel hashing." FunnelHashMap => HashMap,
-        "Consuming iterator over owned `(K, V)`." FunnelIntoIter => IntoIter,
-        "Owned `K` iterator." FunnelIntoKeys => IntoKeys,
-        "Owned `V` iterator." FunnelIntoValues => IntoValues,
+        /// Open-addressed hash map using funnel hashing.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use opthash::FunnelHashMap;
+        ///
+        /// let mut lengths: FunnelHashMap<&str, usize> = ["alpha", "beta", "gamma"]
+        ///     .into_iter()
+        ///     .map(|word| (word, word.len()))
+        ///     .collect();
+        /// lengths.retain(|_, len| *len > 4);
+        ///
+        /// assert_eq!(lengths.len(), 2);
+        /// assert!(!lengths.contains_key("beta"));
+        /// ```
+        FunnelHashMap => HashMap,
+        /// Consuming iterator over owned `(K, V)`.
+        FunnelIntoIter => IntoIter,
+        /// Owned `K` iterator.
+        FunnelIntoKeys => IntoKeys,
+        /// Owned `V` iterator.
+        FunnelIntoValues => IntoValues,
     },
     map_ref {
-        "A view into a single entry, occupied or vacant." FunnelEntry => Entry,
-        "View of an occupied entry." FunnelOccupiedEntry => OccupiedEntry,
-        "View of a vacant entry." FunnelVacantEntry => VacantEntry,
-        "Error returned by `try_insert` on key collision." FunnelOccupiedError => OccupiedError,
-        "Borrowing iterator over `(&K, &V)`." FunnelIter => Iter,
-        "Borrowing iterator over `(&K, &mut V)`." FunnelIterMut => IterMut,
-        "`&K` iterator." FunnelKeys => Keys,
-        "`&V` iterator." FunnelValues => Values,
-        "`&mut V` iterator." FunnelValuesMut => ValuesMut,
-        "Draining iterator that empties the map." FunnelDrain => Drain,
+        /// A view into a single entry, occupied or vacant.
+        FunnelEntry => Entry,
+        /// View of an occupied entry.
+        FunnelOccupiedEntry => OccupiedEntry,
+        /// View of a vacant entry.
+        FunnelVacantEntry => VacantEntry,
+        /// Error returned by `try_insert` on key collision.
+        FunnelOccupiedError => OccupiedError,
+        /// Borrowing iterator over `(&K, &V)`.
+        FunnelIter => Iter,
+        /// Borrowing iterator over `(&K, &mut V)`.
+        FunnelIterMut => IterMut,
+        /// `&K` iterator.
+        FunnelKeys => Keys,
+        /// `&V` iterator.
+        FunnelValues => Values,
+        /// `&mut V` iterator.
+        FunnelValuesMut => ValuesMut,
+        /// Draining iterator that empties the map.
+        FunnelDrain => Drain,
     },
     map_extract_if {
-        "Iterator yielding entries removed by `extract_if`." FunnelExtractIf
+        /// Iterator yielding entries removed by `extract_if`.
+        FunnelExtractIf
     },
     set_no_lifetime {
-        "Hash set using funnel hashing." FunnelHashSet => HashSet,
-        "Consuming iterator over set values." FunnelSetIntoIter => IntoIter,
+        /// Hash set using funnel hashing.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use opthash::FunnelHashSet;
+        ///
+        /// let mut seen = FunnelHashSet::new();
+        /// assert!(seen.insert("Paris"));
+        /// assert!(!seen.insert("Paris"));
+        /// assert!(seen.remove("Paris"));
+        /// assert!(seen.is_empty());
+        /// ```
+        FunnelHashSet => HashSet,
+        /// Consuming iterator over set values.
+        FunnelSetIntoIter => IntoIter,
     },
     set_ref {
-        "Borrowing iterator over set values." FunnelSetIter => Iter,
-        "Draining iterator that empties the set." FunnelSetDrain => Drain,
-        "Iterator yielding values removed by set `extract_if`." FunnelSetExtractIf => ExtractIf,
-        "Iterator over values present only in the first set." FunnelDifference => Difference,
-        "Iterator over values present in both sets." FunnelIntersection => Intersection,
-        "Iterator over values present in exactly one set." FunnelSymmetricDifference => SymmetricDifference,
-        "Iterator over values present in either set." FunnelUnion => Union,
-        "A view into a single set entry." FunnelSetEntry => Entry,
-        "View of an occupied set entry." FunnelSetOccupiedEntry => OccupiedEntry,
-        "View of a vacant set entry." FunnelSetVacantEntry => VacantEntry,
+        /// Borrowing iterator over set values.
+        FunnelSetIter => Iter,
+        /// Draining iterator that empties the set.
+        FunnelSetDrain => Drain,
+        /// Iterator yielding values removed by set `extract_if`.
+        FunnelSetExtractIf => ExtractIf,
+        /// Iterator over values present only in the first set.
+        FunnelDifference => Difference,
+        /// Iterator over values present in both sets.
+        FunnelIntersection => Intersection,
+        /// Iterator over values present in exactly one set.
+        FunnelSymmetricDifference => SymmetricDifference,
+        /// Iterator over values present in either set.
+        FunnelUnion => Union,
+        /// A view into a single set entry.
+        FunnelSetEntry => Entry,
+        /// View of an occupied set entry.
+        FunnelSetOccupiedEntry => OccupiedEntry,
+        /// View of a vacant set entry.
+        FunnelSetVacantEntry => VacantEntry,
     },
 }
 
