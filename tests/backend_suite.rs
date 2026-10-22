@@ -1,6 +1,8 @@
+//! Behaviour every `TableBackend` must share, instantiated once per map.
+
 mod support;
 
-macro_rules! common_suite {
+macro_rules! backend_suite {
     ($mod_name:ident, $TestMap:ident, $Entry:ident) => {
         mod $mod_name {
             use std::collections::HashSet;
@@ -744,5 +746,5 @@ macro_rules! common_suite {
     };
 }
 
-common_suite!(elastic_common, ElasticHashMap, ElasticEntry);
-common_suite!(funnel_common, FunnelHashMap, FunnelEntry);
+backend_suite!(elastic, ElasticHashMap, ElasticEntry);
+backend_suite!(funnel, FunnelHashMap, FunnelEntry);
