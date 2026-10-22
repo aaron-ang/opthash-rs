@@ -12,7 +12,7 @@ use crate::error::TryReserveError;
 
 /// Owns one allocation backing a map's ctrl bytes + slot data.
 /// No `Drop` impl — derived maps orchestrate teardown by calling
-/// [`ArenaSlots::drop_values`] on each descriptor before [`Arena::deallocate`].
+/// [`drop_values`] on its descriptors before [`Arena::deallocate`].
 pub(crate) struct Arena {
     ptr: ptr::NonNull<u8>,
     layout: Layout,
@@ -263,6 +263,52 @@ impl<RS: RegionSet, A: Allocator> Drop for ArenaDropGuard<RS, A> {
     }
 }
 
+/// Drops the value in every occupied slot of `regions`. Call before
+/// [`Arena::deallocate`]. Like dropping a slice, a panicking `Drop` doesn't
+/// stop the walk: the guard drops the remaining values, then the panic
+/// resumes. A second panic aborts.
+pub(crate) fn drop_values<T, R: ArenaSlots<T>>(regions: &mut [R]) {
+    /// Walk position, shared by the normal path and the unwind path.
+    struct Remaining<'a, T, R: ArenaSlots<T>> {
+        regions: &'a [R],
+        region: usize,
+        scan: OccupiedIndices,
+        marker: PhantomData<T>,
+    }
+
+    impl<T, R: ArenaSlots<T>> Remaining<'_, T, R> {
+        fn drop_rest(&mut self) {
+            while let Some(region) = self.regions.get(self.region) {
+                // `step` moves past `idx` before its value drops, so a resumed
+                // walk skips the value that panicked.
+                while let Some(idx) = self.scan.step(region) {
+                    unsafe { ptr::drop_in_place(region.slot_ptr(idx)) }
+                }
+                self.region += 1;
+                self.scan = OccupiedIndices::new();
+            }
+        }
+    }
+
+    impl<T, R: ArenaSlots<T>> Drop for Remaining<'_, T, R> {
+        fn drop(&mut self) {
+            self.drop_rest();
+        }
+    }
+
+    if !mem::needs_drop::<T>() {
+        return;
+    }
+    // On success the guard's `Drop` finds nothing left; on unwind it resumes.
+    Remaining {
+        regions,
+        region: 0,
+        scan: OccupiedIndices::new(),
+        marker: PhantomData,
+    }
+    .drop_rest();
+}
+
 /// One slot's `(key, value)` pair. Co-located so `read`/`drop_in_place`
 /// touches both in one shot.
 #[derive(Clone)]
@@ -344,17 +390,6 @@ pub(crate) trait ArenaSlots<T> {
         debug_assert!(idx < self.capacity());
         debug_assert!(control::is_occupied(self.control_at(idx)));
         unsafe { self.slot_ptr(idx).read() }
-    }
-
-    /// Drop every value in occupied slots. Call before [`Arena::deallocate`].
-    fn drop_values(&mut self) {
-        if !mem::needs_drop::<T>() {
-            return;
-        }
-        let mut scan = OccupiedIndices::new();
-        while let Some(idx) = scan.step(self) {
-            unsafe { ptr::drop_in_place(self.slot_ptr(idx)) }
-        }
     }
 
     /// Clone every occupied slot of `src` into `self` in panic-safe order: clone

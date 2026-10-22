@@ -225,7 +225,7 @@ impl<T> ArenaSlots<T> for FlatStorage<T> {
 
 impl<T> arena::RegionSet for FlatStorage<T> {
     fn drop_all_values(&mut self) {
-        self.drop_values();
+        arena::drop_values(core::slice::from_mut(self));
     }
 }
 
@@ -583,7 +583,9 @@ unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
 impl<K, V, S, A: Allocator + Clone> Drop for FunnelTable<K, V, S, A> {
     fn drop(&mut self) {
         let storage = &mut self.storage;
-        self.arena.drop_table(&self.alloc, || storage.drop_values());
+        self.arena.drop_table(&self.alloc, || {
+            arena::drop_values(core::slice::from_mut(storage));
+        });
     }
 }
 

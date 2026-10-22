@@ -1200,3 +1200,16 @@ fn vector_bucket_scan_preserves_order_across_group_boundaries_and_padding() {
         }
     }
 }
+
+#[test]
+fn drop_continues_past_a_panicking_value() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut map: FunnelHashMap<u64, PanicOnFirstDrop, IdentityBuildHasher> =
+        FunnelHashMap::with_capacity_and_hasher(256, IdentityBuildHasher);
+    for key in 0..200 {
+        map.insert(key, PanicOnFirstDrop(drops.clone()));
+    }
+    assert!(catch_unwind(AssertUnwindSafe(|| drop(map))).is_err());
+    // The panicking value counts too, so every value dropped exactly once.
+    assert_eq!(drops.load(Ordering::SeqCst), 200);
+}

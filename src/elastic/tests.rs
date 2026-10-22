@@ -1270,3 +1270,19 @@ fn probe_schedule_capacity_table_matches_the_route_walk() {
         assert_eq!(PROBE_SCHEDULE_CAPACITY[level + 1], walked);
     }
 }
+
+#[test]
+fn drop_continues_past_a_panicking_value() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut map = FixedElasticHashMap::<usize, PanicOnFirstDrop>::with_capacity(256);
+    // Fill until entries spill past level 0, so the walk resumed after the
+    // panic must cross levels.
+    let mut inserted = 0;
+    while !map.table().levels.iter().skip(1).any(|level| level.len > 0) {
+        map.insert(inserted, PanicOnFirstDrop(drops.clone()));
+        inserted += 1;
+    }
+    assert!(catch_unwind(AssertUnwindSafe(|| drop(map))).is_err());
+    // The panicking value counts too, so every value dropped exactly once.
+    assert_eq!(drops.load(Ordering::SeqCst), inserted);
+}

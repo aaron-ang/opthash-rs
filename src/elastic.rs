@@ -740,9 +740,7 @@ fn handle_elastic_alloc_error<K, V>(level_capacities: &[usize]) -> ! {
 /// panic-safe rollback in `resize`/`clone`.
 impl<K, V> arena::RegionSet for LevelSlice<K, V> {
     fn drop_all_values(&mut self) {
-        for level in self.iter_mut() {
-            level.drop_values();
-        }
+        arena::drop_values(self);
     }
 }
 
