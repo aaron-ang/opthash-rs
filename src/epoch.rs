@@ -78,6 +78,16 @@ impl EpochState {
         self.start(transition);
     }
 
+    /// Starts a rebuild epoch, counting a placement recovery if any entry
+    /// needed exceptional placement during the rebuild.
+    pub(crate) fn start_epoch(&mut self, transition: EpochTransition, recovered: bool) {
+        if recovered {
+            self.start_with_placement_recovery(transition);
+        } else {
+            self.start(transition);
+        }
+    }
+
     pub(crate) const fn snapshot(self, live_entries: usize) -> EpochSnapshot {
         EpochSnapshot {
             generation: self.generation() as u64,

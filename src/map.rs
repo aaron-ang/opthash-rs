@@ -252,12 +252,6 @@ pub trait TableBackend<K, V>: Sized {
         Self::Hasher: Clone;
 }
 
-/// Computes the control-byte fingerprint the backends scan on.
-#[inline]
-fn fingerprint(hash: u64) -> u8 {
-    control::control_fingerprint(hash)
-}
-
 /// Use a [`TableBackend`] backend to store key-value pairs.
 pub struct HashMap<K, V, P: TableBackend<K, V>> {
     table: P,
@@ -434,16 +428,8 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = self.table.hash(key);
-        self.table.find(key, hash, fingerprint(hash))
-    }
-
-    /// Shared reference to the slot at `loc`.
-    ///
-    /// # Safety
-    /// `loc` must be a live location from this table.
-    #[inline]
-    unsafe fn slot_entry(&self, loc: P::Location) -> &SlotEntry<K, V> {
-        unsafe { self.table.slot_ref(loc) }
+        self.table
+            .find(key, hash, control::control_fingerprint(hash))
     }
 
     /// Mutable reference to the slot at `loc`.
@@ -463,7 +449,8 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = self.table.hash(key);
-        self.table.find_entry(key, hash, fingerprint(hash))
+        self.table
+            .find_entry(key, hash, control::control_fingerprint(hash))
     }
 
     /// Inserts `key`/`value`. Returns the previous value for `key`, if any.
@@ -502,13 +489,13 @@ where
         let vacant = match self.table.find_for_entry(key, hash) {
             Ok(loc) => {
                 // SAFETY: the search returned a live location from this table.
-                return unsafe { &self.slot_entry(loc).key };
+                return unsafe { &self.table.slot_ref(loc).key };
             }
             Err(vacant) => vacant,
         };
         let loc = self.table.insert_for_vacant(f(key), value, vacant);
         // SAFETY: `loc` was just inserted into this table.
-        unsafe { &self.slot_entry(loc).key }
+        unsafe { &self.table.slot_ref(loc).key }
     }
 
     /// Returns a mutable reference to the value for `key`.
@@ -738,14 +725,14 @@ where
     #[must_use]
     pub fn key(&self) -> &K {
         // SAFETY: occupied entries store a live location from this table.
-        unsafe { &self.map.slot_entry(self.loc).key }
+        unsafe { &self.map.table.slot_ref(self.loc).key }
     }
 
     /// Reference to the entry's value.
     #[must_use]
     pub fn get(&self) -> &V {
         // SAFETY: occupied entries store a live location from this table.
-        unsafe { &self.map.slot_entry(self.loc).value }
+        unsafe { &self.map.table.slot_ref(self.loc).value }
     }
 
     /// Mutable reference to the value, tied to `self`.
@@ -765,7 +752,7 @@ where
     /// Consumes the entry, returning `&K` for the map's lifetime.
     pub(crate) fn into_key(self) -> &'a K {
         // SAFETY: occupied entries store a live location from this table.
-        unsafe { &self.map.slot_entry(self.loc).key }
+        unsafe { &self.map.table.slot_ref(self.loc).key }
     }
 
     /// Replaces the value, returning the old one.
@@ -1293,8 +1280,8 @@ impl<K, V, P: TableBackend<K, V>> Drop for Drain<'_, K, V, P> {
 }
 
 /// Iterator yielding entries removed by [`HashMap::extract_if`]. Unyielded
-/// non-matching entries are retained. Exhausting the iterator may clean
-/// accumulated tombstones after the scan is finished.
+/// non-matching entries are retained. Exhausting or dropping the iterator may
+/// clean accumulated tombstones.
 pub struct ExtractIf<'a, K, V, P: TableBackend<K, V>, F> {
     table: *mut P,
     scan: P::Scan,

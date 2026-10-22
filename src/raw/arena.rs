@@ -169,8 +169,7 @@ impl<T> LayoutCursor<T> {
 }
 
 /// O(N²) alias check for [`get_disjoint_mut`]-style APIs: panics if two
-/// `Some` locations collide. `T: PartialEq` so it works for both raw
-/// `(level_idx, slot_idx)` tuples and richer `SlotLocation` enums.
+/// `Some` locations collide. Generic over each backend's location type.
 #[inline]
 pub(crate) fn check_disjoint_aliasing<T: PartialEq, const N: usize>(locations: &[Option<T>; N]) {
     for (i, li) in locations.iter().enumerate() {
@@ -186,14 +185,14 @@ pub(crate) fn check_disjoint_aliasing<T: PartialEq, const N: usize>(locations: &
 
 /// Drop-guard: deallocates the arena on drop, so `V::drop` panics in the
 /// map's Drop still free the allocation.
-pub(crate) struct DeallocGuard<'a, A: Allocator> {
+struct DeallocGuard<'a, A: Allocator> {
     arena: Option<Arena>,
     alloc: &'a A,
 }
 
 impl<'a, A: Allocator> DeallocGuard<'a, A> {
     #[inline]
-    pub(crate) fn new(arena: Arena, alloc: &'a A) -> Self {
+    fn new(arena: Arena, alloc: &'a A) -> Self {
         Self {
             arena: Some(arena),
             alloc,
@@ -265,18 +264,10 @@ impl<RS: RegionSet, A: Allocator> Drop for ArenaDropGuard<RS, A> {
 
 /// One slot's `(key, value)` pair. Co-located so `read`/`drop_in_place`
 /// touches both in one shot.
+#[derive(Clone)]
 pub(crate) struct SlotEntry<K, V> {
     pub(crate) key: K,
     pub(crate) value: V,
-}
-
-impl<K: Clone, V: Clone> Clone for SlotEntry<K, V> {
-    fn clone(&self) -> Self {
-        Self {
-            key: self.key.clone(),
-            value: self.value.clone(),
-        }
-    }
 }
 
 /// Per-region view of a map's arena. Descriptors borrow into the arena
@@ -309,7 +300,7 @@ pub(crate) trait ArenaSlots<T> {
         self.set_control(idx, CTRL_TOMBSTONE);
     }
 
-    /// Wipe every ctrl byte in this region to FREE.
+    /// Wipe every ctrl byte in this region to EMPTY.
     /// Caller is responsible for having dropped occupied values first.
     #[inline]
     fn clear_all_controls(&mut self) {

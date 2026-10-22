@@ -13,7 +13,7 @@ pub(crate) struct PaperConfig {
 }
 
 impl PaperConfig {
-    /// Validates exact experiment inputs.
+    /// Validates exact geometry inputs.
     ///
     /// # Errors
     ///
@@ -38,7 +38,7 @@ impl PaperConfig {
         floor_div_pow2(self.n, self.reserve_exponent as u64)
     }
 
-    /// Returns the paper experiment's exact insertion count.
+    /// Returns the exact insertion budget, `n - floor(delta * n)`.
     #[must_use]
     pub(crate) const fn max_insertions(&self) -> usize {
         self.n - self.floor_delta_n()
@@ -647,7 +647,7 @@ const fn ceil_log2(value: usize) -> usize {
     }
 }
 
-pub(crate) const fn ceil_three_quarters(value: usize) -> usize {
+const fn ceil_three_quarters(value: usize) -> usize {
     value - value / 4
 }
 

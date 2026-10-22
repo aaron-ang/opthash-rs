@@ -906,7 +906,7 @@ fn failed_fallible_resize_leaves_a_valid_table() {
 
     armed.store(true, Ordering::SeqCst);
     let result = catch_unwind(AssertUnwindSafe(|| {
-        table.try_resize_exact(next_shape.n).unwrap();
+        map::TableBackend::try_resize(&mut table, next_shape.n).unwrap();
     }));
     assert!(result.is_err());
     assert_eq!(
@@ -992,7 +992,7 @@ fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
     let next = FunnelShape::for_insert_budget(512, reserve).unwrap();
     fail.store(true, Ordering::SeqCst);
     assert_eq!(
-        table.try_resize_exact(next.n),
+        map::TableBackend::try_resize(&mut table, next.n),
         Err(TryReserveError::AllocError)
     );
     assert_eq!(table.len, 32);

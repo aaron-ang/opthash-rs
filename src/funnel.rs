@@ -243,8 +243,8 @@ struct MembershipSlot {
 /// A loaded filter word paired with the key's bits, split from the test so the
 /// load can be issued before the work that hides its latency. An absent tail
 /// yields a gate that never passes, matching an empty table. Two words, not
-/// the slot: a lookup never records, and the extra field cost the miss path
-/// four instructions per call.
+/// the slot: a lookup never records, and the extra field costs the miss path
+/// on every call.
 #[derive(Clone, Copy)]
 struct MembershipGate {
     word: MembershipWord,
@@ -1074,6 +1074,13 @@ where
         self.stale_membership = 0;
     }
 
+    /// Shared tail of `clear` and `wipe_all` once every slot is free.
+    fn finish_clear(&mut self) {
+        self.exceptional_placement = false;
+        self.clear_membership();
+        self.epoch.start(EpochTransition::Clear);
+    }
+
     /// Re-record the filter from the live entries, dropping the bits departed
     /// keys left behind. Entries stay put; only the filter tail is rewritten.
     #[cold]
@@ -1177,7 +1184,7 @@ where
         membership: MembershipSlot,
         key_fingerprint: u8,
         exceptional: bool,
-    ) -> usize {
+    ) {
         let was_tombstone = self.storage.control_at(slot) == CTRL_TOMBSTONE;
         self.storage
             .write_with_control(slot, SlotEntry { key, value }, key_fingerprint);
@@ -1189,7 +1196,6 @@ where
         if exceptional {
             self.exceptional_placement = true;
         }
-        slot
     }
 
     /// Rebuild insertion. The input comes from a table that held each key
@@ -1198,15 +1204,7 @@ where
         let key_hash = self.hash_builder.hash_one(&key);
         let key_fingerprint = control::control_fingerprint(key_hash);
         let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
-        let (slot, exceptional) = match self.search_vacancy(probe) {
-            SearchResult::Vacant(slot) => (slot, false),
-            SearchResult::Full | SearchResult::RangeFailure => (
-                self.first_free_global()
-                    .expect("Funnel rebuild has enough logical capacity"),
-                true,
-            ),
-            SearchResult::Hit(_) => unreachable!("vacancy walk never reports a hit"),
-        };
+        let (slot, exceptional) = self.resolve_vacancy(self.search_vacancy(probe));
         let membership = self.membership_slot(key_hash);
         self.place_new_entry(slot, key, value, membership, key_fingerprint, exceptional);
         exceptional
@@ -1251,7 +1249,22 @@ where
         key_fingerprint: u8,
         exact: SearchResult,
     ) -> usize {
-        let (slot, exceptional) = match exact {
+        let (slot, exceptional) = self.resolve_vacancy(exact);
+        self.place_new_entry(slot, key, value, membership, key_fingerprint, exceptional);
+        if exceptional {
+            self.epoch
+                .start_with_placement_recovery(EpochTransition::PlacementRecovery);
+        }
+        slot
+    }
+
+    /// Maps a known-absent search to `(slot, exceptional)`: its vacancy, or
+    /// the first free slot anywhere once the walk is exhausted. Both callers
+    /// run under the insertion limit, which reserves a free slot.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn resolve_vacancy(&self, exact: SearchResult) -> (usize, bool) {
+        match exact {
             SearchResult::Vacant(slot) => {
                 debug_assert!(
                     control::is_free(self.storage.control_at(slot)),
@@ -1259,20 +1272,13 @@ where
                 );
                 (slot, false)
             }
-            SearchResult::Hit(_) => unreachable!("known-absent Funnel insertion found a key"),
+            SearchResult::Hit(_) => unreachable!("known-absent Funnel search found a key"),
             SearchResult::Full | SearchResult::RangeFailure => (
                 self.first_free_global()
                     .expect("Funnel insertion limit reserves a free slot"),
                 true,
             ),
-        };
-        let location =
-            self.place_new_entry(slot, key, value, membership, key_fingerprint, exceptional);
-        if exceptional {
-            self.epoch
-                .start_with_placement_recovery(EpochTransition::PlacementRecovery);
         }
-        location
     }
 
     /// Inserts a key the caller has proven absent. Runs the placement walk
@@ -1310,39 +1316,7 @@ where
             recovered |= self.insert_unique(entry.key, entry.value);
         });
         drop(guard);
-        if recovered {
-            self.epoch.start_with_placement_recovery(transition);
-        } else {
-            self.epoch.start(transition);
-        }
-    }
-
-    fn try_resize_exact(&mut self, slots: usize) -> Result<(), TryReserveError>
-    where
-        S: Clone,
-    {
-        let prior_epoch = self.epoch;
-        let shape = FunnelShape::from_slots(slots, self.reserve_fraction)?;
-        let mut old_map = Self::try_from_shape(
-            shape,
-            self.reserve_fraction,
-            self.hash_builder.clone(),
-            self.alloc.clone(),
-        )?;
-        mem::swap(self, &mut old_map);
-        let mut recovered = false;
-        old_map.storage.drain_values_and_clear(|entry| {
-            recovered |= self.insert_unique(entry.key, entry.value);
-        });
-        drop(old_map);
-        self.epoch = prior_epoch;
-        if recovered {
-            self.epoch
-                .start_with_placement_recovery(EpochTransition::ExplicitResize);
-        } else {
-            self.epoch.start(EpochTransition::ExplicitResize);
-        }
-        Ok(())
+        self.epoch.start_epoch(transition, recovered);
     }
 }
 
@@ -1486,14 +1460,12 @@ where
         if gate.passes() {
             exact = self.search_exact_prepared_for_insert(&key, probe, fingerprint);
             if let SearchResult::Hit(slot) = exact {
-                let entry = unsafe { self.storage.get_mut(slot) };
-                return Some(mem::replace(&mut entry.value, value));
+                return Some(self.replace_value(slot, value));
             }
             if self.exceptional_placement
                 && let Some(slot) = self.find_by_full_scan(&key, fingerprint)
             {
-                let entry = unsafe { self.storage.get_mut(slot) };
-                return Some(mem::replace(&mut entry.value, value));
+                return Some(self.replace_value(slot, value));
             }
             searched = true;
         }
@@ -1599,7 +1571,24 @@ where
     where
         S: Clone,
     {
-        self.try_resize_exact(new_capacity)
+        let prior_epoch = self.epoch;
+        let shape = FunnelShape::from_slots(new_capacity, self.reserve_fraction)?;
+        let mut old_map = Self::try_from_shape(
+            shape,
+            self.reserve_fraction,
+            self.hash_builder.clone(),
+            self.alloc.clone(),
+        )?;
+        mem::swap(self, &mut old_map);
+        let mut recovered = false;
+        old_map.storage.drain_values_and_clear(|entry| {
+            recovered |= self.insert_unique(entry.key, entry.value);
+        });
+        drop(old_map);
+        self.epoch = prior_epoch;
+        self.epoch
+            .start_epoch(EpochTransition::ExplicitResize, recovered);
+        Ok(())
     }
 
     fn shrink_to(&mut self, min_capacity: usize) {
@@ -1631,18 +1620,14 @@ where
             unsafe { core::ptr::drop_in_place(slot) };
         });
         debug_assert_eq!(self.len, 0);
-        self.exceptional_placement = false;
-        self.clear_membership();
-        self.epoch.start(EpochTransition::Clear);
+        self.finish_clear();
     }
 
     fn wipe_all(&mut self) {
         self.storage.clear_all_controls();
         self.len = 0;
         self.tombstones = 0;
-        self.exceptional_placement = false;
-        self.clear_membership();
-        self.epoch.start(EpochTransition::Clear);
+        self.finish_clear();
     }
 
     fn clone_table(&self) -> Self
