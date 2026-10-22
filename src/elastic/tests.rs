@@ -1255,3 +1255,13 @@ fn removing_every_entry_empties_every_level() {
     assert_eq!(map.len(), 0);
     assert!(map.table().levels.iter().all(|level| level.len == 0));
 }
+
+#[test]
+fn probe_schedule_capacity_table_matches_the_route_walk() {
+    let mut walked = 0;
+    assert_eq!(probe_schedule_capacity(0), 0);
+    for level in 0..MAX_LEVELS {
+        for_each_phi_route(level, 1, QUERY_POSITION_CAP, |_, _| walked += 1);
+        assert_eq!(probe_schedule_capacity(level + 1), walked);
+    }
+}

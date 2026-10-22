@@ -387,12 +387,40 @@ fn for_each_phi_route(
     }
 }
 
-fn probe_schedule_capacity(level_count: usize) -> usize {
+/// Full probe-schedule length per level count, computed at compile time so
+/// construction, resize, and clone size the schedule without walking every
+/// level's probes.
+const PROBE_SCHEDULE_CAPACITY: [usize; MAX_LEVELS + 1] = {
+    let mut capacities = [0; MAX_LEVELS + 1];
+    let mut level = 0;
+    while level < MAX_LEVELS {
+        capacities[level + 1] = capacities[level] + level_route_count(level);
+        level += 1;
+    }
+    capacities
+};
+
+/// Routes [`for_each_phi_route`] visits for `level` from its first probe up to
+/// `QUERY_POSITION_CAP`, evaluable in a `const` context.
+const fn level_route_count(level: usize) -> usize {
+    let paper_level = level as u128 + 1;
+    let mut paper_probe = if level == 0 { 2 } else { 1 };
     let mut count = 0;
-    for level in 0..level_count {
-        for_each_phi_route(level, 1, QUERY_POSITION_CAP, |_, _| count += 1);
+    while paper_probe <= UNIFORM_SEARCH_CAP as u128 {
+        let Ok(phi) = probe::elastic_phi(paper_level, paper_probe) else {
+            panic!("bounded Elastic query coordinate");
+        };
+        if phi > QUERY_POSITION_CAP {
+            break;
+        }
+        count += 1;
+        paper_probe += 1;
     }
     count
+}
+
+fn probe_schedule_capacity(level_count: usize) -> usize {
+    PROBE_SCHEDULE_CAPACITY[level_count]
 }
 
 fn try_probe_schedule(level_count: usize) -> Result<Vec<PhiRoute>, TryReserveError> {
