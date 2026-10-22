@@ -1661,131 +1661,70 @@ mod tests {
         }
     }
 
-    #[test]
-    fn vacant_entry_reuses_filter_positive_search_without_growth() {
-        for (try_insert, tombstone) in [(false, false), (true, false), (false, true), (true, true)]
-        {
-            let comparisons = Arc::new(AtomicUsize::new(0));
-            let key = |id| CountingKey {
-                id,
-                comparisons: comparisons.clone(),
-            };
-            let mut map = FunnelHashMap::with_capacity_and_hasher(64, test_support::fixed_hasher());
-            map.insert(key(0), 10);
-            if tombstone {
-                map.insert(key(1), 0);
-                map.remove(&key(1));
-                assert_eq!(map.table().tombstones, 1);
-            }
-            let capacity = map.capacity();
-            comparisons.store(0, Ordering::Relaxed);
-            VACANCY_WALKS.with(|walks| walks.set(0));
-            let value = if try_insert {
-                map.try_insert(key(1), 20).unwrap()
-            } else {
-                map.entry(key(1)).or_insert(20)
-            };
-            assert_eq!(*value, 20);
-            assert_eq!(comparisons.load(Ordering::Relaxed), 1);
-            assert_eq!(
-                VACANCY_WALKS.with(Cell::get),
-                0,
-                "absent search already found the vacancy"
-            );
-            assert_eq!(map.capacity(), capacity);
-            assert_eq!(map.len(), 2);
-            assert_eq!(map.get(&key(0)), Some(&10));
-            assert_eq!(map.get(&key(1)), Some(&20));
-        }
+    /// Every map path that carries an absent search into insertion. Set
+    /// `get_or_insert` and `get_or_insert_with` wrap `Entry` and the key path.
+    #[derive(Clone, Copy, Debug)]
+    enum VacantPath {
+        Entry,
+        TryInsert,
+        GetOrInsertKey,
     }
 
     #[test]
-    fn vacant_set_get_or_insert_reuses_filter_positive_search() {
-        for borrowed in [false, true] {
-            let comparisons = Arc::new(AtomicUsize::new(0));
-            let key = |id| CountingKey {
-                id,
-                comparisons: comparisons.clone(),
-            };
-            let mut set = FunnelHashSet::with_capacity_and_hasher(64, test_support::fixed_hasher());
-            set.insert(key(0));
-            comparisons.store(0, Ordering::Relaxed);
-            VACANCY_WALKS.with(|walks| walks.set(0));
-            let stored = if borrowed {
-                set.get_or_insert_with(&key(1), Clone::clone)
-            } else {
-                set.get_or_insert(key(1))
-            };
-            assert_eq!(stored.id, 1);
-            assert_eq!(comparisons.load(Ordering::Relaxed), 1);
-            assert_eq!(VACANCY_WALKS.with(Cell::get), 0);
-            assert_eq!(set.len(), 2);
-            assert!(set.contains(&key(0)));
-            assert!(set.contains(&key(1)));
-        }
-    }
+    fn vacant_paths_reuse_search_unless_growth_invalidates_it() {
+        use VacantPath::{Entry, GetOrInsertKey, TryInsert};
 
-    #[test]
-    fn vacant_entry_growth_invalidates_prior_search() {
-        for try_insert in [false, true] {
-            let comparisons = Arc::new(AtomicUsize::new(0));
-            let key = |id| CountingKey {
-                id,
-                comparisons: comparisons.clone(),
-            };
-            let mut map = FunnelHashMap::with_capacity_and_hasher(32, test_support::fixed_hasher());
-            let capacity = map.capacity();
-            for id in 0..capacity as u64 {
-                map.insert(key(2 * id), id);
+        for path in [Entry, TryInsert, GetOrInsertKey] {
+            // (requested capacity, fill to growth, tombstone on the walk)
+            for (requested, full, tombstone) in
+                [(64, false, false), (64, false, true), (32, true, false)]
+            {
+                let comparisons = Arc::new(AtomicUsize::new(0));
+                let key = |id| CountingKey {
+                    id,
+                    comparisons: comparisons.clone(),
+                };
+                let mut map = FunnelHashMap::with_capacity_and_hasher(
+                    requested,
+                    test_support::fixed_hasher(),
+                );
+                let capacity = map.capacity();
+                let live = if full { capacity } else { 1 };
+                for id in 0..live as u64 {
+                    map.insert(key(2 * id), id);
+                }
+                if tombstone {
+                    map.insert(key(1), 0);
+                    map.remove(&key(1));
+                    assert_eq!(map.table().tombstones, 1);
+                }
+                comparisons.store(0, Ordering::Relaxed);
+                VACANCY_WALKS.with(|walks| walks.set(0));
+                match path {
+                    Entry => assert_eq!(*map.entry(key(1)).or_insert(99), 99),
+                    TryInsert => assert_eq!(*map.try_insert(key(1), 99).unwrap(), 99),
+                    GetOrInsertKey => {
+                        assert_eq!(map.get_or_insert_key_with(&key(1), 99, Clone::clone).id, 1);
+                    }
+                }
+                let walks = VACANCY_WALKS.with(Cell::get);
+                let label = format!("{path:?} full={full} tombstone={tombstone}");
+                if full {
+                    // Rebuild places each old key; the new key needs its own fresh walk.
+                    assert!(comparisons.load(Ordering::Relaxed) > 0, "{label}");
+                    assert_eq!(walks, capacity + 1, "{label}");
+                    assert!(map.capacity() > capacity, "{label}");
+                } else {
+                    assert_eq!(comparisons.load(Ordering::Relaxed), 1, "{label}");
+                    assert_eq!(walks, 0, "{label}: absent search already found the vacancy");
+                    assert_eq!(map.capacity(), capacity, "{label}");
+                }
+                assert_eq!(map.len(), live + 1, "{label}");
+                for id in 0..live as u64 {
+                    assert_eq!(map.get(&key(2 * id)), Some(&id), "{label}");
+                }
+                assert_eq!(map.get(&key(1)), Some(&99), "{label}");
             }
-            comparisons.store(0, Ordering::Relaxed);
-            VACANCY_WALKS.with(|walks| walks.set(0));
-            if try_insert {
-                assert_eq!(*map.try_insert(key(1), 99).unwrap(), 99);
-            } else {
-                assert_eq!(*map.entry(key(1)).or_insert(99), 99);
-            }
-            assert!(comparisons.load(Ordering::Relaxed) > 0);
-            // Rebuild places each old key; the new key needs its own fresh walk.
-            assert_eq!(VACANCY_WALKS.with(Cell::get), capacity + 1);
-            assert!(map.capacity() > capacity);
-            assert_eq!(map.len(), capacity + 1);
-            for id in 0..capacity as u64 {
-                assert_eq!(map.get(&key(2 * id)), Some(&id));
-            }
-            assert_eq!(map.get(&key(1)), Some(&99));
-        }
-    }
-
-    #[test]
-    fn vacant_set_growth_invalidates_prior_search() {
-        for borrowed in [false, true] {
-            let comparisons = Arc::new(AtomicUsize::new(0));
-            let key = |id| CountingKey {
-                id,
-                comparisons: comparisons.clone(),
-            };
-            let mut set = FunnelHashSet::with_capacity_and_hasher(32, test_support::fixed_hasher());
-            let capacity = set.capacity();
-            for id in 0..capacity as u64 {
-                set.insert(key(2 * id));
-            }
-            comparisons.store(0, Ordering::Relaxed);
-            VACANCY_WALKS.with(|walks| walks.set(0));
-            let stored = if borrowed {
-                set.get_or_insert_with(&key(1), Clone::clone)
-            } else {
-                set.get_or_insert(key(1))
-            };
-            assert_eq!(stored.id, 1);
-            assert!(comparisons.load(Ordering::Relaxed) > 0);
-            assert_eq!(VACANCY_WALKS.with(Cell::get), capacity + 1);
-            assert!(set.capacity() > capacity);
-            assert_eq!(set.len(), capacity + 1);
-            for id in 0..capacity as u64 {
-                assert!(set.contains(&key(2 * id)));
-            }
-            assert!(set.contains(&key(1)));
         }
     }
 

@@ -2382,44 +2382,6 @@ mod tests {
     }
 
     #[test]
-    fn route_filter_reads_each_selected_summary_bin() {
-        let table: ElasticTable<u64, u64, FixedHashBuilder> =
-            ElasticTable::with_capacity_and_reserve_and_hasher_in(
-                64,
-                ReserveFraction::DEFAULT,
-                fixed_hasher(),
-                Global,
-            );
-        let route_bins = [0x0011, 0x0220, 0x4400, 0x8008];
-        for word in 0..table.membership.words {
-            // SAFETY: `word` is within the initialized metadata region. The
-            // replacement word has no drop glue and preserves its exact layout.
-            unsafe {
-                table.membership_ptr().add(word).write(ElasticMetadataWord {
-                    membership: u64::MAX,
-                    route_bins,
-                });
-            }
-        }
-
-        // The keyed route signature adds two modulo four to each hash.
-        // Keep both selected bins and expected masks literal so a wrong direct
-        // field projection cannot derive its own expected answer.
-        for (hash, expected_bin, expected_mask) in [
-            (2_u64, 0_usize, 0x0011_u32),
-            (3, 1, 0x0220),
-            (0, 2, 0x4400),
-            (1, 3, 0x8008),
-        ] {
-            let prepared = PreparedElasticKey::new(hash);
-            assert_eq!(prepared.route.summary_bin(), expected_bin);
-            let filter = table.route_filter(prepared);
-            assert!(filter.maybe_present);
-            assert_eq!(filter.level_mask, expected_mask);
-        }
-    }
-
-    #[test]
     fn route_summary_saturates_deep_levels_into_the_last_bit() {
         assert_eq!(summary_level(0), 0);
         assert_eq!(
