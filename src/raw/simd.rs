@@ -283,7 +283,6 @@ mod swar {
                 let f = free_mask(word(bytes));
                 let o = occupied_mask(word(bytes));
                 assert_eq!(o, ref_occupied(bytes), "occupied mismatch: {bytes:02x?}");
-                // free and occupied are exact complements over the 8 sentinel bits.
                 assert_eq!(f & o, 0, "free/occupied overlap: {bytes:02x?}");
                 assert_eq!(f | o, HI, "free|occupied != all lanes: {bytes:02x?}");
             }
@@ -295,7 +294,6 @@ mod swar {
             assert_eq!(free_mask(word([CTRL_TOMBSTONE; 8])), HI);
             assert_eq!(occupied_mask(word([CTRL_EMPTY; 8])), 0);
             assert_eq!(occupied_mask(word([CTRL_TOMBSTONE; 8])), 0);
-            // Every occupied fingerprint (1..=127) reads occupied, never free.
             for fp in 1..=FINGERPRINT_MASK {
                 assert_eq!(occupied_mask(word([fp; 8])), HI, "fp {fp:#04x}");
                 assert_eq!(free_mask(word([fp; 8])), 0, "fp {fp:#04x}");
@@ -317,7 +315,6 @@ mod swar {
 
         #[test]
         fn match_lands_in_lane_high_bit() {
-            // Lane `i`'s sentinel is bit `8*i + 7`.
             assert_eq!(eq_mask(word([9; 8]), 9), HI);
             assert_eq!(
                 eq_mask(word([0, 0, 0, 9, 0, 0, 0, 0]), 9),

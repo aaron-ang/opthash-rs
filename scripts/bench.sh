@@ -97,7 +97,6 @@ detect_perf_cores() {
 	done
 }
 
-# Lock fd is held for the script's lifetime; the kernel releases it on exit.
 select_perf_core() {
 	local perf_cores=()
 	while IFS= read -r c; do perf_cores+=("$c"); done < <(detect_perf_cores)
@@ -114,6 +113,7 @@ select_perf_core() {
 	CORE=$min
 }
 
+# Lock fd is held for the script's lifetime; the kernel releases it on exit.
 claim_core_lock() {
 	if [[ ! $CORE =~ ^[0-9]+$ ]]; then
 		echo "error: CORE must be one CPU number" >&2
@@ -158,8 +158,6 @@ command -v cargo >/dev/null 2>&1 || {
 	exit 1
 }
 
-# NUMA: bind memory to the node that owns the pinned core
-# so cache misses don't traverse the inter-socket interconnect.
 numa_wrapper=()
 if ((IS_LINUX)) && command -v numactl >/dev/null 2>&1 && [[ -n "${CORE:-}" ]]; then
 	node_count=$(find /sys/devices/system/node -maxdepth 1 -name 'node[0-9]*' -type d 2>/dev/null | wc -l)
@@ -174,19 +172,13 @@ if ((IS_LINUX)) && command -v numactl >/dev/null 2>&1 && [[ -n "${CORE:-}" ]]; t
 	fi
 fi
 
-# Linux: use `taskset` to pin core and `setarch` to disable ASLR.
 pin_wrapper=()
 if ((IS_LINUX)) && [[ -n "${CORE:-}" ]]; then
 	pin_wrapper=(taskset -c "$CORE" setarch -R)
 fi
 
-# As root: nice -n -20 (max CFS prio) + prlimit memlock (no page-out).
-# Both attributes survive the UID drop, so when SUDO_USER is set we
-# unconditionally hand off to the invoking user — keeps cargo artifacts
-# user-owned even if nice/prlimit are missing.
-#
-# Non-root: chrt -b 0 (SCHED_BATCH) — kernel skips interactive scheduling
-# heuristics, smaller context-switch overhead.
+# nice/prlimit survive the UID drop, so always hand off to SUDO_USER to keep
+# cargo artifacts user-owned, even if nice/prlimit are missing.
 launcher=()
 if ((IS_LINUX)) && [[ $EUID -eq 0 ]]; then
 	if command -v nice >/dev/null 2>&1; then

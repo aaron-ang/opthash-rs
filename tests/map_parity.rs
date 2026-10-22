@@ -254,7 +254,7 @@ macro_rules! parity_suite {
                     hm
                 };
 
-                // By the way, ensure that cloning doesn't screw up the dropping.
+                // Cloning must not disturb drop counts.
                 drop(hm.clone());
 
                 {

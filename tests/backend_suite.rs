@@ -714,7 +714,6 @@ macro_rules! backend_suite {
             #[test]
             fn interleaved_insert_delete_correctness() {
                 let mut map = HashMap::with_capacity(256);
-                // Insert 100, delete odd keys, verify even keys survive.
                 for i in 0..100 {
                     map.insert(i, i);
                 }

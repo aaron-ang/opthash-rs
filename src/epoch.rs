@@ -6,9 +6,6 @@ const TRANSITION_MASK: u64 = 0b111 << TRANSITION_SHIFT;
 const HAD_DELETE_MASK: u64 = 1_u64 << 63;
 
 /// Cause of the current allocation epoch.
-///
-/// The discriminant is the value packed into the lifecycle word's
-/// transition field; `transition_from_bits` is its inverse.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum EpochTransition {
@@ -102,6 +99,8 @@ impl EpochState {
     }
 }
 
+// Inverse of `transition as u64`: `EpochTransition` discriminants are the
+// lifecycle word's transition-field values.
 const fn transition_from_bits(bits: u64) -> EpochTransition {
     match bits {
         1 => EpochTransition::Growth,

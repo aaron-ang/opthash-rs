@@ -97,11 +97,9 @@ pub trait TableBackend<K, V>: Sized {
         Q: Hash + Equivalent<K> + ?Sized;
 
     /// Find and borrow the occupied slot for `key` by precomputed hash and
-    /// fingerprint. This interface lets backends retain the slot reference
-    /// formed while comparing the key, avoiding a second location-to-slot
-    /// dispatch on hot read hits. The reference is tied to `self`; its shared
-    /// borrow prevents the structural mutation that could otherwise invalidate
-    /// the backing allocation.
+    /// fingerprint. Returning the slot reference formed during key comparison
+    /// avoids a second location-to-slot dispatch on read hits. The shared
+    /// borrow of `self` blocks structural mutation while the reference lives.
     fn find_entry<'a, Q>(
         &'a self,
         key: &Q,
@@ -548,8 +546,7 @@ where
         Some(self.table.remove(loc))
     }
 
-    /// Returns `N` disjoint mutable references; per-key `Option`, panics on
-    /// aliasing among the hits.
+    /// Returns `N` disjoint mutable references, `None` for absent keys.
     ///
     /// # Panics
     /// If two input keys resolve to the same slot.

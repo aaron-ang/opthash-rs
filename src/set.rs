@@ -339,7 +339,7 @@ where
         self.map.is_empty()
     }
 
-    /// Current slot capacity.
+    /// Maximum values before the next automatic resize.
     pub fn capacity(&self) -> usize {
         self.map.capacity()
     }
