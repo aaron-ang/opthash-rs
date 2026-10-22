@@ -212,6 +212,40 @@ def test_in_place_ops_with_self_bump_only_on_change(set_cls):
         next(it)
 
 
+def test_failed_update_after_mutation_invalidates_iterators(set_cls):
+    def partial():
+        yield 99
+        raise ValueError
+
+    s = set_cls([1, 2])
+    it = iter(s)
+    with pytest.raises(ValueError):
+        s.update(partial())
+    assert 99 in s
+    with pytest.raises(RuntimeError):
+        next(it)
+
+
+def test_update_that_only_resizes_invalidates_iterators(set_cls):
+    s = set_cls([1, 2])
+    cap = s.capacity
+    it = iter(s)
+    s.update([1, 2] * cap)
+    assert len(s) == 2 and s.capacity > cap
+    with pytest.raises(RuntimeError):
+        next(it)
+
+
+def test_failed_update_before_mutation_keeps_iterators(set_cls):
+    s = set_cls([1, 2])
+    it = iter(s)
+    with pytest.raises(TypeError):
+        s.update(5)
+    with pytest.raises(TypeError):
+        s.update([[]])
+    assert next(it) in {1, 2}
+
+
 @pytest.mark.parametrize("other", [{2, 3, 4}, frozenset({2, 3, 4}), [2, 3, 4]])
 def test_intersection_and_issubset_accept_any_iterable(set_cls, other):
     s = set_cls([1, 2, 3])

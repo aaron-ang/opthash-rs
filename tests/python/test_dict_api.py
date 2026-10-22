@@ -141,6 +141,30 @@ def test_items_view_iter_during_mutation_raises(m):
         next(it)
 
 
+def test_failed_update_after_mutation_invalidates_iterators(m):
+    def partial():
+        yield ("new", 99)
+        raise ValueError
+
+    _populate(m, 3)
+    it = iter(m)
+    with pytest.raises(ValueError):
+        m.update(partial())
+    assert m["new"] == 99
+    with pytest.raises(RuntimeError, match="changed size"):
+        next(it)
+
+
+def test_failed_update_before_mutation_keeps_iterators(m):
+    _populate(m, 3)
+    it = iter(m)
+    with pytest.raises(TypeError):
+        m.update(5)
+    with pytest.raises(TypeError):
+        m.update([([], 1)])
+    next(it)
+
+
 def test_views_register_with_collections_abc(m):
     assert isinstance(m.keys(), abc.KeysView)
     assert isinstance(m.values(), abc.ValuesView)

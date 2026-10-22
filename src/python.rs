@@ -517,13 +517,19 @@ macro_rules! define_pyclass_state {
                 self.generation = self.generation.wrapping_add(1);
             }
 
-            /// Bump once if an in-place op reported a change; propagate its error.
+            /// Run an in-place op and bump once if it changed the collection.
+            /// Length and capacity are compared too: an op may resize before
+            /// inserting anything, or insert some entries and then raise.
             #[inline]
-            fn bump_if_changed(&mut self, changed: PyResult<bool>) -> PyResult<()> {
-                if changed? {
+            fn mutate(&mut self, op: impl FnOnce(&mut Self) -> PyResult<bool>) -> PyResult<()> {
+                let before = (self.inner.len(), self.inner.capacity());
+                let changed = op(self);
+                if matches!(changed, Ok(true))
+                    || before != (self.inner.len(), self.inner.capacity())
+                {
                     self.bump();
                 }
-                Ok(())
+                changed.map(drop)
             }
         }
     };
@@ -592,8 +598,7 @@ macro_rules! define_map_classes {
                     .and_then(|o| o.cast::<Self>().ok())
                     .map(|o| o.borrow());
                 let same_inner = peer.as_ref().map(|p| &p.inner);
-                let touched = map_update(&mut self.inner, other, kwargs, py, same_inner);
-                self.bump_if_changed(touched)
+                self.mutate(|s| map_update(&mut s.inner, other, kwargs, py, same_inner))
             }
         }
 
@@ -758,8 +763,8 @@ macro_rules! define_map_classes {
             }
 
             /// Mirror of `dict.update`; see [`map_update`] for the branch logic.
-            /// `bump()` only on actual inserts — empty `update()` keeps
-            /// iterators valid.
+            /// Bumps only on an insert or a resize, so an empty `update()`
+            /// keeps iterators valid.
             #[pyo3(signature = (other = None, **kwargs))]
             fn update(
                 mut slf: PyRefMut<'_, Self>,
@@ -1555,8 +1560,7 @@ macro_rules! define_set_classes {
             #[pyo3(signature = (*others))]
             fn update(mut slf: PyRefMut<'_, Self>, others: &Bound<PyTuple>) -> PyResult<()> {
                 let me = slf.as_ptr();
-                let changed = slf.fold_each(others, me, false, |s, o| s.add_all(o));
-                slf.bump_if_changed(changed)
+                slf.mutate(|s| s.fold_each(others, me, false, |s, o| s.add_all(o)))
             }
 
             #[pyo3(signature = (*others))]
@@ -1566,8 +1570,7 @@ macro_rules! define_set_classes {
                 py: Python,
             ) -> PyResult<()> {
                 let me = slf.as_ptr();
-                let changed = slf.fold_each(others, me, false, |s, o| s.retain_in(o, py));
-                slf.bump_if_changed(changed)
+                slf.mutate(|s| s.fold_each(others, me, false, |s, o| s.retain_in(o, py)))
             }
 
             #[pyo3(signature = (*others))]
@@ -1576,8 +1579,7 @@ macro_rules! define_set_classes {
                 others: &Bound<PyTuple>,
             ) -> PyResult<()> {
                 let me = slf.as_ptr();
-                let changed = slf.fold_each(others, me, true, |s, o| s.remove_all(o));
-                slf.bump_if_changed(changed)
+                slf.mutate(|s| s.fold_each(others, me, true, |s, o| s.remove_all(o)))
             }
 
             fn symmetric_difference_update(
@@ -1585,8 +1587,7 @@ macro_rules! define_set_classes {
                 other: &Bound<PyAny>,
             ) -> PyResult<()> {
                 let me = slf.as_ptr();
-                let changed = slf.apply(other, me, true, Self::symmetric_difference_with);
-                slf.bump_if_changed(changed)
+                slf.mutate(|s| s.apply(other, me, true, Self::symmetric_difference_with))
             }
 
             fn __eq__(&self, other: &Bound<PyAny>) -> PyResult<bool> {
@@ -1644,8 +1645,7 @@ macro_rules! define_set_classes {
 
             fn __ior__(mut slf: PyRefMut<'_, Self>, other: &Bound<PyAny>) -> PyResult<()> {
                 let me = slf.as_ptr();
-                let changed = slf.apply(other, me, false, Self::add_all);
-                slf.bump_if_changed(changed)
+                slf.mutate(|s| s.apply(other, me, false, Self::add_all))
             }
 
             fn __iand__(
@@ -1654,14 +1654,12 @@ macro_rules! define_set_classes {
                 py: Python,
             ) -> PyResult<()> {
                 let me = slf.as_ptr();
-                let changed = slf.apply(other, me, false, |s, o| s.retain_in(o, py));
-                slf.bump_if_changed(changed)
+                slf.mutate(|s| s.apply(other, me, false, |s, o| s.retain_in(o, py)))
             }
 
             fn __isub__(mut slf: PyRefMut<'_, Self>, other: &Bound<PyAny>) -> PyResult<()> {
                 let me = slf.as_ptr();
-                let changed = slf.apply(other, me, true, Self::remove_all);
-                slf.bump_if_changed(changed)
+                slf.mutate(|s| s.apply(other, me, true, Self::remove_all))
             }
 
             fn __ixor__(slf: PyRefMut<'_, Self>, other: &Bound<PyAny>) -> PyResult<()> {
