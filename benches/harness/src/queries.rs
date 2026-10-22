@@ -1,8 +1,6 @@
 /// Fixed seed for reproducible randomized hit traces.
 pub const DEFAULT_HIT_QUERY_SEED: u64 = 0xD1B5_4A32_D192_ED03;
 
-const SPLITMIX_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
-
 struct SplitMix64 {
     state: u64,
 }
@@ -13,7 +11,7 @@ impl SplitMix64 {
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(SPLITMIX_INCREMENT);
+        self.state = self.state.wrapping_add(crate::GOLDEN_RATIO_U64);
         let mut value = self.state;
         value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -110,4 +108,14 @@ pub fn parse_positive_sizes(name: &str, raw: &str) -> Result<Vec<usize>, String>
         sizes.push(parsed);
     }
     Ok(sizes)
+}
+
+/// Reads `name` as a [`parse_positive_sizes`] list, or returns `default` when
+/// unset. Panics on a malformed or non-Unicode value.
+pub fn sizes_from_env(name: &str, default: &[usize]) -> Vec<usize> {
+    match std::env::var(name) {
+        Ok(raw) => parse_positive_sizes(name, &raw).unwrap_or_else(|error| panic!("{error}")),
+        Err(std::env::VarError::NotPresent) => default.to_vec(),
+        Err(std::env::VarError::NotUnicode(_)) => panic!("{name} must contain valid Unicode"),
+    }
 }

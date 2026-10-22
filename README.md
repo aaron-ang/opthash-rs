@@ -63,7 +63,7 @@ To use opthash without `std`, disable default features and provide a hasher:
 
 ```toml
 [dependencies]
-opthash = { version = "0.10", default-features = false }
+opthash = { version = "0.11", default-features = false }
 ```
 
 ## Choosing an algorithm

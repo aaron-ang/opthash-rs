@@ -35,7 +35,7 @@ jobs:
           python-version: "3.13"
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: actions/cache@v4
         with:
@@ -58,6 +58,7 @@ jobs:
           toolchain: ${{ matrix.channel }}
       - uses: Swatinem/rust-cache@v2
       - name: Test
+        if: matrix.channel == 'stable'
         run: cargo test
       - name: Test (nightly)
         if: matrix.channel == 'nightly'
@@ -87,7 +88,7 @@ jobs:
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
-          args: --release --features python --out dist
+          args: --release --out dist
           sccache: true
       - name: Pytest
         run: |

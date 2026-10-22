@@ -283,7 +283,7 @@ where
     P: TableBackend<T, ()>,
 {
     forward_constructors! {
-        /// Full constructor: capacity, reserve fraction, hasher, and allocator.
+        /// Compatibility constructor accepting an exact dyadic `f64` reserve.
         ///
         /// # Panics
         /// Panics for non-dyadic input, unsupported reserve, or construction failure.
@@ -732,9 +732,7 @@ where
 {
     fn bitor_assign(&mut self, rhs: &HashSet<T, P>) {
         for value in rhs {
-            if !self.contains(value) {
-                self.insert(value.clone());
-            }
+            self.get_or_insert_with(value, T::clone);
         }
     }
 }
@@ -756,9 +754,7 @@ where
 {
     fn bitxor_assign(&mut self, rhs: &HashSet<T, P>) {
         for value in rhs {
-            if self.contains(value) {
-                self.remove(value);
-            } else {
+            if !self.remove(value) {
                 self.insert(value.clone());
             }
         }

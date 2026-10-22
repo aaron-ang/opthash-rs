@@ -111,7 +111,7 @@ const ELASTIC_LOGICAL_SHIFT: u32 = 3;
 const ELASTIC_REJECTION_MASK: u32 = (1 << ELASTIC_LOGICAL_SHIFT) - 1;
 pub(crate) const ELASTIC_LEVEL_LIMIT: u64 = 1 << 5;
 pub(crate) const ELASTIC_LOGICAL_LIMIT: u64 = 1 << 13;
-pub(crate) const ELASTIC_REJECTION_LIMIT: u32 = 1 << ELASTIC_LOGICAL_SHIFT;
+const ELASTIC_REJECTION_LIMIT: u32 = 1 << ELASTIC_LOGICAL_SHIFT;
 /// Random words both backends spend per rejection-sampled probe before the
 /// deterministic fallback.
 pub(crate) const RANGE_WORD_CAP: u32 = 8;
@@ -317,7 +317,7 @@ pub(crate) const fn elastic_counter_level(counter: u32) -> u32 {
 /// for an ordinary level, and eight bits each for the logical probe and exact
 /// range-reduction retry. Unsupported domains or out-of-range values fail
 /// instead of truncating.
-pub(crate) const fn try_pack_funnel_counter(
+const fn try_pack_funnel_counter(
     domain: ProbeDomain,
     logical_probe_index: u64,
     rejection_index: u32,

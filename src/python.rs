@@ -2,10 +2,6 @@
 // Raw-pointer casts in pyo3 macro expansions. Per-fn `#[allow]` doesn't reach
 // the generated wrapper, so suppression must be file-level.
 #![allow(clippy::ptr_as_ptr, clippy::borrow_as_ptr, clippy::ref_as_ptr)]
-// pyo3 signatures (`Bound<PyModule>`, `PyRef<Self>`, …) elide the lifetime by
-// convention; the crate-wide `elided_lifetimes_in_paths` lint is waived here for
-// the same macro-reach reason as above. The rest of the crate keeps it on.
-#![allow(elided_lifetimes_in_paths)]
 
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -60,7 +56,7 @@ enum HashKind {
 const KIND_MASK: usize = 0b11;
 
 /// Owning hashable wrapper for a `Py<PyAny>` map key. Caches `__hash__`
-/// and tag-packs `HashKind` into the pointer's low bit; 16B on 64-bit.
+/// and tag-packs `HashKind` into the pointer's low 2 bits; 16B on 64-bit.
 struct HashedAny {
     /// `PyObject*` OR'd with `HashKind`. `Drop` calls `Py_DECREF` on the masked pointer.
     tagged: NonNull<ffi::PyObject>,
@@ -295,10 +291,8 @@ fn map_update<P: TableBackend<HashedAny, Py<PyAny>>>(
     let mut touched = false;
     if let Some(peer) = same_inner {
         inner.reserve(peer.len());
-        for (k, v) in peer {
-            inner.insert(k.clone_with_py(py), v.clone_ref(py));
-            touched = true;
-        }
+        map_extend_cloned(inner, peer, py);
+        touched = !peer.is_empty();
     } else if let Some(other) = other {
         if let Ok(dict) = other.cast::<PyDict>() {
             inner.reserve(dict.len());
@@ -414,67 +408,60 @@ fn map_eq<P: TableBackend<HashedAny, Py<PyAny>>>(
     true
 }
 
-/// `dict.keys() & other`: keys present in both, as a fresh `set`.
-fn keys_view_intersection<P: TableBackend<HashedAny, Py<PyAny>>>(
-    inner: &HashMap<HashedAny, Py<PyAny>, P>,
-    other: &Bound<PyAny>,
-    py: Python,
-) -> PyResult<Py<PySet>> {
-    let result = PySet::empty(py)?;
-    for (k, _) in inner {
-        let key_b = k.obj_borrowed(py);
-        if other.contains(key_b)? {
-            result.add(key_b)?;
-        }
-    }
-    Ok(result.unbind())
+/// `dict.keys()` view element: the key itself.
+#[expect(clippy::unnecessary_wraps, reason = "matches `item_elem`'s signature")]
+fn key_elem<'py>(k: &HashedAny, _v: &Py<PyAny>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    Ok(k.obj_borrowed(py).to_owned())
 }
 
-/// `dict.keys() | other`: keys from either side, as a fresh `set`.
-fn keys_view_union<P: TableBackend<HashedAny, Py<PyAny>>>(
+/// `dict.items()` view element: a fresh `(k, v)` tuple.
+fn item_elem<'py>(k: &HashedAny, v: &Py<PyAny>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    Ok(PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)])?.into_any())
+}
+
+/// View `&` (`keep_present`) or `-` (`!keep_present`): the `elem` of each
+/// entry whose membership in `other` equals `keep_present`, as a fresh `set`.
+fn view_select<'py, P: TableBackend<HashedAny, Py<PyAny>>>(
     inner: &HashMap<HashedAny, Py<PyAny>, P>,
-    other: &Bound<PyAny>,
-    py: Python,
-) -> PyResult<Py<PySet>> {
+    other: &Bound<'py, PyAny>,
+    py: Python<'py>,
+    keep_present: bool,
+    elem: fn(&HashedAny, &Py<PyAny>, Python<'py>) -> PyResult<Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PySet>> {
     let result = PySet::empty(py)?;
-    for (k, _) in inner {
-        result.add(k.obj_borrowed(py))?;
+    for (k, v) in inner {
+        let e = elem(k, v, py)?;
+        if other.contains(&e)? == keep_present {
+            result.add(e)?;
+        }
+    }
+    Ok(result)
+}
+
+/// View `|`: every entry's `elem` plus every item of `other`, as a fresh `set`.
+fn view_union<'py, P: TableBackend<HashedAny, Py<PyAny>>>(
+    inner: &HashMap<HashedAny, Py<PyAny>, P>,
+    other: &Bound<'py, PyAny>,
+    py: Python<'py>,
+    elem: fn(&HashedAny, &Py<PyAny>, Python<'py>) -> PyResult<Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PySet>> {
+    let result = PySet::empty(py)?;
+    for (k, v) in inner {
+        result.add(elem(k, v, py)?)?;
     }
     for item in other.try_iter()? {
         result.add(item?)?;
     }
-    Ok(result.unbind())
-}
-
-/// `dict.keys() - other`: keys not in `other`, as a fresh `set`.
-fn keys_view_difference<P: TableBackend<HashedAny, Py<PyAny>>>(
-    inner: &HashMap<HashedAny, Py<PyAny>, P>,
-    other: &Bound<PyAny>,
-    py: Python,
-) -> PyResult<Py<PySet>> {
-    let result = PySet::empty(py)?;
-    for (k, _) in inner {
-        let key_b = k.obj_borrowed(py);
-        if !other.contains(key_b)? {
-            result.add(key_b)?;
-        }
-    }
-    Ok(result.unbind())
+    Ok(result)
 }
 
 /// `dict.keys() ^ other`: keys in exactly one side, as a fresh `set`.
-fn keys_view_symmetric_difference<P: TableBackend<HashedAny, Py<PyAny>>>(
+fn keys_view_symmetric_difference<'py, P: TableBackend<HashedAny, Py<PyAny>>>(
     inner: &HashMap<HashedAny, Py<PyAny>, P>,
-    other: &Bound<PyAny>,
-    py: Python,
-) -> PyResult<Py<PySet>> {
-    let result = PySet::empty(py)?;
-    for (k, _) in inner {
-        let key_b = k.obj_borrowed(py);
-        if !other.contains(key_b)? {
-            result.add(key_b)?;
-        }
-    }
+    other: &Bound<'py, PyAny>,
+    py: Python<'py>,
+) -> PyResult<Bound<'py, PySet>> {
+    let result = view_select(inner, other, py, false, key_elem)?;
     for item in other.try_iter()? {
         let item = item?;
         let probe = ProbeKey::from_bound(&item)?;
@@ -482,56 +469,7 @@ fn keys_view_symmetric_difference<P: TableBackend<HashedAny, Py<PyAny>>>(
             result.add(item)?;
         }
     }
-    Ok(result.unbind())
-}
-
-/// `dict.items() & other`: `(k, v)` pairs present in both, as a fresh `set`.
-fn items_view_intersection<P: TableBackend<HashedAny, Py<PyAny>>>(
-    inner: &HashMap<HashedAny, Py<PyAny>, P>,
-    other: &Bound<PyAny>,
-    py: Python,
-) -> PyResult<Py<PySet>> {
-    let result = PySet::empty(py)?;
-    for (k, v) in inner {
-        let tup = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)])?;
-        if other.contains(&tup)? {
-            result.add(tup)?;
-        }
-    }
-    Ok(result.unbind())
-}
-
-/// `dict.items() | other`: `(k, v)` pairs from either side, as a fresh `set`.
-fn items_view_union<P: TableBackend<HashedAny, Py<PyAny>>>(
-    inner: &HashMap<HashedAny, Py<PyAny>, P>,
-    other: &Bound<PyAny>,
-    py: Python,
-) -> PyResult<Py<PySet>> {
-    let result = PySet::empty(py)?;
-    for (k, v) in inner {
-        let tup = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)])?;
-        result.add(tup)?;
-    }
-    for item in other.try_iter()? {
-        result.add(item?)?;
-    }
-    Ok(result.unbind())
-}
-
-/// `dict.items() - other`: `(k, v)` pairs not in `other`, as a fresh `set`.
-fn items_view_difference<P: TableBackend<HashedAny, Py<PyAny>>>(
-    inner: &HashMap<HashedAny, Py<PyAny>, P>,
-    other: &Bound<PyAny>,
-    py: Python,
-) -> PyResult<Py<PySet>> {
-    let result = PySet::empty(py)?;
-    for (k, v) in inner {
-        let tup = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)])?;
-        if !other.contains(&tup)? {
-            result.add(tup)?;
-        }
-    }
-    Ok(result.unbind())
+    Ok(result)
 }
 
 /// Route a `#[pyclass]` method to its backend-generic op, resolving the
@@ -948,16 +886,19 @@ macro_rules! define_map_classes {
                 true
             }
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                keys_view_intersection(&self.map.borrow(py).inner, other, py)
+                view_select(&self.map.borrow(py).inner, other, py, true, key_elem)
+                    .map(Bound::unbind)
             }
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                keys_view_union(&self.map.borrow(py).inner, other, py)
+                view_union(&self.map.borrow(py).inner, other, py, key_elem).map(Bound::unbind)
             }
             fn __sub__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                keys_view_difference(&self.map.borrow(py).inner, other, py)
+                view_select(&self.map.borrow(py).inner, other, py, false, key_elem)
+                    .map(Bound::unbind)
             }
             fn __xor__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
                 keys_view_symmetric_difference(&self.map.borrow(py).inner, other, py)
+                    .map(Bound::unbind)
             }
         }
 
@@ -1081,13 +1022,15 @@ macro_rules! define_map_classes {
                 true
             }
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                items_view_intersection(&self.map.borrow(py).inner, other, py)
+                view_select(&self.map.borrow(py).inner, other, py, true, item_elem)
+                    .map(Bound::unbind)
             }
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                items_view_union(&self.map.borrow(py).inner, other, py)
+                view_union(&self.map.borrow(py).inner, other, py, item_elem).map(Bound::unbind)
             }
             fn __sub__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                items_view_difference(&self.map.borrow(py).inner, other, py)
+                view_select(&self.map.borrow(py).inner, other, py, false, item_elem)
+                    .map(Bound::unbind)
             }
         }
     };
@@ -1262,17 +1205,7 @@ fn set_isdisjoint<P: TableBackend<HashedAny, ()>>(
     same_inner: Option<&HashSet<HashedAny, P>>,
 ) -> PyResult<bool> {
     if let Some(peer) = same_inner {
-        let (smaller, larger) = if inner.len() <= peer.len() {
-            (inner, peer)
-        } else {
-            (peer, inner)
-        };
-        for value in smaller {
-            if larger.contains(value) {
-                return Ok(false);
-            }
-        }
-        return Ok(true);
+        return Ok(inner.is_disjoint(peer));
     }
     for item in other.try_iter()? {
         let item = item?;
@@ -1292,15 +1225,7 @@ fn set_issubset<P: TableBackend<HashedAny, ()>>(
     same_inner: Option<&HashSet<HashedAny, P>>,
 ) -> PyResult<bool> {
     if let Some(peer) = same_inner {
-        if inner.len() > peer.len() {
-            return Ok(false);
-        }
-        for value in inner {
-            if !peer.contains(value) {
-                return Ok(false);
-            }
-        }
-        return Ok(true);
+        return Ok(inner.is_subset(peer));
     }
     let other_set = PySet::empty(py)?;
     for item in other.try_iter()? {
@@ -1325,15 +1250,7 @@ fn set_issuperset<P: TableBackend<HashedAny, ()>>(
     same_inner: Option<&HashSet<HashedAny, P>>,
 ) -> PyResult<bool> {
     if let Some(peer) = same_inner {
-        if inner.len() < peer.len() {
-            return Ok(false);
-        }
-        for value in peer {
-            if !inner.contains(value) {
-                return Ok(false);
-            }
-        }
-        return Ok(true);
+        return Ok(inner.is_superset(peer));
     }
     for item in other.try_iter()? {
         let item = item?;
@@ -1393,7 +1310,6 @@ macro_rules! define_set_classes {
         }
 
         impl $PySet {
-            /// Apply `op` to each element of `others`; report whether any changed.
             fn fold_each(
                 &mut self,
                 others: &Bound<PyTuple>,
@@ -1406,25 +1322,18 @@ macro_rules! define_set_classes {
                 Ok(touched)
             }
 
-            /// Inserts every element of `other` (an opthash set or any iterable).
-            /// Returns whether the set changed.
             fn add_all(&mut self, other: &Bound<PyAny>) -> PyResult<bool> {
                 dispatch_same_type!(set_add_all, &mut self.inner, other)
             }
 
-            /// Removes every element of `other` from the set. Returns whether
-            /// the set changed.
             fn remove_all(&mut self, other: &Bound<PyAny>) -> PyResult<bool> {
                 dispatch_same_type!(set_remove_all, &mut self.inner, other)
             }
 
-            /// Retains only the elements also present in `other`. Returns
-            /// whether the set changed.
             fn retain_in(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
                 dispatch_same_type!(set_retain_in, &mut self.inner, other, py)
             }
 
-            /// In-place symmetric difference with `other`.
             fn symmetric_difference_with(&mut self, other: &Bound<PyAny>) -> PyResult<bool> {
                 dispatch_same_type!(set_symmetric_difference_with, &mut self.inner, other)
             }
@@ -1545,8 +1454,8 @@ macro_rules! define_set_classes {
                 if self.inner.is_empty() {
                     return Err(PyKeyError::new_err("pop from an empty set"));
                 }
-                // `extract_if` removes only the elements it yields (its `Drop` is
-                // a no-op), so taking one leaves the rest intact.
+                // `extract_if` removes only the elements it yields, so taking
+                // one leaves the rest intact.
                 let value = self.inner.extract_if(|_| true).next().expect("len > 0");
                 let obj = value.obj_clone_ref(py);
                 self.bump();

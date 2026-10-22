@@ -57,25 +57,29 @@ LOCK_DIR=${LOCK_DIR:-/tmp}
 IS_LINUX=0
 [[ $(uname) == Linux ]] && IS_LINUX=1
 
-claim_criterion_root_lock() {
-	local canonical_root root_key lock
-	canonical_root=$(realpath -m -- "$CRITERION_ROOT")
-	root_key=$(printf '%s' "$canonical_root" | sha256sum)
-	root_key=${root_key%% *}
+# Lock fds are held for the script's lifetime; the kernel releases them on exit.
+claim_lock() {
+	local lock=$1 label=$2 fd
 	mkdir -p "$LOCK_DIR" 2>/dev/null || true
-	lock="$LOCK_DIR/opthash-bench-root-${root_key}.lock"
 	if [[ -L "$lock" ]] || { [[ -e "$lock" ]] && [[ ! -d "$lock" && ! -f "$lock" ]]; }; then
-		echo "error: unsafe Criterion root lock $lock" >&2
+		echo "error: unsafe $label lock $lock" >&2
 		exit 1
 	fi
 	if [[ ! -e "$lock" ]] && ! mkdir -m 0755 "$lock" 2>/dev/null && [[ ! -e "$lock" ]]; then
-		echo "error: cannot create Criterion root lock $lock" >&2
+		echo "error: cannot create $label lock $lock" >&2
 		exit 1
 	fi
-	exec {CRITERION_LOCK_FD}<"$lock"
-	echo "info: waiting for Criterion root lock..." >&2
-	flock "$CRITERION_LOCK_FD"
-	echo "info: acquired Criterion root lock" >&2
+	exec {fd}<"$lock"
+	echo "info: waiting for $label lock..." >&2
+	flock "$fd"
+	echo "info: acquired $label lock" >&2
+}
+
+claim_criterion_root_lock() {
+	local canonical_root root_key
+	canonical_root=$(realpath -m -- "$CRITERION_ROOT")
+	root_key=$(printf '%s' "$canonical_root" | sha256sum)
+	claim_lock "$LOCK_DIR/opthash-bench-root-${root_key%% *}.lock" "Criterion root"
 }
 
 # Cores at the system's max cpufreq — perf cluster on hybrid SoCs, every
@@ -119,20 +123,7 @@ claim_core_lock() {
 		echo "error: CORE must be one CPU number" >&2
 		exit 1
 	fi
-	mkdir -p "$LOCK_DIR" 2>/dev/null || true
-	local lock="$LOCK_DIR/opthash-bench-core-${CORE}.lock"
-	if [[ -L "$lock" ]] || { [[ -e "$lock" ]] && [[ ! -d "$lock" && ! -f "$lock" ]]; }; then
-		echo "error: unsafe benchmark lock $lock" >&2
-		exit 1
-	fi
-	if [[ ! -e "$lock" ]] && ! mkdir -m 0755 "$lock" 2>/dev/null && [[ ! -e "$lock" ]]; then
-		echo "error: cannot create benchmark lock $lock" >&2
-		exit 1
-	fi
-	exec {LOCK_FD}<"$lock"
-	echo "info: waiting for perf core $CORE lock..." >&2
-	flock "$LOCK_FD"
-	echo "info: acquired perf core $CORE" >&2
+	claim_lock "$LOCK_DIR/opthash-bench-core-${CORE}.lock" "perf core $CORE"
 }
 
 if ((IS_LINUX)); then
@@ -162,8 +153,7 @@ numa_wrapper=()
 if ((IS_LINUX)) && command -v numactl >/dev/null 2>&1 && [[ -n "${CORE:-}" ]]; then
 	node_count=$(find /sys/devices/system/node -maxdepth 1 -name 'node[0-9]*' -type d 2>/dev/null | wc -l)
 	if ((node_count > 1)); then
-		first_core=${CORE%%,*}
-		node_dir=$(find "/sys/devices/system/cpu/cpu${first_core}" -maxdepth 1 -name 'node[0-9]*' 2>/dev/null | head -1)
+		node_dir=$(find "/sys/devices/system/cpu/cpu${CORE}" -maxdepth 1 -name 'node[0-9]*' 2>/dev/null | head -1)
 		if [[ -n "$node_dir" ]]; then
 			numa_node=${node_dir##*/node}
 			numa_wrapper=(numactl --membind="$numa_node")
@@ -218,7 +208,6 @@ else
 fi
 echo "info: Criterion args: ${criterion_args[*]}" >&2
 
-# Strip a leading '--' from forwarded args since we include it ourselves.
 forward_args=("$@")
 if [[ "${#forward_args[@]}" -gt 0 && "${forward_args[0]}" == "--" ]]; then
 	forward_args=("${forward_args[@]:1}")

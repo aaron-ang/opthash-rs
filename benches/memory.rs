@@ -9,7 +9,6 @@
 //! MEMORY_SIZES=1000,10000 cargo bench --profile release --bench memory
 //! ```
 
-use std::env;
 use std::hash::Hash;
 use std::hint::black_box;
 
@@ -100,15 +99,6 @@ struct Report {
     measurement: AllocationMeasurement,
 }
 
-fn configured_sizes() -> Vec<usize> {
-    match env::var("MEMORY_SIZES") {
-        Ok(raw) => harness::parse_positive_sizes("MEMORY_SIZES", &raw)
-            .unwrap_or_else(|error| panic!("{error}")),
-        Err(env::VarError::NotPresent) => DEFAULT_SIZES.to_vec(),
-        Err(env::VarError::NotUnicode(_)) => panic!("MEMORY_SIZES must contain valid Unicode"),
-    }
-}
-
 fn measure<M, V>(payload: &'static str, mode: Mode, pairs: &[(u64, V)]) -> Report
 where
     M: MapUnderTest<u64, V>,
@@ -185,7 +175,7 @@ fn main() {
          bytes_per_capacity\tpeak_bytes\tpeak_bytes_per_entry\tlive_allocations\t\
          allocation_calls\tallocated_bytes\tallocated_bytes_per_entry"
     );
-    for size in configured_sizes() {
+    for size in harness::sizes_from_env("MEMORY_SIZES", DEFAULT_SIZES) {
         family("u64", &harness::make_pairs(size));
         family("big32", &harness::make_big_pairs(size));
     }

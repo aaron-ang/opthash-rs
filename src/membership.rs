@@ -20,7 +20,7 @@ pub(crate) const SLOTS_PER_WORD: usize = 10;
 
 /// Filter words needed to cover `total_slots` logical slots.
 #[inline]
-pub(crate) fn word_count(total_slots: usize) -> usize {
+fn word_count(total_slots: usize) -> usize {
     total_slots.div_ceil(SLOTS_PER_WORD)
 }
 

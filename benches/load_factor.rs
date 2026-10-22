@@ -2,8 +2,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-/// `with_capacity` request shared by every arm; sized to the 100K cache regime
-/// where elastic's high-load spike first appears.
+/// `with_capacity` request shared by every arm.
 const CAP_HINT: usize = 100_000;
 
 /// Fill targets as a fraction of each map's resize threshold (`capacity()`).
@@ -24,7 +23,6 @@ fn bench_load_factor(c: &mut Criterion) {
         let workload = format!("load_factor_{pct}");
         let mut group = c.benchmark_group(&workload);
 
-        // Bench id `<workload>_<impl>`, matching speedup.rs / mean_latency.rs.
         // Maps come from the harness constructors so every arm shares the
         // fixed-seed `BenchHasher` used by the rest of the suite.
         macro_rules! arm {

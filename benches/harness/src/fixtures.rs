@@ -40,9 +40,9 @@ pub fn funnel_map_cap<K: Eq + Hash, V>(cap: usize) -> FunnelHashMap<K, V> {
 pub const LATENCY_SIZES: &[usize] = &[1_000, 10_000, 100_000, 1_000_000, 10_000_000];
 
 /// Knuth multiplicative-hash constant (golden ratio * 2^64, odd).
-pub const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
-/// Alternating 1010... bit pattern; cheap key→value mix that flips every bit.
-pub const VALUE_XOR_MIX: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+pub(crate) const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Fixed `0xA5` byte pattern XOR-ed into keys to derive values.
+pub(crate) const VALUE_XOR_MIX: u64 = 0xA5A5_A5A5_A5A5_A5A5;
 /// Bit-inverse of [`VALUE_XOR_MIX`]; used in delete-heavy bench to mark
 /// replacement values as distinct from the initial value mix.
 pub const VALUE_XOR_MIX_ALT: u64 = 0x5A5A_5A5A_5A5A_5A5A;
@@ -63,15 +63,14 @@ pub fn make_pairs(count: usize) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// Emits `pub fn $fn(pairs: &[(u64, $val)]) -> $Map<u64, $val>` for each
-/// `$fn => $Map`, each a `with_capacity` + insert loop. Covers the map and
-/// big-value builder families.
+/// Emits `pub fn $fn<V: Copy>(pairs: &[(u64, V)]) -> $Map<u64, V>` for each
+/// `$fn => $Map`, each a `with_capacity` + insert loop.
 macro_rules! pairs_builders {
-    ($val:ty; $($fn:ident => $Map:ident),+ $(,)?) => {
+    ($($fn:ident => $Map:ident),+ $(,)?) => {
         $(
             #[inline]
             #[must_use]
-            pub fn $fn(pairs: &[(u64, $val)]) -> $Map<u64, $val> {
+            pub fn $fn<V: Copy>(pairs: &[(u64, V)]) -> $Map<u64, V> {
                 let mut map = $Map::with_capacity_and_hasher(pairs.len(), Default::default());
                 for &(key, value) in pairs {
                     map.insert(key, value);
@@ -101,7 +100,7 @@ macro_rules! drop_builders {
     };
 }
 
-pairs_builders!(u64;
+pairs_builders!(
     build_std_map => StdHashMap,
     build_hashbrown_map => HashbrownMap,
     build_elastic_map => ElasticHashMap,
@@ -132,7 +131,7 @@ impl MapQuad {
 }
 
 /// Side-effect sink for [`DropU64::drop`]; defeats LLVM elision of drop loops.
-pub static DROP_SINK: AtomicU64 = AtomicU64::new(0);
+static DROP_SINK: AtomicU64 = AtomicU64::new(0);
 
 /// `u64` with an observable `Drop`. Use for `clear`/`drain`/`extract_if`
 /// benches where `(u64, u64)` payload would let the optimizer skip the walk.
@@ -166,7 +165,7 @@ pub type BigVal = [u64; 4];
 
 #[inline]
 #[must_use]
-pub fn big_val(key: u64) -> BigVal {
+fn big_val(key: u64) -> BigVal {
     [key, key ^ VALUE_XOR_MIX, key.wrapping_add(1), !key]
 }
 
@@ -179,10 +178,3 @@ pub fn make_big_pairs(count: usize) -> Vec<(u64, BigVal)> {
         })
         .collect()
 }
-
-pairs_builders!(BigVal;
-    build_std_big_map => StdHashMap,
-    build_hashbrown_big_map => HashbrownMap,
-    build_elastic_big_map => ElasticHashMap,
-    build_funnel_big_map => FunnelHashMap,
-);
