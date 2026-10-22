@@ -6,13 +6,13 @@
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 
 use pyo3::Borrowed;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyFrozenSet, PySet, PyString, PyTuple, PyType};
+use pyo3::types::{PyDict, PyFrozenSet, PyList, PySet, PyString, PyTuple, PyType};
 
 use crate::map::{HashMap, TableBackend};
 use crate::set::HashSet;
@@ -472,6 +472,65 @@ fn keys_view_symmetric_difference<'py, P: TableBackend<HashedAny, Py<PyAny>>>(
     Ok(result)
 }
 
+/// An in-place operand that is safe to read while the receiver is mutably
+/// borrowed, plus any error raised while collecting it.
+type Detached<'py> = (Bound<'py, PyAny>, Option<PyErr>);
+
+/// `other` in a form an in-place op can read while its receiver is mutably
+/// borrowed. Builtin containers and same-type collections (`same_type`) pass
+/// through, since iterating them runs no user code. Their elements are still
+/// hashed, compared, and (for `dict.update` pairs) unpacked under the borrow,
+/// so an element whose `__hash__` reads the receiver raises `RuntimeError`. Anything
+/// else (a view or iterator over the receiver, a generator) is collected into
+/// a list first. Items yielded before an iteration error are kept, and the
+/// error is returned with them so the caller decides whether to apply them.
+fn detach<'py>(other: &Bound<'py, PyAny>, same_type: bool) -> PyResult<Detached<'py>> {
+    if same_type
+        || other.is_exact_instance_of::<PyDict>()
+        || other.is_exact_instance_of::<PySet>()
+        || other.is_exact_instance_of::<PyFrozenSet>()
+        || other.is_exact_instance_of::<PyList>()
+        || other.is_exact_instance_of::<PyTuple>()
+    {
+        return Ok((other.clone(), None));
+    }
+    let items = PyList::empty(other.py());
+    for item in other.try_iter()? {
+        match item {
+            Ok(item) => items.append(item)?,
+            Err(err) => return Ok((items.into_any(), Some(err))),
+        }
+    }
+    Ok((items.into_any(), None))
+}
+
+/// [`detach`] for a `dict.update` operand: a mapping other than an exact
+/// `dict` is read through `keys()` and `__getitem__` into `(key, value)`
+/// pairs, which [`map_update`] accepts as an iterable.
+fn detach_mapping<'py>(other: &Bound<'py, PyAny>, same_type: bool) -> PyResult<Detached<'py>> {
+    if same_type || other.is_exact_instance_of::<PyDict>() || !other.hasattr("keys")? {
+        return detach(other, same_type);
+    }
+    let py = other.py();
+    // Like `dict.update`, read every key before any value, so a failing
+    // `keys()` changes nothing.
+    let keys = other
+        .call_method0("keys")?
+        .try_iter()?
+        .collect::<PyResult<Vec<_>>>()?;
+    let pairs = PyList::empty(py);
+    for key in keys {
+        let pair = other
+            .get_item(&key)
+            .and_then(|value| PyTuple::new(py, [key, value]));
+        match pair {
+            Ok(pair) => pairs.append(pair)?,
+            Err(err) => return Ok((pairs.into_any(), Some(err))),
+        }
+    }
+    Ok((pairs.into_any(), None))
+}
+
 /// Route a `#[pyclass]` method to its backend-generic op, resolving the
 /// same-type fast path: if `other` is the same pyclass, borrow its `inner` and
 /// pass it as the trailing `same_inner`, else pass `None`. `$recv` is
@@ -480,7 +539,7 @@ macro_rules! dispatch_same_type {
     ($f:ident, $recv:expr, $other:expr $(, $arg:expr)*) => {
         match $other.cast::<Self>() {
             Ok(o) => {
-                let peer = o.borrow();
+                let peer = o.try_borrow()?;
                 $f($recv, $other $(, $arg)*, Some(&peer.inner))
             }
             Err(_) => $f($recv, $other $(, $arg)*, None),
@@ -517,13 +576,19 @@ macro_rules! define_pyclass_state {
                 self.generation = self.generation.wrapping_add(1);
             }
 
-            /// Bump once if an in-place op reported a change; propagate its error.
+            /// Run an in-place op and bump once if it changed the collection.
+            /// Length and capacity are compared too: an op may resize before
+            /// inserting anything, or insert some entries and then raise.
             #[inline]
-            fn bump_if_changed(&mut self, changed: PyResult<bool>) -> PyResult<()> {
-                if changed? {
+            fn mutate(&mut self, op: impl FnOnce(&mut Self) -> PyResult<bool>) -> PyResult<()> {
+                let before = (self.inner.len(), self.inner.capacity());
+                let changed = op(self);
+                if matches!(changed, Ok(true))
+                    || before != (self.inner.len(), self.inner.capacity())
+                {
                     self.bump();
                 }
-                Ok(())
+                changed.map(drop)
             }
         }
     };
@@ -572,13 +637,28 @@ macro_rules! define_map_classes {
                     generation: 0,
                 };
                 if other_first {
-                    new.update(Some(other), None, py)?;
+                    new.update_from(Some(other), None, py)?;
                 }
                 map_extend_cloned(&mut new.inner, &self.inner, py);
                 if !other_first {
-                    new.update(Some(other), None, py)?;
+                    new.update_from(Some(other), None, py)?;
                 }
                 Ok(new)
+            }
+
+            /// [`map_update`] from `other`, which must not be `self`.
+            fn update_from(
+                &mut self,
+                other: Option<&Bound<PyAny>>,
+                kwargs: Option<&Bound<PyDict>>,
+                py: Python,
+            ) -> PyResult<()> {
+                let peer = other
+                    .and_then(|o| o.cast::<Self>().ok())
+                    .map(Bound::try_borrow)
+                    .transpose()?;
+                let same_inner = peer.as_ref().map(|p| &p.inner);
+                self.mutate(|s| map_update(&mut s.inner, other, kwargs, py, same_inner))
             }
         }
 
@@ -597,7 +677,7 @@ macro_rules! define_map_classes {
                     generation: 0,
                 };
                 if other.is_some() || kwargs.is_some() {
-                    me.update(other, kwargs, py)?;
+                    me.update_from(other, kwargs, py)?;
                 }
                 Ok(me)
             }
@@ -719,10 +799,10 @@ macro_rules! define_map_classes {
                 )
             }
 
-            fn __iter__(slf: &Bound<Self>) -> $KeyIter {
+            fn __iter__(slf: &Bound<Self>) -> PyResult<$KeyIter> {
                 let py = slf.py();
                 let snapshot = slf
-                    .borrow()
+                    .try_borrow()?
                     .inner
                     .iter()
                     .map(|(k, _)| Some(k.obj_clone_ref(py)))
@@ -743,21 +823,30 @@ macro_rules! define_map_classes {
             }
 
             /// Mirror of `dict.update`; see [`map_update`] for the branch logic.
-            /// `bump()` only on actual inserts — empty `update()` keeps
-            /// iterators valid.
+            /// Bumps only on an insert or a resize, so an empty `update()`
+            /// keeps iterators valid.
             #[pyo3(signature = (other = None, **kwargs))]
             fn update(
-                &mut self,
+                slf: &Bound<Self>,
                 other: Option<&Bound<PyAny>>,
                 kwargs: Option<&Bound<PyDict>>,
                 py: Python,
             ) -> PyResult<()> {
-                let peer = other
-                    .and_then(|o| o.cast::<Self>().ok())
-                    .map(|o| o.borrow());
-                let same_inner = peer.as_ref().map(|p| &p.inner);
-                let touched = map_update(&mut self.inner, other, kwargs, py, same_inner);
-                self.bump_if_changed(touched)
+                // Updating from itself only adds `kwargs`; `slf` can't be
+                // borrowed as `other` while it is mutably borrowed.
+                let (other, pending) = match other.filter(|o| !o.is(slf)) {
+                    Some(o) => {
+                        let (o, pending) = detach_mapping(o, o.is_instance_of::<Self>())?;
+                        (Some(o), pending)
+                    }
+                    None => (None, None),
+                };
+                // Like `dict.update`, keyword arguments apply only once `other`
+                // has been read in full.
+                let kwargs = kwargs.filter(|_| pending.is_none());
+                slf.try_borrow_mut()?
+                    .update_from(other.as_ref(), kwargs, py)?;
+                pending.map_or(Ok(()), Err)
             }
 
             #[pyo3(signature = (key, default = None))]
@@ -810,8 +899,8 @@ macro_rules! define_map_classes {
                 }
             }
 
-            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> bool {
-                dispatch_same_type!(map_eq, &self.inner, other, py)
+            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                Ok(dispatch_same_type!(map_eq, &self.inner, other, py))
             }
 
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
@@ -822,8 +911,8 @@ macro_rules! define_map_classes {
                 self.merged(other, true, py)
             }
 
-            fn __ior__(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<()> {
-                self.update(Some(other), None, py)
+            fn __ior__(slf: &Bound<Self>, other: &Bound<PyAny>, py: Python) -> PyResult<()> {
+                Self::update(slf, Some(other), None, py)
             }
         }
 
@@ -840,26 +929,26 @@ macro_rules! define_map_classes {
 
         #[pymethods]
         impl $KeysView {
-            fn __iter__(&self, py: Python) -> $KeyIter {
+            fn __iter__(&self, py: Python) -> PyResult<$KeyIter> {
                 let owner = self.map.bind(py);
                 let snapshot = owner
-                    .borrow()
+                    .try_borrow()?
                     .inner
                     .iter()
                     .map(|(k, _)| Some(k.obj_clone_ref(py)))
                     .collect();
                 $KeyIter::new(owner, snapshot)
             }
-            fn __len__(&self, py: Python) -> usize {
-                self.map.borrow(py).inner.len()
+            fn __len__(&self, py: Python) -> PyResult<usize> {
+                Ok(self.map.try_borrow(py)?.inner.len())
             }
             fn __contains__(&self, key: &Bound<PyAny>, py: Python) -> PyResult<bool> {
-                let m = self.map.borrow(py);
+                let m = self.map.try_borrow(py)?;
                 let probe = ProbeKey::from_bound(key)?;
                 Ok(m.inner.contains_key(probe.as_key()))
             }
             fn __repr__(&self, py: Python) -> PyResult<String> {
-                let m = self.map.borrow(py);
+                let m = self.map.try_borrow(py)?;
                 let parts: PyResult<Vec<String>> = m
                     .inner
                     .iter()
@@ -870,34 +959,34 @@ macro_rules! define_map_classes {
                     parts?.join(", ")
                 ))
             }
-            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> bool {
-                let m = self.map.borrow(py);
+            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                let m = self.map.try_borrow(py)?;
                 let Ok(other_len) = other.len() else {
-                    return false;
+                    return Ok(false);
                 };
                 if other_len != m.inner.len() {
-                    return false;
+                    return Ok(false);
                 }
                 for (k, _) in &m.inner {
                     if !other.contains(k.obj_borrowed(py)).unwrap_or(false) {
-                        return false;
+                        return Ok(false);
                     }
                 }
-                true
+                Ok(true)
             }
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_select(&self.map.borrow(py).inner, other, py, true, key_elem)
+                view_select(&self.map.try_borrow(py)?.inner, other, py, true, key_elem)
                     .map(Bound::unbind)
             }
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_union(&self.map.borrow(py).inner, other, py, key_elem).map(Bound::unbind)
+                view_union(&self.map.try_borrow(py)?.inner, other, py, key_elem).map(Bound::unbind)
             }
             fn __sub__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_select(&self.map.borrow(py).inner, other, py, false, key_elem)
+                view_select(&self.map.try_borrow(py)?.inner, other, py, false, key_elem)
                     .map(Bound::unbind)
             }
             fn __xor__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                keys_view_symmetric_difference(&self.map.borrow(py).inner, other, py)
+                keys_view_symmetric_difference(&self.map.try_borrow(py)?.inner, other, py)
                     .map(Bound::unbind)
             }
         }
@@ -910,30 +999,30 @@ macro_rules! define_map_classes {
 
         #[pymethods]
         impl $ValuesView {
-            fn __iter__(&self, py: Python) -> $ValueIter {
+            fn __iter__(&self, py: Python) -> PyResult<$ValueIter> {
                 let owner = self.map.bind(py);
                 let snapshot = owner
-                    .borrow()
+                    .try_borrow()?
                     .inner
                     .iter()
                     .map(|(_, v)| Some(v.clone_ref(py)))
                     .collect();
                 $ValueIter::new(owner, snapshot)
             }
-            fn __len__(&self, py: Python) -> usize {
-                self.map.borrow(py).inner.len()
+            fn __len__(&self, py: Python) -> PyResult<usize> {
+                Ok(self.map.try_borrow(py)?.inner.len())
             }
-            fn __contains__(&self, value: &Bound<PyAny>, py: Python) -> bool {
-                let m = self.map.borrow(py);
+            fn __contains__(&self, value: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                let m = self.map.try_borrow(py)?;
                 for (_, v) in &m.inner {
                     if v.bind(py).eq(value).unwrap_or(false) {
-                        return true;
+                        return Ok(true);
                     }
                 }
-                false
+                Ok(false)
             }
             fn __repr__(&self, py: Python) -> PyResult<String> {
-                let m = self.map.borrow(py);
+                let m = self.map.try_borrow(py)?;
                 let parts: PyResult<Vec<String>> = m
                     .inner
                     .iter()
@@ -958,7 +1047,7 @@ macro_rules! define_map_classes {
             fn __iter__(&self, py: Python) -> PyResult<$ItemIter> {
                 let owner = self.map.bind(py);
                 let snapshot: PyResult<Vec<Option<Py<PyAny>>>> = owner
-                    .borrow()
+                    .try_borrow()?
                     .inner
                     .iter()
                     .map(|(k, v)| {
@@ -966,10 +1055,10 @@ macro_rules! define_map_classes {
                         Ok(Some(tup.into_any().unbind()))
                     })
                     .collect();
-                Ok($ItemIter::new(owner, snapshot?))
+                $ItemIter::new(owner, snapshot?)
             }
-            fn __len__(&self, py: Python) -> usize {
-                self.map.borrow(py).inner.len()
+            fn __len__(&self, py: Python) -> PyResult<usize> {
+                Ok(self.map.try_borrow(py)?.inner.len())
             }
             fn __contains__(&self, item: &Bound<PyAny>, py: Python) -> PyResult<bool> {
                 let Ok(tup) = item.cast::<PyTuple>() else {
@@ -980,7 +1069,7 @@ macro_rules! define_map_classes {
                 }
                 let k = tup.get_item(0)?;
                 let v = tup.get_item(1)?;
-                let m = self.map.borrow(py);
+                let m = self.map.try_borrow(py)?;
                 let probe = ProbeKey::from_bound(&k)?;
                 match m.inner.get(probe.as_key()) {
                     Some(stored_v) => Ok(stored_v.bind(py).eq(&v).unwrap_or(false)),
@@ -988,7 +1077,7 @@ macro_rules! define_map_classes {
                 }
             }
             fn __repr__(&self, py: Python) -> PyResult<String> {
-                let m = self.map.borrow(py);
+                let m = self.map.try_borrow(py)?;
                 let parts: PyResult<Vec<String>> = m
                     .inner
                     .iter()
@@ -1003,33 +1092,33 @@ macro_rules! define_map_classes {
                     parts?.join(", ")
                 ))
             }
-            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> bool {
-                let m = self.map.borrow(py);
+            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                let m = self.map.try_borrow(py)?;
                 let Ok(other_len) = other.len() else {
-                    return false;
+                    return Ok(false);
                 };
                 if other_len != m.inner.len() {
-                    return false;
+                    return Ok(false);
                 }
                 for (k, v) in &m.inner {
                     let Ok(tup) = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)]) else {
-                        return false;
+                        return Ok(false);
                     };
                     if !other.contains(&tup).unwrap_or(false) {
-                        return false;
+                        return Ok(false);
                     }
                 }
-                true
+                Ok(true)
             }
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_select(&self.map.borrow(py).inner, other, py, true, item_elem)
+                view_select(&self.map.try_borrow(py)?.inner, other, py, true, item_elem)
                     .map(Bound::unbind)
             }
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_union(&self.map.borrow(py).inner, other, py, item_elem).map(Bound::unbind)
+                view_union(&self.map.try_borrow(py)?.inner, other, py, item_elem).map(Bound::unbind)
             }
             fn __sub__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_select(&self.map.borrow(py).inner, other, py, false, item_elem)
+                view_select(&self.map.try_borrow(py)?.inner, other, py, false, item_elem)
                     .map(Bound::unbind)
             }
         }
@@ -1055,13 +1144,13 @@ macro_rules! define_iter {
 
         impl $Iter {
             /// Pin `snapshot` to `owner`'s current generation.
-            fn new(owner: &Bound<$PyMap>, snapshot: Vec<Option<Py<PyAny>>>) -> Self {
-                Self {
+            fn new(owner: &Bound<$PyMap>, snapshot: Vec<Option<Py<PyAny>>>) -> PyResult<Self> {
+                Ok(Self {
                     map: owner.clone().unbind(),
                     snapshot,
-                    expected_gen: owner.borrow().generation,
+                    expected_gen: owner.try_borrow()?.generation,
                     pos: 0,
-                }
+                })
             }
         }
 
@@ -1071,7 +1160,7 @@ macro_rules! define_iter {
                 slf
             }
             fn __next__(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-                if self.map.borrow(py).generation != self.expected_gen {
+                if self.map.try_borrow(py)?.generation != self.expected_gen {
                     return Err(PyRuntimeError::new_err(
                         "dictionary changed size during iteration",
                     ));
@@ -1145,6 +1234,20 @@ fn set_remove_all<P: TableBackend<HashedAny, ()>>(
     Ok(inner.len() != before)
 }
 
+/// `other` itself if it is exactly a `set` or `frozenset`, else its elements
+/// collected into a new `set`. Subclasses are copied: they may override
+/// `__contains__`, which builtin set operations ignore.
+fn lookup_set<'py>(other: &Bound<'py, PyAny>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    if other.is_exact_instance_of::<PySet>() || other.is_exact_instance_of::<PyFrozenSet>() {
+        return Ok(other.clone());
+    }
+    let set = PySet::empty(py)?;
+    for item in other.try_iter()? {
+        set.add(item?)?;
+    }
+    Ok(set.into_any())
+}
+
 /// Retain only elements also in `other`; return whether it changed.
 fn set_retain_in<P: TableBackend<HashedAny, ()>>(
     inner: &mut HashSet<HashedAny, P>,
@@ -1157,12 +1260,18 @@ fn set_retain_in<P: TableBackend<HashedAny, ()>>(
         inner.retain(|value| peer.contains(value));
         return Ok(inner.len() != before);
     }
-    let other_set = PySet::empty(py)?;
-    for item in other.try_iter()? {
-        other_set.add(item?)?;
-    }
-    inner.retain(|value| other_set.contains(value.obj_borrowed(py)).unwrap_or(false));
-    Ok(inner.len() != before)
+    let other_set = lookup_set(other, py)?;
+    let mut err = None;
+    inner.retain(|value| {
+        err.is_some()
+            || other_set
+                .contains(value.obj_borrowed(py))
+                .unwrap_or_else(|e| {
+                    err = Some(e);
+                    true
+                })
+    });
+    err.map_or(Ok(inner.len() != before), Err)
 }
 
 /// Symmetric-difference `inner` with `other` in place; return whether it
@@ -1227,12 +1336,9 @@ fn set_issubset<P: TableBackend<HashedAny, ()>>(
     if let Some(peer) = same_inner {
         return Ok(inner.is_subset(peer));
     }
-    let other_set = PySet::empty(py)?;
-    for item in other.try_iter()? {
-        other_set.add(item?)?;
-    }
+    let other_set = lookup_set(other, py)?;
     // `inner` is a set, so it cannot be a subset of a smaller collection.
-    if other_set.len() < inner.len() {
+    if other_set.len()? < inner.len() {
         return Ok(false);
     }
     for value in inner {
@@ -1310,14 +1416,99 @@ macro_rules! define_set_classes {
         }
 
         impl $PySet {
+            /// Apply `op` to `other`. When `other` is this set's own object
+            /// `self_ptr`, it can't be borrowed while `self` is, so it is
+            /// handled here: difference ops (`clears_self`) clear the set, the
+            /// rest leave it unchanged. Ops on a copy pass a null `self_ptr`.
+            fn apply(
+                &mut self,
+                other: &Bound<PyAny>,
+                self_ptr: *mut ffi::PyObject,
+                clears_self: bool,
+                op: impl FnOnce(&mut Self, &Bound<PyAny>) -> PyResult<bool>,
+            ) -> PyResult<bool> {
+                if other.as_ptr() != self_ptr {
+                    return op(self, other);
+                }
+                let changed = clears_self && !self.inner.is_empty();
+                if changed {
+                    self.inner.clear();
+                }
+                Ok(changed)
+            }
+
+            /// Apply `op` in place with [`detach`]ed `other`, borrowing `slf`
+            /// mutably only while `op` runs. On an error while reading
+            /// `other`, `keeps_prefix` applies the items read before it, as
+            /// `set.update` and `set.difference_update` do; otherwise nothing
+            /// changes, as in `set.symmetric_difference_update`.
+            fn apply_in_place(
+                slf: &Bound<Self>,
+                other: &Bound<PyAny>,
+                clears_self: bool,
+                keeps_prefix: bool,
+                op: impl FnOnce(&mut Self, &Bound<PyAny>) -> PyResult<bool>,
+            ) -> PyResult<()> {
+                let (other, pending) = match detach(other, other.is_instance_of::<Self>())? {
+                    (_, Some(err)) if !keeps_prefix => return Err(err),
+                    detached => detached,
+                };
+                let me = slf.as_ptr();
+                slf.try_borrow_mut()?
+                    .mutate(|s| s.apply(&other, me, clears_self, op))?;
+                pending.map_or(Ok(()), Err)
+            }
+
+            /// `set.intersection_update` with `others`. The result is built on
+            /// a copy while `slf` stays readable, so every operand sees the
+            /// unchanged set, and an error raised while reading or comparing
+            /// changes nothing. `slf` keeps its own table and options.
+            fn intersect_in_place<'py>(
+                slf: &Bound<'py, Self>,
+                others: impl IntoIterator<Item = Bound<'py, PyAny>>,
+                py: Python<'py>,
+            ) -> PyResult<()> {
+                let mut kept = slf.try_borrow()?.copy(py);
+                let me = slf.as_ptr();
+                for other in others {
+                    kept.apply(&other, me, false, |s, o| s.retain_in(o, py))?;
+                }
+                // `kept` holds `slf`'s own objects, so identity decides
+                // membership without running `__eq__` under the borrow.
+                let kept: std::collections::HashSet<_> =
+                    kept.inner.iter().map(HashedAny::obj_ptr).collect();
+                slf.try_borrow_mut()?.mutate(|s| {
+                    s.inner.retain(|value| kept.contains(&value.obj_ptr()));
+                    Ok(false)
+                })
+            }
+
+            /// [`Self::apply_in_place`] with each of `others` in turn, keeping
+            /// the prefix on error. Each operand sees the set as left by the
+            /// ones before it, as in `set.update` and `set.difference_update`.
+            fn fold_in_place(
+                slf: &Bound<Self>,
+                others: &Bound<PyTuple>,
+                clears_self: bool,
+                mut op: impl FnMut(&mut Self, &Bound<PyAny>) -> PyResult<bool>,
+            ) -> PyResult<()> {
+                for other in others {
+                    Self::apply_in_place(slf, &other, clears_self, true, &mut op)?;
+                }
+                Ok(())
+            }
+
+            /// [`Self::apply`] over each of `others`.
             fn fold_each(
                 &mut self,
                 others: &Bound<PyTuple>,
+                self_ptr: *mut ffi::PyObject,
+                clears_self: bool,
                 mut op: impl FnMut(&mut Self, &Bound<PyAny>) -> PyResult<bool>,
             ) -> PyResult<bool> {
                 let mut touched = false;
                 for other in others.try_iter()? {
-                    touched |= op(self, &other?)?;
+                    touched |= self.apply(&other?, self_ptr, clears_self, &mut op)?;
                 }
                 Ok(touched)
             }
@@ -1394,10 +1585,10 @@ macro_rules! define_set_classes {
                 Ok(self.inner.contains(probe.as_key()))
             }
 
-            fn __iter__(slf: &Bound<Self>) -> $KeyIter {
+            fn __iter__(slf: &Bound<Self>) -> PyResult<$KeyIter> {
                 let py = slf.py();
                 let snapshot = slf
-                    .borrow()
+                    .try_borrow()?
                     .inner
                     .iter()
                     .map(|k| Some(k.obj_clone_ref(py)))
@@ -1482,51 +1673,54 @@ macro_rules! define_set_classes {
             #[pyo3(signature = (*others))]
             fn union(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.update(others)?;
+                new.fold_each(others, ptr::null_mut(), false, |s, o| s.add_all(o))?;
                 Ok(new)
             }
 
             #[pyo3(signature = (*others))]
             fn intersection(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.intersection_update(others, py)?;
+                new.fold_each(others, ptr::null_mut(), false, |s, o| s.retain_in(o, py))?;
                 Ok(new)
             }
 
             #[pyo3(signature = (*others))]
             fn difference(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.difference_update(others)?;
+                new.fold_each(others, ptr::null_mut(), true, |s, o| s.remove_all(o))?;
                 Ok(new)
             }
 
             fn symmetric_difference(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.symmetric_difference_update(other)?;
+                new.symmetric_difference_with(other)?;
                 Ok(new)
             }
 
             #[pyo3(signature = (*others))]
-            fn update(&mut self, others: &Bound<PyTuple>) -> PyResult<()> {
-                let changed = self.fold_each(others, |s, o| s.add_all(o));
-                self.bump_if_changed(changed)
+            fn update(slf: &Bound<Self>, others: &Bound<PyTuple>) -> PyResult<()> {
+                Self::fold_in_place(slf, others, false, Self::add_all)
             }
 
             #[pyo3(signature = (*others))]
-            fn intersection_update(&mut self, others: &Bound<PyTuple>, py: Python) -> PyResult<()> {
-                let changed = self.fold_each(others, |s, o| s.retain_in(o, py));
-                self.bump_if_changed(changed)
+            fn intersection_update(
+                slf: &Bound<Self>,
+                others: &Bound<PyTuple>,
+                py: Python,
+            ) -> PyResult<()> {
+                Self::intersect_in_place(slf, others, py)
             }
 
             #[pyo3(signature = (*others))]
-            fn difference_update(&mut self, others: &Bound<PyTuple>) -> PyResult<()> {
-                let changed = self.fold_each(others, |s, o| s.remove_all(o));
-                self.bump_if_changed(changed)
+            fn difference_update(slf: &Bound<Self>, others: &Bound<PyTuple>) -> PyResult<()> {
+                Self::fold_in_place(slf, others, true, Self::remove_all)
             }
 
-            fn symmetric_difference_update(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                let changed = self.symmetric_difference_with(other);
-                self.bump_if_changed(changed)
+            fn symmetric_difference_update(
+                slf: &Bound<Self>,
+                other: &Bound<PyAny>,
+            ) -> PyResult<()> {
+                Self::apply_in_place(slf, other, true, false, Self::symmetric_difference_with)
             }
 
             fn __eq__(&self, other: &Bound<PyAny>) -> PyResult<bool> {
@@ -1535,7 +1729,7 @@ macro_rules! define_set_classes {
 
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.__ior__(other)?;
+                new.add_all(other)?;
                 Ok(new)
             }
 
@@ -1546,7 +1740,7 @@ macro_rules! define_set_classes {
 
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.__iand__(other, py)?;
+                new.retain_in(other, py)?;
                 Ok(new)
             }
 
@@ -1556,7 +1750,7 @@ macro_rules! define_set_classes {
 
             fn __sub__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
                 let mut new = self.copy(py);
-                new.__isub__(other)?;
+                new.remove_all(other)?;
                 Ok(new)
             }
 
@@ -1582,23 +1776,20 @@ macro_rules! define_set_classes {
                 self.symmetric_difference(other, py)
             }
 
-            fn __ior__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                let changed = self.add_all(other);
-                self.bump_if_changed(changed)
+            fn __ior__(slf: &Bound<Self>, other: &Bound<PyAny>) -> PyResult<()> {
+                Self::apply_in_place(slf, other, false, true, Self::add_all)
             }
 
-            fn __iand__(&mut self, other: &Bound<PyAny>, py: Python) -> PyResult<()> {
-                let changed = self.retain_in(other, py);
-                self.bump_if_changed(changed)
+            fn __iand__(slf: &Bound<Self>, other: &Bound<PyAny>, py: Python) -> PyResult<()> {
+                Self::intersect_in_place(slf, [other.clone()], py)
             }
 
-            fn __isub__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                let changed = self.remove_all(other);
-                self.bump_if_changed(changed)
+            fn __isub__(slf: &Bound<Self>, other: &Bound<PyAny>) -> PyResult<()> {
+                Self::apply_in_place(slf, other, true, true, Self::remove_all)
             }
 
-            fn __ixor__(&mut self, other: &Bound<PyAny>) -> PyResult<()> {
-                self.symmetric_difference_update(other)
+            fn __ixor__(slf: &Bound<Self>, other: &Bound<PyAny>) -> PyResult<()> {
+                Self::symmetric_difference_update(slf, other)
             }
         }
 
