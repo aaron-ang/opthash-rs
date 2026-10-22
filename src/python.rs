@@ -1191,8 +1191,17 @@ fn set_retain_in<P: TableBackend<HashedAny, ()>>(
         return Ok(inner.len() != before);
     }
     let other_set = lookup_set(other, py)?;
-    inner.retain(|value| other_set.contains(value.obj_borrowed(py)).unwrap_or(false));
-    Ok(inner.len() != before)
+    let mut err = None;
+    inner.retain(|value| {
+        err.is_some()
+            || other_set
+                .contains(value.obj_borrowed(py))
+                .unwrap_or_else(|e| {
+                    err = Some(e);
+                    true
+                })
+    });
+    err.map_or(Ok(inner.len() != before), Err)
 }
 
 /// Symmetric-difference `inner` with `other` in place; return whether it

@@ -246,6 +246,20 @@ def test_failed_update_before_mutation_keeps_iterators(set_cls):
     assert next(it) in {1, 2}
 
 
+def test_intersection_update_propagates_comparison_errors(set_cls):
+    class RaisingEq:
+        def __hash__(self):
+            return 1
+
+        def __eq__(self, other):
+            raise ValueError
+
+    s = set_cls([RaisingEq()])
+    with pytest.raises(ValueError):
+        s.intersection_update({1})
+    assert len(s) == 1
+
+
 @pytest.mark.parametrize("other", [{2, 3, 4}, frozenset({2, 3, 4}), [2, 3, 4]])
 def test_intersection_and_issubset_accept_any_iterable(set_cls, other):
     s = set_cls([1, 2, 3])
