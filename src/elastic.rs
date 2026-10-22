@@ -18,7 +18,7 @@ use crate::membership::{self, MembershipKey, MembershipRegion};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::INITIAL_CAPACITY;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
-use crate::raw::iter::{OccupiedIndices, RegionCursor};
+use crate::raw::iter::OccupiedIndices;
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -1061,27 +1061,6 @@ where
         self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
             | u32::try_from(high_water).expect("Elastic query cap fits u32");
     }
-
-    /// Prime the scan and cross level boundaries off the hot path.
-    #[cold]
-    fn scan_advance(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
-        if !scan.region.started() {
-            if self.levels.is_empty() {
-                return None;
-            }
-            scan.region.enter(&self.levels[0]);
-        }
-        loop {
-            if let Some((ptr, slot_idx)) = scan.region.step::<SlotEntry<K, V>>() {
-                return Some((ptr, (scan.level_idx, slot_idx)));
-            }
-            scan.level_idx += 1;
-            if scan.level_idx >= self.levels.len() {
-                return None;
-            }
-            scan.region.enter(&self.levels[scan.level_idx]);
-        }
-    }
 }
 
 #[allow(private_interfaces)]
@@ -1240,19 +1219,20 @@ where
     fn scan(&self) -> ElasticScan {
         ElasticScan {
             level_idx: 0,
-            region: RegionCursor::new(),
+            slots: OccupiedIndices::new(),
         }
     }
 
     #[inline]
     fn scan_next(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
-        // Hot path: another occupied slot in the level the cursor already holds.
-        if scan.region.started()
-            && let Some((ptr, slot_idx)) = scan.region.step::<SlotEntry<K, V>>()
-        {
-            return Some((ptr, (scan.level_idx, slot_idx)));
+        while let Some(level) = self.levels.get(scan.level_idx) {
+            if let Some(slot_idx) = scan.slots.step(level) {
+                return Some((level.slot_ptr(slot_idx), (scan.level_idx, slot_idx)));
+            }
+            scan.level_idx += 1;
+            scan.slots = OccupiedIndices::new();
         }
-        self.scan_advance(scan)
+        None
     }
 
     #[inline]
@@ -1362,7 +1342,7 @@ where
 #[derive(Clone)]
 pub struct ElasticScan {
     level_idx: usize,
-    region: RegionCursor,
+    slots: OccupiedIndices,
 }
 
 impl<K, V, S, A> ElasticTable<K, V, S, A>
