@@ -88,9 +88,12 @@ fn sequential_hits_match_the_former_modulo_trace() {
 
 #[test]
 fn empty_pair_inputs_are_safe() {
-    assert!(shuffled_hit_keys(&[], 10).is_empty());
-    assert!(shuffled_hit_keys_with_seed(&[], 10, DEFAULT_HIT_QUERY_SEED).is_empty());
-    assert!(sequential_hit_keys(&[], 10).is_empty());
+    assert_eq!(shuffled_hit_keys(&[], 10), [0_u64; 0]);
+    assert_eq!(
+        shuffled_hit_keys_with_seed(&[], 10, DEFAULT_HIT_QUERY_SEED),
+        [0_u64; 0]
+    );
+    assert_eq!(sequential_hit_keys(&[], 10), [0_u64; 0]);
 }
 
 #[test]
