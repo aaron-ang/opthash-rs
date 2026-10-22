@@ -31,8 +31,6 @@ const UNIFORM_SEARCH_CAP: u64 = 4_096;
 const QUERY_POSITION_CAP: u128 = 1_000_000;
 const EXCEPTIONAL_PLACEMENT_FLAG: u32 = 1 << 31;
 const QUERY_PROBE_LIMIT: usize = 384;
-const MAX_CASE1_LOGICAL_PROBES: usize =
-    ELASTIC_PROBE_BUDGET_C * (u32::BITS as usize - 1) * (u32::BITS as usize - 1);
 const MAX_ELASTIC_SLOTS: usize = match 1_usize.checked_shl(u32::BITS) {
     Some(slots) => slots,
     None => usize::MAX,
@@ -42,7 +40,10 @@ const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
 const _: () = assert!(u32::BITS as u64 <= probe::ELASTIC_LEVEL_LIMIT);
 const _: () = assert!(UNIFORM_SEARCH_CAP <= probe::ELASTIC_LOGICAL_LIMIT);
-const _: () = assert!(MAX_CASE1_LOGICAL_PROBES as u64 <= probe::ELASTIC_LOGICAL_LIMIT);
+const _: () = {
+    let max_case1_logical_probes = ELASTIC_PROBE_BUDGET_C * (u32::BITS as usize - 1).pow(2);
+    assert!(max_case1_logical_probes as u64 <= probe::ELASTIC_LOGICAL_LIMIT);
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExactPlacement {

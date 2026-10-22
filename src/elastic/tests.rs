@@ -168,7 +168,6 @@ fn elastic_placement_matches_the_scalar_paper_model() {
 
 #[test]
 fn compact_query_counters_cover_every_supported_geometry() {
-    assert_eq!(MAX_CASE1_LOGICAL_PROBES, 7_688);
     assert_eq!(
         PaperConfig::new(MAX_ELASTIC_SLOTS, ReserveFraction::DEFAULT.exponent())
             .unwrap()
