@@ -1,10 +1,7 @@
-#[macro_use]
-mod harness;
-
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use harness::MAP_SIZE;
+use harness::{MAP_SIZE, bench_all_impls, bench_empty, bench_populated, bench_with_cap};
 
 fn bench_iter(c: &mut Criterion) {
     let pairs = harness::make_pairs(MAP_SIZE);

@@ -13,7 +13,7 @@ mod neon {
     use core::arch::aarch64;
 
     use super::BitMask;
-    use crate::common::control::FINGERPRINT_MASK;
+    use crate::raw::control::FINGERPRINT_MASK;
 
     /// Collapses an 8-lane compare into its `BitMask` bit pattern.
     #[inline]
@@ -57,7 +57,7 @@ mod neon {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
+        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
 
         #[test]
         fn eight_lane_masks_preserve_control_order() {
@@ -94,7 +94,7 @@ mod sse2 {
     use core::arch::x86_64::{self, __m128i};
 
     use super::BitMask;
-    use crate::common::control::FINGERPRINT_MASK;
+    use crate::raw::control::FINGERPRINT_MASK;
 
     /// Loads a 16-byte control group with only the fingerprint bits kept.
     #[inline]
@@ -210,7 +210,7 @@ mod swar {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, FINGERPRINT_MASK};
+        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE, FINGERPRINT_MASK};
 
         fn word(bytes: [u8; 8]) -> u64 {
             u64::from_le_bytes(bytes)

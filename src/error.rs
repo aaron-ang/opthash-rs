@@ -1,7 +1,7 @@
 use core::error::Error;
 use core::fmt;
 
-use crate::common::reserve::ReserveFractionError;
+use crate::reserve::ReserveFractionError;
 
 /// Error returned by fallible map and set constructors.
 #[derive(Debug, Clone, PartialEq, Eq)]

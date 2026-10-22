@@ -6,8 +6,8 @@ use allocator_api2::alloc::{Allocator, Layout};
 
 use super::config::{CACHE_LINE, GROUP_SIZE};
 use super::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
-use super::error::TryReserveError;
 use super::simd;
+use crate::error::TryReserveError;
 
 /// Owns one allocation backing a map's ctrl bytes + slot data.
 /// No `Drop` impl — derived maps orchestrate teardown by calling

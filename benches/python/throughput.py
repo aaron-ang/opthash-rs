@@ -12,7 +12,7 @@ import pytest
 
 import opthash
 
-# Mirror benches/harness/mod.rs: N is MAP_SIZE, the full insert budget of a
+# Mirror benches/harness/src/lib.rs: N is MAP_SIZE, the full insert budget of a
 # 2^15-slot table at the default 1/8 reserve; TINY_N is TINY_MAP_SIZE and
 # RESIZE_N is RESIZE_INSERT_COUNT.
 N = 2**15 - 2**15 // 8

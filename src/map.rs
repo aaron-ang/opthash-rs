@@ -9,18 +9,18 @@ use allocator_api2::alloc::{Allocator, Global};
 use equivalent::Equivalent;
 
 use crate::ReserveFraction;
+use crate::capacity;
+use crate::epoch::EpochSnapshot;
+use crate::error::{TryBuildError, TryReserveError};
 #[cfg(feature = "default-hasher")]
-use crate::common::DefaultHashBuilder;
-use crate::common::arena::{self, SlotEntry};
-use crate::common::config::INITIAL_CAPACITY;
-use crate::common::control;
-use crate::common::error::{TryBuildError, TryReserveError};
-use crate::common::iter::{
+use crate::hasher::DefaultHashBuilder;
+use crate::raw::arena::{self, SlotEntry};
+use crate::raw::config::INITIAL_CAPACITY;
+use crate::raw::control;
+use crate::raw::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     Values as CommonValues,
 };
-use crate::common::math::capacity;
-use crate::epoch::EpochSnapshot;
 
 /// The backend contract behind [`HashMap`]: storage, lookup, insert, iteration,
 /// and lifecycle, grouped into sections below.

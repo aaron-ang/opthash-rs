@@ -80,6 +80,8 @@ Run shape and options:
 - Other `[[bench]]` targets are not in `all`; run explicitly via
   `BENCH=<name>`: `set_ops`, `map_api`, `load_factor`, `payload_size`, and
   `scaled_insert` (100K/1M/10M insert sweep).
+- `memory` is a plain-`main` footprint report (TSV, deterministic counts), not
+  Criterion: `cargo bench --profile release --bench memory`.
 - Pass through Criterion flags with `--`: `SAVE=opt1 scripts/bench.sh -- --measurement-time 10`.
 - Filter by Criterion name: `SAVE=opt1 scripts/bench.sh -- "get_hit_latency"`. The script strips a leading `--`, so both forms work.
 
@@ -143,14 +145,20 @@ pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 - `src/map.rs` — generic `HashMap<K, V, P>` public shell and the single `TableBackend<K, V>` contract shared by both maps
 - `src/epoch.rs` — compact public epoch snapshot and private lifecycle state
 - `src/macros.rs` — `declare_backend_aliases!`, generating each backend's public type-alias surface
-- `src/elastic.rs` — `ElasticTable` (`TableBackend` implementation) + `ElasticHashMap` shell alias (tests inline)
-- `src/funnel.rs` — `FunnelTable` (`TableBackend` implementation) + `FunnelHashMap` shell alias (tests inline)
+- `src/elastic.rs` — `ElasticTable` (`TableBackend` implementation) + `ElasticHashMap` shell alias (tests in `src/elastic/tests.rs`)
+- `src/funnel.rs` — `FunnelTable` (`TableBackend` implementation) + `FunnelHashMap` shell alias (tests in `src/funnel/tests.rs`)
 - `src/set.rs` — `ElasticHashSet`/`FunnelHashSet` wrapping the maps; set algebra
 - `src/python.rs` — pyo3 bindings, `#[cfg(feature = "python")]`
-- `src/common/exact/` — paper geometry, probe primitives, and test-only scalar oracle
-- `src/common/` — shared arena, reserve, control-byte SIMD, layout math, config, and errors
-- `benches/harness/` — shared workload constants, deterministic fixtures,
+- `src/exact/` — paper geometry, probe primitives, and test-only scalar oracle
+- `src/raw/` — slot storage shared by both tables: arena, control bytes, SIMD group scans, slot iterators, group-size config
+- `src/membership.rs` — Bloom-style membership filter gating lookups in both backends
+- `src/capacity.rs` — capacity and tombstone-cleanup arithmetic
+- `src/reserve.rs`, `src/error.rs`, `src/hasher.rs` — public `ReserveFraction`, error types, and `DefaultHashBuilder`
+- `benches/harness/` — unpublished `opthash-bench-harness` workspace crate (dev-dep `harness`): shared workload constants, deterministic fixtures,
   map constructors, and Criterion comparison helpers
+
+Modules with children use `foo.rs` + `foo/` (no `mod.rs`; `clippy::mod_module_files` enforces it). `tests/support/mod.rs` is the exception: a `tests/support.rs` would build as its own test crate.
+Large modules keep unit tests in a sibling `<module>/tests.rs` (`mod tests;`); small ones keep them inline.
 
 Don't duplicate primitives across `src/` and `benches/`.
 

@@ -1,13 +1,25 @@
-#![allow(dead_code, unused_imports)]
+//! Workload constants, deterministic fixtures, map constructors, and
+//! Criterion comparison helpers shared by every bench target and by
+//! `tests/benchmark_fixtures.rs`.
+
+// Unpublished dev crate: API-documentation lints have no reader here.
+#![allow(
+    clippy::must_use_candidate,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
+)]
 
 mod fixtures;
-#[macro_use]
 mod map_matrix;
+pub mod memory;
 mod queries;
 
 pub use fixtures::*;
 pub use map_matrix::bench_one_lookup_group;
 pub use queries::*;
+
+#[doc(hidden)]
+pub use criterion as __criterion;
 
 use opthash::ReserveFraction;
 

@@ -7,9 +7,9 @@ use alloc::boxed::Box;
 use allocator_api2::alloc::Global;
 use equivalent::Equivalent;
 
+use crate::error::{TryBuildError, TryReserveError};
 #[cfg(feature = "default-hasher")]
-use crate::common::DefaultHashBuilder;
-use crate::common::error::{TryBuildError, TryReserveError};
+use crate::hasher::DefaultHashBuilder;
 use crate::map::{self, TableBackend};
 use crate::{EpochSnapshot, ReserveFraction};
 

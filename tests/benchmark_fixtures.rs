@@ -1,17 +1,14 @@
-#[path = "../benches/harness/mod.rs"]
-mod harness;
-#[path = "../benches/harness/memory.rs"]
-mod memory;
-
 use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashSet;
 
+use harness::memory::{
+    AllocationCounters, AllocationMeasurement, AllocationSnapshot, CountingAllocator,
+};
 use harness::{
     DEFAULT_HIT_QUERY_SEED, LATENCY_SIZES, MAP_SIZE, MAP_SLOTS, MapQuad, exact_size_label,
     parse_positive_sizes, scaled_insert_sample_size, sequential_hit_keys, shuffled_hit_keys,
     shuffled_hit_keys_with_seed,
 };
-use memory::{AllocationCounters, AllocationMeasurement, AllocationSnapshot, CountingAllocator};
 
 fn pairs(count: usize) -> Vec<(u64, u64)> {
     (0..count)

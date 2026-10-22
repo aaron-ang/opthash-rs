@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 /// Fixed seed for reproducible randomized hit traces.
 pub const DEFAULT_HIT_QUERY_SEED: u64 = 0xD1B5_4A32_D192_ED03;
 

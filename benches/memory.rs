@@ -5,23 +5,16 @@
 //! instead of the fat-LTO bench profile:
 //!
 //! ```bash
-//! cargo run --release --example memory
-//! MEMORY_SIZES=1000,10000 cargo run --release --example memory
+//! cargo bench --profile release --bench memory
+//! MEMORY_SIZES=1000,10000 cargo bench --profile release --bench memory
 //! ```
-
-#[path = "../benches/harness/fixtures.rs"]
-mod fixtures;
-#[path = "../benches/harness/memory.rs"]
-mod memory;
-#[path = "../benches/harness/queries.rs"]
-mod queries;
 
 use std::env;
 use std::hash::Hash;
 use std::hint::black_box;
 
-use fixtures::{ElasticHashMap, FunnelHashMap, HashbrownMap, StdHashMap};
-use memory::{AllocationCounters, AllocationMeasurement, CountingAllocator};
+use harness::memory::{AllocationCounters, AllocationMeasurement, CountingAllocator};
+use harness::{ElasticHashMap, FunnelHashMap, HashbrownMap, StdHashMap};
 
 /// Straddles hashbrown's 7/8 · 2^20 = 917,504 capacity step so the
 /// power-of-two sawtooth shows: 900K sits just under it, 1M just over, and
@@ -109,7 +102,7 @@ struct Report {
 
 fn configured_sizes() -> Vec<usize> {
     match env::var("MEMORY_SIZES") {
-        Ok(raw) => queries::parse_positive_sizes("MEMORY_SIZES", &raw)
+        Ok(raw) => harness::parse_positive_sizes("MEMORY_SIZES", &raw)
             .unwrap_or_else(|error| panic!("{error}")),
         Err(env::VarError::NotPresent) => DEFAULT_SIZES.to_vec(),
         Err(env::VarError::NotUnicode(_)) => panic!("MEMORY_SIZES must contain valid Unicode"),
@@ -193,7 +186,7 @@ fn main() {
          allocation_calls\tallocated_bytes\tallocated_bytes_per_entry"
     );
     for size in configured_sizes() {
-        family("u64", &fixtures::make_pairs(size));
-        family("big32", &fixtures::make_big_pairs(size));
+        family("u64", &harness::make_pairs(size));
+        family("big32", &harness::make_big_pairs(size));
     }
 }

@@ -12,7 +12,7 @@ use core::ptr;
 
 use allocator_api2::alloc::Layout;
 
-use crate::common::error::TryReserveError;
+use crate::error::TryReserveError;
 
 /// Logical slots covered by one filter word. Ten keeps the tail under a byte per
 /// slot while leaving words sparse enough for two bits per key to stay selective.

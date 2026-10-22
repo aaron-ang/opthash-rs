@@ -1,0 +1,15 @@
+[package]
+name = "opthash-bench-harness"
+description = "Shared workload fixtures for the opthash benchmarks and fixture tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+criterion = { version = "4", package = "codspeed-criterion-compat", default-features = false, features = ["cargo_bench_support", "rayon"] }
+foldhash = "0.2"
+hashbrown = "0.17"
+opthash = { path = "../.." }
+
+[lints]
+workspace = true

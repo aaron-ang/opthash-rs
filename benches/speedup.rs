@@ -1,12 +1,10 @@
-#[macro_use]
-mod harness;
-
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
 use harness::{
     MAP_SIZE, MISS_KEY_OFFSET, OP_COUNT, RESIZE_INSERT_COUNT, TINY_MAP_SIZE, TINY_OP_COUNT,
+    bench_empty, bench_insert_reuse, bench_populated,
 };
 
 /// Steady-state insert into a reused map (cap = `2 * OP_COUNT`).

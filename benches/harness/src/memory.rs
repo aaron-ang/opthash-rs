@@ -32,6 +32,7 @@ pub struct AllocationMeasurement {
     pub allocated_bytes: usize,
 }
 
+#[derive(Default)]
 pub struct AllocationCounters {
     live_bytes: AtomicUsize,
     peak_live_bytes: AtomicUsize,

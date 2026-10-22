@@ -6,8 +6,6 @@
 //!
 //! The pinned run stores named Criterion estimates under `target/criterion/`.
 
-mod harness;
-
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
