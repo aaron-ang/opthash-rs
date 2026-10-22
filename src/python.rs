@@ -539,7 +539,7 @@ macro_rules! dispatch_same_type {
     ($f:ident, $recv:expr, $other:expr $(, $arg:expr)*) => {
         match $other.cast::<Self>() {
             Ok(o) => {
-                let peer = o.borrow();
+                let peer = o.try_borrow()?;
                 $f($recv, $other $(, $arg)*, Some(&peer.inner))
             }
             Err(_) => $f($recv, $other $(, $arg)*, None),
@@ -655,7 +655,8 @@ macro_rules! define_map_classes {
             ) -> PyResult<()> {
                 let peer = other
                     .and_then(|o| o.cast::<Self>().ok())
-                    .map(|o| o.borrow());
+                    .map(Bound::try_borrow)
+                    .transpose()?;
                 let same_inner = peer.as_ref().map(|p| &p.inner);
                 self.mutate(|s| map_update(&mut s.inner, other, kwargs, py, same_inner))
             }
@@ -798,10 +799,10 @@ macro_rules! define_map_classes {
                 )
             }
 
-            fn __iter__(slf: &Bound<Self>) -> $KeyIter {
+            fn __iter__(slf: &Bound<Self>) -> PyResult<$KeyIter> {
                 let py = slf.py();
                 let snapshot = slf
-                    .borrow()
+                    .try_borrow()?
                     .inner
                     .iter()
                     .map(|(k, _)| Some(k.obj_clone_ref(py)))
@@ -898,8 +899,8 @@ macro_rules! define_map_classes {
                 }
             }
 
-            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> bool {
-                dispatch_same_type!(map_eq, &self.inner, other, py)
+            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                Ok(dispatch_same_type!(map_eq, &self.inner, other, py))
             }
 
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
@@ -928,26 +929,26 @@ macro_rules! define_map_classes {
 
         #[pymethods]
         impl $KeysView {
-            fn __iter__(&self, py: Python) -> $KeyIter {
+            fn __iter__(&self, py: Python) -> PyResult<$KeyIter> {
                 let owner = self.map.bind(py);
                 let snapshot = owner
-                    .borrow()
+                    .try_borrow()?
                     .inner
                     .iter()
                     .map(|(k, _)| Some(k.obj_clone_ref(py)))
                     .collect();
                 $KeyIter::new(owner, snapshot)
             }
-            fn __len__(&self, py: Python) -> usize {
-                self.map.borrow(py).inner.len()
+            fn __len__(&self, py: Python) -> PyResult<usize> {
+                Ok(self.map.try_borrow(py)?.inner.len())
             }
             fn __contains__(&self, key: &Bound<PyAny>, py: Python) -> PyResult<bool> {
-                let m = self.map.borrow(py);
+                let m = self.map.try_borrow(py)?;
                 let probe = ProbeKey::from_bound(key)?;
                 Ok(m.inner.contains_key(probe.as_key()))
             }
             fn __repr__(&self, py: Python) -> PyResult<String> {
-                let m = self.map.borrow(py);
+                let m = self.map.try_borrow(py)?;
                 let parts: PyResult<Vec<String>> = m
                     .inner
                     .iter()
@@ -958,34 +959,34 @@ macro_rules! define_map_classes {
                     parts?.join(", ")
                 ))
             }
-            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> bool {
-                let m = self.map.borrow(py);
+            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                let m = self.map.try_borrow(py)?;
                 let Ok(other_len) = other.len() else {
-                    return false;
+                    return Ok(false);
                 };
                 if other_len != m.inner.len() {
-                    return false;
+                    return Ok(false);
                 }
                 for (k, _) in &m.inner {
                     if !other.contains(k.obj_borrowed(py)).unwrap_or(false) {
-                        return false;
+                        return Ok(false);
                     }
                 }
-                true
+                Ok(true)
             }
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_select(&self.map.borrow(py).inner, other, py, true, key_elem)
+                view_select(&self.map.try_borrow(py)?.inner, other, py, true, key_elem)
                     .map(Bound::unbind)
             }
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_union(&self.map.borrow(py).inner, other, py, key_elem).map(Bound::unbind)
+                view_union(&self.map.try_borrow(py)?.inner, other, py, key_elem).map(Bound::unbind)
             }
             fn __sub__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_select(&self.map.borrow(py).inner, other, py, false, key_elem)
+                view_select(&self.map.try_borrow(py)?.inner, other, py, false, key_elem)
                     .map(Bound::unbind)
             }
             fn __xor__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                keys_view_symmetric_difference(&self.map.borrow(py).inner, other, py)
+                keys_view_symmetric_difference(&self.map.try_borrow(py)?.inner, other, py)
                     .map(Bound::unbind)
             }
         }
@@ -998,30 +999,30 @@ macro_rules! define_map_classes {
 
         #[pymethods]
         impl $ValuesView {
-            fn __iter__(&self, py: Python) -> $ValueIter {
+            fn __iter__(&self, py: Python) -> PyResult<$ValueIter> {
                 let owner = self.map.bind(py);
                 let snapshot = owner
-                    .borrow()
+                    .try_borrow()?
                     .inner
                     .iter()
                     .map(|(_, v)| Some(v.clone_ref(py)))
                     .collect();
                 $ValueIter::new(owner, snapshot)
             }
-            fn __len__(&self, py: Python) -> usize {
-                self.map.borrow(py).inner.len()
+            fn __len__(&self, py: Python) -> PyResult<usize> {
+                Ok(self.map.try_borrow(py)?.inner.len())
             }
-            fn __contains__(&self, value: &Bound<PyAny>, py: Python) -> bool {
-                let m = self.map.borrow(py);
+            fn __contains__(&self, value: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                let m = self.map.try_borrow(py)?;
                 for (_, v) in &m.inner {
                     if v.bind(py).eq(value).unwrap_or(false) {
-                        return true;
+                        return Ok(true);
                     }
                 }
-                false
+                Ok(false)
             }
             fn __repr__(&self, py: Python) -> PyResult<String> {
-                let m = self.map.borrow(py);
+                let m = self.map.try_borrow(py)?;
                 let parts: PyResult<Vec<String>> = m
                     .inner
                     .iter()
@@ -1046,7 +1047,7 @@ macro_rules! define_map_classes {
             fn __iter__(&self, py: Python) -> PyResult<$ItemIter> {
                 let owner = self.map.bind(py);
                 let snapshot: PyResult<Vec<Option<Py<PyAny>>>> = owner
-                    .borrow()
+                    .try_borrow()?
                     .inner
                     .iter()
                     .map(|(k, v)| {
@@ -1054,10 +1055,10 @@ macro_rules! define_map_classes {
                         Ok(Some(tup.into_any().unbind()))
                     })
                     .collect();
-                Ok($ItemIter::new(owner, snapshot?))
+                $ItemIter::new(owner, snapshot?)
             }
-            fn __len__(&self, py: Python) -> usize {
-                self.map.borrow(py).inner.len()
+            fn __len__(&self, py: Python) -> PyResult<usize> {
+                Ok(self.map.try_borrow(py)?.inner.len())
             }
             fn __contains__(&self, item: &Bound<PyAny>, py: Python) -> PyResult<bool> {
                 let Ok(tup) = item.cast::<PyTuple>() else {
@@ -1068,7 +1069,7 @@ macro_rules! define_map_classes {
                 }
                 let k = tup.get_item(0)?;
                 let v = tup.get_item(1)?;
-                let m = self.map.borrow(py);
+                let m = self.map.try_borrow(py)?;
                 let probe = ProbeKey::from_bound(&k)?;
                 match m.inner.get(probe.as_key()) {
                     Some(stored_v) => Ok(stored_v.bind(py).eq(&v).unwrap_or(false)),
@@ -1076,7 +1077,7 @@ macro_rules! define_map_classes {
                 }
             }
             fn __repr__(&self, py: Python) -> PyResult<String> {
-                let m = self.map.borrow(py);
+                let m = self.map.try_borrow(py)?;
                 let parts: PyResult<Vec<String>> = m
                     .inner
                     .iter()
@@ -1091,33 +1092,33 @@ macro_rules! define_map_classes {
                     parts?.join(", ")
                 ))
             }
-            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> bool {
-                let m = self.map.borrow(py);
+            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
+                let m = self.map.try_borrow(py)?;
                 let Ok(other_len) = other.len() else {
-                    return false;
+                    return Ok(false);
                 };
                 if other_len != m.inner.len() {
-                    return false;
+                    return Ok(false);
                 }
                 for (k, v) in &m.inner {
                     let Ok(tup) = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)]) else {
-                        return false;
+                        return Ok(false);
                     };
                     if !other.contains(&tup).unwrap_or(false) {
-                        return false;
+                        return Ok(false);
                     }
                 }
-                true
+                Ok(true)
             }
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_select(&self.map.borrow(py).inner, other, py, true, item_elem)
+                view_select(&self.map.try_borrow(py)?.inner, other, py, true, item_elem)
                     .map(Bound::unbind)
             }
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_union(&self.map.borrow(py).inner, other, py, item_elem).map(Bound::unbind)
+                view_union(&self.map.try_borrow(py)?.inner, other, py, item_elem).map(Bound::unbind)
             }
             fn __sub__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
-                view_select(&self.map.borrow(py).inner, other, py, false, item_elem)
+                view_select(&self.map.try_borrow(py)?.inner, other, py, false, item_elem)
                     .map(Bound::unbind)
             }
         }
@@ -1143,13 +1144,13 @@ macro_rules! define_iter {
 
         impl $Iter {
             /// Pin `snapshot` to `owner`'s current generation.
-            fn new(owner: &Bound<$PyMap>, snapshot: Vec<Option<Py<PyAny>>>) -> Self {
-                Self {
+            fn new(owner: &Bound<$PyMap>, snapshot: Vec<Option<Py<PyAny>>>) -> PyResult<Self> {
+                Ok(Self {
                     map: owner.clone().unbind(),
                     snapshot,
-                    expected_gen: owner.borrow().generation,
+                    expected_gen: owner.try_borrow()?.generation,
                     pos: 0,
-                }
+                })
             }
         }
 
@@ -1159,7 +1160,7 @@ macro_rules! define_iter {
                 slf
             }
             fn __next__(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-                if self.map.borrow(py).generation != self.expected_gen {
+                if self.map.try_borrow(py)?.generation != self.expected_gen {
                     return Err(PyRuntimeError::new_err(
                         "dictionary changed size during iteration",
                     ));
@@ -1584,10 +1585,10 @@ macro_rules! define_set_classes {
                 Ok(self.inner.contains(probe.as_key()))
             }
 
-            fn __iter__(slf: &Bound<Self>) -> $KeyIter {
+            fn __iter__(slf: &Bound<Self>) -> PyResult<$KeyIter> {
                 let py = slf.py();
                 let snapshot = slf
-                    .borrow()
+                    .try_borrow()?
                     .inner
                     .iter()
                     .map(|k| Some(k.obj_clone_ref(py)))

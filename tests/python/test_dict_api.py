@@ -151,6 +151,22 @@ def test_update_with_operand_reading_self(m):
     assert dict(m.items()) == dict.fromkeys(expected, 0)
 
 
+def test_key_reading_the_map_during_insert_raises(m):
+    class Reentrant:
+        def __hash__(self):
+            list(m.keys())
+            return 7
+
+    _populate(m, 2)
+    expected = dict(m.items())
+    assert m.get(Reentrant()) is None
+    with pytest.raises(RuntimeError, match="borrowed"):
+        m[Reentrant()] = 1
+    with pytest.raises(RuntimeError, match="borrowed"):
+        m.update([(Reentrant(), 1)])
+    assert dict(m.items()) == expected
+
+
 def test_failed_update_after_mutation_invalidates_iterators(m):
     def partial():
         yield ("new", 99)
