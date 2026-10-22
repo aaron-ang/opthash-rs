@@ -791,9 +791,12 @@ fn membership_filter_never_forgets_live_or_deleted_hashes() {
 
 #[test]
 fn blocked_membership_never_forgets_inserted_hashes() {
-    let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
-        ElasticHashMap::with_capacity_and_hasher(2_048, IdentityBuildHasher);
     let key_count = if cfg!(miri) { 128_u64 } else { 1_024_u64 };
+    let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+        ElasticHashMap::with_capacity_and_hasher(
+            usize::try_from(key_count * 2).unwrap(),
+            IdentityBuildHasher,
+        );
     for key in 0..key_count {
         map.insert(key, key);
     }

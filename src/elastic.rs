@@ -455,7 +455,7 @@ const PROBE_SCHEDULE_CAPACITY: [usize; MAX_LEVELS + 1] = {
 };
 
 /// Routes [`for_each_phi_route`] visits for `level` from its first probe up to
-/// `QUERY_POSITION_CAP`, evaluable in a `const` context.
+/// `QUERY_POSITION_CAP`, within `UNIFORM_SEARCH_CAP` probes.
 const fn level_route_count(level: usize) -> usize {
     let paper_level = level as u128 + 1;
     let mut paper_probe = if level == 0 { 2 } else { 1 };
