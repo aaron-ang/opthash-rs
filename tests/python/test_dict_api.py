@@ -141,6 +141,16 @@ def test_items_view_iter_during_mutation_raises(m):
         next(it)
 
 
+def test_update_with_operand_reading_self(m):
+    _populate(m, 3)
+    expected = dict(m.items())
+    m.update(m.items())
+    m |= iter(m.items())
+    assert dict(m.items()) == expected
+    m.update((k, 0) for k in m)
+    assert dict(m.items()) == dict.fromkeys(expected, 0)
+
+
 def test_failed_update_after_mutation_invalidates_iterators(m):
     def partial():
         yield ("new", 99)
@@ -153,6 +163,67 @@ def test_failed_update_after_mutation_invalidates_iterators(m):
     assert m["new"] == 99
     with pytest.raises(RuntimeError, match="changed size"):
         next(it)
+
+
+def test_failed_update_keeps_prefix_and_skips_kwargs(m):
+    def partial():
+        yield ("a", 1)
+        raise ValueError
+
+    with pytest.raises(ValueError):
+        m.update(partial(), kw=2)
+    assert dict(m.items()) == {"a": 1}
+
+
+def test_update_from_mapping_reading_self(m):
+    class View:
+        def __init__(self, target):
+            self.target = target
+
+        def keys(self):
+            return iter(self.target)
+
+        def __getitem__(self, key):
+            if key == "stop":
+                raise KeyError(key)
+            return self.target[key] * 10
+
+    _populate(m, 2)
+    expected = {k: v * 10 for k, v in m.items()}
+    m.update(View(m))
+    assert dict(m.items()) == expected
+    m["stop"] = 0
+    with pytest.raises(KeyError):
+        m.update(View(m))
+
+
+def test_update_from_mapping_with_failing_keys_changes_nothing(m):
+    class Broken:
+        def keys(self):
+            yield "a"
+            raise ValueError
+
+        def __getitem__(self, key):
+            return 1
+
+    with pytest.raises(ValueError):
+        m.update(Broken())
+    assert len(m) == 0
+
+
+def test_update_from_mapping_with_failing_getitem_keeps_prefix(m):
+    class Partial:
+        def keys(self):
+            return ["a", "b"]
+
+        def __getitem__(self, key):
+            if key == "b":
+                raise KeyError(key)
+            return 1
+
+    with pytest.raises(KeyError):
+        m.update(Partial(), c=3)
+    assert dict(m.items()) == {"a": 1}
 
 
 def test_failed_update_before_mutation_keeps_iterators(m):

@@ -201,6 +201,50 @@ def test_in_place_ops_with_self(set_cls, op, expected):
     assert set(s - s) == set(s ^ s) == set()
 
 
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [
+        (lambda s: s.update(iter(s)), {1, 2, 3}),
+        (lambda s: s.__ior__(iter(s)), {1, 2, 3}),
+        (lambda s: s.intersection_update(x for x in s if x > 1), {2, 3}),
+        (lambda s: s.__iand__(x for x in s if x > 1), {2, 3}),
+        (lambda s: s.difference_update(iter(s)), set()),
+        (lambda s: s.__isub__(x for x in s if x > 1), {1}),
+        (lambda s: s.symmetric_difference_update(x for x in s if x > 1), {1}),
+        (lambda s: s.__ixor__(iter(s)), set()),
+    ],
+)
+def test_in_place_ops_with_operand_reading_self(set_cls, op, expected):
+    s = set_cls([1, 2, 3])
+    op(s)
+    assert set(s) == expected
+
+
+def test_intersection_update_reads_every_operand_against_the_original(set_cls):
+    s = set_cls([1, 2, 3])
+    s.intersection_update({1, 2}, (x - 1 for x in s))
+    assert set(s) == {1, 2}
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        lambda s, bad: s.intersection_update(bad),
+        lambda s, bad: s.intersection_update({1}, bad),
+        lambda s, bad: s.symmetric_difference_update(bad),
+    ],
+)
+def test_failed_operand_read_changes_nothing(set_cls, op):
+    def partial():
+        yield 1
+        raise ValueError
+
+    s = set_cls([1, 2])
+    with pytest.raises(ValueError):
+        op(s, partial())
+    assert set(s) == {1, 2}
+
+
 def test_in_place_ops_with_self_bump_only_on_change(set_cls):
     s = set_cls([1, 2])
     it = iter(s)
@@ -246,7 +290,10 @@ def test_failed_update_before_mutation_keeps_iterators(set_cls):
     assert next(it) in {1, 2}
 
 
-def test_intersection_update_propagates_comparison_errors(set_cls):
+@pytest.mark.parametrize(
+    "op", [lambda s: s.intersection_update({1}), lambda s: s.__iand__({1})]
+)
+def test_intersection_update_comparison_error_changes_nothing(set_cls, op):
     class RaisingEq:
         def __hash__(self):
             return 1
@@ -254,10 +301,32 @@ def test_intersection_update_propagates_comparison_errors(set_cls):
         def __eq__(self, other):
             raise ValueError
 
-    s = set_cls([RaisingEq()])
+    bad = RaisingEq()
+    s = set_cls([*range(2, 20), bad])
     with pytest.raises(ValueError):
-        s.intersection_update({1})
-    assert len(s) == 1
+        op(s)
+    assert set(s) == {*range(2, 20), bad}
+
+
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [
+        (lambda s, bad: s.update(bad), {1, 2, 9}),
+        (lambda s, bad: s.__ior__(bad), {1, 2, 9}),
+        (lambda s, bad: s.difference_update(bad), {2}),
+        (lambda s, bad: s.__isub__(bad), {2}),
+    ],
+)
+def test_failed_operand_read_keeps_prefix(set_cls, op, expected):
+    def partial():
+        yield 9
+        yield 1
+        raise ValueError
+
+    s = set_cls([1, 2])
+    with pytest.raises(ValueError):
+        op(s, partial())
+    assert set(s) == expected
 
 
 @pytest.mark.parametrize("other", [{2, 3, 4}, frozenset({2, 3, 4}), [2, 3, 4]])
@@ -267,3 +336,14 @@ def test_intersection_and_issubset_accept_any_iterable(set_cls, other):
     s.intersection_update(other)
     assert set(s) == {2, 3}
     assert s.issubset(other)
+
+
+def test_intersection_update_invalidates_iterators_only_on_change(set_cls):
+    s = set_cls([1, 2, 3])
+    it = iter(s)
+    s.intersection_update([1, 2, 3, 4])
+    s &= (x for x in [1, 2, 3])
+    assert next(it) in {1, 2, 3}
+    s &= [1]
+    with pytest.raises(RuntimeError):
+        next(it)
