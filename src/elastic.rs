@@ -1291,10 +1291,7 @@ where
     }
 
     #[inline]
-    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
-    where
-        S: Clone,
-    {
+    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError> {
         self.try_resize(new_capacity)
     }
 
@@ -1435,31 +1432,48 @@ where
     fn resize_with_transition(&mut self, new_capacity: usize, transition: EpochTransition) {
         let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction)
             .expect("capacity overflow");
+        if self.try_resize_to(&geometry, transition).is_err() {
+            handle_elastic_alloc_error::<K, V>(&geometry.level_capacities);
+        }
+    }
+
+    /// Moves every entry into fresh levels for `geometry`. Allocates before
+    /// touching the entries, so `Err` leaves the table intact.
+    fn try_resize_to(
+        &mut self,
+        geometry: &ElasticGeometry,
+        transition: EpochTransition,
+    ) -> Result<(), TryReserveError> {
         let required_schedule_capacity = PROBE_SCHEDULE_CAPACITY[geometry.level_capacities.len()];
         if self.probe_schedule.capacity() < required_schedule_capacity {
             self.probe_schedule
-                .reserve_exact(required_schedule_capacity - self.probe_schedule.len());
+                .try_reserve_exact(required_schedule_capacity - self.probe_schedule.len())
+                .map_err(|_| TryReserveError::AllocError)?;
         }
 
+        // Run user code (`A::clone`) before the swap: between the swap and
+        // the guard, a panic would leak the old arena.
+        let guard_alloc = self.alloc.clone();
+        let scheduler = BatchScheduler::new(&geometry.batch_plan);
         let (new_arena, new_levels, new_membership) =
-            alloc_elastic_arena(&geometry.level_capacities, &self.alloc);
+            try_alloc_elastic_arena(&geometry.level_capacities, &self.alloc)?;
 
-        // Swap in fresh arena; keep old one alive until drain completes.
-        let old_arena = mem::replace(&mut self.arena, new_arena);
-        let old_levels = mem::replace(&mut self.levels, new_levels);
+        // Panic safety: each source ctrl is cleared before the moved entry
+        // reaches `insert_unique`, so on unwind the guard drops only un-moved
+        // slots and frees the old arena; see `ArenaDropGuard`.
+        let mut guard = arena::ArenaDropGuard::new(
+            mem::replace(&mut self.arena, new_arena),
+            mem::replace(&mut self.levels, new_levels),
+            guard_alloc,
+        );
         self.total_slots = geometry.total_slots;
         self.membership = new_membership;
         self.stale_membership = 0;
         self.max_insertions = geometry.max_insertions;
-        self.scheduler = BatchScheduler::new(&geometry.batch_plan);
+        self.scheduler = scheduler;
         self.len = 0;
         self.probe_high_water = 0;
         self.probe_schedule.clear();
-
-        // Panic safety: each source ctrl is cleared before the moved entry
-        // reaches `insert_unique`, so on unwind the guard drops only un-moved
-        // slots and frees `old_arena`; see `ArenaDropGuard`.
-        let mut guard = arena::ArenaDropGuard::new(old_arena, old_levels, self.alloc.clone());
         let mut used_exceptional_placement = false;
         for level in guard.regions_mut().iter_mut() {
             level.drain_values_and_clear(|entry| {
@@ -1472,46 +1486,19 @@ where
             transition,
             transition == EpochTransition::PlacementRecovery || used_exceptional_placement,
         );
-    }
-
-    /// Fallible counterpart to [`Self::resize`]. Allocates the new backing
-    /// storage before touching `self`, so `Err` leaves the map intact.
-    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
-    where
-        S: Clone,
-    {
-        let prior_epoch = self.epoch;
-        let hash_builder = self.hash_builder.clone();
-        let mut new_map = Self::try_with_slots_and_reserve_fraction_and_hasher_in(
-            new_capacity,
-            self.reserve_fraction,
-            hash_builder,
-            self.alloc.clone(),
-        )?;
-
-        // Clear each source ctrl before handing the moved entry to
-        // `insert_unique`. If that panics (e.g. via a user-provided `Hash`
-        // impl), the un-iterated slots remain OCCUPIED on `self` and the
-        // already-moved ones are EMPTY, so both `self.drop_values` and
-        // `new_map.drop_values` are sound on unwind.
-        let mut used_exceptional_placement = false;
-        for level in &mut self.levels {
-            level.drain_reset(|entry| {
-                self.len -= 1;
-                used_exceptional_placement |= new_map.insert_unique(entry.key, entry.value);
-            });
-        }
-        debug_assert_eq!(self.len, 0);
-        *self = new_map;
-        self.epoch = prior_epoch;
-        self.epoch
-            .start_epoch(EpochTransition::ExplicitResize, used_exceptional_placement);
         Ok(())
     }
 
-    /// Internal fallible ctor for `try_resize`. `slots` is raw slot count
-    /// (already inflated by the caller); public ctors take an insertion
-    /// budget and inflate via `capacity_for` — this one skips that.
+    /// Fallible counterpart to [`Self::resize`]; `Err` leaves the map intact.
+    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError> {
+        let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        self.try_resize_to(&geometry, EpochTransition::ExplicitResize)
+    }
+
+    /// Test constructor taking a raw slot count; public constructors take an
+    /// insertion budget and inflate it via `capacity_for`.
+    #[cfg(test)]
     fn try_with_slots_and_reserve_fraction_and_hasher_in(
         slots: usize,
         reserve_fraction: ReserveFraction,

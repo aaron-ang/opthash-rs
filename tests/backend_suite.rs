@@ -262,6 +262,28 @@ macro_rules! backend_suite {
             }
 
             #[test]
+            fn try_reserve_accepts_non_clone_hasher() {
+                /// Fixed-seed hasher that deliberately does not implement `Clone`.
+                struct NonClone(crate::support::FixedHashBuilder);
+
+                impl std::hash::BuildHasher for NonClone {
+                    type Hasher =
+                        <crate::support::FixedHashBuilder as std::hash::BuildHasher>::Hasher;
+
+                    fn build_hasher(&self) -> Self::Hasher {
+                        self.0.build_hasher()
+                    }
+                }
+
+                let mut map =
+                    opthash::$TestMap::with_hasher(NonClone(crate::support::fixed_hasher()));
+                map.insert(1, 10);
+                map.try_reserve(1024).expect("alloc should succeed");
+                assert!(map.capacity() >= 1025);
+                assert_eq!(map.get(&1), Some(&10));
+            }
+
+            #[test]
             fn try_reserve_grows_when_needed() {
                 let mut map: HashMap<i32, i32> = HashMap::new();
                 assert_eq!(map.capacity(), 0);

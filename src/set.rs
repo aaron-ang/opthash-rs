@@ -366,10 +366,7 @@ where
     /// # Errors
     ///
     /// Returns [`TryReserveError`] on capacity overflow or allocator failure.
-    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>
-    where
-        P::Hasher: Clone,
-    {
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
         self.map.try_reserve(additional)
     }
 
