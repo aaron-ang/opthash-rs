@@ -1,6 +1,3 @@
-#[path = "../benches/harness/mod.rs"]
-mod harness;
-
 use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashSet;
 

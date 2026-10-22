@@ -1,5 +1,3 @@
-mod harness;
-
 use std::collections::HashSet as StdHashSet;
 use std::hint::black_box;
 

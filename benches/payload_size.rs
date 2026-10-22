@@ -1,10 +1,7 @@
-#[macro_use]
-mod harness;
-
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use harness::{MAP_SIZE, OP_COUNT};
+use harness::{MAP_SIZE, OP_COUNT, bench_insert_reuse, bench_populated_big};
 
 /// [`bench_insert`] equivalent with `BigVal` payload (32B).
 fn bench_insert_big(c: &mut Criterion) {

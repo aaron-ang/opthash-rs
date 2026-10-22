@@ -54,12 +54,19 @@ pyo3 = { version = "0.29", features = [
 
 [dev-dependencies]
 criterion = { version = "4", package = "codspeed-criterion-compat", default-features = false, features = ["cargo_bench_support", "rayon"] }
+harness = { package = "opthash-bench-harness", path = "benches/harness" }
 hashbrown = "0.17"
 
-[lints.rust]
+[workspace]
+members = ["benches/harness"]
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(codspeed)'] }
 
-[lints.clippy]
+[workspace.lints.clippy]
 borrow_as_ptr = "warn"
 ptr_as_ptr = "warn"
 ptr_cast_constness = "warn"

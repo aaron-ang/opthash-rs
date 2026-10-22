@@ -9,8 +9,6 @@
 //! MEMORY_SIZES=1000,10000 cargo bench --profile release --bench memory
 //! ```
 
-mod harness;
-
 use std::env;
 use std::hash::Hash;
 use std::hint::black_box;

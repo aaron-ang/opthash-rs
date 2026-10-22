@@ -1,8 +1,6 @@
-#![allow(dead_code, unused_macros)]
-
 use criterion::{Criterion, Throughput};
 
-use super::MapQuad;
+use crate::MapQuad;
 
 /// Bulk-lookup group: one Criterion sample walks every key in `query_keys`.
 /// Bench id `<group_name>_<impl>` (see benches/README.md).
@@ -36,6 +34,7 @@ pub fn bench_one_lookup_group(
 }
 
 /// Emits per-impl `bench_function` blocks for a given op.
+#[macro_export]
 macro_rules! bench_all_impls {
     ($group:expr, $op:literal, $batch:expr, $std_setup:expr, $hb_setup:expr, $el_setup:expr, $fn_setup:expr, $body:expr $(,)?) => {{
         let group = &mut $group;
@@ -55,64 +54,68 @@ macro_rules! bench_all_impls {
 }
 
 /// [`bench_all_impls!`] with `build_*_map($pairs)` for each impl.
+#[macro_export]
 macro_rules! bench_populated {
     ($group:expr, $op:literal, $batch:expr, $pairs:expr, $body:expr $(,)?) => {
-        bench_all_impls!(
+        $crate::bench_all_impls!(
             $group,
             $op,
             $batch,
-            || $crate::harness::build_std_map($pairs),
-            || $crate::harness::build_hashbrown_map($pairs),
-            || $crate::harness::build_elastic_map($pairs),
-            || $crate::harness::build_funnel_map($pairs),
+            || $crate::build_std_map($pairs),
+            || $crate::build_hashbrown_map($pairs),
+            || $crate::build_elastic_map($pairs),
+            || $crate::build_funnel_map($pairs),
             $body,
         )
     };
 }
 
 /// Like [`bench_populated`] but using the `(u64, BigVal)` builders.
+#[macro_export]
 macro_rules! bench_populated_big {
     ($group:expr, $op:literal, $batch:expr, $pairs:expr, $body:expr $(,)?) => {
-        bench_all_impls!(
+        $crate::bench_all_impls!(
             $group,
             $op,
             $batch,
-            || $crate::harness::build_std_big_map($pairs),
-            || $crate::harness::build_hashbrown_big_map($pairs),
-            || $crate::harness::build_elastic_big_map($pairs),
-            || $crate::harness::build_funnel_big_map($pairs),
+            || $crate::build_std_big_map($pairs),
+            || $crate::build_hashbrown_big_map($pairs),
+            || $crate::build_elastic_big_map($pairs),
+            || $crate::build_funnel_big_map($pairs),
             $body,
         )
     };
 }
 
 /// [`bench_all_impls!`] with empty-map constructors. For growth / extend.
+#[macro_export]
 macro_rules! bench_empty {
     ($group:expr, $op:literal, $batch:expr, $body:expr $(,)?) => {
-        bench_all_impls!(
+        $crate::bench_all_impls!(
             $group,
             $op,
             $batch,
-            || $crate::harness::std_map_cap(0),
-            || $crate::harness::hashbrown_map_cap(0),
-            || $crate::harness::elastic_map_cap(0),
-            || $crate::harness::funnel_map_cap(0),
+            || $crate::std_map_cap(0),
+            || $crate::hashbrown_map_cap(0),
+            || $crate::elastic_map_cap(0),
+            || $crate::funnel_map_cap(0),
             $body,
         )
     };
 }
 
 /// [`bench_all_impls!`] with `with_capacity($cap)` constructors.
+#[macro_export]
 macro_rules! bench_with_cap {
     ($group:expr, $op:literal, $batch:expr, $cap:expr, $body:expr $(,)?) => {
-        bench_all_impls!(
+        $crate::bench_all_impls!(
             $group,
             $op,
             $batch,
-            || $crate::harness::std_map_cap($cap),
-            || $crate::harness::hashbrown_map_cap($cap),
-            || $crate::harness::elastic_map_cap($cap),
-            || $crate::harness::funnel_map_cap($cap),
+            || $crate::std_map_cap($cap),
+            || $crate::hashbrown_map_cap($cap),
+            || $crate::elastic_map_cap($cap),
+            || $crate::funnel_map_cap($cap),
             $body,
         )
     };
@@ -122,36 +125,38 @@ macro_rules! bench_with_cap {
 /// Timed region excludes setup so allocation-induced cache pollution
 /// doesn't bleed into the measurement (unlike [`bench_with_cap!`]).
 /// `$op` may be a literal or any `Display` expression (size-labelled groups).
+#[macro_export]
 macro_rules! bench_insert_reuse {
     ($group:expr, $op:expr, $cap:expr, $pairs:expr $(,)?) => {{
-        bench_insert_reuse_one!(
+        $crate::bench_insert_reuse_one!(
             $group,
             format!("{}_std", $op),
-            $crate::harness::std_map_cap($cap),
+            $crate::std_map_cap($cap),
             $pairs
         );
-        bench_insert_reuse_one!(
+        $crate::bench_insert_reuse_one!(
             $group,
             format!("{}_hashbrown", $op),
-            $crate::harness::hashbrown_map_cap($cap),
+            $crate::hashbrown_map_cap($cap),
             $pairs
         );
-        bench_insert_reuse_one!(
+        $crate::bench_insert_reuse_one!(
             $group,
             format!("{}_elastic", $op),
-            $crate::harness::elastic_map_cap($cap),
+            $crate::elastic_map_cap($cap),
             $pairs
         );
-        bench_insert_reuse_one!(
+        $crate::bench_insert_reuse_one!(
             $group,
             format!("{}_funnel", $op),
-            $crate::harness::funnel_map_cap($cap),
+            $crate::funnel_map_cap($cap),
             $pairs
         );
     }};
 }
 
 /// Validate the reused-map fixture once before Criterion starts sampling.
+#[macro_export]
 macro_rules! preflight_insert_reuse_map {
     ($map:expr, $pairs:expr $(,)?) => {{
         let expected_capacity = $map.capacity();
@@ -187,13 +192,14 @@ macro_rules! preflight_insert_reuse_map {
 /// `cfg(codspeed)` falls back to `iter_batched_ref` (codspeed-criterion-
 /// compat skips `iter_custom`); accept the realloc cost - instruction
 /// counts under callgrind are insensitive to cache state anyway.
+#[macro_export]
 macro_rules! bench_insert_reuse_one {
     ($group:expr, $name:expr, $setup:expr, $pairs:expr $(,)?) => {{
         #[cfg(not(codspeed))]
         {
             let pairs = $pairs;
             let mut map = $setup;
-            let expected_capacity = preflight_insert_reuse_map!(map, pairs);
+            let expected_capacity = $crate::preflight_insert_reuse_map!(map, pairs);
             $group.bench_function($name, move |b| {
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
@@ -226,7 +232,7 @@ macro_rules! bench_insert_reuse_one {
         {
             let pairs = $pairs;
             let mut preflight = $setup;
-            let _ = preflight_insert_reuse_map!(preflight, pairs);
+            let _ = $crate::preflight_insert_reuse_map!(preflight, pairs);
             drop(preflight);
             $group.bench_function($name, move |b| {
                 b.iter_batched_ref(
@@ -237,7 +243,7 @@ macro_rules! bench_insert_reuse_one {
                         }
                         std::hint::black_box(map.len())
                     },
-                    criterion::BatchSize::PerIteration,
+                    $crate::__criterion::BatchSize::PerIteration,
                 );
             });
         }

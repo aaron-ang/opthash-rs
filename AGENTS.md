@@ -154,7 +154,7 @@ pytest benches/python/throughput.py --benchmark-json=.benchmarks/python.json
 - `src/membership.rs` — Bloom-style membership filter gating lookups in both backends
 - `src/capacity.rs` — capacity and tombstone-cleanup arithmetic
 - `src/reserve.rs`, `src/error.rs`, `src/hasher.rs` — public `ReserveFraction`, error types, and `DefaultHashBuilder`
-- `benches/harness/` — shared workload constants, deterministic fixtures,
+- `benches/harness/` — unpublished `opthash-bench-harness` workspace crate (dev-dep `harness`): shared workload constants, deterministic fixtures,
   map constructors, and Criterion comparison helpers
 
 Large modules keep unit tests in a sibling `<module>/tests.rs` (`mod tests;`); small ones keep them inline.

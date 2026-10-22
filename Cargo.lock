@@ -405,7 +405,18 @@ dependencies = [
  "equivalent",
  "foldhash",
  "hashbrown",
+ "opthash-bench-harness",
  "pyo3",
+]
+
+[[package]]
+name = "opthash-bench-harness"
+version = "0.0.0"
+dependencies = [
+ "codspeed-criterion-compat",
+ "foldhash",
+ "hashbrown",
+ "opthash",
 ]
 
 [[package]]

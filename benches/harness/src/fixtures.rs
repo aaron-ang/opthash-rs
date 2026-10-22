@@ -1,6 +1,3 @@
-// Each benchmark uses only part of the shared fixture set.
-#![allow(dead_code)]
-
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{BuildHasherDefault, Hash};
 use std::sync::atomic::{AtomicU64, Ordering};

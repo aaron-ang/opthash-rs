@@ -1,9 +1,8 @@
-#[macro_use]
-mod harness;
-
 use std::env;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+
+use harness::bench_insert_reuse;
 
 const DEFAULT_SIZES: &[usize] = &[100_000, 1_000_000, 10_000_000];
 

@@ -34,14 +34,14 @@ repos:
     hooks:
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --all-targets --features=python -- -W clippy::pedantic -D warnings
+        entry: cargo clippy --workspace --all-targets --features=python -- -W clippy::pedantic -D warnings
         language: system
         types: [rust]
         pass_filenames: false
 
       - id: cargo-fmt
         name: cargo fmt
-        entry: cargo fmt --check
+        entry: cargo fmt --all --check
         language: system
         types: [rust]
         pass_filenames: false
