@@ -47,6 +47,7 @@ pub const VALUE_XOR_MIX: u64 = 0xA5A5_A5A5_A5A5_A5A5;
 /// replacement values as distinct from the initial value mix.
 pub const VALUE_XOR_MIX_ALT: u64 = 0x5A5A_5A5A_5A5A_5A5A;
 
+#[inline]
 #[must_use]
 pub fn key_at(index: usize) -> u64 {
     (index as u64).wrapping_mul(GOLDEN_RATIO_U64)
@@ -68,6 +69,7 @@ pub fn make_pairs(count: usize) -> Vec<(u64, u64)> {
 macro_rules! pairs_builders {
     ($val:ty; $($fn:ident => $Map:ident),+ $(,)?) => {
         $(
+            #[inline]
             #[must_use]
             pub fn $fn(pairs: &[(u64, $val)]) -> $Map<u64, $val> {
                 let mut map = $Map::with_capacity_and_hasher(pairs.len(), Default::default());
@@ -85,6 +87,7 @@ macro_rules! pairs_builders {
 macro_rules! drop_builders {
     ($($fn:ident => $Map:ident),+ $(,)?) => {
         $(
+            #[inline]
             #[must_use]
             pub fn $fn(n: usize) -> $Map<DropU64, DropU64> {
                 let mut map = $Map::with_capacity_and_hasher(n, Default::default());
@@ -116,6 +119,7 @@ pub struct MapQuad {
 }
 
 impl MapQuad {
+    #[inline]
     #[must_use]
     pub fn new(pairs: &[(u64, u64)]) -> Self {
         Self {
@@ -142,6 +146,7 @@ impl Drop for DropU64 {
     }
 }
 
+#[inline]
 #[must_use]
 pub fn drop_sink_value() -> u64 {
     DROP_SINK.load(Ordering::Relaxed)

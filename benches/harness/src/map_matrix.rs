@@ -4,6 +4,13 @@ use crate::MapQuad;
 
 /// Bulk-lookup group: one Criterion sample walks every key in `query_keys`.
 /// Bench id `<group_name>_<impl>` (see benches/README.md).
+///
+/// `#[inline]`, like the map builders in `fixtures`, so the measured `get`
+/// loops are compiled in the calling bench crate. A harness-crate copy of the
+/// std `HashMap` instantiation is optimized on its own and outlines
+/// `DefaultHasher::write_u64`, inflating the `std` control in the simulated
+/// instruction counts.
+#[inline]
 pub fn bench_one_lookup_group(
     c: &mut Criterion,
     group_name: &str,
