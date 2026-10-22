@@ -608,7 +608,7 @@ pub(crate) enum PhiError {
 ///
 /// Returns [`PhiError::ZeroCoordinate`] for a zero coordinate and
 /// [`PhiError::Overflow`] when the complete encoding cannot fit in `u128`.
-pub(crate) fn elastic_phi(i: u128, j: u128) -> Result<u128, PhiError> {
+pub(crate) const fn elastic_phi(i: u128, j: u128) -> Result<u128, PhiError> {
     if i == 0 {
         return Err(PhiError::ZeroCoordinate {
             coordinate: PhiCoordinate::I,
@@ -624,15 +624,27 @@ pub(crate) fn elastic_phi(i: u128, j: u128) -> Result<u128, PhiError> {
     let mut bit_index = u128::BITS - j.leading_zeros();
     while bit_index > 0 {
         bit_index -= 1;
-        encoded = append_bit(encoded, 1).ok_or(PhiError::Overflow)?;
-        encoded = append_bit(encoded, (j >> bit_index) & 1).ok_or(PhiError::Overflow)?;
+        encoded = match append_bit(encoded, 1) {
+            Some(value) => value,
+            None => return Err(PhiError::Overflow),
+        };
+        encoded = match append_bit(encoded, (j >> bit_index) & 1) {
+            Some(value) => value,
+            None => return Err(PhiError::Overflow),
+        };
     }
-    encoded = append_bit(encoded, 0).ok_or(PhiError::Overflow)?;
+    encoded = match append_bit(encoded, 0) {
+        Some(value) => value,
+        None => return Err(PhiError::Overflow),
+    };
 
     bit_index = u128::BITS - i.leading_zeros();
     while bit_index > 0 {
         bit_index -= 1;
-        encoded = append_bit(encoded, (i >> bit_index) & 1).ok_or(PhiError::Overflow)?;
+        encoded = match append_bit(encoded, (i >> bit_index) & 1) {
+            Some(value) => value,
+            None => return Err(PhiError::Overflow),
+        };
     }
     Ok(encoded)
 }
@@ -805,10 +817,11 @@ const fn mix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn append_bit(prefix: u128, bit: u128) -> Option<u128> {
-    prefix
-        .checked_mul(2)
-        .and_then(|value| value.checked_add(bit))
+const fn append_bit(prefix: u128, bit: u128) -> Option<u128> {
+    match prefix.checked_mul(2) {
+        Some(value) => value.checked_add(bit),
+        None => None,
+    }
 }
 
 #[cfg(test)]

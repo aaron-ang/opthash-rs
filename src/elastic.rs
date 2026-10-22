@@ -31,8 +31,6 @@ const UNIFORM_SEARCH_CAP: u64 = 4_096;
 const QUERY_POSITION_CAP: u128 = 1_000_000;
 const EXCEPTIONAL_PLACEMENT_FLAG: u32 = 1 << 31;
 const QUERY_PROBE_LIMIT: usize = 384;
-const MAX_CASE1_LOGICAL_PROBES: usize =
-    ELASTIC_PROBE_BUDGET_C * (u32::BITS as usize - 1) * (u32::BITS as usize - 1);
 const MAX_ELASTIC_SLOTS: usize = match 1_usize.checked_shl(u32::BITS) {
     Some(slots) => slots,
     None => usize::MAX,
@@ -42,7 +40,10 @@ const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
 const _: () = assert!(u32::BITS as u64 <= probe::ELASTIC_LEVEL_LIMIT);
 const _: () = assert!(UNIFORM_SEARCH_CAP <= probe::ELASTIC_LOGICAL_LIMIT);
-const _: () = assert!(MAX_CASE1_LOGICAL_PROBES as u64 <= probe::ELASTIC_LOGICAL_LIMIT);
+const _: () = {
+    let max_case1_logical_probes = ELASTIC_PROBE_BUDGET_C * (u32::BITS as usize - 1).pow(2);
+    assert!(max_case1_logical_probes as u64 <= probe::ELASTIC_LOGICAL_LIMIT);
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExactPlacement {
@@ -211,41 +212,95 @@ impl<K, V, S, A: Allocator + Clone> Drop for ElasticTable<K, V, S, A> {
 macros::declare_backend_aliases! {
     table = ElasticTable,
     map_no_lifetime {
-        "Open-addressed hash map using elastic hashing." ElasticHashMap => HashMap,
-        "Consuming iterator over owned `(K, V)`." ElasticIntoIter => IntoIter,
-        "Owned `K` iterator." ElasticIntoKeys => IntoKeys,
-        "Owned `V` iterator." ElasticIntoValues => IntoValues,
+        /// Open-addressed hash map using elastic hashing.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use opthash::ElasticHashMap;
+        ///
+        /// let mut stock = ElasticHashMap::with_capacity(16);
+        /// stock.insert("apples", 3);
+        /// *stock.entry("pears").or_insert(0) += 5;
+        ///
+        /// assert_eq!(stock.get("apples"), Some(&3));
+        /// assert_eq!(stock.remove("pears"), Some(5));
+        /// assert_eq!(stock.len(), 1);
+        /// ```
+        ElasticHashMap => HashMap,
+        /// Consuming iterator over owned `(K, V)`.
+        ElasticIntoIter => IntoIter,
+        /// Owned `K` iterator.
+        ElasticIntoKeys => IntoKeys,
+        /// Owned `V` iterator.
+        ElasticIntoValues => IntoValues,
     },
     map_ref {
-        "A view into a single entry, occupied or vacant." ElasticEntry => Entry,
-        "View of an occupied entry." ElasticOccupiedEntry => OccupiedEntry,
-        "View of a vacant entry." ElasticVacantEntry => VacantEntry,
-        "Error returned by `try_insert` on key collision." ElasticOccupiedError => OccupiedError,
-        "Borrowing iterator over `(&K, &V)`." ElasticIter => Iter,
-        "Borrowing iterator over `(&K, &mut V)`." ElasticIterMut => IterMut,
-        "`&K` iterator." ElasticKeys => Keys,
-        "`&V` iterator." ElasticValues => Values,
-        "`&mut V` iterator." ElasticValuesMut => ValuesMut,
-        "Draining iterator that empties the map." ElasticDrain => Drain,
+        /// A view into a single entry, occupied or vacant.
+        ElasticEntry => Entry,
+        /// View of an occupied entry.
+        ElasticOccupiedEntry => OccupiedEntry,
+        /// View of a vacant entry.
+        ElasticVacantEntry => VacantEntry,
+        /// Error returned by `try_insert` on key collision.
+        ElasticOccupiedError => OccupiedError,
+        /// Borrowing iterator over `(&K, &V)`.
+        ElasticIter => Iter,
+        /// Borrowing iterator over `(&K, &mut V)`.
+        ElasticIterMut => IterMut,
+        /// `&K` iterator.
+        ElasticKeys => Keys,
+        /// `&V` iterator.
+        ElasticValues => Values,
+        /// `&mut V` iterator.
+        ElasticValuesMut => ValuesMut,
+        /// Draining iterator that empties the map.
+        ElasticDrain => Drain,
     },
     map_extract_if {
-        "Iterator yielding entries removed by `extract_if`." ElasticExtractIf
+        /// Iterator yielding entries removed by `extract_if`.
+        ElasticExtractIf
     },
     set_no_lifetime {
-        "Hash set using elastic hashing." ElasticHashSet => HashSet,
-        "Consuming iterator over set values." ElasticSetIntoIter => IntoIter,
+        /// Hash set using elastic hashing.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use opthash::ElasticHashSet;
+        ///
+        /// let evens: ElasticHashSet<u32> = (0..10).step_by(2).collect();
+        /// let small: ElasticHashSet<u32> = (0..5).collect();
+        ///
+        /// let mut both: Vec<_> = evens.intersection(&small).copied().collect();
+        /// both.sort_unstable();
+        /// assert_eq!(both, [0, 2, 4]);
+        /// ```
+        ElasticHashSet => HashSet,
+        /// Consuming iterator over set values.
+        ElasticSetIntoIter => IntoIter,
     },
     set_ref {
-        "Borrowing iterator over set values." ElasticSetIter => Iter,
-        "Draining iterator that empties the set." ElasticSetDrain => Drain,
-        "Iterator yielding values removed by set `extract_if`." ElasticSetExtractIf => ExtractIf,
-        "Iterator over values present only in the first set." ElasticDifference => Difference,
-        "Iterator over values present in both sets." ElasticIntersection => Intersection,
-        "Iterator over values present in exactly one set." ElasticSymmetricDifference => SymmetricDifference,
-        "Iterator over values present in either set." ElasticUnion => Union,
-        "A view into a single set entry." ElasticSetEntry => Entry,
-        "View of an occupied set entry." ElasticSetOccupiedEntry => OccupiedEntry,
-        "View of a vacant set entry." ElasticSetVacantEntry => VacantEntry,
+        /// Borrowing iterator over set values.
+        ElasticSetIter => Iter,
+        /// Draining iterator that empties the set.
+        ElasticSetDrain => Drain,
+        /// Iterator yielding values removed by set `extract_if`.
+        ElasticSetExtractIf => ExtractIf,
+        /// Iterator over values present only in the first set.
+        ElasticDifference => Difference,
+        /// Iterator over values present in both sets.
+        ElasticIntersection => Intersection,
+        /// Iterator over values present in exactly one set.
+        ElasticSymmetricDifference => SymmetricDifference,
+        /// Iterator over values present in either set.
+        ElasticUnion => Union,
+        /// A view into a single set entry.
+        ElasticSetEntry => Entry,
+        /// View of an occupied set entry.
+        ElasticSetOccupiedEntry => OccupiedEntry,
+        /// View of a vacant set entry.
+        ElasticSetVacantEntry => VacantEntry,
     },
 }
 
@@ -387,12 +442,40 @@ fn for_each_phi_route(
     }
 }
 
-fn probe_schedule_capacity(level_count: usize) -> usize {
+/// Full probe-schedule length per level count, computed at compile time so
+/// construction, resize, and clone size the schedule without walking every
+/// level's probes.
+const PROBE_SCHEDULE_CAPACITY: [usize; MAX_LEVELS + 1] = {
+    let mut capacities = [0; MAX_LEVELS + 1];
+    let mut level = 0;
+    while level < MAX_LEVELS {
+        capacities[level + 1] = capacities[level] + level_route_count(level);
+        level += 1;
+    }
+    capacities
+};
+
+/// Routes [`for_each_phi_route`] visits for `level` from its first probe up to
+/// `QUERY_POSITION_CAP`, within `UNIFORM_SEARCH_CAP` probes.
+const fn level_route_count(level: usize) -> usize {
+    let paper_level = level as u128 + 1;
+    let mut paper_probe = if level == 0 { 2 } else { 1 };
     let mut count = 0;
-    for level in 0..level_count {
-        for_each_phi_route(level, 1, QUERY_POSITION_CAP, |_, _| count += 1);
+    while paper_probe <= UNIFORM_SEARCH_CAP as u128 {
+        let Ok(phi) = probe::elastic_phi(paper_level, paper_probe) else {
+            panic!("bounded Elastic query coordinate");
+        };
+        if phi > QUERY_POSITION_CAP {
+            break;
+        }
+        count += 1;
+        paper_probe += 1;
     }
     count
+}
+
+fn probe_schedule_capacity(level_count: usize) -> usize {
+    PROBE_SCHEDULE_CAPACITY[level_count]
 }
 
 fn try_probe_schedule(level_count: usize) -> Result<Vec<PhiRoute>, TryReserveError> {
