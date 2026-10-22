@@ -6,6 +6,7 @@ use allocator_api2::alloc::{Allocator, Layout};
 
 use super::config::{CACHE_LINE, GROUP_SIZE};
 use super::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
+use super::iter::OccupiedIndices;
 use super::simd;
 use crate::error::TryReserveError;
 
@@ -347,21 +348,20 @@ pub(crate) trait ArenaSlots<T> {
 
     /// Drop every value in occupied slots. Call before [`Arena::deallocate`].
     fn drop_values(&mut self) {
-        if self.capacity() == 0 {
+        if !mem::needs_drop::<T>() {
             return;
         }
-        let ctrl = self.ctrl_ptr();
-        for idx in 0..self.capacity() {
-            if unsafe { control::is_occupied(*ctrl.add(idx)) } {
-                unsafe { ptr::drop_in_place(self.slot_ptr(idx)) }
-            }
+        let mut scan = OccupiedIndices::new();
+        while let Some(idx) = scan.step(self) {
+            unsafe { ptr::drop_in_place(self.slot_ptr(idx)) }
         }
     }
 
     /// Clone every occupied slot of `src` into `self` in panic-safe order: clone
     /// → write → stamp OCCUPIED. A panic mid-loop leaves `self` OCCUPIED only on
-    /// fully-written slots; TOMBSTONE bytes follow in a second pass. `self` must
-    /// match `src`'s capacity.
+    /// fully-written slots. Once every value is in place, all controls are
+    /// copied, which adds the TOMBSTONE bytes. `self` must match `src`'s
+    /// capacity and start all-EMPTY.
     fn clone_region_from(&mut self, src: &Self)
     where
         Self: Sized,
@@ -369,23 +369,14 @@ pub(crate) trait ArenaSlots<T> {
     {
         let capacity = src.capacity();
         debug_assert_eq!(capacity, self.capacity(), "clone dst must match src");
-        let src_ctrl = src.ctrl_ptr();
-        let dst_ctrl = self.ctrl_ptr();
-        let src_slots = src.data_ptr();
-        let dst_slots = self.data_ptr();
-        for idx in 0..capacity {
-            let ctrl = unsafe { *src_ctrl.add(idx) };
-            if control::is_occupied(ctrl) {
-                let cloned = unsafe { (*src_slots.add(idx)).assume_init_ref() }.clone();
-                unsafe { dst_slots.add(idx).write(MaybeUninit::new(cloned)) };
-                unsafe { *dst_ctrl.add(idx) = ctrl };
-            }
+        let mut scan = OccupiedIndices::new();
+        while let Some(idx) = scan.step(src) {
+            let cloned = unsafe { src.get_ref(idx) }.clone();
+            unsafe { self.slot_ptr(idx).write(cloned) };
+            self.set_control(idx, src.control_at(idx));
         }
-        for idx in 0..capacity {
-            let ctrl = unsafe { *src_ctrl.add(idx) };
-            if ctrl == CTRL_TOMBSTONE {
-                unsafe { *dst_ctrl.add(idx) = CTRL_TOMBSTONE };
-            }
+        if capacity != 0 {
+            unsafe { ptr::copy_nonoverlapping(src.ctrl_ptr(), self.ctrl_ptr(), capacity) };
         }
     }
 

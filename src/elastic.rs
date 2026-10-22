@@ -18,7 +18,7 @@ use crate::membership::{self, MembershipKey, MembershipRegion};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::INITIAL_CAPACITY;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
-use crate::raw::iter::RegionCursor;
+use crate::raw::iter::{OccupiedIndices, RegionCursor};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -135,22 +135,20 @@ impl<T> Level<T> {
     }
 
     /// Moves every live entry out through `visit` and resets the level to
-    /// empty. Each slot's control and the counters are updated before `visit`
-    /// runs, so a panic inside it leaves the level consistent: the entries not
-    /// yet visited stay live and counted, and the moved ones are `EMPTY`.
+    /// empty. Each slot's control and `len` are updated before `visit` runs,
+    /// and tombstones are wiped only after the last entry, so a panic inside
+    /// `visit` leaves the level consistent: the entries not yet visited stay
+    /// live and counted, and the moved ones are `EMPTY`.
     fn drain_reset(&mut self, mut visit: impl FnMut(T)) {
-        for slot in 0..self.capacity() {
-            let control = self.control_at(slot);
-            if control == CTRL_TOMBSTONE {
-                self.set_control(slot, CTRL_EMPTY);
-                self.tombstones -= 1;
-            } else if control::is_occupied(control) {
-                let entry = unsafe { self.take(slot) };
-                self.set_control(slot, CTRL_EMPTY);
-                self.len -= 1;
-                visit(entry);
-            }
+        let mut scan = OccupiedIndices::new();
+        while let Some(slot) = scan.step(self) {
+            let entry = unsafe { self.take(slot) };
+            self.set_control(slot, CTRL_EMPTY);
+            self.len -= 1;
+            visit(entry);
         }
+        self.clear_all_controls();
+        self.tombstones = 0;
     }
 }
 
@@ -1389,10 +1387,8 @@ where
     fn refresh_membership(&mut self) {
         self.clear_membership();
         for level_idx in 0..self.levels.len() {
-            for slot_idx in 0..self.levels[level_idx].capacity() {
-                if !control::is_occupied(self.levels[level_idx].control_at(slot_idx)) {
-                    continue;
-                }
+            let mut scan = OccupiedIndices::new();
+            while let Some(slot_idx) = scan.step(&self.levels[level_idx]) {
                 let hash = {
                     let entry = unsafe { self.levels[level_idx].get_ref(slot_idx) };
                     self.hash_builder.hash_one(&entry.key)

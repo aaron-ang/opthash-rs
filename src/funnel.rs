@@ -1087,10 +1087,8 @@ where
     #[inline(never)]
     fn refresh_membership(&mut self) {
         self.clear_membership();
-        for slot in 0..self.shape.n {
-            if !control::is_occupied(self.storage.control_at(slot)) {
-                continue;
-            }
+        let mut scan = OccupiedIndices::new();
+        while let Some(slot) = scan.step(&self.storage) {
             let hash = {
                 let entry = unsafe { self.storage.get_ref(slot) };
                 self.hash_builder.hash_one(&entry.key)
