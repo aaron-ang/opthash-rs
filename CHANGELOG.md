@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/aaron-ang/opthash-rs/compare/opthash-v0.11.0...opthash-v0.11.1) - 2026-10-23
+
+### Fixed
+
+- *(python)* propagate errors raised by a key's __eq__ ([#151](https://github.com/aaron-ang/opthash-rs/pull/151))
+- *(python)* fix aliasing, iterator invalidation, and swallowed errors in in-place ops ([#146](https://github.com/aaron-ang/opthash-rs/pull/146))
+
+### Other
+
+- build wheels only for binding changes, cross-check targets, tidy build config ([#149](https://github.com/aaron-ang/opthash-rs/pull/149))
+- scan slots by control group and keep dropping after a panicking Drop ([#148](https://github.com/aaron-ang/opthash-rs/pull/148))
+- share one resize path and drop `S: Clone` from `try_reserve` ([#147](https://github.com/aaron-ang/opthash-rs/pull/147))
+- lean pass — prune redundant code, comments, and docs ([#144](https://github.com/aaron-ang/opthash-rs/pull/144))
+- cut Miri runtime with nextest and a const probe-schedule table ([#143](https://github.com/aaron-ang/opthash-rs/pull/143))
+- prune self-explanatory and stale comments ([#142](https://github.com/aaron-ang/opthash-rs/pull/142))
+- align file layout with module hierarchy ([#141](https://github.com/aaron-ang/opthash-rs/pull/141))
+- streamline Elastic metadata and Funnel traversal ([#140](https://github.com/aaron-ang/opthash-rs/pull/140))
+- measure every map at its full insert budget; shrink mode for the memory example ([#139](https://github.com/aaron-ang/opthash-rs/pull/139))
+- *(elastic)* keep the geometry plan on the stack
+- add a memory footprint harness
+- remove unused lint warnings from Cargo.toml
+
 ## [0.11.0](https://github.com/aaron-ang/opthash-rs/compare/v0.10.4...v0.11.0) - 2026-09-07
 
 ### Other
