@@ -56,13 +56,6 @@ impl ReserveFraction {
     }
 
     /// Returns the exact `f64` representation when one exists.
-    #[deprecated(since = "0.12.0", note = "renamed to `to_f64`")]
-    #[must_use]
-    pub const fn as_f64(self) -> Option<f64> {
-        self.to_f64()
-    }
-
-    /// Returns the exact `f64` representation when one exists.
     ///
     /// Binary64 represents inverse powers of two through `2^-1074`; larger
     /// exponents return `None` rather than underflowing to zero.
