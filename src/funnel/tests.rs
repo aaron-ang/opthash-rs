@@ -208,6 +208,8 @@ fn dense_scan_preserves_order_while_removals_make_the_table_sparse() {
     for slot in slots {
         let (ptr, found) = map::TableBackend::scan_next(&table, &mut scan).unwrap();
         assert_eq!(found, slot);
+        // SAFETY: `scan_next` yields occupied slots; `extract_finish` tombstones
+        // this one before it could be read again.
         let entry = unsafe { ptr.read() };
         assert_eq!((entry.key, entry.value), (slot as u64, slot as u64 + 100));
         map::TableBackend::extract_finish(&mut table, slot);
@@ -234,13 +236,16 @@ fn sparse_scan_visits_group_boundaries_and_tail_once_in_slot_order() {
         );
     }
     // Include a deleted slot next to a live slot in a cached group.
-    table.storage.mark_tombstone(GROUP_SIZE + 1);
+    // SAFETY: the table holds well over `GROUP_SIZE + 1` slots.
+    unsafe { table.storage.mark_tombstone(GROUP_SIZE + 1) };
     let mut scan = map::TableBackend::scan(&table);
     for slot in slots {
         let (ptr, found) = map::TableBackend::scan_next(&table, &mut scan).unwrap();
         assert_eq!(found, slot);
+        // SAFETY: `scan_next` yields occupied slots.
         assert_eq!(unsafe { (*ptr).value }, slot as u64 + 100);
         // Draining changes control bytes while the cursor holds its mask.
+        // SAFETY: as above; `extract_finish` tombstones the slot after the move.
         let entry = unsafe { ptr.read() };
         assert_eq!(entry.key, slot as u64);
         map::TableBackend::extract_finish(&mut table, slot);
@@ -256,12 +261,14 @@ fn refresh_membership_rebuilds_the_recorded_filter() {
     for key in 0..64_u64 {
         assert!(!table.insert_unique(key, key));
     }
+    // SAFETY: the filter tail holds `membership.words` initialized words.
     let recorded = unsafe {
         core::slice::from_raw_parts(table.membership_ptr(), table.membership.words).to_vec()
     };
     table.clear_membership();
     table.refresh_membership();
     assert_eq!(
+        // SAFETY: as above.
         unsafe { core::slice::from_raw_parts(table.membership_ptr(), table.membership.words) },
         recorded
     );
@@ -356,6 +363,7 @@ fn gated_insert_skips_the_duplicate_walk_only_for_unrecorded_keys() {
         let hash = table.hash_builder.hash_one(key);
         let fingerprint = control::control_fingerprint(hash);
         let slot = table.find_location(&key, hash, fingerprint).unwrap();
+        // SAFETY: `find_location` returns occupied in-bounds slots.
         assert_eq!(unsafe { table.storage.get_ref(slot) }.value, key + 1);
     }
 }
@@ -453,7 +461,11 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
                 .find_location(&identity, identity, control::control_fingerprint(identity))
                 .unwrap();
             assert_eq!(actual, expected.global_slot(), "n={n} key={identity}");
-            locations.push((identity, actual, table.storage.slot_ptr(actual) as usize));
+            locations.push((
+                identity,
+                actual,
+                table.storage.checked_slot_ptr(actual) as usize,
+            ));
             assert_eq!(
                 table.find_location(&identity, identity, control::control_fingerprint(identity),),
                 Some(actual)
@@ -476,7 +488,7 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
                 Some(location),
                 "moved n={n} key={identity}"
             );
-            assert_eq!(table.storage.slot_ptr(location) as usize, pointer);
+            assert_eq!(table.storage.checked_slot_ptr(location) as usize, pointer);
         }
 
         let duplicate = config.max_insertions() as u64 / 2;
@@ -530,10 +542,13 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
         key: u64,
         fingerprint: u8,
     ) {
-        if control::is_free(table.storage.control_at(slot)) {
-            table
-                .storage
-                .write_with_control(slot, SlotEntry { key, value: key }, fingerprint);
+        if control::is_free(table.storage.checked_control(slot)) {
+            // SAFETY: `checked_control` bounds-checked `slot`.
+            unsafe {
+                table
+                    .storage
+                    .write_with_control(slot, SlotEntry { key, value: key }, fingerprint);
+            }
             // Placing a slot directly still owes the filter its record.
             let membership = table.membership_slot(key);
             table.record_membership(membership);
@@ -661,7 +676,10 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
     );
     assert_eq!(
         direct,
-        table.storage.slot_ptr(second_bucket_slot_one).cast_const()
+        table
+            .storage
+            .checked_slot_ptr(second_bucket_slot_one)
+            .cast_const()
     );
 }
 
@@ -856,24 +874,25 @@ fn clear_marks_each_slot_empty_before_dropping_its_value() {
         table.insert_for_vacant_entry(key, PanicOnFirstDrop(drops.clone()), key);
     }
     let first_occupied = (0..table.shape.n)
-        .find(|&slot| control::is_occupied(table.storage.control_at(slot)))
+        .find(|&slot| control::is_occupied(table.storage.checked_control(slot)))
         .unwrap();
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clear(&mut table);
     }));
     assert!(result.is_err());
-    assert_eq!(table.storage.control_at(first_occupied), CTRL_EMPTY);
+    assert_eq!(table.storage.checked_control(first_occupied), CTRL_EMPTY);
     assert_eq!(
         table.len,
         (0..table.shape.n)
-            .filter(|&slot| control::is_occupied(table.storage.control_at(slot)))
+            .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
     );
 
     <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clear(&mut table);
     assert_eq!(table.len, 0);
     assert_eq!(drops.load(Ordering::SeqCst), 3);
+    // SAFETY: `table` is dropped once and not used afterward.
     unsafe { ManuallyDrop::drop(&mut table) };
 }
 
@@ -912,7 +931,7 @@ fn failed_fallible_resize_leaves_a_valid_table() {
     assert_eq!(
         table.len,
         (0..table.shape.n)
-            .filter(|&slot| control::is_occupied(table.storage.control_at(slot)))
+            .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
     );
 
@@ -934,7 +953,7 @@ fn failed_fallible_resize_leaves_a_valid_table() {
     assert_eq!(
         table.len,
         (0..table.shape.n)
-            .filter(|&slot| control::is_occupied(table.storage.control_at(slot)))
+            .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
     );
     drop(table);
@@ -1049,6 +1068,8 @@ fn vector_bucket_scan_matches_scalar_order_for_every_default_pattern() {
 
             let mut actual_first_tombstone = None;
             let mut actual_compared = Vec::new();
+            // SAFETY: `controls` pads `GROUP_SIZE - 1` bytes past `WIDTH`; the
+            // closure touches no slot data.
             let actual = unsafe {
                 scan_funnel_bucket(
                     controls.as_ptr(),
@@ -1074,6 +1095,7 @@ fn vector_bucket_scan_matches_scalar_order_for_every_default_pattern() {
 
             if !controls[..WIDTH].contains(&CTRL_TOMBSTONE) {
                 let mut clean_compared = Vec::new();
+                // SAFETY: as above, and this pattern has no tombstones.
                 let clean = unsafe {
                     scan_clean_funnel_bucket(controls.as_ptr(), 0, WIDTH, FP, |slot| {
                         clean_compared.push(slot);
@@ -1151,6 +1173,8 @@ fn vector_bucket_scan_preserves_order_across_group_boundaries_and_padding() {
             let expected = scalar(&controls, start, width, Some(hit), existing_tombstone);
             let mut actual_first_tombstone = existing_tombstone;
             let mut actual_compared = Vec::new();
+            // SAFETY: `controls` spans `start + width + GROUP_SIZE - 1` bytes;
+            // the closure touches no slot data.
             let actual = unsafe {
                 scan_funnel_bucket(
                     controls.as_ptr(),
@@ -1181,6 +1205,8 @@ fn vector_bucket_scan_preserves_order_across_group_boundaries_and_padding() {
             );
             let mut actual_first_tombstone = existing_tombstone;
             let mut actual_compared = Vec::new();
+            // SAFETY: `controls` spans `start + width + GROUP_SIZE - 1` bytes;
+            // the closure touches no slot data.
             let actual = unsafe {
                 scan_funnel_bucket(
                     controls.as_ptr(),

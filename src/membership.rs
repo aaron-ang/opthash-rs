@@ -112,6 +112,8 @@ impl MembershipRegion {
     #[inline]
     #[allow(clippy::cast_ptr_alignment)]
     pub(crate) unsafe fn ptr<W>(self, base: *mut u8) -> *mut W {
+        // SAFETY: `offset` came from laying this region into `base`'s arena, so
+        // it is in bounds and `W`-aligned.
         unsafe { base.add(self.offset).cast::<W>() }
     }
 
@@ -123,6 +125,8 @@ impl MembershipRegion {
     #[inline]
     pub(crate) unsafe fn clear<W>(self, base: *mut u8) {
         if self.words != 0 {
+            // SAFETY: the caller's arena holds this region's `words` words at
+            // `ptr`; all-zero is a valid `W`.
             unsafe { ptr::write_bytes(self.ptr::<W>(base), 0, self.words) };
         }
     }
@@ -134,8 +138,10 @@ impl MembershipRegion {
     /// As for [`Self::ptr`], for both arenas; the regions must not overlap.
     #[inline]
     pub(crate) unsafe fn copy_from<W>(self, base: *mut u8, source: Self, source_base: *mut u8) {
-        debug_assert_eq!(self.words, source.words);
+        assert_eq!(self.words, source.words, "membership regions must match");
         if self.words != 0 {
+            // SAFETY: both arenas hold `words` words at their region pointers
+            // (asserted equal above), and the caller rules out overlap.
             unsafe {
                 ptr::copy_nonoverlapping(
                     source.ptr::<W>(source_base),

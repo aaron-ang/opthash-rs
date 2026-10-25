@@ -25,6 +25,7 @@ impl Arena {
     pub(crate) const fn empty() -> Self {
         Self {
             ptr: ptr::NonNull::dangling(),
+            // SAFETY: align 1 is a power of two and size 0 cannot overflow.
             layout: unsafe { Layout::from_size_align_unchecked(0, 1) },
         }
     }
@@ -44,7 +45,10 @@ impl Arena {
             .allocate(layout)
             .map_err(|_| TryReserveError::AllocError)?
             .cast::<u8>();
+        debug_assert!(ctrl_bytes <= layout.size(), "ctrl prefix exceeds layout");
         if ctrl_bytes > 0 {
+            // SAFETY: `ptr` is a fresh allocation of `layout`, whose ctrl
+            // prefix spans `ctrl_bytes` by construction in `layout_for*`.
             unsafe { ptr::write_bytes(ptr.as_ptr(), 0, ctrl_bytes) };
         }
         Ok(Self { ptr, layout })
@@ -61,11 +65,15 @@ impl Arena {
     }
 
     /// Frees the backing allocation. Caller must have already run any
-    /// destructors for values living inside.
+    /// destructors for values living inside, and pass the allocator that
+    /// allocated the arena.
     pub(crate) fn deallocate<A: Allocator>(self, alloc: &A) {
         if self.layout.size() == 0 {
             return;
         }
+        // SAFETY: a nonzero `layout` means `ptr` came from `allocate(layout)`
+        // on `alloc` (the caller passes the owning allocator); `self` is
+        // consumed, so it is freed once.
         unsafe { alloc.deallocate(self.ptr, self.layout) };
     }
 
@@ -94,6 +102,7 @@ pub(crate) fn layout_for_extents<K, V>(
     data_slots: usize,
 ) -> Result<(Layout, usize), TryReserveError> {
     if ctrl_bytes == 0 && data_slots == 0 {
+        // SAFETY: `CACHE_LINE` is a power of two and size 0 cannot overflow.
         let layout = unsafe { Layout::from_size_align_unchecked(0, CACHE_LINE) };
         return Ok((layout, 0));
     }
@@ -158,6 +167,7 @@ impl<T> LayoutCursor<T> {
 
         // SAFETY: offsets stay within the caller's arena layout.
         let ctrl_ptr = unsafe { self.base.add(self.ctrl_off as usize) };
+        // SAFETY: as above.
         let data_ptr = unsafe {
             self.base
                 .add(self.data_off as usize)
@@ -240,13 +250,16 @@ impl<RS: RegionSet, A: Allocator> ArenaDropGuard<RS, A> {
     /// Mutable access to the guarded regions (the clone/drain loop writes here).
     #[inline]
     pub(crate) fn regions_mut(&mut self) -> &mut RS {
-        self.regions.as_mut().unwrap()
+        self.regions.as_mut().expect("regions live until disarm")
     }
 
     /// Success path: reclaim `(arena, regions)`; the guard's `Drop` no-ops.
     #[inline]
     pub(crate) fn disarm(mut self) -> (Arena, RS) {
-        (self.arena.take().unwrap(), self.regions.take().unwrap())
+        (
+            self.arena.take().expect("arena live until disarm"),
+            self.regions.take().expect("regions live until disarm"),
+        )
     }
 }
 
@@ -282,6 +295,8 @@ pub(crate) fn drop_values<T, R: ArenaSlots<T>>(regions: &mut [R]) {
                 // `step` moves past `idx` before its value drops, so a resumed
                 // walk skips the value that panicked.
                 while let Some(idx) = self.scan.step(region) {
+                    // SAFETY: `step` yields occupied in-bounds slots, each
+                    // visited once, so every value drops exactly once.
                     unsafe { ptr::drop_in_place(region.slot_ptr(idx)) }
                 }
                 self.region += 1;
@@ -319,32 +334,78 @@ pub(crate) struct SlotEntry<K, V> {
 
 /// Per-region view of a map's arena. Descriptors borrow into the arena
 /// allocation, parameterized by slot type `T`.
-pub(crate) trait ArenaSlots<T> {
+///
+/// Every slot whose control byte is occupied holds an initialized `T`; the
+/// `unsafe` index accessors exist so no safe call can break that.
+///
+/// # Safety
+///
+/// For as long as the descriptor is used, `ctrl_ptr()` must be valid for
+/// reads and writes of `capacity()` bytes and `data_ptr()` valid for
+/// `capacity()` slots of `T`, with neither range overlapping another
+/// descriptor's. A new descriptor must start with no occupied control byte
+/// over an uninitialized slot.
+pub(crate) unsafe trait ArenaSlots<T> {
     fn ctrl_ptr(&self) -> *mut u8;
     fn data_ptr(&self) -> *mut MaybeUninit<T>;
     fn capacity(&self) -> usize;
 
+    /// # Safety
+    ///
+    /// `idx < self.capacity()`.
     #[inline]
-    fn slot_ptr(&self, idx: usize) -> *mut T {
+    unsafe fn slot_ptr(&self, idx: usize) -> *mut T {
         debug_assert!(idx < self.capacity());
+        // SAFETY: caller keeps `idx` in bounds of the `capacity()` slots.
         unsafe { self.data_ptr().add(idx).cast::<T>() }
     }
 
+    /// # Safety
+    ///
+    /// `idx < self.capacity()`.
     #[inline]
-    fn control_at(&self, idx: usize) -> u8 {
+    unsafe fn control_at(&self, idx: usize) -> u8 {
         debug_assert!(idx < self.capacity());
+        // SAFETY: caller keeps `idx` in bounds of the `capacity()` ctrl bytes.
         unsafe { *self.ctrl_ptr().add(idx) }
     }
 
+    /// Bounds-checked [`control_at`](Self::control_at) for test assertions.
+    #[cfg(test)]
+    fn checked_control(&self, idx: usize) -> u8 {
+        assert!(idx < self.capacity(), "control index {idx} out of bounds");
+        // SAFETY: bounds checked above.
+        unsafe { self.control_at(idx) }
+    }
+
+    /// Bounds-checked [`slot_ptr`](Self::slot_ptr) for test assertions.
+    #[cfg(test)]
+    fn checked_slot_ptr(&self, idx: usize) -> *mut T {
+        assert!(idx < self.capacity(), "slot index {idx} out of bounds");
+        // SAFETY: bounds checked above.
+        unsafe { self.slot_ptr(idx) }
+    }
+
+    /// # Safety
+    ///
+    /// `idx < self.capacity()`, and an occupied `ctrl` is only stamped on a
+    /// slot that holds an initialized `T`.
     #[inline]
-    fn set_control(&mut self, idx: usize, ctrl: u8) {
+    unsafe fn set_control(&mut self, idx: usize, ctrl: u8) {
         debug_assert!(idx < self.capacity());
+        // SAFETY: caller keeps `idx` in bounds of the `capacity()` ctrl bytes.
         unsafe { *self.ctrl_ptr().add(idx) = ctrl }
     }
 
+    /// Leaks the slot's value unless the caller already moved or dropped it.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity()`.
     #[inline]
-    fn mark_tombstone(&mut self, idx: usize) {
-        self.set_control(idx, CTRL_TOMBSTONE);
+    unsafe fn mark_tombstone(&mut self, idx: usize) {
+        // SAFETY: caller keeps `idx` in bounds; a tombstone is never occupied.
+        unsafe { self.set_control(idx, CTRL_TOMBSTONE) };
     }
 
     /// Wipe every ctrl byte in this region to EMPTY.
@@ -354,42 +415,69 @@ pub(crate) trait ArenaSlots<T> {
         if self.capacity() == 0 {
             return;
         }
+        // SAFETY: the trait contract makes `ctrl_ptr()` writable for
+        // `capacity()` bytes.
         unsafe { ptr::write_bytes(self.ctrl_ptr(), 0, self.capacity()) }
     }
 
+    /// # Safety
+    ///
+    /// `idx < self.capacity()`. The slot should be free (debug-asserted);
+    /// overwriting a live value leaks it.
     #[inline]
-    fn write_with_control(&mut self, idx: usize, entry: T, ctrl: u8) {
-        debug_assert!(control::is_free(self.control_at(idx)));
-        unsafe { self.slot_ptr(idx).write(entry) }
-        self.set_control(idx, ctrl);
+    unsafe fn write_with_control(&mut self, idx: usize, entry: T, ctrl: u8) {
+        // SAFETY: caller keeps `idx` in bounds; the slot is initialized
+        // before `ctrl` is stamped.
+        unsafe {
+            debug_assert!(control::is_free(self.control_at(idx)));
+            self.slot_ptr(idx).write(entry);
+            self.set_control(idx, ctrl);
+        }
     }
 
-    /// SAFETY: caller ensures `idx` is in-bounds and the slot is initialized.
+    /// # Safety
+    ///
+    /// `idx < self.capacity()` and the slot is initialized.
     #[inline]
     unsafe fn get_ref(&self, idx: usize) -> &T {
         debug_assert!(idx < self.capacity());
-        debug_assert!(control::is_occupied(self.control_at(idx)));
-        unsafe { &*self.slot_ptr(idx) }
+        // SAFETY: caller guarantees `idx` is in bounds and initialized.
+        unsafe {
+            debug_assert!(control::is_occupied(self.control_at(idx)));
+            &*self.slot_ptr(idx)
+        }
     }
 
     /// `&mut self` is a type-level proof of exclusive access — without it,
     /// two calls with the same `idx` could hand out aliasing `&mut T` (UB).
     ///
-    /// SAFETY: caller ensures `idx` is in-bounds and the slot is initialized.
+    /// # Safety
+    ///
+    /// `idx < self.capacity()` and the slot is initialized.
     #[inline]
     unsafe fn get_mut(&mut self, idx: usize) -> &mut T {
         debug_assert!(idx < self.capacity());
-        debug_assert!(control::is_occupied(self.control_at(idx)));
-        unsafe { &mut *self.slot_ptr(idx) }
+        // SAFETY: caller guarantees `idx` is in bounds and initialized;
+        // `&mut self` rules out an aliasing borrow.
+        unsafe {
+            debug_assert!(control::is_occupied(self.control_at(idx)));
+            &mut *self.slot_ptr(idx)
+        }
     }
 
-    /// SAFETY: caller ensures `idx` is in-bounds and the slot is initialized.
-    /// The slot must not be read again before being re-written.
+    /// # Safety
+    ///
+    /// `idx < self.capacity()` and the slot is initialized. The slot must not
+    /// be read again before being re-written.
     #[inline]
     unsafe fn take(&mut self, idx: usize) -> T {
         debug_assert!(idx < self.capacity());
-        debug_assert!(control::is_occupied(self.control_at(idx)));
-        unsafe { self.slot_ptr(idx).read() }
+        // SAFETY: caller guarantees `idx` is in bounds, initialized, and not
+        // read again, so the bitwise move cannot double-drop.
+        unsafe {
+            debug_assert!(control::is_occupied(self.control_at(idx)));
+            self.slot_ptr(idx).read()
+        }
     }
 
     /// Clone every occupied slot of `src` into `self` in panic-safe order: clone
@@ -403,14 +491,21 @@ pub(crate) trait ArenaSlots<T> {
         T: Clone,
     {
         let capacity = src.capacity();
-        debug_assert_eq!(capacity, self.capacity(), "clone dst must match src");
+        assert_eq!(capacity, self.capacity(), "clone dst must match src");
         let mut scan = OccupiedIndices::new();
         while let Some(idx) = scan.step(src) {
+            // SAFETY: `step` yields occupied in-bounds indices of `src`, and
+            // the capacities match, so `idx` is in bounds of `self` too.
             let cloned = unsafe { src.get_ref(idx) }.clone();
-            unsafe { self.slot_ptr(idx).write(cloned) };
-            self.set_control(idx, src.control_at(idx));
+            // SAFETY: as above; the slot is written before it is stamped.
+            unsafe {
+                self.slot_ptr(idx).write(cloned);
+                self.set_control(idx, src.control_at(idx));
+            }
         }
         if capacity != 0 {
+            // SAFETY: both ctrl ranges hold `capacity` bytes in distinct
+            // allocations.
             unsafe { ptr::copy_nonoverlapping(src.ctrl_ptr(), self.ctrl_ptr(), capacity) };
         }
     }
@@ -426,17 +521,24 @@ pub(crate) trait ArenaSlots<T> {
         let full_groups = self.capacity() / GROUP_SIZE;
         for group_idx in 0..full_groups {
             let group_start = group_idx * GROUP_SIZE;
+            // SAFETY: `group_start + GROUP_SIZE <= capacity()` for a full group.
             let group_ctrl = unsafe { ctrl.add(group_start) };
+            // SAFETY: a full group leaves `GROUP_SIZE` readable ctrl bytes.
             for offset in unsafe { simd::occupied_mask_group(group_ctrl) } {
                 let idx = group_start + offset;
+                // SAFETY: `idx` is an in-bounds occupied lane of this group; its
+                // ctrl is cleared before `visit` takes the initialized slot.
                 unsafe {
                     *ctrl.add(idx) = CTRL_EMPTY;
                     visit(self.slot_ptr(idx));
                 }
             }
+            // SAFETY: the full group's `GROUP_SIZE` ctrl bytes are writable.
             unsafe { ptr::write_bytes(group_ctrl, CTRL_EMPTY, GROUP_SIZE) };
         }
         for idx in full_groups * GROUP_SIZE..self.capacity() {
+            // SAFETY: `idx < capacity()`; `visit` only sees slots whose ctrl was
+            // occupied, i.e. initialized, after that ctrl is cleared.
             unsafe {
                 let prev = *ctrl.add(idx);
                 *ctrl.add(idx) = CTRL_EMPTY;
@@ -451,6 +553,8 @@ pub(crate) trait ArenaSlots<T> {
     /// The current ctrl byte is cleared before `f` runs, so a panic cannot
     /// leave the moved-out slot marked occupied.
     fn drain_values_and_clear<F: FnMut(T)>(&mut self, mut f: F) {
+        // SAFETY: `slot` is initialized and its ctrl is already EMPTY, so the
+        // moved-out value is never read or dropped again.
         self.clear_occupied_slots_with(|slot| unsafe { f(slot.read()) });
     }
 }

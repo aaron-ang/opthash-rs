@@ -1,7 +1,8 @@
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use allocator_api2::alloc::{Allocator, Global, Layout};
 use equivalent::Equivalent;
 
@@ -87,13 +88,20 @@ struct Level<T> {
     tombstones: u32,
 }
 
+// SAFETY: the raw pointers address slots this descriptor's table owns
+// exclusively, like `Box<[T]>`; no shared interior state outlives the borrow.
 unsafe impl<T: Send> Send for Level<T> {}
+// SAFETY: as above; `&Level` only permits reads of `T` through the pointers.
 unsafe impl<T: Sync> Sync for Level<T> {}
 
 // `Level` is read on every lookup — keep it within one 64-byte cache line.
 const _: () = assert!(mem::size_of::<Level<SlotEntry<u64, u64>>>() <= 64);
 
-impl<T> ArenaSlots<T> for Level<T> {
+// SAFETY: descriptors are only stamped at offsets carved from an arena
+// allocated by `arena::layout_for` for exactly `capacity` ctrl bytes and
+// slots, whose ctrl bytes `try_allocate_with_ctrl_zeroed` starts EMPTY, and
+// are dropped or re-stamped before that arena is freed.
+unsafe impl<T> ArenaSlots<T> for Level<T> {
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
         self.ctrl_ptr
@@ -142,8 +150,11 @@ impl<T> Level<T> {
     fn drain_reset(&mut self, mut visit: impl FnMut(T)) {
         let mut scan = OccupiedIndices::new();
         while let Some(slot) = scan.step(self) {
+            // SAFETY: `step` yields occupied in-bounds slots; the value is
+            // moved out before the slot is marked empty.
             let entry = unsafe { self.take(slot) };
-            self.set_control(slot, CTRL_EMPTY);
+            // SAFETY: `slot` is in bounds, as above.
+            unsafe { self.set_control(slot, CTRL_EMPTY) };
             self.len -= 1;
             visit(entry);
         }
@@ -184,10 +195,14 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     stale_membership: usize,
 }
 
+// SAFETY: the table uniquely owns its arena and every entry in it, like
+// `Box<[SlotEntry<K, V>]>`; the raw pointers are never shared with another table.
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
     for ElasticTable<K, V, S, A>
 {
 }
+// SAFETY: as above; slots are mutated only under an exclusive borrow of the
+// owning map, so `&ElasticTable` only reads.
 unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
     for ElasticTable<K, V, S, A>
 {
@@ -701,6 +716,7 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     let membership = arena_layout.membership;
     // The arena zeroes control bytes only; an empty filter must read as
     // "nothing recorded".
+    // SAFETY: `membership` was laid out by `elastic_arena_layout` for this arena.
     unsafe { membership.clear::<ElasticMetadataWord>(arena.as_ptr()) };
 
     // `Arena` has no `Drop`: deallocate explicitly if level construction fails.
@@ -732,7 +748,7 @@ fn handle_elastic_alloc_error<K, V>(level_capacities: &[usize]) -> ! {
                 .ok()
                 .map(|layout| layout.layout)
         })
-        .unwrap_or_else(|| Layout::from_size_align(1, 1).unwrap());
+        .unwrap_or_else(Layout::new::<u8>);
     allocator_api2::alloc::handle_alloc_error(layout)
 }
 
@@ -808,6 +824,7 @@ where
 
     #[inline]
     fn membership_ptr(&self) -> *mut ElasticMetadataWord {
+        // SAFETY: `self.membership` was laid out together with `self.arena`.
         unsafe {
             self.membership
                 .ptr::<ElasticMetadataWord>(self.arena.as_ptr())
@@ -855,6 +872,7 @@ where
             return false;
         }
         let word = MembershipKey::word(route.signature(), words);
+        // SAFETY: `word < words`, and the region holds that many initialized words.
         unsafe {
             (*self.membership_ptr().add(word)).membership & membership.bits() == membership.bits()
         }
@@ -870,6 +888,8 @@ where
         let words = self.membership.words;
         if words != 0 {
             let word = MembershipKey::word(route.signature(), words);
+            // SAFETY: `word < words` indexes an initialized word; `&mut self`
+            // makes the borrow exclusive.
             let metadata = unsafe { &mut *self.membership_ptr().add(word) };
             metadata.membership |= membership.bits();
             metadata.route_bins[route.summary_bin()] |= 1_u16 << summary_level(level);
@@ -877,6 +897,7 @@ where
     }
 
     fn clear_membership(&mut self) {
+        // SAFETY: `self.membership` was laid out together with `self.arena`.
         unsafe {
             self.membership
                 .clear::<ElasticMetadataWord>(self.arena.as_ptr());
@@ -885,6 +906,8 @@ where
     }
 
     fn copy_membership_from(&mut self, source: &Self) {
+        // SAFETY: each region was laid out for its own table's arena, so the two
+        // never overlap; clones share geometry, so word counts match.
         unsafe {
             self.membership.copy_from::<ElasticMetadataWord>(
                 self.arena.as_ptr(),
@@ -994,7 +1017,8 @@ where
             .enumerate()
             .find_map(|(level_index, level)| {
                 (0..level.capacity())
-                    .find(|&slot| control::is_free(level.control_at(slot)))
+                    // SAFETY: `slot` ranges over the level's capacity.
+                    .find(|&slot| control::is_free(unsafe { level.control_at(slot) }))
                     .map(|slot| (level_index, slot))
             })
     }
@@ -1011,8 +1035,12 @@ where
     ) -> (usize, usize) {
         {
             let level = &mut self.levels[level_idx];
-            let prev_ctrl = level.control_at(slot_idx);
-            level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+            // SAFETY: callers pass a free slot found within this level.
+            let prev_ctrl = unsafe { level.control_at(slot_idx) };
+            // SAFETY: as above; `key_fingerprint` is an occupied control byte.
+            unsafe {
+                level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+            }
             level.len += 1;
             if prev_ctrl == CTRL_TOMBSTONE {
                 level.tombstones -= 1;
@@ -1040,7 +1068,8 @@ where
                 let logical_probe_index =
                     u64::try_from(paper_probe - 1).expect("Elastic probe cap fits u64");
                 assert!(
-                    usize::try_from(logical_probe_index).unwrap() < QUERY_PROBE_LIMIT,
+                    usize::try_from(logical_probe_index)
+                        .is_ok_and(|index| index < QUERY_PROBE_LIMIT),
                     "Elastic query-probe convention exhausted"
                 );
                 let counter_base =
@@ -1109,6 +1138,7 @@ where
 
     #[inline]
     unsafe fn slot_ref(&self, (level_idx, slot_idx): (usize, usize)) -> &SlotEntry<K, V> {
+        // SAFETY: caller passes a live location: occupied and in bounds.
         unsafe { self.levels[level_idx].get_ref(slot_idx) }
     }
 
@@ -1120,11 +1150,13 @@ where
         let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
         // SAFETY: shared `&Level` only — never `&mut` — so no aliasing tag.
         let level = unsafe { &*levels_ptr.add(level_idx) };
-        level.slot_ptr(slot_idx)
+        // SAFETY: caller passes a live location, so `slot_idx` is in bounds.
+        unsafe { level.slot_ptr(slot_idx) }
     }
 
     #[inline]
     fn replace_value(&mut self, (level_idx, slot_idx): (usize, usize), value: V) -> V {
+        // SAFETY: `Location` contract: a valid location is occupied and in bounds.
         let slot = unsafe { self.levels[level_idx].get_mut(slot_idx) };
         mem::replace(&mut slot.value, value)
     }
@@ -1183,6 +1215,8 @@ where
     }
 
     fn remove(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
+        // SAFETY: `TableBackend::Location` contract: a live location from
+        // this table names an occupied in-bounds slot.
         let removed = unsafe { self.levels[level_idx].take(slot_idx) };
         self.extract_finish((level_idx, slot_idx));
         self.settle_after_deletes(self.levels[level_idx].needs_cleanup());
@@ -1191,14 +1225,16 @@ where
 
     #[inline]
     fn tombstone_slot(&mut self, (level_idx, slot_idx): (usize, usize)) {
-        self.levels[level_idx].mark_tombstone(slot_idx);
+        // SAFETY: a live location names an in-bounds slot.
+        unsafe { self.levels[level_idx].mark_tombstone(slot_idx) };
     }
 
     #[inline]
     fn extract_finish(&mut self, (level_idx, slot_idx): (usize, usize)) {
         {
             let level = &mut self.levels[level_idx];
-            level.mark_tombstone(slot_idx);
+            // SAFETY: a live location names an in-bounds slot.
+            unsafe { level.mark_tombstone(slot_idx) };
             level.len -= 1;
             level.tombstones += 1;
         }
@@ -1225,7 +1261,9 @@ where
     fn scan_next(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
         while let Some(level) = self.levels.get(scan.level_idx) {
             if let Some(slot_idx) = scan.slots.step(level) {
-                return Some((level.slot_ptr(slot_idx), (scan.level_idx, slot_idx)));
+                // SAFETY: `step` yields in-bounds slots.
+                let slot = unsafe { level.slot_ptr(slot_idx) };
+                return Some((slot, (scan.level_idx, slot_idx)));
             }
             scan.level_idx += 1;
             scan.slots = OccupiedIndices::new();
@@ -1370,6 +1408,7 @@ where
             let mut scan = OccupiedIndices::new();
             while let Some(slot_idx) = scan.step(&self.levels[level_idx]) {
                 let hash = {
+                    // SAFETY: `step` yields occupied in-bounds slots.
                     let entry = unsafe { self.levels[level_idx].get_ref(slot_idx) };
                     self.hash_builder.hash_one(&entry.key)
                 };
@@ -1566,7 +1605,8 @@ where
         logical_index: u64,
     ) -> Option<usize> {
         let slot = self.route_prepared(level, probe, logical_index)?;
-        control::is_free(self.levels[level].control_at(slot)).then_some(slot)
+        // SAFETY: `route_prepared` maps into the level's capacity.
+        control::is_free(unsafe { self.levels[level].control_at(slot) }).then_some(slot)
     }
 
     fn route_prepared(
@@ -1658,7 +1698,8 @@ where
         // The metadata load is issued while the level-zero control byte is still
         // in flight: neither depends on the other.
         let filter = self.route_filter(prepared);
-        if let Some(entry) = self.entry_if_match(0, h11_slot, key_fingerprint, key) {
+        // SAFETY: the counter route maps into level zero's capacity.
+        if let Some(entry) = unsafe { self.entry_if_match(0, h11_slot, key_fingerprint, key) } {
             return Some(on_hit(0, h11_slot, entry));
         }
         // A key the filter never recorded was never inserted, so neither the
@@ -1681,7 +1722,9 @@ where
             ) else {
                 return self.find_by_full_scan(key, key_fingerprint, on_hit);
             };
-            if let Some(entry) = self.entry_if_match(level, slot, key_fingerprint, key) {
+            // SAFETY: schedule routes name real levels and map below
+            // `range_upper`, which is within that level's capacity.
+            if let Some(entry) = unsafe { self.entry_if_match(level, slot, key_fingerprint, key) } {
                 return Some(on_hit(level, slot, entry));
             }
         }
@@ -1703,7 +1746,10 @@ where
     {
         for (level_index, level) in self.levels.iter().enumerate() {
             for slot in 0..level.capacity() {
-                if let Some(entry) = self.entry_if_match(level_index, slot, key_fingerprint, key) {
+                if let Some(entry) =
+                    // SAFETY: both indices come from iterating the levels.
+                    unsafe { self.entry_if_match(level_index, slot, key_fingerprint, key) }
+                {
                     return Some(on_hit(level_index, slot, entry));
                 }
             }
@@ -1711,8 +1757,11 @@ where
         None
     }
 
+    /// # Safety
+    ///
+    /// `level < self.levels.len()` and `slot` is within that level's capacity.
     #[inline]
-    fn entry_if_match<'a, Q>(
+    unsafe fn entry_if_match<'a, Q>(
         &'a self,
         level: usize,
         slot: usize,
@@ -1723,12 +1772,16 @@ where
         Q: Equivalent<K> + ?Sized,
     {
         debug_assert!(level < self.levels.len());
-        let level = unsafe { self.levels.get_unchecked(level) };
-        if level.control_at(slot) != key_fingerprint {
-            return None;
+        // SAFETY: caller keeps `level` and `slot` in bounds; a fingerprint
+        // match means the slot is occupied.
+        unsafe {
+            let level = self.levels.get_unchecked(level);
+            if level.control_at(slot) != key_fingerprint {
+                return None;
+            }
+            let entry = level.get_ref(slot);
+            key.equivalent(&entry.key).then_some(entry)
         }
-        let entry = unsafe { level.get_ref(slot) };
-        key.equivalent(&entry.key).then_some(entry)
     }
 }
 
