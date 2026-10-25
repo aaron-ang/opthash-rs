@@ -39,7 +39,8 @@ so every removed key remains filter-positive and exercises vacant-search reuse.
 Measure its baseline using the same fixture on the comparison revision.
 
 Criterion IDs use `<workload>_<implementation>`, where implementation is one
-of `std`, `hashbrown`, `elastic`, or `funnel`. Renaming an ID resets CodSpeed
+of `std`, `hashbrown`, `elastic`, `funnel`, or `group_probe` (high-load sweep
+only). Renaming an ID resets CodSpeed
 history. The registered headline workloads live in
 [`speedup.rs`](speedup.rs).
 
@@ -108,6 +109,37 @@ For smoke runs only:
 ```bash
 SCALED_INSERT_SIZES=1000 cargo bench --bench scaled_insert -- insert_scale_1K
 ```
+
+## High-load sweep
+
+`high_load` measures Elastic and Funnel where the paper's bounds separate from
+greedy probing: tables filled to 87.5%, 96.9%, 99.2%, and 99.9% of their slots
+(reserve exponents 3, 5, 7, and 10), at 2^16 slots (cache-resident) and 2^20
+slots (past one L3 cluster).
+
+```bash
+BENCH=high_load SAVE=<name> scripts/bench.sh
+BENCH=high_load SAVE=<name> scripts/bench.sh -- '_64K_'   # one size
+```
+
+Groups are `{workload}_{size}_{load}`, for example `get_miss_1M_99_9`:
+
+- `tail_insert` times the last 1/64 of the inserts into a clone of a map
+  holding the rest, so each sample ends at the point's load.
+- `get_hit` and `get_miss` time the same shuffled hit and offset miss queries
+  as `speedup`.
+
+hashbrown caps load at 7/8, so it cannot run above the first point.
+`group_probe` is the greedy control instead: a harness table with hashbrown's
+control-byte layout, 8-lane SWAR groups, and triangular probing, but no load
+cap and no removal. hashbrown joins only the 87.5% groups, to calibrate it.
+
+**Calibration rule.** At 87.5%, at both sizes, `group_probe` must be within
+1.5x of `hashbrown` on every workload in the same run. A run that misses it
+does not count as evidence until `group_probe` is tuned.
+
+Each arm builds its map just before its own benchmark and drops it right
+after, so arm order and other backends' allocation sizes cannot move it.
 
 ## Memory footprint
 

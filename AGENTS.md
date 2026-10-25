@@ -66,8 +66,9 @@ Run shape and options:
   explicit `CORE=<n>` skips that selection but is still locked.
 - `BENCH=all` (default) runs `speedup`, then `mean_latency`; set `BENCH=speedup|mean_latency` for one target.
 - Other `[[bench]]` targets are not in `all`; run explicitly via
-  `BENCH=<name>`: `set_ops`, `map_api`, `load_factor`, `payload_size`, and
-  `scaled_insert` (reused-map insert sweep). `SCALED_INSERT_SIZES` overrides
+  `BENCH=<name>`: `set_ops`, `map_api`, `load_factor`, `payload_size`,
+  `scaled_insert` (reused-map insert sweep), and `high_load` (87.5–99.9% load
+  vs the `group_probe` baseline). `SCALED_INSERT_SIZES` overrides
   are for smoke runs only; evidence uses the default sizes.
 - `memory` is a plain-`main` footprint report (TSV, deterministic counts), not
   Criterion: `cargo bench --profile release --bench memory`.
