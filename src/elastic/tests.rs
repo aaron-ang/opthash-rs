@@ -166,21 +166,22 @@ fn elastic_placement_matches_the_scalar_paper_model() {
 #[test]
 fn compact_query_counters_cover_every_supported_geometry() {
     assert_eq!(
-        PaperConfig::new(MAX_ELASTIC_SLOTS, ReserveFraction::DEFAULT.exponent())
-            .unwrap()
-            .elastic_plan()
-            .level_count(),
+        PaperConfig::new(
+            usize::try_from(MAX_ELASTIC_SLOTS).unwrap_or(usize::MAX),
+            ReserveFraction::DEFAULT.exponent()
+        )
+        .unwrap()
+        .elastic_plan()
+        .level_count(),
         u32::BITS as usize
     );
     #[cfg(target_pointer_width = "64")]
     {
-        assert!(
-            ElasticGeometry::for_insert_budget(MAX_ELASTIC_SLOTS, ReserveFraction::DEFAULT,)
-                .is_none()
-        );
+        let max_slots = usize::try_from(MAX_ELASTIC_SLOTS).unwrap();
+        assert!(ElasticGeometry::for_insert_budget(max_slots, ReserveFraction::DEFAULT).is_none());
         let result = ElasticTable::<u64, u64, IdentityBuildHasher>::
             try_with_slots_and_reserve_fraction_and_hasher_in(
-                MAX_ELASTIC_SLOTS + 1,
+                max_slots + 1,
                 ReserveFraction::DEFAULT,
                 IdentityBuildHasher,
                 Global,
