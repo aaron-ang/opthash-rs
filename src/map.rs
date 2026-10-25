@@ -298,6 +298,11 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     /// Panics when `reserve_fraction` is not exactly `1 / 2^d` for positive
     /// `d`, or when construction otherwise fails.
     #[must_use]
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher_in`"
+    )]
+    #[allow(deprecated)]
     pub fn with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
         reserve_fraction: f64,
@@ -319,6 +324,11 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     ///
     /// Returns [`TryBuildError::InvalidReserveFraction`] for non-dyadic input,
     /// or the backend construction error.
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `try_with_capacity_and_reserve_and_hasher_in`"
+    )]
+    #[allow(deprecated)]
     pub fn try_with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
         reserve_fraction: f64,
@@ -960,6 +970,11 @@ where
     /// # Panics
     /// Panics for non-dyadic input, unsupported reserve, or allocation failure.
     #[must_use]
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `with_reserve`"
+    )]
+    #[allow(deprecated)]
     pub fn with_reserve_fraction(reserve_fraction: f64) -> Self {
         Self::with_capacity_and_reserve_fraction(0, reserve_fraction)
     }
@@ -969,6 +984,11 @@ where
     /// # Panics
     /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve`"
+    )]
+    #[allow(deprecated)]
     pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self {
         Self::with_capacity_and_reserve_fraction_and_hasher(
             capacity,
@@ -982,6 +1002,11 @@ where
     /// # Errors
     ///
     /// Returns [`TryBuildError`] for invalid input or construction failure.
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `try_with_capacity_and_reserve`"
+    )]
+    #[allow(deprecated)]
     pub fn try_with_capacity_and_reserve_fraction(
         capacity: usize,
         reserve_fraction: f64,
@@ -1029,6 +1054,11 @@ where
     /// # Panics
     /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher`"
+    )]
+    #[allow(deprecated)]
     pub fn with_reserve_fraction_and_hasher(
         reserve_fraction: f64,
         hash_builder: P::Hasher,
@@ -1041,6 +1071,11 @@ where
     /// # Panics
     /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher`"
+    )]
+    #[allow(deprecated)]
     pub fn with_capacity_and_reserve_fraction_and_hasher(
         capacity: usize,
         reserve_fraction: f64,

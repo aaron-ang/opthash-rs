@@ -7,7 +7,7 @@ fn default_is_exactly_one_eighth() {
     let reserve = ReserveFraction::DEFAULT;
 
     assert_eq!(reserve.exponent(), 3);
-    assert_eq!(reserve.as_f64(), Some(0.125));
+    assert_eq!(reserve.to_f64(), Some(0.125));
     assert_eq!(reserve.floor_reserved(17), 2);
     assert_eq!(reserve.floor_half_reserved(17), 1);
 }
@@ -21,7 +21,7 @@ fn exponent_constructor_rejects_zero_and_handles_unrepresentable_floats() {
 
     let reserve = ReserveFraction::from_exponent(u32::MAX).unwrap();
     assert_eq!(reserve.exponent(), u32::MAX);
-    assert_eq!(reserve.as_f64(), None);
+    assert_eq!(reserve.to_f64(), None);
     assert_eq!(reserve.floor_reserved(usize::MAX), 0);
     assert_eq!(reserve.floor_half_reserved(usize::MAX), 0);
 }
@@ -37,7 +37,7 @@ fn float_constructor_accepts_exact_inverse_powers_of_two() {
     ] {
         let reserve = ReserveFraction::try_from(value).unwrap();
         assert_eq!(reserve.exponent(), exponent);
-        assert_eq!(reserve.as_f64(), Some(value));
+        assert_eq!(reserve.to_f64(), Some(value));
     }
 }
 
@@ -93,6 +93,7 @@ fn maps_report_the_configured_reserve() {
 }
 
 #[test]
+#[allow(deprecated)] // covers the deprecated f64 constructors until removal
 fn fallible_float_compatibility_constructor_rejects_non_dyadic_input() {
     let result = ElasticHashMap::<u64, u64>::try_with_capacity_and_reserve_fraction(64, 0.1);
 
@@ -119,6 +120,7 @@ fn funnel_fallible_constructor_rejects_reserve_above_one_eighth() {
 }
 
 #[test]
+#[allow(deprecated)] // covers the deprecated f64 constructors until removal
 fn infallible_float_compatibility_constructor_no_longer_clamps() {
     let result = std::panic::catch_unwind(|| {
         FunnelHashMap::<u64, u64>::with_capacity_and_reserve_fraction(64, 0.5)

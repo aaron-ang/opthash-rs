@@ -195,6 +195,11 @@ where
         /// # Panics
         /// Panics for non-dyadic input, unsupported reserve, or allocation failure.
         #[must_use]
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `with_reserve`"
+        )]
+        #[allow(deprecated)]
         pub fn with_reserve_fraction(reserve_fraction: f64) -> Self;
 
         /// Compatibility constructor for capacity and an exact dyadic `f64` reserve.
@@ -202,12 +207,22 @@ where
         /// # Panics
         /// Panics for non-dyadic input, unsupported reserve, or construction failure.
         #[must_use]
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve`"
+        )]
+        #[allow(deprecated)]
         pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self;
 
         /// Fallible compatibility constructor for an exact dyadic `f64` reserve.
         ///
         /// # Errors
         /// Returns [`TryBuildError`] for invalid input or construction failure.
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `try_with_capacity_and_reserve`"
+        )]
+        #[allow(deprecated)]
         pub fn try_with_capacity_and_reserve_fraction(
             capacity: usize,
             reserve_fraction: f64,
@@ -233,6 +248,11 @@ where
         /// # Panics
         /// Panics for non-dyadic input, unsupported reserve, or construction failure.
         #[must_use]
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher`"
+        )]
+        #[allow(deprecated)]
         pub fn with_reserve_fraction_and_hasher(
             reserve_fraction: f64,
             hash_builder: P::Hasher,
@@ -243,6 +263,11 @@ where
         /// # Panics
         /// Panics for non-dyadic input, unsupported reserve, or construction failure.
         #[must_use]
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher`"
+        )]
+        #[allow(deprecated)]
         pub fn with_capacity_and_reserve_fraction_and_hasher(
             capacity: usize,
             reserve_fraction: f64,
@@ -288,6 +313,11 @@ where
         /// # Panics
         /// Panics for non-dyadic input, unsupported reserve, or construction failure.
         #[must_use]
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher_in`"
+        )]
+        #[allow(deprecated)]
         pub fn with_capacity_and_reserve_fraction_and_hasher_in(
             capacity: usize,
             reserve_fraction: f64,
