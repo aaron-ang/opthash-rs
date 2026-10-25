@@ -303,7 +303,7 @@ fn clear_marks_each_slot_empty_before_dropping_its_value() {
         .enumerate()
         .find_map(|(level_index, level)| {
             (0..level.capacity())
-                .find(|&slot| control::is_occupied(level.control_at(slot)))
+                .find(|&slot| control::is_occupied(level.checked_control(slot)))
                 .map(|slot| (level_index, slot))
         })
         .unwrap();
@@ -311,7 +311,7 @@ fn clear_marks_each_slot_empty_before_dropping_its_value() {
     let result = catch_unwind(AssertUnwindSafe(|| map.clear()));
     assert!(result.is_err());
     assert_eq!(
-        map.table().levels[first_occupied.0].control_at(first_occupied.1),
+        map.table().levels[first_occupied.0].checked_control(first_occupied.1),
         CTRL_EMPTY
     );
     let live_controls = map
@@ -320,7 +320,7 @@ fn clear_marks_each_slot_empty_before_dropping_its_value() {
         .iter()
         .map(|level| {
             (0..level.capacity())
-                .filter(|&slot| control::is_occupied(level.control_at(slot)))
+                .filter(|&slot| control::is_occupied(level.checked_control(slot)))
                 .count()
         })
         .sum::<usize>();
@@ -328,13 +328,14 @@ fn clear_marks_each_slot_empty_before_dropping_its_value() {
     assert!(map.table().levels.iter().all(|level| {
         level.len as usize
             == (0..level.capacity())
-                .filter(|&slot| control::is_occupied(level.control_at(slot)))
+                .filter(|&slot| control::is_occupied(level.checked_control(slot)))
                 .count()
     }));
 
     map.clear();
     assert!(map.is_empty());
     assert_eq!(drops.load(Ordering::SeqCst), 3);
+    // SAFETY: `map` is not used after this drop.
     unsafe { ManuallyDrop::drop(&mut map) };
 }
 
@@ -364,7 +365,7 @@ fn caught_hash_panic_during_try_resize_leaves_counters_valid() {
         .iter()
         .map(|level| {
             (0..level.capacity())
-                .filter(|&slot| control::is_occupied(level.control_at(slot)))
+                .filter(|&slot| control::is_occupied(level.checked_control(slot)))
                 .count()
         })
         .sum::<usize>();
@@ -372,7 +373,7 @@ fn caught_hash_panic_during_try_resize_leaves_counters_valid() {
     assert!(map.table().levels.iter().all(|level| {
         level.len as usize
             == (0..level.capacity())
-                .filter(|&slot| control::is_occupied(level.control_at(slot)))
+                .filter(|&slot| control::is_occupied(level.checked_control(slot)))
                 .count()
     }));
     // The first moved key panics, so the resize drops every entry once,
@@ -426,6 +427,7 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
     let layout = elastic_arena_layout::<OverAligned, OverAligned>(table.total_slots).unwrap();
     assert_eq!(
         table.membership_ptr().addr(),
+        // SAFETY: the membership offset lies within the arena layout.
         unsafe { table.arena.as_ptr().add(layout.membership.offset) }.addr()
     );
     assert_eq!(
@@ -433,6 +435,7 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
         0
     );
     for word in 0..table.membership.words {
+        // SAFETY: `word < words` indexes an initialized metadata word.
         let metadata = unsafe { *table.membership_ptr().add(word) };
         assert_eq!(metadata.membership, 0);
         assert_eq!(metadata.route_bins, [0; 4]);
@@ -684,7 +687,7 @@ fn elastic_controls_keep_the_public_hash_fingerprint() {
         .unwrap();
 
     assert_eq!(
-        map.table().levels[location.0].control_at(location.1),
+        map.table().levels[location.0].checked_control(location.1),
         control::control_fingerprint(hash)
     );
 }
@@ -705,7 +708,8 @@ fn route_summary_conservatively_records_every_live_level() {
     let mut key_levels = vec![None; usize::try_from(key_count).unwrap()];
     for (level_index, level) in map.table().levels.iter().enumerate() {
         for slot in 0..level.capacity() {
-            if control::is_occupied(level.control_at(slot)) {
+            if control::is_occupied(level.checked_control(slot)) {
+                // SAFETY: `slot` is in bounds and occupied.
                 let key = unsafe { level.get_ref(slot) }.key;
                 key_levels[usize::try_from(key).unwrap()] = Some(level_index);
             }
@@ -745,6 +749,7 @@ fn route_summary_conservatively_records_every_live_level() {
     assert!(map.table().levels.len() <= ROUTE_SUMMARY_LEVELS);
     for word in 0..map.table().membership.words {
         assert_eq!(
+            // SAFETY: `word < words` indexes an initialized metadata word.
             unsafe { (*map.table().membership_ptr().add(word)).route_bins },
             [0; 4]
         );
@@ -987,15 +992,18 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
             break;
         }
         let slot = table.route_exact(0, 0, logical_index).unwrap();
-        if control::is_free(table.levels[0].control_at(slot)) {
-            table.levels[0].write_with_control(
-                slot,
-                SlotEntry {
-                    key: next_key,
-                    value: next_key,
-                },
-                fingerprint,
-            );
+        if control::is_free(table.levels[0].checked_control(slot)) {
+            // SAFETY: `checked_control` bounds-checked `slot`.
+            unsafe {
+                table.levels[0].write_with_control(
+                    slot,
+                    SlotEntry {
+                        key: next_key,
+                        value: next_key,
+                    },
+                    fingerprint,
+                );
+            }
             table.levels[0].len += 1;
             table.len += 1;
             next_key += 1;
@@ -1060,6 +1068,7 @@ fn direct_lookup_returns_the_compared_slot_reference() {
         let direct = table
             .find_entry_prepared(&key, prepared, fingerprint)
             .expect("inserted key must have an entry reference");
+        // SAFETY: `find_slot_indices_prepared` returns an occupied in-bounds slot.
         let resolved = unsafe { table.levels[location.0].get_ref(location.1) };
         assert!(ptr::eq(direct, resolved), "key {key} returned a new slot");
     }

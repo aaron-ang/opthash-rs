@@ -425,6 +425,7 @@ where
     #[inline]
     #[allow(clippy::mut_from_ref)]
     unsafe fn slot_entry_mut(&self, loc: P::Location) -> &mut SlotEntry<K, V> {
+        // SAFETY: caller passes a live `loc` and guarantees exclusive access.
         unsafe { &mut *self.table.slot_ptr(loc) }
     }
 
@@ -1199,6 +1200,8 @@ impl<'a, K, V, P: TableBackend<K, V>> Iterator for IterMut<'a, K, V, P> {
         let table = unsafe { &*self.table };
         let (ptr, _loc) = table.scan_next(&mut self.scan)?;
         self.remaining -= 1;
+        // SAFETY: as above; `ptr` is a live slot yielded once under the `&'a mut`
+        // map borrow.
         let slot: &'a mut SlotEntry<K, V> = unsafe { &mut *ptr };
         Some((&slot.key, &mut slot.value))
     }
@@ -1247,6 +1250,8 @@ impl<K, V, P: TableBackend<K, V>> Iterator for Drain<'_, K, V, P> {
         // SAFETY: live slot; read the entry out and mark a tombstone (counters
         // are reset wholesale by `wipe_all` on drop).
         let entry = unsafe { core::ptr::read(ptr) };
+        // SAFETY: `table` is exclusively borrowed; `loc` is still valid since no
+        // structural mutation ran after `scan_next`.
         unsafe { (*self.table).tombstone_slot(loc) };
         Some((entry.key, entry.value))
     }
@@ -1259,6 +1264,8 @@ impl<K, V, P: TableBackend<K, V>> Drop for Drain<'_, K, V, P> {
     fn drop(&mut self) {
         // Drain any unyielded entries so values run their `Drop`, then wipe.
         for _ in &mut *self {}
+        // SAFETY: `table` points to the exclusively borrowed map for the drain's
+        // lifetime.
         unsafe { (*self.table).wipe_all() };
     }
 }
@@ -1299,6 +1306,8 @@ where
                 // SAFETY: matched — read the entry out, then finalize removal
                 // (tombstone + counters; the map keeps being used).
                 let entry = unsafe { core::ptr::read(ptr) };
+                // SAFETY: `table` is exclusively borrowed; `slot` is dead, and `loc`
+                // is still valid since the predicate cannot mutate the map.
                 unsafe { (*self.table).extract_finish(loc) };
                 return Some((entry.key, entry.value));
             }

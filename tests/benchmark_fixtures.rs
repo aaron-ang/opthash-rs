@@ -243,6 +243,7 @@ fn counting_allocator_tracks_successful_allocation_and_deallocation() {
     let layout = Layout::from_size_align(64, 8).unwrap();
     let before = allocator.snapshot();
 
+    // SAFETY: `layout` has nonzero size.
     let ptr = unsafe { allocator.alloc(layout) };
     assert!(!ptr.is_null());
     let allocated = allocator.snapshot();
@@ -252,6 +253,7 @@ fn counting_allocator_tracks_successful_allocation_and_deallocation() {
     assert_eq!(allocated.allocation_calls - before.allocation_calls, 1);
     assert_eq!(allocated.allocated_bytes - before.allocated_bytes, 64);
 
+    // SAFETY: `ptr` came from `alloc` with `layout` and is freed once.
     unsafe { allocator.dealloc(ptr, layout) };
     let deallocated = allocator.snapshot();
     assert_eq!(deallocated.live_bytes, before.live_bytes);
@@ -266,14 +268,17 @@ fn counting_allocator_tracks_zeroed_and_reallocated_memory() {
     allocator.reset_peak();
     let before = allocator.snapshot();
 
+    // SAFETY: `initial_layout` has nonzero size.
     let ptr = unsafe { allocator.alloc_zeroed(initial_layout) };
     assert!(!ptr.is_null());
     assert!(
+        // SAFETY: `ptr` is a live, zero-initialized 32-byte allocation.
         unsafe { std::slice::from_raw_parts(ptr, 32) }
             .iter()
             .all(|&byte| byte == 0)
     );
 
+    // SAFETY: `ptr` is live with `initial_layout`; 96 is nonzero and fits `isize`.
     let grown = unsafe { allocator.realloc(ptr, initial_layout, 96) };
     assert!(!grown.is_null());
     let grown_snapshot = allocator.snapshot();
@@ -284,6 +289,7 @@ fn counting_allocator_tracks_zeroed_and_reallocated_memory() {
     assert_eq!(grown_snapshot.peak_live_bytes - before.live_bytes, 32 + 96);
 
     let grown_layout = Layout::from_size_align(96, 8).unwrap();
+    // SAFETY: `grown` is live with `grown_layout`; 16 is nonzero.
     let shrunk = unsafe { allocator.realloc(grown, grown_layout, 16) };
     assert!(!shrunk.is_null());
     let shrunk_snapshot = allocator.snapshot();
@@ -294,6 +300,7 @@ fn counting_allocator_tracks_zeroed_and_reallocated_memory() {
     );
 
     let shrunk_layout = Layout::from_size_align(16, 8).unwrap();
+    // SAFETY: `shrunk` is live with `shrunk_layout` and freed once.
     unsafe { allocator.dealloc(shrunk, shrunk_layout) };
     let after = allocator.snapshot();
     assert_eq!(after.live_bytes, before.live_bytes);

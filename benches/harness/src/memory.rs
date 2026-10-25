@@ -81,8 +81,11 @@ impl CountingAllocator {
     }
 }
 
+// SAFETY: every allocation and free forwards to `System` with the caller's
+// layout; the counters only observe.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwards the caller's `alloc` contract to `System`.
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             let c = self.counters;
@@ -97,6 +100,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from `alloc` above, i.e. from `System`, with `layout`.
         unsafe { System.dealloc(ptr, layout) };
         self.counters
             .live_bytes

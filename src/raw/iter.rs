@@ -96,10 +96,13 @@ const GROUP_SLOT_INIT: usize = 0_usize.wrapping_sub(GROUP_SIZE);
 #[inline]
 unsafe fn occupied_mask(ctrl: *const u8, remaining: usize) -> BitMask {
     if remaining >= GROUP_SIZE {
+        // SAFETY: `remaining >= GROUP_SIZE`, so the caller guarantees a full
+        // group is readable.
         return unsafe { simd::occupied_mask_group(ctrl) };
     }
     let mut mask = 0_u64;
     for index in 0..remaining {
+        // SAFETY: `index < remaining`, all of which the caller guarantees readable.
         let control = unsafe { *ctrl.add(index) };
         if control::is_occupied(control) {
             let lane = u32::try_from(index).expect("control-group lane fits u32");

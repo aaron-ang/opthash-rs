@@ -1206,11 +1206,14 @@ macro_rules! clone_alloc_suite {
                 }
             }
 
+            // SAFETY: forwards to `Global`, so blocks stay valid across clones and
+            // moves; the `Arc` only tracks drops.
             unsafe impl Allocator for MyAlloc {
                 fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
                     Global.allocate(layout)
                 }
                 unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+                    // SAFETY: `ptr` came from `allocate`, i.e. `Global`, with `layout`.
                     unsafe { Global.deallocate(ptr, layout) };
                 }
             }
