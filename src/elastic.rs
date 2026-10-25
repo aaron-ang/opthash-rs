@@ -33,10 +33,7 @@ const UNIFORM_SEARCH_CAP: u64 = 4_096;
 const QUERY_POSITION_CAP: u128 = 1_000_000;
 const EXCEPTIONAL_PLACEMENT_FLAG: u32 = 1 << 31;
 const QUERY_PROBE_LIMIT: usize = 384;
-const MAX_ELASTIC_SLOTS: usize = match 1_usize.checked_shl(u32::BITS) {
-    Some(slots) => slots,
-    None => usize::MAX,
-};
+const MAX_ELASTIC_SLOTS: u64 = 1 << u32::BITS;
 const ROUTE_SUMMARY_LEVELS: usize = u16::BITS as usize;
 const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
@@ -650,7 +647,7 @@ impl ElasticGeometry {
 
     /// `None` when `total_slots` exceeds `MAX_ELASTIC_SLOTS`.
     fn for_slots(total_slots: usize, reserve_fraction: ReserveFraction) -> Option<Self> {
-        if total_slots > MAX_ELASTIC_SLOTS {
+        if !u64::try_from(total_slots).is_ok_and(|slots| slots <= MAX_ELASTIC_SLOTS) {
             return None;
         }
         if total_slots == 0 {
