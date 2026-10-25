@@ -51,15 +51,8 @@ impl ReserveFraction {
 
     /// Returns `floor(delta * n / 2)` using exact integer arithmetic.
     #[must_use]
-    pub const fn floor_half_reserved(self, n: usize) -> usize {
+    pub(crate) const fn floor_half_reserved(self, n: usize) -> usize {
         geometry::floor_div_pow2(n, self.exponent as u64 + 1)
-    }
-
-    /// Returns the exact `f64` representation when one exists.
-    #[deprecated(since = "0.12.0", note = "renamed to `to_f64`")]
-    #[must_use]
-    pub const fn as_f64(self) -> Option<f64> {
-        self.to_f64()
     }
 
     /// Returns the exact `f64` representation when one exists.
@@ -166,5 +159,14 @@ mod tests {
             ReserveFraction::try_from(0.125),
             Ok(ReserveFraction::DEFAULT)
         );
+    }
+
+    #[test]
+    fn floor_half_reserved_is_exact() {
+        let reserve = |exponent| ReserveFraction::from_exponent(exponent).unwrap();
+        assert_eq!(ReserveFraction::DEFAULT.floor_half_reserved(17), 1);
+        assert_eq!(reserve(1).floor_half_reserved(usize::MAX), usize::MAX >> 2);
+        assert_eq!(reserve(usize::BITS - 1).floor_half_reserved(usize::MAX), 0);
+        assert_eq!(reserve(u32::MAX).floor_half_reserved(usize::MAX), 0);
     }
 }

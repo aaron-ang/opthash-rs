@@ -292,6 +292,14 @@ macro_rules! set_suite {
 
                 assert!(set_str == "{1, 2}" || set_str == "{2, 1}");
                 assert_eq!(format!("{empty:?}"), "{}");
+
+                let mut single = HashSet::new();
+                single.insert(1);
+                assert_eq!(format!("{:?}", single.clone().drain()), "[1]");
+                let mut into_iter = single.into_iter();
+                assert_eq!(format!("{into_iter:?}"), "[1]");
+                into_iter.next();
+                assert_eq!(format!("{into_iter:?}"), "[]");
             }
 
             #[test]
