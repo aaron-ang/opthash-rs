@@ -148,7 +148,7 @@ macro_rules! set_iter {
     };
 }
 
-/// Use a [`TableBackend`] backend to store unique values.
+/// Use a table backend to store unique values.
 pub struct HashSet<T, P: TableBackend<T, ()>> {
     map: map::HashMap<T, (), P>,
 }
@@ -357,6 +357,10 @@ where
     }
 
     /// Reserves room for at least `additional` more values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity overflows `usize`.
     pub fn reserve(&mut self, additional: usize) {
         self.map.reserve(additional);
     }
