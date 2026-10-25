@@ -1129,7 +1129,7 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
         let scan = self.table.scan();
         let remaining = self.table.len();
         IterMut {
-            table: core::ptr::from_mut(&mut self.table),
+            table: TableBorrow::new(&mut self.table),
             scan,
             remaining,
             _marker: PhantomData,
@@ -1172,7 +1172,7 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
         let scan = self.table.scan();
         let remaining = self.table.len();
         Drain {
-            table: core::ptr::from_mut(&mut self.table),
+            table: TableBorrow::new(&mut self.table),
             scan,
             remaining,
             _marker: PhantomData,
@@ -1247,6 +1247,33 @@ where
     }
 }
 
+/// Exclusive table borrow kept as a raw pointer, so an iterator can hand out
+/// `&mut` slots while `&self` methods still read the table.
+struct TableBorrow<'a, P> {
+    ptr: *mut P,
+    _marker: PhantomData<&'a mut P>,
+}
+
+impl<'a, P> TableBorrow<'a, P> {
+    fn new(table: &'a mut P) -> Self {
+        Self {
+            ptr: core::ptr::from_mut(table),
+            _marker: PhantomData,
+        }
+    }
+
+    fn as_ptr(&self) -> *mut P {
+        self.ptr
+    }
+}
+
+// SAFETY: built only from a `&'a mut P` and used in its place, so it may be
+// sent exactly when that borrow may.
+unsafe impl<P: Send> Send for TableBorrow<'_, P> {}
+
+// SAFETY: as above, for sharing.
+unsafe impl<P: Sync> Sync for TableBorrow<'_, P> {}
+
 impl<'a, K, V, P: TableBackend<K, V>> Iterator for Iter<'a, K, V, P> {
     type Item = (&'a K, &'a V);
     fn next(&mut self) -> Option<(&'a K, &'a V)> {
@@ -1290,7 +1317,7 @@ where
 /// Borrowing iterator over `(&K, &mut V)`.
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct IterMut<'a, K, V, P: TableBackend<K, V>> {
-    table: *mut P,
+    table: TableBorrow<'a, P>,
     scan: P::Scan,
     remaining: usize,
     _marker: PhantomData<(&'a K, &'a mut V)>,
@@ -1301,7 +1328,7 @@ impl<'a, K, V, P: TableBackend<K, V>> Iterator for IterMut<'a, K, V, P> {
     fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
         // SAFETY: `table` points to the borrowed map; `scan_next` yields each
         // location at most once, so the `&'a mut` references are disjoint.
-        let table = unsafe { &*self.table };
+        let table = unsafe { &*self.table.as_ptr() };
         let (ptr, _loc) = table.scan_next(&mut self.scan)?;
         self.remaining -= 1;
         // SAFETY: as above; `ptr` is a live slot yielded once under the `&'a mut`
@@ -1334,7 +1361,7 @@ where
         // SAFETY: `&self` blocks `next`, and the cloned scan visits only
         // slots not yet yielded, so these shared borrows alias no handed-out
         // `&mut V`.
-        let table = unsafe { &*self.table };
+        let table = unsafe { &*self.table.as_ptr() };
         Iter::remaining(table, &self.scan, self.remaining)
     }
 }
@@ -1386,24 +1413,24 @@ where
 
 /// Draining iterator; empties the map on consumption or drop.
 pub struct Drain<'a, K, V, P: TableBackend<K, V>> {
-    table: *mut P,
+    table: TableBorrow<'a, P>,
     scan: P::Scan,
     remaining: usize,
-    _marker: PhantomData<&'a mut P>,
+    _marker: PhantomData<(K, V)>,
 }
 
 impl<K, V, P: TableBackend<K, V>> Iterator for Drain<'_, K, V, P> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
         // SAFETY: `table` points to the borrowed map for the drain's lifetime.
-        let (ptr, loc) = unsafe { (*self.table).scan_next(&mut self.scan) }?;
+        let (ptr, loc) = unsafe { (*self.table.as_ptr()).scan_next(&mut self.scan) }?;
         self.remaining -= 1;
         // SAFETY: live slot; read the entry out and mark a tombstone (counters
         // are reset wholesale by `wipe_all` on drop).
         let entry = unsafe { core::ptr::read(ptr) };
         // SAFETY: `table` is exclusively borrowed; `loc` is still valid since no
         // structural mutation ran after `scan_next`.
-        unsafe { (*self.table).tombstone_slot(loc) };
+        unsafe { (*self.table.as_ptr()).tombstone_slot(loc) };
         Some((entry.key, entry.value))
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1417,7 +1444,7 @@ impl<K, V, P: TableBackend<K, V>> Drop for Drain<'_, K, V, P> {
         for _ in &mut *self {}
         // SAFETY: `table` points to the exclusively borrowed map for the drain's
         // lifetime.
-        unsafe { (*self.table).wipe_all() };
+        unsafe { (*self.table.as_ptr()).wipe_all() };
     }
 }
 
@@ -1440,7 +1467,7 @@ where
     pub(crate) fn view(&self) -> Iter<'_, K, V, P> {
         // SAFETY: `table` points to the exclusively borrowed map; the cloned
         // scan visits only slots not yet moved out.
-        let table = unsafe { &*self.table };
+        let table = unsafe { &*self.table.as_ptr() };
         Iter::remaining(table, &self.scan, self.remaining)
     }
 }
@@ -1471,7 +1498,7 @@ where
 /// Removal scan behind map and set `ExtractIf`. Holds the map's exclusive
 /// borrow and finishes deferred cleanup once exhausted or dropped.
 pub(crate) struct ExtractScan<'a, K, V, P: TableBackend<K, V>> {
-    table: *mut P,
+    table: TableBorrow<'a, P>,
     scan: P::Scan,
     finished: bool,
     _marker: PhantomData<&'a mut HashMap<K, V, P>>,
@@ -1481,7 +1508,7 @@ impl<'a, K, V, P: TableBackend<K, V>> ExtractScan<'a, K, V, P> {
     pub(crate) fn new(map: &'a mut HashMap<K, V, P>) -> Self {
         let scan = map.table.scan();
         Self {
-            table: core::ptr::from_mut(&mut map.table),
+            table: TableBorrow::new(&mut map.table),
             scan,
             finished: false,
             _marker: PhantomData,
@@ -1499,11 +1526,12 @@ impl<'a, K, V, P: TableBackend<K, V>> ExtractScan<'a, K, V, P> {
         }
         loop {
             // SAFETY: `table` points to the borrowed map for the iterator's life.
-            let Some((ptr, loc)) = (unsafe { (*self.table).scan_next(&mut self.scan) }) else {
+            let Some((ptr, loc)) = (unsafe { (*self.table.as_ptr()).scan_next(&mut self.scan) })
+            else {
                 self.finished = true;
                 // SAFETY: the scan is exhausted and the iterator still owns the
                 // map's exclusive borrow, so a same-size cleanup is now safe.
-                unsafe { (*self.table).finish_deferred_removals() };
+                unsafe { (*self.table.as_ptr()).finish_deferred_removals() };
                 return None;
             };
             // SAFETY: live slot; exclusive via the `&mut` map borrow.
@@ -1514,7 +1542,7 @@ impl<'a, K, V, P: TableBackend<K, V>> ExtractScan<'a, K, V, P> {
                 let entry = unsafe { core::ptr::read(ptr) };
                 // SAFETY: `table` is exclusively borrowed; `slot` is dead, and `loc`
                 // is still valid since the predicate cannot mutate the map.
-                unsafe { (*self.table).extract_finish(loc) };
+                unsafe { (*self.table.as_ptr()).extract_finish(loc) };
                 return Some((entry.key, entry.value));
             }
         }
@@ -1538,7 +1566,7 @@ impl<K, V, P: TableBackend<K, V>> Drop for ExtractScan<'_, K, V, P> {
     fn drop(&mut self) {
         if !self.finished {
             // SAFETY: the iterator still owns the map's exclusive borrow.
-            unsafe { (*self.table).finish_deferred_removals() };
+            unsafe { (*self.table.as_ptr()).finish_deferred_removals() };
         }
     }
 }

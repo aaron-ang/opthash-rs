@@ -8,16 +8,38 @@
 
 mod support;
 
-#[test]
-fn funnel_shared_and_consuming_iterators_remain_send_and_sync() {
-    fn assert_send_sync<T: Send + Sync>(_: T) {}
-    let mut map = <support::FunnelHashMap<u64, u64> as support::Deterministic>::with_capacity(64);
-    map.insert(1, 2);
-    assert_send_sync(map.iter());
-    assert_send_sync(map.keys());
-    assert_send_sync(map.values());
-    assert_send_sync(map.into_iter());
+macro_rules! send_sync_suite {
+    ($name:ident, $Map:ident, $Set:ident) => {
+        #[test]
+        fn $name() {
+            fn assert_send_sync<T: Send + Sync>(_: T) {}
+            let mut map = <support::$Map<u64, u64> as support::Deterministic>::with_capacity(64);
+            map.insert(1, 2);
+            assert_send_sync(map.iter());
+            assert_send_sync(map.keys());
+            assert_send_sync(map.values());
+            assert_send_sync(map.iter_mut());
+            assert_send_sync(map.values_mut());
+            assert_send_sync(map.extract_if(|_, _| false));
+            assert_send_sync(map.drain());
+            assert_send_sync(map.into_iter());
+            let mut set = <support::$Set<u64> as support::Deterministic>::with_capacity(64);
+            assert_send_sync(set.extract_if(|_| false));
+            assert_send_sync(set.drain());
+        }
+    };
 }
+
+send_sync_suite!(
+    elastic_iterators_are_send_and_sync,
+    ElasticHashMap,
+    ElasticHashSet
+);
+send_sync_suite!(
+    funnel_iterators_are_send_and_sync,
+    FunnelHashMap,
+    FunnelHashSet
+);
 
 macro_rules! parity_suite {
     ($mod_name:ident, $TestMap:ident, $Entry:ident) => {
