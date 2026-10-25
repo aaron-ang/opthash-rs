@@ -126,3 +126,13 @@ fn infallible_float_compatibility_constructor_no_longer_clamps() {
 
     assert!(result.is_err());
 }
+
+#[test]
+fn build_error_display_leaves_cause_to_source() {
+    use std::error::Error;
+
+    let error = TryBuildError::InvalidReserveFraction(ReserveFractionError::NonFinite);
+    let source = error.source().expect("wrapped cause is the source");
+
+    assert!(!error.to_string().contains(&source.to_string()));
+}

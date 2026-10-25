@@ -310,7 +310,7 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
             hash_builder,
             alloc,
         )
-        .unwrap_or_else(|error| panic!("invalid map construction: {error}"))
+        .expect("invalid map construction")
     }
 
     /// Fallible compatibility constructor accepting an exact dyadic `f64`.
@@ -888,8 +888,7 @@ where
     /// Panics if the backend rejects the inputs or allocation fails.
     #[must_use]
     pub fn with_capacity_and_reserve(capacity: usize, reserve: ReserveFraction) -> Self {
-        Self::try_with_capacity_and_reserve(capacity, reserve)
-            .unwrap_or_else(|error| panic!("invalid map construction: {error}"))
+        Self::try_with_capacity_and_reserve(capacity, reserve).expect("invalid map construction")
     }
 
     /// Fallible exact-reserve constructor.

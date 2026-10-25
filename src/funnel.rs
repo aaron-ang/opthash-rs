@@ -1637,7 +1637,7 @@ where
         alloc: A,
     ) -> Self {
         Self::try_with_insert_budget(capacity, reserve, hash_builder, alloc)
-            .unwrap_or_else(|error| panic!("invalid Funnel construction: {error}"))
+            .expect("invalid Funnel construction")
     }
 
     fn try_with_capacity_and_reserve_and_hasher_in(
