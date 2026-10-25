@@ -5,9 +5,9 @@ use harness::memory::{
     AllocationCounters, AllocationMeasurement, AllocationSnapshot, CountingAllocator,
 };
 use harness::{
-    DEFAULT_HIT_QUERY_SEED, LATENCY_SIZES, MAP_SIZE, MAP_SLOTS, MapQuad, exact_size_label,
-    parse_positive_sizes, scaled_insert_sample_size, sequential_hit_keys, shuffled_hit_keys,
-    shuffled_hit_keys_with_seed,
+    DEFAULT_HIT_QUERY_SEED, GroupProbeMap, LATENCY_SIZES, MAP_SIZE, MAP_SLOTS, MISS_KEY_OFFSET,
+    MapQuad, OP_COUNT, exact_size_label, key_at, parse_positive_sizes, scaled_insert_sample_size,
+    sequential_hit_keys, shuffled_hit_keys, shuffled_hit_keys_with_seed,
 };
 
 fn pairs(count: usize) -> Vec<(u64, u64)> {
@@ -320,4 +320,43 @@ fn mean_latency_builds_each_map_once_per_size_not_once_per_sample() {
             && !source.contains("latency_arm!(\"std\", harness::build_std_map)"),
         "a builder inside bench_function is repeated for every Criterion sample"
     );
+}
+
+#[test]
+fn group_probe_matches_std_at_high_load() {
+    // 2^16 slots with all but 2^-10 of them filled: 99.9% load.
+    let slots = 1 << 16;
+    let entries = slots - (slots >> 10);
+    let pairs = harness::make_pairs(entries);
+    let mut map = GroupProbeMap::with_slots(slots, entries);
+    let mut model = harness::std_map_cap(entries);
+    assert!(map.is_empty());
+
+    for &(key, value) in &pairs {
+        assert_eq!(map.insert(key, value), model.insert(key, value));
+    }
+    for &(key, value) in pairs.iter().step_by(7) {
+        assert_eq!(map.insert(key, !value), model.insert(key, !value));
+    }
+    assert_eq!(map.len(), model.len());
+    for &(key, _) in &pairs {
+        assert_eq!(map.get(&key), model.get(&key));
+    }
+    for index in 0..OP_COUNT {
+        assert_eq!(map.get(&key_at(index + MISS_KEY_OFFSET)), None);
+    }
+}
+
+#[test]
+#[should_panic(expected = "max_len must leave an empty slot")]
+fn group_probe_rejects_a_budget_that_fills_every_slot() {
+    let _ = GroupProbeMap::with_slots(64, 64);
+}
+
+#[test]
+#[should_panic(expected = "GroupProbeMap is full")]
+fn group_probe_rejects_inserts_past_its_budget() {
+    let mut map = GroupProbeMap::with_slots(64, 1);
+    map.insert(1, 1);
+    map.insert(2, 2);
 }

@@ -10,11 +10,13 @@
 )]
 
 mod fixtures;
+mod group_probe;
 mod map_matrix;
 pub mod memory;
 mod queries;
 
 pub use fixtures::*;
+pub use group_probe::GroupProbeMap;
 pub use map_matrix::bench_one_lookup_group;
 pub use queries::*;
 
