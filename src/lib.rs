@@ -69,10 +69,9 @@ pub use funnel::{
 /// methods and trait impls are documented in one place.
 pub mod hash_map {
     pub use crate::map::{
-        Drain, Entry, ExtractIf, HashMap, IntoIter, Iter, IterMut, OccupiedEntry, OccupiedError,
-        VacantEntry,
+        Drain, Entry, ExtractIf, HashMap, IntoIter, IntoKeys, IntoValues, Iter, IterMut, Keys,
+        OccupiedEntry, OccupiedError, VacantEntry, Values, ValuesMut,
     };
-    pub use crate::raw::iter::{IntoKeys, IntoValues, Keys, Values};
 }
 
 /// The generic set shell behind [`ElasticHashSet`] and [`FunnelHashSet`],

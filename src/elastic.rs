@@ -299,8 +299,6 @@ macros::declare_backend_aliases! {
         ElasticSetIter => Iter,
         /// Draining iterator that empties the set.
         ElasticSetDrain => Drain,
-        /// Iterator yielding values removed by set `extract_if`.
-        ElasticSetExtractIf => ExtractIf,
         /// Iterator over values present only in the first set.
         ElasticDifference => Difference,
         /// Iterator over values present in both sets.
@@ -315,6 +313,10 @@ macros::declare_backend_aliases! {
         ElasticSetOccupiedEntry => OccupiedEntry,
         /// View of a vacant set entry.
         ElasticSetVacantEntry => VacantEntry,
+    },
+    set_extract_if {
+        /// Iterator yielding values removed by set `extract_if`.
+        ElasticSetExtractIf
     },
 }
 
