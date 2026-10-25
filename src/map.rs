@@ -1182,13 +1182,9 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     where
         F: FnMut(&K, &mut V) -> bool,
     {
-        let scan = self.table.scan();
         ExtractIf {
-            table: core::ptr::from_mut(&mut self.table),
-            scan,
+            scan: ExtractScan::new(self),
             pred: f,
-            finished: false,
-            _marker: PhantomData,
         }
     }
 }
@@ -1421,11 +1417,8 @@ where
 /// clean accumulated tombstones.
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct ExtractIf<'a, K, V, P: TableBackend<K, V>, F> {
-    table: *mut P,
-    scan: P::Scan,
+    scan: ExtractScan<'a, K, V, P>,
     pred: F,
-    finished: bool,
-    _marker: PhantomData<&'a mut P>,
 }
 
 impl<K, V, P, F> Iterator for ExtractIf<'_, K, V, P, F>
@@ -1435,6 +1428,39 @@ where
 {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
+        self.scan.next_matching(&mut self.pred)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
+    }
+}
+
+/// Removal scan behind map and set `ExtractIf`. Holds the map's exclusive
+/// borrow and finishes deferred cleanup once exhausted or dropped.
+pub(crate) struct ExtractScan<'a, K, V, P: TableBackend<K, V>> {
+    table: *mut P,
+    scan: P::Scan,
+    finished: bool,
+    _marker: PhantomData<&'a mut HashMap<K, V, P>>,
+}
+
+impl<'a, K, V, P: TableBackend<K, V>> ExtractScan<'a, K, V, P> {
+    pub(crate) fn new(map: &'a mut HashMap<K, V, P>) -> Self {
+        let scan = map.table.scan();
+        Self {
+            table: core::ptr::from_mut(&mut map.table),
+            scan,
+            finished: false,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Removes and returns the next entry `pred` accepts.
+    #[inline]
+    pub(crate) fn next_matching(
+        &mut self,
+        mut pred: impl FnMut(&K, &mut V) -> bool,
+    ) -> Option<(K, V)> {
         if self.finished {
             return None;
         }
@@ -1449,7 +1475,7 @@ where
             };
             // SAFETY: live slot; exclusive via the `&mut` map borrow.
             let slot = unsafe { &mut *ptr };
-            if (self.pred)(&slot.key, &mut slot.value) {
+            if pred(&slot.key, &mut slot.value) {
                 // SAFETY: matched — read the entry out, then finalize removal
                 // (tombstone + counters; the map keeps being used).
                 let entry = unsafe { core::ptr::read(ptr) };
@@ -1459,9 +1485,6 @@ where
                 return Some((entry.key, entry.value));
             }
         }
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, None)
     }
 }
 
@@ -1478,7 +1501,7 @@ where
 {
 }
 
-impl<K, V, P: TableBackend<K, V>, F> Drop for ExtractIf<'_, K, V, P, F> {
+impl<K, V, P: TableBackend<K, V>> Drop for ExtractScan<'_, K, V, P> {
     fn drop(&mut self) {
         if !self.finished {
             // SAFETY: the iterator still owns the map's exclusive borrow.

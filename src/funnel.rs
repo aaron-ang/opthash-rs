@@ -706,8 +706,6 @@ macros::declare_backend_aliases! {
         FunnelSetIter => Iter,
         /// Draining iterator that empties the set.
         FunnelSetDrain => Drain,
-        /// Iterator yielding values removed by set `extract_if`.
-        FunnelSetExtractIf => ExtractIf,
         /// Iterator over values present only in the first set.
         FunnelDifference => Difference,
         /// Iterator over values present in both sets.
@@ -722,6 +720,10 @@ macros::declare_backend_aliases! {
         FunnelSetOccupiedEntry => OccupiedEntry,
         /// View of a vacant set entry.
         FunnelSetVacantEntry => VacantEntry,
+    },
+    set_extract_if {
+        /// Iterator yielding values removed by set `extract_if`.
+        FunnelSetExtractIf
     },
 }
 

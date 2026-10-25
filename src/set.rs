@@ -3,7 +3,6 @@ use core::hash::Hash;
 use core::iter::{Chain, FusedIterator};
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Sub, SubAssign};
 
-use alloc::boxed::Box;
 use allocator_api2::alloc::Global;
 use equivalent::Equivalent;
 
@@ -12,11 +11,6 @@ use crate::error::{TryBuildError, TryReserveError};
 use crate::hasher::DefaultHashBuilder;
 use crate::map::{self, TableBackend};
 use crate::{EpochSnapshot, ReserveFraction};
-
-/// Boxed predicate adapting a set-level `FnMut(&T) -> bool` to the map's
-/// `FnMut(&K, &mut V) -> bool`. Boxing keeps the public `ExtractIf` type
-/// nameable; the allocation is once per `extract_if` call, off the hot path.
-type SetExtractPred<'a, T> = Box<dyn FnMut(&T, &mut ()) -> bool + 'a>;
 
 /// Forward a family of [`HashSet`] constructors to the same-named
 /// [`map::HashMap`] constructor. `-> Self` items wrap the map directly;
@@ -440,14 +434,13 @@ where
 
     /// Removes and yields values for which `f` returns `true`. Retains the
     /// rest, and retains any unvisited values if the iterator is dropped early.
-    pub fn extract_if<'s, F>(&'s mut self, mut f: F) -> ExtractIf<'s, T, P>
+    pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, T, P, F>
     where
-        T: 's,
-        F: FnMut(&T) -> bool + 's,
+        F: FnMut(&T) -> bool,
     {
-        let pred: SetExtractPred<'s, T> = Box::new(move |value, ()| f(value));
         ExtractIf {
-            inner: self.map.extract_if(pred),
+            scan: map::ExtractScan::new(&mut self.map),
+            pred: f,
         }
     }
 }
@@ -863,18 +856,41 @@ set_iter! {
     exact_size debug_opaque
 }
 
-set_iter! {
-    /// Iterator yielding the extracted values of a [`HashSet`].
-    #[must_use = "iterators are lazy and do nothing unless consumed"]
-    pub struct ExtractIf<'a, T, P> { inner: map::ExtractIf<'a, T, (), P, SetExtractPred<'a, T>> }
+/// Iterator yielding the extracted values of a [`HashSet`].
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct ExtractIf<'a, T, P: TableBackend<T, ()>, F> {
+    scan: map::ExtractScan<'a, T, (), P>,
+    pred: F,
+}
+
+impl<T, P, F> Iterator for ExtractIf<'_, T, P, F>
+where
+    P: TableBackend<T, ()>,
+    F: FnMut(&T) -> bool,
+{
     type Item = T;
-    fn next(&mut self) {
-        self.inner.next().map(|(value, ())| value)
+    fn next(&mut self) -> Option<T> {
+        let pred = &mut self.pred;
+        self.scan
+            .next_matching(|value, ()| pred(value))
+            .map(|(value, ())| value)
     }
-    fn size_hint(&self) {
-        (0, self.inner.size_hint().1)
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
     }
-    debug_opaque
+}
+
+impl<T, P, F> FusedIterator for ExtractIf<'_, T, P, F>
+where
+    P: TableBackend<T, ()>,
+    F: FnMut(&T) -> bool,
+{
+}
+
+impl<T, P: TableBackend<T, ()>, F> fmt::Debug for ExtractIf<'_, T, P, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtractIf").finish_non_exhaustive()
+    }
 }
 
 /// Advances `iter` to the next value whose membership in `other` equals

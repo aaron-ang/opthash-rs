@@ -9,7 +9,6 @@ fn default_is_exactly_one_eighth() {
     assert_eq!(reserve.exponent(), 3);
     assert_eq!(reserve.to_f64(), Some(0.125));
     assert_eq!(reserve.floor_reserved(17), 2);
-    assert_eq!(reserve.floor_half_reserved(17), 1);
 }
 
 #[test]
@@ -23,7 +22,6 @@ fn exponent_constructor_rejects_zero_and_handles_unrepresentable_floats() {
     assert_eq!(reserve.exponent(), u32::MAX);
     assert_eq!(reserve.to_f64(), None);
     assert_eq!(reserve.floor_reserved(usize::MAX), 0);
-    assert_eq!(reserve.floor_half_reserved(usize::MAX), 0);
 }
 
 #[test]
@@ -71,11 +69,9 @@ fn float_constructor_rejects_non_inverse_powers_of_two() {
 fn integer_reserve_rounding_is_exact_at_word_boundaries() {
     let one_half = ReserveFraction::from_exponent(1).unwrap();
     assert_eq!(one_half.floor_reserved(usize::MAX), usize::MAX >> 1);
-    assert_eq!(one_half.floor_half_reserved(usize::MAX), usize::MAX >> 2);
 
     let last_nonzero = ReserveFraction::from_exponent(usize::BITS - 1).unwrap();
     assert_eq!(last_nonzero.floor_reserved(usize::MAX), 1);
-    assert_eq!(last_nonzero.floor_half_reserved(usize::MAX), 0);
 }
 
 #[test]

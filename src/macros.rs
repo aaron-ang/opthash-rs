@@ -7,7 +7,7 @@
 /// shells; the generic-argument threading lives here once. Each entry is its
 /// doc attributes, alias name, and the unprefixed shell type. Categories are the distinct
 /// generic shapes: `*_no_lifetime` (owned/consuming, `<K, V, S, A>`), `*_ref`
-/// (borrowing, carries `'a`), and `map_extract_if` (threads its `F` after the
+/// (borrowing, carries `'a`), and `*_extract_if` (threads its `F` after the
 /// table type).
 macro_rules! declare_backend_aliases {
     (
@@ -22,6 +22,8 @@ macro_rules! declare_backend_aliases {
         set_no_lifetime { $($(#[$sp_meta:meta])* $sp_alias:ident => $sp_target:ident),* $(,)? },
         // set, borrowing (`'a`): `set::Target<'a, T, Table<T, (), S, A>>`
         set_ref { $($(#[$sr_meta:meta])* $sr_alias:ident => $sr_target:ident),* $(,)? },
+        // set `ExtractIf`: `<'a, T, F, S, A>` -> `set::ExtractIf<'a, T, Table<..>, F>`
+        set_extract_if { $(#[$sx_meta:meta])* $sx_alias:ident },
     ) => {
         $(
             $(#[$mp_meta])*
@@ -68,6 +70,14 @@ macro_rules! declare_backend_aliases {
                 A = allocator_api2::alloc::Global,
             > = $crate::set::$sr_target<'a, T, $Table<T, (), S, A>>;
         )*
+        $(#[$sx_meta])*
+        pub type $sx_alias<
+            'a,
+            T,
+            F,
+            S = $crate::DefaultHashBuilder,
+            A = allocator_api2::alloc::Global,
+        > = $crate::set::ExtractIf<'a, T, $Table<T, (), S, A>, F>;
     };
 }
 
