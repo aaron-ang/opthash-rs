@@ -102,6 +102,10 @@ name = "scaled_insert"
 harness = false
 
 [[bench]]
+name = "high_load"
+harness = false
+
+[[bench]]
 name = "memory"
 harness = false
 
