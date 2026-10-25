@@ -61,9 +61,8 @@ Advanced users can tune the reserve with `ReserveFraction`, provide another
 
 To use opthash without `std`, disable default features and provide a hasher:
 
-```toml
-[dependencies]
-opthash = { version = "0.11", default-features = false }
+```bash
+cargo add opthash --no-default-features
 ```
 
 ## Choosing an algorithm
