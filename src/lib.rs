@@ -60,3 +60,28 @@ pub use funnel::{
     FunnelSetVacantEntry, FunnelSymmetricDifference, FunnelUnion, FunnelVacantEntry, FunnelValues,
     FunnelValuesMut,
 };
+
+/// The generic map shell behind [`ElasticHashMap`] and [`FunnelHashMap`],
+/// with its entry and iterator types.
+///
+/// Name these through the backend aliases; this module exists so their
+/// methods and trait impls are documented in one place.
+pub mod hash_map {
+    pub use crate::map::{
+        Drain, Entry, ExtractIf, HashMap, IntoIter, Iter, IterMut, OccupiedEntry, OccupiedError,
+        VacantEntry,
+    };
+    pub use crate::raw::iter::{IntoKeys, IntoValues, Keys, Values};
+}
+
+/// The generic set shell behind [`ElasticHashSet`] and [`FunnelHashSet`],
+/// with its entry and iterator types.
+///
+/// Name these through the backend aliases; this module exists so their
+/// methods and trait impls are documented in one place.
+pub mod hash_set {
+    pub use crate::set::{
+        Difference, Drain, Entry, ExtractIf, HashSet, Intersection, IntoIter, Iter, OccupiedEntry,
+        SymmetricDifference, Union, VacantEntry,
+    };
+}

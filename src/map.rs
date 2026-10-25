@@ -241,7 +241,7 @@ pub trait TableBackend<K, V>: Sized {
         Self::Hasher: Clone;
 }
 
-/// Use a [`TableBackend`] backend to store key-value pairs.
+/// Use a table backend to store key-value pairs.
 pub struct HashMap<K, V, P: TableBackend<K, V>> {
     table: P,
     _marker: PhantomData<(K, V)>,
@@ -368,6 +368,10 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     }
 
     /// Reserves room for at least `additional` more entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity overflows `usize`.
     pub fn reserve(&mut self, additional: usize) {
         self.table.reserve(additional);
     }
@@ -1411,6 +1415,12 @@ where
     P: TableBackend<K, V>,
 {
     type Output = V;
+
+    /// Returns the value for `key`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `key` is not present.
     fn index(&self, key: &Q) -> &V {
         self.get(key).expect("no entry found for key")
     }
