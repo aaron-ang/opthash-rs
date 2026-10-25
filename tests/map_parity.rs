@@ -1153,6 +1153,14 @@ macro_rules! parity_suite {
                 let mut map: HashMap<i32, i32> = HashMap::new();
                 map.insert(1, 10);
                 assert_eq!(format!("{:?}", map.iter_mut()), "[(1, 10)]");
+                let mut iter_mut = map.iter_mut();
+                iter_mut.next();
+                assert_eq!(format!("{iter_mut:?}"), "[]");
+                assert_eq!(format!("{:?}", map.keys()), "[1]");
+                assert_eq!(format!("{:?}", map.values()), "[10]");
+                assert_eq!(format!("{:?}", map.values_mut()), "[10]");
+                assert_eq!(format!("{:?}", map.clone().into_keys()), "[1]");
+                assert_eq!(format!("{:?}", map.clone().into_values()), "[10]");
                 assert_eq!(
                     format!("{:?}", map.entry(1)),
                     "Entry(OccupiedEntry { key: 1, value: 10 })"

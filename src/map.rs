@@ -16,10 +16,6 @@ use crate::error::{TryBuildError, TryReserveError};
 use crate::hasher::DefaultHashBuilder;
 use crate::raw::arena::{self, SlotEntry};
 use crate::raw::config::INITIAL_CAPACITY;
-use crate::raw::iter::{
-    IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
-    Values as CommonValues,
-};
 
 /// The backend contract behind [`HashMap`]: storage, lookup, insert, iteration,
 /// and lifecycle, grouped into sections below.
@@ -1142,27 +1138,33 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
 
     /// Iterator over `&K`.
     pub fn keys(&self) -> Keys<'_, K, V, P> {
-        CommonKeys::new(self.iter())
+        Keys { inner: self.iter() }
     }
 
     /// Iterator over `&V`.
     pub fn values(&self) -> Values<'_, K, V, P> {
-        CommonValues::new(self.iter())
+        Values { inner: self.iter() }
     }
 
     /// Iterator over `&mut V`.
     pub fn values_mut(&mut self) -> ValuesMut<'_, K, V, P> {
-        CommonValues::new(self.iter_mut())
+        ValuesMut {
+            inner: self.iter_mut(),
+        }
     }
 
     /// Consuming iterator over owned keys.
     pub fn into_keys(self) -> IntoKeys<K, V, P> {
-        CommonIntoKeys::new(self.into_iter())
+        IntoKeys {
+            inner: self.into_iter(),
+        }
     }
 
     /// Consuming iterator over owned values.
     pub fn into_values(self) -> IntoValues<K, V, P> {
-        CommonIntoValues::new(self.into_iter())
+        IntoValues {
+            inner: self.into_iter(),
+        }
     }
 
     /// Draining iterator that empties the map.
@@ -1230,6 +1232,10 @@ where
     P: TableBackend<K, V>,
     P::Scan: Clone,
 {
+    fn view(&self) -> Self {
+        self.clone()
+    }
+
     /// Shared view of the entries another iterator has yet to yield.
     fn remaining(table: &'a P, scan: &P::Scan, remaining: usize) -> Self {
         Self {
@@ -1314,13 +1320,22 @@ where
     P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.view()).finish()
+    }
+}
+
+impl<K, V, P> IterMut<'_, K, V, P>
+where
+    P: TableBackend<K, V>,
+    P::Scan: Clone,
+{
+    /// Shared view of the entries not yet yielded.
+    pub(crate) fn view(&self) -> Iter<'_, K, V, P> {
         // SAFETY: `&self` blocks `next`, and the cloned scan visits only
         // slots not yet yielded, so these shared borrows alias no handed-out
         // `&mut V`.
         let table = unsafe { &*self.table };
-        f.debug_list()
-            .entries(Iter::remaining(table, &self.scan, self.remaining))
-            .finish()
+        Iter::remaining(table, &self.scan, self.remaining)
     }
 }
 
@@ -1354,9 +1369,18 @@ where
     P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(Iter::remaining(&self.table, &self.scan, self.remaining))
-            .finish()
+        f.debug_list().entries(self.view()).finish()
+    }
+}
+
+impl<K, V, P> IntoIter<K, V, P>
+where
+    P: TableBackend<K, V>,
+    P::Scan: Clone,
+{
+    /// Shared view of the entries not yet yielded.
+    pub(crate) fn view(&self) -> Iter<'_, K, V, P> {
+        Iter::remaining(&self.table, &self.scan, self.remaining)
     }
 }
 
@@ -1403,12 +1427,21 @@ where
     P::Scan: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.view()).finish()
+    }
+}
+
+impl<K, V, P> Drain<'_, K, V, P>
+where
+    P: TableBackend<K, V>,
+    P::Scan: Clone,
+{
+    /// Shared view of the entries not yet moved out.
+    pub(crate) fn view(&self) -> Iter<'_, K, V, P> {
         // SAFETY: `table` points to the exclusively borrowed map; the cloned
         // scan visits only slots not yet moved out.
         let table = unsafe { &*self.table };
-        f.debug_list()
-            .entries(Iter::remaining(table, &self.scan, self.remaining))
-            .finish()
+        Iter::remaining(table, &self.scan, self.remaining)
     }
 }
 
@@ -1510,16 +1543,98 @@ impl<K, V, P: TableBackend<K, V>> Drop for ExtractScan<'_, K, V, P> {
     }
 }
 
-/// Iterator over `&K`.
-pub(crate) type Keys<'a, K, V, P> = CommonKeys<Iter<'a, K, V, P>>;
-/// Iterator over `&V`.
-pub(crate) type Values<'a, K, V, P> = CommonValues<Iter<'a, K, V, P>>;
-/// Iterator over `&mut V`.
-pub(crate) type ValuesMut<'a, K, V, P> = CommonValues<IterMut<'a, K, V, P>>;
-/// Consuming iterator over owned keys.
-pub(crate) type IntoKeys<K, V, P> = CommonIntoKeys<IntoIter<K, V, P>>;
-/// Consuming iterator over owned values.
-pub(crate) type IntoValues<K, V, P> = CommonIntoValues<IntoIter<K, V, P>>;
+/// Generate a projection iterator over one of the `(K, V)` scanning iterators.
+///
+/// Each type maps every inner item through `$project`, forwards `size_hint`,
+/// and inherits the inner `ExactSizeIterator` and `FusedIterator`. `Debug`
+/// lists the projection of the not-yet-yielded entries. A trailing `clone`
+/// derives `Clone` from the inner borrowing iterator.
+macro_rules! project_iter {
+    (
+        $(#[$attr:meta])*
+        $name:ident$(<$lt:lifetime>)?($inner:ident) => $item:ty, debug($shown:ident),
+        |($k:pat_param, $v:pat_param)| $project:expr $(, $flag:ident)?
+    ) => {
+        $(#[$attr])*
+        #[must_use = "iterators are lazy and do nothing unless consumed"]
+        pub struct $name<$($lt,)? K, V, P: TableBackend<K, V>> {
+            inner: $inner<$($lt,)? K, V, P>,
+        }
+
+        impl<$($lt,)? K, V, P: TableBackend<K, V>> Iterator for $name<$($lt,)? K, V, P> {
+            type Item = $item;
+            #[inline]
+            fn next(&mut self) -> Option<$item> {
+                self.inner.next().map(|($k, $v)| $project)
+            }
+            #[inline]
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                self.inner.size_hint()
+            }
+        }
+
+        impl<$($lt,)? K, V, P: TableBackend<K, V>> ExactSizeIterator for $name<$($lt,)? K, V, P> {
+            fn len(&self) -> usize {
+                self.inner.len()
+            }
+        }
+
+        impl<$($lt,)? K, V, P: TableBackend<K, V>> FusedIterator for $name<$($lt,)? K, V, P> {}
+
+        impl<$($lt,)? K, V, P> fmt::Debug for $name<$($lt,)? K, V, P>
+        where
+            $shown: fmt::Debug,
+            P: TableBackend<K, V>,
+            P::Scan: Clone,
+        {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_list()
+                    .entries(self.inner.view().map(|($k, $v)| $project))
+                    .finish()
+            }
+        }
+
+        $(project_iter!(@$flag $name);)?
+    };
+    (@clone $name:ident) => {
+        impl<K, V, P> Clone for $name<'_, K, V, P>
+        where
+            P: TableBackend<K, V>,
+            P::Scan: Clone,
+        {
+            fn clone(&self) -> Self {
+                Self {
+                    inner: self.inner.clone(),
+                }
+            }
+        }
+    };
+}
+
+project_iter! {
+    /// Iterator over `&K`.
+    Keys<'a>(Iter) => &'a K, debug(K), |(k, _)| k, clone
+}
+
+project_iter! {
+    /// Iterator over `&V`.
+    Values<'a>(Iter) => &'a V, debug(V), |(_, v)| v, clone
+}
+
+project_iter! {
+    /// Iterator over `&mut V`.
+    ValuesMut<'a>(IterMut) => &'a mut V, debug(V), |(_, v)| v
+}
+
+project_iter! {
+    /// Consuming iterator over owned keys.
+    IntoKeys(IntoIter) => K, debug(K), |(k, _)| k
+}
+
+project_iter! {
+    /// Consuming iterator over owned values.
+    IntoValues(IntoIter) => V, debug(V), |(_, v)| v
+}
 
 // ---------------------------------------------------------------------------
 // Trait impls

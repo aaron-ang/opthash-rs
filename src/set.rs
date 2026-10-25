@@ -50,7 +50,8 @@ macro_rules! forward_constructors {
 /// `where` clauses shared by every `Iterator`-dependent impl. Trailing flags
 /// add `exact_size` (`len` forwards to the first field), `clone` (fieldwise,
 /// requiring `P::Scan: Clone`), and either `debug_list` (prints the
-/// remaining values from a clone) or `debug_opaque` (prints the type name).
+/// remaining values from a clone) or `debug_view` (prints the remaining
+/// values of the inner map iterator's `view`).
 macro_rules! set_iter {
     (
         $(#[$attr:meta])*
@@ -130,13 +131,17 @@ macro_rules! set_iter {
             }
         }
     };
-    (@debug_opaque $name:ident<$($lt:lifetime,)? T, P> [$($bound:tt)*] { $($field:ident),+ }) => {
+    (@debug_view $name:ident<$($lt:lifetime,)? T, P> [$($bound:tt)*] { $first:ident $(, $rest:ident)* }) => {
         impl<$($lt,)? T, P> fmt::Debug for $name<$($lt,)? T, P>
         where
+            T: fmt::Debug,
             P: TableBackend<T, ()>,
+            P::Scan: Clone,
         {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.debug_struct(stringify!($name)).finish_non_exhaustive()
+                f.debug_list()
+                    .entries(self.$first.view().map(|(value, ())| value))
+                    .finish()
             }
         }
     };
@@ -706,7 +711,7 @@ where
     type IntoIter = IntoIter<T, P>;
     fn into_iter(self) -> IntoIter<T, P> {
         IntoIter {
-            inner: self.map.into_keys(),
+            inner: self.map.into_iter(),
         }
     }
 }
@@ -832,15 +837,15 @@ set_iter! {
 set_iter! {
     /// Consuming iterator over [`HashSet`] values.
     #[must_use = "iterators are lazy and do nothing unless consumed"]
-    pub struct IntoIter<T, P> { inner: map::IntoKeys<T, (), P> }
+    pub struct IntoIter<T, P> { inner: map::IntoIter<T, (), P> }
     type Item = T;
     fn next(&mut self) {
-        self.inner.next()
+        self.inner.next().map(|(value, ())| value)
     }
     fn size_hint(&self) {
         self.inner.size_hint()
     }
-    exact_size debug_opaque
+    exact_size debug_view
 }
 
 set_iter! {
@@ -853,7 +858,7 @@ set_iter! {
     fn size_hint(&self) {
         self.inner.size_hint()
     }
-    exact_size debug_opaque
+    exact_size debug_view
 }
 
 /// Iterator yielding the extracted values of a [`HashSet`].
