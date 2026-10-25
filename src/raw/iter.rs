@@ -20,6 +20,7 @@ macro_rules! project_iter {
         $name:ident => $item:ident, |($k:pat_param, $v:pat_param)| $project:expr
     ) => {
         $(#[$attr])*
+        #[must_use = "iterators are lazy and do nothing unless consumed"]
         pub struct $name<I> {
             inner: I,
         }

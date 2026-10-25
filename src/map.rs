@@ -331,26 +331,31 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     }
 
     /// Reference to the map's allocator.
+    #[must_use]
     pub fn allocator(&self) -> &P::Alloc {
         self.table.allocator()
     }
 
     /// Reference to the map's [`BuildHasher`].
+    #[must_use]
     pub fn hasher(&self) -> &P::Hasher {
         self.table.hasher()
     }
 
     /// Number of entries.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.table.len()
     }
 
     /// Returns `true` if empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.table.len() == 0
     }
 
     /// Maximum entries before the next automatic resize.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.table.capacity()
     }
@@ -449,6 +454,7 @@ where
     }
 
     /// Returns a reference to the value for `key`.
+    #[must_use]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -457,6 +463,7 @@ where
     }
 
     /// Returns the stored `(key, value)` pair for `key`.
+    #[must_use]
     pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -498,6 +505,7 @@ where
     }
 
     /// Returns `true` if `key` is present.
+    #[must_use]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -788,13 +796,11 @@ where
     }
 
     /// Removes the entry and returns its value.
-    #[must_use]
     pub fn remove(self) -> V {
         self.remove_entry().1
     }
 
     /// Removes the entry and returns the `(key, value)` pair.
-    #[must_use]
     pub fn remove_entry(self) -> (K, V) {
         self.map.table.remove(self.loc)
     }
@@ -806,6 +812,7 @@ where
     P: TableBackend<K, V>,
 {
     /// Reference to the key that would be inserted.
+    #[must_use]
     pub fn key(&self) -> &K {
         &self.key
     }
@@ -858,6 +865,7 @@ where
     }
 
     /// Reference to this entry's key.
+    #[must_use]
     pub fn key(&self) -> &K {
         match self {
             Entry::Occupied(e) => e.key(),
@@ -1178,6 +1186,7 @@ exact_scan_iters! {
 }
 
 /// Borrowing iterator over `(&K, &V)`.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Iter<'a, K, V, P: TableBackend<K, V>> {
     table: &'a P,
     scan: P::Scan,
@@ -1242,6 +1251,7 @@ where
 }
 
 /// Borrowing iterator over `(&K, &mut V)`.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct IterMut<'a, K, V, P: TableBackend<K, V>> {
     table: *mut P,
     scan: P::Scan,
@@ -1284,6 +1294,7 @@ where
 }
 
 /// Consuming iterator over owned `(K, V)`.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct IntoIter<K, V, P: TableBackend<K, V>> {
     table: P,
     scan: P::Scan,
@@ -1373,6 +1384,7 @@ where
 /// Iterator yielding entries removed by [`HashMap::extract_if`]. Unyielded
 /// non-matching entries are retained. Exhausting or dropping the iterator may
 /// clean accumulated tombstones.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct ExtractIf<'a, K, V, P: TableBackend<K, V>, F> {
     table: *mut P,
     scan: P::Scan,
