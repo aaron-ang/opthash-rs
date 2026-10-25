@@ -8,6 +8,7 @@ const HAD_DELETE_MASK: u64 = 1_u64 << 63;
 /// Cause of the current allocation epoch.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum EpochTransition {
     /// Initial construction.
     Initial,
@@ -25,6 +26,7 @@ pub enum EpochTransition {
 
 /// Snapshot of the current allocation epoch.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub struct EpochSnapshot {
     /// Monotonic epoch number; initial construction is generation zero.
     pub generation: u64,
