@@ -128,6 +128,11 @@ fn infallible_float_compatibility_constructor_no_longer_clamps() {
 }
 
 #[test]
+fn default_trait_matches_default_const() {
+    assert_eq!(ReserveFraction::default(), ReserveFraction::DEFAULT);
+}
+
+#[test]
 fn build_error_display_leaves_cause_to_source() {
     use std::error::Error;
 

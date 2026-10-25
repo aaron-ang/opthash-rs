@@ -10,6 +10,7 @@
 // govern only the library and not benches/tests/build-script.
 #![warn(missing_docs)]
 #![warn(unreachable_pub)]
+#![warn(missing_debug_implementations)]
 
 extern crate alloc;
 

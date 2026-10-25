@@ -75,6 +75,12 @@ impl ReserveFraction {
     }
 }
 
+impl Default for ReserveFraction {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 impl TryFrom<f64> for ReserveFraction {
     type Error = ReserveFractionError;
 

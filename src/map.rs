@@ -680,6 +680,44 @@ where
     }
 }
 
+impl<K, V, P> fmt::Debug for OccupiedEntry<'_, K, V, P>
+where
+    K: Eq + Hash + fmt::Debug,
+    V: fmt::Debug,
+    P: TableBackend<K, V>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OccupiedEntry")
+            .field("key", self.key())
+            .field("value", self.get())
+            .finish()
+    }
+}
+
+impl<K, V, P> fmt::Debug for VacantEntry<'_, K, V, P>
+where
+    K: Eq + Hash + fmt::Debug,
+    P: TableBackend<K, V>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("VacantEntry").field(self.key()).finish()
+    }
+}
+
+impl<K, V, P> fmt::Debug for Entry<'_, K, V, P>
+where
+    K: Eq + Hash + fmt::Debug,
+    V: fmt::Debug,
+    P: TableBackend<K, V>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Entry::Occupied(entry) => f.debug_tuple("Entry").field(entry).finish(),
+            Entry::Vacant(entry) => f.debug_tuple("Entry").field(entry).finish(),
+        }
+    }
+}
+
 impl<K, V, P> fmt::Display for OccupiedError<'_, K, V, P>
 where
     K: Eq + Hash + fmt::Debug,
@@ -784,7 +822,7 @@ where
     }
 
     /// Inserts `value` and returns the resulting [`OccupiedEntry`].
-    pub(crate) fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, P> {
+    pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, P> {
         let loc = self
             .map
             .table
@@ -1147,6 +1185,22 @@ pub struct Iter<'a, K, V, P: TableBackend<K, V>> {
     _marker: PhantomData<(&'a K, &'a V)>,
 }
 
+impl<'a, K, V, P> Iter<'a, K, V, P>
+where
+    P: TableBackend<K, V>,
+    P::Scan: Clone,
+{
+    /// Shared view of the entries another iterator has yet to yield.
+    fn remaining(table: &'a P, scan: &P::Scan, remaining: usize) -> Self {
+        Self {
+            table,
+            scan: scan.clone(),
+            remaining,
+            _marker: PhantomData,
+        }
+    }
+}
+
 impl<'a, K, V, P: TableBackend<K, V>> Iterator for Iter<'a, K, V, P> {
     type Item = (&'a K, &'a V);
     fn next(&mut self) -> Option<(&'a K, &'a V)> {
@@ -1213,6 +1267,22 @@ impl<'a, K, V, P: TableBackend<K, V>> Iterator for IterMut<'a, K, V, P> {
     }
 }
 
+impl<K: fmt::Debug, V: fmt::Debug, P> fmt::Debug for IterMut<'_, K, V, P>
+where
+    P: TableBackend<K, V>,
+    P::Scan: Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // SAFETY: `&self` blocks `next`, and the cloned scan visits only
+        // slots not yet yielded, so these shared borrows alias no handed-out
+        // `&mut V`.
+        let table = unsafe { &*self.table };
+        f.debug_list()
+            .entries(Iter::remaining(table, &self.scan, self.remaining))
+            .finish()
+    }
+}
+
 /// Consuming iterator over owned `(K, V)`.
 pub struct IntoIter<K, V, P: TableBackend<K, V>> {
     table: P,
@@ -1233,6 +1303,18 @@ impl<K, V, P: TableBackend<K, V>> Iterator for IntoIter<K, V, P> {
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug, P> fmt::Debug for IntoIter<K, V, P>
+where
+    P: TableBackend<K, V>,
+    P::Scan: Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(Iter::remaining(&self.table, &self.scan, self.remaining))
+            .finish()
     }
 }
 
@@ -1270,6 +1352,21 @@ impl<K, V, P: TableBackend<K, V>> Drop for Drain<'_, K, V, P> {
         // SAFETY: `table` points to the exclusively borrowed map for the drain's
         // lifetime.
         unsafe { (*self.table).wipe_all() };
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug, P> fmt::Debug for Drain<'_, K, V, P>
+where
+    P: TableBackend<K, V>,
+    P::Scan: Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // SAFETY: `table` points to the exclusively borrowed map; the cloned
+        // scan visits only slots not yet moved out.
+        let table = unsafe { &*self.table };
+        f.debug_list()
+            .entries(Iter::remaining(table, &self.scan, self.remaining))
+            .finish()
     }
 }
 
@@ -1318,6 +1415,12 @@ where
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         (0, None)
+    }
+}
+
+impl<K, V, P: TableBackend<K, V>, F> fmt::Debug for ExtractIf<'_, K, V, P, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtractIf").finish_non_exhaustive()
     }
 }
 
@@ -1472,6 +1575,17 @@ where
         let mut map = Self::with_capacity_and_hasher(iter.size_hint().0, P::Hasher::default());
         map.extend(iter);
         map
+    }
+}
+
+impl<K, V, P, const N: usize> From<[(K, V); N]> for HashMap<K, V, P>
+where
+    K: Eq + Hash,
+    P: TableBackend<K, V, Alloc = Global>,
+    P::Hasher: Default,
+{
+    fn from(arr: [(K, V); N]) -> Self {
+        arr.into_iter().collect()
     }
 }
 

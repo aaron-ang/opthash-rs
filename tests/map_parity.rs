@@ -1147,6 +1147,45 @@ macro_rules! parity_suite {
                 drop(cloned);
                 assert_eq!(counter.load(Ordering::SeqCst), 32);
             }
+
+            #[test]
+            fn test_debug_formats() {
+                let mut map: HashMap<i32, i32> = HashMap::new();
+                map.insert(1, 10);
+                assert_eq!(format!("{:?}", map.iter_mut()), "[(1, 10)]");
+                assert_eq!(
+                    format!("{:?}", map.entry(1)),
+                    "Entry(OccupiedEntry { key: 1, value: 10 })"
+                );
+                assert_eq!(format!("{:?}", map.entry(2)), "Entry(VacantEntry(2))");
+                assert_eq!(
+                    format!("{:?}", map.extract_if(|_, _| false)),
+                    "ExtractIf { .. }"
+                );
+                let mut drain = map.clone();
+                assert_eq!(format!("{:?}", drain.drain()), "[(1, 10)]");
+                let mut into_iter = map.into_iter();
+                assert_eq!(format!("{into_iter:?}"), "[(1, 10)]");
+                into_iter.next();
+                assert_eq!(format!("{into_iter:?}"), "[]");
+            }
+
+            #[test]
+            fn test_from_array() {
+                let map: HashMap<i32, i32> = HashMap::from_iter([(1, 10), (2, 20)]);
+                let from_array = <HashMap<i32, i32>>::from([(1, 10), (2, 20)]);
+                assert_eq!(map, from_array);
+            }
+
+            #[test]
+            fn test_insert_entry() {
+                let mut map: HashMap<i32, i32> = HashMap::new();
+                let Entry::Vacant(vacant) = map.entry(1) else {
+                    panic!("fresh map has no key 1");
+                };
+                let occupied = vacant.insert_entry(10);
+                assert_eq!((occupied.key(), occupied.get()), (&1, &10));
+            }
         }
     };
 }
