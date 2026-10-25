@@ -1,3 +1,4 @@
+use core::fmt;
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
 
@@ -206,6 +207,12 @@ unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
 unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
     for ElasticTable<K, V, S, A>
 {
+}
+
+impl<K, V, S, A: Allocator + Clone> fmt::Debug for ElasticTable<K, V, S, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ElasticTable").finish_non_exhaustive()
+    }
 }
 
 impl<K, V, S, A: Allocator + Clone> Drop for ElasticTable<K, V, S, A> {
@@ -1375,7 +1382,7 @@ where
 }
 
 /// Track a pointerless scan across elastic levels.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ElasticScan {
     level_idx: usize,
     slots: OccupiedIndices,

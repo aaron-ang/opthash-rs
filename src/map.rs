@@ -298,6 +298,11 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     /// Panics when `reserve_fraction` is not exactly `1 / 2^d` for positive
     /// `d`, or when construction otherwise fails.
     #[must_use]
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher_in`"
+    )]
+    #[allow(deprecated)]
     pub fn with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
         reserve_fraction: f64,
@@ -310,7 +315,7 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
             hash_builder,
             alloc,
         )
-        .unwrap_or_else(|error| panic!("invalid map construction: {error}"))
+        .expect("invalid map construction")
     }
 
     /// Fallible compatibility constructor accepting an exact dyadic `f64`.
@@ -319,6 +324,11 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     ///
     /// Returns [`TryBuildError::InvalidReserveFraction`] for non-dyadic input,
     /// or the backend construction error.
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `try_with_capacity_and_reserve_and_hasher_in`"
+    )]
+    #[allow(deprecated)]
     pub fn try_with_capacity_and_reserve_fraction_and_hasher_in(
         capacity: usize,
         reserve_fraction: f64,
@@ -331,26 +341,31 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     }
 
     /// Reference to the map's allocator.
+    #[must_use]
     pub fn allocator(&self) -> &P::Alloc {
         self.table.allocator()
     }
 
     /// Reference to the map's [`BuildHasher`].
+    #[must_use]
     pub fn hasher(&self) -> &P::Hasher {
         self.table.hasher()
     }
 
     /// Number of entries.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.table.len()
     }
 
     /// Returns `true` if empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.table.len() == 0
     }
 
     /// Maximum entries before the next automatic resize.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.table.capacity()
     }
@@ -449,6 +464,7 @@ where
     }
 
     /// Returns a reference to the value for `key`.
+    #[must_use]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -457,6 +473,7 @@ where
     }
 
     /// Returns the stored `(key, value)` pair for `key`.
+    #[must_use]
     pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -498,6 +515,7 @@ where
     }
 
     /// Returns `true` if `key` is present.
+    #[must_use]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -680,6 +698,44 @@ where
     }
 }
 
+impl<K, V, P> fmt::Debug for OccupiedEntry<'_, K, V, P>
+where
+    K: Eq + Hash + fmt::Debug,
+    V: fmt::Debug,
+    P: TableBackend<K, V>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OccupiedEntry")
+            .field("key", self.key())
+            .field("value", self.get())
+            .finish()
+    }
+}
+
+impl<K, V, P> fmt::Debug for VacantEntry<'_, K, V, P>
+where
+    K: Eq + Hash + fmt::Debug,
+    P: TableBackend<K, V>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("VacantEntry").field(self.key()).finish()
+    }
+}
+
+impl<K, V, P> fmt::Debug for Entry<'_, K, V, P>
+where
+    K: Eq + Hash + fmt::Debug,
+    V: fmt::Debug,
+    P: TableBackend<K, V>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Entry::Occupied(entry) => f.debug_tuple("Entry").field(entry).finish(),
+            Entry::Vacant(entry) => f.debug_tuple("Entry").field(entry).finish(),
+        }
+    }
+}
+
 impl<K, V, P> fmt::Display for OccupiedError<'_, K, V, P>
 where
     K: Eq + Hash + fmt::Debug,
@@ -750,13 +806,11 @@ where
     }
 
     /// Removes the entry and returns its value.
-    #[must_use]
     pub fn remove(self) -> V {
         self.remove_entry().1
     }
 
     /// Removes the entry and returns the `(key, value)` pair.
-    #[must_use]
     pub fn remove_entry(self) -> (K, V) {
         self.map.table.remove(self.loc)
     }
@@ -768,6 +822,7 @@ where
     P: TableBackend<K, V>,
 {
     /// Reference to the key that would be inserted.
+    #[must_use]
     pub fn key(&self) -> &K {
         &self.key
     }
@@ -784,7 +839,7 @@ where
     }
 
     /// Inserts `value` and returns the resulting [`OccupiedEntry`].
-    pub(crate) fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, P> {
+    pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, P> {
         let loc = self
             .map
             .table
@@ -820,6 +875,7 @@ where
     }
 
     /// Reference to this entry's key.
+    #[must_use]
     pub fn key(&self) -> &K {
         match self {
             Entry::Occupied(e) => e.key(),
@@ -888,8 +944,7 @@ where
     /// Panics if the backend rejects the inputs or allocation fails.
     #[must_use]
     pub fn with_capacity_and_reserve(capacity: usize, reserve: ReserveFraction) -> Self {
-        Self::try_with_capacity_and_reserve(capacity, reserve)
-            .unwrap_or_else(|error| panic!("invalid map construction: {error}"))
+        Self::try_with_capacity_and_reserve(capacity, reserve).expect("invalid map construction")
     }
 
     /// Fallible exact-reserve constructor.
@@ -915,6 +970,11 @@ where
     /// # Panics
     /// Panics for non-dyadic input, unsupported reserve, or allocation failure.
     #[must_use]
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `with_reserve`"
+    )]
+    #[allow(deprecated)]
     pub fn with_reserve_fraction(reserve_fraction: f64) -> Self {
         Self::with_capacity_and_reserve_fraction(0, reserve_fraction)
     }
@@ -924,6 +984,11 @@ where
     /// # Panics
     /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve`"
+    )]
+    #[allow(deprecated)]
     pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self {
         Self::with_capacity_and_reserve_fraction_and_hasher(
             capacity,
@@ -937,6 +1002,11 @@ where
     /// # Errors
     ///
     /// Returns [`TryBuildError`] for invalid input or construction failure.
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `try_with_capacity_and_reserve`"
+    )]
+    #[allow(deprecated)]
     pub fn try_with_capacity_and_reserve_fraction(
         capacity: usize,
         reserve_fraction: f64,
@@ -984,6 +1054,11 @@ where
     /// # Panics
     /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher`"
+    )]
+    #[allow(deprecated)]
     pub fn with_reserve_fraction_and_hasher(
         reserve_fraction: f64,
         hash_builder: P::Hasher,
@@ -996,6 +1071,11 @@ where
     /// # Panics
     /// Panics for non-dyadic input, unsupported reserve, or construction failure.
     #[must_use]
+    #[deprecated(
+        since = "0.12.0",
+        note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher`"
+    )]
+    #[allow(deprecated)]
     pub fn with_capacity_and_reserve_fraction_and_hasher(
         capacity: usize,
         reserve_fraction: f64,
@@ -1141,11 +1221,28 @@ exact_scan_iters! {
 }
 
 /// Borrowing iterator over `(&K, &V)`.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Iter<'a, K, V, P: TableBackend<K, V>> {
     table: &'a P,
     scan: P::Scan,
     remaining: usize,
     _marker: PhantomData<(&'a K, &'a V)>,
+}
+
+impl<'a, K, V, P> Iter<'a, K, V, P>
+where
+    P: TableBackend<K, V>,
+    P::Scan: Clone,
+{
+    /// Shared view of the entries another iterator has yet to yield.
+    fn remaining(table: &'a P, scan: &P::Scan, remaining: usize) -> Self {
+        Self {
+            table,
+            scan: scan.clone(),
+            remaining,
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<'a, K, V, P: TableBackend<K, V>> Iterator for Iter<'a, K, V, P> {
@@ -1189,6 +1286,7 @@ where
 }
 
 /// Borrowing iterator over `(&K, &mut V)`.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct IterMut<'a, K, V, P: TableBackend<K, V>> {
     table: *mut P,
     scan: P::Scan,
@@ -1214,7 +1312,24 @@ impl<'a, K, V, P: TableBackend<K, V>> Iterator for IterMut<'a, K, V, P> {
     }
 }
 
+impl<K: fmt::Debug, V: fmt::Debug, P> fmt::Debug for IterMut<'_, K, V, P>
+where
+    P: TableBackend<K, V>,
+    P::Scan: Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // SAFETY: `&self` blocks `next`, and the cloned scan visits only
+        // slots not yet yielded, so these shared borrows alias no handed-out
+        // `&mut V`.
+        let table = unsafe { &*self.table };
+        f.debug_list()
+            .entries(Iter::remaining(table, &self.scan, self.remaining))
+            .finish()
+    }
+}
+
 /// Consuming iterator over owned `(K, V)`.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct IntoIter<K, V, P: TableBackend<K, V>> {
     table: P,
     scan: P::Scan,
@@ -1234,6 +1349,18 @@ impl<K, V, P: TableBackend<K, V>> Iterator for IntoIter<K, V, P> {
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug, P> fmt::Debug for IntoIter<K, V, P>
+where
+    P: TableBackend<K, V>,
+    P::Scan: Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(Iter::remaining(&self.table, &self.scan, self.remaining))
+            .finish()
     }
 }
 
@@ -1274,9 +1401,25 @@ impl<K, V, P: TableBackend<K, V>> Drop for Drain<'_, K, V, P> {
     }
 }
 
+impl<K: fmt::Debug, V: fmt::Debug, P> fmt::Debug for Drain<'_, K, V, P>
+where
+    P: TableBackend<K, V>,
+    P::Scan: Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // SAFETY: `table` points to the exclusively borrowed map; the cloned
+        // scan visits only slots not yet moved out.
+        let table = unsafe { &*self.table };
+        f.debug_list()
+            .entries(Iter::remaining(table, &self.scan, self.remaining))
+            .finish()
+    }
+}
+
 /// Iterator yielding entries removed by [`HashMap::extract_if`]. Unyielded
 /// non-matching entries are retained. Exhausting or dropping the iterator may
 /// clean accumulated tombstones.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct ExtractIf<'a, K, V, P: TableBackend<K, V>, F> {
     table: *mut P,
     scan: P::Scan,
@@ -1319,6 +1462,12 @@ where
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         (0, None)
+    }
+}
+
+impl<K, V, P: TableBackend<K, V>, F> fmt::Debug for ExtractIf<'_, K, V, P, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtractIf").finish_non_exhaustive()
     }
 }
 
@@ -1473,6 +1622,17 @@ where
         let mut map = Self::with_capacity_and_hasher(iter.size_hint().0, P::Hasher::default());
         map.extend(iter);
         map
+    }
+}
+
+impl<K, V, P, const N: usize> From<[(K, V); N]> for HashMap<K, V, P>
+where
+    K: Eq + Hash,
+    P: TableBackend<K, V, Alloc = Global>,
+    P::Hasher: Default,
+{
+    fn from(arr: [(K, V); N]) -> Self {
+        arr.into_iter().collect()
     }
 }
 

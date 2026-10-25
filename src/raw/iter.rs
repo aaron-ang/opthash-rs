@@ -20,6 +20,7 @@ macro_rules! project_iter {
         $name:ident => $item:ident, |($k:pat_param, $v:pat_param)| $project:expr
     ) => {
         $(#[$attr])*
+        #[must_use = "iterators are lazy and do nothing unless consumed"]
         pub struct $name<I> {
             inner: I,
         }
@@ -115,7 +116,7 @@ unsafe fn occupied_mask(ctrl: *const u8, remaining: usize) -> BitMask {
 /// Pointerless group scanner for a single region. The caller supplies the same
 /// region on each step; removing already-yielded slots is allowed, but resizing
 /// or inserting while a scan is in progress is not.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct OccupiedIndices {
     current_group_slot: usize,
     current_mask: BitMask,

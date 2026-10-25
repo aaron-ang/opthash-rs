@@ -1,4 +1,5 @@
 //! Paper-exact Funnel placement with explicit dynamic-map epoch extensions.
+use core::fmt;
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
 
@@ -29,12 +30,12 @@ use crate::{macros, map};
 const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
 
 /// Pointerless scan progress through Funnel's flat storage.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FunnelScan {
     mode: FunnelScanMode,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum FunnelScanMode {
     Dense(usize),
     Sparse(OccupiedIndices),
@@ -328,6 +329,7 @@ enum SearchResult {
 }
 
 /// A known-absent search, retained only while the entry borrows its map.
+#[derive(Debug)]
 pub struct FunnelVacant {
     hash: u64,
     // Allocated slot indices are below isize::MAX. Reserve the two largest
@@ -611,6 +613,12 @@ unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
 unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
     for FunnelTable<K, V, S, A>
 {
+}
+
+impl<K, V, S, A: Allocator + Clone> fmt::Debug for FunnelTable<K, V, S, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FunnelTable").finish_non_exhaustive()
+    }
 }
 
 impl<K, V, S, A: Allocator + Clone> Drop for FunnelTable<K, V, S, A> {
@@ -1637,7 +1645,7 @@ where
         alloc: A,
     ) -> Self {
         Self::try_with_insert_budget(capacity, reserve, hash_builder, alloc)
-            .unwrap_or_else(|error| panic!("invalid Funnel construction: {error}"))
+            .expect("invalid Funnel construction")
     }
 
     fn try_with_capacity_and_reserve_and_hasher_in(

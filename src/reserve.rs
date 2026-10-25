@@ -56,11 +56,18 @@ impl ReserveFraction {
     }
 
     /// Returns the exact `f64` representation when one exists.
+    #[deprecated(since = "0.12.0", note = "renamed to `to_f64`")]
+    #[must_use]
+    pub const fn as_f64(self) -> Option<f64> {
+        self.to_f64()
+    }
+
+    /// Returns the exact `f64` representation when one exists.
     ///
     /// Binary64 represents inverse powers of two through `2^-1074`; larger
     /// exponents return `None` rather than underflowing to zero.
     #[must_use]
-    pub const fn as_f64(self) -> Option<f64> {
+    pub const fn to_f64(self) -> Option<f64> {
         match self.exponent {
             1..F64_EXPONENT_BIAS => {
                 let biased_exponent = (F64_EXPONENT_BIAS - self.exponent) as u64;
@@ -72,6 +79,12 @@ impl ReserveFraction {
             }
             _ => None,
         }
+    }
+}
+
+impl Default for ReserveFraction {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -148,7 +161,7 @@ mod tests {
     #[test]
     fn default_is_exactly_one_eighth() {
         assert_eq!(ReserveFraction::DEFAULT.exponent(), 3);
-        assert_eq!(ReserveFraction::DEFAULT.as_f64(), Some(0.125));
+        assert_eq!(ReserveFraction::DEFAULT.to_f64(), Some(0.125));
         assert_eq!(
             ReserveFraction::try_from(0.125),
             Ok(ReserveFraction::DEFAULT)
