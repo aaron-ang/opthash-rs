@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/aaron-ang/opthash-rs/compare/v0.11.1...v0.12.0) - 2026-10-25
+
+### Added
+
+- close std API parity gaps (Debug, entries, must_use, deprecations) ([#157](https://github.com/aaron-ang/opthash-rs/pull/157))
+- expose generic map and set shells in public hash_map/hash_set modules ([#156](https://github.com/aaron-ang/opthash-rs/pull/156))
+
+### Fixed
+
+- make the elastic slot limit check meaningful on 32-bit targets ([#160](https://github.com/aaron-ang/opthash-rs/pull/160))
+
+### Other
+
+- [**breaking**] std-shaped iterators, generic set ExtractIf, remove as_f64 ([#158](https://github.com/aaron-ang/opthash-rs/pull/158))
+- [**breaking**] mark public enums and EpochSnapshot non_exhaustive ([#155](https://github.com/aaron-ang/opthash-rs/pull/155))
+- enforce unsafe contracts and document every unsafe block ([#154](https://github.com/aaron-ang/opthash-rs/pull/154))
+- pin release-plz tag format to v{{ version }} ([#152](https://github.com/aaron-ang/opthash-rs/pull/152))
+
 ## [0.11.1](https://github.com/aaron-ang/opthash-rs/compare/opthash-v0.11.0...opthash-v0.11.1) - 2026-10-23
 
 ### Fixed
