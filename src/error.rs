@@ -4,7 +4,8 @@ use core::fmt;
 use crate::reserve::ReserveFractionError;
 
 /// Error returned by fallible map and set constructors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TryBuildError {
     /// A floating-point compatibility input was not an exact dyadic fraction.
     InvalidReserveFraction(ReserveFractionError),
@@ -58,7 +59,8 @@ impl From<TryReserveError> for TryBuildError {
 }
 
 /// Error returned by `try_reserve` when the map can't grow.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TryReserveError {
     /// Capacity computation overflowed `usize`.
     CapacityOverflow,

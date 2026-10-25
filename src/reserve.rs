@@ -111,6 +111,7 @@ impl TryFrom<f64> for ReserveFraction {
 
 /// A reserve fraction cannot be represented by the exact dyadic model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ReserveFractionError {
     /// Exponent zero would represent one, outside the open unit interval.
     ExponentZero,
