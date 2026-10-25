@@ -23,7 +23,7 @@ pub enum TryBuildError {
 impl fmt::Display for TryBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidReserveFraction(error) => error.fmt(f),
+            Self::InvalidReserveFraction(_) => f.write_str("invalid reserve fraction"),
             Self::FunnelExponentBelowMinimum {
                 reserve_exponent,
                 minimum,
@@ -31,7 +31,7 @@ impl fmt::Display for TryBuildError {
                 f,
                 "Funnel reserve exponent {reserve_exponent} is below the minimum {minimum}"
             ),
-            Self::Reserve(error) => error.fmt(f),
+            Self::Reserve(_) => f.write_str("failed to reserve table capacity"),
         }
     }
 }

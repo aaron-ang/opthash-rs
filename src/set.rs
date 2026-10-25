@@ -195,6 +195,11 @@ where
         /// # Panics
         /// Panics for non-dyadic input, unsupported reserve, or allocation failure.
         #[must_use]
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `with_reserve`"
+        )]
+        #[allow(deprecated)]
         pub fn with_reserve_fraction(reserve_fraction: f64) -> Self;
 
         /// Compatibility constructor for capacity and an exact dyadic `f64` reserve.
@@ -202,12 +207,22 @@ where
         /// # Panics
         /// Panics for non-dyadic input, unsupported reserve, or construction failure.
         #[must_use]
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve`"
+        )]
+        #[allow(deprecated)]
         pub fn with_capacity_and_reserve_fraction(capacity: usize, reserve_fraction: f64) -> Self;
 
         /// Fallible compatibility constructor for an exact dyadic `f64` reserve.
         ///
         /// # Errors
         /// Returns [`TryBuildError`] for invalid input or construction failure.
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `try_with_capacity_and_reserve`"
+        )]
+        #[allow(deprecated)]
         pub fn try_with_capacity_and_reserve_fraction(
             capacity: usize,
             reserve_fraction: f64,
@@ -233,6 +248,11 @@ where
         /// # Panics
         /// Panics for non-dyadic input, unsupported reserve, or construction failure.
         #[must_use]
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher`"
+        )]
+        #[allow(deprecated)]
         pub fn with_reserve_fraction_and_hasher(
             reserve_fraction: f64,
             hash_builder: P::Hasher,
@@ -243,6 +263,11 @@ where
         /// # Panics
         /// Panics for non-dyadic input, unsupported reserve, or construction failure.
         #[must_use]
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher`"
+        )]
+        #[allow(deprecated)]
         pub fn with_capacity_and_reserve_fraction_and_hasher(
             capacity: usize,
             reserve_fraction: f64,
@@ -288,6 +313,11 @@ where
         /// # Panics
         /// Panics for non-dyadic input, unsupported reserve, or construction failure.
         #[must_use]
+        #[deprecated(
+            since = "0.12.0",
+            note = "convert with `ReserveFraction::try_from` and call `with_capacity_and_reserve_and_hasher_in`"
+        )]
+        #[allow(deprecated)]
         pub fn with_capacity_and_reserve_fraction_and_hasher_in(
             capacity: usize,
             reserve_fraction: f64,
@@ -320,26 +350,31 @@ where
     }
 
     /// Reference to the set's allocator.
+    #[must_use]
     pub fn allocator(&self) -> &P::Alloc {
         self.map.allocator()
     }
 
     /// Reference to the set's [`core::hash::BuildHasher`].
+    #[must_use]
     pub fn hasher(&self) -> &P::Hasher {
         self.map.hasher()
     }
 
     /// Number of values in the set.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
     /// Returns `true` if the set contains no values.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
     /// Maximum values before the next automatic resize.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.map.capacity()
     }
@@ -423,6 +458,7 @@ where
     P: TableBackend<T, ()>,
 {
     /// Returns `true` if the set contains a value equal to `value`.
+    #[must_use]
     pub fn contains<Q>(&self, value: &Q) -> bool
     where
         Q: Hash + Equivalent<T> + ?Sized,
@@ -431,6 +467,7 @@ where
     }
 
     /// Returns a reference to the value equal to `value`, if any.
+    #[must_use]
     pub fn get<Q>(&self, value: &Q) -> Option<&T>
     where
         Q: Hash + Equivalent<T> + ?Sized,
@@ -545,16 +582,19 @@ where
     }
 
     /// Returns `true` if `self` and `other` share no values.
+    #[must_use]
     pub fn is_disjoint(&self, other: &Self) -> bool {
         self.intersection(other).next().is_none()
     }
 
     /// Returns `true` if every value in `self` is also in `other`.
+    #[must_use]
     pub fn is_subset(&self, other: &Self) -> bool {
         self.len() <= other.len() && self.iter().all(|value| other.contains(value))
     }
 
     /// Returns `true` if every value in `other` is also in `self`.
+    #[must_use]
     pub fn is_superset(&self, other: &Self) -> bool {
         other.is_subset(self)
     }
@@ -784,6 +824,7 @@ where
 
 set_iter! {
     /// Borrowing iterator over [`HashSet`] values.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub struct Iter<'a, T, P> { inner: map::Keys<'a, T, (), P> }
     type Item = &'a T;
     fn next(&mut self) {
@@ -797,6 +838,7 @@ set_iter! {
 
 set_iter! {
     /// Consuming iterator over [`HashSet`] values.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub struct IntoIter<T, P> { inner: map::IntoKeys<T, (), P> }
     type Item = T;
     fn next(&mut self) {
@@ -823,6 +865,7 @@ set_iter! {
 
 set_iter! {
     /// Iterator yielding the extracted values of a [`HashSet`].
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub struct ExtractIf<'a, T, P> { inner: map::ExtractIf<'a, T, (), P, SetExtractPred<'a, T>> }
     type Item = T;
     fn next(&mut self) {
@@ -850,6 +893,7 @@ where
 
 set_iter! {
     /// Iterator over the difference of two [`HashSet`]s.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub struct Difference<'a, T, P> { iter: Iter<'a, T, P>, other: &'a HashSet<T, P> }
     bounds [T: Eq + Hash]
     type Item = &'a T;
@@ -864,6 +908,7 @@ set_iter! {
 
 set_iter! {
     /// Iterator over the intersection of two [`HashSet`]s.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub struct Intersection<'a, T, P> { iter: Iter<'a, T, P>, other: &'a HashSet<T, P> }
     bounds [T: Eq + Hash]
     type Item = &'a T;
@@ -878,6 +923,7 @@ set_iter! {
 
 set_iter! {
     /// Iterator over the symmetric difference of two [`HashSet`]s.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub struct SymmetricDifference<'a, T, P> {
         iter: Chain<Difference<'a, T, P>, Difference<'a, T, P>>,
     }
@@ -894,6 +940,7 @@ set_iter! {
 
 set_iter! {
     /// Iterator over the union of two [`HashSet`]s.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub struct Union<'a, T, P> { iter: Chain<Iter<'a, T, P>, Difference<'a, T, P>> }
     bounds [T: Eq + Hash]
     type Item = &'a T;
@@ -949,6 +996,7 @@ where
     }
 
     /// Reference to the entry's value.
+    #[must_use]
     pub fn get(&self) -> &T {
         match self {
             Entry::Occupied(entry) => entry.get(),
@@ -963,6 +1011,7 @@ where
     P: TableBackend<T, ()>,
 {
     /// Reference to the value in the entry.
+    #[must_use]
     pub fn get(&self) -> &T {
         self.inner.key()
     }
@@ -979,6 +1028,7 @@ where
     P: TableBackend<T, ()>,
 {
     /// Reference to the value that would be inserted.
+    #[must_use]
     pub fn get(&self) -> &T {
         self.inner.key()
     }
