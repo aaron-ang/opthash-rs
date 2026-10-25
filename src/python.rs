@@ -67,6 +67,7 @@ struct HashedAny {
 
 // SAFETY: matches `Py<PyAny>` — atomic refcount, derefs only under `Python::attach`.
 unsafe impl Send for HashedAny {}
+// SAFETY: as above; `&HashedAny` derefs the object only under `Python::attach`.
 unsafe impl Sync for HashedAny {}
 
 const _: () = assert!(std::mem::size_of::<HashedAny>() == 2 * std::mem::size_of::<usize>());
@@ -244,6 +245,7 @@ impl PartialEq for HashedAny {
                 // SAFETY: kind tag guarantees both are PyLong.
                 let a =
                     unsafe { ffi::PyLong_AsLongLongAndOverflow(self.obj_ptr(), &raw mut ovf_a) };
+                // SAFETY: as above.
                 let b =
                     unsafe { ffi::PyLong_AsLongLongAndOverflow(other.obj_ptr(), &raw mut ovf_b) };
                 if ovf_a == 0 && ovf_b == 0 {

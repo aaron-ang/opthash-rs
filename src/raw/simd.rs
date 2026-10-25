@@ -19,12 +19,14 @@ mod neon {
     #[inline]
     #[must_use]
     unsafe fn lane_mask(cmp: aarch64::uint8x8_t) -> BitMask {
+        // SAFETY: NEON is baseline on aarch64; lane 0 of a 1-lane vector exists.
         BitMask(unsafe { aarch64::vget_lane_u64(aarch64::vreinterpret_u64_u8(cmp), 0) })
     }
 
     #[inline]
     #[must_use]
     pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         unsafe {
             let bytes = aarch64::vld1_u8(ptr);
             lane_mask(aarch64::vceq_u8(bytes, aarch64::vdup_n_u8(target)))
@@ -34,6 +36,7 @@ mod neon {
     #[inline]
     #[must_use]
     pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         unsafe {
             let bytes = aarch64::vld1_u8(ptr);
             let masked = aarch64::vand_u8(bytes, aarch64::vdup_n_u8(FINGERPRINT_MASK));
@@ -45,6 +48,7 @@ mod neon {
     #[inline]
     #[must_use]
     pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         unsafe {
             let bytes = aarch64::vld1_u8(ptr);
             lane_mask(aarch64::vtst_u8(
@@ -72,9 +76,12 @@ mod neon {
                 2,
             ];
 
+            // SAFETY: `controls` holds exactly one 8-byte group.
             let matches: alloc::vec::Vec<_> =
                 unsafe { eq_mask_group(controls.as_ptr(), 7) }.collect();
+            // SAFETY: as above.
             let free: alloc::vec::Vec<_> = unsafe { free_mask_group(controls.as_ptr()) }.collect();
+            // SAFETY: as above.
             let occupied: alloc::vec::Vec<_> =
                 unsafe { occupied_mask_group(controls.as_ptr()) }.collect();
 
@@ -100,6 +107,8 @@ mod sse2 {
     #[inline]
     #[must_use]
     unsafe fn load_fingerprints(ptr: *const u8) -> __m128i {
+        // SAFETY: SSE2 is baseline on x86_64; caller guarantees 16 readable
+        // bytes and `loadu` has no alignment requirement.
         unsafe {
             let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
             x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()))
@@ -110,6 +119,7 @@ mod sse2 {
     #[inline]
     #[must_use]
     unsafe fn lane_mask(cmp: __m128i) -> BitMask {
+        // SAFETY: SSE2 is baseline on x86_64.
         let bits = unsafe { x86_64::_mm_movemask_epi8(cmp) }.cast_unsigned() & 0xFFFF;
         BitMask(u64::from(bits))
     }
@@ -117,6 +127,8 @@ mod sse2 {
     #[inline]
     #[must_use]
     pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
+        // SAFETY: SSE2 is baseline on x86_64; caller guarantees 16 readable
+        // bytes and `loadu` has no alignment requirement.
         unsafe {
             let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
             let target_vec = x86_64::_mm_set1_epi8(target.cast_signed());
@@ -127,6 +139,7 @@ mod sse2 {
     #[inline]
     #[must_use]
     pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
+        // SAFETY: SSE2 is baseline on x86_64; caller guarantees 16 readable bytes.
         unsafe {
             let masked = load_fingerprints(ptr);
             lane_mask(x86_64::_mm_cmpeq_epi8(masked, x86_64::_mm_setzero_si128()))
@@ -137,6 +150,7 @@ mod sse2 {
     #[inline]
     #[must_use]
     pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
+        // SAFETY: SSE2 is baseline on x86_64; caller guarantees 16 readable bytes.
         unsafe {
             let masked = load_fingerprints(ptr);
             lane_mask(x86_64::_mm_cmpgt_epi8(masked, x86_64::_mm_setzero_si128()))
@@ -163,6 +177,7 @@ mod swar {
     #[inline]
     unsafe fn word(ptr: *const u8) -> u64 {
         #[allow(clippy::cast_ptr_alignment)]
+        // SAFETY: caller guarantees 8 readable bytes; the read is unaligned.
         let raw = unsafe { ptr.cast::<u64>().read_unaligned() };
         raw.to_le()
     }
@@ -191,12 +206,14 @@ mod swar {
     #[inline]
     #[must_use]
     pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         BitMask(eq_mask(unsafe { word(ptr) }, target))
     }
 
     #[inline]
     #[must_use]
     pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         BitMask(free_mask(unsafe { word(ptr) }))
     }
 
@@ -204,6 +221,7 @@ mod swar {
     #[inline]
     #[must_use]
     pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         BitMask(occupied_mask(unsafe { word(ptr) }))
     }
 

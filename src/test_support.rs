@@ -94,6 +94,8 @@ impl ToggleAllocator {
     }
 }
 
+// SAFETY: forwards to `Global`, so blocks stay valid across clones and moves;
+// the failure toggle only refuses allocations.
 unsafe impl Allocator for ToggleAllocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if self.fail.load(Ordering::SeqCst) {
@@ -107,6 +109,7 @@ unsafe impl Allocator for ToggleAllocator {
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         self.deallocations.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: `ptr` came from `allocate`, i.e. from `Global`, with `layout`.
         unsafe { Global.deallocate(ptr, layout) };
     }
 }
