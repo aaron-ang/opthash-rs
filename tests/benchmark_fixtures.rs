@@ -5,9 +5,10 @@ use harness::memory::{
     AllocationCounters, AllocationMeasurement, AllocationSnapshot, CountingAllocator,
 };
 use harness::{
-    DEFAULT_HIT_QUERY_SEED, GroupProbeMap, LATENCY_SIZES, MAP_SIZE, MAP_SLOTS, MISS_KEY_OFFSET,
-    MapQuad, OP_COUNT, exact_size_label, key_at, parse_positive_sizes, scaled_insert_sample_size,
-    sequential_hit_keys, shuffled_hit_keys, shuffled_hit_keys_with_seed,
+    DEFAULT_HIT_QUERY_SEED, GroupProbeMap, HIGH_LOAD_EXPONENTS, HIGH_LOAD_SLOTS, LATENCY_SIZES,
+    LoadPoint, MAP_SIZE, MAP_SLOTS, MISS_KEY_OFFSET, MapQuad, OP_COUNT, exact_size_label, key_at,
+    parse_positive_sizes, scaled_insert_sample_size, sequential_hit_keys, shuffled_hit_keys,
+    shuffled_hit_keys_with_seed,
 };
 
 fn pairs(count: usize) -> Vec<(u64, u64)> {
@@ -359,4 +360,55 @@ fn group_probe_rejects_inserts_past_its_budget() {
     let mut map = GroupProbeMap::with_slots(64, 1);
     map.insert(1, 1);
     map.insert(2, 2);
+}
+
+#[test]
+fn high_load_groups_name_size_and_load() {
+    let names: Vec<String> = HIGH_LOAD_SLOTS
+        .iter()
+        .flat_map(|&slots| {
+            HIGH_LOAD_EXPONENTS
+                .iter()
+                .map(move |&exponent| LoadPoint::new(slots, exponent).group("get_miss"))
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "get_miss_64K_87_5",
+            "get_miss_64K_96_9",
+            "get_miss_64K_99_2",
+            "get_miss_64K_99_9",
+            "get_miss_1M_87_5",
+            "get_miss_1M_96_9",
+            "get_miss_1M_99_2",
+            "get_miss_1M_99_9",
+        ]
+    );
+}
+
+#[test]
+fn high_load_tail_is_one_sixty_fourth_of_the_entries() {
+    let point = LoadPoint::new(1 << 16, 10);
+    assert_eq!(point.entries(), 65_472);
+    assert_eq!(point.tail(), 1_023);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "full-size bench fixture is too slow")]
+fn high_load_arms_run_at_the_point_load() {
+    for slots in HIGH_LOAD_SLOTS {
+        for exponent in HIGH_LOAD_EXPONENTS {
+            let point = LoadPoint::new(slots, exponent);
+            // The constructors assert their own capacities.
+            let _ = (point.elastic(), point.funnel(), point.group_probe());
+        }
+        let _ = LoadPoint::new(slots, 3).hashbrown();
+    }
+}
+
+#[test]
+#[should_panic(expected = "hashbrown")]
+fn high_load_hashbrown_refuses_points_above_its_load_cap() {
+    let _ = LoadPoint::new(1 << 16, 5).hashbrown();
 }

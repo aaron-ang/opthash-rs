@@ -11,12 +11,14 @@
 
 mod fixtures;
 mod group_probe;
+mod high_load;
 mod map_matrix;
 pub mod memory;
 mod queries;
 
 pub use fixtures::*;
 pub use group_probe::GroupProbeMap;
+pub use high_load::{HIGH_LOAD_EXPONENTS, HIGH_LOAD_SLOTS, LoadPoint};
 pub use map_matrix::bench_one_lookup_group;
 pub use queries::*;
 
