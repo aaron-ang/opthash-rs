@@ -44,7 +44,7 @@ allocator-api2 = { version = "0.2", default-features = false, features = [
 ] }
 equivalent = "1"
 foldhash = { version = "0.2", default-features = false, optional = true }
-pyo3 = { version = "0.29", features = [
+pyo3 = { version = "0.30", features = [
     "extension-module",
     "abi3-py310",
 ], optional = true }
