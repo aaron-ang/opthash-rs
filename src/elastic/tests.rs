@@ -341,7 +341,7 @@ fn clear_marks_each_slot_empty_before_dropping_its_value() {
 }
 
 #[test]
-fn caught_hash_panic_during_try_resize_leaves_counters_valid() {
+fn caught_hash_panic_during_try_resize_keeps_every_entry() {
     let panic = Arc::new(AtomicBool::new(false));
     let drops = Arc::new(AtomicUsize::new(0));
     let key_drops = Arc::new(AtomicUsize::new(0));
@@ -377,10 +377,10 @@ fn caught_hash_panic_during_try_resize_leaves_counters_valid() {
                 .filter(|&slot| control::is_occupied(level.checked_control(slot)))
                 .count()
     }));
-    // The first moved key panics, so the resize drops every entry once,
-    // including the ones not yet moved.
-    assert_eq!(map.len(), 0);
-    assert_eq!(drops.load(Ordering::SeqCst), 16);
+    // The old table stays intact until every entry has been rehashed.
+    assert_eq!(map.len(), 16);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(key_drops.load(Ordering::SeqCst), 0);
 
     let live_keys = map.keys().map(|key| key.id).collect::<Vec<_>>();
     map.insert(key(100), CountDrop(drops.clone()));
@@ -510,6 +510,14 @@ fn batch_target_follows_the_live_count_in_both_directions() {
         };
         assert_eq!(index, expected, "len {len}");
     }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn pop_first_churn_restores_paper_placement() {
+    test_support::assert_pop_first_churn_restores_paper_placement::<
+        ElasticTable<u64, u64, FixedHashBuilder>,
+    >(|table| table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG != 0);
 }
 
 #[test]
@@ -987,32 +995,47 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
     let prepared = PreparedElasticKey::new(0);
     let mut next_key = 0_u64;
 
-    for logical_index in 0..UNIFORM_SEARCH_CAP {
-        let paper_probe = u128::from(logical_index) + 1;
-        if probe::elastic_phi(1, paper_probe).unwrap() > QUERY_POSITION_CAP {
-            break;
-        }
-        let slot = table.route_exact(0, 0, logical_index).unwrap();
-        if control::is_free(table.levels[0].checked_control(slot)) {
-            // SAFETY: `checked_control` bounds-checked `slot`.
-            unsafe {
-                table.levels[0].write_with_control(
-                    slot,
-                    SlotEntry {
-                        key: next_key,
-                        value: next_key,
-                    },
-                    fingerprint,
-                );
+    // Occupy every slot the shared hash can reach in every level, so no batch
+    // target can place it.
+    let block_every_route = |table: &mut ElasticTable<u64, u64, ConstHashBuilder>,
+                             next_key: &mut u64| {
+        for level in 0..table.levels.len() {
+            let paper_level = level as u128 + 1;
+            for logical_index in 0..UNIFORM_SEARCH_CAP {
+                let paper_probe = u128::from(logical_index) + 1;
+                if probe::elastic_phi(paper_level, paper_probe).unwrap() > QUERY_POSITION_CAP {
+                    break;
+                }
+                let slot = table.route_exact(level, 0, logical_index).unwrap();
+                if control::is_free(table.levels[level].checked_control(slot)) {
+                    // SAFETY: `checked_control` bounds-checked `slot`.
+                    unsafe {
+                        table.levels[level].write_with_control(
+                            slot,
+                            SlotEntry {
+                                key: *next_key,
+                                value: *next_key,
+                            },
+                            fingerprint,
+                        );
+                    }
+                    table.levels[level].len += 1;
+                    table.len += 1;
+                    *next_key += 1;
+                }
             }
-            table.levels[0].len += 1;
-            table.len += 1;
-            next_key += 1;
         }
-    }
+    };
+    block_every_route(&mut table, &mut next_key);
+    assert!(table.len < table.max_insertions);
     assert!(
         table
             .choose_slot_for_new_key(prepared.route.probe, BatchTarget::Bootstrap)
+            .is_none()
+    );
+    assert!(
+        table
+            .choose_slot_on_other_targets(prepared.route.probe, BatchTarget::Bootstrap)
             .is_none()
     );
 
@@ -1035,6 +1058,20 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
                 .is_some()
         );
     }
+
+    // The epoch already failed its rebuild, so the next failure places
+    // exceptionally without another O(n) rebuild.
+    block_every_route(&mut table, &mut next_key);
+    assert!(table.len < table.max_insertions);
+    let before = table.epoch.snapshot(table.len);
+    let location = table.insert_for_vacant_entry(u64::MAX - 1, 8, 0);
+    let after = table.epoch.snapshot(table.len);
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.placement_recoveries, before.placement_recoveries + 1);
+    assert_eq!(
+        table.find_slot_indices_prepared(&(u64::MAX - 1), prepared, fingerprint),
+        Some(location)
+    );
 }
 
 #[test]
@@ -1051,7 +1088,13 @@ fn direct_lookup_returns_the_compared_slot_reference() {
         && !table.levels.iter().skip(1).any(|level| level.len > 0)
     {
         let key = insertion_count;
-        table.insert_unique(key, key ^ 0xa5a5);
+        table.place_unique(
+            SlotEntry {
+                key,
+                value: key ^ 0xa5a5,
+            },
+            table.hash_builder.hash_one(key),
+        );
         insertion_count += 1;
     }
     assert!(
@@ -1137,7 +1180,10 @@ fn rebuild_inserts_advance_batch_scheduler() {
     );
 
     for key in 0..=initial_quota {
-        table.insert_unique(key, key);
+        table.place_unique(
+            SlotEntry { key, value: key },
+            table.hash_builder.hash_one(key),
+        );
     }
 
     let len = table.len;
@@ -1161,7 +1207,10 @@ fn vacant_insert_uses_the_table_insertion_limit() {
     let bootstrap_quota = rebuild_geometry.batch_plan[0];
 
     for key in 0..bootstrap_quota {
-        table.insert_unique(key, key);
+        table.place_unique(
+            SlotEntry { key, value: key },
+            table.hash_builder.hash_one(key),
+        );
     }
     table.max_insertions = table.len;
     let previous_slots = table.total_slots;
@@ -1291,4 +1340,129 @@ fn drop_continues_past_a_panicking_value() {
     assert!(catch_unwind(AssertUnwindSafe(|| drop(map))).is_err());
     // The panicking value counts too, so every value dropped exactly once.
     assert_eq!(drops.load(Ordering::SeqCst), inserted);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn delete_churn_does_not_target_saturated_levels() {
+    // Random inserts, removes, and small `retain` sweeps over a fixed key
+    // space settle the table near three fifths full while the live count
+    // keeps crossing batch boundaries.
+    let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(0);
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+
+    let mut recoveries = 0;
+    let mut generation = map.epoch().generation;
+    for step in 0..200_000_u64 {
+        let key = next() % 2_000;
+        match next() % 10 {
+            0..5 => {
+                map.insert(key, step);
+            }
+            5..8 => {
+                map.remove(&key);
+            }
+            8 => {
+                let residue = next() % 97;
+                map.retain(|&k, _| k % 97 != residue);
+            }
+            _ => {}
+        }
+        let epoch = map.epoch();
+        if epoch.generation != generation && epoch.transition == EpochTransition::PlacementRecovery
+        {
+            recoveries += 1;
+        }
+        generation = epoch.generation;
+    }
+
+    assert_eq!(recoveries, 0, "placement recoveries under delete churn");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
+    // At delta = 2^-16 the Case 1 budget reaches 128 probes, one more than a
+    // level-8 lookup can reach. A vacancy found only by that last probe must
+    // count as a failed probe, as in the paper, not abort the placement.
+    const LEVEL: usize = 8;
+    let reserve = ReserveFraction::from_exponent(16).unwrap();
+    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(1 << 20, reserve, IdentityBuildHasher, Global)
+        .unwrap();
+    let level_slots = table.levels[LEVEL].capacity();
+    let reachable = (1..=QUERY_POSITION_CAP)
+        .take_while(|&probe| {
+            probe::elastic_phi(LEVEL as u128 + 1, probe).unwrap() <= QUERY_POSITION_CAP
+        })
+        .count() as u64;
+    let budget = probe::elastic_dyadic_probe_budget(
+        level_slots / 16,
+        level_slots,
+        reserve.exponent(),
+        ELASTIC_PROBE_BUDGET_C,
+    )
+    .unwrap() as u64;
+    assert!(
+        budget > reachable,
+        "fixture needs a budget past the query cap"
+    );
+
+    // A key whose last budgeted probe lands on a slot no earlier probe visits.
+    let (key_hash, unreachable_slot) = (0_u64..)
+        .find_map(|hash| {
+            let last = table.route_exact(LEVEL, hash, reachable)?;
+            (0..reachable)
+                .all(|index| table.route_exact(LEVEL, hash, index) != Some(last))
+                .then_some((hash, last))
+        })
+        .unwrap();
+
+    // Fill the level to one sixteenth free, keeping only that slot among the
+    // key's reachable probes open; leave the next level empty.
+    let probed = (0..reachable).map(|index| table.route_exact(LEVEL, key_hash, index).unwrap());
+    let fill_order = probed.chain(0..level_slots).collect::<Vec<_>>();
+    let mut next_key = 0_u64;
+    for slot in fill_order {
+        if slot == unreachable_slot
+            || !control::is_free(table.levels[LEVEL].checked_control(slot))
+            || table.levels[LEVEL].free_slots() == level_slots / 16
+        {
+            continue;
+        }
+        // SAFETY: `checked_control` bounds-checked `slot`.
+        unsafe {
+            table.levels[LEVEL].write_with_control(
+                slot,
+                SlotEntry {
+                    key: next_key,
+                    value: next_key,
+                },
+                1,
+            );
+        }
+        table.levels[LEVEL].len += 1;
+        table.len += 1;
+        next_key += 1;
+    }
+    assert!(
+        (0..reachable).all(|index| {
+            let slot = table.route_exact(LEVEL, key_hash, index).unwrap();
+            !control::is_free(table.levels[LEVEL].checked_control(slot))
+        }),
+        "every reachable probe must be occupied"
+    );
+
+    let prepared = PreparedElasticKey::new(key_hash);
+    let placement = table
+        .choose_slot_for_new_key(prepared.route.probe, BatchTarget::LevelPair(LEVEL))
+        .expect("Case 1 falls through to the next level");
+    assert_eq!(placement.level, LEVEL + 1);
 }

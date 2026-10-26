@@ -4,10 +4,9 @@ use core::ptr;
 
 use allocator_api2::alloc::{Allocator, Layout};
 
-use super::config::{CACHE_LINE, GROUP_SIZE};
-use super::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
+use super::config::CACHE_LINE;
+use super::control::{self, CTRL_TOMBSTONE};
 use super::iter::OccupiedIndices;
-use super::simd;
 use crate::error::TryReserveError;
 
 /// Owns one allocation backing a map's ctrl bytes + slot data.
@@ -508,54 +507,6 @@ pub(crate) unsafe trait ArenaSlots<T> {
             // allocations.
             unsafe { ptr::copy_nonoverlapping(src.ctrl_ptr(), self.ctrl_ptr(), capacity) };
         }
-    }
-
-    /// Reset controls for every occupied slot and invoke `visit` with that
-    /// slot's pointer after its control byte has been cleared.
-    #[inline]
-    fn clear_occupied_slots_with<F: FnMut(*mut T)>(&mut self, mut visit: F) {
-        if self.capacity() == 0 {
-            return;
-        }
-        let ctrl = self.ctrl_ptr();
-        let full_groups = self.capacity() / GROUP_SIZE;
-        for group_idx in 0..full_groups {
-            let group_start = group_idx * GROUP_SIZE;
-            // SAFETY: `group_start + GROUP_SIZE <= capacity()` for a full group.
-            let group_ctrl = unsafe { ctrl.add(group_start) };
-            // SAFETY: a full group leaves `GROUP_SIZE` readable ctrl bytes.
-            for offset in unsafe { simd::occupied_mask_group(group_ctrl) } {
-                let idx = group_start + offset;
-                // SAFETY: `idx` is an in-bounds occupied lane of this group; its
-                // ctrl is cleared before `visit` takes the initialized slot.
-                unsafe {
-                    *ctrl.add(idx) = CTRL_EMPTY;
-                    visit(self.slot_ptr(idx));
-                }
-            }
-            // SAFETY: the full group's `GROUP_SIZE` ctrl bytes are writable.
-            unsafe { ptr::write_bytes(group_ctrl, CTRL_EMPTY, GROUP_SIZE) };
-        }
-        for idx in full_groups * GROUP_SIZE..self.capacity() {
-            // SAFETY: `idx < capacity()`; `visit` only sees slots whose ctrl was
-            // occupied, i.e. initialized, after that ctrl is cleared.
-            unsafe {
-                let prev = *ctrl.add(idx);
-                *ctrl.add(idx) = CTRL_EMPTY;
-                if control::is_occupied(prev) {
-                    visit(self.slot_ptr(idx));
-                }
-            }
-        }
-    }
-
-    /// Move every occupied value out and reset all controls to EMPTY.
-    /// The current ctrl byte is cleared before `f` runs, so a panic cannot
-    /// leave the moved-out slot marked occupied.
-    fn drain_values_and_clear<F: FnMut(T)>(&mut self, mut f: F) {
-        // SAFETY: `slot` is initialized and its ctrl is already EMPTY, so the
-        // moved-out value is never read or dropped again.
-        self.clear_occupied_slots_with(|slot| unsafe { f(slot.read()) });
     }
 }
 

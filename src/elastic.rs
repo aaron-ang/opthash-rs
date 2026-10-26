@@ -21,6 +21,7 @@ use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::INITIAL_CAPACITY;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::raw::iter::OccupiedIndices;
+use crate::raw::rebuild::{self, Rebuildable};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -74,7 +75,7 @@ impl PhiRoute {
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
 /// [`SlotEntry`] data live contiguously in [`ElasticTable::arena`].
-struct Level<T> {
+pub(crate) struct Level<T> {
     /// Cached `arena.as_ptr() + ctrl_offset`, stamped at construction.
     ctrl_ptr: *mut u8,
     /// Cached `arena.as_ptr() + data_offset`, stamped at construction.
@@ -466,6 +467,22 @@ const PROBE_SCHEDULE_CAPACITY: [usize; MAX_LEVELS + 1] = {
         level += 1;
     }
     capacities
+};
+
+/// Paper probes a lookup can reach in each level: those with
+/// `phi <= QUERY_POSITION_CAP`, within `UNIFORM_SEARCH_CAP`. Placement stops
+/// there, so a vacancy past the cap counts as a failed probe.
+const LEVEL_PROBE_LIMIT: [u64; MAX_LEVELS] = {
+    let mut limits = [0; MAX_LEVELS];
+    let mut level = 0;
+    while level < MAX_LEVELS {
+        // `level_route_count` skips level 0's first probe, which the
+        // direct-slot fast path covers.
+        let first_probe_skipped = if level == 0 { 1 } else { 0 };
+        limits[level] = (level_route_count(level) + first_probe_skipped) as u64;
+        level += 1;
+    }
+    limits
 };
 
 /// Routes [`for_each_phi_route`] visits for `level` from its first probe up to
@@ -971,7 +988,31 @@ where
         if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             return self.place_new_entry(key, value, prepared, key_fingerprint, placement);
         }
+        self.place_after_target_failure(key, value, prepared, key_fingerprint, target)
+    }
 
+    /// Places a key whose active batch target has no slot: another target,
+    /// then a same-size rebuild, then exceptional placement. Kept out of line
+    /// so the common path inlines as a single target attempt.
+    #[cold]
+    #[inline(never)]
+    fn place_after_target_failure(
+        &mut self,
+        key: K,
+        value: V,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
+        target: BatchTarget,
+    ) -> (usize, usize) {
+        if let Some(placement) = self.choose_slot_on_other_targets(prepared.route.probe, target) {
+            return self.place_new_entry(key, value, prepared, key_fingerprint, placement);
+        }
+        // An epoch that already placed outside its probe routes failed its
+        // own rebuild; another would cost O(n) per insert without helping.
+        if self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG != 0 {
+            self.epoch.note_placement_recovery();
+            return self.place_exceptional_entry(key, value, prepared, key_fingerprint);
+        }
         self.resize_with_transition(self.total_slots, EpochTransition::PlacementRecovery);
         let target = self.scheduler.target(self.len);
         if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
@@ -1424,26 +1465,6 @@ where
         }
     }
 
-    /// Insert `(key, value)` known to be new. Skips the existence check and
-    /// capacity check in `insert`; resize loops drain old levels into fresh
-    /// (all-EMPTY) ones, so neither check can succeed. Returns `true` on
-    /// exceptional placement.
-    #[inline]
-    fn insert_unique(&mut self, key: K, value: V) -> bool {
-        let key_hash = self.hash_builder.hash_one(&key);
-        let prepared = PreparedElasticKey::new(key_hash);
-        let key_fingerprint = control::control_fingerprint(key_hash);
-
-        let target = self.scheduler.target(self.len);
-        if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
-            self.place_new_entry(key, value, prepared, key_fingerprint, placement);
-            false
-        } else {
-            self.place_exceptional_entry(key, value, prepared, key_fingerprint);
-            true
-        }
-    }
-
     /// Rebuilds levels at `new_capacity` and moves every live entry across.
     /// Passing the current capacity flushes tombstones without growing.
     fn resize(&mut self, new_capacity: usize) {
@@ -1458,51 +1479,33 @@ where
         }
     }
 
-    /// Moves every entry into fresh levels for `geometry`. Allocates before
-    /// touching the entries, so `Err` leaves the table intact.
+    /// Moves every entry into fresh levels for `geometry`. Each key is hashed
+    /// in place before its entry is copied, and the old levels are freed only
+    /// after the last copy, so `Err` or a panicking hasher leaves the table
+    /// intact.
     fn try_resize_to(
         &mut self,
         geometry: &ElasticGeometry,
         transition: EpochTransition,
     ) -> Result<(), TryReserveError> {
-        let required_schedule_capacity = PROBE_SCHEDULE_CAPACITY[geometry.level_capacities.len()];
-        if self.probe_schedule.capacity() < required_schedule_capacity {
-            self.probe_schedule
-                .try_reserve_exact(required_schedule_capacity - self.probe_schedule.len())
-                .map_err(|_| TryReserveError::AllocError)?;
-        }
-
-        // Run user code (`A::clone`) before the swap: between the swap and
-        // the guard, a panic would leak the old arena.
-        let guard_alloc = self.alloc.clone();
-        let scheduler = BatchScheduler::new(&geometry.batch_plan);
-        let (new_arena, new_levels, new_membership) =
+        let probe_schedule = try_probe_schedule(geometry.level_capacities.len())?;
+        let (arena, levels, membership) =
             try_alloc_elastic_arena(&geometry.level_capacities, &self.alloc)?;
-
-        // Panic safety: each source ctrl is cleared before the moved entry
-        // reaches `insert_unique`, so on unwind the guard drops only un-moved
-        // slots and frees the old arena; see `ArenaDropGuard`.
-        let mut guard = arena::ArenaDropGuard::new(
-            mem::replace(&mut self.arena, new_arena),
-            mem::replace(&mut self.levels, new_levels),
-            guard_alloc,
+        let used_exceptional_placement = rebuild::rebuild(
+            self,
+            ElasticGeneration {
+                levels,
+                len: 0,
+                total_slots: geometry.total_slots,
+                max_insertions: geometry.max_insertions,
+                scheduler: BatchScheduler::new(&geometry.batch_plan),
+                arena,
+                probe_high_water: 0,
+                probe_schedule,
+                membership,
+                stale_membership: 0,
+            },
         );
-        self.total_slots = geometry.total_slots;
-        self.membership = new_membership;
-        self.stale_membership = 0;
-        self.max_insertions = geometry.max_insertions;
-        self.scheduler = scheduler;
-        self.len = 0;
-        self.probe_high_water = 0;
-        self.probe_schedule.clear();
-        let mut used_exceptional_placement = false;
-        for level in guard.regions_mut().iter_mut() {
-            level.drain_values_and_clear(|entry| {
-                used_exceptional_placement |= self.insert_unique(entry.key, entry.value);
-            });
-        }
-        // Every slot is now EMPTY, so dropping the guard only frees `old_arena`.
-        drop(guard);
         self.epoch.start_epoch(
             transition,
             transition == EpochTransition::PlacementRecovery || used_exceptional_placement,
@@ -1529,6 +1532,27 @@ where
         let geometry = ElasticGeometry::for_slots(slots, reserve_fraction)
             .ok_or(TryReserveError::CapacityOverflow)?;
         Self::try_from_geometry(&geometry, reserve_fraction, hash_builder, alloc)
+    }
+
+    /// Retries placement on every other batch target, shallowest first.
+    /// Batches follow the live count, so after deletes the active pair can be
+    /// one that earlier batches filled while other levels have room again.
+    /// Insert-only traces never fail their active pair, so they never get here.
+    fn choose_slot_on_other_targets(
+        &self,
+        probe: PreparedElasticProbe,
+        target: BatchTarget,
+    ) -> Option<ExactPlacement> {
+        let has_room = |level: usize| self.levels.get(level).is_some_and(|l| l.free_slots() > 0);
+        let pairs = self.levels.len().saturating_sub(1);
+        core::iter::once(BatchTarget::Bootstrap)
+            .chain((0..pairs).map(BatchTarget::LevelPair))
+            .filter(|&candidate| candidate != target)
+            .filter(|&candidate| match candidate {
+                BatchTarget::Bootstrap => has_room(0),
+                BatchTarget::LevelPair(current) => has_room(current) || has_room(current + 1),
+            })
+            .find_map(|candidate| self.choose_slot_for_new_key(probe, candidate))
     }
 
     fn choose_slot_for_new_key(
@@ -1574,8 +1598,10 @@ where
                         ELASTIC_PROBE_BUDGET_C,
                     )
                     .ok()?;
+                    let budget = u64::try_from(budget)
+                        .unwrap_or(u64::MAX)
+                        .min(LEVEL_PROBE_LIMIT[current]);
                     if let Some((slot, probe)) = (0..budget).find_map(|logical_index| {
-                        let logical_index = u64::try_from(logical_index).ok()?;
                         self.vacancy(current, probe, logical_index)
                             .map(|slot| (slot, logical_index + 1))
                     }) {
@@ -1596,7 +1622,7 @@ where
     }
 
     fn uniform_vacancy(&self, probe: PreparedElasticProbe, level: usize) -> Option<(usize, u64)> {
-        for logical_index in 0..UNIFORM_SEARCH_CAP {
+        for logical_index in 0..LEVEL_PROBE_LIMIT[level] {
             if let Some(slot) = self.vacancy(level, probe, logical_index) {
                 return Some((slot, logical_index + 1));
             }
@@ -1818,6 +1844,73 @@ where
         let probe = CounterPrf::new(ELASTIC_PROBE_SEED).prepare_elastic(key_hash);
         self.levels.get(level)?;
         self.route_prepared(level, probe, logical_index)
+    }
+}
+
+/// The fields a resize replaces as a unit.
+pub(crate) struct ElasticGeneration<K, V> {
+    levels: LevelSlice<K, V>,
+    len: usize,
+    total_slots: usize,
+    max_insertions: usize,
+    scheduler: BatchScheduler,
+    arena: Arena,
+    probe_high_water: u32,
+    probe_schedule: Vec<PhiRoute>,
+    membership: MembershipRegion,
+    stale_membership: usize,
+}
+
+impl<K, V, S, A> Rebuildable for ElasticTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    type Key = K;
+    type Value = V;
+    type Region = Level<SlotEntry<K, V>>;
+    type Generation = ElasticGeneration<K, V>;
+
+    fn swap_generation(&mut self, other: &mut ElasticGeneration<K, V>) {
+        mem::swap(&mut self.levels, &mut other.levels);
+        mem::swap(&mut self.len, &mut other.len);
+        mem::swap(&mut self.total_slots, &mut other.total_slots);
+        mem::swap(&mut self.max_insertions, &mut other.max_insertions);
+        mem::swap(&mut self.scheduler, &mut other.scheduler);
+        mem::swap(&mut self.arena, &mut other.arena);
+        mem::swap(&mut self.probe_high_water, &mut other.probe_high_water);
+        mem::swap(&mut self.probe_schedule, &mut other.probe_schedule);
+        mem::swap(&mut self.membership, &mut other.membership);
+        mem::swap(&mut self.stale_membership, &mut other.stale_membership);
+    }
+
+    fn regions(generation: &ElasticGeneration<K, V>) -> &[Level<SlotEntry<K, V>>] {
+        &generation.levels
+    }
+
+    fn release(&self, generation: ElasticGeneration<K, V>) {
+        generation.arena.deallocate(&self.alloc);
+    }
+
+    fn hash_key(&self, key: &K) -> u64 {
+        self.hash_builder.hash_one(key)
+    }
+
+    /// Skips the existence and capacity checks in `insert`: the new
+    /// generation starts all-EMPTY, so neither can succeed.
+    #[inline]
+    fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
+        let prepared = PreparedElasticKey::new(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
+        let target = self.scheduler.target(self.len);
+        if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
+            self.place_new_entry(entry.key, entry.value, prepared, key_fingerprint, placement);
+            false
+        } else {
+            self.place_exceptional_entry(entry.key, entry.value, prepared, key_fingerprint);
+            true
+        }
     }
 }
 

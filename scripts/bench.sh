@@ -164,7 +164,7 @@ fi
 
 pin_wrapper=()
 if ((IS_LINUX)) && [[ -n "${CORE:-}" ]]; then
-	pin_wrapper=(taskset -c "$CORE" setarch -R)
+	pin_wrapper=(taskset -c "$CORE" setarch "$(uname -m)" -R)
 fi
 
 # nice/prlimit survive the UID drop, so always hand off to SUDO_USER to keep

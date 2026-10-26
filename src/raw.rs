@@ -6,4 +6,5 @@ pub(crate) mod bitmask;
 pub(crate) mod config;
 pub(crate) mod control;
 pub(crate) mod iter;
+pub(crate) mod rebuild;
 pub(crate) mod simd;

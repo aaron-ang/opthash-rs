@@ -28,7 +28,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build benchmarks
         run: cargo codspeed build --bench speedup
-      - uses: CodSpeedHQ/action@v4
+      - uses: CodSpeedHQ/action@v5
         with:
           mode: simulation
           run: cargo codspeed run
@@ -50,7 +50,7 @@ jobs:
         run: |
           uv venv
           uv pip install dist/*.whl pytest pytest-codspeed pytest-benchmark
-      - uses: CodSpeedHQ/action@v4
+      - uses: CodSpeedHQ/action@v5
         with:
           mode: simulation
           run: .venv/bin/pytest benches/python/throughput.py --codspeed
