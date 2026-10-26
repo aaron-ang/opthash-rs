@@ -1342,6 +1342,7 @@ fn for_insert_budget_finds_the_smallest_valid_slot_count() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn large_reserve_exponent_sizes_without_scanning_every_slot_count() {
     let reserve = ReserveFraction::from_exponent(40).unwrap();
     let shape = FunnelShape::for_insert_budget(1, reserve).unwrap();
