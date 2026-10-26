@@ -50,7 +50,7 @@ pyo3 = { version = "0.30", features = [
 ], optional = true }
 
 [dev-dependencies]
-criterion = { version = "4", package = "codspeed-criterion-compat", default-features = false, features = ["cargo_bench_support", "rayon"] }
+criterion = { version = "6", package = "codspeed-criterion-compat", default-features = false, features = ["cargo_bench_support", "rayon"] }
 harness = { package = "opthash-bench-harness", path = "benches/harness" }
 hashbrown = "0.17"
 
