@@ -45,7 +45,6 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           args: --release --out dist
-          sccache: true
       - name: Install
         run: |
           uv venv
