@@ -17,6 +17,22 @@ pub(crate) fn capacity_for(start: usize, needed: usize, reserve: ReserveFraction
     Some(cap)
 }
 
+/// Smallest slot count whose insertion budget holds `needed` entries:
+/// inverts `n - floor(n / 2^d) >= needed` exactly, where the closed form
+/// `ceil(needed * 2^d / (2^d - 1))` overshoots at many floor boundaries.
+/// `None` on overflow.
+#[inline]
+pub(crate) fn exact_capacity_for(needed: usize, reserve: ReserveFraction) -> Option<usize> {
+    if needed == 0 {
+        return Some(0);
+    }
+    let exponent = reserve.exponent();
+    if exponent >= usize::BITS {
+        return Some(needed);
+    }
+    needed.checked_add((needed - 1) / ((1_usize << exponent) - 1))
+}
+
 #[inline]
 pub(crate) fn tombstone_cleanup_threshold(capacity: usize) -> usize {
     let half = capacity / 2;
@@ -53,6 +69,26 @@ mod tests {
     #[test]
     fn capacity_for_returns_none_on_overflow() {
         assert_eq!(capacity_for(1, usize::MAX, reserve(1)), None);
+    }
+
+    #[test]
+    fn exact_capacity_for_is_the_smallest_fit() {
+        for exponent in [1, 2, 3, 5, 8, 64, 70] {
+            let reserve = reserve(exponent);
+            for needed in 1..3_000 {
+                let slots = exact_capacity_for(needed, reserve).unwrap();
+                assert!(
+                    max_insertions(slots, reserve) >= needed,
+                    "d={exponent} {needed}"
+                );
+                assert!(
+                    max_insertions(slots - 1, reserve) < needed,
+                    "d={exponent} {needed}"
+                );
+            }
+        }
+        assert_eq!(exact_capacity_for(0, reserve(3)), Some(0));
+        assert_eq!(exact_capacity_for(usize::MAX, reserve(1)), None);
     }
 
     #[test]

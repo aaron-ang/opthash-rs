@@ -12,7 +12,7 @@ use crate::ReserveFraction;
 use crate::capacity;
 use crate::epoch::{EpochSnapshot, EpochState, EpochTransition};
 use crate::error::{TryBuildError, TryReserveError};
-use crate::exact::geometry::PaperConfig;
+use crate::exact::geometry::{self, PaperConfig};
 use crate::exact::probe::{
     self, FUNNEL_SPECIAL_FALLBACK_A_BASE, FUNNEL_SPECIAL_FALLBACK_B_BASE,
     FUNNEL_SPECIAL_PRIMARY_BASE, FunnelPrf, PreparedFastFunnelDomainProbe, PreparedFastFunnelProbe,
@@ -24,10 +24,14 @@ use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::GROUP_SIZE;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::raw::iter::OccupiedIndices;
+use crate::raw::rebuild::{self, Rebuildable};
 use crate::raw::simd;
 use crate::{macros, map};
 
 const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
+/// Added to the probe seed by each placement-recovery rebuild. The seed passes
+/// through `mix64` before routing, so any odd step draws a fresh mapping.
+const FUNNEL_RESEED_STEP: u64 = probe::WYHASH_DEFAULT_SECRET[0];
 
 /// Pointerless scan progress through Funnel's flat storage.
 #[derive(Clone, Debug)]
@@ -163,18 +167,8 @@ impl FunnelShape {
         if !(3..usize::BITS).contains(&d) {
             return Err(TryReserveError::CapacityOverflow);
         }
-        let scale = 1_u128 << d;
-        let denominator = scale - 1;
-        // Invert `n - floor(n / scale) >= requested` exactly. Using
-        // `ceil(requested * scale / (scale - 1))` skips a valid `n` at many
-        // floor boundaries and can change geometry for a request that the
-        // preceding map already reports as its capacity.
-        let requested_wide = requested as u128;
-        let n_lower_bound = requested_wide
-            .checked_add((requested_wide - 1) / denominator)
-            .ok_or(TryReserveError::CapacityOverflow)?;
-        let mut n = usize::try_from(n_lower_bound)
-            .map_err(|_| TryReserveError::CapacityOverflow)?
+        let mut n = capacity::exact_capacity_for(requested, reserve)
+            .ok_or(TryReserveError::CapacityOverflow)?
             .max(2);
 
         let alpha = usize::try_from(u128::from(d) * 4 + 10)
@@ -188,6 +182,7 @@ impl FunnelShape {
                 .ok_or(TryReserveError::CapacityOverflow)?,
         );
 
+        n = geometry::funnel_minimum_slots(d, n).ok_or(TryReserveError::CapacityOverflow)?;
         loop {
             if let Ok(shape) = Self::from_slots(n, reserve)
                 && shape.max_insertions >= requested
@@ -199,7 +194,7 @@ impl FunnelShape {
     }
 }
 
-struct FlatStorage<T> {
+pub(crate) struct FlatStorage<T> {
     ctrl_ptr: *mut u8,
     data_ptr: *mut MaybeUninit<T>,
     capacity: usize,
@@ -594,6 +589,10 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     arena: Arena,
     epoch: EpochState,
     exceptional_placement: bool,
+    /// Seeds every probe sequence. Starts at [`FUNNEL_PROBE_SEED`]; a
+    /// placement-recovery rebuild advances it, because survivors of slot-order
+    /// deletes are skewed toward the buckets the old seed left full.
+    probe_seed: u64,
     /// Cached location of the membership filter tail. Lookups load one word
     /// from it before probing; see [`crate::membership`].
     membership: MembershipRegion,
@@ -751,6 +750,7 @@ where
             arena,
             epoch: EpochState::initial(),
             exceptional_placement: false,
+            probe_seed: FUNNEL_PROBE_SEED,
             membership,
             stale_membership: 0,
         })
@@ -834,7 +834,7 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
+        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
         self.search_exact_prepared_for_insert(key, probe, key_fingerprint)
     }
 
@@ -1217,7 +1217,7 @@ where
         // key the filter never recorded was never inserted, so neither the walk
         // nor the exceptional full scan can find it.
         let gate = self.membership_gate(key_hash);
-        let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
+        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
         if !gate.passes() {
             return Err(None);
         }
@@ -1275,18 +1275,6 @@ where
         }
     }
 
-    /// Rebuild insertion. The input comes from a table that held each key
-    /// once, so the placement walk never needs to look for a duplicate.
-    fn insert_unique(&mut self, key: K, value: V) -> bool {
-        let key_hash = self.hash_builder.hash_one(&key);
-        let key_fingerprint = control::control_fingerprint(key_hash);
-        let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(key_hash);
-        let (slot, exceptional) = self.resolve_vacancy(self.search_vacancy(probe));
-        let membership = self.membership_slot(key_hash);
-        self.place_new_entry(slot, key, value, membership, key_fingerprint, exceptional);
-        exceptional
-    }
-
     fn next_growth_slots(&self, needed: usize) -> Option<usize> {
         if needed >= isize::MAX as usize {
             return None;
@@ -1318,17 +1306,35 @@ where
         self.resize_with_transition(slots, EpochTransition::Growth);
     }
 
+    /// Places a known-absent key at its search's vacancy. An exhausted walk
+    /// first rebuilds the table at the same size under a fresh probe seed,
+    /// which clears tombstones and re-places every survivor, then walks
+    /// again; only a second exhaustion places the key outside its funnel.
     fn place_absent_after_search(
         &mut self,
         key: K,
         value: V,
-        membership: MembershipSlot,
-        key_fingerprint: u8,
+        key_hash: u64,
+        mut membership: MembershipSlot,
         exact: SearchResult,
     ) -> usize {
+        let key_fingerprint = control::control_fingerprint(key_hash);
+        // An epoch that already placed outside its funnels was either rebuilt
+        // for this reason or failed in its own rebuild; another would cost
+        // O(n) per insert without helping.
+        let rebuilt = !matches!(exact, SearchResult::Vacant(_)) && !self.exceptional_placement;
+        let exact = if rebuilt {
+            self.resize_with_transition(self.shape.n, EpochTransition::PlacementRecovery);
+            membership = self.membership_slot(key_hash);
+            self.search_vacancy(FunnelPrf::new(self.probe_seed).prepare(key_hash))
+        } else {
+            exact
+        };
         let (slot, exceptional) = self.resolve_vacancy(exact);
         self.place_new_entry(slot, key, value, membership, key_fingerprint, exceptional);
-        if exceptional {
+        if exceptional && rebuilt {
+            self.epoch.note_placement_recovery();
+        } else if exceptional {
             self.epoch
                 .start_with_placement_recovery(EpochTransition::PlacementRecovery);
         }
@@ -1380,37 +1386,105 @@ where
         }
     }
 
-    /// Moves every entry into fresh storage for `shape`. Allocates before
-    /// touching `self`, so `Err` leaves the table intact.
+    /// Moves every entry into fresh storage for `shape`. A placement-recovery
+    /// rebuild also advances the probe seed. Each key is hashed in place
+    /// before its entry is copied, and the old storage is freed only after
+    /// the last copy, so `Err` or a panicking hasher leaves the table intact.
     fn try_resize_to(
         &mut self,
         shape: FunnelShape,
         transition: EpochTransition,
     ) -> Result<(), TryReserveError> {
-        // Run user code (`A::clone`) before the swap: between the swap and
-        // the guard, a panic would leak the old arena.
-        let guard_alloc = self.alloc.clone();
-        let (new_arena, new_storage, new_membership) = try_allocate_storage(shape.n, &self.alloc)?;
-
-        let mut guard = arena::ArenaDropGuard::new(
-            mem::replace(&mut self.arena, new_arena),
-            mem::replace(&mut self.storage, new_storage),
-            guard_alloc,
+        let (arena, storage, membership) = try_allocate_storage(shape.n, &self.alloc)?;
+        let probe_seed = if matches!(transition, EpochTransition::PlacementRecovery) {
+            self.probe_seed.wrapping_add(FUNNEL_RESEED_STEP)
+        } else {
+            self.probe_seed
+        };
+        let recovered = rebuild::rebuild(
+            self,
+            FunnelGeneration {
+                shape,
+                storage,
+                len: 0,
+                tombstones: 0,
+                arena,
+                exceptional_placement: false,
+                probe_seed,
+                membership,
+                stale_membership: 0,
+            },
         );
-        self.membership = new_membership;
-        self.stale_membership = 0;
-        self.shape = shape;
-        self.len = 0;
-        self.tombstones = 0;
-        self.exceptional_placement = false;
-
-        let mut recovered = false;
-        guard.regions_mut().drain_values_and_clear(|entry| {
-            recovered |= self.insert_unique(entry.key, entry.value);
-        });
-        drop(guard);
         self.epoch.start_epoch(transition, recovered);
         Ok(())
+    }
+}
+
+/// The fields a resize replaces as a unit.
+pub(crate) struct FunnelGeneration<K, V> {
+    shape: FunnelShape,
+    storage: FlatStorage<SlotEntry<K, V>>,
+    len: usize,
+    tombstones: usize,
+    arena: Arena,
+    exceptional_placement: bool,
+    probe_seed: u64,
+    membership: MembershipRegion,
+    stale_membership: usize,
+}
+
+impl<K, V, S, A> Rebuildable for FunnelTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    type Key = K;
+    type Value = V;
+    type Region = FlatStorage<SlotEntry<K, V>>;
+    type Generation = FunnelGeneration<K, V>;
+
+    fn swap_generation(&mut self, other: &mut FunnelGeneration<K, V>) {
+        mem::swap(&mut self.shape, &mut other.shape);
+        mem::swap(&mut self.storage, &mut other.storage);
+        mem::swap(&mut self.len, &mut other.len);
+        mem::swap(&mut self.tombstones, &mut other.tombstones);
+        mem::swap(&mut self.arena, &mut other.arena);
+        mem::swap(
+            &mut self.exceptional_placement,
+            &mut other.exceptional_placement,
+        );
+        mem::swap(&mut self.probe_seed, &mut other.probe_seed);
+        mem::swap(&mut self.membership, &mut other.membership);
+        mem::swap(&mut self.stale_membership, &mut other.stale_membership);
+    }
+
+    fn regions(generation: &FunnelGeneration<K, V>) -> &[FlatStorage<SlotEntry<K, V>>] {
+        core::slice::from_ref(&generation.storage)
+    }
+
+    fn release(&self, generation: FunnelGeneration<K, V>) {
+        generation.arena.deallocate(&self.alloc);
+    }
+
+    fn hash_key(&self, key: &K) -> u64 {
+        self.hash_builder.hash_one(key)
+    }
+
+    fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
+        let key_fingerprint = control::control_fingerprint(key_hash);
+        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
+        let (slot, exceptional) = self.resolve_vacancy(self.search_vacancy(probe));
+        let membership = self.membership_slot(key_hash);
+        self.place_new_entry(
+            slot,
+            entry.key,
+            entry.value,
+            membership,
+            key_fingerprint,
+            exceptional,
+        );
+        exceptional
     }
 }
 
@@ -1522,18 +1596,17 @@ where
         let exact = if self.prepare_vacant_insert() || vacant.exact == FunnelVacant::UNSEARCHED {
             // Growth invalidates any recorded slot or exhaustion; an unsearched
             // token never had one.
-            let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(vacant.hash);
+            let probe = FunnelPrf::new(self.probe_seed).prepare(vacant.hash);
             self.search_vacancy(probe)
         } else if vacant.exact == FunnelVacant::EXHAUSTED {
-            // Both exhaustion reasons use the same exceptional placement.
+            // Both exhaustion reasons take the same recovery path.
             SearchResult::Full
         } else {
             SearchResult::Vacant(vacant.exact)
         };
         // Filter geometry may have changed during growth too.
         let membership = self.membership_slot(vacant.hash);
-        let fingerprint = control::control_fingerprint(vacant.hash);
-        self.place_absent_after_search(key, value, membership, fingerprint, exact)
+        self.place_absent_after_search(key, value, vacant.hash, membership, exact)
     }
 
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
@@ -1545,7 +1618,7 @@ where
         // only the placement walk runs.
         let mut membership = self.membership_slot(hash);
         let gate = self.membership_gate_at(membership);
-        let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(hash);
+        let probe = FunnelPrf::new(self.probe_seed).prepare(hash);
         let fingerprint = control::control_fingerprint(hash);
         let mut exact = SearchResult::Full;
         let mut searched = false;
@@ -1569,7 +1642,7 @@ where
         } else if !searched {
             exact = self.search_vacancy(probe);
         }
-        self.place_absent_after_search(key, value, membership, fingerprint, exact);
+        self.place_absent_after_search(key, value, hash, membership, exact);
         None
     }
 
@@ -1688,25 +1761,26 @@ where
         }
     }
 
+    /// Lookups stop at `EMPTY`, so each value's slot becomes a tombstone
+    /// before the value drops, and controls reset only after the last drop.
+    /// A panicking `Drop` leaves every undropped entry reachable and counted,
+    /// and a later `clear` finishes the job.
     fn clear(&mut self) {
-        for slot in 0..self.shape.n {
-            // SAFETY: `slot < n`, the storage capacity; EMPTY is not occupied.
-            unsafe {
-                if self.storage.control_at(slot) == CTRL_TOMBSTONE {
-                    self.storage.set_control(slot, CTRL_EMPTY);
-                }
+        if mem::needs_drop::<SlotEntry<K, V>>() {
+            let mut scan = OccupiedIndices::new();
+            while let Some(slot) = scan.step(&self.storage) {
+                // SAFETY: `step` yields occupied in-bounds slots; the slot is
+                // marked a tombstone before `entry` drops, so it is never read
+                // or dropped again.
+                let entry = unsafe { self.storage.take(slot) };
+                // SAFETY: `slot` is in bounds and its value was moved out.
+                unsafe { self.storage.set_control(slot, CTRL_TOMBSTONE) };
+                self.len -= 1;
+                self.tombstones += 1;
+                drop(entry);
             }
         }
-        self.tombstones = 0;
-        let len = &mut self.len;
-        self.storage.clear_occupied_slots_with(|slot| {
-            *len -= 1;
-            // SAFETY: the visitor only receives slots that were occupied, each
-            // once, with their control already cleared.
-            unsafe { core::ptr::drop_in_place(slot) };
-        });
-        debug_assert_eq!(self.len, 0);
-        self.finish_clear();
+        self.wipe_all();
     }
 
     fn wipe_all(&mut self) {
@@ -1734,6 +1808,7 @@ where
         cloned.tombstones = self.tombstones;
         cloned.epoch = self.epoch;
         cloned.exceptional_placement = self.exceptional_placement;
+        cloned.probe_seed = self.probe_seed;
         // Slots are copied rather than reinserted, so the filter comes with them.
         cloned.copy_membership_from(self);
         cloned.stale_membership = self.stale_membership;

@@ -235,3 +235,42 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
     assert_eq!(stale_membership(map.table()), 0);
     assert!((0..live).all(|key| !gate_passes(map.table(), key)));
 }
+
+/// Work-queue churn at fixed capacity: pop the first key in iteration order,
+/// push a fresh one. Popping in slot order drains the first level while fresh
+/// keys overflow deeper, so placements eventually exhaust their prescribed
+/// candidates. Each exhaustion must end in a rebuild that restores paper
+/// placement, never in a permanent full-scan mode.
+///
+/// `exceptional` reports whether the backend is in its full-scan fallback.
+pub(crate) fn assert_pop_first_churn_restores_paper_placement<P>(exceptional: impl Fn(&P) -> bool)
+where
+    P: TableBackend<u64, u64, Hasher = FixedHashBuilder, Alloc = Global>,
+{
+    let mut map: HashMap<u64, u64, P> = Deterministic::with_capacity(2_048);
+    let capacity = map.capacity();
+    let mut live = std::collections::HashSet::new();
+    let mut next_key = 0_u64;
+    while map.len() < capacity {
+        map.insert(next_key, next_key);
+        live.insert(next_key);
+        next_key += 1;
+    }
+
+    for _ in 0..capacity * 8 {
+        let first = *map.keys().next().unwrap();
+        assert_eq!(map.remove(&first), Some(first));
+        live.remove(&first);
+        map.insert(next_key, next_key);
+        live.insert(next_key);
+        next_key += 1;
+        assert!(
+            !exceptional(map.table()),
+            "churn left the full-scan fallback on"
+        );
+    }
+
+    assert_eq!(map.capacity(), capacity);
+    assert_eq!(map.len(), live.len());
+    assert!(live.iter().all(|key| map.get(key) == Some(key)));
+}

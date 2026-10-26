@@ -74,10 +74,16 @@ impl EpochState {
     }
 
     pub(crate) fn start_with_placement_recovery(&mut self, transition: EpochTransition) {
-        let recoveries = self.placement_recoveries().saturating_add(1);
-        self.lifecycle =
-            (self.lifecycle & !RECOVERY_MASK) | (u64::from(recoveries) << RECOVERY_SHIFT);
+        self.note_placement_recovery();
         self.start(transition);
+    }
+
+    /// Counts a placement recovery inside the current epoch. The counter
+    /// saturates at its field width.
+    pub(crate) fn note_placement_recovery(&mut self) {
+        let recoveries =
+            (u64::from(self.placement_recoveries()) + 1).min(RECOVERY_MASK >> RECOVERY_SHIFT);
+        self.lifecycle = (self.lifecycle & !RECOVERY_MASK) | (recoveries << RECOVERY_SHIFT);
     }
 
     /// Starts a rebuild epoch, counting a placement recovery if any entry
@@ -142,5 +148,21 @@ mod tests {
             assert_eq!(bits & !(TRANSITION_MASK >> TRANSITION_SHIFT), 0);
             assert_eq!(transition_from_bits(bits), transition);
         }
+    }
+
+    #[test]
+    fn placement_recoveries_saturate_without_touching_other_fields() {
+        let max = RECOVERY_MASK >> RECOVERY_SHIFT;
+        let mut epoch = EpochState {
+            deletions: 0,
+            lifecycle: (max - 1) << RECOVERY_SHIFT,
+        };
+        for _ in 0..3 {
+            epoch.start_with_placement_recovery(EpochTransition::PlacementRecovery);
+        }
+        let snapshot = epoch.snapshot(0);
+        assert_eq!(snapshot.placement_recoveries, max);
+        assert_eq!(snapshot.transition, EpochTransition::PlacementRecovery);
+        assert_eq!(snapshot.generation, 3);
     }
 }

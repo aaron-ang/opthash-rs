@@ -144,7 +144,7 @@ fn vacant_entry_filter_rejection_still_searches_for_placement() {
 }
 
 #[test]
-fn vacant_entry_reuses_exhausted_search_before_exceptional_placement() {
+fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement() {
     use crate::map::TableBackend;
 
     let mut table = raw_table(512, 3);
@@ -162,14 +162,23 @@ fn vacant_entry_reuses_exhausted_search_before_exceptional_placement() {
     );
     let vacant = table.find_for_entry(&absent, hash).err().unwrap();
     let old_len = table.len;
+    let old_seed = table.probe_seed;
     VACANCY_WALKS.with(|walks| walks.set(0));
     let inserted = table.insert_for_vacant(absent, 99, vacant);
+
+    // The colliding keys were placed under one forced hash; the rebuild
+    // rehashes them, so the walk after it finds a vacancy in the funnel.
     assert_eq!(
         VACANCY_WALKS.with(Cell::get),
-        0,
-        "an exhausted exact search needs no second walk"
+        old_len + 1,
+        "one walk per survivor, then one for the new key"
     );
-    assert!(table.exceptional_placement);
+    assert_ne!(table.probe_seed, old_seed);
+    assert!(!table.exceptional_placement);
+    assert_eq!(
+        table.epoch_snapshot().transition,
+        EpochTransition::PlacementRecovery
+    );
     assert_eq!(table.len, old_len + 1);
     assert_eq!(
         table.find_location(&absent, hash, fingerprint),
@@ -259,7 +268,10 @@ fn sparse_scan_visits_group_boundaries_and_tail_once_in_slot_order() {
 fn refresh_membership_rebuilds_the_recorded_filter() {
     let mut table = raw_table(32_767, 3);
     for key in 0..64_u64 {
-        assert!(!table.insert_unique(key, key));
+        assert!(!table.place_unique(
+            SlotEntry { key, value: key },
+            table.hash_builder.hash_one(key)
+        ));
     }
     // SAFETY: the filter tail holds `membership.words` initialized words.
     let recorded = unsafe {
@@ -279,7 +291,10 @@ fn refresh_membership_rebuilds_the_recorded_filter() {
 fn clean_and_dirty_search_modes_agree_without_tombstones() {
     let mut table = raw_table(344, 4);
     for key in 0..128_u64 {
-        assert!(!table.insert_unique(key, key));
+        assert!(!table.place_unique(
+            SlotEntry { key, value: key },
+            table.hash_builder.hash_one(key)
+        ));
     }
     assert_eq!(table.tombstones, 0);
 
@@ -301,7 +316,10 @@ fn vacancy_walk_matches_exact_search_for_absent_keys() {
     let mut table = raw_table(5_472, 8);
     let live = table.shape.max_insertions as u64;
     for key in 0..live {
-        assert!(!table.insert_unique(key, key));
+        assert!(!table.place_unique(
+            SlotEntry { key, value: key },
+            table.hash_builder.hash_one(key)
+        ));
     }
     let check = |table: &FunnelTable<u64, u64, IdentityBuildHasher>, label: &str| {
         let mut vacant = 0_usize;
@@ -340,6 +358,14 @@ fn deletes_past_the_threshold_refresh_the_membership_filter() {
         },
         |table| table.stale_membership,
     );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn pop_first_churn_restores_paper_placement() {
+    test_support::assert_pop_first_churn_restores_paper_placement::<
+        FunnelTable<u64, u64, test_support::FixedHashBuilder>,
+    >(|table| table.exceptional_placement);
 }
 
 #[test]
@@ -857,7 +883,7 @@ fn tombstone_before_a_duplicate_does_not_hide_the_duplicate() {
 }
 
 #[test]
-fn clear_marks_each_slot_empty_before_dropping_its_value() {
+fn clear_tombstones_each_slot_before_dropping_its_value() {
     let drops = Arc::new(AtomicUsize::new(0));
     let reserve = ReserveFraction::from_exponent(3).unwrap();
     let shape = FunnelShape::from_slots(144, reserve).unwrap();
@@ -881,7 +907,10 @@ fn clear_marks_each_slot_empty_before_dropping_its_value() {
         <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clear(&mut table);
     }));
     assert!(result.is_err());
-    assert_eq!(table.storage.checked_control(first_occupied), CTRL_EMPTY);
+    assert_eq!(
+        table.storage.checked_control(first_occupied),
+        CTRL_TOMBSTONE
+    );
     assert_eq!(
         table.len,
         (0..table.shape.n)
@@ -897,7 +926,38 @@ fn clear_marks_each_slot_empty_before_dropping_its_value() {
 }
 
 #[test]
-fn failed_fallible_resize_leaves_a_valid_table() {
+#[cfg_attr(miri, ignore)]
+fn clear_interrupted_by_a_panicking_drop_keeps_survivors_reachable() {
+    use crate::test_support::Deterministic;
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut map: FunnelHashMap<u64, PanicOnFirstDrop, test_support::FixedHashBuilder> =
+        Deterministic::with_capacity(4_096);
+    let keys = 0..map.capacity() as u64;
+    for key in keys.clone() {
+        map.insert(key, PanicOnFirstDrop(drops.clone()));
+    }
+    // Tombstones on the survivors' walks.
+    // Leaked so the first value drop happens inside `clear`.
+    for key in keys.clone().filter(|key| key % 4 == 0) {
+        mem::forget(map.remove(&key));
+    }
+
+    assert!(catch_unwind(AssertUnwindSafe(|| map.clear())).is_err());
+    let reachable = keys.clone().filter(|key| map.get(key).is_some()).count();
+    assert_eq!(reachable, map.len(), "every counted survivor is reachable");
+    assert!(!map.is_empty(), "the panic interrupted the clear");
+
+    // Reinserting every key must not duplicate a survivor.
+    for key in keys.clone() {
+        map.insert(key, PanicOnFirstDrop(drops.clone()));
+    }
+    assert_eq!(map.len(), keys.clone().count());
+    assert_eq!(map.iter().count(), map.len());
+}
+
+#[test]
+fn panicking_hasher_during_resize_keeps_every_entry() {
     let armed = Arc::new(AtomicBool::new(false));
     let drops = Arc::new(AtomicUsize::new(0));
     let reserve = ReserveFraction::from_exponent(3).unwrap();
@@ -928,6 +988,9 @@ fn failed_fallible_resize_leaves_a_valid_table() {
         map::TableBackend::try_resize(&mut table, next_shape.n).unwrap();
     }));
     assert!(result.is_err());
+    assert_eq!(table.shape.n, 144);
+    assert_eq!(table.len, 3);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert_eq!(
         table.len,
         (0..table.shape.n)
@@ -936,6 +999,18 @@ fn failed_fallible_resize_leaves_a_valid_table() {
     );
 
     armed.store(false, Ordering::SeqCst);
+    for id in 0..3 {
+        let probe = PanicHashKey {
+            id,
+            armed: armed.clone(),
+            drops: Arc::new(AtomicUsize::new(0)),
+        };
+        assert_eq!(
+            <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::find_entry(&table, &probe, id)
+                .map(|entry| entry.value),
+            Some(id)
+        );
+    }
     let replacement = PanicHashKey {
         id: 99,
         armed: armed.clone(),
@@ -1238,4 +1313,38 @@ fn drop_continues_past_a_panicking_value() {
     assert!(catch_unwind(AssertUnwindSafe(|| drop(map))).is_err());
     // The panicking value counts too, so every value dropped exactly once.
     assert_eq!(drops.load(Ordering::SeqCst), 200);
+}
+
+/// Smallest valid `n` by trying every slot count from 2 upward.
+fn for_insert_budget_by_scan(requested: usize, reserve: ReserveFraction) -> usize {
+    (2..usize::MAX)
+        .find(|&n| {
+            FunnelShape::from_slots(n, reserve).is_ok_and(|shape| shape.max_insertions >= requested)
+        })
+        .unwrap()
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn for_insert_budget_finds_the_smallest_valid_slot_count() {
+    for exponent in 3..=7 {
+        let reserve = ReserveFraction::from_exponent(exponent).unwrap();
+        for requested in [1, 2, 1_000, 20_000] {
+            assert_eq!(
+                FunnelShape::for_insert_budget(requested, reserve)
+                    .unwrap()
+                    .n,
+                for_insert_budget_by_scan(requested, reserve),
+                "exponent={exponent} requested={requested}"
+            );
+        }
+    }
+}
+
+#[test]
+fn large_reserve_exponent_sizes_without_scanning_every_slot_count() {
+    let reserve = ReserveFraction::from_exponent(40).unwrap();
+    let shape = FunnelShape::for_insert_budget(1, reserve).unwrap();
+    assert!(FunnelShape::from_slots(shape.n - 1, reserve).is_err());
+    assert!(crate::FunnelHashMap::<u64, u64>::try_with_capacity_and_reserve(1, reserve).is_err());
 }

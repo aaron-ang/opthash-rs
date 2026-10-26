@@ -410,6 +410,25 @@ impl Iterator for BatchQuotas {
 impl ExactSizeIterator for BatchQuotas {}
 impl FusedIterator for BatchQuotas {}
 
+/// Returns the smallest `n >= from` whose special-array ceiling
+/// `floor(3n / 2^(d+2))` can hold two fallback buckets, a necessary condition
+/// for [`PaperConfig::funnel_plan`]. The bucket width grows with `n`, so the
+/// bound is iterated to its least fixed point. `None` on overflow.
+pub(crate) fn funnel_minimum_slots(reserve_exponent: u32, from: usize) -> Option<usize> {
+    let mut n = from;
+    loop {
+        let minimum_special_len = 4 * base_two_loglog_ceiling(n) as u128;
+        let required = minimum_special_len
+            .checked_mul(1_u128.checked_shl(reserve_exponent.checked_add(2)?)?)?
+            .div_ceil(3);
+        let required = usize::try_from(required).ok()?;
+        if required <= n {
+            return Some(n);
+        }
+        n = required;
+    }
+}
+
 fn largest_compatible_special_layout(
     n: usize,
     lower: usize,
