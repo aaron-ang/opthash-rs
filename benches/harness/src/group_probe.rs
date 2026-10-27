@@ -1,7 +1,7 @@
-//! Greedy group-probing control for the `high_load` sweep. It copies
-//! hashbrown's `SwissTable` design (control-byte encoding, group width and
-//! scans, hash split, triangular probing), so the two compare at 7/8 load, the
-//! most hashbrown accepts. Above that, it is the only greedy arm.
+//! Greedy group-probing control for the `high_load` sweep. On 64-bit targets
+//! it copies hashbrown's `SwissTable` design (control-byte encoding, group
+//! width and scans, hash split, triangular probing), so the two compare at 7/8
+//! load, the most hashbrown accepts. Above that, it is the only greedy arm.
 
 use std::hash::BuildHasher;
 
@@ -76,7 +76,8 @@ mod group {
     }
 }
 
-/// hashbrown's portable SWAR group scans, for targets with neither backend.
+/// Portable SWAR group scans after hashbrown's generic backend, for targets
+/// with neither SIMD backend.
 #[cfg(not(any(
     all(
         target_feature = "sse2",
@@ -107,6 +108,7 @@ mod group {
         diff.wrapping_sub(LANE_LSB) & !diff & LANE_MSB
     }
 
+    /// With no tombstones, only `EMPTY` has its high bit set.
     #[inline]
     pub(super) fn match_empty(group: [u8; WIDTH]) -> Mask {
         u64::from_le_bytes(group) & LANE_MSB
@@ -161,6 +163,15 @@ impl GroupProbeMap {
         self.max_len
     }
 
+    /// Keys in slot order.
+    pub fn keys(&self) -> impl Iterator<Item = &u64> {
+        self.ctrl[..=self.mask]
+            .iter()
+            .zip(&self.entries)
+            .filter(|&(&ctrl, _)| ctrl != EMPTY)
+            .map(|(_, (key, _))| key)
+    }
+
     #[inline]
     pub fn get(&self, key: &u64) -> Option<&u64> {
         let mask = self.mask;
@@ -170,7 +181,9 @@ impl GroupProbeMap {
         let (start, tag) = split_hash(self.hasher.hash_one(key), mask);
         let mut probe = Probe::new(start);
         loop {
-            let group = load_group(&self.ctrl, probe.pos);
+            // SAFETY: `probe.pos <= mask`, and `ctrl` holds `mask + 1 + WIDTH`
+            // bytes.
+            let group = unsafe { load_group(&self.ctrl, probe.pos) };
             for lane in Lanes(group::match_tag(group, tag)) {
                 let (stored, value) = &entries[(probe.pos + lane) & mask];
                 if stored == key {
@@ -193,7 +206,9 @@ impl GroupProbeMap {
         let (start, tag) = split_hash(self.hasher.hash_one(key), mask);
         let mut probe = Probe::new(start);
         loop {
-            let group = load_group(&self.ctrl, probe.pos);
+            // SAFETY: `probe.pos <= mask`, and `ctrl` holds `mask + 1 + WIDTH`
+            // bytes.
+            let group = unsafe { load_group(&self.ctrl, probe.pos) };
             for lane in Lanes(group::match_tag(group, tag)) {
                 let slot = &mut entries[(probe.pos + lane) & mask];
                 if slot.0 == key {
@@ -218,11 +233,18 @@ impl GroupProbeMap {
     }
 }
 
+/// Reads the group at `pos` without a bounds check, as hashbrown does; the
+/// check would cost the control a compare and branch on every probed group.
+///
+/// # Safety
+///
+/// `pos + WIDTH <= ctrl.len()`.
 #[inline]
-fn load_group(ctrl: &[u8], pos: usize) -> [u8; group::WIDTH] {
-    ctrl[pos..pos + group::WIDTH]
-        .try_into()
-        .expect("a group is WIDTH bytes")
+unsafe fn load_group(ctrl: &[u8], pos: usize) -> [u8; group::WIDTH] {
+    debug_assert!(pos + group::WIDTH <= ctrl.len());
+    // SAFETY: the caller keeps the group in bounds, and `[u8; WIDTH]` has
+    // alignment 1.
+    unsafe { ctrl.as_ptr().add(pos).cast::<[u8; group::WIDTH]>().read() }
 }
 
 /// The low bits pick the start slot; the top seven bits tag it.
@@ -235,6 +257,8 @@ fn split_hash(hash: u64, mask: usize) -> (usize, u8) {
 /// Triangular group probe: strides of 1, 2, 3, ... groups. Over a power-of-two
 /// table it visits every group position before repeating.
 struct Probe {
+    /// At most `mask`: [`split_hash`] masks the start and [`Probe::advance`]
+    /// masks every step.
     pos: usize,
     stride: usize,
 }

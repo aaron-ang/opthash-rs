@@ -323,9 +323,9 @@ fn mean_latency_builds_each_map_once_per_size_not_once_per_sample() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore = "full-size bench fixture is too slow")]
 fn group_probe_matches_std_at_high_load() {
-    let point = LoadPoint::new(1 << 16, 10);
+    let slots = if cfg!(miri) { 1 << 10 } else { 1 << 16 };
+    let point = LoadPoint::new(slots, 10);
     let pairs = harness::make_pairs(point.entries());
     let mut map = point.group_probe();
     let mut model = harness::std_map_cap(point.entries());
@@ -341,9 +341,44 @@ fn group_probe_matches_std_at_high_load() {
     for &(key, _) in &pairs {
         assert_eq!(map.get(&key), model.get(&key));
     }
-    for key in harness::miss_keys(OP_COUNT) {
+    let misses = if cfg!(miri) { 64 } else { OP_COUNT };
+    for key in harness::miss_keys(misses) {
         assert_eq!(map.get(&key), None);
     }
+}
+
+/// Small tables filled to one empty slot put many keys in groups that wrap
+/// past the last slot, so lookups depend on the mirrored control bytes.
+#[test]
+fn group_probe_finds_keys_in_wrapping_groups() {
+    let key_sets = if cfg!(miri) { 8 } else { 512 };
+    for slots in [32, 64] {
+        for set in 0..key_sets {
+            let keys: Vec<u64> = (0..slots - 1)
+                .map(|index| harness::key_at(set * slots + index))
+                .collect();
+            let mut map = GroupProbeMap::with_slots(slots, slots - 1);
+            for (value, &key) in (0..).zip(&keys) {
+                assert_eq!(map.insert(key, value), None);
+            }
+            assert_eq!(map.len(), slots - 1);
+            for (value, key) in (0..).zip(&keys) {
+                assert_eq!(map.get(key), Some(&value), "slots {slots}, set {set}");
+            }
+        }
+    }
+}
+
+#[test]
+fn group_probe_places_keys_where_hashbrown_does() {
+    let point = LoadPoint::new(1 << 10, 3);
+    let mut group_probe = point.group_probe();
+    let mut hashbrown = point.hashbrown().expect("hashbrown runs at 7/8 load");
+    for (key, value) in harness::make_pairs(point.entries()) {
+        group_probe.insert(key, value);
+        hashbrown.insert(key, value);
+    }
+    assert!(group_probe.keys().eq(hashbrown.keys()));
 }
 
 #[test]
