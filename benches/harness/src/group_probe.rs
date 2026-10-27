@@ -1,7 +1,7 @@
 //! Greedy group-probing control for the `high_load` sweep. It copies
-//! hashbrown's `SwissTable` design (control-byte layout, group width, hash split,
-//! triangular probing) so it can be calibrated against hashbrown at 7/8 load,
-//! but drops hashbrown's 7/8 load cap and removal.
+//! hashbrown's `SwissTable` design (control-byte layout, group width, hash
+//! split, triangular probing), so the two compare at 7/8 load, the most
+//! hashbrown accepts. Above that, it is the only greedy arm.
 
 use std::hash::BuildHasher;
 

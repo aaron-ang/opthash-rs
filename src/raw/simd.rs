@@ -158,9 +158,9 @@ mod sse2 {
     }
 }
 
-/// Portable SWAR-8 control scan (hashbrown's "generic" backend): 8 control bytes
-/// packed into one `u64`, matched with exact borrow-free masks. Lane `i`'s match
-/// is flagged by its high bit at bit `8*i + 7` (`BITMASK_STRIDE` 8).
+/// Portable SWAR-8 fallback control scan: 8 control bytes packed into one
+/// `u64`, matched with exact borrow-free masks. Lane `i`'s match is flagged by
+/// its high bit at bit `8*i + 7` (`BITMASK_STRIDE` 8).
 #[cfg(opthash_scalar_group)]
 mod swar {
     use super::BitMask;

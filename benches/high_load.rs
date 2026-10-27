@@ -10,10 +10,9 @@ use std::hint::black_box;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use harness::{HIGH_LOAD_EXPONENTS, HIGH_LOAD_SLOTS, LoadPoint, OP_COUNT};
 
-/// Invokes `$arm!(impl_name, empty_map)` once per arm at `$point`; hashbrown
-/// joins only the points its load cap admits. Each arm builds and drops its map
-/// inside its own `$arm!` block, so no arm's map stays resident while another
-/// arm is timed.
+/// Invokes `$arm!(impl_name, empty_map)` once per arm at `$point`. Each arm
+/// builds and drops its map inside its own `$arm!` block, so no arm's map stays
+/// resident while another arm is timed.
 macro_rules! for_each_arm {
     ($point:expr, $arm:ident) => {
         $arm!("elastic", $point.elastic());
