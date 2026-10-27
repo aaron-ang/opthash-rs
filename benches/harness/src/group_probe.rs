@@ -37,13 +37,58 @@ mod group {
     }
 }
 
-/// hashbrown's portable SWAR group scans. They stand in on aarch64 too:
-/// hashbrown uses NEON there, but safe Rust cannot move a NEON compare result
-/// into a `u64`.
-#[cfg(not(all(
-    target_feature = "sse2",
-    any(target_arch = "x86", target_arch = "x86_64"),
+/// NEON group scans: `cmeq` + `fmov`, as hashbrown's NEON backend issues.
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "neon",
+    target_endian = "little",
     not(miri)
+))]
+mod group {
+    use core::arch::aarch64::{vceq_u8, vcreate_u8, vdup_n_u8, vget_lane_u64, vreinterpret_u64_u8};
+
+    pub(super) const WIDTH: usize = 8;
+    /// Mask bits per lane; only each lane's high bit is kept.
+    pub(super) const STRIDE: u32 = 8;
+    pub(super) type Mask = u64;
+
+    const LANE_MSB: u64 = 0x8080_8080_8080_8080;
+
+    /// A matching lane compares to `0xFF`; keeping one bit of it lets `Lanes`
+    /// clear the whole lane at once.
+    #[inline]
+    pub(super) fn match_tag(group: [u8; WIDTH], tag: u8) -> Mask {
+        let group = u64::from_le_bytes(group);
+        // SAFETY: this module compiles only when `neon` is enabled for the
+        // whole build, so every intrinsic's target feature is present.
+        let lanes = unsafe {
+            vget_lane_u64::<0>(vreinterpret_u64_u8(vceq_u8(
+                vcreate_u8(group),
+                vdup_n_u8(tag),
+            )))
+        };
+        lanes & LANE_MSB
+    }
+
+    #[inline]
+    pub(super) fn match_empty(group: [u8; WIDTH]) -> Mask {
+        match_tag(group, super::EMPTY)
+    }
+}
+
+/// hashbrown's portable SWAR group scans, for targets with neither backend.
+#[cfg(not(any(
+    all(
+        target_feature = "sse2",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        not(miri)
+    ),
+    all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little",
+        not(miri)
+    )
 )))]
 mod group {
     pub(super) const WIDTH: usize = 8;

@@ -134,9 +134,8 @@ counts in other targets:
 hashbrown caps load at 7/8, so it cannot run above the first point.
 `group_probe` is the greedy control instead: a harness table with hashbrown's
 control-byte encoding, group width, hash split, and triangular probing, but no
-load cap and no removal. Its x86 group scans compile to hashbrown's SSE2
-instructions. On aarch64 it uses hashbrown's portable SWAR scans, because safe
-Rust cannot express hashbrown's NEON ones. hashbrown joins only the 87.5% groups, to calibrate it.
+load cap and no removal. Its group scans compile to hashbrown's instructions:
+SSE2 on x86, NEON on aarch64, and portable SWAR elsewhere. hashbrown joins only the 87.5% groups, to calibrate it.
 
 **Calibration rule.** At 87.5%, at both sizes, `group_probe` must be within
 1.15x of `hashbrown` on every workload in the same run. A run that misses it
