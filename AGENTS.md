@@ -55,6 +55,12 @@ SAVE=ref scripts/bench.sh                   # intentionally refresh the default 
 Run shape and options:
 
 - Pins the core, disables ASLR, and uses the batch scheduler without privileges; `sudo` adds `nice` and memlock, then drops back to the invoking user for cargo.
+- Sets `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` for the measured run, so large
+  fixtures get transparent huge pages and DRAM-bound groups stop shifting with
+  physical page placement. A caller-set value wins; an empty one opts out.
+- Keep heavy work (VMs, builds) off the machine during evidence runs. The
+  core pin keeps the bench on one core but does not keep other processes off
+  it, and the L3, DRAM bandwidth, and power budget stay shared.
 - Linux runs lock the pinned core and the Criterion output root, so concurrent
   runs serialize. With `CORE` unset the script picks a max-frequency core; an
   explicit `CORE=<n>` skips that selection but is still locked.

@@ -1,8 +1,10 @@
 # Benchmarks
 
 Use [`scripts/bench.sh`](../scripts/bench.sh) for evidence. On Linux it pins and
-locks one CPU and disables ASLR; non-Linux keeps the plain-Cargo fallback. Raw
-`cargo bench` is for smoke iteration only.
+locks one CPU, disables ASLR, and turns on glibc's transparent huge pages for
+large allocations; non-Linux keeps the plain-Cargo fallback. Raw `cargo bench`
+is for smoke iteration only. The pin does not keep other processes off the core,
+so run evidence on an otherwise idle machine.
 
 ## Named runs
 
