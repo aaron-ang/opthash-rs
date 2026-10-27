@@ -8,30 +8,42 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use harness::{HIGH_LOAD_EXPONENTS, HIGH_LOAD_SLOTS, LoadPoint, MISS_KEY_OFFSET, OP_COUNT};
+use harness::{HIGH_LOAD_EXPONENTS, HIGH_LOAD_SLOTS, LoadPoint, OP_COUNT};
 
-/// hashbrown caps load at `1 - 2^-3`, so it joins only that point, where it
-/// calibrates `group_probe`.
-const HASHBROWN_EXPONENT: u32 = 3;
-
-/// Invokes `$arm!(impl_name, empty_map)` once per arm at `$point`. Each arm
-/// builds and drops its map inside its own `$arm!` block, so no other arm's
-/// allocations decide where it lands.
+/// Invokes `$arm!(impl_name, empty_map)` once per arm at `$point`; hashbrown
+/// joins only the points its load cap admits. Each arm builds and drops its map
+/// inside its own `$arm!` block, so no arm's map stays resident while another
+/// arm is timed.
 macro_rules! for_each_arm {
     ($point:expr, $arm:ident) => {
         $arm!("elastic", $point.elastic());
         $arm!("funnel", $point.funnel());
         $arm!("group_probe", $point.group_probe());
-        if $point.reserve.exponent() == HASHBROWN_EXPONENT {
-            $arm!("hashbrown", $point.hashbrown());
+        if let Some(map) = $point.hashbrown() {
+            $arm!("hashbrown", map);
         }
     };
 }
 
+/// Inserts `$pairs` into `$map`, then asserts it holds `$len` pairs at its
+/// starting capacity: a map that grew would run below the point's load.
+macro_rules! fill {
+    ($impl:literal, $map:ident, $pairs:expr, $len:expr) => {{
+        let capacity = $map.capacity();
+        for &(key, value) in $pairs {
+            $map.insert(key, value);
+        }
+        assert_eq!(
+            ($map.len(), $map.capacity()),
+            ($len, capacity),
+            "{} left its point while filling",
+            $impl
+        );
+    }};
+}
+
 fn bench_high_load(c: &mut Criterion) {
-    let miss_keys: Vec<u64> = (0..OP_COUNT)
-        .map(|index| harness::key_at(index + MISS_KEY_OFFSET))
-        .collect();
+    let miss_keys = harness::miss_keys(OP_COUNT);
     for slots in HIGH_LOAD_SLOTS {
         for exponent in HIGH_LOAD_EXPONENTS {
             let point = LoadPoint::new(slots, exponent);
@@ -45,8 +57,9 @@ fn bench_high_load(c: &mut Criterion) {
 }
 
 /// Times the last `point.tail()` inserts into a clone of a template holding
-/// every earlier pair, so each sample starts at the same load. Per-iteration
-/// batches keep at most one clone alive and drop it outside the timing.
+/// every earlier pair, so each sample starts at the same load. One untimed
+/// preflight clone checks the tail ends at the point. Per-iteration batches
+/// keep at most one clone alive and drop it outside the timing.
 fn bench_tail_insert(c: &mut Criterion, point: LoadPoint, pairs: &[(u64, u64)]) {
     let (prefix, tail) = pairs.split_at(point.entries() - point.tail());
     let group_name = point.group("tail_insert");
@@ -56,9 +69,10 @@ fn bench_tail_insert(c: &mut Criterion, point: LoadPoint, pairs: &[(u64, u64)]) 
     macro_rules! arm {
         ($impl:literal, $empty:expr) => {{
             let mut template = $empty;
-            for &(key, value) in prefix {
-                template.insert(key, value);
-            }
+            fill!($impl, template, prefix, prefix.len());
+            let mut full = template.clone();
+            fill!($impl, full, tail, point.entries());
+            drop(full);
             group.bench_function(format!("{group_name}_{}", $impl), |b| {
                 b.iter_batched_ref(
                     || template.clone(),
@@ -90,9 +104,7 @@ fn bench_lookup(
     macro_rules! arm {
         ($impl:literal, $empty:expr) => {{
             let mut map = $empty;
-            for &(key, value) in pairs {
-                map.insert(key, value);
-            }
+            fill!($impl, map, pairs, point.entries());
             group.bench_function(format!("{group_name}_{}", $impl), |b| {
                 b.iter(|| {
                     for key in keys {

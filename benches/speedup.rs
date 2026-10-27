@@ -23,9 +23,7 @@ fn bench_lookups(c: &mut Criterion) {
 
     let hit_keys = harness::shuffled_hit_keys(&pairs, OP_COUNT);
     let sequential_hit_keys = harness::sequential_hit_keys(&pairs, OP_COUNT);
-    let miss_keys: Vec<u64> = (0..OP_COUNT)
-        .map(|idx| harness::key_at(idx + MISS_KEY_OFFSET))
-        .collect();
+    let miss_keys = harness::miss_keys(OP_COUNT);
 
     harness::bench_one_lookup_group(c, "get_hit", &hit_keys, &maps);
     harness::bench_one_lookup_group(c, "get_hit_sequential", &sequential_hit_keys, &maps);

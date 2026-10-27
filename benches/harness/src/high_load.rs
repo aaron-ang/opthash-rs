@@ -1,5 +1,7 @@
 //! Load points and per-arm constructors for the `high_load` sweep.
 
+use std::ops::RangeInclusive;
+
 use opthash::ReserveFraction;
 
 use crate::{BenchHasher, ElasticHashMap, FunnelHashMap, GroupProbeMap, HashbrownMap};
@@ -8,6 +10,9 @@ use crate::{BenchHasher, ElasticHashMap, FunnelHashMap, GroupProbeMap, Hashbrown
 pub const HIGH_LOAD_SLOTS: [usize; 2] = [1 << 16, 1 << 20];
 /// Reserve exponents `d`; a point fills `1 - 2^-d` of its slots.
 pub const HIGH_LOAD_EXPONENTS: [u32; 4] = [3, 5, 7, 10];
+/// Exponents start at hashbrown's 7/8 cap. Past `d = 10` the load label's one
+/// decimal place stops telling points apart.
+const EXPONENTS: RangeInclusive<u32> = 3..=10;
 /// `tail_insert` times the last `entries >> TAIL_SHIFT` inserts.
 const TAIL_SHIFT: u32 = 6;
 
@@ -22,10 +27,13 @@ impl LoadPoint {
     pub fn new(slots: usize, exponent: u32) -> Self {
         assert!(
             slots.is_power_of_two() && slots >= 1 << 10,
-            "sweep slot counts are powers of two of at least 1K"
+            "sweep slot counts are powers of two of at least 1Ki"
         );
-        let reserve =
-            ReserveFraction::from_exponent(exponent).expect("sweep exponents are positive");
+        assert!(
+            EXPONENTS.contains(&exponent),
+            "sweep exponents run over {EXPONENTS:?}"
+        );
+        let reserve = ReserveFraction::from_exponent(exponent).expect("exponent is positive");
         Self { slots, reserve }
     }
 
@@ -38,12 +46,13 @@ impl LoadPoint {
         self.entries() >> TAIL_SHIFT
     }
 
-    /// `{workload}_{size}_{load}`, for example `get_miss_64K_99_9`.
+    /// `{workload}_{slots}_{load}`, for example `get_miss_64Ki_99_9`. Slot
+    /// counts take binary prefixes, unlike the decimal entry counts elsewhere.
     pub fn group(self, workload: &str) -> String {
         let size = if self.slots >= 1 << 20 {
-            format!("{}M", self.slots >> 20)
+            format!("{}Mi", self.slots >> 20)
         } else {
-            format!("{}K", self.slots >> 10)
+            format!("{}Ki", self.slots >> 10)
         };
         let denominator = 1_usize << self.reserve.exponent();
         let tenths = (1000 * (denominator - 1) + denominator / 2) / denominator;
@@ -62,14 +71,20 @@ impl LoadPoint {
         map
     }
 
-    /// Funnel sizes exactly, so its slot count is near `slots`, not equal.
+    /// Funnel sizes exactly, so its slot count is near `slots`, not equal. Its
+    /// budget may round up, but by under a tenth of a percent, the label's
+    /// resolution.
     pub fn funnel(self) -> FunnelHashMap<u64, u64> {
         let map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity_and_reserve_and_hasher(
             self.entries(),
             self.reserve,
             BenchHasher::default(),
         );
-        assert!(map.capacity() >= self.entries(), "funnel under its point");
+        let spare = map.capacity().checked_sub(self.entries());
+        assert!(
+            spare.is_some_and(|spare| spare < self.entries() / 1000),
+            "funnel left its point"
+        );
         map
     }
 
@@ -77,14 +92,13 @@ impl LoadPoint {
         GroupProbeMap::with_slots(self.slots, self.entries())
     }
 
-    /// hashbrown caps load at 7/8, so only a `d = 3` point fits its table.
-    pub fn hashbrown(self) -> HashbrownMap<u64, u64> {
+    /// hashbrown caps load at 7/8, so it has no table for a point above that.
+    pub fn hashbrown(self) -> Option<HashbrownMap<u64, u64>> {
+        if self.entries() > self.slots / 8 * 7 {
+            return None;
+        }
         let map: HashbrownMap<u64, u64> = crate::hashbrown_map_cap(self.entries());
-        assert_eq!(
-            map.capacity(),
-            self.entries(),
-            "hashbrown cannot hold this point's load"
-        );
-        map
+        assert_eq!(map.capacity(), self.entries(), "hashbrown left its point");
+        Some(map)
     }
 }

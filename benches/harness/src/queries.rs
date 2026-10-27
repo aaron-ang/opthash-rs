@@ -57,6 +57,15 @@ pub fn sequential_hit_keys(pairs: &[(u64, u64)], count: usize) -> Vec<u64> {
     cycle_keys(&keys, count)
 }
 
+/// Creates `count` keys that no fixture populates, starting at
+/// [`MISS_KEY_OFFSET`](crate::MISS_KEY_OFFSET).
+#[must_use]
+pub fn miss_keys(count: usize) -> Vec<u64> {
+    (0..count)
+        .map(|index| crate::key_at(index + crate::MISS_KEY_OFFSET))
+        .collect()
+}
+
 fn cycle_keys(keys: &[u64], count: usize) -> Vec<u64> {
     keys.iter().copied().cycle().take(count).collect()
 }

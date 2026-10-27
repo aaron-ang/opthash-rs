@@ -119,10 +119,12 @@ slots (past one L3 cluster).
 
 ```bash
 BENCH=high_load SAVE=<name> scripts/bench.sh
-BENCH=high_load SAVE=<name> scripts/bench.sh -- '_64K_'   # one size
+BENCH=high_load SAVE=<name> scripts/bench.sh -- '_64Ki_'  # one size
 ```
 
-Groups are `{workload}_{size}_{load}`, for example `get_miss_1M_99_9`:
+Groups are `{workload}_{slots}_{load}`, for example `get_miss_1Mi_99_9`. Slot
+counts use binary prefixes (`1Mi` is 2^20 slots), unlike the decimal entry
+counts in other targets:
 
 - `tail_insert` times the last 1/64 of the inserts into a clone of a map
   holding the rest, so each sample ends at the point's load.
@@ -131,15 +133,16 @@ Groups are `{workload}_{size}_{load}`, for example `get_miss_1M_99_9`:
 
 hashbrown caps load at 7/8, so it cannot run above the first point.
 `group_probe` is the greedy control instead: a harness table with hashbrown's
-control-byte layout, 8-lane SWAR groups, and triangular probing, but no load
-cap and no removal. hashbrown joins only the 87.5% groups, to calibrate it.
+control-byte layout, group width (16 lanes under SSE2, 8 elsewhere), and
+triangular probing, but no load cap and no removal. hashbrown joins only the 87.5% groups, to calibrate it.
 
 **Calibration rule.** At 87.5%, at both sizes, `group_probe` must be within
 1.5x of `hashbrown` on every workload in the same run. A run that misses it
 does not count as evidence until `group_probe` is tuned.
 
 Each arm builds its map just before its own benchmark and drops it right
-after, so arm order and other backends' allocation sizes cannot move it.
+after, so no other arm's map stays resident while it is timed. Every fill
+asserts that the map reached the point's length without growing.
 
 ## Memory footprint
 

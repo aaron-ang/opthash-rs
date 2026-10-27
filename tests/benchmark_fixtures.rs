@@ -6,9 +6,8 @@ use harness::memory::{
 };
 use harness::{
     DEFAULT_HIT_QUERY_SEED, GroupProbeMap, HIGH_LOAD_EXPONENTS, HIGH_LOAD_SLOTS, LATENCY_SIZES,
-    LoadPoint, MAP_SIZE, MAP_SLOTS, MISS_KEY_OFFSET, MapQuad, OP_COUNT, exact_size_label, key_at,
-    parse_positive_sizes, scaled_insert_sample_size, sequential_hit_keys, shuffled_hit_keys,
-    shuffled_hit_keys_with_seed,
+    LoadPoint, MAP_SIZE, MAP_SLOTS, MapQuad, OP_COUNT, exact_size_label, parse_positive_sizes,
+    scaled_insert_sample_size, sequential_hit_keys, shuffled_hit_keys, shuffled_hit_keys_with_seed,
 };
 
 fn pairs(count: usize) -> Vec<(u64, u64)> {
@@ -324,13 +323,12 @@ fn mean_latency_builds_each_map_once_per_size_not_once_per_sample() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "full-size bench fixture is too slow")]
 fn group_probe_matches_std_at_high_load() {
-    // 2^16 slots with all but 2^-10 of them filled: 99.9% load.
-    let slots = 1 << 16;
-    let entries = slots - (slots >> 10);
-    let pairs = harness::make_pairs(entries);
-    let mut map = GroupProbeMap::with_slots(slots, entries);
-    let mut model = harness::std_map_cap(entries);
+    let point = LoadPoint::new(1 << 16, 10);
+    let pairs = harness::make_pairs(point.entries());
+    let mut map = point.group_probe();
+    let mut model = harness::std_map_cap(point.entries());
     assert!(map.is_empty());
 
     for &(key, value) in &pairs {
@@ -343,8 +341,8 @@ fn group_probe_matches_std_at_high_load() {
     for &(key, _) in &pairs {
         assert_eq!(map.get(&key), model.get(&key));
     }
-    for index in 0..OP_COUNT {
-        assert_eq!(map.get(&key_at(index + MISS_KEY_OFFSET)), None);
+    for key in harness::miss_keys(OP_COUNT) {
+        assert_eq!(map.get(&key), None);
     }
 }
 
@@ -375,14 +373,14 @@ fn high_load_groups_name_size_and_load() {
     assert_eq!(
         names,
         [
-            "get_miss_64K_87_5",
-            "get_miss_64K_96_9",
-            "get_miss_64K_99_2",
-            "get_miss_64K_99_9",
-            "get_miss_1M_87_5",
-            "get_miss_1M_96_9",
-            "get_miss_1M_99_2",
-            "get_miss_1M_99_9",
+            "get_miss_64Ki_87_5",
+            "get_miss_64Ki_96_9",
+            "get_miss_64Ki_99_2",
+            "get_miss_64Ki_99_9",
+            "get_miss_1Mi_87_5",
+            "get_miss_1Mi_96_9",
+            "get_miss_1Mi_99_2",
+            "get_miss_1Mi_99_9",
         ]
     );
 }
@@ -402,13 +400,13 @@ fn high_load_arms_run_at_the_point_load() {
             let point = LoadPoint::new(slots, exponent);
             // The constructors assert their own capacities.
             let _ = (point.elastic(), point.funnel(), point.group_probe());
+            assert_eq!(point.hashbrown().is_some(), exponent == 3);
         }
-        let _ = LoadPoint::new(slots, 3).hashbrown();
     }
 }
 
 #[test]
-#[should_panic(expected = "hashbrown")]
-fn high_load_hashbrown_refuses_points_above_its_load_cap() {
-    let _ = LoadPoint::new(1 << 16, 5).hashbrown();
+#[should_panic(expected = "sweep exponents")]
+fn high_load_rejects_exponents_the_load_label_cannot_tell_apart() {
+    let _ = LoadPoint::new(1 << 16, 11);
 }

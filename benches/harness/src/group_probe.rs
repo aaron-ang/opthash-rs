@@ -1,21 +1,32 @@
-//! `SwissTable`-layout baseline without hashbrown's 7/8 load cap, so the
-//! `high_load` sweep has a greedy group-probing control at every load.
+//! Greedy group-probing control for the `high_load` sweep. It copies
+//! hashbrown's `SwissTable` design (control-byte layout, group width, hash split,
+//! triangular probing) so it can be calibrated against hashbrown at 7/8 load,
+//! but drops hashbrown's 7/8 load cap and removal.
 
 use std::hash::BuildHasher;
 
 use crate::BenchHasher;
 
-/// Control bytes per group: one `u64` of SWAR lanes, the width of hashbrown's
-/// NEON group on aarch64.
-const GROUP: usize = 8;
+/// One group of SWAR lanes: 16 under SSE2, 8 elsewhere on 64-bit targets.
+#[cfg(all(
+    target_feature = "sse2",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+type Word = u128;
+#[cfg(not(all(
+    target_feature = "sse2",
+    any(target_arch = "x86", target_arch = "x86_64")
+)))]
+type Word = u64;
+
+const GROUP: usize = size_of::<Word>();
 /// Control byte of a never-filled slot. Live slots hold a 7-bit tag, so the
 /// high bit alone marks empties.
 const EMPTY: u8 = 0x80;
-const LANE_LSB: u64 = 0x0101_0101_0101_0101;
-const LANE_MSB: u64 = 0x8080_8080_8080_8080;
+const LANE_LSB: Word = Word::MAX / 0xFF;
+const LANE_MSB: Word = LANE_LSB << 7;
 
-/// Insert-and-lookup table over `(u64, u64)` with hashbrown's control-byte
-/// layout and triangular group probing. It never removes, so it needs no
+/// Insert-and-lookup table over `(u64, u64)`. It never removes, so it needs no
 /// tombstones, and a probe always ends at an empty slot because `max_len`
 /// leaves at least one.
 #[derive(Clone)]
@@ -55,6 +66,11 @@ impl GroupProbeMap {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// The insert budget; fixed, because the table never grows.
+    pub fn capacity(&self) -> usize {
+        self.max_len
     }
 
     #[inline]
@@ -105,11 +121,11 @@ impl GroupProbeMap {
     }
 
     #[inline]
-    fn group(&self, pos: usize) -> u64 {
+    fn group(&self, pos: usize) -> Word {
         let bytes: [u8; GROUP] = self.ctrl[pos..pos + GROUP]
             .try_into()
             .expect("a group is GROUP bytes");
-        u64::from_le_bytes(bytes)
+        Word::from_le_bytes(bytes)
     }
 
     #[inline]
@@ -121,8 +137,7 @@ impl GroupProbeMap {
     }
 }
 
-/// Start slot and 7-bit tag, split as hashbrown splits a hash: the low bits
-/// pick the start and the top seven bits tag the slot.
+/// The low bits pick the start slot; the top seven bits tag it.
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
 fn split_hash(hash: u64, mask: usize) -> (usize, u8) {
@@ -133,13 +148,13 @@ fn split_hash(hash: u64, mask: usize) -> (usize, u8) {
 /// lane above a true match; the key comparison rejects it. Empty lanes never
 /// match, because a tag has its high bit clear.
 #[inline]
-fn match_tag(group: u64, tag: u8) -> u64 {
-    let diff = group ^ (LANE_LSB * u64::from(tag));
+fn match_tag(group: Word, tag: u8) -> Word {
+    let diff = group ^ (LANE_LSB * Word::from(tag));
     diff.wrapping_sub(LANE_LSB) & !diff & LANE_MSB
 }
 
 #[inline]
-fn match_empty(group: u64) -> u64 {
+fn match_empty(group: Word) -> Word {
     group & LANE_MSB
 }
 
@@ -164,7 +179,7 @@ impl Probe {
 }
 
 /// Lane indices of the set high bits in a SWAR mask, lowest first.
-struct Lanes(u64);
+struct Lanes(Word);
 
 impl Iterator for Lanes {
     type Item = usize;
