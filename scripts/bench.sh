@@ -215,6 +215,10 @@ echo "info: Criterion args: ${criterion_args[*]}" >&2
 # caller-set value wins, so an empty one opts out.
 malloc_env=("GLIBC_TUNABLES=${GLIBC_TUNABLES-glibc.malloc.hugetlb=1}")
 echo "info: ${malloc_env[0]}" >&2
+thp_enabled=/sys/kernel/mm/transparent_hugepage/enabled
+if [[ "${malloc_env[0]}" == *hugetlb=1* && -r "$thp_enabled" && "$(<"$thp_enabled")" == *"[never]"* ]]; then
+	echo "warn: transparent huge pages are off, so glibc.malloc.hugetlb=1 has no effect" >&2
+fi
 
 forward_args=("$@")
 if [[ "${#forward_args[@]}" -gt 0 && "${forward_args[0]}" == "--" ]]; then
