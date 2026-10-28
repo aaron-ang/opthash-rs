@@ -121,8 +121,8 @@ jobs:
           args: --release --out dist
       - name: Pytest
         run: |
-          uv venv
-          uv pip install dist/*.whl pytest hypothesis
+          uv sync --locked --only-group dev --no-install-project
+          uv pip install dist/*.whl
           .venv/bin/pytest tests/python/
 
   miri:

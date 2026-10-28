@@ -47,8 +47,8 @@ jobs:
           args: --release --out dist
       - name: Install
         run: |
-          uv venv
-          uv pip install dist/*.whl pytest pytest-codspeed pytest-benchmark
+          uv sync --locked --only-group dev --no-install-project
+          uv pip install dist/*.whl
       - uses: CodSpeedHQ/action@v5
         with:
           mode: simulation
