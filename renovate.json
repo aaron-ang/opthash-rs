@@ -1,0 +1,15 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "schedule:weekly"],
+  "packageRules": [
+    { "matchManagers": ["github-actions"], "groupName": "github-actions" },
+    { "matchManagers": ["cargo"], "groupName": "cargo" },
+    { "matchManagers": ["pep621"], "groupName": "uv" },
+    {
+      "description": "The Allocator trait is public API and must match hashbrown's.",
+      "matchPackageNames": ["allocator-api2"],
+      "matchUpdateTypes": ["major", "minor"],
+      "enabled": false
+    }
+  ]
+}
