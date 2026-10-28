@@ -13,21 +13,21 @@ pub const HIGH_LOAD_EXPONENTS: [u32; 4] = [3, 5, 7, 10];
 /// Exponents start at hashbrown's 7/8 cap. Past `d = 10` the load label's one
 /// decimal place stops telling points apart.
 const EXPONENTS: RangeInclusive<u32> = 3..=10;
-/// `tail_insert` times the last `entries >> TAIL_SHIFT` inserts.
-const TAIL_SHIFT: u32 = 6;
+/// The smallest table whose tail holds an insert at every exponent.
+const MIN_SLOTS: usize = 1 << (*EXPONENTS.end() + 1);
 
 /// One `(slots, reserve)` point. Every arm holds `entries()` pairs.
 #[derive(Clone, Copy, Debug)]
 pub struct LoadPoint {
-    pub slots: usize,
-    pub reserve: ReserveFraction,
+    slots: usize,
+    reserve: ReserveFraction,
 }
 
 impl LoadPoint {
     pub fn new(slots: usize, exponent: u32) -> Self {
         assert!(
-            slots.is_power_of_two() && slots >= 1 << 10,
-            "sweep slot counts are powers of two of at least 1Ki"
+            slots.is_power_of_two() && slots >= MIN_SLOTS,
+            "sweep slot counts are powers of two of at least {MIN_SLOTS}"
         );
         assert!(
             EXPONENTS.contains(&exponent),
@@ -39,11 +39,17 @@ impl LoadPoint {
 
     /// The insert budget of `slots` slots at `reserve`.
     pub const fn entries(self) -> usize {
-        self.slots - self.reserve.floor_reserved(self.slots)
+        self.slots - self.reserved()
     }
 
+    const fn reserved(self) -> usize {
+        self.reserve.floor_reserved(self.slots)
+    }
+
+    /// The inserts that fill the last half of the reserve, so the free fraction
+    /// falls from 1.5 to 1 times the reserve at every exponent.
     pub const fn tail(self) -> usize {
-        self.entries() >> TAIL_SHIFT
+        self.reserved() / 2
     }
 
     /// `{workload}_{slots}_{load}`, for example `get_miss_64Ki_99_9`. Slot
@@ -72,8 +78,8 @@ impl LoadPoint {
     }
 
     /// Funnel sizes exactly, so its slot count is near `slots`, not equal. Its
-    /// budget may round up, but by under a tenth of a percent, the label's
-    /// resolution.
+    /// budget may round up by a few slots; the check keeps that under an eighth
+    /// of the reserve, so its free slots stay near the point's.
     pub fn funnel(self) -> FunnelHashMap<u64, u64> {
         let map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity_and_reserve_and_hasher(
             self.entries(),
@@ -82,7 +88,7 @@ impl LoadPoint {
         );
         let spare = map.capacity().checked_sub(self.entries());
         assert!(
-            spare.is_some_and(|spare| spare < self.entries() / 1000),
+            spare.is_some_and(|spare| spare < self.reserved() / 8),
             "funnel left its point"
         );
         map

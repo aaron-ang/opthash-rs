@@ -324,7 +324,7 @@ fn mean_latency_builds_each_map_once_per_size_not_once_per_sample() {
 
 #[test]
 fn group_probe_matches_std_at_high_load() {
-    let slots = if cfg!(miri) { 1 << 10 } else { 1 << 16 };
+    let slots = if cfg!(miri) { 1 << 11 } else { 1 << 16 };
     let point = LoadPoint::new(slots, 10);
     let pairs = harness::make_pairs(point.entries());
     let mut map = point.group_probe();
@@ -371,7 +371,7 @@ fn group_probe_finds_keys_in_wrapping_groups() {
 
 #[test]
 fn group_probe_places_keys_where_hashbrown_does() {
-    let point = LoadPoint::new(1 << 10, 3);
+    let point = LoadPoint::new(1 << 11, 3);
     let mut group_probe = point.group_probe();
     let mut hashbrown = point.hashbrown().expect("hashbrown runs at 7/8 load");
     for (key, value) in harness::make_pairs(point.entries()) {
@@ -421,10 +421,17 @@ fn high_load_groups_name_size_and_load() {
 }
 
 #[test]
-fn high_load_tail_is_one_sixty_fourth_of_the_entries() {
+fn high_load_tail_fills_the_last_half_of_the_reserve() {
     let point = LoadPoint::new(1 << 16, 10);
     assert_eq!(point.entries(), 65_472);
-    assert_eq!(point.tail(), 1_023);
+    assert_eq!(point.tail(), 32);
+    assert_eq!(LoadPoint::new(1 << 16, 3).tail(), 4_096);
+}
+
+#[test]
+#[should_panic(expected = "sweep slot counts")]
+fn high_load_rejects_tables_too_small_for_a_tail() {
+    let _ = LoadPoint::new(1 << 10, 3);
 }
 
 #[test]
