@@ -36,6 +36,9 @@ const EXCEPTIONAL_PLACEMENT_FLAG: u32 = 1 << 31;
 const QUERY_PROBE_LIMIT: usize = 384;
 const MAX_ELASTIC_SLOTS: u64 = 1 << u32::BITS;
 const ROUTE_SUMMARY_LEVELS: usize = u16::BITS as usize;
+/// Filter bits per key. Misses exhaust every level's schedule once the gate
+/// passes, so each false positive costs Elastic far more than it costs Funnel.
+const MEMBERSHIP_BITS: usize = 3;
 const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
 const _: () = assert!(u32::BITS as u64 <= probe::ELASTIC_LEVEL_LIMIT);
@@ -384,7 +387,7 @@ impl PreparedElasticKey {
     fn new(hash: u64) -> Self {
         let route = PreparedElasticRoute::new(hash);
         Self {
-            membership: MembershipKey::from_signature(route.signature()),
+            membership: MembershipKey::from_signature::<MEMBERSHIP_BITS>(route.signature()),
             route,
         }
     }
