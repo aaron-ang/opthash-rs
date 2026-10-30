@@ -27,6 +27,8 @@
 #                    against BASELINE (defaults to ref).
 #   OPTHASH_CRITERION_ROOT=
 #                    override Criterion output; its canonical path is locked.
+#   GLIBC_TUNABLES=  malloc tunables for the measured run; defaults to
+#                    glibc.malloc.hugetlb=1. Set it empty to opt out.
 #
 # Common workflows:
 #   scripts/bench.sh                      # save clean HEAD under its commit stamp
@@ -208,6 +210,16 @@ else
 fi
 echo "info: Criterion args: ${criterion_args[*]}" >&2
 
+# Transparent huge pages for large fixtures: fewer TLB misses, and physical
+# page placement no longer shifts DRAM-bound groups between runs. A
+# caller-set value wins, so an empty one opts out.
+malloc_env=("GLIBC_TUNABLES=${GLIBC_TUNABLES-glibc.malloc.hugetlb=1}")
+echo "info: ${malloc_env[0]}" >&2
+thp_enabled=/sys/kernel/mm/transparent_hugepage/enabled
+if [[ "${malloc_env[0]}" == *hugetlb=1* && -r "$thp_enabled" && "$(<"$thp_enabled")" == *"[never]"* ]]; then
+	echo "warn: transparent huge pages are off, so glibc.malloc.hugetlb=1 has no effect" >&2
+fi
+
 forward_args=("$@")
 if [[ "${#forward_args[@]}" -gt 0 && "${forward_args[0]}" == "--" ]]; then
 	forward_args=("${forward_args[@]:1}")
@@ -217,7 +229,7 @@ echo "info: forwarding args: ${forward_args[*]}" >&2
 for target in "${bench_targets[@]}"; do
 	# Build unpinned so compilation uses every core; only the run is pinned.
 	"${launcher[@]}" cargo bench --no-run --bench "$target"
-	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" env "${criterion_env_args[@]}"
+	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" env "${criterion_env_args[@]}" "${malloc_env[@]}"
 		cargo bench --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
 	"${launcher[@]}" "${cmd[@]}"
 done
