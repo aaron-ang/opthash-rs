@@ -5,9 +5,9 @@ use harness::memory::{
     AllocationCounters, AllocationMeasurement, AllocationSnapshot, CountingAllocator,
 };
 use harness::{
-    DEFAULT_HIT_QUERY_SEED, LATENCY_SIZES, MAP_SIZE, MAP_SLOTS, MapQuad, exact_size_label,
-    parse_positive_sizes, scaled_insert_sample_size, sequential_hit_keys, shuffled_hit_keys,
-    shuffled_hit_keys_with_seed,
+    DEFAULT_HIT_QUERY_SEED, GroupProbeMap, HIGH_LOAD_EXPONENTS, HIGH_LOAD_SLOTS, LATENCY_SIZES,
+    LoadPoint, MAP_SIZE, MAP_SLOTS, MapQuad, OP_COUNT, exact_size_label, parse_positive_sizes,
+    scaled_insert_sample_size, sequential_hit_keys, shuffled_hit_keys, shuffled_hit_keys_with_seed,
 };
 
 fn pairs(count: usize) -> Vec<(u64, u64)> {
@@ -320,4 +320,135 @@ fn mean_latency_builds_each_map_once_per_size_not_once_per_sample() {
             && !source.contains("latency_arm!(\"std\", harness::build_std_map)"),
         "a builder inside bench_function is repeated for every Criterion sample"
     );
+}
+
+#[test]
+fn group_probe_matches_std_at_high_load() {
+    let slots = if cfg!(miri) { 1 << 11 } else { 1 << 16 };
+    let point = LoadPoint::new(slots, 10);
+    let pairs = harness::make_pairs(point.entries());
+    let mut map = point.group_probe();
+    let mut model = harness::std_map_cap(point.entries());
+    assert!(map.is_empty());
+
+    for &(key, value) in &pairs {
+        assert_eq!(map.insert(key, value), model.insert(key, value));
+    }
+    for &(key, value) in pairs.iter().step_by(7) {
+        assert_eq!(map.insert(key, !value), model.insert(key, !value));
+    }
+    assert_eq!(map.len(), model.len());
+    for &(key, _) in &pairs {
+        assert_eq!(map.get(&key), model.get(&key));
+    }
+    let misses = if cfg!(miri) { 64 } else { OP_COUNT };
+    for key in harness::miss_keys(misses) {
+        assert_eq!(map.get(&key), None);
+    }
+}
+
+/// Small tables filled to one empty slot put many keys in groups that wrap
+/// past the last slot, so lookups depend on the mirrored control bytes.
+#[test]
+fn group_probe_finds_keys_in_wrapping_groups() {
+    let key_sets = if cfg!(miri) { 8 } else { 512 };
+    for slots in [32, 64] {
+        for set in 0..key_sets {
+            let keys: Vec<u64> = (0..slots - 1)
+                .map(|index| harness::key_at(set * slots + index))
+                .collect();
+            let mut map = GroupProbeMap::with_slots(slots, slots - 1);
+            for (value, &key) in (0..).zip(&keys) {
+                assert_eq!(map.insert(key, value), None);
+            }
+            assert_eq!(map.len(), slots - 1);
+            for (value, key) in (0..).zip(&keys) {
+                assert_eq!(map.get(key), Some(&value), "slots {slots}, set {set}");
+            }
+        }
+    }
+}
+
+#[test]
+fn group_probe_places_keys_where_hashbrown_does() {
+    let point = LoadPoint::new(1 << 11, 3);
+    let mut group_probe = point.group_probe();
+    let mut hashbrown = point.hashbrown().expect("hashbrown runs at 7/8 load");
+    for (key, value) in harness::make_pairs(point.entries()) {
+        group_probe.insert(key, value);
+        hashbrown.insert(key, value);
+    }
+    assert!(group_probe.keys().eq(hashbrown.keys()));
+}
+
+#[test]
+#[should_panic(expected = "max_len must leave an empty slot")]
+fn group_probe_rejects_a_budget_that_fills_every_slot() {
+    let _ = GroupProbeMap::with_slots(64, 64);
+}
+
+#[test]
+#[should_panic(expected = "GroupProbeMap is full")]
+fn group_probe_rejects_inserts_past_its_budget() {
+    let mut map = GroupProbeMap::with_slots(64, 1);
+    map.insert(1, 1);
+    map.insert(2, 2);
+}
+
+#[test]
+fn high_load_groups_name_size_and_load() {
+    let names: Vec<String> = HIGH_LOAD_SLOTS
+        .iter()
+        .flat_map(|&slots| {
+            HIGH_LOAD_EXPONENTS
+                .iter()
+                .map(move |&exponent| LoadPoint::new(slots, exponent).group("get_miss"))
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "get_miss_64Ki_87_5",
+            "get_miss_64Ki_96_9",
+            "get_miss_64Ki_99_2",
+            "get_miss_64Ki_99_9",
+            "get_miss_1Mi_87_5",
+            "get_miss_1Mi_96_9",
+            "get_miss_1Mi_99_2",
+            "get_miss_1Mi_99_9",
+        ]
+    );
+}
+
+#[test]
+fn high_load_tail_fills_the_last_half_of_the_reserve() {
+    let point = LoadPoint::new(1 << 16, 10);
+    assert_eq!(point.entries(), 65_472);
+    assert_eq!(point.tail(), 32);
+    assert_eq!(LoadPoint::new(1 << 16, 3).tail(), 4_096);
+}
+
+#[test]
+#[should_panic(expected = "sweep slot counts")]
+fn high_load_rejects_tables_too_small_for_a_tail() {
+    let _ = LoadPoint::new(1 << 10, 3);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "full-size bench fixture is too slow")]
+fn high_load_arms_run_at_the_point_load() {
+    for slots in HIGH_LOAD_SLOTS {
+        for exponent in HIGH_LOAD_EXPONENTS {
+            let point = LoadPoint::new(slots, exponent);
+            // The constructors assert their own capacities.
+            let _ = (point.elastic(), point.funnel(), point.group_probe());
+            assert_eq!(point.hashbrown().is_some(), exponent == 3);
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "sweep exponents")]
+fn high_load_rejects_exponents_the_load_label_cannot_tell_apart() {
+    let _ = LoadPoint::new(1 << 16, 11);
 }

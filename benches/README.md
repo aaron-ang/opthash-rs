@@ -39,9 +39,9 @@ so every removed key remains filter-positive and exercises vacant-search reuse.
 Measure its baseline using the same fixture on the comparison revision.
 
 Criterion IDs use `<workload>_<implementation>`, where implementation is one
-of `std`, `hashbrown`, `elastic`, or `funnel`. Renaming an ID resets CodSpeed
-history. The registered headline workloads live in
-[`speedup.rs`](speedup.rs).
+of `std`, `hashbrown`, `elastic`, `funnel`, or `group_probe` (high-load sweep
+only). Renaming an ID resets CodSpeed history. The registered headline
+workloads live in [`speedup.rs`](speedup.rs).
 
 ## Interpreting comparisons
 
@@ -108,6 +108,44 @@ For smoke runs only:
 ```bash
 SCALED_INSERT_SIZES=1000 cargo bench --bench scaled_insert -- insert_scale_1K
 ```
+
+## High-load sweep
+
+`high_load` measures Elastic and Funnel where the paper's bounds separate from
+greedy probing: tables filled to 87.5%, 96.9%, 99.2%, and 99.9% of their slots
+(reserve exponents 3, 5, 7, and 10), at 2^16 slots (cache-resident) and 2^20
+slots (past one L3 cluster).
+
+```bash
+BENCH=high_load SAVE=<name> scripts/bench.sh
+BENCH=high_load SAVE=<name> scripts/bench.sh -- '_64Ki_'  # one size
+```
+
+Groups are `{workload}_{slots}_{load}`, for example `get_miss_1Mi_99_9`. Slot
+counts use binary prefixes (`1Mi` is 2^20 slots), unlike the decimal entry
+counts in other targets:
+
+- `tail_insert` times the inserts that fill the last half of the point's
+  reserve, into a clone of a map holding the rest. Each sample ends at the
+  point's load and starts with 1.5 times its free slots.
+- `get_hit` and `get_miss` time the same shuffled hit and offset miss queries
+  as `speedup`.
+
+hashbrown caps load at 7/8, so it cannot run above the first point.
+`group_probe` is the greedy control instead: a harness table with hashbrown's
+control-byte encoding, group width, hash split, and triangular probing, but no
+load cap and no removal. On x86 and aarch64 its group scans compile to
+hashbrown's SSE2 and NEON instructions; elsewhere a portable SWAR fallback
+follows hashbrown's generic backend. hashbrown joins only the 87.5% groups, to
+calibrate it.
+
+**Calibration rule.** At 87.5%, at both sizes, `group_probe` must be within
+1.15x of `hashbrown` on every workload in the same run. A run that misses it
+does not count as evidence until `group_probe` is tuned.
+
+Each arm builds its map just before its own benchmark and drops it right
+after, so no other arm's map stays resident while it is timed. Every fill
+asserts that the map reached the point's length without growing.
 
 ## Memory footprint
 
