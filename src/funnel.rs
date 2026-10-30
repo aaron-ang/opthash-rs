@@ -1064,6 +1064,9 @@ where
         SearchResult::Full
     }
 
+    /// Only epochs that placed a key outside its funnel reach this scan.
+    #[cold]
+    #[inline(never)]
     fn find_by_full_scan<Q>(&self, key: &Q, key_fingerprint: u8) -> Option<usize>
     where
         Q: Equivalent<K> + ?Sized,
@@ -1249,6 +1252,9 @@ where
         Some(unsafe { self.storage.get_ref(slot) })
     }
 
+    /// Only an exhausted placement walk reaches this scan.
+    #[cold]
+    #[inline(never)]
     fn first_free_global(&self) -> Option<usize> {
         // SAFETY: `slot < n`, the storage capacity.
         (0..self.shape.n).find(|&slot| control::is_free(unsafe { self.storage.control_at(slot) }))
@@ -1329,9 +1335,9 @@ where
         // O(n) per insert without helping.
         let rebuilt = !matches!(exact, SearchResult::Vacant(_)) && !self.exceptional_placement;
         let exact = if rebuilt {
-            self.resize_with_transition(self.shape.n, EpochTransition::PlacementRecovery);
-            membership = self.membership_slot(key_hash);
-            self.search_vacancy(FunnelPrf::new(self.probe_seed).prepare(key_hash))
+            let (recovered, slot) = self.rebuild_for_placement(key_hash);
+            membership = slot;
+            recovered
         } else {
             exact
         };
@@ -1344,6 +1350,18 @@ where
                 .start_with_placement_recovery(EpochTransition::PlacementRecovery);
         }
         slot
+    }
+
+    /// Rebuilds at the same size under a fresh probe seed and walks `key_hash`
+    /// again, returning the new search and filter slot. Out of line so the
+    /// insert paths carry one inlined copy of the placement walk, not two.
+    #[cold]
+    #[inline(never)]
+    fn rebuild_for_placement(&mut self, key_hash: u64) -> (SearchResult, MembershipSlot) {
+        self.resize_with_transition(self.shape.n, EpochTransition::PlacementRecovery);
+        let membership = self.membership_slot(key_hash);
+        let exact = self.search_vacancy(FunnelPrf::new(self.probe_seed).prepare(key_hash));
+        (exact, membership)
     }
 
     /// Maps a known-absent search to `(slot, exceptional)`: its vacancy, or
