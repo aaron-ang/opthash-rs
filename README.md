@@ -72,6 +72,11 @@ API. Choose the construction you want to explore; switching between them is
 straightforward. For current performance results, see the
 [benchmark guide](benches/README.md).
 
+Near full load, Funnel answers lookups for absent keys faster than a greedy
+group-probing table, and the gap widens as the table fills. Greedy probing
+still wins hits and most inserts. See the
+[high-load sweep](benches/README.md#high-load-sweep).
+
 ## Compared with the paper
 
 opthash preserves the paper's finite geometry, placement rules, and probe order
