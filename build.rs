@@ -13,16 +13,11 @@ fn main() {
     }
 
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    // Portable SWAR-8 fallback for targets without a NEON/SSE control scan.
-    let scalar = arch != "x86_64" && arch != "aarch64";
-
-    if arch == "aarch64" {
-        println!("cargo:rustc-cfg=opthash_neon_group");
-    }
-    if arch == "x86_64" {
-        println!("cargo:rustc-cfg=opthash_x86_16_group");
-    }
-    if scalar {
-        println!("cargo:rustc-cfg=opthash_scalar_group");
-    }
+    let group = match arch.as_str() {
+        "aarch64" => "opthash_neon_group",
+        "x86_64" => "opthash_x86_16_group",
+        // Portable SWAR-8 fallback for targets without a NEON/SSE control scan.
+        _ => "opthash_scalar_group",
+    };
+    println!("cargo:rustc-cfg={group}");
 }
