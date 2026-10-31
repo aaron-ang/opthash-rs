@@ -472,12 +472,13 @@ unsafe fn scan_funnel_bucket_multi_group<T>(
     BucketScanResult::Full
 }
 
-/// Clean-epoch scan of one group: the first free lane is the terminating EMPTY.
+/// Tombstone-blind scan of one group: stops at the first EMPTY lane and never
+/// inspects tombstones. A lookup needs nothing more; without tombstones in the
+/// group, the reported EMPTY is also the first free lane an insert wants.
 ///
 /// # Safety
 ///
-/// The bounds requirements are identical to [`scan_funnel_group`], and the
-/// logical group must contain no tombstones.
+/// The bounds requirements are identical to [`scan_funnel_group`].
 #[inline]
 unsafe fn scan_clean_funnel_group<T>(
     ctrl_ptr: *const u8,
@@ -493,7 +494,7 @@ unsafe fn scan_clean_funnel_group<T>(
     // Iterator search on purpose: `BitMask::first_below` is the same test, but
     // here LLVM lowers it to a select chain instead of one test-and-branch.
     // SAFETY: as above.
-    let first_empty = unsafe { simd::free_mask_group(group) }
+    let first_empty = unsafe { simd::eq_mask_group(group, CTRL_EMPTY) }
         .into_iter()
         .find(|&lane| lane < logical_lanes);
     let semantic_lanes = first_empty.unwrap_or(logical_lanes);
@@ -513,12 +514,12 @@ unsafe fn scan_clean_funnel_group<T>(
     BucketScanResult::Full
 }
 
-/// Clean-epoch specialization over `length` logical controls.
+/// Tombstone-blind scan over `length` logical controls; see
+/// [`scan_clean_funnel_group`].
 ///
 /// # Safety
 ///
-/// The bounds requirements are identical to [`scan_funnel_bucket`], and the
-/// logical table must contain no tombstones.
+/// The bounds requirements are identical to [`scan_funnel_bucket`].
 unsafe fn scan_clean_funnel_bucket<T>(
     ctrl_ptr: *const u8,
     start: usize,
@@ -528,7 +529,7 @@ unsafe fn scan_clean_funnel_bucket<T>(
 ) -> BucketScanResult<T> {
     if length <= GROUP_SIZE {
         // SAFETY: `length <= GROUP_SIZE`, so the caller's readable span covers
-        // one full group; the caller also guarantees no tombstones.
+        // one full group.
         return unsafe {
             scan_clean_funnel_group(ctrl_ptr, start, length, fingerprint, &mut inspect_match)
         };
@@ -538,7 +539,7 @@ unsafe fn scan_clean_funnel_bucket<T>(
     while position < end {
         let logical_lanes = GROUP_SIZE.min(end - position);
         // SAFETY: `position < start + length`, so a full group from `position`
-        // stays within the caller's readable span; no tombstones by contract.
+        // stays within the caller's readable span.
         match unsafe {
             scan_clean_funnel_group(
                 ctrl_ptr,
@@ -887,9 +888,10 @@ where
             let start = level.offset + bucket * self.shape.beta;
             let scan = if CLEAN_EPOCH {
                 // SAFETY: an ordinary bucket ends at or before `n`, and the
-                // control array pads `GROUP_SIZE - 1` bytes past `n`;
-                // `CLEAN_EPOCH` is only chosen with zero tombstones; matched
+                // control array pads `GROUP_SIZE - 1` bytes past `n`; matched
                 // lanes carry the fingerprint, so they are occupied.
+                // `CLEAN_EPOCH` is only chosen with zero tombstones, so the
+                // reported EMPTY is the first free slot.
                 unsafe {
                     scan_clean_funnel_bucket(
                         self.storage.ctrl_ptr(),
@@ -984,6 +986,83 @@ where
             }
         }
         first_tombstone.map_or(SearchResult::Full, SearchResult::Vacant)
+    }
+
+    /// Read-only walk for `get` and `contains`: the buckets of
+    /// `search_exact_mode` in the same order, but it stops only at a real
+    /// EMPTY and skips tombstones without recording them, since a lookup never
+    /// needs the vacancy an insert would take.
+    fn lookup_exact_prepared<Q>(
+        &self,
+        key: &Q,
+        probe: PreparedFastFunnelProbe,
+        key_fingerprint: u8,
+    ) -> Option<usize>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        if self.shape.n == 0 {
+            return None;
+        }
+        for level in &self.shape.levels {
+            let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
+            let bucket = Self::sample(&level_probe, 0, level.bucket_range)?;
+            let start = level.offset + bucket * self.shape.beta;
+            // SAFETY: an ordinary bucket ends at or before `n`, and the control
+            // array pads `GROUP_SIZE - 1` bytes past `n`; matched lanes carry
+            // the fingerprint, so they are occupied.
+            match unsafe {
+                scan_clean_funnel_bucket(
+                    self.storage.ctrl_ptr(),
+                    start,
+                    self.shape.beta,
+                    key_fingerprint,
+                    |slot| {
+                        let entry = self.storage.get_ref(slot);
+                        key.equivalent(&entry.key).then_some(slot)
+                    },
+                )
+            } {
+                BucketScanResult::Hit(slot) => return Some(slot),
+                BucketScanResult::Empty(_) => return None,
+                BucketScanResult::Full => {}
+            }
+        }
+
+        let primary_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_PRIMARY_BASE);
+        for logical_probe in 0..self.shape.loglog_ceiling {
+            let local = Self::sample(
+                &primary_probe,
+                self.shape.encode_logical_probe(logical_probe),
+                self.shape.primary_range,
+            )?;
+            let slot = self.shape.primary_offset + local;
+            // SAFETY: a primary probe stays inside the primary range.
+            match unsafe { self.inspect_slot(slot, key_fingerprint, key) } {
+                Some(true) => return Some(slot),
+                Some(false) => return None,
+                None => {}
+            }
+        }
+
+        let first_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_A_BASE);
+        let first_bucket = Self::sample(&first_probe, 0, self.shape.fallback_bucket_range)?;
+        let second_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_B_BASE);
+        let second_bucket = Self::sample(&second_probe, 0, self.shape.fallback_bucket_range)?;
+        for slot_in_bucket in 0..self.shape.fallback_bucket_width {
+            for bucket in [first_bucket, second_bucket] {
+                let slot = self.shape.fallback_offset
+                    + bucket * self.shape.fallback_bucket_width
+                    + slot_in_bucket;
+                // SAFETY: both buckets lie inside the fallback range.
+                match unsafe { self.inspect_slot(slot, key_fingerprint, key) } {
+                    Some(true) => return Some(slot),
+                    Some(false) => return None,
+                    None => {}
+                }
+            }
+        }
+        None
     }
 
     /// Placement walk for a key already known to be absent: the buckets of
@@ -1200,14 +1279,45 @@ where
         };
     }
 
+    /// Read-side counterpart of [`Self::locate`]: the same filter gate and
+    /// exceptional full scan around the tombstone-blind lookup walk.
+    ///
+    /// Only the filter test is inline: the walk keeps many registers live, and
+    /// LLVM saves them all ahead of the test, so filter-rejected misses would
+    /// pay for a walk they never run.
+    #[inline]
     fn find_location<Q>(&self, key: &Q, key_hash: u64, key_fingerprint: u8) -> Option<usize>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.locate(key, key_hash, key_fingerprint, |_| ()).ok()
+        if !self.membership_gate(key_hash).passes() {
+            return None;
+        }
+        self.find_location_after_gate(key, key_hash, key_fingerprint)
     }
 
-    /// Lookup protocol shared by reads and entries. `Err(None)` means the
+    /// Probe preparation stays next to the walk so the prepared probe never
+    /// crosses a call boundary.
+    #[inline(never)]
+    fn find_location_after_gate<Q>(
+        &self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+    ) -> Option<usize>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
+        match self.lookup_exact_prepared(key, probe, key_fingerprint) {
+            Some(slot) => Some(slot),
+            None if self.exceptional_placement => self.find_by_full_scan(key, key_fingerprint),
+            None => None,
+        }
+    }
+
+    /// Entry-side lookup, which keeps the exact walk's vacancy for the insert
+    /// that may follow. `Err(None)` means the
     /// filter rejected the key before any walk; `Err(Some(_))` maps the exact
     /// walk's miss, which is never `Hit`, through `on_miss`.
     #[inline]
