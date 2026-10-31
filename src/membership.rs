@@ -14,8 +14,8 @@ use allocator_api2::alloc::Layout;
 
 use crate::error::TryReserveError;
 
-/// Logical slots covered by one filter word. Ten keeps the tail under a byte per
-/// slot while leaving words sparse enough for two or three bits per key to stay
+/// Logical slots covered by one filter word. Ten keeps the membership lane under
+/// a byte per slot while leaving words sparse enough for two or three bits per key to stay
 /// selective.
 pub(crate) const SLOTS_PER_WORD: usize = 10;
 
@@ -36,6 +36,18 @@ fn word_count(total_slots: usize) -> usize {
 pub(crate) const fn refresh_deletes(max_insertions: usize) -> usize {
     max_insertions
 }
+
+/// One word of a backend's metadata tail: the membership lane, plus four level
+/// bins that each summarize which levels the keys sharing the word and bin
+/// occupy.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MetadataWord {
+    pub(crate) membership: u64,
+    pub(crate) level_bins: [u16; 4],
+}
+
+const _: () = assert!(core::mem::size_of::<MetadataWord>() == 16);
 
 /// One key's filter bits, derived once per operation.
 #[derive(Clone, Copy)]

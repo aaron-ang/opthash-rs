@@ -416,7 +416,7 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
     assert_layout::<u64, u64>();
     assert_layout::<Zst, Zst>();
     assert_layout::<OverAligned, OverAligned>();
-    assert!(mem::size_of::<ElasticMetadataWord>() <= 2 * membership::SLOTS_PER_WORD);
+    assert!(mem::size_of::<MetadataWord>() <= 2 * membership::SLOTS_PER_WORD);
 
     let table =
         ElasticTable::<OverAligned, OverAligned, FixedHashBuilder>::with_capacity_and_reserve_and_hasher_in(
@@ -432,14 +432,14 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
         unsafe { table.arena.as_ptr().add(layout.membership.offset) }.addr()
     );
     assert_eq!(
-        table.membership_ptr().addr() % mem::align_of::<ElasticMetadataWord>(),
+        table.membership_ptr().addr() % mem::align_of::<MetadataWord>(),
         0
     );
     for word in 0..table.membership.words {
         // SAFETY: `word < words` indexes an initialized metadata word.
         let metadata = unsafe { *table.membership_ptr().add(word) };
         assert_eq!(metadata.membership, 0);
-        assert_eq!(metadata.route_bins, [0; 4]);
+        assert_eq!(metadata.level_bins, [0; 4]);
     }
     assert_eq!(
         table.levels[0].data_ptr().addr() % mem::align_of::<OverAligned>(),
@@ -760,7 +760,7 @@ fn route_summary_conservatively_records_every_live_level() {
     for word in 0..map.table().membership.words {
         assert_eq!(
             // SAFETY: `word < words` indexes an initialized metadata word.
-            unsafe { (*map.table().membership_ptr().add(word)).route_bins },
+            unsafe { (*map.table().membership_ptr().add(word)).level_bins },
             [0; 4]
         );
     }

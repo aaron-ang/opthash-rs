@@ -19,7 +19,7 @@ use crate::exact::probe::{
     PreparedProbeRange,
 };
 use crate::hasher::DefaultHashBuilder;
-use crate::membership::{self, MembershipKey, MembershipRegion};
+use crate::membership::{self, MembershipKey, MembershipRegion, MetadataWord};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::GROUP_SIZE;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
@@ -241,26 +241,47 @@ impl<T> arena::RegionSet for FlatStorage<T> {
     }
 }
 
-/// One word of the membership filter tail.
-type MembershipWord = u64;
+/// Level-bin bit shared by every ordinary level from this index on and by both
+/// special arrays. Shallower levels each own the bit at their index.
+const OVERFLOW_LEVEL: usize = u16::BITS as usize - 1;
+const OVERFLOW_LEVEL_BIT: u16 = 1 << OVERFLOW_LEVEL;
 
-/// One key's filter location: which word and which bits. Computed once per
-/// operation and carried to the record step, so placement never re-derives it.
+/// Level-bin bit of ordinary level `level`.
+#[inline]
+fn level_bit_of(level: usize) -> u16 {
+    1 << level.min(OVERFLOW_LEVEL)
+}
+
+/// Level bin of a key. Bits 6 and 7 of the hash: disjoint from both membership
+/// bit fields (bits 0..6 and 32..38) and from the control fingerprint (bits
+/// 57..64), while the word index draws on the high half.
+#[inline]
+const fn level_bin(key_hash: u64) -> usize {
+    ((key_hash >> 6) & 3) as usize
+}
+
+/// One key's filter location: which word, which bits, and which level bin.
+/// Computed once per operation and carried to the record step, so placement
+/// never re-derives it.
 #[derive(Clone, Copy)]
 struct MembershipSlot {
     index: usize,
     bits: u64,
+    bin: usize,
 }
 
 /// A loaded filter word paired with the key's bits, split from the test so the
 /// load can be issued before the work that hides its latency. An absent tail
-/// yields a gate that never passes, matching an empty table. Two words, not
-/// the slot: a lookup never records, and the extra field costs the miss path
-/// on every call.
+/// yields a gate that never passes, matching an empty table. It omits the
+/// word index: a lookup never records, and carrying it costs the miss path on
+/// every call.
 #[derive(Clone, Copy)]
 struct MembershipGate {
-    word: MembershipWord,
+    word: u64,
     bits: u64,
+    /// The key's level bin: a set bit marks a level some key sharing the bin
+    /// was recorded at.
+    levels: u16,
 }
 
 impl MembershipGate {
@@ -290,7 +311,7 @@ fn try_allocate_storage<K, V, A: Allocator>(
     // The arena zeroes control bytes only; an empty filter must read as
     // "nothing recorded".
     // SAFETY: `shape.membership` was laid out for this arena by `funnel_layout`.
-    unsafe { shape.membership.clear::<MembershipWord>(arena.as_ptr()) };
+    unsafe { shape.membership.clear::<MetadataWord>(arena.as_ptr()) };
     let storage = FlatStorage {
         ctrl_ptr: arena.as_ptr(),
         // SAFETY: `data_offset` is the data section's offset within this
@@ -314,7 +335,7 @@ fn funnel_layout<K, V>(n: usize) -> Result<FunnelLayout, TryReserveError> {
             .ok_or(TryReserveError::CapacityOverflow)?
     };
     let (base_layout, data_offset) = arena::layout_for_extents::<K, V>(control_bytes, n)?;
-    let (layout, membership) = MembershipRegion::extend::<MembershipWord>(base_layout, n)?;
+    let (layout, membership) = MembershipRegion::extend::<MetadataWord>(base_layout, n)?;
     Ok(FunnelLayout {
         layout,
         data_offset,
@@ -329,6 +350,15 @@ enum SearchResult {
     Vacant(usize),
     Full,
     RangeFailure,
+}
+
+/// A free slot and the level-bin bit an entry placed there records. The
+/// placement walk knows the level it stopped at; carrying the bit spares the
+/// insert a slot-to-level search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Vacancy {
+    slot: usize,
+    level_bit: u16,
 }
 
 /// A known-absent search, retained only while the entry borrows its map.
@@ -820,7 +850,8 @@ where
         None
     }
 
-    /// Lookup-side search over a probe the caller already prepared.
+    /// Entry-side search over a probe the caller already prepared: the full
+    /// walk, so a miss carries the vacancy an insert reuses.
     fn search_exact_prepared<Q>(
         &self,
         key: &Q,
@@ -991,11 +1022,90 @@ where
         first_tombstone.map_or(SearchResult::Full, SearchResult::Vacant)
     }
 
-    /// Read-only walk for `get` and `contains`: the buckets of
-    /// `search_exact_mode` in the same order, but it stops only at a real
-    /// EMPTY and skips tombstones without recording them, since a lookup never
-    /// needs the vacancy an insert would take.
-    fn lookup_exact_prepared<Q>(
+    /// Read-only walk for `get`, `contains` and `remove`: the buckets of
+    /// `search_exact_mode` in the same order, restricted to the levels set in
+    /// the key's bin `levels`, shallowest first. It stops only at a real EMPTY
+    /// and skips tombstones without recording them, since a lookup never needs
+    /// the vacancy an insert would take.
+    ///
+    /// An `EMPTY` lane in a visited bucket proves the key is not deeper: a
+    /// slot returns to `EMPTY` only when the epoch is rebuilt, so that lane was
+    /// free when the key was placed, and placement takes the first free slot
+    /// of the walk. The level holding a live key always has its bit set, as
+    /// bits only accumulate and a refresh re-records every live entry. Entries
+    /// placed outside their funnel are the caller's full scan's concern.
+    fn lookup_recorded_levels<Q>(
+        &self,
+        key: &Q,
+        probe: PreparedFastFunnelProbe,
+        key_fingerprint: u8,
+        levels: u16,
+    ) -> Option<usize>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let mut ordinary = levels & !OVERFLOW_LEVEL_BIT;
+        while ordinary != 0 {
+            let level = &self.shape.levels[ordinary.trailing_zeros() as usize];
+            ordinary &= ordinary - 1;
+            // A range failure here ended the key's placement walk too.
+            match self.lookup_level(key, probe, level, key_fingerprint)? {
+                BucketScanResult::Hit(slot) => return Some(slot),
+                BucketScanResult::Empty(_) => return None,
+                BucketScanResult::Full => {}
+            }
+        }
+        if levels & OVERFLOW_LEVEL_BIT == 0 {
+            return None;
+        }
+        self.lookup_overflow_levels(key, probe, key_fingerprint)
+    }
+
+    /// Tombstone-blind scan of the key's bucket in one ordinary level; `None`
+    /// is a range failure.
+    ///
+    /// Forced inline: with two callers LLVM outlines it, and the call per
+    /// visited level costs more than the scan.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn lookup_level<Q>(
+        &self,
+        key: &Q,
+        probe: PreparedFastFunnelProbe,
+        level: &LevelShape,
+        key_fingerprint: u8,
+    ) -> Option<BucketScanResult<usize>>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
+        let bucket = Self::sample(&level_probe, 0, level.bucket_range)?;
+        let start = level.offset + bucket * self.shape.beta;
+        // SAFETY: an ordinary bucket ends at or before `n`, and the control
+        // array pads `GROUP_SIZE - 1` bytes past `n`; matched lanes carry the
+        // fingerprint, so they are occupied.
+        Some(unsafe {
+            scan_clean_funnel_bucket(
+                self.storage.ctrl_ptr(),
+                start,
+                self.shape.beta,
+                key_fingerprint,
+                |slot| {
+                    let entry = self.storage.get_ref(slot);
+                    key.equivalent(&entry.key).then_some(slot)
+                },
+            )
+        })
+    }
+
+    /// Overflow leg of [`Self::lookup_recorded_levels`]: every ordinary level
+    /// from `OVERFLOW_LEVEL` on, then the special arrays, as the exact walk
+    /// visits them.
+    ///
+    /// Out of line: most keys never record the overflow bit, and inlining
+    /// this leg would give the hot walk a second copy of the level scan.
+    #[inline(never)]
+    fn lookup_overflow_levels<Q>(
         &self,
         key: &Q,
         probe: PreparedFastFunnelProbe,
@@ -1007,25 +1117,8 @@ where
         if self.shape.n == 0 {
             return None;
         }
-        for level in &self.shape.levels {
-            let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
-            let bucket = Self::sample(&level_probe, 0, level.bucket_range)?;
-            let start = level.offset + bucket * self.shape.beta;
-            // SAFETY: an ordinary bucket ends at or before `n`, and the control
-            // array pads `GROUP_SIZE - 1` bytes past `n`; matched lanes carry
-            // the fingerprint, so they are occupied.
-            match unsafe {
-                scan_clean_funnel_bucket(
-                    self.storage.ctrl_ptr(),
-                    start,
-                    self.shape.beta,
-                    key_fingerprint,
-                    |slot| {
-                        let entry = self.storage.get_ref(slot);
-                        key.equivalent(&entry.key).then_some(slot)
-                    },
-                )
-            } {
+        for level in self.shape.levels.get(OVERFLOW_LEVEL..).unwrap_or_default() {
+            match self.lookup_level(key, probe, level, key_fingerprint)? {
                 BucketScanResult::Hit(slot) => return Some(slot),
                 BucketScanResult::Empty(_) => return None,
                 BucketScanResult::Full => {}
@@ -1068,10 +1161,29 @@ where
         None
     }
 
+    /// A vacancy at `slot`, found by a walk that did not track its level.
+    #[inline]
+    fn vacancy_at(&self, slot: usize) -> Vacancy {
+        Vacancy {
+            slot,
+            level_bit: self.level_bit(slot),
+        }
+    }
+
+    /// The vacancy an exact search reports, if any, with its level-bin bit.
+    #[inline]
+    fn vacancy_of(&self, exact: SearchResult) -> Option<Vacancy> {
+        match exact {
+            SearchResult::Vacant(slot) => Some(self.vacancy_at(slot)),
+            SearchResult::Hit(_) => unreachable!("known-absent Funnel search found a key"),
+            SearchResult::Full | SearchResult::RangeFailure => None,
+        }
+    }
+
     /// Placement walk for a key already known to be absent: the buckets of
     /// `search_exact_mode` in the same order, returning the first free slot,
     /// which is the `Vacant` slot the exact search reports for an absent key.
-    /// No fingerprint mask, no key compares, never `Hit`.
+    /// No fingerprint mask, no key compares. `None` is an exhausted walk.
     ///
     /// Forced inline: the loop keeps many registers live, so a call costs more
     /// in prologue and epilogue than the walk. The special-array tail stays out
@@ -1080,58 +1192,56 @@ where
     /// closure-driven walker slows the exact search's misses.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn search_vacancy(&self, probe: PreparedFastFunnelProbe) -> SearchResult {
+    fn search_vacancy(&self, probe: PreparedFastFunnelProbe) -> Option<Vacancy> {
         #[cfg(test)]
         tests::VACANCY_WALKS.with(|walks| walks.set(walks.get() + 1));
         if self.shape.n == 0 {
-            return SearchResult::Full;
+            return None;
         }
         let ctrl_ptr = self.storage.ctrl_ptr();
-        for level in &self.shape.levels {
+        for (index, level) in self.shape.levels.iter().enumerate() {
             let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
-            let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) else {
-                return SearchResult::RangeFailure;
-            };
+            let bucket = Self::sample(&level_probe, 0, level.bucket_range)?;
             let start = level.offset + bucket * self.shape.beta;
             // SAFETY: an ordinary bucket ends at or before `n`, and the control
             // array pads `GROUP_SIZE - 1` bytes past `n`.
             if let Some(slot) = unsafe { first_free_in_bucket(ctrl_ptr, start, self.shape.beta) } {
-                return SearchResult::Vacant(slot);
+                return Some(Vacancy {
+                    slot,
+                    level_bit: level_bit_of(index),
+                });
             }
         }
-        self.search_vacancy_special(probe)
+        self.search_vacancy_special(probe).map(|slot| Vacancy {
+            slot,
+            level_bit: OVERFLOW_LEVEL_BIT,
+        })
     }
 
     /// Special-array leg of [`Self::search_vacancy`]: primary probes, then the
-    /// two fallback buckets, in the exact search's order.
+    /// two fallback buckets, in the exact search's order. Returns the bare
+    /// slot: every special slot shares the overflow bit, and a slot alone
+    /// returns in registers.
     #[inline(never)]
-    fn search_vacancy_special(&self, probe: PreparedFastFunnelProbe) -> SearchResult {
+    fn search_vacancy_special(&self, probe: PreparedFastFunnelProbe) -> Option<usize> {
         let primary_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_PRIMARY_BASE);
         for logical_probe in 0..self.shape.loglog_ceiling {
-            let Some(local) = Self::sample(
+            let local = Self::sample(
                 &primary_probe,
                 self.shape.encode_logical_probe(logical_probe),
                 self.shape.primary_range,
-            ) else {
-                return SearchResult::RangeFailure;
-            };
+            )?;
             let slot = self.shape.primary_offset + local;
             // SAFETY: a primary probe stays inside the primary range.
             if control::is_free(unsafe { self.storage.control_at(slot) }) {
-                return SearchResult::Vacant(slot);
+                return Some(slot);
             }
         }
 
         let first_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_A_BASE);
-        let Some(first_bucket) = Self::sample(&first_probe, 0, self.shape.fallback_bucket_range)
-        else {
-            return SearchResult::RangeFailure;
-        };
+        let first_bucket = Self::sample(&first_probe, 0, self.shape.fallback_bucket_range)?;
         let second_probe = probe.prepare_counter_base(FUNNEL_SPECIAL_FALLBACK_B_BASE);
-        let Some(second_bucket) = Self::sample(&second_probe, 0, self.shape.fallback_bucket_range)
-        else {
-            return SearchResult::RangeFailure;
-        };
+        let second_bucket = Self::sample(&second_probe, 0, self.shape.fallback_bucket_range)?;
         for slot_in_bucket in 0..self.shape.fallback_bucket_width {
             for bucket in [first_bucket, second_bucket] {
                 let slot = self.shape.fallback_offset
@@ -1139,11 +1249,11 @@ where
                     + slot_in_bucket;
                 // SAFETY: both buckets lie inside the fallback range.
                 if control::is_free(unsafe { self.storage.control_at(slot) }) {
-                    return SearchResult::Vacant(slot);
+                    return Some(slot);
                 }
             }
         }
-        SearchResult::Full
+        None
     }
 
     /// Only epochs that placed a key outside its funnel reach this scan.
@@ -1162,10 +1272,10 @@ where
     }
 
     #[inline]
-    fn membership_ptr(&self) -> *mut MembershipWord {
+    fn membership_ptr(&self) -> *mut MetadataWord {
         // SAFETY: `self.membership` was laid out for `self.arena`; both are
         // replaced together on every resize.
-        unsafe { self.membership.ptr::<MembershipWord>(self.arena.as_ptr()) }
+        unsafe { self.membership.ptr::<MetadataWord>(self.arena.as_ptr()) }
     }
 
     /// `false` proves no insert ever recorded this key.
@@ -1180,7 +1290,7 @@ where
         let word = MembershipKey::word(key_hash, words);
         // SAFETY: `word` is a multiply-high reduction below `words`, and the
         // arena's tail holds exactly that many zero-initialized words.
-        unsafe { *self.membership_ptr().add(word) & bits == bits }
+        unsafe { (*self.membership_ptr().add(word)).membership & bits == bits }
     }
 
     /// This key's filter word index and bits for the current epoch. Only an
@@ -1190,6 +1300,7 @@ where
         MembershipSlot {
             index: MembershipKey::word(key_hash, self.membership.words),
             bits: MembershipKey::from_signature::<MEMBERSHIP_BITS>(key_hash).bits(),
+            bin: level_bin(key_hash),
         }
     }
 
@@ -1208,29 +1319,67 @@ where
             return MembershipGate {
                 word: 0,
                 bits: u64::MAX,
+                levels: 0,
             };
         }
+        // SAFETY: `slot.index` is a multiply-high reduction below `words`, and
+        // the arena's tail holds exactly that many words. Two field loads, not
+        // a copy of the whole word, so the bin needs no dynamic extraction.
+        let (word, levels) = unsafe {
+            let metadata = self.membership_ptr().add(slot.index);
+            ((*metadata).membership, (*metadata).level_bins[slot.bin])
+        };
         MembershipGate {
-            // SAFETY: `slot.index` is a multiply-high reduction below `words`,
-            // and the arena's tail holds exactly that many words.
-            word: unsafe { *self.membership_ptr().add(slot.index) },
+            word,
             bits: slot.bits,
+            levels,
         }
     }
 
-    /// Records a key at a slot derived from this epoch, including entries
+    /// Level-bin bit for an entry stored at `slot`. Levels are contiguous from
+    /// slot zero, and the special arrays follow the last of them, so the slot
+    /// alone names its level.
+    #[inline]
+    fn level_bit(&self, slot: usize) -> u16 {
+        let levels = &self.shape.levels;
+        let overflow_start = levels
+            .get(OVERFLOW_LEVEL)
+            .map_or(self.shape.primary_offset, |level| level.offset);
+        if slot >= overflow_start {
+            return OVERFLOW_LEVEL_BIT;
+        }
+        // Level zero starts at slot zero, so the later levels starting at or
+        // before `slot` count up to its level. Most entries sit in the first
+        // few levels, so the walk is short.
+        level_bit_of(
+            levels
+                .iter()
+                .skip(1)
+                .take_while(|level| level.offset <= slot)
+                .count(),
+        )
+    }
+
+    /// Records a key under a filter location derived from this epoch, at the
+    /// level-bin bit of the slot it is stored in, including entries
     /// exceptional recovery places outside their funnel.
     #[inline]
-    fn record_membership(&mut self, slot: MembershipSlot) {
+    fn record_membership(&mut self, membership: MembershipSlot, level_bit: u16) {
+        debug_assert!(level_bit.is_power_of_two());
         if self.membership.words != 0 {
-            // SAFETY: as in `membership_gate`.
-            unsafe { *self.membership_ptr().add(slot.index) |= slot.bits };
+            // SAFETY: as in `membership_gate`; `&mut self` makes the borrow
+            // exclusive.
+            let metadata = unsafe { &mut *self.membership_ptr().add(membership.index) };
+            metadata.membership |= membership.bits;
+            metadata.level_bins[membership.bin] |= level_bit;
         }
     }
 
     fn clear_membership(&mut self) {
         // SAFETY: as in `membership_ptr`.
-        unsafe { self.membership.clear::<MembershipWord>(self.arena.as_ptr()) };
+        unsafe {
+            self.membership.clear::<MetadataWord>(self.arena.as_ptr());
+        }
         self.stale_membership = 0;
     }
 
@@ -1255,7 +1404,7 @@ where
                 self.hash_builder.hash_one(&entry.key)
             };
             let membership = self.membership_slot(hash);
-            self.record_membership(membership);
+            self.record_membership(membership, self.level_bit(slot));
         }
     }
 
@@ -1274,7 +1423,7 @@ where
         // SAFETY: each region belongs to its own table's arena; the source has
         // the same shape, so equal word counts; distinct arenas never overlap.
         unsafe {
-            self.membership.copy_from::<MembershipWord>(
+            self.membership.copy_from::<MetadataWord>(
                 self.arena.as_ptr(),
                 source.membership,
                 source.arena.as_ptr(),
@@ -1283,7 +1432,8 @@ where
     }
 
     /// Read-side counterpart of [`Self::locate`]: the same filter gate and
-    /// exceptional full scan around the tombstone-blind lookup walk.
+    /// exceptional full scan around the tombstone-blind lookup walk, which
+    /// visits only the levels the key's bin has recorded.
     ///
     /// Only the filter test is inline: the walk keeps many registers live, and
     /// LLVM saves them all ahead of the test, so filter-rejected misses would
@@ -1293,10 +1443,11 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        if !self.membership_gate(key_hash).passes() {
+        let gate = self.membership_gate(key_hash);
+        if !gate.passes() {
             return None;
         }
-        self.find_location_after_gate(key, key_hash, key_fingerprint)
+        self.find_location_after_gate(key, key_hash, key_fingerprint, gate.levels)
     }
 
     /// Probe preparation stays next to the walk so the prepared probe never
@@ -1307,12 +1458,13 @@ where
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
+        levels: u16,
     ) -> Option<usize>
     where
         Q: Equivalent<K> + ?Sized,
     {
         let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
-        match self.lookup_exact_prepared(key, probe, key_fingerprint) {
+        match self.lookup_recorded_levels(key, probe, key_fingerprint, levels) {
             Some(slot) => Some(slot),
             None if self.exceptional_placement => self.find_by_full_scan(key, key_fingerprint),
             None => None,
@@ -1375,13 +1527,14 @@ where
 
     fn place_new_entry(
         &mut self,
-        slot: usize,
+        vacancy: Vacancy,
         key: K,
         value: V,
         membership: MembershipSlot,
         key_fingerprint: u8,
         exceptional: bool,
     ) {
+        let Vacancy { slot, level_bit } = vacancy;
         // SAFETY: callers pass a free slot from a probe within the storage.
         let was_tombstone = unsafe { self.storage.control_at(slot) } == CTRL_TOMBSTONE;
         // SAFETY: as above, and `key_fingerprint` is an occupied control.
@@ -1389,7 +1542,8 @@ where
             self.storage
                 .write_with_control(slot, SlotEntry { key, value }, key_fingerprint);
         }
-        self.record_membership(membership);
+        debug_assert_eq!(level_bit, self.level_bit(slot), "level bit of slot {slot}");
+        self.record_membership(membership, level_bit);
         self.len += 1;
         if was_tombstone {
             self.tombstones -= 1;
@@ -1440,64 +1594,69 @@ where
         value: V,
         key_hash: u64,
         mut membership: MembershipSlot,
-        exact: SearchResult,
+        vacancy: Option<Vacancy>,
     ) -> usize {
         let key_fingerprint = control::control_fingerprint(key_hash);
         // An epoch that already placed outside its funnels was either rebuilt
         // for this reason or failed in its own rebuild; another would cost
         // O(n) per insert without helping.
-        let rebuilt = !matches!(exact, SearchResult::Vacant(_)) && !self.exceptional_placement;
-        let exact = if rebuilt {
+        let rebuilt = vacancy.is_none() && !self.exceptional_placement;
+        let vacancy = if rebuilt {
             let (recovered, slot) = self.rebuild_for_placement(key_hash);
             membership = slot;
             recovered
         } else {
-            exact
+            vacancy
         };
-        let (slot, exceptional) = self.resolve_vacancy(exact);
-        self.place_new_entry(slot, key, value, membership, key_fingerprint, exceptional);
+        let (vacancy, exceptional) = self.resolve_vacancy(vacancy);
+        self.place_new_entry(
+            vacancy,
+            key,
+            value,
+            membership,
+            key_fingerprint,
+            exceptional,
+        );
         if exceptional && rebuilt {
             self.epoch.note_placement_recovery();
         } else if exceptional {
             self.epoch
                 .start_with_placement_recovery(EpochTransition::PlacementRecovery);
         }
-        slot
+        vacancy.slot
     }
 
     /// Rebuilds at the same size under a fresh probe seed and walks `key_hash`
-    /// again, returning the new search and filter slot. Out of line so the
+    /// again, returning the new vacancy and filter slot. Out of line so the
     /// insert paths carry one inlined copy of the placement walk, not two.
     #[cold]
     #[inline(never)]
-    fn rebuild_for_placement(&mut self, key_hash: u64) -> (SearchResult, MembershipSlot) {
+    fn rebuild_for_placement(&mut self, key_hash: u64) -> (Option<Vacancy>, MembershipSlot) {
         self.resize_with_transition(self.shape.n, EpochTransition::PlacementRecovery);
         let membership = self.membership_slot(key_hash);
-        let exact = self.search_vacancy(FunnelPrf::new(self.probe_seed).prepare(key_hash));
-        (exact, membership)
+        let vacancy = self.search_vacancy(FunnelPrf::new(self.probe_seed).prepare(key_hash));
+        (vacancy, membership)
     }
 
-    /// Maps a known-absent search to `(slot, exceptional)`: its vacancy, or
+    /// Maps a known-absent search to `(vacancy, exceptional)`: its vacancy, or
     /// the first free slot anywhere once the walk is exhausted. Both callers
     /// run under the insertion limit, which reserves a free slot.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn resolve_vacancy(&self, exact: SearchResult) -> (usize, bool) {
-        match exact {
-            SearchResult::Vacant(slot) => {
-                debug_assert!(
-                    // SAFETY: a vacancy is a probed in-bounds slot.
-                    control::is_free(unsafe { self.storage.control_at(slot) }),
-                    "stale Funnel vacancy at slot {slot}"
-                );
-                (slot, false)
-            }
-            SearchResult::Hit(_) => unreachable!("known-absent Funnel search found a key"),
-            SearchResult::Full | SearchResult::RangeFailure => (
-                self.first_free_global()
-                    .expect("Funnel insertion limit reserves a free slot"),
-                true,
-            ),
+    fn resolve_vacancy(&self, vacancy: Option<Vacancy>) -> (Vacancy, bool) {
+        if let Some(vacancy) = vacancy {
+            debug_assert!(
+                // SAFETY: a vacancy is a probed in-bounds slot.
+                control::is_free(unsafe { self.storage.control_at(vacancy.slot) }),
+                "stale Funnel vacancy at slot {}",
+                vacancy.slot
+            );
+            (vacancy, false)
+        } else {
+            let slot = self
+                .first_free_global()
+                .expect("Funnel insertion limit reserves a free slot");
+            (self.vacancy_at(slot), true)
         }
     }
 
@@ -1610,10 +1769,10 @@ where
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let key_fingerprint = control::control_fingerprint(key_hash);
         let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
-        let (slot, exceptional) = self.resolve_vacancy(self.search_vacancy(probe));
+        let (vacancy, exceptional) = self.resolve_vacancy(self.search_vacancy(probe));
         let membership = self.membership_slot(key_hash);
         self.place_new_entry(
-            slot,
+            vacancy,
             entry.key,
             entry.value,
             membership,
@@ -1729,20 +1888,20 @@ where
 
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, vacant: FunnelVacant) -> usize {
-        let exact = if self.prepare_vacant_insert() || vacant.exact == FunnelVacant::UNSEARCHED {
+        let vacancy = if self.prepare_vacant_insert() || vacant.exact == FunnelVacant::UNSEARCHED {
             // Growth invalidates any recorded slot or exhaustion; an unsearched
             // token never had one.
             let probe = FunnelPrf::new(self.probe_seed).prepare(vacant.hash);
             self.search_vacancy(probe)
         } else if vacant.exact == FunnelVacant::EXHAUSTED {
             // Both exhaustion reasons take the same recovery path.
-            SearchResult::Full
+            None
         } else {
-            SearchResult::Vacant(vacant.exact)
+            Some(self.vacancy_at(vacant.exact))
         };
         // Filter geometry may have changed during growth too.
         let membership = self.membership_slot(vacant.hash);
-        self.place_absent_after_search(key, value, vacant.hash, membership, exact)
+        self.place_absent_after_search(key, value, vacant.hash, membership, vacancy)
     }
 
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
@@ -1756,11 +1915,10 @@ where
         let gate = self.membership_gate_at(membership);
         let probe = FunnelPrf::new(self.probe_seed).prepare(hash);
         let fingerprint = control::control_fingerprint(hash);
-        let mut exact = SearchResult::Full;
-        let mut searched = false;
+        let mut exact = None;
         if gate.passes() {
-            exact = self.search_exact_prepared_for_insert(&key, probe, fingerprint);
-            if let SearchResult::Hit(slot) = exact {
+            let search = self.search_exact_prepared_for_insert(&key, probe, fingerprint);
+            if let SearchResult::Hit(slot) = search {
                 return Some(self.replace_value(slot, value));
             }
             if self.exceptional_placement
@@ -1768,17 +1926,19 @@ where
             {
                 return Some(self.replace_value(slot, value));
             }
-            searched = true;
+            exact = Some(search);
         }
-        if self.prepare_vacant_insert() {
+        let vacancy = if self.prepare_vacant_insert() {
             // Growth rebuilt the arena and its filter; both the search and the
             // filter slot from before it are stale.
             membership = self.membership_slot(hash);
-            exact = self.search_vacancy(probe);
-        } else if !searched {
-            exact = self.search_vacancy(probe);
-        }
-        self.place_absent_after_search(key, value, hash, membership, exact);
+            self.search_vacancy(probe)
+        } else if let Some(exact) = exact {
+            self.vacancy_of(exact)
+        } else {
+            self.search_vacancy(probe)
+        };
+        self.place_absent_after_search(key, value, hash, membership, vacancy);
         None
     }
 
