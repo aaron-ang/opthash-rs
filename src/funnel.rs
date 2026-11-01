@@ -28,12 +28,14 @@ use crate::raw::rebuild::{self, Rebuildable};
 use crate::raw::simd;
 use crate::{macros, map};
 
+/// Initial probe seed; each placement-recovery rebuild advances it by
+/// [`FUNNEL_RESEED_STEP`].
 const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
 /// Added to the probe seed by each placement-recovery rebuild. The seed passes
 /// through `mix64` before routing, so any odd step draws a fresh mapping.
 const FUNNEL_RESEED_STEP: u64 = probe::WYHASH_DEFAULT_SECRET[0];
-/// Filter bits per key. A Funnel false positive costs one bounded walk, so a
-/// third bit would buy little for its extra insert work.
+/// Bits each key sets in its membership-filter word. A lookup whose bits are
+/// not all set skips the probe walk, since the key cannot be present.
 const MEMBERSHIP_BITS: usize = 2;
 
 /// Pointerless scan progress through Funnel's flat storage.

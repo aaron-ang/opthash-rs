@@ -27,18 +27,38 @@ use crate::raw::rebuild::{self, Rebuildable};
 /// by iterators, the `(level, slot)` location backs removal.
 type ElasticScanItem<K, V> = (*mut SlotEntry<K, V>, (usize, usize));
 
-// Fixed construction seed shared by placement, lookup, and membership.
+/// Fixed construction seed shared by placement, lookup, and membership.
 const ELASTIC_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[0];
+/// The paper's constant `c` in the per-level probe budget
+/// `c * min(log2(1/eps)^2, log2(1/delta))`; the paper only asks that it be
+/// sufficiently large.
 const ELASTIC_PROBE_BUDGET_C: usize = 8;
+/// Most probe indices any level's search visits. The paper's fallback search
+/// is unbounded; this caps it so the lookup schedule stays finite.
 const UNIFORM_SEARCH_CAP: u64 = 4_096;
+/// Largest paper query position a placement may take. The lookup schedule
+/// covers every position up to it, so a vacancy past it counts as a failed
+/// probe.
 const QUERY_POSITION_CAP: u128 = 1_000_000;
+/// Top bit of `probe_high_water`, set once this epoch placed an entry outside
+/// its probe routes; lookups that miss the schedule then fall back to a full
+/// scan.
 const EXCEPTIONAL_PLACEMENT_FLAG: u32 = 1 << 31;
+/// Bound on a level's probe index within `QUERY_POSITION_CAP`. Level one
+/// reaches the most probes before its positions pass the cap.
 const QUERY_PROBE_LIMIT: usize = 384;
+/// Largest table: slot positions and schedule bounds are stored as `u32`.
 const MAX_ELASTIC_SLOTS: u64 = 1 << u32::BITS;
+/// Levels a key's route summary tracks, one `u16` bit each; the last bit
+/// stands for every deeper level.
 const ROUTE_SUMMARY_LEVELS: usize = u16::BITS as usize;
-/// Filter bits per key. Misses exhaust every level's schedule once the gate
-/// passes, so each false positive costs Elastic far more than it costs Funnel.
+/// Bits each key sets in its membership-filter word. A lookup whose bits are
+/// not all set skips the probe walk, since the key cannot be present. A false
+/// positive walks every level's full schedule, so a third bit rejects enough
+/// extra misses to outweigh its cost.
 const MEMBERSHIP_BITS: usize = 3;
+/// Counter base of level zero's first probe, which lookups route ahead of
+/// the schedule.
 const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
 const _: () = assert!(u32::BITS as u64 <= probe::ELASTIC_LEVEL_LIMIT);
