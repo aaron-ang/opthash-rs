@@ -28,10 +28,15 @@ use crate::raw::rebuild::{self, Rebuildable};
 use crate::raw::simd;
 use crate::{macros, map};
 
+/// Initial probe seed; each placement-recovery rebuild advances it by
+/// [`FUNNEL_RESEED_STEP`].
 const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
 /// Added to the probe seed by each placement-recovery rebuild. The seed passes
 /// through `mix64` before routing, so any odd step draws a fresh mapping.
 const FUNNEL_RESEED_STEP: u64 = probe::WYHASH_DEFAULT_SECRET[0];
+/// Bits each key sets in its membership-filter word. A lookup whose bits are
+/// not all set skips the probe walk, since the key cannot be present.
+const MEMBERSHIP_BITS: usize = 2;
 
 /// Pointerless scan progress through Funnel's flat storage.
 #[derive(Clone, Debug)]
@@ -1086,7 +1091,7 @@ where
         if words == 0 {
             return false;
         }
-        let bits = MembershipKey::from_signature(key_hash).bits();
+        let bits = MembershipKey::from_signature::<MEMBERSHIP_BITS>(key_hash).bits();
         let word = MembershipKey::word(key_hash, words);
         // SAFETY: `word` is a multiply-high reduction below `words`, and the
         // arena's tail holds exactly that many zero-initialized words.
@@ -1099,7 +1104,7 @@ where
     fn membership_slot(&self, key_hash: u64) -> MembershipSlot {
         MembershipSlot {
             index: MembershipKey::word(key_hash, self.membership.words),
-            bits: MembershipKey::from_signature(key_hash).bits(),
+            bits: MembershipKey::from_signature::<MEMBERSHIP_BITS>(key_hash).bits(),
         }
     }
 

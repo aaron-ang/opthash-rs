@@ -15,7 +15,8 @@ use allocator_api2::alloc::Layout;
 use crate::error::TryReserveError;
 
 /// Logical slots covered by one filter word. Ten keeps the tail under a byte per
-/// slot while leaving words sparse enough for two bits per key to stay selective.
+/// slot while leaving words sparse enough for two or three bits per key to stay
+/// selective.
 pub(crate) const SLOTS_PER_WORD: usize = 10;
 
 /// Filter words needed to cover `total_slots` logical slots.
@@ -43,16 +44,20 @@ pub(crate) struct MembershipKey {
 }
 
 impl MembershipKey {
-    /// Two bits of one word, from disjoint signature fields. Two bits rather
-    /// than more trade slightly more false positives for cheaper inserts and
-    /// gated lookups.
+    /// `BITS` bits of one word, from disjoint signature fields. Each extra bit
+    /// cuts false positives but costs a shift and OR per insert and fills the
+    /// filter faster between refreshes, so each backend picks its own count.
     #[inline]
-    pub(crate) fn from_signature(signature: u64) -> Self {
-        let first = signature & 63;
-        let second = (signature >> 32) & 63;
-        Self {
-            bits: (1_u64 << first) | (1_u64 << second),
+    pub(crate) const fn from_signature<const BITS: usize>(signature: u64) -> Self {
+        const SHIFTS: [u32; 3] = [0, 32, 16];
+        const { assert!(BITS >= 1 && BITS <= SHIFTS.len()) };
+        let mut bits = 0;
+        let mut field = 0;
+        while field < BITS {
+            bits |= 1_u64 << ((signature >> SHIFTS[field]) & 63);
+            field += 1;
         }
+        Self { bits }
     }
 
     #[inline]

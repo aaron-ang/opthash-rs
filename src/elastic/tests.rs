@@ -555,7 +555,8 @@ fn duplicate_insert_does_not_advance_the_paper_schedule() {
 fn membership_bits_from_signature(signature: u64) -> u64 {
     let first = signature & 63;
     let second = (signature >> 32) & 63;
-    (1_u64 << first) | (1_u64 << second)
+    let third = (signature >> 16) & 63;
+    (1_u64 << first) | (1_u64 << second) | (1_u64 << third)
 }
 
 fn membership_maybe_contains_prepared<K, V, S, A>(
