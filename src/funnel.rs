@@ -214,8 +214,11 @@ unsafe impl<T: Sync> Sync for FlatStorage<T> {}
 // SAFETY: storage is only stamped at offsets carved from an arena laid out by
 // `funnel_layout` with at least `capacity` ctrl bytes (plus group padding) and
 // `capacity` slots, whose ctrl bytes `try_allocate_with_ctrl_zeroed` starts
-// EMPTY, and is re-stamped before that arena is freed.
+// EMPTY, and is re-stamped before that arena is freed. The `GROUP_SIZE - 1`
+// padding bytes are zeroed with the rest and never stamped, so they stay EMPTY.
 unsafe impl<T> ArenaSlots<T> for FlatStorage<T> {
+    const PADDED_TAIL: bool = true;
+
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
         self.ctrl_ptr

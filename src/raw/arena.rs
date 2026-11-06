@@ -343,8 +343,14 @@ pub(crate) struct SlotEntry<K, V> {
 /// reads and writes of `capacity()` bytes and `data_ptr()` valid for
 /// `capacity()` slots of `T`, with neither range overlapping another
 /// descriptor's. A new descriptor must start with no occupied control byte
-/// over an uninitialized slot.
+/// over an uninitialized slot. A descriptor that sets
+/// [`PADDED_TAIL`](Self::PADDED_TAIL) must also keep the `GROUP_SIZE - 1`
+/// ctrl bytes past `capacity()` readable and never occupied.
 pub(crate) unsafe trait ArenaSlots<T> {
+    /// The ctrl array extends past `capacity()` with never-occupied padding,
+    /// so group scans load the final partial group whole.
+    const PADDED_TAIL: bool = false;
+
     fn ctrl_ptr(&self) -> *mut u8;
     fn data_ptr(&self) -> *mut MaybeUninit<T>;
     fn capacity(&self) -> usize;

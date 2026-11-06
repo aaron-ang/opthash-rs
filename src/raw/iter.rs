@@ -59,13 +59,16 @@ impl OccupiedIndices {
                 return None;
             }
             self.current_group_slot = next_group;
-            // SAFETY: `next_group` is in bounds, and `occupied_mask` reads at
-            // most the remaining controls, including a partial final group.
+            // SAFETY: `next_group` is in bounds. A padded region keeps a full
+            // group readable past it, and its padding never reads occupied;
+            // otherwise `occupied_mask` reads at most the remaining controls.
             self.current_mask = unsafe {
-                occupied_mask(
-                    region.ctrl_ptr().add(next_group),
-                    region.capacity() - next_group,
-                )
+                let ctrl = region.ctrl_ptr().add(next_group);
+                if D::PADDED_TAIL {
+                    simd::occupied_mask_group(ctrl)
+                } else {
+                    occupied_mask(ctrl, region.capacity() - next_group)
+                }
             };
         }
     }
