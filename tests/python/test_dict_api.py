@@ -1,6 +1,6 @@
 """Coverage for dict-parity API: iteration, bulk ops, equality, merge."""
 
-import collections.abc as abc
+from collections import abc
 
 import pytest
 

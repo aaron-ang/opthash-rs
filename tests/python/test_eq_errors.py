@@ -39,7 +39,7 @@ def arm():
         lambda m, k: m.__setitem__(k, 2),
         lambda m, k: m.update({k: 2}),
         lambda m, k: m.update([(k, 2)]),
-        lambda m, k: k in m.keys(),
+        lambda m, k: m.keys().__contains__(k),
         lambda m, k: (k, 1) in m.items(),
     ],
 )
@@ -60,7 +60,7 @@ def test_map_update_from_same_type_raises(map_cls, keys):
     with pytest.raises(ValueError, match="eq"):
         m.update(other)
     with pytest.raises(ValueError, match="eq"):
-        m == map_cls({probe: 1})
+        _ = m == map_cls({probe: 1})
 
 
 def test_map_value_comparisons_raise(map_cls, keys):
@@ -68,13 +68,13 @@ def test_map_value_comparisons_raise(map_cls, keys):
     m = map_cls({"a": stored})
     arm()
     with pytest.raises(ValueError, match="eq"):
-        m == map_cls({"a": probe})
+        _ = m == map_cls({"a": probe})
     with pytest.raises(ValueError, match="eq"):
-        m == {"a": probe}
+        _ = m == {"a": probe}
     with pytest.raises(ValueError, match="eq"):
-        probe in m.values()
+        _ = probe in m.values()
     with pytest.raises(ValueError, match="eq"):
-        ("a", probe) in m.items()
+        _ = ("a", probe) in m.items()
 
 
 @pytest.mark.parametrize(

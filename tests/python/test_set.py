@@ -1,4 +1,4 @@
-import collections.abc as abc
+from collections import abc
 
 import pytest
 
@@ -23,7 +23,7 @@ def test_unhashable_elements_raise_type_error(set_cls):
     with pytest.raises(TypeError):
         set_cls([[1]])
     with pytest.raises(TypeError):
-        [1] in s
+        _ = [1] in s
 
 
 def test_options_validation(set_cls):
