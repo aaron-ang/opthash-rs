@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1](https://github.com/aaron-ang/opthash-rs/compare/v0.12.0...v0.12.1) - 2026-11-06
+
+### Added
+
+- *(bench)* add high_load sweep vs a hashbrown-calibrated greedy control ([#172](https://github.com/aaron-ang/opthash-rs/pull/172))
+
+### Other
+
+- *(funnel)* skip unrecorded levels on lookups ([#178](https://github.com/aaron-ang/opthash-rs/pull/178))
+- *(funnel)* load the padded tail group whole in occupied scans ([#177](https://github.com/aaron-ang/opthash-rs/pull/177))
+- *(funnel)* walk get and contains with a read-only lookup kernel ([#176](https://github.com/aaron-ang/opthash-rs/pull/176))
+- *(funnel)* outline full-scan and recovery fallbacks as cold ([#175](https://github.com/aaron-ang/opthash-rs/pull/175))
+- *(elastic)* record three filter bits per key ([#174](https://github.com/aaron-ang/opthash-rs/pull/174))
+- *(deps)* let Renovate bump pre-commit hooks
+- *(build)* pick the control-group cfg with one match
+- *(deps)* switch from Dependabot to Renovate
+
 ## [0.12.0](https://github.com/aaron-ang/opthash-rs/compare/v0.11.1...v0.12.0) - 2026-10-26
 
 ### Added
