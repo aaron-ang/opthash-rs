@@ -345,6 +345,47 @@ fn vacancy_walk_matches_exact_search_for_absent_keys() {
     check(&table, "tombstoned table");
 }
 
+/// The read-only walk must report exactly the exact search's hits, for
+/// present and absent keys, on clean epochs and with tombstones on the walk.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn lookup_walk_matches_exact_search_hits() {
+    let mut table = raw_table(5_472, 8);
+    let live = table.shape.max_insertions as u64;
+    for key in 0..live {
+        assert!(!table.place_unique(
+            SlotEntry { key, value: key },
+            table.hash_builder.hash_one(key)
+        ));
+    }
+    let check = |table: &FunnelTable<u64, u64, IdentityBuildHasher>, label: &str| {
+        for key in 0..live + 4_096 {
+            let hash = table.hash_builder.hash_one(key);
+            let fingerprint = control::control_fingerprint(hash);
+            let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(hash);
+            let expected = match table.search_exact_for_insert(&key, hash, fingerprint) {
+                SearchResult::Hit(slot) => Some(slot),
+                SearchResult::Vacant(_) | SearchResult::Full | SearchResult::RangeFailure => None,
+            };
+            assert_eq!(
+                table.lookup_exact_prepared(&key, probe, fingerprint),
+                expected,
+                "{label} key={key}"
+            );
+        }
+    };
+    check(&table, "clean full table");
+
+    for key in (0..live).step_by(3) {
+        let hash = table.hash_builder.hash_one(key);
+        let fingerprint = control::control_fingerprint(hash);
+        let slot = table.find_location(&key, hash, fingerprint).unwrap();
+        map::TableBackend::remove(&mut table, slot);
+    }
+    assert!(table.tombstones > 0);
+    check(&table, "tombstoned table");
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn deletes_past_the_threshold_refresh_the_membership_filter() {
@@ -1168,21 +1209,34 @@ fn vector_bucket_scan_matches_scalar_order_for_every_default_pattern() {
                 "pattern={encoded} hit={hit_lane}"
             );
 
-            if !controls[..WIDTH].contains(&CTRL_TOMBSTONE) {
-                let mut clean_compared = Vec::new();
-                // SAFETY: as above, and this pattern has no tombstones.
-                let clean = unsafe {
-                    scan_clean_funnel_bucket(controls.as_ptr(), 0, WIDTH, FP, |slot| {
-                        clean_compared.push(slot);
-                        (Some(slot) == expected_hit).then_some(slot)
-                    })
-                };
-                assert_eq!(clean, expected, "clean pattern={encoded} hit={hit_lane}");
-                assert_eq!(
-                    clean_compared, expected_compared,
-                    "clean pattern={encoded} hit={hit_lane}"
-                );
-            }
+            // The tombstone-blind scan compares the same lanes and finds the
+            // same hit; otherwise it reports the first EMPTY, which is the
+            // general scan's vacancy only when no tombstone precedes it.
+            let expected_clean = match expected {
+                BucketScanResult::Empty(_) => BucketScanResult::Empty(
+                    controls[..WIDTH]
+                        .iter()
+                        .position(|&control| control == CTRL_EMPTY)
+                        .unwrap(),
+                ),
+                other => other,
+            };
+            let mut clean_compared = Vec::new();
+            // SAFETY: as above.
+            let clean = unsafe {
+                scan_clean_funnel_bucket(controls.as_ptr(), 0, WIDTH, FP, |slot| {
+                    clean_compared.push(slot);
+                    (Some(slot) == expected_hit).then_some(slot)
+                })
+            };
+            assert_eq!(
+                clean, expected_clean,
+                "clean pattern={encoded} hit={hit_lane}"
+            );
+            assert_eq!(
+                clean_compared, expected_compared,
+                "clean pattern={encoded} hit={hit_lane}"
+            );
         }
     }
 }
