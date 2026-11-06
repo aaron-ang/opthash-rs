@@ -3,7 +3,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/bench.sh"
 
 

@@ -53,5 +53,8 @@ python-source = "python"
 trusted-publishing = true
 publishing-environment = "pypi"
 
+[tool.ruff]
+src = ["python"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
