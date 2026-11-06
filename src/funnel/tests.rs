@@ -114,7 +114,14 @@ fn entry_search_checks_exceptional_hits_before_reusing_vacancy() {
     let exact = table.search_exact_for_insert(&key, key, fingerprint);
     let slot = table.shape.n - 1;
     assert_ne!(exact, SearchResult::Vacant(slot));
-    table.place_new_entry(slot, key, 7, table.membership_slot(key), fingerprint, true);
+    table.place_new_entry(
+        table.vacancy_at(slot),
+        key,
+        7,
+        table.membership_slot(key),
+        fingerprint,
+        true,
+    );
     assert_eq!(table.find_for_entry(&key, key).ok(), Some(slot));
 
     // A different key with the same hash must complete the exceptional
@@ -205,7 +212,7 @@ fn dense_scan_preserves_order_while_removals_make_the_table_sparse() {
         let key = slot as u64;
         let hash = table.hash_builder.hash_one(key);
         table.place_new_entry(
-            slot,
+            table.vacancy_at(slot),
             key,
             key + 100,
             table.membership_slot(hash),
@@ -236,7 +243,7 @@ fn sparse_scan_visits_group_boundaries_and_tail_once_in_slot_order() {
         let key = slot as u64;
         let hash = table.hash_builder.hash_one(key);
         table.place_new_entry(
-            slot,
+            table.vacancy_at(slot),
             key,
             key + 100,
             table.membership_slot(hash),
@@ -328,7 +335,11 @@ fn vacancy_walk_matches_exact_search_for_absent_keys() {
             let fingerprint = control::control_fingerprint(hash);
             let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(hash);
             let exact = table.search_exact_for_insert(&key, hash, fingerprint);
-            assert_eq!(table.search_vacancy(probe), exact, "{label} key={key}");
+            assert_eq!(
+                table.search_vacancy(probe),
+                table.vacancy_of(exact),
+                "{label} key={key}"
+            );
             vacant += usize::from(matches!(exact, SearchResult::Vacant(_)));
         }
         assert!(vacant > 0, "{label}: fixture never reached a vacancy");
@@ -345,8 +356,9 @@ fn vacancy_walk_matches_exact_search_for_absent_keys() {
     check(&table, "tombstoned table");
 }
 
-/// The read-only walk must report exactly the exact search's hits, for
-/// present and absent keys, on clean epochs and with tombstones on the walk.
+/// With every level bit set, the read-only walk must report exactly the exact
+/// search's hits, for present and absent keys, on clean epochs and with
+/// tombstones on the walk.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn lookup_walk_matches_exact_search_hits() {
@@ -358,6 +370,10 @@ fn lookup_walk_matches_exact_search_hits() {
             table.hash_builder.hash_one(key)
         ));
     }
+    // Every bit `level_bit` can record for this shape; a bit past the last
+    // level would index out of bounds.
+    let every_level = (0..table.shape.levels.len())
+        .fold(OVERFLOW_LEVEL_BIT, |mask, level| mask | level_bit_of(level));
     let check = |table: &FunnelTable<u64, u64, IdentityBuildHasher>, label: &str| {
         for key in 0..live + 4_096 {
             let hash = table.hash_builder.hash_one(key);
@@ -368,7 +384,7 @@ fn lookup_walk_matches_exact_search_hits() {
                 SearchResult::Vacant(_) | SearchResult::Full | SearchResult::RangeFailure => None,
             };
             assert_eq!(
-                table.lookup_exact_prepared(&key, probe, fingerprint),
+                table.lookup_recorded_levels(&key, probe, fingerprint, every_level),
                 expected,
                 "{label} key={key}"
             );
@@ -618,7 +634,7 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
             }
             // Placing a slot directly still owes the filter its record.
             let membership = table.membership_slot(key);
-            table.record_membership(membership);
+            table.record_membership(membership, table.level_bit(slot));
             table.len += 1;
         }
     }
@@ -846,6 +862,110 @@ fn membership_filter_is_reset_by_clear_and_wipe() {
             .filter(|&key| table.membership_maybe_contains(key))
             .count();
         assert_eq!(recorded, 0, "reset must clear every filter word");
+    }
+}
+
+#[test]
+fn level_bits_follow_slot_levels_into_the_special_arrays() {
+    let table = raw_table(32_768, 3);
+    let levels = &table.shape.levels;
+    assert!(
+        levels.len() > OVERFLOW_LEVEL,
+        "fixture must reach the overflow bit"
+    );
+    for (index, level) in levels.iter().enumerate() {
+        let last = levels
+            .get(index + 1)
+            .map_or(table.shape.primary_offset, |next| next.offset)
+            - 1;
+        for slot in [level.offset, last] {
+            assert_eq!(table.level_bit(slot), level_bit_of(index), "level {index}");
+        }
+    }
+    for slot in [
+        table.shape.primary_offset,
+        table.shape.fallback_offset,
+        table.shape.n - 1,
+    ] {
+        assert_eq!(
+            table.level_bit(slot),
+            OVERFLOW_LEVEL_BIT,
+            "special slot {slot}"
+        );
+    }
+}
+
+/// Every live entry's level bit is set in its bin and the masked lookup finds
+/// it; returns the level bits the live entries cover.
+fn assert_level_masks_cover_live(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> u16 {
+    let mut covered = 0;
+    let mut scan = OccupiedIndices::new();
+    while let Some(slot) = scan.step(&table.storage) {
+        // SAFETY: `step` yields occupied in-bounds slots.
+        let key = unsafe { table.storage.get_ref(slot) }.key;
+        let hash = table.hash_builder.hash_one(key);
+        let level_bit = table.level_bit(slot);
+        assert_ne!(
+            table.membership_gate(hash).levels & level_bit,
+            0,
+            "slot {slot} lost its level bit"
+        );
+        assert_eq!(
+            table.find_location(&key, hash, control::control_fingerprint(hash)),
+            Some(slot),
+            "masked lookup missed slot {slot}"
+        );
+        covered |= level_bit;
+    }
+    covered
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn level_masks_never_lose_a_live_key() {
+    use crate::map::TableBackend;
+
+    let spread = |i: u64| i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut table = raw_table(65_536, 6);
+    let live = table.shape.max_insertions as u64;
+    for i in 0..live {
+        let key = spread(i);
+        assert_eq!(table.insert(key, i, key), None);
+    }
+    assert_eq!(
+        assert_level_masks_cover_live(&table),
+        u16::MAX,
+        "a full table must cover every level bit, overflow included"
+    );
+    // Absent keys whose gate passes still miss: an EMPTY that ends a masked
+    // walk early never turns into a false hit.
+    for i in live..live + 4_096 {
+        let key = spread(i);
+        let fingerprint = control::control_fingerprint(key);
+        assert_eq!(table.find_location(&key, key, fingerprint), None);
+    }
+
+    for i in (0..live).step_by(3) {
+        let key = spread(i);
+        let slot = table
+            .find_location(&key, key, control::control_fingerprint(key))
+            .unwrap();
+        table.remove(slot);
+    }
+    assert_level_masks_cover_live(&table);
+    table.refresh_membership();
+    assert_level_masks_cover_live(&table);
+    table.resize_with_transition(table.shape.n, EpochTransition::PlacementRecovery);
+    assert_level_masks_cover_live(&table);
+    assert_level_masks_cover_live(&table.clone_table());
+    table.resize_with_transition(2 * table.shape.n, EpochTransition::ExplicitResize);
+    assert_level_masks_cover_live(&table);
+    for i in (0..live).filter(|i| i % 3 != 0) {
+        let key = spread(i);
+        let fingerprint = control::control_fingerprint(key);
+        let slot = table.find_location(&key, key, fingerprint).unwrap();
+        // SAFETY: `find_location` returns occupied in-bounds slots.
+        assert_eq!(unsafe { table.storage.get_ref(slot) }.value, i);
     }
 }
 

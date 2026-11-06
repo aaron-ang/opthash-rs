@@ -16,7 +16,7 @@ use crate::exact::probe::{self, CounterPrf, PreparedElasticProbe};
 use crate::hasher::DefaultHashBuilder;
 use crate::macros;
 use crate::map;
-use crate::membership::{self, MembershipKey, MembershipRegion};
+use crate::membership::{self, MembershipKey, MembershipRegion, MetadataWord};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::INITIAL_CAPACITY;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
@@ -346,15 +346,6 @@ type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
 /// A fresh arena, its level descriptors, and the metadata tail they share.
 type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>, MembershipRegion);
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct ElasticMetadataWord {
-    membership: u64,
-    route_bins: [u16; 4],
-}
-
-const _: () = assert!(mem::size_of::<ElasticMetadataWord>() == 16);
-
 struct ElasticArenaLayout {
     layout: Layout,
     data_base_off: usize,
@@ -363,8 +354,7 @@ struct ElasticArenaLayout {
 
 fn elastic_arena_layout<K, V>(total_slots: usize) -> Result<ElasticArenaLayout, TryReserveError> {
     let (base_layout, data_base_off) = arena::layout_for::<K, V>(total_slots)?;
-    let (layout, membership) =
-        MembershipRegion::extend::<ElasticMetadataWord>(base_layout, total_slots)?;
+    let (layout, membership) = MembershipRegion::extend::<MetadataWord>(base_layout, total_slots)?;
     Ok(ElasticArenaLayout {
         layout,
         data_base_off,
@@ -763,7 +753,7 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     // The arena zeroes control bytes only; an empty filter must read as
     // "nothing recorded".
     // SAFETY: `membership` was laid out by `elastic_arena_layout` for this arena.
-    unsafe { membership.clear::<ElasticMetadataWord>(arena.as_ptr()) };
+    unsafe { membership.clear::<MetadataWord>(arena.as_ptr()) };
 
     // `Arena` has no `Drop`: deallocate explicitly if level construction fails.
     match build_elastic_levels::<K, V>(arena.as_ptr(), arena_layout.data_base_off, level_capacities)
@@ -869,12 +859,9 @@ where
     }
 
     #[inline]
-    fn membership_ptr(&self) -> *mut ElasticMetadataWord {
+    fn membership_ptr(&self) -> *mut MetadataWord {
         // SAFETY: `self.membership` was laid out together with `self.arena`.
-        unsafe {
-            self.membership
-                .ptr::<ElasticMetadataWord>(self.arena.as_ptr())
-        }
+        unsafe { self.membership.ptr::<MetadataWord>(self.arena.as_ptr()) }
     }
 
     /// Reads the membership scalar and selected route-summary bin directly:
@@ -895,10 +882,10 @@ where
         let bits = prepared.membership.bits();
         // SAFETY: `word` is a multiply-high reduction below `words`, and the
         // cached region covers exactly that many initialized, properly aligned
-        // `ElasticMetadataWord`s.
+        // `MetadataWord`s.
         let (membership, route_bin) = unsafe {
             let metadata = self.membership_ptr().add(word);
-            ((*metadata).membership, (*metadata).route_bins[summary_bin])
+            ((*metadata).membership, (*metadata).level_bins[summary_bin])
         };
         ElasticRouteFilter {
             maybe_present: membership & bits == bits,
@@ -938,15 +925,14 @@ where
             // makes the borrow exclusive.
             let metadata = unsafe { &mut *self.membership_ptr().add(word) };
             metadata.membership |= membership.bits();
-            metadata.route_bins[route.summary_bin()] |= 1_u16 << summary_level(level);
+            metadata.level_bins[route.summary_bin()] |= 1_u16 << summary_level(level);
         }
     }
 
     fn clear_membership(&mut self) {
         // SAFETY: `self.membership` was laid out together with `self.arena`.
         unsafe {
-            self.membership
-                .clear::<ElasticMetadataWord>(self.arena.as_ptr());
+            self.membership.clear::<MetadataWord>(self.arena.as_ptr());
         }
         self.stale_membership = 0;
     }
@@ -955,7 +941,7 @@ where
         // SAFETY: each region was laid out for its own table's arena, so the two
         // never overlap; clones share geometry, so word counts match.
         unsafe {
-            self.membership.copy_from::<ElasticMetadataWord>(
+            self.membership.copy_from::<MetadataWord>(
                 self.arena.as_ptr(),
                 source.membership,
                 source.arena.as_ptr(),
