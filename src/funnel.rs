@@ -24,6 +24,7 @@ use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::GROUP_SIZE;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::raw::iter::OccupiedIndices;
+use crate::raw::prefetch;
 use crate::raw::rebuild::{self, Rebuildable};
 use crate::raw::simd;
 use crate::{macros, map};
@@ -1766,6 +1767,27 @@ where
         self.hash_builder.hash_one(key)
     }
 
+    #[inline]
+    fn prefetch_placement(&self, key_hash: u64) {
+        let membership = self.membership_slot(key_hash);
+        if self.membership.words != 0 {
+            prefetch::prefetch_write(self.membership_ptr().wrapping_add(membership.index));
+        }
+        let Some(level) = self.shape.levels.first() else {
+            return;
+        };
+        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
+        let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
+        if let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) {
+            self.storage
+                .prefetch_slot(level.offset + bucket * self.shape.beta);
+        }
+    }
+
+    /// Inlined into both rebuild loops: outlining it costs a call per entry
+    /// on the rebuild hot path.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let key_fingerprint = control::control_fingerprint(key_hash);
         let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);

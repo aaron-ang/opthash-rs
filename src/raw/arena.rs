@@ -7,6 +7,7 @@ use allocator_api2::alloc::{Allocator, Layout};
 use super::config::CACHE_LINE;
 use super::control::{self, CTRL_TOMBSTONE};
 use super::iter::OccupiedIndices;
+use super::prefetch;
 use crate::error::TryReserveError;
 
 /// Owns one allocation backing a map's ctrl bytes + slot data.
@@ -373,6 +374,15 @@ pub(crate) unsafe trait ArenaSlots<T> {
         debug_assert!(idx < self.capacity());
         // SAFETY: caller keeps `idx` in bounds of the `capacity()` ctrl bytes.
         unsafe { *self.ctrl_ptr().add(idx) }
+    }
+
+    /// Prefetches the control byte and payload of slot `idx` ahead of a write.
+    /// Wrapping offsets keep an out-of-bounds `idx` sound; it only wastes the
+    /// hint.
+    #[inline]
+    fn prefetch_slot(&self, idx: usize) {
+        prefetch::prefetch_write(self.ctrl_ptr().wrapping_add(idx));
+        prefetch::prefetch_write(self.data_ptr().wrapping_add(idx));
     }
 
     /// Bounds-checked [`control_at`](Self::control_at) for test assertions.
