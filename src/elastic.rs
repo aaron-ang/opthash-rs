@@ -21,6 +21,7 @@ use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::INITIAL_CAPACITY;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::raw::iter::OccupiedIndices;
+use crate::raw::prefetch;
 use crate::raw::rebuild::{self, Rebuildable};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
@@ -583,6 +584,13 @@ impl BatchScheduler {
         if len >= self.batch_end || len < self.batch_start {
             self.sync(len);
         }
+        self.cached_target()
+    }
+
+    /// The target of the cached batch, which may trail `len` until the next
+    /// [`Self::target`] re-syncs it.
+    #[inline]
+    fn cached_target(&self) -> BatchTarget {
         if self.current_batch_index == 0 {
             BatchTarget::Bootstrap
         } else {
@@ -1587,10 +1595,7 @@ where
                 let next_level = self.levels.get(next)?;
                 let free_current = current_level.free_slots();
                 let free_next = next_level.free_slots();
-                let current_low = free_current
-                    <= self
-                        .reserve_fraction
-                        .floor_half_reserved(current_level.capacity());
+                let current_low = self.current_level_low(current_level);
                 let next_low = free_next.saturating_mul(4) <= next_level.capacity();
 
                 if current_low {
@@ -1628,6 +1633,16 @@ where
             return None;
         }
         Some(ExactPlacement { level, slot, phi })
+    }
+
+    /// Case 2's test: the active pair's current level has at most half its
+    /// reserve left, so new keys go to the next level.
+    #[inline]
+    fn current_level_low(&self, current_level: &Level<SlotEntry<K, V>>) -> bool {
+        current_level.free_slots()
+            <= self
+                .reserve_fraction
+                .floor_half_reserved(current_level.capacity())
     }
 
     fn uniform_vacancy(&self, probe: PreparedElasticProbe, level: usize) -> Option<(usize, u64)> {
@@ -1904,6 +1919,37 @@ where
 
     fn hash_key(&self, key: &K) -> u64 {
         self.hash_builder.hash_one(key)
+    }
+
+    #[inline]
+    fn prefetch_placement(&self, key_hash: u64) {
+        let prepared = PreparedElasticKey::new(key_hash);
+        let words = self.membership.words;
+        if words != 0 {
+            let word = MembershipKey::word(prepared.route.signature(), words);
+            prefetch::prefetch_write(self.membership_ptr().wrapping_add(word));
+        }
+        // The level whose first probe `choose_slot_for_new_key` reads, judged
+        // from the cached batch; a stale batch only misdirects the hint.
+        let level = match self.scheduler.cached_target() {
+            BatchTarget::Bootstrap => 0,
+            BatchTarget::LevelPair(current) => {
+                let Some(current_level) = self.levels.get(current) else {
+                    return;
+                };
+                if self.current_level_low(current_level) {
+                    current + 1
+                } else {
+                    current
+                }
+            }
+        };
+        if let (Some(region), Some(slot)) = (
+            self.levels.get(level),
+            self.route_prepared(level, prepared.route.probe, 0),
+        ) {
+            region.prefetch_slot(slot);
+        }
     }
 
     /// Skips the existence and capacity checks in `insert`: the new

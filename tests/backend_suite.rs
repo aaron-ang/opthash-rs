@@ -621,6 +621,98 @@ macro_rules! backend_suite {
                 assert!(map.capacity() > max_insertions);
             }
 
+            /// Value wide enough that a few hundred slots exceed the footprint
+            /// at which a resize prefetches placements ahead.
+            struct Wide {
+                id: u64,
+                _pad: [u64; 8_192],
+                _drop: DropCounter,
+            }
+
+            impl Wide {
+                #[allow(
+                    clippy::large_stack_arrays,
+                    reason = "the padding must sit inline in the slot"
+                )]
+                fn new(id: u64, drops: &Arc<AtomicUsize>) -> Self {
+                    Self {
+                        id,
+                        _pad: [0; 8_192],
+                        _drop: DropCounter::new(drops),
+                    }
+                }
+            }
+
+            /// Key whose `Hash` panics once `budget` hashes have run.
+            struct BudgetKey {
+                id: u64,
+                budget: Arc<AtomicUsize>,
+            }
+
+            impl PartialEq for BudgetKey {
+                fn eq(&self, other: &Self) -> bool {
+                    self.id == other.id
+                }
+            }
+
+            impl Eq for BudgetKey {}
+
+            impl std::hash::Hash for BudgetKey {
+                fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                    assert!(
+                        self.budget.fetch_sub(1, Ordering::SeqCst) != 0,
+                        "hash budget spent"
+                    );
+                    state.write_u64(self.id);
+                }
+            }
+
+            #[test]
+            fn growth_of_a_large_footprint_table_keeps_every_entry() {
+                let drops = Arc::new(AtomicUsize::new(0));
+                let mut map: HashMap<u64, Wide> = HashMap::with_capacity(8);
+                for id in 0..400 {
+                    assert!(map.insert(id, Wide::new(id, &drops)).is_none());
+                }
+                assert_eq!(map.len(), 400);
+                for id in 0..400 {
+                    assert_eq!(map.get(&id).map(|wide| wide.id), Some(id));
+                }
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                drop(map);
+                assert_eq!(drops.load(Ordering::SeqCst), 400);
+            }
+
+            #[test]
+            fn hash_panic_midway_through_a_large_footprint_resize_keeps_every_entry() {
+                let drops = Arc::new(AtomicUsize::new(0));
+                let budget = Arc::new(AtomicUsize::new(usize::MAX));
+                let key = |id| BudgetKey {
+                    id,
+                    budget: Arc::clone(&budget),
+                };
+                let mut map: HashMap<BudgetKey, Wide> = HashMap::with_capacity(256);
+                for id in 0..200 {
+                    assert!(map.insert(key(id), Wide::new(id, &drops)).is_none());
+                }
+
+                // Enough hashes to place some entries before the panic; the
+                // counter then wraps, so later hashing succeeds.
+                budget.store(100, Ordering::SeqCst);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    map.try_reserve(4_096)
+                }));
+                assert!(result.is_err());
+
+                assert_eq!(map.len(), 200);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                for id in 0..200 {
+                    assert_eq!(map.get(&key(id)).map(|wide| wide.id), Some(id));
+                }
+                drop(map);
+                assert_eq!(drops.load(Ordering::SeqCst), 200);
+            }
+
             #[test]
             #[cfg_attr(miri, ignore = "broad delete and reinsert workload is too slow")]
             fn delete_heavy_preserves_correctness() {
