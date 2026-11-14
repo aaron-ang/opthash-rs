@@ -21,6 +21,7 @@ use crate::exact::probe::{
 use crate::hasher::DefaultHashBuilder;
 use crate::membership::{self, MembershipKey, MembershipRegion, MetadataWord};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
+use crate::raw::bitmask::BITMASK_STRIDE;
 use crate::raw::config::GROUP_SIZE;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::raw::iter::OccupiedIndices;
@@ -35,6 +36,14 @@ const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
 /// Added to the probe seed by each placement-recovery rebuild. The seed passes
 /// through `mix64` before routing, so any odd step draws a fresh mapping.
 const FUNNEL_RESEED_STEP: u64 = probe::WYHASH_DEFAULT_SECRET[0];
+/// Largest table whose lookups select between the first two recorded levels
+/// instead of branching on the first. While the control bytes stay in cache a
+/// mispredicted level costs more than a second scan; past this size the scan
+/// is a cache miss, and speculating on the first level is cheaper.
+const SELECT_MAX_SLOTS: usize = 1 << 20;
+/// Smallest table that selects. A table below it holds so few keys that
+/// the level branch is learned, and the second scan is pure cost.
+const SELECT_MIN_SLOTS: usize = 1 << 10;
 /// Bits each key sets in its membership-filter word. A lookup whose bits are
 /// not all set skips the probe walk, since the key cannot be present.
 const MEMBERSHIP_BITS: usize = 2;
@@ -1035,6 +1044,9 @@ where
     /// of the walk. The level holding a live key always has its bit set, as
     /// bits only accumulate and a refresh re-records every live entry. Entries
     /// placed outside their funnel are the caller's full scan's concern.
+    ///
+    /// [`Self::lookup_first_matches`] hands every lookup it cannot settle to
+    /// this walk, which therefore decides them all.
     fn lookup_recorded_levels<Q>(
         &self,
         key: &Q,
@@ -1060,6 +1072,102 @@ where
             return None;
         }
         self.lookup_overflow_levels(key, probe, key_fingerprint)
+    }
+
+    /// Lookup over the ordinary levels the key's bin recorded, checking only
+    /// the first fingerprint match of each bucket. `Ok` is the lookup's
+    /// answer. `Err` hands the lookup to the ordered walk: a rejected probe
+    /// word, a matching fingerprint on another key, a bucket wider than one
+    /// group, or a key that may sit in the overflow levels or outside its
+    /// funnel.
+    ///
+    /// A level without the fingerprint cannot hold the key, so the walk moves
+    /// on without the ordered walk's `EMPTY` test, which only shortens misses
+    /// the filter let through.
+    ///
+    /// Calls nothing but the key comparison, so a caller that hands off by
+    /// tail call keeps no frame.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn lookup_first_matches<Q>(
+        &self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+        levels: u16,
+    ) -> Result<Option<usize>, ()>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        // An empty shape has no lanes to mask and never reaches a lookup.
+        if self.shape.beta.wrapping_sub(1) >= GROUP_SIZE {
+            return Err(());
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let lanes = u64::MAX >> (u64::BITS - self.shape.beta as u32 * BITMASK_STRIDE);
+        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
+        // Fingerprint matches of the key's bucket in one level, with the
+        // bucket's first slot.
+        let scan = |level: u32| -> Result<(usize, u64), ()> {
+            let level = self.shape.levels.get(level as usize).ok_or(())?;
+            let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
+            let bucket = probe::first_word_funnel_probe_index(&level_probe, 0, level.bucket_range)
+                .ok_or(())?;
+            let start = level.offset + bucket * self.shape.beta;
+            // SAFETY: an ordinary bucket ends at or before `n`, and the control
+            // array pads `GROUP_SIZE - 1` bytes past `n`.
+            let matches =
+                unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), key_fingerprint) };
+            Ok((start, matches.0 & lanes))
+        };
+        let confirm = |start: usize, matches: u64| -> Result<Option<usize>, ()> {
+            let slot = start + (matches.trailing_zeros() / BITMASK_STRIDE) as usize;
+            // SAFETY: a matched lane lies inside its bucket and carries the
+            // fingerprint, so the slot is in bounds and occupied.
+            let entry = unsafe { self.storage.get_ref(slot) };
+            if key.equivalent(&entry.key) {
+                Ok(Some(slot))
+            } else {
+                Err(())
+            }
+        };
+        let mut ordinary = levels & !OVERFLOW_LEVEL_BIT;
+        if ordinary != 0 && (SELECT_MIN_SLOTS..=SELECT_MAX_SLOTS).contains(&self.shape.n) {
+            // The first two recorded levels are scanned together and the
+            // holder is selected, not branched on: which of them holds the key
+            // is unpredictable.
+            let first = ordinary.trailing_zeros();
+            ordinary &= ordinary - 1;
+            let second = if ordinary == 0 {
+                first
+            } else {
+                ordinary.trailing_zeros()
+            };
+            ordinary &= ordinary.wrapping_sub(1);
+            let (first_start, first_matches) = scan(first)?;
+            let (second_start, second_matches) = scan(second)?;
+            let in_first = first_matches != 0;
+            let start = if in_first { first_start } else { second_start };
+            let matches = if in_first {
+                first_matches
+            } else {
+                second_matches
+            };
+            if matches != 0 {
+                return confirm(start, matches);
+            }
+        }
+        while ordinary != 0 {
+            let (start, matches) = scan(ordinary.trailing_zeros())?;
+            ordinary &= ordinary - 1;
+            if matches != 0 {
+                return confirm(start, matches);
+            }
+        }
+        if levels & OVERFLOW_LEVEL_BIT != 0 || self.exceptional_placement {
+            return Err(());
+        }
+        Ok(None)
     }
 
     /// Tombstone-blind scan of the key's bucket in one ordinary level; `None`
@@ -1451,10 +1559,31 @@ where
         self.find_location_after_gate(key, key_hash, key_fingerprint, gate.levels)
     }
 
+    /// Out of line so a filter-rejected miss pays for no probe preparation.
+    /// The ordered walk sits in tail position, so its call needs no frame
+    /// here and the lookups this function answers itself can skip the
+    /// register saves.
+    #[inline(never)]
+    fn find_location_after_gate<Q>(
+        &self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+        levels: u16,
+    ) -> Option<usize>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        match self.lookup_first_matches(key, key_hash, key_fingerprint, levels) {
+            Ok(found) => found,
+            Err(()) => self.find_location_by_walk(key, key_hash, key_fingerprint, levels),
+        }
+    }
+
     /// Probe preparation stays next to the walk so the prepared probe never
     /// crosses a call boundary.
     #[inline(never)]
-    fn find_location_after_gate<Q>(
+    fn find_location_by_walk<Q>(
         &self,
         key: &Q,
         key_hash: u64,
