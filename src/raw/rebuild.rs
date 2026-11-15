@@ -35,11 +35,18 @@ pub(crate) trait Rebuildable {
 }
 
 /// Entries hashed and prefetched ahead of the one being placed, so their
-/// cache misses overlap instead of serializing.
+/// cache misses overlap instead of running one after another. The distance
+/// only has to give a prefetch time to finish before its entry is placed;
+/// going further gains nothing.
 const PREFETCH_DISTANCE: usize = 16;
 
-/// Smallest old-generation slot footprint that rebuilds with prefetching.
-/// Below it the tables stay cache-resident, so hashing ahead only adds work.
+/// Smallest old-generation slot footprint that rebuilds with prefetching. A
+/// smaller table stays in cache, where hashing ahead is only extra work.
+///
+/// The value assumes a cache size; it is not a property of the table. With a
+/// smaller cache, some rebuilds that would gain from prefetching take the
+/// plain loop. With a larger one, some rebuilds prefetch without need, at a
+/// small cost.
 const PREFETCH_MIN_BYTES: usize = 1 << 22;
 
 /// Moves every entry of `table` into `next` and installs it. Each key is
