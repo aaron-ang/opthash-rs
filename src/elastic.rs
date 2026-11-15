@@ -240,6 +240,9 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     probe_schedule: Vec<PhiRoute>,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
+    /// First word of the metadata tail, so the gate's address needs one load.
+    /// Dangling while `membership` has no words.
+    metadata_words: *mut MetadataWord,
     /// Deletes since the filter last matched the live set; see
     /// [`membership::refresh_deletes`].
     stale_membership: usize,
@@ -823,6 +826,12 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     }
 }
 
+/// First metadata word of `membership`'s tail inside `arena`.
+fn metadata_words(arena: &Arena, membership: MembershipRegion) -> *mut MetadataWord {
+    // SAFETY: `membership` was laid out together with `arena`.
+    unsafe { membership.ptr::<MetadataWord>(arena.as_ptr()) }
+}
+
 fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
     level_capacities: &[usize],
     alloc: &A,
@@ -879,6 +888,7 @@ where
             scheduler: BatchScheduler::new(&geometry.batch_plan),
             hash_builder,
             alloc,
+            metadata_words: metadata_words(&arena, membership),
             arena,
             epoch: EpochState::initial(),
             probe_high_water: 0,
@@ -919,8 +929,7 @@ where
 
     #[inline]
     fn membership_ptr(&self) -> *mut MetadataWord {
-        // SAFETY: `self.membership` was laid out together with `self.arena`.
-        unsafe { self.membership.ptr::<MetadataWord>(self.arena.as_ptr()) }
+        self.metadata_words
     }
 
     /// Reads the membership scalar and selected route-summary bin directly:
@@ -1632,6 +1641,7 @@ where
             scheduler,
             hash_builder,
             alloc,
+            metadata_words: metadata_words(&arena, membership),
             arena,
             epoch: self.epoch,
             probe_high_water: self.probe_high_water,
@@ -1742,6 +1752,7 @@ where
                 total_slots: geometry.total_slots,
                 max_insertions: geometry.max_insertions,
                 scheduler: BatchScheduler::new(&geometry.batch_plan),
+                metadata_words: metadata_words(&arena, membership),
                 arena,
                 probe_high_water: 0,
                 scheduled_levels: 0,
@@ -2253,6 +2264,7 @@ pub(crate) struct ElasticGeneration<K, V> {
     scheduled_probes: u32,
     probe_schedule: Vec<PhiRoute>,
     membership: MembershipRegion,
+    metadata_words: *mut MetadataWord,
     stale_membership: usize,
 }
 
@@ -2279,6 +2291,7 @@ where
         mem::swap(&mut self.scheduled_probes, &mut other.scheduled_probes);
         mem::swap(&mut self.probe_schedule, &mut other.probe_schedule);
         mem::swap(&mut self.membership, &mut other.membership);
+        mem::swap(&mut self.metadata_words, &mut other.metadata_words);
         mem::swap(&mut self.stale_membership, &mut other.stale_membership);
     }
 
