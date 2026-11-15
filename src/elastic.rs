@@ -232,7 +232,8 @@ impl<T> Level<T> {
     }
 
     /// Tombstones exceed [`capacity::tombstone_cleanup_threshold`], so the
-    /// table should begin a same-size cleanup epoch after the active scan.
+    /// table owes a same-size cleanup epoch: at its next delete maintenance,
+    /// or at the insert after one that reuses a tombstone of this level.
     #[inline]
     fn needs_cleanup(&self) -> bool {
         self.tombstones as usize > capacity::tombstone_cleanup_threshold(self.capacity as usize)
@@ -331,10 +332,13 @@ const _: () = {
 };
 
 // SAFETY: the table uniquely owns its arena and every entry in it, like
-// `Box<[SlotEntry<K, V>]>`. Its raw pointers address that arena, except the
-// schedule's sentinel route, which addresses an immutable static, and the
-// schedule's entry origin, which is an address to offset from and is never
-// read: it lies outside the arena, and is null without levels.
+// `Box<[SlotEntry<K, V>]>`. Its raw pointers address that arena, except:
+// `ProbeSchedule::direct`, which addresses the routes the schedule owns;
+// the schedule's sentinel route and, in a table without a metadata tail,
+// `metadata_words`, which address the immutable statics `SENTINEL_CONTROL`
+// and `NO_METADATA` and are only read; and the schedule's entry origin,
+// which is an address to offset from and is never read: it lies outside
+// the arena, and is null without levels.
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
     for ElasticTable<K, V, S, A>
 {

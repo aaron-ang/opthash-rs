@@ -2823,12 +2823,19 @@ fn settled_gate_follows_the_live_count_through_a_clear_that_panicked() {
             let general = table
                 .choose_slot_for_new_key(probe, table.scheduler.target_at(table.live()))
                 .map(|placement| (placement.level, placement.slot));
-            if let Some((level, slot, _)) = table.settled_slot(probe) {
-                assert_eq!(Some((level, slot)), general);
-                settled += 1;
-            }
+            let settles = table
+                .scheduler
+                .would_settle(table.placed, table.stale_membership());
             map.insert(key, value());
             assert!(map.get(&key).is_some());
+            if settles {
+                // The insert itself took the slot the general placement
+                // names.
+                let table = map.table();
+                let took = table.find(&key, table.hash_builder.hash_one(key));
+                assert_eq!(took, general);
+                settled += 1;
+            }
         }
 
         map.clear();
@@ -3005,6 +3012,87 @@ fn settled_gate_closes_when_the_removal_count_starts_over() {
     assert_eq!(table.live() as u64, live);
     assert!(!table.scheduler.settles(table.placed));
     assert_settled_gate(&table, true);
+}
+
+#[test]
+fn reusing_a_tombstone_past_the_threshold_starts_a_cleanup_inside_the_batch() {
+    let mut map = FixedElasticHashMap::<u64, u64>::with_capacity(1_024);
+    // Stay in the bootstrap batch, which starts at zero: no removal can
+    // take the live count out of it.
+    let live = {
+        let scheduler = &map.table().scheduler;
+        assert_eq!(scheduler.current_batch_index, 0);
+        scheduler.batch_end as u64 - 8
+    };
+    for key in 0..live {
+        map.insert(key, key);
+    }
+    let threshold = {
+        let level = &map.table().levels[0];
+        assert_eq!(u64::from(level.len), live);
+        capacity::tombstone_cleanup_threshold(level.capacity()) as u64
+    };
+    let departed = threshold + 4;
+    assert!(departed < live);
+    for key in 0..departed {
+        assert_eq!(map.remove(&key), Some(key));
+    }
+    assert!(map.table().levels[0].needs_cleanup());
+    assert_eq!(map.epoch().generation, 0);
+
+    // Insert until one lands on a tombstone. The level stays past its
+    // threshold and the live count inside the batch throughout.
+    let mut key = live;
+    loop {
+        let tombstones = map.table().levels[0].tombstones;
+        map.insert(key, key);
+        key += 1;
+        let table = map.table();
+        assert_eq!(map.epoch().generation, 0);
+        assert_eq!(table.scheduler.current_batch_index, 0);
+        if table.levels[0].tombstones < tombstones {
+            break;
+        }
+        assert!(key < live + 8, "no insert reused a tombstone");
+    }
+    assert!(map.table().levels[0].needs_cleanup());
+
+    map.insert(key, key);
+    let epoch = map.epoch();
+    assert_eq!(epoch.generation, 1);
+    assert_eq!(epoch.transition, EpochTransition::TombstoneCleanup);
+    assert!(map.table().levels.iter().all(|level| level.tombstones == 0));
+    for present in departed..=key {
+        assert_eq!(map.get(&present), Some(&present));
+    }
+}
+
+#[test]
+fn a_scan_that_spends_the_delete_budget_refreshes_the_filter() {
+    let mut map = FixedElasticHashMap::<u64, u64>::with_capacity(1_024);
+    let live = map.capacity() as u64 / 2;
+    for key in 0..live {
+        map.insert(key, key);
+    }
+    let budget = membership::refresh_deletes(map.table().max_insertions);
+
+    // Churn one key up to two removals short of the budget: the insert
+    // retakes the tombstone, so no level nears its cleanup threshold.
+    let churned = live;
+    for _ in 0..budget - 2 {
+        map.insert(churned, churned);
+        assert_eq!(map.remove(&churned), Some(churned));
+    }
+    assert_eq!(map.table().stale_membership(), budget - 2);
+
+    // The scan's removals spend the rest. No single removal runs
+    // maintenance inside a scan, so the scan's end has to.
+    map.retain(|key, _| *key >= 4);
+    let table = map.table();
+    assert!(!table.levels.iter().any(Level::needs_cleanup));
+    assert_eq!(table.stale_membership(), 0);
+    assert_eq!(map.epoch().generation, 0);
+    assert_eq!(map.len() as u64, live - 4);
 }
 
 #[test]
