@@ -243,8 +243,9 @@ const FIXED_ROUTES: usize = 2;
 /// load brings both.
 #[repr(C)]
 pub(super) struct ProbeSchedule {
-    /// `routes.as_ptr()`. Every method that may move `routes` ends in
-    /// [`Self::sync_direct`].
+    /// `routes.as_ptr()`. The routes never move: [`Self::clear`] only
+    /// shortens them, and [`Self::push`] writes into room they already
+    /// hold or panics.
     direct: *const PhiRoute,
     /// See [`entry_origin`].
     entry_origin: *mut u8,
@@ -282,13 +283,6 @@ impl ProbeSchedule {
             entry_origin,
             routes,
         }
-    }
-
-    /// Points `direct` at the routes again after a change that may have
-    /// moved them.
-    #[inline]
-    fn sync_direct(&mut self) {
-        self.direct = self.routes.as_ptr();
     }
 
     /// Byte offset from the entry origin of the entry beside control byte
@@ -345,7 +339,6 @@ impl ProbeSchedule {
     pub(super) fn clear(&mut self) {
         self.routes.truncate(1);
         self.routes.push(SENTINEL);
-        self.sync_direct();
     }
 
     /// Appends the route of logical probe `logical_probe_index` of level
@@ -353,9 +346,13 @@ impl ProbeSchedule {
     /// prefix of it. The caller appends routes in query-position order.
     pub(super) fn push<T>(&mut self, levels: &[Level<T>], level: usize, logical_probe_index: u64) {
         let sentinel = self.routes.len() - 1;
+        // Growing would move the routes away from `direct`.
+        assert!(
+            self.routes.len() < self.routes.capacity(),
+            "probe schedule outgrew its room"
+        );
         self.routes[sentinel] = PhiRoute::new(level, &levels[level], logical_probe_index);
         self.routes.push(SENTINEL);
-        self.sync_direct();
     }
 
     /// Whether every route is the one its level in `levels` gives.

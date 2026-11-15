@@ -3096,6 +3096,26 @@ fn a_scan_that_spends_the_delete_budget_refreshes_the_filter() {
 }
 
 #[test]
+#[should_panic(expected = "probe schedule outgrew its room")]
+fn schedule_push_past_its_room_panics_instead_of_moving_the_routes() {
+    let table =
+        ElasticTable::<u64, u64, FixedHashBuilder>::try_with_slots_and_reserve_fraction_and_hasher_in(
+            1_024,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+    let mut schedule = ProbeScheduleRoom::try_with_capacity(1)
+        .unwrap()
+        .schedule(&table.levels);
+    assert_eq!(schedule.route_capacity(), 1);
+    schedule.push(&table.levels, 0, 1);
+    assert!(schedule.addresses(&table.levels));
+    schedule.push(&table.levels, 0, 2);
+}
+
+#[test]
 fn removing_a_full_table_leaves_no_tombstone_for_lookups() {
     let mut map = FixedElasticHashMap::<u64, u64>::with_capacity(1_024);
     let live = map.capacity() as u64;
