@@ -528,12 +528,17 @@ impl ElasticRouteFilter<'_> {
 
 /// Widens the saturating last summary bit over every level index it stands
 /// for, so a lookup tests `1 << level` directly instead of clamping the
-/// level on each schedule step. The last bit is the summary's sign bit, so
-/// sign extension is the widening.
+/// level on each schedule step.
+///
+/// The last bit is the summary's sign bit, yet the widening is arithmetic on
+/// the zero-extended bin and not a sign extension: the shorter form hands
+/// the walk its open levels sooner, and the lookup benchmarks run slower
+/// with it.
 #[inline]
 const fn expand_level_mask(level_mask: u16) -> u64 {
-    const { assert!(ROUTE_SUMMARY_LEVELS == u16::BITS as usize) };
-    (level_mask.cast_signed() as i64).cast_unsigned()
+    let mask = level_mask as u64;
+    let saturated = mask >> (ROUTE_SUMMARY_LEVELS - 1);
+    mask | (saturated.wrapping_neg() << (ROUTE_SUMMARY_LEVELS - 1))
 }
 
 /// Maps a level index onto its route-summary bit. Levels past the summary's
