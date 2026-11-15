@@ -995,11 +995,16 @@ unsafe fn reset_metadata(membership: MembershipRegion, base: *mut u8) {
         let words = unsafe { membership.ptr::<MetadataWord>(base) };
         // SAFETY: as above, nothing else borrows the words, and a metadata
         // word is two machine words, by the assertion beside the pattern.
-        let tail =
-            unsafe { core::slice::from_raw_parts_mut(words.cast::<[u64; 2]>(), membership.words) };
+        // The tail may be uninitialized, which `MaybeUninit` allows.
+        let tail = unsafe {
+            core::slice::from_raw_parts_mut(words.cast::<MaybeUninit<[u64; 2]>>(), membership.words)
+        };
         // Rebuilt from its elements: the fill then stores a value it holds
         // in registers, which is what makes the loop a wide one.
-        tail.fill([NO_METADATA_WORDS[0], NO_METADATA_WORDS[1]]);
+        tail.fill(MaybeUninit::new([
+            NO_METADATA_WORDS[0],
+            NO_METADATA_WORDS[1],
+        ]));
     }
 }
 
