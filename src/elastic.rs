@@ -432,6 +432,15 @@ impl PreparedElasticKey {
 const _: () = assert!(mem::size_of::<PreparedElasticRoute>() == 8);
 const _: () = assert!(mem::size_of::<PreparedElasticKey>() == 16);
 
+/// Outcome of [`ElasticTable::search_schedule`].
+enum ScheduleSearch<R> {
+    Hit(R),
+    Absent,
+    /// The walk could not decide; carries the key's widened level mask for
+    /// [`ElasticTable::find_by_general_schedule`].
+    Unresolved(u32),
+}
+
 /// Both metadata answers for one prepared key, read from one word.
 #[derive(Clone, Copy)]
 struct ElasticRouteFilter {
@@ -606,10 +615,16 @@ impl BatchScheduler {
     /// `len` has left its window; the common case is two compares.
     #[inline]
     fn target(&mut self, len: usize) -> BatchTarget {
-        if len >= self.batch_end || len < self.batch_start {
+        if !self.covers(len) {
             self.sync(len);
         }
         self.cached_target()
+    }
+
+    /// The cached batch is the one a table holding `len` live entries is in.
+    #[inline]
+    fn covers(&self, len: usize) -> bool {
+        len < self.batch_end && len >= self.batch_start
     }
 
     /// The target of the cached batch, which may trail `len` until the next
@@ -1015,10 +1030,94 @@ where
 
     /// Post-lookup insert for a key known to be absent. Returns the chosen
     /// slot so the caller can borrow into it without re-probing.
+    #[inline]
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
-        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint)
+        self.insert_absent(key, value, prepared, key_fingerprint, |location| location)
+    }
+
+    /// Inserts a key known to be absent and hands its location to `finish`.
+    /// The common insert chooses its slot inline: growth, a batch change, the
+    /// general range reduction, a target without a slot, and schedule growth
+    /// all leave for out-of-line paths.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn insert_absent<R>(
+        &mut self,
+        key: K,
+        value: V,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
+        finish: impl FnOnce((usize, usize)) -> R,
+    ) -> R {
+        let Some(placement) = self.settled_placement(prepared.route.probe) else {
+            return self.insert_absent_unsettled(key, value, prepared, key_fingerprint, finish);
+        };
+        if placement.level >= self.scheduled_levels as usize
+            || placement.paper_probe > u64::from(self.scheduled_probes)
+        {
+            return self.place_unscheduled_entry(
+                key,
+                value,
+                prepared,
+                key_fingerprint,
+                placement,
+                finish,
+            );
+        }
+        finish(self.write_new_entry(
+            key,
+            value,
+            prepared,
+            key_fingerprint,
+            placement.level,
+            placement.slot,
+        ))
+    }
+
+    /// The slot the active batch gives a new key, when the table needs no
+    /// growth, the cached batch is current, and its levels reduce by shift.
+    /// `None` leaves the insert to [`Self::insert_for_vacant_entry_prepared`].
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn settled_placement(&self, probe: PreparedElasticProbe) -> Option<ExactPlacement> {
+        if self.len >= self.max_insertions || !self.scheduler.covers(self.len) {
+            return None;
+        }
+        if self.levels.first()?.index_shift == GENERAL_REDUCTION {
+            return None;
+        }
+        self.choose_slot_with(self.scheduler.cached_target(), |level, budget| {
+            // SAFETY: level zero reducing by shift means every level does.
+            unsafe { self.first_shifted_vacancy(probe, level, budget) }
+        })
+    }
+
+    #[inline(never)]
+    fn insert_absent_unsettled<R>(
+        &mut self,
+        key: K,
+        value: V,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
+        finish: impl FnOnce((usize, usize)) -> R,
+    ) -> R {
+        finish(self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn place_unscheduled_entry<R>(
+        &mut self,
+        key: K,
+        value: V,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
+        placement: ExactPlacement,
+        finish: impl FnOnce((usize, usize)) -> R,
+    ) -> R {
+        finish(self.place_new_entry(key, value, prepared, key_fingerprint, placement))
     }
 
     fn insert_for_vacant_entry_prepared(
@@ -1042,6 +1141,31 @@ where
             return self.place_new_entry(key, value, prepared, key_fingerprint, placement);
         }
         self.place_after_target_failure(key, value, prepared, key_fingerprint, target)
+    }
+
+    /// [`map::TableBackend::insert`] for a key
+    /// [`Self::search_schedule`] left unresolved.
+    #[inline(never)]
+    fn insert_unresolved(
+        &mut self,
+        key: K,
+        value: V,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
+        level_mask: u32,
+    ) -> Option<V> {
+        let found = self.find_by_general_schedule(
+            &key,
+            prepared,
+            key_fingerprint,
+            level_mask,
+            |level, slot, _| (level, slot),
+        );
+        if let Some(location) = found {
+            return Some(map::TableBackend::replace_value(self, location, value));
+        }
+        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
+        None
     }
 
     /// Places a key whose active batch target has no slot: another target,
@@ -1138,7 +1262,9 @@ where
         slot_idx: usize,
     ) -> (usize, usize) {
         {
-            let level = &mut self.levels[level_idx];
+            debug_assert!(level_idx < self.levels.len());
+            // SAFETY: callers pass a level they found a free slot in.
+            let level = unsafe { self.levels.get_unchecked_mut(level_idx) };
             // SAFETY: callers pass a free slot found within this level.
             let prev_ctrl = unsafe { level.control_at(slot_idx) };
             // SAFETY: as above; `key_fingerprint` is an occupied control byte.
@@ -1335,13 +1461,20 @@ where
     {
         let prepared = PreparedElasticKey::new(hash);
         let key_fingerprint = control::control_fingerprint(hash);
-        // `find_slot_indices_prepared` applies the same filter from the metadata
-        // word it already reads, so this path pays no separate pre-check load.
-        if let Some(location) = self.find_slot_indices_prepared(&key, prepared, key_fingerprint) {
-            return Some(self.replace_value(location, value));
+        // The search applies the filter from the metadata word it already
+        // reads, so this path pays no separate pre-check load.
+        let search = self.search_schedule(&key, prepared, key_fingerprint, |level, slot, _| {
+            (level, slot)
+        });
+        match search {
+            ScheduleSearch::Hit(location) => Some(self.replace_value(location, value)),
+            ScheduleSearch::Absent => {
+                self.insert_absent(key, value, prepared, key_fingerprint, |_| None)
+            }
+            ScheduleSearch::Unresolved(level_mask) => {
+                self.insert_unresolved(key, value, prepared, key_fingerprint, level_mask)
+            }
         }
-        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
-        None
     }
 
     fn remove(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
@@ -1665,16 +1798,29 @@ where
         probe: PreparedElasticProbe,
         target: BatchTarget,
     ) -> Option<ExactPlacement> {
-        if self.levels.is_empty() {
-            return None;
-        }
+        self.choose_slot_with(target, |level, budget| {
+            self.first_vacancy(probe, level, budget)
+        })
+    }
+
+    /// Chooses `target`'s slot for a new key. `first_vacancy(level, budget)`
+    /// yields the first free slot among `level`'s first `budget` probes and
+    /// the one-based probe that reached it.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn choose_slot_with(
+        &self,
+        target: BatchTarget,
+        first_vacancy: impl Fn(usize, u64) -> Option<(usize, u64)>,
+    ) -> Option<ExactPlacement> {
+        let uniform_vacancy = |level: usize| first_vacancy(level, *LEVEL_PROBE_LIMIT.get(level)?);
         // The paper's insertion cases, in order: Batch 0 fills level 0; then,
         // for the active pair, Case 2 (current nearly full) places in `next`,
         // Case 3 (next nearly full) in `current`, and Case 1 gives `current`
         // a bounded probe budget before falling back to `next`.
         let (level, slot, paper_probe) = match target {
             BatchTarget::Bootstrap => {
-                let (slot, paper_probe) = self.uniform_vacancy(probe, 0)?;
+                let (slot, paper_probe) = uniform_vacancy(0)?;
                 (0, slot, paper_probe)
             }
             BatchTarget::LevelPair(current) => {
@@ -1687,10 +1833,10 @@ where
                 let next_low = free_next.saturating_mul(4) <= next_level.capacity();
 
                 if current_low {
-                    let (slot, paper_probe) = self.uniform_vacancy(probe, next)?;
+                    let (slot, paper_probe) = uniform_vacancy(next)?;
                     (next, slot, paper_probe)
                 } else if next_low {
-                    let (slot, paper_probe) = self.uniform_vacancy(probe, current)?;
+                    let (slot, paper_probe) = uniform_vacancy(current)?;
                     (current, slot, paper_probe)
                 } else {
                     let budget = probe::elastic_dyadic_probe_budget(
@@ -1702,11 +1848,11 @@ where
                     .ok()?;
                     let budget = u64::try_from(budget)
                         .unwrap_or(u64::MAX)
-                        .min(LEVEL_PROBE_LIMIT[current]);
-                    if let Some((slot, probe)) = self.first_vacancy(probe, current, budget) {
+                        .min(*LEVEL_PROBE_LIMIT.get(current)?);
+                    if let Some((slot, probe)) = first_vacancy(current, budget) {
                         (current, slot, probe)
                     } else {
-                        let (slot, paper_probe) = self.uniform_vacancy(probe, next)?;
+                        let (slot, paper_probe) = uniform_vacancy(next)?;
                         (next, slot, paper_probe)
                     }
                 }
@@ -1731,24 +1877,36 @@ where
                 .floor_half_reserved(current_level.capacity())
     }
 
-    #[inline]
-    fn uniform_vacancy(&self, probe: PreparedElasticProbe, level: usize) -> Option<(usize, u64)> {
-        self.first_vacancy(probe, level, LEVEL_PROBE_LIMIT[level])
-    }
-
     /// The first free slot among `level`'s first `budget` probes, in probe
     /// order, with the one-based probe that reached it.
-    #[inline]
     fn first_vacancy(
         &self,
         probe: PreparedElasticProbe,
         level: usize,
         budget: u64,
     ) -> Option<(usize, u64)> {
-        let region = self.levels.get(level)?;
-        if region.index_shift == GENERAL_REDUCTION {
+        if self.levels.get(level)?.index_shift == GENERAL_REDUCTION {
             return self.first_vacancy_general(probe, level, budget);
         }
+        // SAFETY: the level reduces by shift.
+        unsafe { self.first_shifted_vacancy(probe, level, budget) }
+    }
+
+    /// [`Self::first_vacancy`] for a level that reduces by shift.
+    ///
+    /// # Safety
+    ///
+    /// `level`, when the table has it, must not be marked
+    /// [`GENERAL_REDUCTION`].
+    #[inline]
+    unsafe fn first_shifted_vacancy(
+        &self,
+        probe: PreparedElasticProbe,
+        level: usize,
+        budget: u64,
+    ) -> Option<(usize, u64)> {
+        let region = self.levels.get(level)?;
+        debug_assert_ne!(region.index_shift, GENERAL_REDUCTION);
         let level = u32::try_from(level).ok()?;
         for logical_index in 0..budget {
             let slot = probe::shifted_elastic_probe_index(
@@ -1756,7 +1914,8 @@ where
                 probe::elastic_counter_base(level, logical_index),
                 region.index_shift,
             );
-            // SAFETY: the shifted index maps into the level's capacity.
+            // SAFETY: the caller's shift maps the index into the level's
+            // capacity.
             if control::is_free(unsafe { region.control_at(slot) }) {
                 return Some((slot, logical_index + 1));
             }
@@ -1856,9 +2015,6 @@ where
         self.find_by_exact_schedule(key, prepared, key_fingerprint, |_level, _slot, entry| entry)
     }
 
-    /// Walks the key's candidates in schedule order while every level it
-    /// reaches reduces by shift. It calls nothing but the key comparison and
-    /// leaves through tail calls, so it keeps no stack frame.
     #[inline]
     fn find_by_exact_schedule<'a, Q, R>(
         &'a self,
@@ -1870,29 +2026,48 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
+        match self.search_schedule(key, prepared, key_fingerprint, &mut on_hit) {
+            ScheduleSearch::Hit(hit) => Some(hit),
+            ScheduleSearch::Absent => None,
+            ScheduleSearch::Unresolved(level_mask) => {
+                self.find_by_general_schedule(key, prepared, key_fingerprint, level_mask, on_hit)
+            }
+        }
+    }
+
+    /// Walks the key's candidates in schedule order while the table reduces
+    /// by shift. It calls nothing but the key comparison, so a caller that
+    /// hands [`ScheduleSearch::Unresolved`] on in tail position keeps no
+    /// stack frame.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn search_schedule<'a, Q, R>(
+        &'a self,
+        key: &Q,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
+        mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
+    ) -> ScheduleSearch<R>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
         // A key the filter never recorded was never inserted, so neither the
         // candidates nor the exceptional full scan can hold it.
         let filter = self.route_filter(prepared);
         if !filter.maybe_present {
-            return None;
+            return ScheduleSearch::Absent;
         }
         // SAFETY: the filter only passes when it has words, and those are laid
         // out for a non-zero slot count, which gives the table a level zero.
         let h11_shift = unsafe { self.levels.get_unchecked(0) }.index_shift;
         if h11_shift == GENERAL_REDUCTION {
-            return self.find_by_general_schedule(
-                key,
-                prepared,
-                key_fingerprint,
-                filter.expanded_level_mask(),
-                on_hit,
-            );
+            return ScheduleSearch::Unresolved(filter.expanded_level_mask());
         }
         let h11_slot =
             probe::shifted_elastic_probe_index(prepared.route.probe, H11_COUNTER_BASE, h11_shift);
         // SAFETY: the shifted index maps into level zero's capacity.
         if let Some(entry) = unsafe { self.entry_if_match(0, h11_slot, key_fingerprint, key) } {
-            return Some(on_hit(0, h11_slot, entry));
+            return ScheduleSearch::Hit(on_hit(0, h11_slot, entry));
         }
 
         let level_mask = filter.expanded_level_mask();
@@ -1913,19 +2088,20 @@ where
             // SAFETY: the route names a real level and the shifted index maps
             // into its capacity.
             if let Some(entry) = unsafe { self.entry_if_match(level, slot, key_fingerprint, key) } {
-                return Some(on_hit(level, slot, entry));
+                return ScheduleSearch::Hit(on_hit(level, slot, entry));
             }
         }
         if self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG != 0 {
-            self.find_by_full_scan(key, key_fingerprint, on_hit)
+            ScheduleSearch::Unresolved(level_mask)
         } else {
-            None
+            ScheduleSearch::Absent
         }
     }
 
-    /// [`Self::find_by_exact_schedule`] from the first candidate, for a key
-    /// that passed the filter in a table with a level needing the general
-    /// range reduction.
+    /// The schedule walk from the first candidate, for a key that passed the
+    /// filter and that [`Self::search_schedule`] left unresolved: the table
+    /// needs the general range reduction or placed an entry outside its
+    /// probe routes.
     #[inline(never)]
     fn find_by_general_schedule<'a, Q, R>(
         &'a self,
