@@ -654,9 +654,11 @@ pub(crate) struct BatchScheduler {
     /// table's insertion limit, or zero where [`settled_limit()`] rules a
     /// settled insert out.
     settled_limit: usize,
-    /// Live counts from `batch_start` that are inside the cached batch and
-    /// below `settled_limit`.
-    settled_span: usize,
+    /// Exclusive live-count bound of the cached batch's settled inserts: the
+    /// lower of `batch_end` and `settled_limit`, or zero once a removal took
+    /// the live count below `batch_start`. A live count under this bound is
+    /// therefore inside the cached batch.
+    settled_end: usize,
 }
 
 /// One of the paper's insertion cases, resolved against a table's levels.
@@ -692,18 +694,28 @@ impl BatchScheduler {
             batch_start: 0,
             batch_end: usize::MAX,
             settled_limit,
-            settled_span: settled_limit,
+            settled_end: settled_limit,
         };
         scheduler.reset();
         scheduler
     }
 
-    /// The cached batch is current for `len` live entries and `len` is below
-    /// the settled limit, in one compare: a `len` under `batch_start` wraps
-    /// past any span.
+    /// The cached batch is current for the table's `len` live entries and
+    /// `len` is below the settled limit. One compare, which
+    /// [`Self::note_removal`] keeps sound for a live count that falls back
+    /// under the cached batch.
     #[inline]
     fn settles(&self, len: usize) -> bool {
-        len.wrapping_sub(self.batch_start) < self.settled_span
+        len < self.settled_end
+    }
+
+    /// Records that removals left `len` live entries: a count under the
+    /// cached batch closes the settled gate until the next re-sync.
+    #[inline]
+    fn note_removal(&mut self, len: usize) {
+        if len < self.batch_start {
+            self.settled_end = 0;
+        }
     }
 
     /// [`Self::target`] on a copy, for assertions through a shared borrow.
@@ -754,10 +766,7 @@ impl BatchScheduler {
         self.current_batch_index = index;
         self.batch_start = if index == 0 { 0 } else { ends[index - 1] };
         self.batch_end = ends[index];
-        self.settled_span = self
-            .batch_end
-            .min(self.settled_limit)
-            .saturating_sub(self.batch_start);
+        self.settled_end = self.batch_end.min(self.settled_limit);
     }
 
     /// Reset batch progress after resize or clear.
@@ -1741,6 +1750,7 @@ where
             level.tombstones += 1;
         }
         self.len -= 1;
+        self.scheduler.note_removal(self.len);
         self.stale_membership += 1;
         self.epoch.note_delete();
     }

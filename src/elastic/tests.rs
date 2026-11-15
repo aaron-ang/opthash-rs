@@ -2603,6 +2603,15 @@ fn the_fold_multiplier_as_a_hash_stays_findable_and_unflagged() {
     }
 }
 
+/// The settled gate holds exactly for a live count inside the cached batch
+/// and under the insertion limit.
+fn assert_settled_gate(table: &ElasticTable<u64, u64, FixedHashBuilder>, shifted: bool) {
+    assert_eq!(
+        table.scheduler.settles(table.len),
+        shifted && table.len < table.max_insertions && table.scheduler.covers(table.len)
+    );
+}
+
 #[test]
 fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
     for (slots, shifted) in [(1_024, true), (1_000, false), (4_096, true)] {
@@ -2617,12 +2626,7 @@ fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
         assert_eq!(table.levels[0].index_shift() != GENERAL_REDUCTION, shifted);
         let mut settled_inserts = 0;
         for key in 0..table.max_insertions as u64 {
-            for len in [table.len.saturating_sub(1), table.len, table.len + 1] {
-                assert_eq!(
-                    table.scheduler.settles(len),
-                    shifted && len < table.max_insertions && table.scheduler.covers(len)
-                );
-            }
+            assert_settled_gate(&table, shifted);
             settled_inserts += usize::from(table.scheduler.settles(table.len));
             let hash = table.hash_builder.hash_one(key);
             assert_eq!(table.insert(key, key, hash), None);
@@ -2630,5 +2634,24 @@ fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
         assert!(!table.scheduler.settles(table.len));
         assert_eq!(settled_inserts > table.max_insertions / 2, shifted);
         assert_eq!(settled_inserts == 0, !shifted);
+
+        // Removals walk the live count back under the cached batch, where
+        // the gate must stay shut until an insert re-syncs the batch.
+        let full = table.max_insertions as u64;
+        let mut reopened = 0;
+        for key in 0..full {
+            let hash = table.hash_builder.hash_one(key);
+            let location = table.find_for_entry(&key, hash).ok().unwrap();
+            assert_eq!(table.remove(location), (key, key));
+            assert_settled_gate(&table, shifted);
+            if key % 7 == 0 {
+                let fresh = full + key;
+                let hash = table.hash_builder.hash_one(fresh);
+                assert_eq!(table.insert(fresh, fresh, hash), None);
+                assert_settled_gate(&table, shifted);
+                reopened += usize::from(table.scheduler.settles(table.len));
+            }
+        }
+        assert_eq!(reopened != 0, shifted);
     }
 }
