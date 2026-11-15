@@ -311,7 +311,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
             0,
             0,
             0x0000_0000_0000_0000,
-            0x0ef8_0bc3_2b4b_4b8b,
+            0x1900_49ec_e9b9_4124,
         ),
         (
             1,
@@ -321,7 +321,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
             255,
             255,
             0x3fff_ffff_ffff_ffff,
-            0xe12e_db4c_7253_f889,
+            0x0610_a668_27e7_3b4b,
         ),
         (
             u64::MAX,
@@ -329,7 +329,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
             255,
             255,
             0x4000_0000_0000_ffff,
-            0x0381_edbb_81aa_baf9,
+            0xc018_4e05_44d6_1b67,
         ),
         (
             0xd1b5_4a32_d192_ed03,
@@ -337,7 +337,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
             7,
             1,
             0x8000_0000_0000_0701,
-            0xaae3_de68_9f97_85e8,
+            0x16c9_2271_400d_9fc0,
         ),
         (
             0x0123_4567_89ab_cdef,
@@ -345,7 +345,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
             0,
             0,
             0xc000_0000_0000_0000,
-            0xf046_a747_c536_c435,
+            0xee3b_835b_d981_5793,
         ),
     ];
     for (key, domain, logical, retry, counter, word) in cases {
@@ -369,7 +369,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
     }
     assert_eq!(
         oracle.word(0, ProbeDomain::FunnelOrdinary { level: 0 }, 0, 0),
-        0xa075_8163_8770_9699
+        0x2ee5_d5a0_6f80_afe8
     );
 }
 
@@ -425,10 +425,10 @@ fn fast_funnel_retries_and_exhaustion_use_distinct_checked_counters() {
 #[test]
 #[allow(clippy::cast_possible_truncation)]
 fn fast_funnel_reducer_accepts_the_full_rejection_index_lane() {
-    const KEY: u64 = 0x55;
+    const KEY: u64 = 0x1c7;
     const LOGICAL_PROBE_INDEX: u8 = u8::MAX;
     const UPPER: usize = 2;
-    const REJECTION_THRESHOLD: u64 = 0xfef8_8af3_37e1_1307;
+    const REJECTION_THRESHOLD: u64 = 0xfe17_cfc8_112e_3a20;
     let prepared = FunnelPrf::new(0x1234_5678_9abc_def0)
         .prepare(KEY)
         .prepare_domain(ProbeDomain::FunnelSpecialPrimary)
@@ -550,4 +550,123 @@ fn ordinary_level_multipliers_are_odd_and_distinct() {
         .collect::<alloc::collections::BTreeSet<_>>();
     assert_eq!(multipliers.len() as u64, levels.end);
     assert!(multipliers.iter().all(|multiplier| multiplier % 2 == 1));
+}
+
+/// The fingerprint tells apart the keys sharing a bucket, so two keys of one
+/// bucket must share it about once in its number of values: for a mixing
+/// hasher, for the key families an identity hasher passes through unmixed,
+/// and for bucket counts on both sides of a power of two.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "counts fingerprints over hundreds of thousands of keys"
+)]
+fn fingerprints_stay_spread_within_a_bucket_for_every_key_family() {
+    use core::hash::BuildHasher;
+
+    const KEYS: u64 = 1 << 17;
+    const VALUES: usize = 128;
+    type Family = (&'static str, fn(u64) -> u64);
+    let oracle = FunnelPrf::new(FIXED_SEED);
+    let families: [Family; 5] = [
+        ("mixed", |index| {
+            crate::test_support::fixed_hasher().hash_one(index)
+        }),
+        ("sequential", |index| index),
+        ("multiplicative", |index| {
+            index.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        }),
+        ("shifted", |index| index << 32),
+        ("stepped", |index| index * VALUES as u64),
+    ];
+    for buckets in [8, 1_000, 4_096] {
+        let range = PreparedProbeRange::new(buckets).unwrap();
+        for (family, key_of) in families {
+            for level in [0, 1, 7] {
+                let multiplier = FunnelPrf::ordinary_multiplier(level).unwrap();
+                let mut counts = alloc::vec![[0_u64; VALUES]; buckets];
+                for index in 0..KEYS {
+                    let probe = oracle.prepare(key_of(index));
+                    let (bucket, _) = ordinary_funnel_first_draw(probe, multiplier, range);
+                    let fingerprint = probe.fingerprint();
+                    assert!(crate::raw::control::is_occupied(fingerprint));
+                    counts[bucket][usize::from(fingerprint) % VALUES] += 1;
+                }
+                // Pairs of keys sharing a bucket, and those of them sharing a
+                // fingerprint as well.
+                let pairs = |count: u64| count * count.saturating_sub(1) / 2;
+                let sharing_bucket: u64 =
+                    counts.iter().map(|bucket| pairs(bucket.iter().sum())).sum();
+                let sharing_both: u64 = counts.iter().flatten().copied().map(pairs).sum();
+                let even = sharing_bucket / VALUES as u64;
+                assert!(
+                    (even - even / 8..=even + even / 8).contains(&sharing_both),
+                    "{family} level {level} buckets {buckets}: {sharing_both} of {sharing_bucket}"
+                );
+            }
+        }
+    }
+}
+
+/// The bound-only acceptance answers with the exact draw's bucket whenever it
+/// answers, and leaves to the exact test every rejected word, the accepted
+/// words at or below the bound, and every word of a range with no index.
+#[test]
+fn certain_first_index_agrees_with_the_exact_draw_whenever_it_answers() {
+    // Inverse of an odd word modulo 2^64, by Newton's iteration.
+    fn inverse(odd: u64) -> u64 {
+        let mut inverse = odd;
+        for _ in 0..6 {
+            inverse = inverse.wrapping_mul(2_u64.wrapping_sub(odd.wrapping_mul(inverse)));
+        }
+        assert_eq!(odd.wrapping_mul(inverse), 1);
+        inverse
+    }
+    let multiplier = FunnelPrf::ordinary_multiplier(3).unwrap();
+    // A probe whose first word in the level is `word`.
+    let probe_drawing = |word: u64| PreparedFastFunnelProbe {
+        keyed: 0,
+        key_out: word.wrapping_mul(inverse(multiplier)),
+    };
+    let (mut certain_count, mut deferred_accepted, mut deferred_rejected) = (0, 0, 0);
+    for upper in [1_usize, 2, 3, 7, 1_000, (1 << 20) + 1, (1 << 31) - 1] {
+        let range = PreparedProbeRange::new(upper).unwrap();
+        let bound = upper as u64;
+        // Words whose low product lands on, just above, and just below the
+        // bound and the threshold, then words spread over the whole range.
+        let near = (0..=4).flat_map(|quotient: u64| {
+            // Words wrap, so the first word past each multiple of 2^64 does too.
+            #[allow(clippy::cast_possible_truncation)]
+            let wrap = (u128::from(quotient) << 64).div_ceil(u128::from(bound)) as u64;
+            (0..=4).flat_map(move |step| [wrap.wrapping_add(step), wrap.wrapping_sub(step)])
+        });
+        let spread = (0..4_096_u64).map(|index| index.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        for word in near.chain(spread) {
+            let probe = probe_drawing(word);
+            let (bucket, accepted) = ordinary_funnel_first_draw(probe, multiplier, range);
+            match ordinary_funnel_first_certain_index(probe, multiplier, range) {
+                Some(certain) => {
+                    assert!(accepted, "upper {upper} word {word:#x}");
+                    assert_eq!(certain, bucket, "upper {upper} word {word:#x}");
+                    certain_count += 1;
+                }
+                None if accepted => {
+                    assert!(word.wrapping_mul(bound) <= bound);
+                    deferred_accepted += 1;
+                }
+                None => deferred_rejected += 1,
+            }
+        }
+    }
+    assert_ne!(certain_count, 0);
+    assert_ne!(deferred_accepted, 0);
+    assert_ne!(deferred_rejected, 0);
+    for word in [0, 1, u64::MAX, 0x9E37_79B9_7F4A_7C15] {
+        let none = ordinary_funnel_first_certain_index(
+            probe_drawing(word),
+            multiplier,
+            PreparedProbeRange::rejecting(),
+        );
+        assert_eq!(none, None);
+    }
 }
