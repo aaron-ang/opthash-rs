@@ -274,19 +274,21 @@ impl<T> Level<T> {
     }
 
     /// Moves every live entry out through `visit` and resets the level to
-    /// empty. Each slot's control and `len` are updated before `visit` runs,
-    /// and tombstones are wiped only after the last entry, so a panic inside
-    /// `visit` leaves the level consistent: the entries not yet visited stay
-    /// live and counted, and the moved ones are `EMPTY`.
+    /// empty. Each moved slot becomes a counted tombstone before `visit`
+    /// runs, and controls return to `EMPTY` only after the last entry, so a
+    /// panic inside `visit` leaves the level as a run of removals would: the
+    /// entries not yet visited stay live and counted, and no `EMPTY` slot
+    /// appears ahead of one on its probe route.
     fn drain_reset(&mut self, mut visit: impl FnMut(T)) {
         let mut scan = OccupiedIndices::new();
         while let Some(slot) = scan.step(self) {
             // SAFETY: `step` yields occupied in-bounds slots; the value is
-            // moved out before the slot is marked empty.
+            // moved out before the slot is marked.
             let entry = unsafe { self.take(slot) };
             // SAFETY: `slot` is in bounds, as above.
-            unsafe { self.set_control(slot, CTRL_EMPTY) };
+            unsafe { self.mark_tombstone(slot) };
             self.len -= 1;
+            self.tombstones += 1;
             visit(entry);
         }
         self.clear_all_controls();
@@ -1102,11 +1104,6 @@ where
     }
 
     fn clear(&mut self) {
-        // Draining empties slots in slot order, so a drop that panics leaves
-        // `EMPTY` slots ahead of live entries on their probe routes. The
-        // flag keeps lookups off the walk that stops at `EMPTY` until
-        // `reset_after_clear` lifts it.
-        self.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG;
         for level in &mut self.levels {
             level.drain_reset(|entry| {
                 self.len -= 1;
@@ -2214,9 +2211,11 @@ where
                     return ScheduleSearch::Hit(on_hit(level, slot, entry));
                 }
             } else if control == CTRL_EMPTY {
-                // A key takes its level's first free probe, and a slot never
-                // returns to `EMPTY` while its level holds entries, so the
-                // key cannot sit at a later probe of this level.
+                // A key takes its level's first free probe, and a slot
+                // returns to `EMPTY` only when its whole level is reset: a
+                // removal leaves a tombstone, and so does a `clear` until its
+                // last entry is out, even one a panicking drop interrupts. So
+                // the key cannot sit at a later probe of this level.
                 open_levels &= !(1 << route.level);
                 // Either no real level is left open, or this was the
                 // sentinel.
