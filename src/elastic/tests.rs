@@ -1747,6 +1747,54 @@ fn reinsert_replaces_the_value_on_a_table_flagged_exceptional() {
 }
 
 #[test]
+fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
+    let mut hits = 0;
+    let mut filtered_misses = 0;
+    let mut walked_misses = 0;
+    for capacity in [16, 100, 1_024, 5_000] {
+        let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(capacity);
+        let budget = capacity as u64 * 7 / 8;
+        for key in 0..budget {
+            map.insert(key, key);
+        }
+        for key in (0..budget).step_by(3) {
+            map.remove(&key);
+        }
+        for key in (0..budget).step_by(6) {
+            map.insert(key, key);
+        }
+        let table = map.table();
+        for key in 0..2 * budget {
+            let hash = table.hash_builder.hash_one(key);
+            let prepared = PreparedElasticKey::new(hash);
+            let fingerprint = control::control_fingerprint(hash);
+            let scheduled = table.find_slot_indices_prepared(&key, prepared, fingerprint);
+            let scanned =
+                table.find_by_full_scan(&key, fingerprint, |level, slot, _| (level, slot));
+            assert_eq!(scheduled, scanned);
+            let filter = table.route_filter(prepared);
+            if filter.maybe_present {
+                let walked = table.find_by_general_schedule(
+                    &key,
+                    prepared,
+                    fingerprint,
+                    filter.expanded_level_mask(),
+                    |level, slot, _| (level, slot),
+                );
+                assert_eq!(scheduled, walked);
+            }
+            match (scheduled, filter.maybe_present) {
+                (Some(_), _) => hits += 1,
+                (None, true) => walked_misses += 1,
+                (None, false) => filtered_misses += 1,
+            }
+        }
+    }
+    assert!(hits > 1_000 && filtered_misses > 1_000);
+    assert!(walked_misses > 0);
+}
+
+#[test]
 fn shifted_vacancy_search_agrees_with_the_general_one() {
     let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(1_024);
     for key in 0..900 {
