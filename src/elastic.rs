@@ -1576,7 +1576,8 @@ where
         )
     }
 
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn find_value<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -1604,7 +1605,8 @@ where
         self.insert_for_vacant_entry(key, value, hash)
     }
 
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
     where
         K: Hash + Eq,
@@ -2227,7 +2229,8 @@ where
     /// Looks the key up along its schedule. The filter is tested where the
     /// caller is, so a key it rejects costs no call and derives no
     /// fingerprint.
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn find_by_exact_schedule<'a, Q, R>(
         &'a self,
         key: &Q,
@@ -2249,7 +2252,8 @@ where
 
     /// The lookup of a key that passed `filter`. Out of line so the filter
     /// test inlines alone.
-    #[inline(never)]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn find_after_filter<'a, Q, R>(
         &'a self,
         key: &Q,

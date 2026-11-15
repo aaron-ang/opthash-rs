@@ -466,6 +466,8 @@ where
     }
 
     /// Inserts `key`/`value`. Returns the previous value for `key`, if any.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let hash = self.table.hash(&key);
         self.table.insert(key, value, hash)
@@ -473,6 +475,8 @@ where
 
     /// Returns a reference to the value for `key`.
     #[must_use]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
