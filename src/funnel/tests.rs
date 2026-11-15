@@ -907,10 +907,8 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
     }
 }
 
-/// A shape without lanes gives lookups no lanes either, so none scans its
-/// buckets for first matches, and it keeps an all-absent head, which ends
-/// the insert's head walk at once. A shape with lanes copies its levels into
-/// the head and flags the lookups of a table small enough to select.
+/// Every set of recorded levels yields its head entries in level order, and
+/// the overflow bit yields none.
 #[test]
 fn recorded_head_yields_the_entry_of_every_recorded_level_shallowest_first() {
     let shape = FunnelShape::for_insert_budget(1 << 12, ReserveFraction::from_exponent(3).unwrap())
@@ -953,6 +951,10 @@ fn recorded_head_yields_the_entry_of_every_recorded_level_shallowest_first() {
     assert_eq!(level_bit_of(usize::MAX), OVERFLOW_LEVEL_BIT);
 }
 
+/// A shape without lanes gives lookups no lanes either, so none scans its
+/// buckets for first matches, and it keeps an all-absent head, which ends
+/// the insert's head walk at once. A shape with lanes copies its levels into
+/// the head and flags the lookups of a table small enough to select.
 #[test]
 fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     let (wide, smallest_wide) = smallest_wide_shape();
