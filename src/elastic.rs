@@ -734,6 +734,19 @@ impl BatchScheduler {
         }
     }
 
+    /// Counts an insert into one of `level`'s tombstones. In a level past
+    /// its cleanup threshold it also leaves no live count covered or
+    /// settled, so the next insert re-syncs off the settled path.
+    #[cold]
+    #[inline(never)]
+    fn reuse_tombstone<T>(&mut self, level: &mut Level<T>) {
+        if level.needs_cleanup() {
+            self.batch_end = 0;
+            self.settled_end = 0;
+        }
+        level.tombstones -= 1;
+    }
+
     /// [`Self::target`] on a copy, for assertions through a shared borrow.
     #[cfg(test)]
     fn target_at(&self, len: usize) -> BatchTarget {
@@ -1319,7 +1332,10 @@ where
             self.resize_with_transition(new_cap, EpochTransition::Growth);
         }
 
-        let target = self.scheduler.target(self.len);
+        if !self.scheduler.covers(self.len) {
+            self.enter_batch();
+        }
+        let target = self.scheduler.cached_target();
         if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             return self.place_new_entry(key, value, prepared, key_fingerprint, placement);
         }
@@ -1517,12 +1533,14 @@ where
                 level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
             }
             level.len += 1;
-            // A free slot that is not empty is a tombstone.
-            if prev_ctrl != CTRL_EMPTY {
-                level.tombstones -= 1;
-            }
-        };
+        }
         self.len += 1;
+        // A free slot that is not empty is a tombstone. Last, so the call
+        // sits after every store of the common path.
+        if prev_ctrl != CTRL_EMPTY {
+            // SAFETY: the caller's contract, as above.
+            self.scheduler.reuse_tombstone(unsafe { &mut *level });
+        }
     }
 
     /// Extends the schedule to cover a placement outside the scheduled levels
@@ -1786,7 +1804,9 @@ where
         // this table names an occupied in-bounds slot.
         let removed = unsafe { self.levels[level_idx].take(slot_idx) };
         self.extract_finish((level_idx, slot_idx));
-        self.settle_after_deletes(self.levels[level_idx].needs_cleanup());
+        if self.maintenance_is_due() {
+            self.maintain_after_deletes();
+        }
         (removed.key, removed.value)
     }
 
@@ -1812,7 +1832,9 @@ where
     }
 
     fn finish_deferred_removals(&mut self) {
-        self.settle_after_deletes(self.levels.iter().any(Level::needs_cleanup));
+        if self.maintenance_is_due() || self.levels.iter().any(Level::needs_cleanup) {
+            self.maintain_after_deletes();
+        }
     }
 
     type Scan = ElasticScan;
@@ -1963,15 +1985,43 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
-    /// Same-size cleanup when a level passed its tombstone threshold; otherwise
-    /// a filter refresh once departed keys passed theirs. The cleanup rebuilds
-    /// the filter too, so the two never stack.
-    fn settle_after_deletes(&mut self, needs_cleanup: bool) {
-        if needs_cleanup {
+    /// Departed keys passed [`membership::refresh_deletes`], so the deletes
+    /// since the last maintenance pay for a pass over the live entries.
+    #[inline]
+    fn maintenance_is_due(&self) -> bool {
+        self.stale_membership > membership::refresh_deletes(self.max_insertions)
+    }
+
+    /// Same-size cleanup when a level passed its tombstone threshold;
+    /// otherwise a filter refresh. The cleanup rebuilds the filter too, so
+    /// the two never stack.
+    ///
+    /// A single removal runs this only once [`Self::maintenance_is_due`], so
+    /// removals alone rebuild at most once per capacity's worth of deletes.
+    /// Tombstones cost a removal nothing and a present key's lookup nothing;
+    /// the insert that reuses one in a level past its threshold asks for the
+    /// cleanup through [`BatchScheduler::reuse_tombstone`].
+    #[cold]
+    #[inline(never)]
+    fn maintain_after_deletes(&mut self) {
+        if self.levels.iter().any(Level::needs_cleanup) {
             self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
-        } else if self.stale_membership > membership::refresh_deletes(self.max_insertions) {
+        } else {
             self.refresh_membership();
         }
+    }
+
+    /// Moves the scheduler to the batch of the live count, first cleaning up
+    /// a level past its tombstone threshold. Runs when the cached batch no
+    /// longer covers the live count, which an insert that reused a tombstone
+    /// in such a level forces.
+    #[cold]
+    #[inline(never)]
+    fn enter_batch(&mut self) {
+        if self.levels.iter().any(Level::needs_cleanup) {
+            self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
+        }
+        self.scheduler.sync(self.len);
     }
 
     /// Re-record the filter from the live entries, dropping the bits departed

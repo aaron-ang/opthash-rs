@@ -160,22 +160,66 @@ fn tombstone_cleanup_is_an_observable_same_size_epoch_boundary() {
     let capacity = fill_to_capacity!(map);
     let before = map.epoch();
 
-    let mut removed = 0;
+    // Removals leave tombstones and no rebuild behind them.
+    for key in 1..capacity {
+        assert_eq!(map.remove(&key), Some(key));
+    }
+    assert_eq!(map.epoch().generation, before.generation);
+    assert!(map.epoch().had_delete);
+
+    // The inserts that reuse them start the cleanup.
+    let mut inserted = 0;
     while map.epoch().generation == before.generation {
-        assert_eq!(map.remove(&removed), Some(removed));
-        removed += 1;
-        assert!(
-            removed < capacity,
-            "cleanup must occur before the map empties"
-        );
+        inserted += 1;
+        assert!(inserted < capacity, "cleanup must occur before the refill");
+        assert_eq!(map.insert(inserted, inserted), None);
     }
 
     let after = map.epoch();
     assert_eq!(map.capacity(), capacity);
     assert_eq!(after.generation, before.generation + 1);
     assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
+    assert!(inserted <= 2, "took {inserted} inserts");
+    for key in 0..=inserted {
+        assert_eq!(map.get(&key), Some(&key));
+    }
+    assert_eq!(map.len(), inserted + 1);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn removals_alone_clean_up_once_per_capacity_of_deletes() {
+    let mut map = ElasticHashMap::<usize, usize>::with_capacity(512);
+    let capacity = fill_to_capacity!(map);
+    let before = map.epoch();
+
+    // Churn on the last key: every insert lands on the tombstone its
+    // removal left, so the deletes count and no level passes its threshold.
+    let churned = capacity - 1;
+    let churns = capacity / 4;
+    for _ in 0..churns {
+        assert_eq!(map.remove(&churned), Some(churned));
+        assert_eq!(map.insert(churned, churned), None);
+    }
+    assert_eq!(map.epoch().generation, before.generation);
+
+    // The rebuild waits for a capacity's worth of deletes, well past the
+    // removal that took a level over its threshold.
+    let mut removed = 0;
+    while map.epoch().generation == before.generation {
+        assert_eq!(map.remove(&removed), Some(removed));
+        removed += 1;
+        assert!(
+            removed < churned,
+            "cleanup must occur before the map empties"
+        );
+    }
+    assert_eq!(removed + churns, capacity + 1);
+    let after = map.epoch();
+    assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
     assert!(!after.had_delete);
     assert_eq!(after.distinct_insertions, map.len());
+    assert_eq!(map.capacity(), capacity);
 }
 
 #[test]
