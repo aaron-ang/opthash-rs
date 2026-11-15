@@ -64,6 +64,8 @@ const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
 const _: () = assert!(u32::BITS as u64 <= probe::ELASTIC_LEVEL_LIMIT);
 const _: () = assert!(UNIFORM_SEARCH_CAP <= probe::ELASTIC_LOGICAL_LIMIT);
+// A vacancy search's end sentinel, one past the last probe, still packs.
+const _: () = assert!(UNIFORM_SEARCH_CAP < probe::ELASTIC_LOGICAL_LIMIT);
 const _: () = {
     let max_case1_logical_probes = ELASTIC_PROBE_BUDGET_C * (u32::BITS as usize - 1).pow(2);
     assert!(max_case1_logical_probes as u64 <= probe::ELASTIC_LOGICAL_LIMIT);
@@ -1894,18 +1896,22 @@ where
     ) -> Option<(usize, u64)> {
         let region = self.levels.get(level)?;
         debug_assert_ne!(region.index_shift, GENERAL_REDUCTION);
+        let index_shift = region.index_shift;
         let level = u32::try_from(level).ok()?;
-        for logical_index in 0..budget {
-            let slot = probe::shifted_elastic_probe_index(
-                probe,
-                probe::elastic_counter_base(level, logical_index),
-                region.index_shift,
-            );
+        // The counter is the loop's only induction variable; the probe
+        // number is recovered from it once, on the way out.
+        let first = probe::elastic_counter_base(level, 0);
+        let end = probe::elastic_counter_base(level, budget.min(UNIFORM_SEARCH_CAP));
+        let mut counter_base = first;
+        while counter_base != end {
+            let slot = probe::shifted_elastic_probe_index(probe, counter_base, index_shift);
             // SAFETY: the caller's shift maps the index into the level's
             // capacity.
             if control::is_free(unsafe { region.control_at(slot) }) {
+                let logical_index = probe::elastic_counter_logical(counter_base - first);
                 return Some((slot, logical_index + 1));
             }
+            counter_base += probe::ELASTIC_LOGICAL_STEP;
         }
         None
     }
