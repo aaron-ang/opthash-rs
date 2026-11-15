@@ -72,7 +72,8 @@ struct LevelShape {
 }
 
 // Declaration order is layout order: the words every operation reads are
-// adjacent at the front, and the large head array comes last.
+// adjacent at the front, the head array follows them, where an insert reaches
+// most of its entries by a short offset, and the rest comes last.
 #[repr(C)]
 #[derive(Clone, Debug)]
 struct FunnelShape {
@@ -83,6 +84,11 @@ struct FunnelShape {
     bucket_lanes: u64,
     beta: usize,
     n: usize,
+    /// The levels that own a level-bin bit, copied inline so the hot paths
+    /// index them without the pointer chase or a bounds check. Every other
+    /// entry, the last two always among them, is [`LevelShape::ABSENT`], and
+    /// so is every entry of a shape without [`Self::bucket_lanes`].
+    head: [LevelShape; HEAD_ENTRIES],
     levels: Box<[LevelShape]>,
     loglog_ceiling: usize,
     primary_offset: usize,
@@ -90,11 +96,6 @@ struct FunnelShape {
     fallback_offset: usize,
     fallback_bucket_width: usize,
     fallback_bucket_range: PreparedProbeRange,
-    /// The levels that own a level-bin bit, copied inline so the hot paths
-    /// index them without the pointer chase or a bounds check. Every other
-    /// entry, the last two always among them, is [`LevelShape::ABSENT`], and
-    /// so is every entry of a shape without [`Self::bucket_lanes`].
-    head: [LevelShape; HEAD_ENTRIES],
 }
 
 impl LevelShape {
@@ -851,8 +852,8 @@ unsafe fn first_free_in_bucket(ctrl_ptr: *const u8, start: usize, length: usize)
 /// Paper-exact Funnel hashing within each table epoch. Deletion, growth, and
 /// exceptional collision recovery are built-in dynamic-map behavior beyond
 /// the paper's fixed-size insertion model.
-// Declaration order is layout order; see [`FunnelShape`], which comes last
-// for its head array.
+// Declaration order is layout order: the words the lookup and the common
+// insert read, then [`FunnelShape`] for its head array, then the rest.
 #[repr(C)]
 pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     storage: FlatStorage<SlotEntry<K, V>>,
@@ -863,16 +864,7 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// Cached location of the membership filter tail. Lookups load one word
     /// from it before probing; see [`crate::membership`].
     membership: FilterTail,
-    hash_builder: S,
-    reserve_fraction: ReserveFraction,
-    alloc: A,
-    arena: Arena,
-    epoch: EpochState,
     exceptional_placement: bool,
-    /// Deletes since the filter last matched the live set; see
-    /// [`membership::refresh_deletes`].
-    stale_membership: usize,
-    tombstones: usize,
     /// The entry count plus [`Self::head_left`]; see [`Self::entries`].
     entries_base: usize,
     /// Inserts the head placement may still make: the insertion limit less
@@ -881,6 +873,15 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// word.
     head_left: usize,
     shape: FunnelShape,
+    hash_builder: S,
+    reserve_fraction: ReserveFraction,
+    alloc: A,
+    arena: Arena,
+    epoch: EpochState,
+    /// Deletes since the filter last matched the live set; see
+    /// [`membership::refresh_deletes`].
+    stale_membership: usize,
+    tombstones: usize,
 }
 
 // SAFETY: the table uniquely owns its arena and every `K`/`V` in it; no
