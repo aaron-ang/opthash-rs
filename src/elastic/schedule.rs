@@ -140,8 +140,10 @@ const FIXED_ROUTES: usize = 2;
 /// open in every walk and its probe reads an `EMPTY` control byte, which is
 /// where a walk stops.
 ///
-/// Every route addresses the levels the schedule was built for, and only
-/// [`ProbeScheduleRoom::schedule`] and [`Self::clone_onto`] choose them.
+/// Every route addresses a level of the slice its schedule was built for:
+/// [`ProbeScheduleRoom::schedule`], [`Self::clone_onto`] and [`Self::push`]
+/// each take that slice, and a route holds only what [`PhiRoute::new`]
+/// derives from one of its levels.
 pub(super) struct ProbeSchedule {
     /// The direct route, the pushed routes, then the sentinel. No method
     /// leaves the first or the last off, so a walk from [`Self::direct`]
@@ -184,11 +186,12 @@ impl ProbeSchedule {
         self.routes.push(SENTINEL);
     }
 
-    /// Appends the route of `level`'s logical probe `logical_probe_index`.
-    /// The caller appends routes in query-position order.
-    pub(super) fn push<T>(&mut self, level: usize, region: &Level<T>, logical_probe_index: u64) {
+    /// Appends the route of logical probe `logical_probe_index` of level
+    /// `level` of `levels`, the slice this schedule was built for or a
+    /// prefix of it. The caller appends routes in query-position order.
+    pub(super) fn push<T>(&mut self, levels: &[Level<T>], level: usize, logical_probe_index: u64) {
         let sentinel = self.routes.len() - 1;
-        self.routes[sentinel] = PhiRoute::new(level, region, logical_probe_index);
+        self.routes[sentinel] = PhiRoute::new(level, &levels[level], logical_probe_index);
         self.routes.push(SENTINEL);
     }
 

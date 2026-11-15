@@ -64,8 +64,7 @@ const ROUTE_SUMMARY_LEVELS: usize = u16::BITS as usize;
 /// positive walks every level's full schedule, so a third bit rejects enough
 /// extra misses to outweigh its cost.
 const MEMBERSHIP_BITS: usize = 3;
-/// Counter base of level zero's first probe, which lookups route ahead of
-/// the schedule.
+/// Counter base of level zero's first probe, the schedule's direct route.
 const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
 const _: () = assert!(u32::BITS as u64 <= probe::ELASTIC_LEVEL_LIMIT);
@@ -237,7 +236,7 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     scheduler: BatchScheduler,
     hash_builder: S,
     alloc: A,
-    /// [`ctrl_L0|ctrl_L1|...`][pad][`slots_L0|slots_L1|...`].
+    /// `ctrl_L0|ctrl_L1|...`, padding, then `slots_L0|slots_L1|...`.
     arena: Arena,
     epoch: EpochState,
     probe_high_water: u32,
@@ -492,34 +491,6 @@ const fn summary_level(level: usize) -> usize {
     }
 }
 
-/// Walks `level`'s probes in paper order from `from_probe`, visiting each
-/// `(paper_probe, phi)` with `phi <= position_cap` inside the uniform search
-/// cap. Level 0's first probe is skipped: the H11 fast path covers it, so no
-/// route is ever scheduled for it.
-#[cfg(test)]
-fn for_each_phi_route(
-    level: usize,
-    from_probe: u128,
-    position_cap: u128,
-    mut visit: impl FnMut(u128, u128),
-) {
-    let paper_level = level as u128 + 1;
-    let mut paper_probe = if level == 0 && from_probe == 1 {
-        2
-    } else {
-        from_probe
-    };
-    while paper_probe <= u128::from(UNIFORM_SEARCH_CAP) {
-        let phi =
-            probe::elastic_phi(paper_level, paper_probe).expect("bounded Elastic query coordinate");
-        if phi > position_cap {
-            break;
-        }
-        visit(paper_probe, phi);
-        paper_probe += 1;
-    }
-}
-
 /// Full probe-schedule length per level count, computed at compile time so
 /// construction, resize, and clone size the schedule without walking every
 /// level's probes.
@@ -594,7 +565,7 @@ pub(crate) struct BatchScheduler {
     batch_start: usize,
     /// `batch_ends[current_batch_index]`, or `usize::MAX` for an empty plan.
     batch_end: usize,
-    /// Live count below which [`ElasticTable::settled_placement`] can place: the
+    /// Live count below which [`ElasticTable::settled_slot`] can place: the
     /// table's insertion limit, or zero when its levels do not all reduce by
     /// shift.
     settled_limit: usize,
@@ -1349,7 +1320,7 @@ where
     }
 
     /// Extends the schedule to cover a placement outside the scheduled levels
-    /// or past the probes every scheduled level already holds.
+    /// or past the probes its own level already holds.
     #[cold]
     #[inline(never)]
     fn schedule_placement(&mut self, placement: ExactPlacement) {
@@ -1403,8 +1374,7 @@ where
             .filter_map(|(level, phi)| phi.map(|phi| (level, phi)))
             .min_by_key(|&(_, phi)| phi)
         {
-            let region = &mut levels[level];
-            let logical_probe_index = u64::from(region.scheduled_probes);
+            let logical_probe_index = u64::from(levels[level].scheduled_probes);
             // Level zero's first probe is the direct slot, which every
             // lookup reads before it walks the schedule.
             if level != 0 || logical_probe_index != 0 {
@@ -1413,8 +1383,9 @@ where
                         .is_ok_and(|index| index < QUERY_PROBE_LIMIT),
                     "Elastic query-probe convention exhausted"
                 );
-                self.probe_schedule.push(level, region, logical_probe_index);
+                self.probe_schedule.push(levels, level, logical_probe_index);
             }
+            let region = &mut levels[level];
             region.scheduled_probes += 1;
             next[level] = position(level, u64::from(region.scheduled_probes) + 1);
         }
@@ -2224,8 +2195,8 @@ where
                 sequence.word(route.sequence_index()),
                 route.index_shift(),
             );
-            // SAFETY: the route holds its level's control base, and the
-            // shifted index maps into that level's capacity.
+            // SAFETY: the route's shifted index maps into the control bytes
+            // it holds.
             let control = unsafe { *route.control().add(slot) };
             if control == key_fingerprint {
                 let level = route.level() as usize;

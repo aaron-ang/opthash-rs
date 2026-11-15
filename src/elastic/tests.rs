@@ -216,6 +216,101 @@ fn compact_query_counters_cover_every_supported_geometry() {
     );
 }
 
+/// Walks `level`'s probes in paper order from `from_probe`, visiting each
+/// `(paper_probe, phi)` with `phi <= position_cap` inside the uniform search
+/// cap. Level 0's first probe is skipped: it is the schedule's direct route, so
+/// no route is ever pushed for it.
+fn for_each_phi_route(
+    level: usize,
+    from_probe: u128,
+    position_cap: u128,
+    mut visit: impl FnMut(u128, u128),
+) {
+    let paper_level = level as u128 + 1;
+    let mut paper_probe = if level == 0 && from_probe == 1 {
+        2
+    } else {
+        from_probe
+    };
+    while paper_probe <= u128::from(UNIFORM_SEARCH_CAP) {
+        let phi =
+            probe::elastic_phi(paper_level, paper_probe).expect("bounded Elastic query coordinate");
+        if phi > position_cap {
+            break;
+        }
+        visit(paper_probe, phi);
+        paper_probe += 1;
+    }
+}
+
+/// `(level, logical probe)` of every route a schedule over the first
+/// `levels` levels holds at `high_water`, in position order.
+fn routes_in_position_order(levels: usize, high_water: u128) -> Vec<(usize, u128)> {
+    let mut expected = Vec::new();
+    for level in 0..levels {
+        for_each_phi_route(level, 1, high_water, |paper_probe, phi| {
+            expected.push((phi, level, paper_probe - 1));
+        });
+    }
+    expected.sort_unstable();
+    expected
+        .into_iter()
+        .map(|(_, level, logical)| (level, logical))
+        .collect()
+}
+
+#[test]
+fn query_schedule_stays_in_position_order_through_every_extension() {
+    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            4_096,
+            ReserveFraction::DEFAULT,
+            IdentityBuildHasher,
+            Global,
+        )
+        .unwrap();
+    let scheduled = |table: &ElasticTable<u64, u64, IdentityBuildHasher>| {
+        table
+            .probe_schedule
+            .routes()
+            .iter()
+            .map(|route| {
+                let (level, logical) = route.coordinates();
+                (level as usize, u128::from(logical))
+            })
+            .collect::<Vec<_>>()
+    };
+    let level_count = table.levels.len();
+    assert!(level_count >= 4);
+    let mut high_water = 0_u128;
+    let mut extensions_onto_routes = 0;
+    let mut extensions_in_place = 0;
+    while high_water < QUERY_POSITION_CAP {
+        // While a level is left, each step first brings in the next one,
+        // which rebuilds the schedule up to the high water reached so far.
+        // The steps after that extend it in place.
+        if (table.scheduled_levels as usize) < level_count {
+            table.schedule_levels_through(table.scheduled_levels as usize);
+            assert_eq!(
+                scheduled(&table),
+                routes_in_position_order(table.scheduled_levels as usize, high_water)
+            );
+        } else {
+            extensions_in_place += 1;
+        }
+        extensions_onto_routes += usize::from(!table.probe_schedule.routes().is_empty());
+        high_water = (high_water * 2 + 3).min(QUERY_POSITION_CAP);
+        table.extend_probe_schedule(high_water);
+        assert_eq!(
+            scheduled(&table),
+            routes_in_position_order(table.scheduled_levels as usize, high_water)
+        );
+        assert!(table.probe_schedule.addresses(&table.levels));
+    }
+    assert_eq!(table.scheduled_levels as usize, level_count);
+    assert!(extensions_onto_routes > 3 && extensions_in_place > 3);
+}
+
 #[test]
 fn query_schedule_never_reallocates_within_an_epoch() {
     let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
