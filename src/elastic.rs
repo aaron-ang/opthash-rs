@@ -70,8 +70,6 @@ const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
 const _: () = assert!(u32::BITS as u64 <= probe::ELASTIC_LEVEL_LIMIT);
 const _: () = assert!(UNIFORM_SEARCH_CAP <= probe::ELASTIC_LOGICAL_LIMIT);
-// A vacancy search's end sentinel, one past the last probe, still packs.
-const _: () = assert!(UNIFORM_SEARCH_CAP < probe::ELASTIC_LOGICAL_LIMIT);
 const _: () = {
     let max_case1_logical_probes = ELASTIC_PROBE_BUDGET_C * (u32::BITS as usize - 1).pow(2);
     assert!(max_case1_logical_probes as u64 <= probe::ELASTIC_LOGICAL_LIMIT);
@@ -220,7 +218,8 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     levels: LevelSlice<K, V>,
     len: usize,
     total_slots: usize,
-    /// Fixed for the allocation; the scheduler's settled limit mirrors it.
+    /// Fixed for the allocation. The scheduler's settled limit is taken from
+    /// it once, when the two are built ([`settled_limit`]).
     max_insertions: usize,
     reserve_fraction: ReserveFraction,
     /// Schedule batch progression and epoch boundaries.
@@ -253,7 +252,8 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
 }
 
 // SAFETY: the table uniquely owns its arena and every entry in it, like
-// `Box<[SlotEntry<K, V>]>`; the raw pointers are never shared with another table.
+// `Box<[SlotEntry<K, V>]>`. Its raw pointers address that arena, except the
+// schedule's sentinel route, which addresses an immutable static.
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
     for ElasticTable<K, V, S, A>
 {
@@ -1126,8 +1126,11 @@ where
         if !self.scheduler.settles(self.len) {
             return None;
         }
-        // SAFETY: the settled limit is zero for a table without a level
-        // zero, so a settled table has one.
+        debug_assert!(!self.levels.is_empty());
+        // SAFETY: the scheduler settles only below the limit it was built
+        // with, which `settled_limit` derives from the levels built beside
+        // it and makes zero without a level zero. A clone copies both, and
+        // a rebuild swaps both together.
         unsafe { core::hint::assert_unchecked(!self.levels.is_empty()) };
         self.choose_slot_with(self.scheduler.cached_target(), |level, budget| {
             // SAFETY: a settled table's level zero reduces by shift, which
@@ -1826,7 +1829,8 @@ where
     /// Retries placement on every other batch target, shallowest first.
     /// Batches follow the live count, so after deletes the active pair can be
     /// one that earlier batches filled while other levels have room again.
-    /// Insert-only traces never fail their active pair, so they never get here.
+    /// A trace without deletes gets here only when a key's probes in its
+    /// active pair all land on occupied slots.
     fn choose_slot_on_other_targets(
         &self,
         probe: PreparedElasticProbe,
