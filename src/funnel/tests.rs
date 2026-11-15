@@ -786,7 +786,11 @@ fn operation_streams_agree_with_a_model_map_under_colliding_hashes() {
         })
         .collect();
     // Buckets narrower and wider than one control group.
-    let (wide, _) = smallest_wide_shape();
+    let (wide, wide_shape) = smallest_wide_shape();
+    // The keys overfill a probe path only in a shape they outgrow, and the
+    // smallest wide shape grows with the group width. The staged test below
+    // reseeds that shape at any width.
+    let outgrown = universe.len() > wide_shape.max_insertions;
     for d in [3, wide] {
         let coverage = run_differential(
             d,
@@ -797,9 +801,11 @@ fn operation_streams_agree_with_a_model_map_under_colliding_hashes() {
         assert_eq!(coverage.wide_buckets, d == wide, "{coverage:?}");
         assert_eq!(coverage.narrow_buckets, d != wide, "{coverage:?}");
         assert!(coverage.overflow_entries, "{coverage:?}");
-        assert!(coverage.reseeds > 0, "{coverage:?}");
-        assert!(coverage.exceptional, "{coverage:?}");
-        assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
+        if d != wide || outgrown {
+            assert!(coverage.reseeds > 0, "{coverage:?}");
+            assert!(coverage.exceptional, "{coverage:?}");
+            assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
+        }
     }
 }
 
