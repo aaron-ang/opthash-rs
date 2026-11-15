@@ -190,6 +190,18 @@ fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement(
     assert_eq!(table.find_location(&absent, hash), Some(inserted));
 }
 
+/// The smallest reserve exponent whose buckets are wider than one control
+/// group on this target, with its smallest shape.
+fn smallest_wide_shape() -> (u32, FunnelShape) {
+    (3..=16)
+        .map(|d| {
+            let reserve = ReserveFraction::from_exponent(d).unwrap();
+            (d, FunnelShape::for_insert_budget(1, reserve).unwrap())
+        })
+        .find(|(_, shape)| shape.beta > GROUP_SIZE)
+        .unwrap()
+}
+
 fn raw_table(n: usize, d: u32) -> FunnelTable<u64, u64, IdentityBuildHasher> {
     let reserve = ReserveFraction::from_exponent(d).unwrap();
     FunnelTable::try_from_shape(
@@ -313,7 +325,14 @@ fn controls_and_filter(
 #[cfg_attr(miri, ignore)]
 fn frameless_insert_places_and_records_like_the_placement_walk() {
     const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
-    for (n, d) in [(344, 4), (4096, 3), (1 << 14, 3), (1_372, 6), (21_856, 10)] {
+    let (wide, wide_shape) = smallest_wide_shape();
+    for (n, d) in [
+        (344, 4),
+        (4096, 3),
+        (1 << 14, 3),
+        (wide_shape.n, wide),
+        (21_856, 10),
+    ] {
         let mut inline = raw_table(n, d);
         let mut walked = raw_table(n, d);
         let budget = inline.shape.max_insertions as u64;
@@ -345,6 +364,110 @@ fn frameless_insert_places_and_records_like_the_placement_walk() {
         }
         assert_eq!(inline.len, walked.len);
         assert_eq!(controls_and_filter(&inline), controls_and_filter(&walked));
+        // The budget is spent, so an unrecorded key grows the table first.
+        let key = (budget..2 * budget)
+            .map(|index| index.wrapping_mul(SPREAD))
+            .find(|&key| !inline.membership_gate(key).passes())
+            .unwrap();
+        assert_eq!(inline.len, inline.shape.max_insertions);
+        assert_eq!(map::TableBackend::insert(&mut inline, key, 0, key), None);
+        assert!(inline.shape.n > n, "n {n} d {d}");
+        assert!(inline.len <= inline.shape.max_insertions);
+    }
+}
+
+/// With tombstones the frameless insert stands aside: the placement walk
+/// takes a tombstone ahead of the first EMPTY lane.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn insert_reuses_tombstones_like_the_placement_walk() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    for (n, d) in [(4096, 3), (1 << 14, 3)] {
+        let mut inline = raw_table(n, d);
+        let mut walked = raw_table(n, d);
+        let budget = inline.shape.max_insertions as u64;
+        for index in 0..budget {
+            let key = index.wrapping_mul(SPREAD);
+            map::TableBackend::insert(&mut inline, key, index, key);
+            walked.insert_for_vacant_entry(key, index, key);
+        }
+        let removed = (0..budget).step_by(4);
+        for index in removed.clone() {
+            let key = index.wrapping_mul(SPREAD);
+            for table in [&mut inline, &mut walked] {
+                let slot = table.find_location(&key, key).unwrap();
+                map::TableBackend::remove(table, slot);
+            }
+        }
+        assert_eq!(inline.tombstones, removed.clone().count());
+        let mut reused_unrecorded = 0;
+        for index in (budget..).take(removed.count()) {
+            let key = index.wrapping_mul(SPREAD);
+            let unrecorded = !inline.membership_gate(key).passes();
+            let tombstones = walked.tombstones;
+            assert_eq!(
+                map::TableBackend::insert(&mut inline, key, index, key),
+                None
+            );
+            let slot = walked.insert_for_vacant_entry(key, index, key);
+            assert_eq!(
+                inline.find_location(&key, key),
+                Some(slot),
+                "n {n} d {d} index {index}"
+            );
+            reused_unrecorded += usize::from(unrecorded && walked.tombstones < tombstones);
+        }
+        assert_ne!(reused_unrecorded, 0, "n {n} d {d}");
+        assert_eq!(inline.tombstones, walked.tombstones);
+        assert_eq!(controls_and_filter(&inline), controls_and_filter(&walked));
+    }
+}
+
+/// A key placed outside its funnel records the level it landed in, not the
+/// overflow bit, so only the table's flag sends its lookup past the buckets
+/// its probe selects.
+#[test]
+fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut table = raw_table(4096, 3);
+    let level = table.shape.levels[0];
+    let buckets = level.bucket_range.upper();
+    let mut accepted_elsewhere = 0;
+    for index in 1..=32_u64 {
+        let key = index.wrapping_mul(SPREAD);
+        let probe = table.prf.prepare(key);
+        let own = probe::ordinary_funnel_first_index(probe, level.multiplier, level.bucket_range);
+        // The first lane of an untouched level-zero bucket the probe does
+        // not select.
+        let (_, slot) = (0..buckets)
+            .map(|bucket| (bucket, level.offset + bucket * table.shape.beta))
+            .find(|&(bucket, slot)| {
+                // SAFETY: a level-zero bucket starts inside the storage.
+                own != Some(bucket) && control::is_free(unsafe { table.storage.control_at(slot) })
+            })
+            .unwrap();
+        let vacancy = table.vacancy_at(slot);
+        assert_eq!(vacancy.level_bit, 1);
+        table.place_new_entry(
+            vacancy,
+            key,
+            index,
+            table.membership_slot(key),
+            control::control_fingerprint(key),
+            true,
+        );
+        accepted_elsewhere += usize::from(own.is_some());
+    }
+    assert!(table.exceptional_placement);
+    assert_ne!(accepted_elsewhere, 0);
+    for index in 1..=32_u64 {
+        let key = index.wrapping_mul(SPREAD);
+        assert_eq!(table.membership_gate(key).levels & OVERFLOW_LEVEL_BIT, 0);
+        assert_eq!(
+            map::TableBackend::find_entry(&table, &key, key).map(|entry| entry.value),
+            Some(index),
+            "index {index}"
+        );
     }
 }
 
@@ -375,6 +498,7 @@ struct DifferentialCoverage {
     rejected_first_words: bool,
     overwrites: usize,
     wide_buckets: bool,
+    narrow_buckets: bool,
 }
 
 /// Lengths, in operations, of the stretches one differential cycle runs in
@@ -414,6 +538,9 @@ fn assert_matches_model(
     use crate::map::TableBackend;
 
     assert_eq!(table.len, model.len());
+    assert!(table.len <= table.shape.max_insertions);
+    coverage.wide_buckets |= table.shape.beta > GROUP_SIZE;
+    coverage.narrow_buckets |= table.shape.n != 0 && table.shape.beta <= GROUP_SIZE;
     let mut scan = OccupiedIndices::new();
     let mut occupied = 0;
     while scan.step(&table.storage).is_some() {
@@ -447,13 +574,11 @@ fn assert_matches_model(
             Some(*value),
             "{key:?}"
         );
-        if !table.exceptional_placement {
-            assert_ne!(
-                table.membership_gate(key.hash).levels & table.level_bit(slot),
-                0,
-                "{key:?} lost its level bit"
-            );
-        }
+        assert_ne!(
+            table.membership_gate(key.hash).levels & table.level_bit(slot),
+            0,
+            "{key:?} lost its level bit"
+        );
         coverage.overflow_entries |= slot >= overflow_start;
         if let Some(level) = table.shape.levels.first() {
             coverage.rejected_first_words |= probe::ordinary_funnel_first_index(
@@ -532,8 +657,12 @@ fn run_differential(
             );
         } else if roll < insert_below {
             let value = next();
-            coverage.full_budget_inserts +=
-                usize::from(table.len == table.shape.max_insertions && !model.contains_key(&key));
+            // The first insert allocates; only a later one meets a spent budget.
+            coverage.full_budget_inserts += usize::from(
+                table.shape.max_insertions > 0
+                    && table.len == table.shape.max_insertions
+                    && !model.contains_key(&key),
+            );
             let previous = model.insert(key, value);
             coverage.overwrites += usize::from(previous.is_some());
             assert_eq!(
@@ -557,7 +686,9 @@ fn run_differential(
             // A remove adds a tombstone unless it triggered the cleanup.
             coverage.tombstone_cleanups += usize::from(table.tombstones < tombstones);
         }
-        coverage.growths += usize::from(table.shape.n > slots);
+        assert!(table.len <= table.shape.max_insertions, "step {step}");
+        // The first allocation is not a growth.
+        coverage.growths += usize::from(slots != 0 && table.shape.n > slots);
         coverage.reseeds += usize::from(table.prf != prf);
         coverage.exceptional |= table.exceptional_placement;
         if step % stream.check_every == 0 {
@@ -565,12 +696,12 @@ fn run_differential(
         }
     }
     assert_matches_model(&table, &model, universe, &mut coverage);
-    coverage.wide_buckets = table.shape.bucket_lanes == 0;
     coverage
 }
 
 fn spread_universe(len: u64) -> Vec<HashedKey> {
-    // Identity zero hashes to zero, whose first word every level rejects.
+    // Identity zero hashes to zero, whose first word a level rejects unless
+    // its bucket count is a power of two.
     (0..len)
         .map(|id| HashedKey {
             id,
@@ -589,7 +720,10 @@ fn operation_streams_agree_with_a_model_map_and_the_ordered_walk() {
             DifferentialStream::SMALL,
             0x2545_F491_4F6C_DD1D,
         );
-        assert!(!coverage.wide_buckets, "{coverage:?}");
+        assert!(
+            coverage.narrow_buckets && !coverage.wide_buckets,
+            "{coverage:?}"
+        );
         assert!(coverage.growths >= 4, "{coverage:?}");
         assert!(coverage.full_budget_inserts > 0, "{coverage:?}");
         assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
@@ -611,9 +745,20 @@ fn operation_streams_agree_with_a_model_map_in_wide_buckets() {
         clear_every: 95_003,
         check_every: 4_099,
     };
-    for (d, keys, stream) in [(6, 6_000, DifferentialStream::SMALL), (10, 80_000, large)] {
+    // The stream has to outgrow the smallest shape, which grows with the
+    // group width.
+    let (wide, wide_shape) = smallest_wide_shape();
+    let smallest = if 4 * wide_shape.max_insertions <= 6_000 {
+        (wide, 6_000, DifferentialStream::SMALL)
+    } else {
+        (wide, 80_000, large)
+    };
+    for (d, keys, stream) in [smallest, (10, 80_000, large)] {
         let coverage = run_differential(d, &spread_universe(keys), stream, 0x9E37_79B9_7F4A_7C15);
-        assert!(coverage.wide_buckets, "{coverage:?}");
+        assert!(
+            coverage.wide_buckets && !coverage.narrow_buckets,
+            "{coverage:?}"
+        );
         assert!(coverage.growths > 0, "{coverage:?}");
         assert!(coverage.full_budget_inserts > 0, "{coverage:?}");
         assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
