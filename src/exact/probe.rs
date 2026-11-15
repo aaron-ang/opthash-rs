@@ -69,11 +69,11 @@ pub(crate) struct CounterPrf {
 /// and the special arrays draw counter words.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FunnelPrf {
-    /// The seed plus [`DOMAIN_KIND_LANE`], so preparing a probe is one add
-    /// ahead of the mix.
+    /// The seed plus [`DOMAIN_KIND_LANE`]; the counter words' input lane
+    /// derives from it.
     lane_seed: u64,
-    /// [`KEY_FOLD`], held beside the seed so a probe loads the multiplier
-    /// instead of building it from immediates.
+    /// The seed's odd multiplier for the per-key fold, so a probe's only
+    /// seeded step is that multiply.
     fold: u64,
 }
 
@@ -153,27 +153,27 @@ impl FunnelPrf {
     /// Creates the deterministic Funnel counter permutation for `seed`.
     #[must_use]
     pub(crate) const fn new(seed: u64) -> Self {
-        Self {
-            lane_seed: seed.wrapping_add(DOMAIN_KIND_LANE),
-            fold: KEY_FOLD,
-        }
+        Self::from_lane_seed(seed.wrapping_add(DOMAIN_KIND_LANE))
     }
 
     /// The oracle for a seed `step` past this one.
     #[must_use]
     pub(crate) const fn reseeded(self, step: u64) -> Self {
+        Self::from_lane_seed(self.lane_seed.wrapping_add(step))
+    }
+
+    const fn from_lane_seed(lane_seed: u64) -> Self {
         Self {
-            lane_seed: self.lane_seed.wrapping_add(step),
-            fold: self.fold,
+            lane_seed,
+            fold: mix64(lane_seed ^ KEY_LANE) | 1,
         }
     }
 
     #[inline]
     pub(crate) fn prepare(self, key_hash: u64) -> PreparedFastFunnelProbe {
-        let keyed = key_hash.wrapping_add(self.lane_seed);
         PreparedFastFunnelProbe {
-            keyed,
-            key_out: folded_multiply(keyed, self.fold),
+            keyed: key_hash.wrapping_add(self.lane_seed),
+            key_out: folded_multiply(key_hash, self.fold),
         }
     }
 
@@ -927,9 +927,6 @@ pub(crate) const fn elastic_dyadic_probe_budget(
     };
     Ok(budget)
 }
-
-/// Multiplier of the per-key fold in [`FunnelPrf::prepare`].
-const KEY_FOLD: u64 = 0xbf58_476d_1ce4_e5b9;
 
 const fn mix64(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
