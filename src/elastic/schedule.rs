@@ -14,11 +14,11 @@ use crate::raw::control::CTRL_EMPTY;
 #[repr(C)]
 pub(super) struct PhiRoute {
     /// The distance of the level's bit of a closed-level set below the top
-    /// bit in the low byte, the index shift in the next and the sequence
-    /// index in the high half, so one load brings all three. Both byte
-    /// fields are below the word width: used as a shift amount, the word
-    /// itself moves the level's bit to the top, and the top bit down to the
-    /// level's.
+    /// bit in the low byte, the index shift in the next, the level in the
+    /// third and the sequence index in the high half, so one load brings
+    /// them all. The first two byte fields are below the word width: used
+    /// as a shift amount, the word itself moves the level's bit to the top,
+    /// and the top bit down to the level's.
     packed: u64,
     control: *const u8,
 }
@@ -26,12 +26,14 @@ pub(super) struct PhiRoute {
 const _: () = assert!(size_of::<PhiRoute>() <= 16);
 
 const INDEX_SHIFT_BIT: u32 = u8::BITS;
+const LEVEL_BIT: u32 = 2 * u8::BITS;
 const SEQUENCE_INDEX_BIT: u32 = u32::BITS;
 
 const fn pack(level: u8, index_shift: u8, sequence_index: u32) -> u64 {
     assert!(level <= SENTINEL_LEVEL && (index_shift as u32) < u64::BITS);
     (TOP_LEVEL_BIT - level_bit(level)) as u64
         | (index_shift as u64) << INDEX_SHIFT_BIT
+        | (level as u64) << LEVEL_BIT
         | (sequence_index as u64) << SEQUENCE_INDEX_BIT
 }
 
@@ -123,7 +125,7 @@ impl PhiRoute {
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub(super) fn level(&self) -> u8 {
-        (TOP_LEVEL_BIT - (self.packed as u8 & TOP_LEVEL_BIT)).wrapping_sub(1) & TOP_LEVEL_BIT
+        (self.packed >> LEVEL_BIT) as u8
     }
 
     /// Whether `closed_levels` holds the route's level.
