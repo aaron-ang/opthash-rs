@@ -1751,19 +1751,36 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
     let mut hits = 0;
     let mut filtered_misses = 0;
     let mut walked_misses = 0;
-    for capacity in [16, 100, 1_024, 5_000] {
-        let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(capacity);
-        let budget = capacity as u64 * 7 / 8;
+    let mut shifted_tables = 0;
+    let mut general_tables = 0;
+    for slots in [32, 128, 1_000, 2_048, 3_000, 8_192] {
+        let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                slots,
+                ReserveFraction::DEFAULT,
+                fixed_hasher(),
+                Global,
+            )
+            .unwrap();
+        if table.levels[0].index_shift == GENERAL_REDUCTION {
+            general_tables += 1;
+        } else {
+            shifted_tables += 1;
+        }
+        let budget = table.max_insertions as u64;
         for key in 0..budget {
-            map.insert(key, key);
+            let hash = table.hash_builder.hash_one(key);
+            assert_eq!(table.insert(key, key, hash), None);
         }
         for key in (0..budget).step_by(3) {
-            map.remove(&key);
+            let hash = table.hash_builder.hash_one(key);
+            let location = table.find(&key, hash).unwrap();
+            assert_eq!(table.remove(location), (key, key));
         }
         for key in (0..budget).step_by(6) {
-            map.insert(key, key);
+            let hash = table.hash_builder.hash_one(key);
+            assert_eq!(table.insert(key, key, hash), None);
         }
-        let table = map.table();
         for key in 0..2 * budget {
             let hash = table.hash_builder.hash_one(key);
             let prepared = PreparedElasticKey::new(hash);
@@ -1772,6 +1789,7 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
             let scanned =
                 table.find_by_full_scan(&key, fingerprint, |level, slot, _| (level, slot));
             assert_eq!(scheduled, scanned);
+            assert_eq!(scheduled.is_some(), key < budget && key % 6 != 3);
             let filter = table.route_filter(prepared);
             if filter.maybe_present {
                 let walked = table.find_by_general_schedule(
@@ -1790,8 +1808,8 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
             }
         }
     }
-    assert!(hits > 1_000 && filtered_misses > 1_000);
-    assert!(walked_misses > 0);
+    assert!(hits > 1_000 && filtered_misses > 1_000 && walked_misses > 0);
+    assert!(shifted_tables > 0 && general_tables > 0);
 }
 
 #[test]
@@ -2016,6 +2034,37 @@ fn all_zero_and_all_one_hashes_place_inside_their_active_pair() {
             map.insert(filler, filler);
         }
         assert_eq!(map.capacity(), limit);
+    }
+}
+
+#[test]
+fn the_fold_multiplier_as_a_hash_stays_findable_and_unflagged() {
+    const KEY: u64 = probe::ELASTIC_FOLD_MULTIPLIER;
+    for capacity in [16_usize, 256, 2_048] {
+        let mut map =
+            crate::ElasticHashMap::<u64, u64, IdentityBuildHasher>::with_capacity_and_hasher(
+                capacity,
+                IdentityBuildHasher,
+            );
+        let limit = map.capacity();
+        for filler in 1..limit as u64 {
+            let mut probed = map.clone();
+            assert_eq!(probed.insert(KEY, 1), None);
+            assert_eq!(probed.insert(KEY, 2), Some(1));
+            assert_eq!(probed.len(), map.len() + 1);
+            assert_eq!(probed.get(&KEY), Some(&2));
+            for present in 1..filler {
+                assert_eq!(probed.get(&present), Some(&present));
+            }
+            assert_eq!(
+                probed.table().probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG,
+                0
+            );
+            assert_eq!(probed.epoch().placement_recoveries, 0);
+            assert_eq!(probed.remove(&KEY), Some(2));
+            assert_eq!(probed.get(&KEY), None);
+            map.insert(filler, filler);
+        }
     }
 }
 
