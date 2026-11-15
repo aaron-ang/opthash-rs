@@ -2232,7 +2232,12 @@ fn head_vacancy_agrees_with_the_placement_walk_whenever_it_answers() {
             let key = index.wrapping_mul(SPREAD);
             let probe = table.prf.prepare(key);
             let general = table.search_vacancy(probe);
-            if let Some(head) = table.first_empty_in_head(probe) {
+            // An empty bin comes back holding the level's bit alone.
+            if let Some(head) = table.first_empty_in_head(probe, 0) {
+                let head = Vacancy {
+                    slot: head.slot,
+                    level_bit: head.bins,
+                };
                 assert_eq!(Some(head), general, "n {n} d {d} index {index}");
                 answered += 1;
             }
