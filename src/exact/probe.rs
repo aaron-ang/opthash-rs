@@ -1187,16 +1187,11 @@ pub(crate) const fn elastic_dyadic_probe_budget(
         return Err(ElasticProbeBudgetError::ZeroConstant);
     }
 
-    let quotient = level_slots / free_slots;
-    let ratio_ceiling = if level_slots.is_multiple_of(free_slots) {
-        quotient
-    } else {
-        let Some(rounded) = quotient.checked_add(1) else {
-            return Err(ElasticProbeBudgetError::Overflow);
-        };
-        rounded
-    };
-    let log_ceiling = (usize::BITS - (ratio_ceiling - 1).leading_zeros()) as usize;
+    // `k` is the least exponent with `free_slots << k >= level_slots`. The
+    // gap between the two bit lengths lines the top bits up, which makes it
+    // `k` or one short, and cannot shift `free_slots` out of the word.
+    let gap = free_slots.leading_zeros() - level_slots.leading_zeros();
+    let log_ceiling = (gap + ((free_slots << gap) < level_slots) as u32) as usize;
     let Some(log_squared) = log_ceiling.checked_mul(log_ceiling) else {
         return Err(ElasticProbeBudgetError::Overflow);
     };

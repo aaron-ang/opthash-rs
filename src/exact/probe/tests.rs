@@ -763,3 +763,47 @@ fn certain_first_index_agrees_with_the_exact_draw_whenever_it_answers() {
         assert_eq!(none, None);
     }
 }
+
+#[test]
+fn elastic_probe_budget_matches_the_ceiling_quotient_form() {
+    let by_quotient = |free: usize, level: usize, exponent: u32, c: usize| {
+        let ratio_ceiling = level.div_ceil(free);
+        let log_ceiling = (usize::BITS - (ratio_ceiling - 1).leading_zeros()) as usize;
+        c * (log_ceiling * log_ceiling).min(exponent as usize)
+    };
+    let check = |free: usize, level: usize| {
+        for exponent in [1, 3, 4, 64, u32::MAX] {
+            assert_eq!(
+                elastic_dyadic_probe_budget(free, level, exponent, 8),
+                Ok(by_quotient(free, level, exponent, 8)),
+                "free {free} of {level}"
+            );
+        }
+    };
+    for level in 1..=600_usize {
+        for free in 1..=level {
+            check(free, level);
+        }
+    }
+    for shift in [15, 31, usize::BITS - 2, usize::BITS - 1] {
+        let power = 1_usize << shift;
+        for level in [power - 1, power, power + 1, usize::MAX] {
+            for free in [
+                1,
+                2,
+                3,
+                level / 3,
+                level / 2,
+                level / 2 + 1,
+                level - 1,
+                level,
+            ] {
+                check(free, level);
+            }
+        }
+    }
+
+    assert!(elastic_dyadic_probe_budget(0, 8, 3, 8).is_err());
+    assert!(elastic_dyadic_probe_budget(9, 8, 3, 8).is_err());
+    assert!(elastic_dyadic_probe_budget(1, 8, 3, 0).is_err());
+}
