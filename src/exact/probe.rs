@@ -434,10 +434,12 @@ impl PreparedElasticProbe {
 /// Across levels, every level's words come from the same two values. Each
 /// level multiplies the stride by its own step, so a key that revisits slots
 /// in one level is not bound to in the next. The exception is a stride so
-/// small that no step carries it out of one slot: the signature equal to
-/// the fold multiplier has a zero origin and a stride of one, and probes
-/// slot zero of every level. Two keys with the same origin share every
-/// probe; that takes a collision of the fold.
+/// small that no step carries it out of one slot: an origin whose low half
+/// is zero and whose high half is small stays in slot zero of every level
+/// the stride cannot cross. The signature equal to the fold multiplier is
+/// the one such key an identity hasher reaches directly; its origin is zero
+/// and its stride one. Two keys with the same origin share every probe;
+/// that takes a collision of the fold.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ElasticProbeSequence {
     /// Word at sequence index zero, the key's level-zero first probe: both

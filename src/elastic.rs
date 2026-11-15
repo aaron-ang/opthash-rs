@@ -1375,12 +1375,7 @@ where
                         .is_ok_and(|index| index < QUERY_PROBE_LIMIT),
                     "Elastic query-probe convention exhausted"
                 );
-                self.probe_schedule.push(
-                    level,
-                    region.index_shift,
-                    logical_probe_index,
-                    region.ctrl_ptr,
-                );
+                self.probe_schedule.push(level, region, logical_probe_index);
             });
         }
         self.probe_schedule.sort_from(old_len);

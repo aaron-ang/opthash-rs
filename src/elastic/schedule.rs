@@ -3,6 +3,7 @@
 
 use alloc::vec::Vec;
 
+use super::Level;
 use crate::error::TryReserveError;
 use crate::exact::probe;
 use crate::raw::control::CTRL_EMPTY;
@@ -136,21 +137,15 @@ impl ProbeSchedule {
     /// Appends the route of `level`'s logical probe `logical_probe_index`.
     /// The schedule is out of order until [`Self::sort_from`] runs over the
     /// appended routes.
-    pub(super) fn push(
-        &mut self,
-        level: usize,
-        index_shift: u32,
-        logical_probe_index: u64,
-        control: *const u8,
-    ) {
+    pub(super) fn push<T>(&mut self, level: usize, region: &Level<T>, logical_probe_index: u64) {
         let route = PhiRoute {
             level: u8::try_from(level).expect("Elastic level count fits u8"),
-            index_shift: u8::try_from(index_shift).expect("Elastic index shift fits u8"),
+            index_shift: u8::try_from(region.index_shift).expect("Elastic index shift fits u8"),
             sequence_index: probe::elastic_sequence_index(
                 u32::try_from(level).expect("Elastic level count fits u32"),
                 logical_probe_index,
             ),
-            control,
+            control: region.ctrl_ptr,
         };
         let sentinel = self.routes.len() - 1;
         self.routes[sentinel] = route;
