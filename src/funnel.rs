@@ -2560,9 +2560,22 @@ where
     #[inline(always)]
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let probe = self.prf.prepare(key_hash);
+        let membership = self.membership_slot(key_hash);
+        // A table being rebuilt has no tombstones, so until its head
+        // placements run out an entry goes where the common insert puts an
+        // absent key.
+        if let Some(vacancy) = self.head_vacancy(probe, membership) {
+            // SAFETY: a vacancy exists only in a table with slots, so its
+            // filter has words and `membership.index` is below their count.
+            // Word and vacancy are read here, with no write between.
+            unsafe {
+                let word = *self.membership_ptr().add(membership.index);
+                self.place_in_head(entry.key, entry.value, membership, word, probe, vacancy);
+            }
+            return false;
+        }
         let key_fingerprint = probe.fingerprint();
         let (vacancy, exceptional) = self.resolve_vacancy(self.search_vacancy(probe));
-        let membership = self.membership_slot(key_hash);
         self.place_new_entry(
             vacancy,
             entry.key,

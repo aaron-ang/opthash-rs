@@ -86,9 +86,10 @@ fn vacant_paths_reuse_search_unless_growth_invalidates_it() {
             let walks = VACANCY_WALKS.with(Cell::get);
             let label = format!("{path:?} full={full} tombstone={tombstone}");
             if full {
-                // Rebuild places each old key; the new key needs its own fresh walk.
+                // Rebuild places each old key from the head walk; the new key
+                // needs its own fresh walk.
                 assert!(comparisons.load(Ordering::Relaxed) > 0, "{label}");
-                assert_eq!(walks, capacity + 1, "{label}");
+                assert_eq!(walks, 1, "{label}");
                 assert!(map.capacity() > capacity, "{label}");
             } else {
                 assert_eq!(comparisons.load(Ordering::Relaxed), 1, "{label}");
@@ -177,9 +178,10 @@ fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement(
     // rehashes them, so the walk after it finds a vacancy in the funnel.
     assert_eq!(
         VACANCY_WALKS.with(Cell::get),
-        old_len + 1,
-        "one walk per survivor, then one for the new key"
+        1,
+        "the head walk places each survivor; the new key walks afresh"
     );
+    assert_eq!(table.entries(), old_len + 1);
     assert_ne!(table.prf, old_seed);
     assert!(!table.exceptional_placement);
     assert_eq!(
@@ -366,6 +368,69 @@ fn frameless_insert_places_and_records_like_the_placement_walk() {
         assert_eq!(map::TableBackend::insert(&mut inline, key, 0, key), None);
         assert!(inline.shape.n > n, "n {n} d {d}");
         assert!(inline.entries() <= inline.shape.max_insertions);
+    }
+}
+
+/// A rebuild places each survivor where the placement walk would, in slot
+/// order, and records it the same way.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn rebuild_places_and_records_like_the_placement_walk() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let (wide, wide_shape) = smallest_wide_shape();
+    for (n, d) in [
+        (344, 4),
+        (4096, 3),
+        (1 << 14, 3),
+        (wide_shape.n, wide),
+        (21_856, 10),
+    ] {
+        let mut rebuilt = raw_table(n, d);
+        let budget = rebuilt.shape.max_insertions as u64;
+        let key_of = |index: u64| {
+            let key = index.wrapping_mul(SPREAD);
+            (key ^ (key >> 32)).wrapping_mul(SPREAD)
+        };
+        for index in 0..budget {
+            let key = key_of(index);
+            assert_eq!(
+                map::TableBackend::insert(&mut rebuilt, key, index, key),
+                None
+            );
+        }
+        // Tombstones, so the rebuild has slots to reclaim.
+        for index in (0..budget).step_by(3) {
+            let key = key_of(index);
+            let slot = rebuilt.find_location(&key, key).unwrap();
+            map::TableBackend::remove(&mut rebuilt, slot);
+        }
+        let mut survivors = Vec::new();
+        let mut scan = OccupiedIndices::new();
+        while let Some(slot) = scan.step(&rebuilt.storage) {
+            // SAFETY: `step` yields occupied in-bounds slots.
+            let entry = unsafe { rebuilt.storage.get_ref(slot) };
+            survivors.push((entry.key, entry.value));
+        }
+        rebuilt.resize_with_transition(n, EpochTransition::ExplicitResize);
+
+        let mut walked = raw_table(n, d);
+        for &(key, value) in &survivors {
+            walked.insert_for_vacant_entry(key, value, key);
+        }
+        assert_eq!(rebuilt.entries(), survivors.len(), "n {n} d {d}");
+        assert_eq!(rebuilt.head_left, walked.head_left, "n {n} d {d}");
+        assert_eq!(rebuilt.tombstones(), 0);
+        assert_eq!(
+            controls_and_filter(&rebuilt),
+            controls_and_filter(&walked),
+            "n {n} d {d}"
+        );
+        for &(key, value) in &survivors {
+            assert_eq!(
+                map::TableBackend::find_entry(&rebuilt, &key, key).map(|entry| entry.value),
+                Some(value)
+            );
+        }
     }
 }
 
