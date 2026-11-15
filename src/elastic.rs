@@ -271,39 +271,64 @@ impl<T> Level<T> {
 ///
 /// Placement uses the paper's exact level schedule and uniform per-level
 /// probes. Query positions are compressed without changing their order.
+///
+/// `repr(C)` fixes the field order, which puts words an operation reads or
+/// writes together next to each other so one paired access covers both: the
+/// fold multiplier and the schedule's direct route, the filter's word count
+/// and its first word, the placed count and the settled bound, the cached
+/// batch and the levels.
+#[repr(C)]
 pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    levels: LevelSlice<K, V>,
-    /// Live entries plus the removals the scheduler's countdown has counted,
-    /// so a removal moves the countdown alone. [`Self::live`] is the live
-    /// count.
-    placed: usize,
-    total_slots: usize,
-    /// Fixed for the allocation. The scheduler's settled limit is taken from
-    /// it once, when the two are built ([`settled_limit`]).
-    max_insertions: usize,
-    reserve_fraction: ReserveFraction,
-    /// Schedule batch progression and epoch boundaries.
-    scheduler: BatchScheduler,
-    hash_builder: S,
-    alloc: A,
     /// `ctrl_L0|ctrl_L1|...`, padding, then `slots_L0|slots_L1|...`.
     arena: Arena,
-    epoch: EpochState,
-    probe_high_water: u32,
-    /// Levels the schedule holds routes for: every level up to the deepest
-    /// one a placement of this epoch chose. A deeper level holds no entry, so
-    /// lookups have nothing to visit there.
-    scheduled_levels: u32,
-    probe_schedule: ProbeSchedule,
     /// [`probe::ELASTIC_FOLD_MULTIPLIER`], kept in the table so the hot
     /// paths load it rather than build it.
     fold_multiplier: u64,
+    probe_schedule: ProbeSchedule,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
     /// First word of the metadata tail, so the gate's address needs one load;
     /// [`NO_METADATA`] while `membership` has no words.
     metadata_words: *mut MetadataWord,
+    /// Live entries plus the removals the scheduler's countdown has counted,
+    /// so a removal moves the countdown alone. [`Self::live`] is the live
+    /// count.
+    placed: usize,
+    /// Schedule batch progression and epoch boundaries.
+    scheduler: BatchScheduler,
+    levels: LevelSlice<K, V>,
+    total_slots: usize,
+    /// Fixed for the allocation. The scheduler's settled limit is taken from
+    /// it once, when the two are built ([`settled_limit`]).
+    max_insertions: usize,
+    epoch: EpochState,
+    reserve_fraction: ReserveFraction,
+    probe_high_water: u32,
+    /// Levels the schedule holds routes for: every level up to the deepest
+    /// one a placement of this epoch chose. A deeper level holds no entry, so
+    /// lookups have nothing to visit there.
+    scheduled_levels: u32,
+    hash_builder: S,
+    alloc: A,
 }
+
+const _: () = {
+    type Table = ElasticTable<(), ()>;
+    let word = size_of::<usize>();
+    assert!(
+        mem::offset_of!(Table, probe_schedule)
+            == mem::offset_of!(Table, fold_multiplier) + size_of::<u64>()
+            && mem::offset_of!(Table, metadata_words)
+                == mem::offset_of!(Table, membership) + size_of::<MembershipRegion>()
+            && mem::offset_of!(Table, scheduler) == mem::offset_of!(Table, placed) + word
+            && mem::offset_of!(BatchScheduler, settled_end) == 0
+            && mem::offset_of!(BatchScheduler, deletes_left) == word
+            && mem::offset_of!(BatchScheduler, current_batch_index) + word
+                == size_of::<BatchScheduler>()
+            && mem::offset_of!(Table, levels)
+                == mem::offset_of!(Table, scheduler) + size_of::<BatchScheduler>()
+    );
+};
 
 // SAFETY: the table uniquely owns its arena and every entry in it, like
 // `Box<[SlotEntry<K, V>]>`. Its raw pointers address that arena, except the
@@ -660,35 +685,38 @@ fn settled_limit<T>(
 /// an insert tally.
 ///
 /// It also counts removals, in the word next to the gate a removal closes:
-/// `repr(C)` keeps the two adjacent, so a removal writes both together.
+/// `repr(C)` keeps the two adjacent, so a removal writes both together. It
+/// also keeps the gate first and the cached batch's index last, next to the
+/// table fields an insert reads with them.
 #[derive(Clone)]
 #[repr(C)]
 pub(crate) struct BatchScheduler {
-    /// Cumulative quota through each batch: the exclusive `len` bound at
-    /// which the batch ends. Zero-quota batches repeat the previous end.
-    batch_ends: Box<[usize]>,
-    current_batch_index: usize,
-    /// `batch_ends[current_batch_index - 1]`, or zero for the first batch.
-    batch_start: usize,
-    /// `batch_ends[current_batch_index]`, or `usize::MAX` for an empty plan.
-    batch_end: usize,
-    /// Live count below which [`ElasticTable::settled_level_slot`] can place: the
-    /// table's insertion limit, or zero where [`settled_limit()`] rules a
-    /// settled insert out.
-    settled_limit: usize,
-    /// Removals the table's filter still tolerates, counted down from
-    /// [`membership::refresh_deletes`]; maintenance is due once it is
-    /// negative as a signed count, so the test is its sign bit. A scan's
-    /// removals may take it further down before the scan can settle.
-    deletes_left: usize,
     /// Exclusive bound of the cached batch's settled inserts, on the table's
     /// placed count: the lower of `batch_end` and `settled_limit` plus the
     /// removals the placed count still holds, or zero since a removal or a
     /// re-sync. Every path that lowers the table's live count or changes
     /// those removals closes it through [`Self::note_removal`] or
-    /// [`Self::close`], or re-syncs the batch, and only [`Self::reopen`] raises it, so a placed count
-    /// under this bound is a live count inside the cached batch.
+    /// [`Self::close`], or re-syncs the batch, and only [`Self::reopen`]
+    /// raises it, so a placed count under this bound is a live count inside
+    /// the cached batch.
     settled_end: usize,
+    /// Removals the table's filter still tolerates, counted down from
+    /// [`membership::refresh_deletes`]; maintenance is due once it is
+    /// negative as a signed count, so the test is its sign bit. A scan's
+    /// removals may take it further down before the scan can settle.
+    deletes_left: usize,
+    /// Live count below which [`ElasticTable::settled_level_slot`] can place: the
+    /// table's insertion limit, or zero where [`settled_limit()`] rules a
+    /// settled insert out.
+    settled_limit: usize,
+    /// `batch_ends[current_batch_index - 1]`, or zero for the first batch.
+    batch_start: usize,
+    /// `batch_ends[current_batch_index]`, or `usize::MAX` for an empty plan.
+    batch_end: usize,
+    /// Cumulative quota through each batch: the exclusive `len` bound at
+    /// which the batch ends. Zero-quota batches repeat the previous end.
+    batch_ends: Box<[usize]>,
+    current_batch_index: usize,
 }
 
 /// One of the paper's insertion cases, resolved against a table's levels.
