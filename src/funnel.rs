@@ -1545,38 +1545,51 @@ where
     /// [`Self::search_vacancy`] for a table without tombstones, over the levels
     /// that own a level-bin bit: the first EMPTY lane of the walk, which is
     /// then its first free slot. `None` hands the insert to the general walk:
-    /// a rejected probe word, a bucket wider than one group, or no vacancy in
-    /// those levels.
+    /// a rejected probe word, which is every word of a shape without lanes,
+    /// or no vacancy in those levels.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn first_empty_in_head(&self, probe: PreparedFastFunnelProbe) -> Option<Vacancy> {
-        // A shape without lanes has an absent head, which ends the walk at
-        // its first entry.
-        let lanes = self.shape.bucket_lanes;
-        let ctrl_ptr = self.storage.ctrl_ptr();
-        let mut index = 0;
-        loop {
-            // SAFETY: the head's last entry is always absent and accepts no
-            // word, so the walk returns there at the latest and `index` stays
-            // below `HEAD_LEVELS`.
-            let level = unsafe { self.shape.head.get_unchecked(index) };
-            let bucket =
-                probe::ordinary_funnel_first_index(probe, level.multiplier, level.bucket_range)?;
-            let start = level.offset + bucket * self.shape.beta;
-            // SAFETY: an ordinary bucket ends at or before `n`, and the control
-            // array pads `GROUP_SIZE - 1` bytes past `n`.
-            let empty = unsafe { simd::eq_mask_group(ctrl_ptr.add(start), CTRL_EMPTY) }.0 & lanes;
-            if empty != 0 {
-                debug_assert!(index < OVERFLOW_LEVEL);
-                return Some(Vacancy {
-                    // SAFETY: `empty` is non-empty and masked with the
-                    // shape's lanes.
-                    slot: start + unsafe { lowest_lane(empty) },
-                    level_bit: 1 << index,
-                });
-            }
-            index += 1;
+        // One copy of the step per level, each with a constant index: the
+        // walk then keeps no index and checks no bound.
+        macro_rules! walk {
+            ($($index:literal)*) => {
+                const { assert!([$($index),*].len() == OVERFLOW_LEVEL) };
+                $(
+                    if let Some(vacancy) = self.first_empty_in_head_level(probe, $index).ok()? {
+                        return Some(vacancy);
+                    }
+                )*
+            };
         }
+        walk!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14);
+        None
+    }
+
+    /// One step of [`Self::first_empty_in_head`]: the first EMPTY lane of the
+    /// key's bucket in head entry `index`, if it has one. `Err` is a rejected
+    /// probe word.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn first_empty_in_head_level(
+        &self,
+        probe: PreparedFastFunnelProbe,
+        index: usize,
+    ) -> Result<Option<Vacancy>, ()> {
+        let level = &self.shape.head[index];
+        let bucket =
+            probe::ordinary_funnel_first_index(probe, level.multiplier, level.bucket_range)
+                .ok_or(())?;
+        let start = level.offset + bucket * self.shape.beta;
+        // SAFETY: an ordinary bucket ends at or before `n`, and the control
+        // array pads `GROUP_SIZE - 1` bytes past `n`.
+        let empty = unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), CTRL_EMPTY) }
+            .0
+            & self.shape.bucket_lanes;
+        Ok((empty != 0).then(|| Vacancy {
+            slot: start + (empty.trailing_zeros() / BITMASK_STRIDE) as usize,
+            level_bit: level_bit_of(index),
+        }))
     }
 
     /// Special-array leg of [`Self::search_vacancy`]: primary probes, then the
