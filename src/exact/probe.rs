@@ -378,6 +378,15 @@ pub(crate) const fn elastic_counter_base(level: u32, logical_probe_index: u64) -
     (level << ELASTIC_LEVEL_SHIFT) | ((logical_probe_index as u32) << ELASTIC_LOGICAL_SHIFT)
 }
 
+/// Distance between the counter bases of consecutive logical probes.
+pub(crate) const ELASTIC_LOGICAL_STEP: u32 = 1 << ELASTIC_LOGICAL_SHIFT;
+
+/// Logical probe index packed in a level-zero counter base.
+#[inline]
+pub(crate) const fn elastic_counter_logical(counter: u32) -> u64 {
+    (counter >> ELASTIC_LOGICAL_SHIFT) as u64
+}
+
 #[inline]
 pub(crate) const fn elastic_counter_level(counter: u32) -> u32 {
     (counter >> ELASTIC_LEVEL_SHIFT) & 0x1f
