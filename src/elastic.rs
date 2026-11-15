@@ -670,9 +670,10 @@ pub(crate) struct BatchScheduler {
     /// settled insert out.
     settled_limit: usize,
     /// Exclusive live-count bound of the cached batch's settled inserts: the
-    /// lower of `batch_end` and `settled_limit`, or zero once a removal took
-    /// the live count below `batch_start`. A live count under this bound is
-    /// therefore inside the cached batch.
+    /// lower of `batch_end` and `settled_limit`, or zero once the live count
+    /// fell below `batch_start`. Every path that lowers the table's live
+    /// count reports it through [`Self::note_removal`] or re-syncs the
+    /// batch, so a live count under this bound is inside the cached batch.
     settled_end: usize,
 }
 
@@ -1203,6 +1204,9 @@ where
         for level in &mut self.levels {
             level.drain_reset(|entry| {
                 self.len -= 1;
+                // Before the drop: one that panics leaves the table live
+                // with this count.
+                self.scheduler.note_removal(self.len);
                 drop(entry);
             });
         }

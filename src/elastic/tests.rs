@@ -2706,6 +2706,67 @@ fn settled_inserts_match_an_ordered_map_model() {
     }
 }
 
+#[test]
+fn settled_gate_follows_the_live_count_through_a_clear_that_panicked() {
+    const CAPACITY: usize = if cfg!(miri) { 120 } else { 900 };
+    let full = FixedElasticHashMap::<u64, u64>::with_capacity(CAPACITY)
+        .table()
+        .max_insertions;
+    let mut settled = 0;
+    // The drain stops with the live count in an earlier batch than the one
+    // the table filled to.
+    for panic_at in [full / 2, full - full / 8, full - 2] {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let value = || PanicOnNthDrop {
+            drops: drops.clone(),
+            panic_at,
+        };
+        let mut map = ManuallyDrop::new(FixedElasticHashMap::<u64, PanicOnNthDrop>::with_capacity(
+            CAPACITY,
+        ));
+        for key in 0..full as u64 - 1 {
+            map.insert(key, value());
+        }
+        assert!(map.table().scheduler.current_batch_index > 0);
+
+        let result = catch_unwind(AssertUnwindSafe(|| map.clear()));
+        assert!(result.is_err());
+        let table = map.table();
+        assert_eq!(table.len, full - 1 - panic_at - 1);
+        assert_eq!(
+            table.scheduler.settles(table.len),
+            table.scheduler.covers(table.len)
+        );
+
+        let follow_ups = full as u64..full as u64 + if cfg!(miri) { 20 } else { 100 };
+        for key in follow_ups {
+            let table = map.table();
+            assert_eq!(
+                table.scheduler.settles(table.len),
+                table.scheduler.covers(table.len)
+            );
+            let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
+                .route
+                .probe;
+            let general = table
+                .choose_slot_for_new_key(probe, table.scheduler.target_at(table.len))
+                .map(|placement| (placement.level, placement.slot));
+            if let Some((level, slot, _)) = table.settled_slot(probe) {
+                assert_eq!(Some((level, slot)), general);
+                settled += 1;
+            }
+            map.insert(key, value());
+            assert!(map.get(&key).is_some());
+        }
+
+        map.clear();
+        assert!(map.is_empty());
+        // SAFETY: the map is not used again.
+        unsafe { ManuallyDrop::drop(&mut map) };
+    }
+    assert!(settled > 0);
+}
+
 /// The settled gate holds exactly for a live count inside the cached batch
 /// and under the insertion limit.
 fn assert_settled_gate(table: &ElasticTable<u64, u64, FixedHashBuilder>, shifted: bool) {
