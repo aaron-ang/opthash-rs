@@ -657,6 +657,17 @@ fn assert_matches_model(
         .levels
         .get(OVERFLOW_LEVEL)
         .map_or(table.shape.primary_offset, |level| level.offset);
+    if table.shape.beta < GROUP_SIZE {
+        for slot in 0..table.shape.primary_offset {
+            // SAFETY: `slot` is below the storage capacity.
+            let control = unsafe { table.storage.control_at(slot) };
+            assert_eq!(
+                control == CTRL_PADDING,
+                slot % GROUP_SIZE >= table.shape.beta,
+                "slot {slot} holds {control:#x}"
+            );
+        }
+    }
     for (key, value) in model {
         let slot = table
             .find_location(key, key.hash)
@@ -1098,16 +1109,15 @@ fn recorded_head_yields_the_entry_of_every_recorded_level_shallowest_first() {
     assert_eq!(level_bit_of(usize::MAX), OVERFLOW_LEVEL_BIT);
 }
 
-/// A shape without lanes matches nothing in a first-match scan, and it keeps
-/// an all-absent head, which ends the insert's head walk at once. A shape
-/// with lanes copies its levels into the head.
+/// An empty shape and one with buckets wider than a group keep an all-absent
+/// head, which ends the insert's head walk at once and matches nothing in a
+/// first-match scan. Any other shape copies its levels into the head.
 #[test]
 fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     let (wide, smallest_wide) = smallest_wide_shape();
     let wide_reserve = ReserveFraction::from_exponent(wide).unwrap();
     let large_wide = FunnelShape::for_insert_budget(1 << 19, wide_reserve).unwrap();
     for shape in [FunnelShape::empty(), smallest_wide, large_wide] {
-        assert_eq!(shape.bucket_lanes, 0, "n {}", shape.n);
         assert_eq!(
             shape.head,
             [LevelShape::ABSENT; HEAD_ENTRIES],
@@ -1119,7 +1129,7 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     let narrow_reserve = ReserveFraction::from_exponent(3).unwrap();
     for budget in [1, 1 << 19] {
         let shape = FunnelShape::for_insert_budget(budget, narrow_reserve).unwrap();
-        assert_eq!(shape.bucket_lanes.count_ones() as usize, shape.beta);
+        assert!(shape.beta <= GROUP_SIZE);
         let recorded = shape.levels.len().min(OVERFLOW_LEVEL);
         assert_eq!(shape.head[..recorded], shape.levels[..recorded]);
         assert!(

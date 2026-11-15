@@ -79,17 +79,14 @@ struct LevelShape {
 #[derive(Clone, Debug)]
 struct FunnelShape {
     max_insertions: usize,
-    /// One bit per lane of a bucket, selecting its lanes from a group's
-    /// EMPTY controls, which its padding lanes are too. Zero when a bucket
-    /// is wider than one group, or the shape is empty: such a table has no
-    /// head level to place in or to scan for first matches.
-    bucket_lanes: u64,
     beta: usize,
     n: usize,
     /// The levels that own a level-bin bit, copied inline so the hot paths
     /// index them without the pointer chase or a bounds check. Every other
     /// entry, the last two always among them, is [`LevelShape::ABSENT`], and
-    /// so is every entry of a shape without [`Self::bucket_lanes`].
+    /// so is every entry of an empty shape or of one whose buckets are wider
+    /// than a group: such a table has no head level to place in or to scan
+    /// for first matches.
     head: [LevelShape; HEAD_ENTRIES],
     levels: Box<[LevelShape]>,
     loglog_ceiling: usize,
@@ -100,8 +97,8 @@ struct FunnelShape {
     fallback_bucket_range: PreparedProbeRange,
     /// Slots between the starts of two buckets of an ordinary level. A
     /// bucket no wider than a group is padded to one, so a group read at its
-    /// start covers no other bucket; the padding lanes stay EMPTY and hold
-    /// no entry.
+    /// start covers no other bucket; the padding lanes hold
+    /// [`CTRL_PADDING`] and no entry.
     stride: usize,
     /// Slots of the storage, padding lanes included; `n` counts the rest.
     slots: usize,
@@ -175,7 +172,6 @@ impl FunnelShape {
             fallback_offset: 0,
             fallback_bucket_width: 0,
             fallback_bucket_range: PreparedProbeRange::empty(),
-            bucket_lanes: 0,
             stride: 0,
             slots: 0,
         }
@@ -195,6 +191,27 @@ impl FunnelShape {
 
     fn from_slots(n: usize, reserve: ReserveFraction) -> Result<Self, TryReserveError> {
         Self::try_from_slots(n, reserve).map_err(TryReserveError::from)
+    }
+
+    /// Writes [`CTRL_PADDING`] to the padding lanes of every ordinary bucket
+    /// and EMPTY to its other lanes.
+    ///
+    /// # Safety
+    ///
+    /// `ctrl_ptr` must be writable for `self.slots` bytes, none of them the
+    /// control of an initialized entry.
+    unsafe fn reset_ordinary_controls(&self, ctrl_ptr: *mut u8) {
+        if self.beta >= GROUP_SIZE {
+            return;
+        }
+        let mut bucket = [CTRL_EMPTY; GROUP_SIZE];
+        bucket[self.beta..].fill(CTRL_PADDING);
+        for start in (0..self.primary_offset).step_by(GROUP_SIZE) {
+            // SAFETY: a bucket narrower than a group has a stride of one
+            // group, so the ordinary levels are whole groups below
+            // `primary_offset`, itself at most `slots`.
+            unsafe { ctrl_ptr.add(start).cast::<[u8; GROUP_SIZE]>().write(bucket) };
+        }
     }
 
     fn try_from_slots(n: usize, reserve: ReserveFraction) -> Result<Self, ShapeError> {
@@ -248,9 +265,8 @@ impl FunnelShape {
         }
         let loglog_ceiling =
             u8::try_from(plan.loglog_ceiling()).map_err(|_| ShapeError::Infeasible)?;
-        let bucket_lanes = bucket_lanes(plan.beta());
         let mut head = [LevelShape::ABSENT; HEAD_ENTRIES];
-        if bucket_lanes != 0 {
+        if plan.beta() <= GROUP_SIZE {
             for (slot, level) in head.iter_mut().zip(levels.iter().take(OVERFLOW_LEVEL)) {
                 *slot = *level;
             }
@@ -268,7 +284,6 @@ impl FunnelShape {
             fallback_bucket_width: plan.fallback_bucket_width(),
             fallback_bucket_range: PreparedProbeRange::new(plan.fallback_bucket_count())
                 .map_err(|_| ShapeError::Infeasible)?,
-            bucket_lanes,
             stride,
             slots,
         })
@@ -333,21 +348,23 @@ impl From<ShapeError> for TryReserveError {
     }
 }
 
-/// See [`FunnelShape::bucket_lanes`].
-const fn bucket_lanes(beta: usize) -> u64 {
-    if beta > GROUP_SIZE {
-        return 0;
-    }
-    // One bit per lane, which every group mask sets for a matching lane. A
-    // set of matches is then walked by clearing its lowest bit.
+/// Control byte of a bucket's padding lanes. It is free, so no scan takes it
+/// for an entry, and it is not EMPTY, so the EMPTY controls of a bucket's
+/// group are lanes of the bucket.
+const CTRL_PADDING: u8 = 0x02;
+const _: () = assert!(CTRL_PADDING != CTRL_EMPTY && CTRL_PADDING != CTRL_TOMBSTONE);
+
+/// One bit per lane of a group, which every group mask sets for a matching
+/// lane. A set of matches is then walked by clearing its lowest bit.
+const GROUP_LANES: u64 = {
     let mut lanes = 0;
     let mut lane = 0;
-    while lane < beta {
+    while lane < GROUP_SIZE {
         lanes |= 1 << (lane * BITMASK_STRIDE as usize + BITMASK_SLOT_BIT as usize);
         lane += 1;
     }
     lanes
-}
+};
 
 /// Marks the path that calls it as rarely taken, so the paths around it are
 /// laid out to fall through.
@@ -361,7 +378,7 @@ const fn rarely_taken() {}
 ///
 /// `matches` must be non-empty, with its lowest set bit at
 /// `BITMASK_SLOT_BIT` of its stride, as a group mask's is and as a subset
-/// of a [`bucket_lanes`] mask's is.
+/// of [`GROUP_LANES`] is.
 #[inline]
 // The stride is one where a group mask holds one bit per slot.
 #[allow(clippy::modulo_one)]
@@ -391,7 +408,8 @@ unsafe impl<T: Sync> Sync for FlatStorage<T> {}
 // `funnel_layout` with at least `capacity` ctrl bytes (plus group padding) and
 // `capacity` slots, whose ctrl bytes `try_allocate_with_ctrl_zeroed` starts
 // EMPTY, and is re-stamped before that arena is freed. The `GROUP_SIZE - 1`
-// padding bytes are zeroed with the rest and never stamped, so they stay EMPTY.
+// padding bytes are zeroed with the rest and never stamped, so they stay EMPTY;
+// a bucket's padding lanes hold `CTRL_PADDING`, which is not occupied either.
 unsafe impl<T> ArenaSlots<T> for FlatStorage<T> {
     const PADDED_TAIL: bool = true;
 
@@ -576,6 +594,8 @@ fn try_allocate_storage<K, V, A: Allocator>(
     // "nothing recorded".
     // SAFETY: `shape.membership` was laid out for this arena by `funnel_layout`.
     unsafe { shape.membership.clear::<MetadataWord>(arena.as_ptr()) };
+    // SAFETY: the arena holds `geometry.slots` control bytes and no entry.
+    unsafe { geometry.reset_ordinary_controls(arena.as_ptr()) };
     let storage = FlatStorage {
         ctrl_ptr: arena.as_ptr(),
         // SAFETY: `data_offset` is the data section's offset within this
@@ -1428,8 +1448,8 @@ where
             // before `slots`, and the control array pads `GROUP_SIZE - 1`
             // bytes past them. An absent head entry has no buckets and
             // draws slot zero, which every shape that recorded a level has.
-            // The group is the whole bucket: its padding lanes are EMPTY,
-            // which no fingerprint matches.
+            // The group is the whole bucket: no fingerprint matches its
+            // padding lanes.
             let matches =
                 unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), key_fingerprint) };
             (start, matches.0)
@@ -1479,7 +1499,7 @@ where
                 }
                 // Another key shares the fingerprint.
                 rarely_taken();
-                matches &= const { bucket_lanes(GROUP_SIZE) };
+                matches &= GROUP_LANES;
                 matches &= matches - 1;
             }
             if pending == 0 {
@@ -1725,10 +1745,11 @@ where
         let bins = *bins;
         let start = level.offset + bucket * GROUP_SIZE;
         // SAFETY: an ordinary bucket ends at or before `slots`, and the control
-        // array pads `GROUP_SIZE - 1` bytes past them.
-        let empty = unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), CTRL_EMPTY) }
-            .0
-            & self.shape.bucket_lanes;
+        // array pads `GROUP_SIZE - 1` bytes past them. The padding lanes are
+        // not EMPTY, so every EMPTY control of the group is a lane of the
+        // bucket.
+        let empty =
+            unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), CTRL_EMPTY) }.0;
         Ok((empty != 0).then(|| HeadVacancy {
             slot: start + (empty.trailing_zeros() / BITMASK_STRIDE) as usize,
             bins: bins | level_bit_of(index),
@@ -2945,6 +2966,9 @@ where
 
     fn wipe_all(&mut self) {
         self.storage.clear_all_controls();
+        // SAFETY: the storage holds `shape.slots` control bytes, and every
+        // entry was dropped.
+        unsafe { self.shape.reset_ordinary_controls(self.storage.ctrl_ptr()) };
         self.settle_counts();
         self.tombstones = 0;
         self.set_entries(0);
