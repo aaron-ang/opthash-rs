@@ -307,13 +307,15 @@ fn controls_and_filter(
     (controls, filter)
 }
 
+/// The reference side inserts through the vacant-entry placement walk, which
+/// shares no lookup or vacancy code with the frameless insert.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn frameless_insert_places_and_records_like_the_general_insert() {
+fn frameless_insert_places_and_records_like_the_placement_walk() {
     const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
-    for (n, d) in [(344, 4), (4096, 3), (1 << 14, 3)] {
+    for (n, d) in [(344, 4), (4096, 3), (1 << 14, 3), (1_372, 6), (21_856, 10)] {
         let mut inline = raw_table(n, d);
-        let mut general = raw_table(n, d);
+        let mut walked = raw_table(n, d);
         let budget = inline.shape.max_insertions as u64;
         for index in 0..budget {
             let key = index.wrapping_mul(SPREAD);
@@ -321,24 +323,326 @@ fn frameless_insert_places_and_records_like_the_general_insert() {
                 map::TableBackend::insert(&mut inline, key, index, key),
                 None
             );
-            assert_eq!(general.insert_general(key, index, key), None);
-        }
-        assert_eq!(inline.len, general.len);
-        assert_eq!(controls_and_filter(&inline), controls_and_filter(&general));
-        for index in 0..budget {
-            let key = index.wrapping_mul(SPREAD);
+            let slot = walked.insert_for_vacant_entry(key, index, key);
             assert_eq!(
                 inline.find_location(&key, key),
-                general.find_location(&key, key),
+                Some(slot),
                 "n {n} d {d} index {index}"
             );
+        }
+        assert_eq!(inline.len, walked.len);
+        assert_eq!(controls_and_filter(&inline), controls_and_filter(&walked));
+        for index in 0..budget {
+            let key = index.wrapping_mul(SPREAD);
             assert_eq!(
                 map::TableBackend::insert(&mut inline, key, index + 1, key),
                 Some(index)
             );
+            assert_eq!(
+                map::TableBackend::find_entry(&inline, &key, key).map(|entry| entry.value),
+                Some(index + 1)
+            );
         }
-        assert_eq!(inline.len, general.len);
+        assert_eq!(inline.len, walked.len);
+        assert_eq!(controls_and_filter(&inline), controls_and_filter(&walked));
     }
+}
+
+/// A key whose hash the test chooses, so several keys can share one.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct HashedKey {
+    id: u64,
+    hash: u64,
+}
+
+impl core::hash::Hash for HashedKey {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+/// What a differential run met, so each fixture can prove its coverage.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Default)]
+struct DifferentialCoverage {
+    growths: usize,
+    full_budget_inserts: usize,
+    tombstone_cleanups: usize,
+    clears: usize,
+    reseeds: usize,
+    exceptional: bool,
+    overflow_entries: bool,
+    rejected_first_words: bool,
+    overwrites: usize,
+    wide_buckets: bool,
+}
+
+/// Lengths, in operations, of the stretches one differential cycle runs in
+/// order, and how often the table is checked against the model.
+#[derive(Clone, Copy)]
+struct DifferentialStream {
+    operations: usize,
+    filling: usize,
+    mixed: usize,
+    draining: usize,
+    clear_every: usize,
+    check_every: usize,
+}
+
+impl DifferentialStream {
+    const SMALL: Self = Self {
+        operations: 60_000,
+        filling: 4_096,
+        mixed: 2_048,
+        draining: 6_144,
+        clear_every: 9_973,
+        check_every: 251,
+    };
+}
+
+type DifferentialTable = FunnelTable<HashedKey, u64, IdentityBuildHasher>;
+
+/// Every model entry is found where the ordered walk finds it, with the
+/// model's value, under a filter that records it; the table holds nothing
+/// else.
+fn assert_matches_model(
+    table: &DifferentialTable,
+    model: &alloc::collections::BTreeMap<HashedKey, u64>,
+    absent: &[HashedKey],
+    coverage: &mut DifferentialCoverage,
+) {
+    use crate::map::TableBackend;
+
+    assert_eq!(table.len, model.len());
+    let mut scan = OccupiedIndices::new();
+    let mut occupied = 0;
+    while scan.step(&table.storage).is_some() {
+        occupied += 1;
+    }
+    assert_eq!(occupied, model.len());
+    // The ordered walk over every level the shape has, and the special
+    // arrays behind the overflow bit.
+    let every_level = if table.shape.n == 0 {
+        0
+    } else {
+        (0..table.shape.levels.len())
+            .fold(OVERFLOW_LEVEL_BIT, |bits, level| bits | level_bit_of(level))
+    };
+    let overflow_start = table
+        .shape
+        .levels
+        .get(OVERFLOW_LEVEL)
+        .map_or(table.shape.primary_offset, |level| level.offset);
+    for (key, value) in model {
+        let slot = table
+            .find_location(key, key.hash)
+            .unwrap_or_else(|| panic!("lost {key:?}"));
+        assert_eq!(
+            table.find_location_by_walk(key, key.hash, every_level),
+            Some(slot),
+            "{key:?}"
+        );
+        assert_eq!(
+            table.find_entry(key, key.hash).map(|entry| entry.value),
+            Some(*value),
+            "{key:?}"
+        );
+        if !table.exceptional_placement {
+            assert_ne!(
+                table.membership_gate(key.hash).levels & table.level_bit(slot),
+                0,
+                "{key:?} lost its level bit"
+            );
+        }
+        coverage.overflow_entries |= slot >= overflow_start;
+        if let Some(level) = table.shape.levels.first() {
+            coverage.rejected_first_words |= probe::ordinary_funnel_first_index(
+                table.prf.prepare(key.hash),
+                level.multiplier,
+                level.bucket_range,
+            )
+            .is_none();
+        }
+    }
+    for key in absent {
+        if !model.contains_key(key) {
+            assert_eq!(table.find_location(key, key.hash), None, "{key:?}");
+            assert_eq!(
+                table.find_location_by_walk(key, key.hash, every_level),
+                None,
+                "{key:?}"
+            );
+        }
+    }
+}
+
+/// Runs a fixed pseudo-random insert, overwrite, remove, lookup and clear
+/// stream against a model map, starting from a table with no storage.
+fn run_differential(
+    d: u32,
+    universe: &[HashedKey],
+    stream: DifferentialStream,
+    seed: u64,
+) -> DifferentialCoverage {
+    use crate::map::TableBackend;
+
+    let reserve = ReserveFraction::from_exponent(d).unwrap();
+    let mut table = DifferentialTable::with_capacity_and_reserve_and_hasher_in(
+        0,
+        reserve,
+        IdentityBuildHasher,
+        Global,
+    );
+    assert_eq!(table.shape.n, 0);
+    let mut model = alloc::collections::BTreeMap::new();
+    let mut coverage = DifferentialCoverage::default();
+    let mut state = seed;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    assert_matches_model(&table, &model, universe, &mut coverage);
+    let cycle = stream.filling + stream.mixed + stream.draining;
+    for step in 0..stream.operations {
+        // A filling stretch meets the insertion budget and growth, a mixed
+        // one reuses tombstones, and a draining one removes only live keys,
+        // so tombstones pass the cleanup threshold.
+        let (insert_below, draining) = match step % cycle {
+            at if at < stream.filling => (85, false),
+            at if at < stream.filling + stream.mixed => (50, false),
+            _ => (2, true),
+        };
+        let drawn = universe[usize::try_from(next() % universe.len() as u64).unwrap()];
+        let key = if draining {
+            model.range(drawn..).next().map_or(drawn, |(key, _)| *key)
+        } else {
+            drawn
+        };
+        let roll = next() % 100;
+        let slots = table.shape.n;
+        let tombstones = table.tombstones;
+        let prf = table.prf;
+        if roll < 2 {
+            assert_eq!(
+                table.find_entry(&key, key.hash).map(|entry| entry.value),
+                model.get(&key).copied(),
+                "step {step} get {key:?}"
+            );
+        } else if roll < insert_below {
+            let value = next();
+            coverage.full_budget_inserts +=
+                usize::from(table.len == table.shape.max_insertions && !model.contains_key(&key));
+            let previous = model.insert(key, value);
+            coverage.overwrites += usize::from(previous.is_some());
+            assert_eq!(
+                table.insert(key, value, key.hash),
+                previous,
+                "step {step} insert {key:?}"
+            );
+        } else if step % stream.clear_every == stream.clear_every - 1 {
+            table.clear();
+            model.clear();
+            coverage.clears += 1;
+        } else {
+            let removed = table
+                .find(&key, key.hash)
+                .map(|location| table.remove(location));
+            assert_eq!(
+                removed,
+                model.remove(&key).map(|value| (key, value)),
+                "step {step} remove {key:?}"
+            );
+            // A remove adds a tombstone unless it triggered the cleanup.
+            coverage.tombstone_cleanups += usize::from(table.tombstones < tombstones);
+        }
+        coverage.growths += usize::from(table.shape.n > slots);
+        coverage.reseeds += usize::from(table.prf != prf);
+        coverage.exceptional |= table.exceptional_placement;
+        if step % stream.check_every == 0 {
+            assert_matches_model(&table, &model, universe, &mut coverage);
+        }
+    }
+    assert_matches_model(&table, &model, universe, &mut coverage);
+    coverage.wide_buckets = table.shape.bucket_lanes == 0;
+    coverage
+}
+
+fn spread_universe(len: u64) -> Vec<HashedKey> {
+    // Identity zero hashes to zero, whose first word every level rejects.
+    (0..len)
+        .map(|id| HashedKey {
+            id,
+            hash: id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        })
+        .collect()
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn operation_streams_agree_with_a_model_map_and_the_ordered_walk() {
+    for d in [3, 4] {
+        let coverage = run_differential(
+            d,
+            &spread_universe(6_000),
+            DifferentialStream::SMALL,
+            0x2545_F491_4F6C_DD1D,
+        );
+        assert!(!coverage.wide_buckets, "{coverage:?}");
+        assert!(coverage.growths >= 4, "{coverage:?}");
+        assert!(coverage.full_budget_inserts > 0, "{coverage:?}");
+        assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
+        assert!(coverage.clears > 0, "{coverage:?}");
+        assert!(coverage.overwrites > 0, "{coverage:?}");
+        assert!(coverage.rejected_first_words, "{coverage:?}");
+        assert!(!coverage.exceptional, "{coverage:?}");
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn operation_streams_agree_with_a_model_map_in_wide_buckets() {
+    let large = DifferentialStream {
+        operations: 200_000,
+        filling: 60_000,
+        mixed: 2_000,
+        draining: 30_000,
+        clear_every: 95_003,
+        check_every: 4_099,
+    };
+    for (d, keys, stream) in [(6, 6_000, DifferentialStream::SMALL), (10, 80_000, large)] {
+        let coverage = run_differential(d, &spread_universe(keys), stream, 0x9E37_79B9_7F4A_7C15);
+        assert!(coverage.wide_buckets, "{coverage:?}");
+        assert!(coverage.growths > 0, "{coverage:?}");
+        assert!(coverage.full_budget_inserts > 0, "{coverage:?}");
+        assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
+        assert!(coverage.overwrites > 0, "{coverage:?}");
+    }
+}
+
+/// A few hashes shared by many keys overfill one probe path, which forces
+/// the special arrays, a reseeding rebuild, and placements outside the
+/// funnel.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn operation_streams_agree_with_a_model_map_under_colliding_hashes() {
+    let universe: Vec<HashedKey> = (0..900_u64)
+        .map(|id| HashedKey {
+            id,
+            hash: (id % 3 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        })
+        .collect();
+    let coverage = run_differential(
+        3,
+        &universe,
+        DifferentialStream::SMALL,
+        0xD1B5_4A32_D192_ED03,
+    );
+    assert!(coverage.overflow_entries, "{coverage:?}");
+    assert!(coverage.reseeds > 0, "{coverage:?}");
+    assert!(coverage.exceptional, "{coverage:?}");
+    assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
 }
 
 #[test]
