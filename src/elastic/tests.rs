@@ -2137,7 +2137,8 @@ fn lookup_and_insert_paths_hold_on_every_small_table_shape() {
         .unwrap();
         assert_holds(&table, |_| false, 0);
         // Twice the budget takes the table through a growth.
-        let keys = 2 * table.max_insertions.max(8) as u64;
+        let budget = table.max_insertions;
+        let keys = 2 * budget.max(8) as u64;
         for key in 0..keys {
             match table.levels.first().map(Level::index_shift) {
                 Some(GENERAL_REDUCTION) => general_tables += 1,
@@ -2150,6 +2151,7 @@ fn lookup_and_insert_paths_hold_on_every_small_table_shape() {
             assert_eq!(table.insert(key, key, hash), None);
             assert_eq!(table.insert(key, key, hash), Some(key));
         }
+        assert!(table.max_insertions > budget, "slots {slots}");
         assert_holds(&table, |key| key < keys, keys);
 
         let cloned = map::TableBackend::clone_table(&table);
