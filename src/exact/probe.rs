@@ -298,6 +298,15 @@ impl PreparedFastFunnelProbe {
             .wrapping_add(KEY_LANE)
     }
 
+    /// Occupied control byte of the key, from the low bits of its folded
+    /// word. A bucket draw reads the top of that word times an odd
+    /// multiplier, which leaves these bits uniform among the keys sharing a
+    /// bucket. The word follows the seed, so a reseed changes the byte.
+    #[inline]
+    pub(crate) const fn fingerprint(self) -> u8 {
+        crate::raw::control::control_fingerprint_low(self.key_out)
+    }
+
     #[inline]
     const fn ordinary_first_word(self, multiplier: u64) -> u64 {
         self.key_out.wrapping_mul(multiplier)
