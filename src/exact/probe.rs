@@ -49,12 +49,12 @@ pub(crate) trait ProbeOracle {
 
 /// A seeded, copyable probe-word family for reproducible Elastic probing.
 ///
-/// A key's probes in one level form a double-hashing sequence: the key's
-/// folded word plus the logical probe index times an odd step taken from the
-/// same word, scaled by the level's odd multiplier, so levels draw from
-/// decorrelated sequences. It is an engineering random-oracle model only: its
-/// outputs are not evidence of statistical independence, and the construction
-/// is not cryptographic.
+/// Every probe word of a key is a term of one double-hashing sequence: the
+/// key's folded word plus a sequence index times an odd stride taken from
+/// the same word ([`ElasticProbeSequence`]). A level reads the sequence at
+/// its own run of indices ([`elastic_level_run`]). It is an engineering
+/// random-oracle model only: its outputs are not evidence of statistical
+/// independence, and the construction is not cryptographic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CounterPrf {
     seed: u64,
@@ -124,15 +124,55 @@ const DOMAIN_KIND_LANE: u64 = WYHASH_DEFAULT_SECRET[1];
 const ELASTIC_LEVEL_SHIFT: u32 = 16;
 const ELASTIC_LOGICAL_SHIFT: u32 = 3;
 const ELASTIC_REJECTION_MASK: u32 = (1 << ELASTIC_LOGICAL_SHIFT) - 1;
-/// Folds an Elastic signature into its probe origin.
+/// Odd multiplier that folds an Elastic signature into its probe origin.
 pub(crate) const ELASTIC_FOLD_MULTIPLIER: u64 = WYHASH_DEFAULT_SECRET[2] | 1;
-pub(crate) const ELASTIC_LEVEL_LIMIT: u64 = 1 << 5;
+const ELASTIC_LEVEL_COUNT: usize = 1 << 5;
+pub(crate) const ELASTIC_LEVEL_LIMIT: u64 = ELASTIC_LEVEL_COUNT as u64;
 pub(crate) const ELASTIC_LOGICAL_LIMIT: u64 = 1 << 13;
-/// Sequence positions between the first probes of consecutive levels. Odd
-/// and above the logical limit, so levels own disjoint runs whose words
-/// differ in every bit position.
-const ELASTIC_SEQUENCE_LEVEL_SPAN: u32 = (1 << (ELASTIC_LEVEL_SHIFT - ELASTIC_LOGICAL_SHIFT)) + 1;
-const _: () = assert!(ELASTIC_SEQUENCE_LEVEL_SPAN as u64 > ELASTIC_LOGICAL_LIMIT);
+/// Low bits of a sequence index, which hold its level.
+const ELASTIC_RUN_LEVEL_BITS: u32 = ELASTIC_LEVEL_COUNT.trailing_zeros();
+const ELASTIC_RUN_LEVEL_MASK: u32 = (1 << ELASTIC_RUN_LEVEL_BITS) - 1;
+/// A first index stays in the lower half of `u32`.
+const ELASTIC_RUN_FIRST_MASK: u32 = u32::MAX >> 1;
+/// A step's odd factor is narrow enough that the last logical probe of a
+/// run adds less than the other half.
+const ELASTIC_RUN_UNIT_MASK: u32 =
+    (1 << (u32::BITS - 1 - ELASTIC_LOGICAL_LIMIT.trailing_zeros() - ELASTIC_RUN_LEVEL_BITS)) - 1;
+/// `(first index, step)` of each level's run of sequence indices; see
+/// [`elastic_level_run`].
+///
+/// A first index carries its level in the low bits and a step is a multiple
+/// of the level count, so the step never touches those bits: no two
+/// `(level, probe)` pairs share an index. The remaining bits come from the
+/// level's mixed word, which gives every level its own step and its own
+/// offset along the sequence. Level zero starts at index zero, so its first
+/// probe is the origin.
+///
+/// Both are narrow enough that a run never wraps `u32`, so a level's words
+/// are themselves an arithmetic progression: consecutive probes differ by
+/// the sequence's stride times the level's step.
+#[allow(clippy::cast_possible_truncation)]
+const ELASTIC_LEVEL_RUNS: [(u32, u32); ELASTIC_LEVEL_COUNT] = {
+    let mut runs = [(0, 0); ELASTIC_LEVEL_COUNT];
+    let mut level = 0;
+    while level < runs.len() {
+        let mixed = mix64(level as u64 ^ INITIAL_LANE);
+        let first = if level == 0 {
+            0
+        } else {
+            (mixed as u32 & ELASTIC_RUN_FIRST_MASK & !ELASTIC_RUN_LEVEL_MASK) | level as u32
+        };
+        let odd_units = ((mixed >> u32::BITS) as u32 & ELASTIC_RUN_UNIT_MASK) | 1;
+        runs[level] = (first, odd_units << ELASTIC_RUN_LEVEL_BITS);
+        level += 1;
+    }
+    runs
+};
+const _: () = assert!(
+    ELASTIC_RUN_FIRST_MASK as u64
+        + (ELASTIC_LOGICAL_LIMIT - 1) * ((ELASTIC_RUN_UNIT_MASK as u64) << ELASTIC_RUN_LEVEL_BITS)
+        <= u32::MAX as u64
+);
 const ELASTIC_REJECTION_LIMIT: u32 = 1 << ELASTIC_LOGICAL_SHIFT;
 /// Random words both backends spend per rejection-sampled probe before the
 /// deterministic fallback.
@@ -241,12 +281,24 @@ impl CounterPrf {
         rejection_index: u32,
     ) -> u64 {
         const WORD: u128 = 1 << u64::BITS;
-        let signature = u128::from(key_hash ^ self.seed);
-        let product = signature * u128::from(WYHASH_DEFAULT_SECRET[2] | 1);
-        let origin = (product % WORD) ^ (product / WORD);
+        let multiplier = WYHASH_DEFAULT_SECRET[2] | 1;
+        let signature = u128::from(key_hash ^ self.seed ^ multiplier);
+        let product = signature * u128::from(multiplier);
+        let origin = (((product % WORD) ^ (product / WORD)) * u128::from(multiplier)) % WORD;
         let half = 1_u128 << u32::BITS;
         let stride = (((origin % half) * half) + origin / half) | 1;
-        let sequence_index = u128::from(level) * 8_193 + u128::from(logical_probe_index);
+        let mut mixed = level ^ 0x9e37_79b9_7f4a_7c15;
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        let mixed = u128::from(mixed);
+        let first_index = if level == 0 {
+            0
+        } else {
+            (mixed % (half / 2)) / 32 * 32 + u128::from(level)
+        };
+        let step = ((mixed / half) % 8_192) / 2 * 64 + 32;
+        let sequence_index = first_index + u128::from(logical_probe_index) * step;
         let first =
             u64::try_from((origin + sequence_index * stride) % WORD).expect("reduced to one word");
         if rejection_index == 0 {
@@ -314,12 +366,25 @@ impl PreparedElasticProbe {
     /// The origin and stride are the key's only probe state, so every level's
     /// probes lie on the one sequence `origin + index * stride`
     /// ([`ElasticProbeSequence`]).
+    ///
+    /// The signature is xored with the multiplier before the multiply. A
+    /// zero factor folds to a zero origin and a stride of one, whose words
+    /// all reduce to slot zero; the xor moves that factor from the zero
+    /// signature, which an identity hasher gives the key zero, to the
+    /// multiplier's own value.
+    ///
+    /// The fold is multiplied once more. Both halves of the product are
+    /// close to linear in the signature, so signatures in arithmetic
+    /// progression, such as keys that differ only in their high bits, would
+    /// otherwise start on a lattice of level-zero slots; the second multiply
+    /// carries every bit of the fold into the top of the origin.
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
     pub(crate) const fn sequence(self, fold_multiplier: u64) -> ElasticProbeSequence {
         debug_assert!(fold_multiplier == ELASTIC_FOLD_MULTIPLIER);
-        let product = self.key as u128 * fold_multiplier as u128;
-        let origin = (product as u64) ^ (product >> u64::BITS) as u64;
+        let product = (self.key ^ fold_multiplier) as u128 * fold_multiplier as u128;
+        let folded = (product as u64) ^ (product >> u64::BITS) as u64;
+        let origin = folded.wrapping_mul(fold_multiplier);
         ElasticProbeSequence {
             origin,
             stride: origin.rotate_left(u32::BITS) | 1,
@@ -353,21 +418,35 @@ impl PreparedElasticProbe {
     }
 }
 
-/// One key's Elastic probe words: a double-hashing sequence every level
-/// owns a disjoint run of.
+/// One key's Elastic probe words: the double-hashing sequence
+/// `origin + index * stride`, which every level reads at its own run of
+/// indices ([`elastic_level_run`]).
 ///
-/// Every level's probes lie on one arithmetic sequence,
-/// `origin + index * stride`, so a key's probes in different levels are
-/// related: two keys whose first probes agree in two levels agree in the
-/// deeper levels as well.
+/// The origin and stride are all a key contributes, so its probe words are
+/// related in two ways the paper's independent draws are not.
+///
+/// Within a level, consecutive probes differ by one word distance, the
+/// stride times the level's step. A key for which a small multiple of that
+/// distance is close to a whole number of turns of the level revisits slots
+/// it has already probed, and so sees fewer distinct slots than independent
+/// draws would.
+///
+/// Across levels, every level's words come from the same two values. Each
+/// level multiplies the stride by its own step, so a key that revisits slots
+/// in one level is not bound to in the next. The exception is a stride so
+/// small that no step carries it out of one slot: the signature equal to
+/// the fold multiplier has a zero origin and a stride of one, and probes
+/// slot zero of every level. Two keys with the same origin share every
+/// probe; that takes a collision of the fold.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ElasticProbeSequence {
     /// Word at sequence index zero, the key's level-zero first probe: both
     /// halves of the signature's product with the fold multiplier, folded
-    /// together.
+    /// together and multiplied again.
     origin: u64,
-    /// Odd distance between consecutive words. Its high half is the origin's
-    /// low half, which the top bits that pick a level-zero slot do not reach.
+    /// Odd distance between the words of consecutive indices. Its high half
+    /// is the origin's low half, which the top bits that pick a level-zero
+    /// slot do not reach.
     stride: u64,
 }
 
@@ -381,15 +460,13 @@ impl ElasticProbeSequence {
             .wrapping_add((sequence_index as u64).wrapping_mul(self.stride))
     }
 
-    /// `(first word, distance between consecutive words)` of the key's probes
-    /// in `level`; word `j` is `first + j * distance`.
-    #[allow(clippy::cast_possible_truncation)]
+    /// First random word of `level`'s first logical probe, and the distance
+    /// from each of the level's probes to its next.
+    #[allow(clippy::cast_lossless)]
     #[inline]
-    pub(crate) const fn level_run(self, level: usize) -> (u64, u64) {
-        (
-            self.word(elastic_sequence_index(level as u32, 0)),
-            self.stride,
-        )
+    pub(crate) const fn level_words(self, level: usize) -> (u64, u64) {
+        let (first, step) = elastic_level_run(level);
+        (self.word(first), (step as u64).wrapping_mul(self.stride))
     }
 }
 
@@ -499,6 +576,14 @@ const fn elastic_counter_logical(counter: u32) -> u64 {
     ((counter & ((1 << ELASTIC_LEVEL_SHIFT) - 1)) >> ELASTIC_LOGICAL_SHIFT) as u64
 }
 
+/// `(first index, step)` of `level`'s run of sequence indices: logical probe
+/// `j` of the level reads the key's sequence at `first + j * step`, which
+/// stays inside `u32`.
+#[inline]
+pub(crate) const fn elastic_level_run(level: usize) -> (u32, u32) {
+    ELASTIC_LEVEL_RUNS[level % ELASTIC_LEVEL_COUNT]
+}
+
 /// Position of logical probe `logical_probe_index` of `level` in a key's
 /// probe sequence.
 #[allow(clippy::cast_possible_truncation)]
@@ -506,16 +591,15 @@ const fn elastic_counter_logical(counter: u32) -> u64 {
 pub(crate) const fn elastic_sequence_index(level: u32, logical_probe_index: u64) -> u32 {
     debug_assert!((level as u64) < ELASTIC_LEVEL_LIMIT);
     debug_assert!(logical_probe_index < ELASTIC_LOGICAL_LIMIT);
-    level * ELASTIC_SEQUENCE_LEVEL_SPAN + logical_probe_index as u32
+    let (first, step) = elastic_level_run(level as usize);
+    first + logical_probe_index as u32 * step
 }
 
 /// `(level, logical probe)` of the probe at `sequence_index`.
-#[inline]
 pub(crate) const fn elastic_sequence_coordinates(sequence_index: u32) -> (u32, u64) {
-    (
-        sequence_index / ELASTIC_SEQUENCE_LEVEL_SPAN,
-        (sequence_index % ELASTIC_SEQUENCE_LEVEL_SPAN) as u64,
-    )
+    let level = sequence_index & ELASTIC_RUN_LEVEL_MASK;
+    let (first, step) = elastic_level_run(level as usize);
+    (level, ((sequence_index - first) / step) as u64)
 }
 
 #[inline]

@@ -2052,7 +2052,8 @@ where
         let region = self.levels.get(level)?;
         debug_assert_ne!(region.index_shift, GENERAL_REDUCTION);
         let index_shift = region.index_shift;
-        let (mut word, distance) = probe.sequence(self.fold_multiplier).level_run(level);
+        let sequence = probe.sequence(self.fold_multiplier);
+        let (mut word, word_step) = sequence.level_words(level);
         let mut remaining = budget;
         while remaining != 0 {
             let slot = probe::shifted_elastic_index(word, index_shift);
@@ -2061,7 +2062,7 @@ where
             if control::is_free(unsafe { region.control_at(slot) }) {
                 return Some((slot, budget - remaining + 1));
             }
-            word = word.wrapping_add(distance);
+            word = word.wrapping_add(word_step);
             remaining -= 1;
         }
         None
