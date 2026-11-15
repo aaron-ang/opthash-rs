@@ -97,6 +97,8 @@ pub(crate) struct PreparedFastFunnelDomainProbe {
     counter_base: u64,
 }
 
+// Declaration order is layout order, for the level records that embed it.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedProbeRange {
     upper: usize,
