@@ -57,13 +57,6 @@ impl PhiRoute {
         let (level, logical) = self.coordinates();
         probe::elastic_counter_base(level, logical)
     }
-
-    /// Paper query position of the route.
-    fn phi(&self) -> u128 {
-        let (level, logical) = self.coordinates();
-        probe::elastic_phi(u128::from(level) + 1, u128::from(logical) + 1)
-            .expect("a scheduled route has a query position")
-    }
 }
 
 /// Control bytes the sentinel route probes: its shift leaves one index bit.
@@ -135,8 +128,7 @@ impl ProbeSchedule {
     }
 
     /// Appends the route of `level`'s logical probe `logical_probe_index`.
-    /// The schedule is out of order until [`Self::sort_from`] runs over the
-    /// appended routes.
+    /// The caller appends routes in query-position order.
     pub(super) fn push<T>(&mut self, level: usize, region: &Level<T>, logical_probe_index: u64) {
         let route = PhiRoute {
             level: u8::try_from(level).expect("Elastic level count fits u8"),
@@ -150,12 +142,6 @@ impl ProbeSchedule {
         let sentinel = self.routes.len() - 1;
         self.routes[sentinel] = route;
         self.routes.push(SENTINEL);
-    }
-
-    /// Orders the routes from index `start` on by query position.
-    pub(super) fn sort_from(&mut self, start: usize) {
-        let sentinel = self.routes.len() - 1;
-        self.routes[start..sentinel].sort_unstable_by_key(PhiRoute::phi);
     }
 
     #[cfg(test)]

@@ -496,8 +496,7 @@ const fn summary_level(level: usize) -> usize {
 /// `(paper_probe, phi)` with `phi <= position_cap` inside the uniform search
 /// cap. Level 0's first probe is skipped: the H11 fast path covers it, so no
 /// route is ever scheduled for it.
-#[allow(clippy::inline_always)]
-#[inline(always)]
+#[cfg(test)]
 fn for_each_phi_route(
     level: usize,
     from_probe: u128,
@@ -550,8 +549,9 @@ const LEVEL_PROBE_LIMIT: [u64; MAX_LEVELS] = {
     limits
 };
 
-/// Routes [`for_each_phi_route`] visits for `level` from its first probe up to
-/// `QUERY_POSITION_CAP`, within `UNIFORM_SEARCH_CAP` probes.
+/// Routes a full schedule holds for `level`: its probes at positions up to
+/// `QUERY_POSITION_CAP`, within `UNIFORM_SEARCH_CAP` probes, less level
+/// zero's first, which is the direct slot.
 const fn level_route_count(level: usize) -> usize {
     let paper_level = level as u128 + 1;
     let mut paper_probe = if level == 0 { 2 } else { 1 };
@@ -1359,32 +1359,45 @@ where
         if high_water <= u128::from(prior_high_water) {
             return;
         }
-        let old_len = self.probe_schedule.routes().len();
-        for level in 0..self.scheduled_levels as usize {
-            let region = &self.levels[level];
-            let from_probe =
-                first_paper_probe_after(level as u128 + 1, u128::from(prior_high_water));
-            for_each_phi_route(level, from_probe, high_water, |paper_probe, _| {
-                let logical_probe_index =
-                    u64::try_from(paper_probe - 1).expect("Elastic probe cap fits u64");
+        // A level's positions grow with its probe, so each level offers its
+        // next unscheduled probe and the lowest position among them is the
+        // next route in position order.
+        let position = |level: usize, paper_probe: u64| {
+            if paper_probe > UNIFORM_SEARCH_CAP {
+                return None;
+            }
+            let phi = probe::elastic_phi(level as u128 + 1, u128::from(paper_probe))
+                .expect("bounded Elastic query coordinate");
+            (phi <= high_water).then_some(phi)
+        };
+        let levels = &mut self.levels[..self.scheduled_levels as usize];
+        let mut next = [None; MAX_LEVELS];
+        for (level, region) in levels.iter().enumerate() {
+            next[level] = position(level, u64::from(region.scheduled_probes) + 1);
+        }
+        while let Some((level, _)) = next[..levels.len()]
+            .iter()
+            .enumerate()
+            .filter_map(|(level, phi)| phi.map(|phi| (level, phi)))
+            .min_by_key(|&(_, phi)| phi)
+        {
+            let region = &mut levels[level];
+            let logical_probe_index = u64::from(region.scheduled_probes);
+            // Level zero's first probe is the direct slot, which every
+            // lookup reads before it walks the schedule.
+            if level != 0 || logical_probe_index != 0 {
                 assert!(
                     usize::try_from(logical_probe_index)
                         .is_ok_and(|index| index < QUERY_PROBE_LIMIT),
                     "Elastic query-probe convention exhausted"
                 );
                 self.probe_schedule.push(level, region, logical_probe_index);
-            });
+            }
+            region.scheduled_probes += 1;
+            next[level] = position(level, u64::from(region.scheduled_probes) + 1);
         }
-        self.probe_schedule.sort_from(old_len);
         self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
             | u32::try_from(high_water).expect("Elastic query cap fits u32");
-        for (level, region) in self.levels[..self.scheduled_levels as usize]
-            .iter_mut()
-            .enumerate()
-        {
-            let covered = first_paper_probe_after(level as u128 + 1, high_water) - 1;
-            region.scheduled_probes = u16::try_from(covered).expect("Elastic probe cap fits u16");
-        }
     }
 }
 
@@ -2305,22 +2318,6 @@ where
             key.equivalent(&entry.key).then_some(entry)
         }
     }
-}
-
-fn first_paper_probe_after(paper_level: u128, position: u128) -> u128 {
-    let mut lower = 1_u128;
-    let mut upper = u128::from(UNIFORM_SEARCH_CAP) + 1;
-    while lower < upper {
-        let middle = lower + (upper - lower) / 2;
-        let phi =
-            probe::elastic_phi(paper_level, middle).expect("bounded Elastic query coordinate");
-        if phi <= position {
-            lower = middle + 1;
-        } else {
-            upper = middle;
-        }
-    }
-    lower
 }
 
 #[cfg(test)]
