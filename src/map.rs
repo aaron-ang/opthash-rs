@@ -466,6 +466,8 @@ where
     }
 
     /// Inserts `key`/`value`. Returns the previous value for `key`, if any.
+    // Forced inline: the caller hashes the key, so a loop of inserts builds
+    // the hasher's constants once.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {

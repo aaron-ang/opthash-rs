@@ -38,12 +38,6 @@ const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
 /// added to the key hash ahead of the fold, so a reseed translates every hash
 /// by this step.
 const FUNNEL_RESEED_STEP: u64 = probe::WYHASH_DEFAULT_SECRET[0];
-/// Largest table whose lookups select between the first two recorded levels
-/// instead of branching on the first. The second scan is a few instructions
-/// while the control bytes, one per slot, stay in a core's private cache; past
-/// that it is one more cache miss per lookup. The bound is a size such caches
-/// commonly hold, not a measured crossover.
-const SELECT_MAX_SLOTS: usize = 1 << 18;
 /// Bits each key sets in its membership-filter word. A lookup whose bits are
 /// not all set skips the probe walk, since the key cannot be present.
 const MEMBERSHIP_BITS: usize = 2;
@@ -60,9 +54,11 @@ enum FunnelScanMode {
     Sparse(OccupiedIndices),
 }
 
-/// Entries of [`FunnelShape::head`]: one per level that owns a level-bin bit,
-/// then absent entries up to a power of two.
-const HEAD_LEVELS: usize = (OVERFLOW_LEVEL + 1).next_power_of_two();
+/// Leading zeros of a level bin widened to a word, ahead of its top bit.
+const BIN_LEAD: usize = (u32::BITS - u16::BITS) as usize;
+/// Entries of [`FunnelShape::head`]: one per level-bin bit, then one for the
+/// leading zeros of an empty bin.
+const HEAD_ENTRIES: usize = u16::BITS as usize + 1;
 
 // Declaration order is layout order: a draw reads the multiplier with the
 // bucket count, and a tested draw the threshold with the offset.
@@ -76,7 +72,8 @@ struct LevelShape {
 }
 
 // Declaration order is layout order: the words every operation reads are
-// adjacent at the front, and the large head array comes last.
+// adjacent at the front, the head array follows them, where an insert reaches
+// most of its entries by a short offset, and the rest comes last.
 #[repr(C)]
 #[derive(Clone, Debug)]
 struct FunnelShape {
@@ -86,11 +83,12 @@ struct FunnelShape {
     /// the shape is empty: such a table scans no bucket for first matches.
     bucket_lanes: u64,
     beta: usize,
-    /// [`Self::bucket_lanes`] for lookups, with [`LOOKUP_SELECTS`] set when
-    /// they select between the first two recorded levels; see
-    /// [`SELECT_MAX_SLOTS`]. Next to `beta` so a lookup loads the pair.
-    lookup_lanes: u64,
     n: usize,
+    /// The levels that own a level-bin bit, copied inline so the hot paths
+    /// index them without the pointer chase or a bounds check. Every other
+    /// entry, the last two always among them, is [`LevelShape::ABSENT`], and
+    /// so is every entry of a shape without [`Self::bucket_lanes`].
+    head: [LevelShape; HEAD_ENTRIES],
     levels: Box<[LevelShape]>,
     loglog_ceiling: usize,
     primary_offset: usize,
@@ -98,11 +96,6 @@ struct FunnelShape {
     fallback_offset: usize,
     fallback_bucket_width: usize,
     fallback_bucket_range: PreparedProbeRange,
-    /// The levels that own a level-bin bit, copied inline so the hot paths
-    /// index them without the pointer chase or a bounds check. Every other
-    /// entry, the last one always among them, is [`LevelShape::ABSENT`], and
-    /// so is every entry of a shape without [`Self::bucket_lanes`].
-    head: [LevelShape; HEAD_LEVELS],
 }
 
 impl LevelShape {
@@ -122,7 +115,7 @@ struct RecordedHead<'a> {
     /// stands for the head entry `distance` entries past `entry`.
     pending: u32,
     entry: *const LevelShape,
-    head: PhantomData<&'a [LevelShape; HEAD_LEVELS]>,
+    head: PhantomData<&'a [LevelShape; HEAD_ENTRIES]>,
 }
 
 impl<'a> RecordedHead<'a> {
@@ -133,11 +126,6 @@ impl<'a> RecordedHead<'a> {
             entry: shape.head.as_ptr(),
             head: PhantomData,
         }
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.pending == 0
     }
 }
 
@@ -170,7 +158,7 @@ impl FunnelShape {
             n: 0,
             max_insertions: 0,
             levels: Box::new([]),
-            head: [LevelShape::ABSENT; HEAD_LEVELS],
+            head: [LevelShape::ABSENT; HEAD_ENTRIES],
             beta: 0,
             loglog_ceiling: 0,
             primary_offset: 0,
@@ -179,7 +167,6 @@ impl FunnelShape {
             fallback_bucket_width: 0,
             fallback_bucket_range: PreparedProbeRange::empty(),
             bucket_lanes: 0,
-            lookup_lanes: 0,
         }
     }
 
@@ -243,7 +230,7 @@ impl FunnelShape {
         let loglog_ceiling =
             u8::try_from(plan.loglog_ceiling()).map_err(|_| TryReserveError::CapacityOverflow)?;
         let bucket_lanes = bucket_lanes(plan.beta());
-        let mut head = [LevelShape::ABSENT; HEAD_LEVELS];
+        let mut head = [LevelShape::ABSENT; HEAD_ENTRIES];
         if bucket_lanes != 0 {
             for (slot, level) in head.iter_mut().zip(levels.iter().take(OVERFLOW_LEVEL)) {
                 *slot = *level;
@@ -263,11 +250,6 @@ impl FunnelShape {
             fallback_bucket_range: PreparedProbeRange::new(plan.fallback_bucket_count())
                 .map_err(|_| TryReserveError::CapacityOverflow)?,
             bucket_lanes,
-            lookup_lanes: if bucket_lanes != 0 && n <= SELECT_MAX_SLOTS {
-                bucket_lanes | LOOKUP_SELECTS
-            } else {
-                bucket_lanes
-            },
         })
     }
 
@@ -308,16 +290,6 @@ impl FunnelShape {
         }
     }
 }
-
-/// Bit of [`FunnelShape::lookup_lanes`] that no lane owns.
-const LOOKUP_SELECTS_BIT: u32 = u64::BITS - 1 - BITMASK_SLOT_BIT;
-const LOOKUP_SELECTS: u64 = 1 << LOOKUP_SELECTS_BIT;
-// The stride is one where a group mask holds one bit per slot.
-#[allow(clippy::modulo_one)]
-const _: () = assert!(
-    LOOKUP_SELECTS_BIT % BITMASK_STRIDE != BITMASK_SLOT_BIT
-        || LOOKUP_SELECTS_BIT as usize >= BITMASK_STRIDE as usize * GROUP_SIZE
-);
 
 /// See [`FunnelShape::bucket_lanes`].
 fn bucket_lanes(beta: usize) -> u64 {
@@ -399,17 +371,17 @@ impl<T> arena::RegionSet for FlatStorage<T> {
 }
 
 /// Level-bin bit shared by every ordinary level from this index on and by both
-/// special arrays: the top bit. Shallower levels each own a bit below it,
+/// special arrays: the lowest bit. Shallower levels each own a bit above it,
 /// level zero the highest, so the leading zeros of a bin count up to its
 /// shallowest recorded level.
 const OVERFLOW_LEVEL: usize = u16::BITS as usize - 1;
-const OVERFLOW_LEVEL_BIT: u16 = 1 << OVERFLOW_LEVEL;
+const OVERFLOW_LEVEL_BIT: u16 = 1;
 
 /// Level-bin bit of ordinary level `level`.
 #[inline]
 fn level_bit_of(level: usize) -> u16 {
     if level < OVERFLOW_LEVEL {
-        (OVERFLOW_LEVEL_BIT >> 1) >> level
+        (1 << OVERFLOW_LEVEL) >> level
     } else {
         OVERFLOW_LEVEL_BIT
     }
@@ -423,16 +395,23 @@ const SHALLOWEST_LEVEL: u32 = 1 << (u32::BITS - 1);
 /// shallowest level.
 #[inline]
 fn recorded_head_levels(levels: u16) -> u32 {
-    // One place past the top half, which shifts the overflow bit out.
-    u32::from(levels) << (u32::BITS - u16::BITS + 1)
+    u32::from(levels & !OVERFLOW_LEVEL_BIT) << (u32::BITS - u16::BITS)
 }
 
-/// Level bin of a key. Bits 6 and 7 of the hash: disjoint from both membership
-/// bit fields (bits 0..6 and 32..38), while the word index draws on the high
-/// half.
+/// Level bin of a key, as the negative index [`FunnelTable::level_bin_ptr`]
+/// counts back by. The top two bits of the hash's low half: disjoint from both
+/// membership bit fields (bits 0..6 and 32..38), while the word index draws on
+/// the high half.
 #[inline]
-const fn level_bin(key_hash: u64) -> usize {
-    ((key_hash >> 6) & 3) as usize
+const fn level_bin(key_hash: u64) -> isize {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "two bits, complemented into an index below zero"
+    )]
+    {
+        !((key_hash as u32) >> (u32::BITS - 2)) as i32 as isize
+    }
 }
 
 /// One key's filter location: which word, which bits, and which level bin.
@@ -442,7 +421,7 @@ const fn level_bin(key_hash: u64) -> usize {
 struct MembershipSlot {
     index: usize,
     bits: u64,
-    bin: usize,
+    bin: isize,
 }
 
 /// A loaded filter word paired with the key's bits, split from the test so the
@@ -483,14 +462,17 @@ struct FilterTail {
     /// rather than rebuilt from the arena base and region offset. An empty
     /// region points at [`NO_FILTER_WORD`], which rejects every key, so the
     /// gate needs no emptiness test; nothing writes through that pointer.
-    base: *mut MetadataWord,
+    ///
+    /// The base is the first membership word. Those words run upward from
+    /// it and the level bins downward, the bins of word `index` in the word
+    /// `index + 1` before it, so a gate indexes its word off the base
+    /// without forming the address of a pair.
+    base: *mut u64,
 }
 
-/// The word an empty table's gate reads: nothing recorded.
-static NO_FILTER_WORD: MetadataWord = MetadataWord {
-    membership: 0,
-    level_bins: [0; 4],
-};
+/// The level bins and membership word an empty table's gate reads: nothing
+/// recorded.
+static NO_FILTER_WORD: [u64; 2] = [0; 2];
 
 impl FilterTail {
     /// # Safety
@@ -498,10 +480,12 @@ impl FilterTail {
     /// `region` must have been laid out for the arena at `arena_base`.
     unsafe fn new(region: MembershipRegion, arena_base: *mut u8) -> Self {
         let base = if region.words == 0 {
-            core::ptr::from_ref(&NO_FILTER_WORD).cast_mut()
+            NO_FILTER_WORD.as_ptr().wrapping_add(1).cast_mut()
         } else {
-            // SAFETY: the caller's contract is `ptr`'s.
-            unsafe { region.ptr::<MetadataWord>(arena_base) }
+            // SAFETY: the caller's contract is `ptr`'s; the region holds a
+            // `MetadataWord` per filter word, which is two words, the bins
+            // in its first half.
+            unsafe { region.ptr::<u64>(arena_base).add(region.words) }
         };
         Self { region, base }
     }
@@ -881,9 +865,9 @@ unsafe fn first_free_in_bucket(ctrl_ptr: *const u8, start: usize, length: usize)
 /// Paper-exact Funnel hashing within each table epoch. Deletion, growth, and
 /// exceptional collision recovery are built-in dynamic-map behavior beyond
 /// the paper's fixed-size insertion model.
-// Declaration order is layout order. The hasher and the allocator come last,
-// so their sizes move no other field, and the shape, with its head array,
-// comes after every other word of the table.
+// Declaration order is layout order: the words the lookup and the common
+// insert read, then [`FunnelShape`] for its head array, then the rest. The
+// allocator comes last, so its size moves no other field.
 #[repr(C)]
 pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     storage: FlatStorage<SlotEntry<K, V>>,
@@ -894,17 +878,23 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// Cached location of the membership filter tail. Lookups load one word
     /// from it before probing; see [`crate::membership`].
     membership: FilterTail,
+    exceptional_placement: bool,
+    /// The entry count plus [`Self::head_left`]; see [`Self::entries`].
+    entries_base: usize,
+    /// Inserts the head placement may still make: the insertion limit less
+    /// the entry count in a table without tombstones, zero with any. Kept by
+    /// [`Self::set_entries`], so that placement tests and counts with one
+    /// word.
+    head_left: usize,
+    shape: FunnelShape,
+    hash_builder: S,
     reserve_fraction: ReserveFraction,
     arena: Arena,
     epoch: EpochState,
-    exceptional_placement: bool,
     /// Deletes since the filter last matched the live set; see
     /// [`membership::refresh_deletes`].
     stale_membership: usize,
     tombstones: usize,
-    len: usize,
-    shape: FunnelShape,
-    hash_builder: S,
     alloc: A,
 }
 
@@ -1047,9 +1037,10 @@ where
     ) -> Result<Self, TryReserveError> {
         let (arena, storage, membership) = try_allocate_storage(shape.n, &alloc)?;
         Ok(Self {
+            entries_base: shape.max_insertions,
+            head_left: shape.max_insertions,
             shape,
             storage,
-            len: 0,
             tombstones: 0,
             reserve_fraction,
             hash_builder,
@@ -1312,26 +1303,25 @@ where
         &self,
         key: &Q,
         probe: PreparedFastFunnelProbe,
-        levels: u16,
+        levels: u32,
     ) -> Option<Found<'_, K, V>>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let lookup_lanes = self.shape.lookup_lanes;
+        let lanes = self.shape.bucket_lanes;
         let beta = self.shape.beta;
         let key_fingerprint = probe.fingerprint();
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
-        let scan = |level: &LevelShape, lanes: u64| -> (usize, u64) {
-            debug_assert_ne!(lanes, 0);
+        let scan = |level: &LevelShape| -> (usize, u64) {
             let (bucket, _) =
                 probe::ordinary_funnel_first_draw(probe, level.multiplier, level.bucket_range);
             let start = level.offset + bucket * beta;
             // SAFETY: a first draw is below the level's bucket count whether
             // or not its word is accepted, an ordinary bucket ends at or
             // before `n`, and the control array pads `GROUP_SIZE - 1` bytes
-            // past `n`. A level past the shape's last has no buckets and
-            // draws slot zero, which a shape with lanes has.
+            // past `n`. An absent head entry has no buckets and draws slot
+            // zero, which every shape that recorded a level has.
             let matches =
                 unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), key_fingerprint) };
             (start, matches.0 & lanes)
@@ -1347,56 +1337,43 @@ where
             let found = unsafe { self.found_at(slot) };
             key.equivalent(&found.entry.key).then_some(found)
         };
-        // Compares every match of every level left in a set.
-        let walk = |mut recorded: RecordedHead<'_>, lanes: u64| -> Option<Found<'_, K, V>> {
-            loop {
-                let (start, mut matches) = scan(recorded.next()?, lanes);
-                while matches != 0 {
-                    if let Some(found) = holding_key(start, matches) {
-                        return Some(found);
-                    }
-                    // Another key shares the fingerprint.
-                    rarely_taken();
-                    matches &= matches - 1;
+        // A passed gate means a recorded key, so the table has slots.
+        debug_assert_ne!(self.shape.n, 0);
+        debug_assert!(u16::try_from(levels).is_ok());
+        // The bin is walked as it is, in the low half of the word: its
+        // leading zeros are `BIN_LEAD` more than the index of the shallowest
+        // level, so the walk starts that many entries ahead of the head. Two
+        // sets reach an absent entry, which matches nothing, as every scan of
+        // a shape without lanes does: the overflow bit stands where the level
+        // past the last recorded one would, and an empty set, which the walk
+        // tests for after a scan and not before one, has a whole word of
+        // leading zeros.
+        let mut pending = levels;
+        let mut entry = self.shape.head.as_ptr().wrapping_sub(BIN_LEAD);
+        loop {
+            let distance = pending.leading_zeros();
+            entry = entry.wrapping_add(distance as usize);
+            // The scanned level's bit moves to the top and is cleared, so
+            // the rest keep their distances from its entry. An empty set
+            // shifts by its whole width, which wraps to none.
+            pending = pending.wrapping_shl(distance) & !SHALLOWEST_LEVEL;
+            // SAFETY: the distances stepped so far add up to `BIN_LEAD` plus
+            // the index of a set bit, which is below `u16::BITS`, or to
+            // `u32::BITS` for an empty set. Either way the entry is one of
+            // the head's `HEAD_ENTRIES`, which outlive the borrow of `self`.
+            let (start, mut matches) = scan(unsafe { &*entry });
+            while matches != 0 {
+                if let Some(found) = holding_key(start, matches) {
+                    return Some(found);
                 }
+                // Another key shares the fingerprint.
+                rarely_taken();
+                matches &= matches - 1;
             }
-        };
-        let recorded = RecordedHead::new(&self.shape, levels);
-        if recorded.is_empty() {
-            return None;
-        }
-        if lookup_lanes & LOOKUP_SELECTS == 0 {
-            // Without lanes no scan can match, and the head is absent.
-            if lookup_lanes == 0 {
+            if pending == 0 {
                 return None;
             }
-            return walk(recorded, lookup_lanes);
         }
-        let lanes = lookup_lanes & !LOOKUP_SELECTS;
-        // The first two recorded levels are scanned together and the
-        // holder is selected, not branched on: which of them holds the
-        // key is unpredictable.
-        let mut pending = recorded.clone();
-        let first = pending.next()?;
-        let second = pending.next().unwrap_or(first);
-        let (first_start, first_matches) = scan(first, lanes);
-        let (second_start, second_matches) = scan(second, lanes);
-        let in_first = first_matches != 0;
-        let start = if in_first { first_start } else { second_start };
-        let matches = if in_first {
-            first_matches
-        } else {
-            second_matches
-        };
-        if matches != 0 {
-            if let Some(found) = holding_key(start, matches) {
-                return Some(found);
-            }
-            // Another key shares the fingerprint. Start over,
-            // comparing every match of every recorded level.
-            pending = recorded;
-        }
-        walk(pending, lanes)
     }
 
     /// Whether a lookup [`Self::first_match`] found nothing for is absent.
@@ -1583,23 +1560,27 @@ where
     /// a probe word not accepted for certain, which is every word of a shape
     /// without lanes, or no vacancy in those levels.
     ///
-    /// `bins` is the key's level bin. Each step sets its own level's bit in
-    /// it, so the insert stores the bin it gets back and no step hands a bit
-    /// on to be merged later.
+    /// `slot` names the key's level bin, which the first step loads once its
+    /// probe word is accepted. Each step sets its own level's bit in it, so
+    /// the insert stores the bin it gets back and no step hands a bit on to
+    /// be merged later.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn first_empty_in_head(
         &self,
         probe: PreparedFastFunnelProbe,
-        bins: u16,
+        slot: MembershipSlot,
     ) -> Option<HeadVacancy> {
+        let mut bins = 0;
         // One copy of the step per level, each with a constant index: the
         // walk then keeps no index and checks no bound.
         macro_rules! walk {
             ($($index:literal)*) => {
                 const { assert!([$($index),*].len() == OVERFLOW_LEVEL) };
                 $(
-                    if let Some(vacancy) = self.first_empty_in_head_level(probe, $index, bins).ok()? {
+                    if let Some(vacancy) =
+                        self.first_empty_in_head_level(probe, $index, slot, &mut bins).ok()?
+                    {
                         return Some(vacancy);
                     }
                 )*
@@ -1618,12 +1599,18 @@ where
         &self,
         probe: PreparedFastFunnelProbe,
         index: usize,
-        bins: u16,
+        slot: MembershipSlot,
+        bins: &mut u16,
     ) -> Result<Option<HeadVacancy>, ()> {
         let level = &self.shape.head[index];
         let bucket =
             probe::ordinary_funnel_first_certain_index(probe, level.multiplier, level.bucket_range)
                 .ok_or(())?;
+        if index == 0 {
+            // SAFETY: the caller derived `slot` for this geometry.
+            *bins = unsafe { *self.level_bin_ptr(slot) };
+        }
+        let bins = *bins;
         let start = level.offset + bucket * self.shape.beta;
         // SAFETY: an ordinary bucket ends at or before `n`, and the control
         // array pads `GROUP_SIZE - 1` bytes past `n`.
@@ -1690,8 +1677,26 @@ where
     }
 
     #[inline]
-    fn membership_ptr(&self) -> *mut MetadataWord {
+    fn membership_ptr(&self) -> *mut u64 {
         self.membership.base
+    }
+
+    /// The level bin of `slot`.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must come from [`Self::membership_slot`] with no change of
+    /// geometry since.
+    #[inline]
+    unsafe fn level_bin_ptr(&self, slot: MembershipSlot) -> *mut u16 {
+        // SAFETY: the bins of word `index` are the word `index + 1` words
+        // before the base, and `slot.bin` counts back from that word's end.
+        unsafe {
+            self.membership_ptr()
+                .sub(slot.index)
+                .cast::<u16>()
+                .offset(slot.bin)
+        }
     }
 
     /// `false` proves no insert ever recorded this key.
@@ -1706,7 +1711,7 @@ where
         let word = MembershipKey::word(key_hash, words);
         // SAFETY: `word` is a multiply-high reduction below `words`, and the
         // arena's tail holds exactly that many zero-initialized words.
-        unsafe { (*self.membership_ptr().add(word)).membership & bits == bits }
+        unsafe { *self.membership_ptr().add(word) & bits == bits }
     }
 
     /// This key's filter word index and bits for the current epoch. Only an
@@ -1737,8 +1742,10 @@ where
         // zero, and the base is the shared empty word. Two field loads, not a
         // copy of the whole word, so the bin needs no dynamic extraction.
         let (word, levels) = unsafe {
-            let metadata = self.membership_ptr().add(slot.index);
-            ((*metadata).membership, (*metadata).level_bins[slot.bin])
+            (
+                *self.membership_ptr().add(slot.index),
+                *self.level_bin_ptr(slot),
+            )
         };
         MembershipGate {
             word,
@@ -1780,9 +1787,10 @@ where
         if self.membership.region.words != 0 {
             // SAFETY: as in `membership_gate`; `&mut self` makes the borrow
             // exclusive.
-            let metadata = unsafe { &mut *self.membership_ptr().add(membership.index) };
-            metadata.membership |= membership.bits;
-            metadata.level_bins[membership.bin] |= level_bit;
+            unsafe {
+                *self.membership_ptr().add(membership.index) |= membership.bits;
+                *self.level_bin_ptr(membership) |= level_bit;
+            }
         }
     }
 
@@ -1862,7 +1870,7 @@ where
         if !gate.passes() {
             return None;
         }
-        self.find_after_gate::<Q, P>(key, key_hash, gate.levels)
+        self.find_after_gate::<Q, P>(key, key_hash, u32::from(gate.levels))
     }
 
     #[inline]
@@ -1875,34 +1883,39 @@ where
 
     /// Out of line so a filter-rejected miss pays for no probe preparation.
     /// A lookup that finds its key returns from here without a frame.
+    ///
+    /// Takes the level bin at register width, as the gate's load left it, so
+    /// the walk does not widen it again.
     #[inline(never)]
-    fn find_after_gate<'a, Q, P>(&'a self, key: &Q, key_hash: u64, levels: u16) -> Option<P::Part>
+    fn find_after_gate<'a, Q, P>(&'a self, key: &Q, key_hash: u64, levels: u32) -> Option<P::Part>
     where
         Q: Equivalent<K> + ?Sized,
         P: FoundPart<'a, K, V>,
     {
+        debug_assert!(u16::try_from(levels).is_ok());
         let probe = self.prf.prepare(key_hash);
         match self.first_match(key, probe, levels) {
             Some(found) => Some(P::of(found)),
-            None => self.find_unmatched::<Q, P>(key, key_hash, levels, probe),
+            None => self.find_unmatched::<Q, P>(key, key_hash, probe),
         }
     }
 
     /// Out of line so the first-match scan keeps none of its state for the
-    /// lookup that found nothing. The ordered walk sits in tail position, so
-    /// its call needs no frame here.
+    /// lookup that found nothing, not even the level bin, which is loaded
+    /// again here. The ordered walk sits in tail position, so its call needs
+    /// no frame here.
     #[inline(never)]
     fn find_unmatched<'a, Q, P>(
         &'a self,
         key: &Q,
         key_hash: u64,
-        levels: u16,
         probe: PreparedFastFunnelProbe,
     ) -> Option<P::Part>
     where
         Q: Equivalent<K> + ?Sized,
         P: FoundPart<'a, K, V>,
     {
+        let levels = self.membership_gate(key_hash).levels;
         if self.unmatched_is_absent(probe, levels) {
             None
         } else {
@@ -1952,15 +1965,44 @@ where
     /// Where an absent key goes in a table without tombstones and below its
     /// insertion limit: the first EMPTY lane of the placement walk over the
     /// levels that own a level-bin bit. `None` leaves the placement to the
-    /// general insert. `bins` is the key's level bin, as for
+    /// general insert. `slot` names the key's level bin, as for
     /// [`Self::first_empty_in_head`].
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn head_vacancy(&self, probe: PreparedFastFunnelProbe, bins: u16) -> Option<HeadVacancy> {
-        if self.tombstones != 0 || self.len >= self.shape.max_insertions {
+    fn head_vacancy(
+        &self,
+        probe: PreparedFastFunnelProbe,
+        slot: MembershipSlot,
+    ) -> Option<HeadVacancy> {
+        debug_assert_eq!(
+            self.head_left,
+            self.head_limit().saturating_sub(self.entries())
+        );
+        if self.head_left == 0 {
             return None;
         }
-        self.first_empty_in_head(probe, bins)
+        self.first_empty_in_head(probe, slot)
+    }
+
+    /// Entry count below which the head placement may run.
+    fn head_limit(&self) -> usize {
+        if self.tombstones == 0 {
+            self.shape.max_insertions
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn entries(&self) -> usize {
+        self.entries_base - self.head_left
+    }
+
+    /// Sets the entry count, and with it [`Self::head_left`]. Also restores
+    /// that word after a change to the tombstone count or the shape.
+    fn set_entries(&mut self, entries: usize) {
+        self.head_left = self.head_limit().saturating_sub(entries);
+        self.entries_base = entries + self.head_left;
     }
 
     /// Stores an absent key at the vacancy [`Self::head_vacancy`] reported
@@ -1968,10 +2010,10 @@ where
     ///
     /// # Safety
     ///
-    /// `gate` must come from the filter word of `membership`, itself from
+    /// `word` must be the filter word of `membership`, itself from
     /// [`Self::membership_slot`], and `vacancy` from [`Self::head_vacancy`]
-    /// over the gate's level bin, with no write to the table since any of
-    /// them was read.
+    /// over the same slot, with no write to the table since any of them was
+    /// read.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     unsafe fn place_in_head(
@@ -1979,20 +2021,29 @@ where
         key: K,
         value: V,
         membership: MembershipSlot,
-        gate: MembershipGate,
+        word: u64,
         probe: PreparedFastFunnelProbe,
         vacancy: HeadVacancy,
     ) {
-        debug_assert_eq!(vacancy.bins, gate.levels | self.level_bit(vacancy.slot));
         debug_assert_ne!(self.membership.region.words, 0);
         // Every table word this insert needs is read before its first
         // store, which could otherwise force each to be loaded again:
         // the length and the filter word's address here, the word itself
         // by the gate.
-        let len = self.len;
+        let head_left = self.head_left;
         // SAFETY: a vacancy exists only in a table with slots, so its
         // filter has words and `membership.index` is below their count.
-        let metadata = unsafe { self.membership_ptr().add(membership.index) };
+        let (metadata, bin) = unsafe {
+            (
+                self.membership_ptr().add(membership.index),
+                self.level_bin_ptr(membership),
+            )
+        };
+        debug_assert_eq!(
+            vacancy.bins,
+            // SAFETY: `bin` is the key's level bin, as above.
+            unsafe { *bin } | self.level_bit(vacancy.slot)
+        );
         let key_fingerprint = probe.fingerprint();
         // SAFETY: the vacancy is an EMPTY lane of an ordinary bucket, and
         // `key_fingerprint` is an occupied control.
@@ -2006,15 +2057,15 @@ where
         // SAFETY: `metadata` is this key's filter word, as above, and
         // `&mut self` makes the access exclusive.
         unsafe {
-            (*metadata).membership = gate.word | membership.bits;
-            (*metadata).level_bins[membership.bin] = vacancy.bins;
+            *metadata = word | membership.bits;
+            *bin = vacancy.bins;
         }
-        self.len = len + 1;
+        self.head_left = head_left - 1;
     }
 
     /// The whole insert: duplicate search behind the filter gate, growth, then
     /// placement with its recovery paths. Out of line so the common insert in
-    /// [`map::TableBackend::insert`] keeps no frame.
+    /// [`map::TableBackend::insert`] makes no call.
     #[inline(never)]
     fn insert_general(&mut self, key: K, value: V, hash: u64) -> Option<V> {
         // Same gate and, behind it, the same search as a lookup: a key the
@@ -2024,14 +2075,15 @@ where
         let mut membership = self.membership_slot(hash);
         let gate = self.membership_gate_at(membership);
         if gate.passes() {
-            if let Some(slot) = self.find_after_gate::<K, FoundSlot>(&key, hash, gate.levels) {
+            let found = self.find_after_gate::<K, FoundSlot>(&key, hash, u32::from(gate.levels));
+            if let Some(slot) = found {
                 return Some(map::TableBackend::replace_value(self, slot, value));
             }
             let probe = self.prf.prepare(hash);
-            if let Some(vacancy) = self.head_vacancy(probe, gate.levels) {
+            if let Some(vacancy) = self.head_vacancy(probe, membership) {
                 // SAFETY: slot, gate and vacancy were read just above, with
                 // no write since.
-                unsafe { self.place_in_head(key, value, membership, gate, probe, vacancy) };
+                unsafe { self.place_in_head(key, value, membership, gate.word, probe, vacancy) };
                 return None;
             }
         }
@@ -2112,10 +2164,10 @@ where
         }
         debug_assert_eq!(level_bit, self.level_bit(slot), "level bit of slot {slot}");
         self.record_membership(membership, level_bit);
-        self.len += 1;
         if was_tombstone {
             self.tombstones -= 1;
         }
+        self.set_entries(self.entries() + 1);
         if exceptional {
             self.exceptional_placement = true;
         }
@@ -2135,7 +2187,7 @@ where
     /// Returns `true` when a resize ran, so a search from before it is stale.
     #[inline]
     fn prepare_vacant_insert(&mut self) -> bool {
-        if self.len >= self.shape.max_insertions {
+        if self.entries() >= self.shape.max_insertions {
             self.grow_for_next_insert();
             true
         } else {
@@ -2147,7 +2199,7 @@ where
     #[inline(never)]
     fn grow_for_next_insert(&mut self) {
         let slots = self
-            .next_growth_slots(self.len.saturating_add(1))
+            .next_growth_slots(self.entries().saturating_add(1))
             .expect("capacity overflow");
         self.resize_with_transition(slots, EpochTransition::Growth);
     }
@@ -2311,8 +2363,9 @@ where
     fn swap_generation(&mut self, other: &mut FunnelGeneration<K, V>) {
         mem::swap(&mut self.shape, &mut other.shape);
         mem::swap(&mut self.storage, &mut other.storage);
-        mem::swap(&mut self.len, &mut other.len);
+        let entries = mem::replace(&mut other.len, self.entries());
         mem::swap(&mut self.tombstones, &mut other.tombstones);
+        self.set_entries(entries);
         mem::swap(&mut self.arena, &mut other.arena);
         mem::swap(
             &mut self.exceptional_placement,
@@ -2397,7 +2450,7 @@ where
 
     #[inline]
     fn len(&self) -> usize {
-        self.len
+        self.entries()
     }
 
     #[inline]
@@ -2416,7 +2469,7 @@ where
     }
 
     fn epoch_snapshot(&self) -> EpochSnapshot {
-        self.epoch.snapshot(self.len)
+        self.epoch.snapshot(self.entries())
     }
 
     #[inline]
@@ -2488,22 +2541,28 @@ where
         self.place_absent_after_search(key, value, vacant.hash, membership, vacancy)
     }
 
-    #[inline]
+    // Forced inline with the shell's insert: the common insert then runs in
+    // its caller, which makes no call for it.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
     where
         K: Hash + Eq,
     {
         // A key the filter never recorded is absent, so it needs no duplicate
-        // search. That common insert calls nothing and keeps no frame; every
+        // search. That common insert calls nothing; every
         // other case is the general insert's.
         let membership = self.membership_slot(hash);
-        let gate = self.membership_gate_at(membership);
-        if !gate.passes() {
+        // SAFETY: as in `membership_gate_at`. Only the word is loaded: the
+        // head walk loads the level bin, once its first probe word is
+        // accepted.
+        let word = unsafe { *self.membership_ptr().add(membership.index) };
+        if word & membership.bits != membership.bits {
             let probe = self.prf.prepare(hash);
-            if let Some(vacancy) = self.head_vacancy(probe, gate.levels) {
-                // SAFETY: slot, gate and vacancy were read just above, with
+            if let Some(vacancy) = self.head_vacancy(probe, membership) {
+                // SAFETY: slot, word and vacancy were read just above, with
                 // no write since.
-                unsafe { self.place_in_head(key, value, membership, gate, probe, vacancy) };
+                unsafe { self.place_in_head(key, value, membership, word, probe, vacancy) };
                 return None;
             }
         }
@@ -2529,8 +2588,8 @@ where
     fn extract_finish(&mut self, slot: usize) {
         // SAFETY: a live location names an in-bounds slot.
         unsafe { self.storage.mark_tombstone(slot) };
-        self.len -= 1;
         self.tombstones += 1;
+        self.set_entries(self.entries() - 1);
         self.stale_membership += 1;
         self.epoch.note_delete();
     }
@@ -2545,7 +2604,7 @@ where
             // Dense scans avoid lane extraction for nearly every slot. Only
             // sparse tables amortize masks over enough empty controls; choose
             // once so draining cannot switch modes midway through a group.
-            mode: if self.len <= self.shape.n / 4 {
+            mode: if self.entries() <= self.shape.n / 4 {
                 FunnelScanMode::Sparse(OccupiedIndices::new())
             } else {
                 FunnelScanMode::Dense(0)
@@ -2610,13 +2669,13 @@ where
     }
 
     fn shrink_to(&mut self, min_capacity: usize) {
-        if self.len == 0 && min_capacity == 0 {
+        if self.entries() == 0 && min_capacity == 0 {
             if self.shape.n != 0 {
                 self.resize_with_transition(0, EpochTransition::ExplicitResize);
             }
             return;
         }
-        let requested = self.len.max(min_capacity);
+        let requested = self.entries().max(min_capacity);
         let Ok(shape) = FunnelShape::for_insert_budget(requested, self.reserve_fraction) else {
             panic!("capacity overflow");
         };
@@ -2639,8 +2698,8 @@ where
                 let entry = unsafe { self.storage.take(slot) };
                 // SAFETY: `slot` is in bounds and its value was moved out.
                 unsafe { self.storage.set_control(slot, CTRL_TOMBSTONE) };
-                self.len -= 1;
                 self.tombstones += 1;
+                self.set_entries(self.entries() - 1);
                 drop(entry);
             }
         }
@@ -2649,8 +2708,8 @@ where
 
     fn wipe_all(&mut self) {
         self.storage.clear_all_controls();
-        self.len = 0;
         self.tombstones = 0;
+        self.set_entries(0);
         self.finish_clear();
     }
 
@@ -2668,8 +2727,8 @@ where
         )
         .unwrap_or_else(|error| panic!("Funnel clone allocation failed: {error}"));
         cloned.storage.clone_region_from(&self.storage);
-        cloned.len = self.len;
         cloned.tombstones = self.tombstones;
+        cloned.set_entries(self.entries());
         cloned.epoch = self.epoch;
         cloned.exceptional_placement = self.exceptional_placement;
         cloned.prf = self.prf;
