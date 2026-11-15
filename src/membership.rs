@@ -43,8 +43,8 @@ pub(crate) const fn refresh_deletes(max_insertions: usize) -> usize {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetadataWord {
-    pub(crate) membership: u64,
     pub(crate) level_bins: [u16; 4],
+    pub(crate) membership: u64,
 }
 
 const _: () = assert!(core::mem::size_of::<MetadataWord>() == 16);
