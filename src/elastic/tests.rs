@@ -227,18 +227,15 @@ fn query_schedule_never_reallocates_within_an_epoch() {
         )
         .unwrap();
     let initial_ptr = table.probe_schedule.first();
-    let initial_capacity = table.probe_schedule.routes.capacity();
+    let initial_capacity = table.probe_schedule.route_capacity();
 
     table.schedule_levels_through(table.levels.len() - 1);
     table.extend_probe_schedule(QUERY_POSITION_CAP);
 
     assert_eq!(table.probe_schedule.first(), initial_ptr);
-    assert_eq!(table.probe_schedule.routes.capacity(), initial_capacity);
-    assert_eq!(table.probe_schedule.routes.len(), initial_capacity);
-    assert_eq!(
-        table.probe_schedule.routes.last(),
-        Some(&ProbeSchedule::SENTINEL)
-    );
+    assert_eq!(table.probe_schedule.route_capacity(), initial_capacity);
+    assert_eq!(table.probe_schedule.routes().len(), initial_capacity);
+    assert!(table.probe_schedule.ends_with_sentinel());
 }
 
 #[test]
@@ -267,11 +264,11 @@ fn query_schedule_holds_every_route_once_in_position_order() {
         .routes()
         .iter()
         .map(|route| {
-            let (level, logical) = probe::elastic_sequence_coordinates(route.sequence_index);
-            assert_eq!(level, u32::from(route.level));
+            let (level, logical) = route.coordinates();
+            assert_eq!(level, u32::from(route.level()));
             let region = &table.levels[level as usize];
-            assert_eq!(route.control, region.ctrl_ptr.cast_const());
-            assert_eq!(u32::from(route.index_shift), region.index_shift);
+            assert_eq!(route.control(), region.ctrl_ptr.cast_const());
+            assert_eq!(route.index_shift(), region.index_shift);
             (level as usize, u128::from(logical))
         })
         .collect::<Vec<_>>();
@@ -1607,8 +1604,8 @@ fn scheduled_logical_probes<K, V, S, A: Allocator + Clone>(
         .probe_schedule
         .routes()
         .iter()
-        .filter(|route| route.level as usize == level)
-        .map(|route| probe::elastic_sequence_coordinates(route.sequence_index).1)
+        .filter(|route| route.level() as usize == level)
+        .map(|route| route.coordinates().1)
         .collect::<Vec<_>>();
     logical.sort_unstable();
     logical
@@ -1830,19 +1827,20 @@ fn clone_carries_the_schedule_onto_its_own_levels() {
             .zip(source.probe_schedule.routes())
         {
             assert_eq!(
-                (ours.level, ours.index_shift, ours.sequence_index),
-                (theirs.level, theirs.index_shift, theirs.sequence_index)
+                (ours.level(), ours.index_shift(), ours.sequence_index()),
+                (
+                    theirs.level(),
+                    theirs.index_shift(),
+                    theirs.sequence_index()
+                )
             );
             assert_eq!(
-                ours.control,
-                copy.levels[ours.level as usize].ctrl_ptr.cast_const()
+                ours.control(),
+                copy.levels[ours.level() as usize].ctrl_ptr.cast_const()
             );
-            assert_ne!(ours.control, theirs.control);
+            assert_ne!(ours.control(), theirs.control());
         }
-        assert_eq!(
-            copy.probe_schedule.routes.last(),
-            Some(&ProbeSchedule::SENTINEL)
-        );
+        assert!(copy.probe_schedule.ends_with_sentinel());
     }
     drop(map);
     for key in 0..KEYS - 64 {
