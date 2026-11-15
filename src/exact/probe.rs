@@ -462,12 +462,12 @@ impl ElasticProbeSequence {
             .wrapping_add((sequence_index as u64).wrapping_mul(self.stride))
     }
 
-    /// First random word of `level`'s first logical probe, and the distance
-    /// from each of the level's probes to its next.
+    /// First random word of the first logical probe of the level whose
+    /// [`elastic_level_run`] is `run`, and the distance from each of that
+    /// level's probes to its next.
     #[allow(clippy::cast_lossless)]
     #[inline]
-    pub(crate) const fn level_words(self, level: usize) -> (u64, u64) {
-        let (first, step) = elastic_level_run(level);
+    pub(crate) const fn run_words(self, (first, step): (u32, u32)) -> (u64, u64) {
         (self.word(first), (step as u64).wrapping_mul(self.stride))
     }
 }
@@ -1127,6 +1127,7 @@ pub(crate) fn elastic_phi_inverse(encoded: u128) -> Option<(u128, u128)> {
 }
 
 /// A failure to compute the exact discrete Elastic probe budget.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ElasticProbeBudgetError {
     /// `free_slots` was outside the required interval
@@ -1171,6 +1172,7 @@ pub(crate) enum ElasticProbeBudgetError {
 /// [`ElasticProbeBudgetError::ZeroConstant`] when `c == 0`, and
 /// [`ElasticProbeBudgetError::Overflow`] when checked arithmetic cannot
 /// represent the exact result.
+#[cfg(test)]
 pub(crate) const fn elastic_dyadic_probe_budget(
     free_slots: usize,
     level_slots: usize,
@@ -1187,11 +1189,7 @@ pub(crate) const fn elastic_dyadic_probe_budget(
         return Err(ElasticProbeBudgetError::ZeroConstant);
     }
 
-    // `k` is the least exponent with `free_slots << k >= level_slots`. The
-    // gap between the two bit lengths lines the top bits up, which makes it
-    // `k` or one short, and cannot shift `free_slots` out of the word.
-    let gap = free_slots.leading_zeros() - level_slots.leading_zeros();
-    let log_ceiling = (gap + ((free_slots << gap) < level_slots) as u32) as usize;
+    let log_ceiling = dyadic_log_ceiling(free_slots as u64, level_slots as u64) as usize;
     let Some(log_squared) = log_ceiling.checked_mul(log_ceiling) else {
         return Err(ElasticProbeBudgetError::Overflow);
     };
@@ -1204,6 +1202,41 @@ pub(crate) const fn elastic_dyadic_probe_budget(
         return Err(ElasticProbeBudgetError::Overflow);
     };
     Ok(budget)
+}
+
+/// [`elastic_dyadic_probe_budget`] of a level's own counters, for a caller
+/// that holds `0 < free_slots <= level_slots` already and so has no error
+/// to handle. Counters outside that range give some budget rather than a
+/// failure; the widths rule out overflow.
+#[inline]
+pub(crate) const fn elastic_level_probe_budget(
+    free_slots: u32,
+    level_slots: u32,
+    reserve_exponent: u32,
+    c: u32,
+) -> u64 {
+    debug_assert!(0 < free_slots && free_slots <= level_slots);
+    let log_ceiling = dyadic_log_ceiling(free_slots as u64, level_slots as u64) as u64;
+    let log_squared = log_ceiling * log_ceiling;
+    let capped = if log_squared < reserve_exponent as u64 {
+        log_squared
+    } else {
+        reserve_exponent as u64
+    };
+    c as u64 * capped
+}
+
+/// `ceil(log2(level_slots / free_slots))` for `0 < free_slots <=
+/// level_slots`: the least `k` with `free_slots << k >= level_slots`. The
+/// gap between the two bit lengths lines the top bits up, which makes it
+/// `k` or one short, and cannot shift `free_slots` out of the word. Other
+/// arguments wrap to some value.
+#[inline]
+const fn dyadic_log_ceiling(free_slots: u64, level_slots: u64) -> u32 {
+    let gap = free_slots
+        .leading_zeros()
+        .wrapping_sub(level_slots.leading_zeros());
+    gap.wrapping_add((free_slots.wrapping_shl(gap) < level_slots) as u32)
 }
 
 /// Multiplier of the per-key fold in [`FunnelPrf::prepare`].
