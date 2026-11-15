@@ -2049,14 +2049,21 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                             walk,
                             "n {n} d {d} index {index}"
                         );
+                        // A bucket wider than a group is never scanned here:
+                        // only a key no level recorded is answered.
+                        assert!(
+                            !wide || gate.levels & !OVERFLOW_LEVEL_BIT == 0,
+                            "n {n} d {d} index {index}"
+                        );
                         answered += 1;
                     }
                     Err(()) => handed_off += 1,
                 }
             }
-            assert_eq!(answered == 0, wide, "n {n} d {d}");
             if wide {
                 assert_ne!(handed_off, 0, "n {n} d {d}");
+            } else {
+                assert_ne!(answered, 0, "n {n} d {d}");
             }
         }
     }
