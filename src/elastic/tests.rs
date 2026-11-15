@@ -259,7 +259,11 @@ fn query_schedule_holds_every_route_once_in_position_order() {
     let scheduled = table
         .probe_schedule
         .iter()
-        .map(|route| (route.level as usize, u128::from(route.logical)))
+        .map(|route| {
+            let (level, logical) = probe::elastic_sequence_coordinates(route.sequence_index);
+            assert_eq!(level, route.level);
+            (level as usize, u128::from(logical))
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         scheduled,
