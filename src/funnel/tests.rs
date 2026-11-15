@@ -1996,6 +1996,87 @@ fn panicking_hasher_during_resize_keeps_every_entry() {
     assert_eq!(drops.load(Ordering::SeqCst), 4);
 }
 
+/// Deletes the counts have yet to see when a resize starts are settled as the
+/// new generation goes in, and must come back out with it when a panicking
+/// hasher rolls the resize back.
+#[test]
+fn panicking_hasher_during_resize_rolls_back_uncounted_deletes() {
+    const INSERTED: u64 = 9;
+    const REMOVED: u64 = 4;
+    let armed = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let reserve = ReserveFraction::from_exponent(3).unwrap();
+    let shape = FunnelShape::from_slots(144, reserve).unwrap();
+    let mut table = FunnelTable::<PanicHashKey, u64, IdentityBuildHasher>::try_from_shape(
+        shape,
+        reserve,
+        IdentityBuildHasher,
+        Global,
+    )
+    .unwrap();
+    let key_of = |id: u64| PanicHashKey {
+        id,
+        armed: armed.clone(),
+        drops: drops.clone(),
+    };
+    for id in 0..INSERTED {
+        assert_eq!(
+            map::TableBackend::insert(&mut table, key_of(id), id, id),
+            None
+        );
+    }
+    for id in 0..REMOVED {
+        let slot = table.find_location(&key_of(id), id).unwrap();
+        map::TableBackend::remove(&mut table, slot);
+    }
+    assert_ne!(table.uncounted_deletes(), 0, "the deletes were settled");
+    let before = map::TableBackend::epoch_snapshot(&table);
+    assert_eq!(before.distinct_insertions as u64, INSERTED);
+    assert!(before.had_delete);
+    let next_shape = FunnelShape::for_insert_budget(256, reserve).unwrap();
+
+    armed.store(true, Ordering::SeqCst);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        map::TableBackend::try_resize(&mut table, next_shape.n).unwrap();
+    }));
+    armed.store(false, Ordering::SeqCst);
+    assert!(result.is_err());
+
+    assert_eq!(table.shape.n, 144);
+    assert_eq!(table.entries() as u64, INSERTED - REMOVED);
+    assert_eq!(table.tombstones() as u64, REMOVED);
+    assert_eq!(table.stale_membership() as u64, REMOVED);
+    assert_eq!(map::TableBackend::epoch_snapshot(&table), before);
+    assert_eq!(
+        table.head_left,
+        table.head_limit().saturating_sub(table.entries())
+    );
+    for id in 0..INSERTED {
+        assert_eq!(
+            map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
+            (id >= REMOVED).then_some(id)
+        );
+    }
+
+    // The counts still drive placement and the next resize.
+    for id in 0..REMOVED {
+        assert_eq!(
+            map::TableBackend::insert(&mut table, key_of(id), id, id),
+            None
+        );
+    }
+    assert_eq!(table.entries() as u64, INSERTED);
+    map::TableBackend::try_resize(&mut table, next_shape.n).unwrap();
+    assert_eq!(table.entries() as u64, INSERTED);
+    assert_eq!(table.tombstones(), 0);
+    for id in 0..INSERTED {
+        assert_eq!(
+            map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
+            Some(id)
+        );
+    }
+}
+
 /// A filter refresh hashes every live key. A hasher that panics part way
 /// through must leave the filter recording every live key.
 #[test]

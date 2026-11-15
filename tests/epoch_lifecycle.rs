@@ -207,6 +207,32 @@ fn funnel_leaves_a_due_tombstone_cleanup_to_the_next_absent_insert() {
     assert_eq!(map.get(&capacity), Some(&capacity));
 }
 
+/// Removed keys stay counted as distinct insertions of their epoch, and a
+/// clone reports the epoch its source does.
+#[test]
+fn removed_keys_stay_distinct_insertions_and_a_clone_agrees() {
+    macro_rules! check {
+        ($map:ty) => {{
+            let mut map = <$map>::with_capacity(512);
+            fill_identity!(map, 0..200);
+            for key in 0..10 {
+                assert_eq!(map.remove(&key), Some(key));
+            }
+            let epoch = map.epoch();
+            assert_eq!(epoch.distinct_insertions, 200);
+            assert!(epoch.had_delete);
+            assert_eq!(map.clone().epoch(), epoch);
+
+            fill_identity!(map, 200..210);
+            let epoch = map.epoch();
+            assert_eq!(epoch.distinct_insertions, 210);
+            assert_eq!(map.clone().epoch(), epoch);
+        }};
+    }
+    check!(FunnelHashMap<usize, usize>);
+    check!(ElasticHashMap<usize, usize>);
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn bulk_removal_cleans_tombstones_after_iteration_finishes() {

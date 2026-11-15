@@ -2730,8 +2730,11 @@ where
     }
 
     fn epoch_snapshot(&self) -> EpochSnapshot {
-        let mut snapshot = self.epoch.snapshot(self.entries());
-        snapshot.had_delete |= self.uncounted_deletes() != 0;
+        // The epoch has yet to see the uncounted deletes, and the entry
+        // count already has.
+        let uncounted = self.uncounted_deletes();
+        let mut snapshot = self.epoch.snapshot(self.entries() + uncounted);
+        snapshot.had_delete |= uncounted != 0;
         snapshot
     }
 
