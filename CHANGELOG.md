@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2](https://github.com/aaron-ang/opthash-rs/compare/v0.12.1...v0.12.2) - 2026-11-15
+
+### Other
+
+- use one initial capacity and document the prefetch constants ([#189](https://github.com/aaron-ang/opthash-rs/pull/189))
+- prefetch placements ahead during large rebuilds ([#185](https://github.com/aaron-ang/opthash-rs/pull/185))
+- Use plain Renovate schedule and grouping
+
 ## [0.12.1](https://github.com/aaron-ang/opthash-rs/compare/v0.12.0...v0.12.1) - 2026-11-06
 
 ### Added
