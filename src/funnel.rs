@@ -508,6 +508,15 @@ struct Vacancy {
     level_bit: u16,
 }
 
+/// A free slot of the head walk, and the key's level bin once an entry placed
+/// there is recorded: the bin the walk was given with the bit of the slot's
+/// level set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeadVacancy {
+    slot: usize,
+    bins: u16,
+}
+
 /// A live entry and the slot that holds it. Lookups return both, so a caller
 /// that wants the entry need not re-derive its address from the slot.
 struct Found<'a, K, V> {
@@ -1529,16 +1538,24 @@ where
     /// then its first free slot. `None` hands the insert to the general walk:
     /// a probe word not accepted for certain, which is every word of a shape
     /// without lanes, or no vacancy in those levels.
+    ///
+    /// `bins` is the key's level bin. Each step sets its own level's bit in
+    /// it, so the insert stores the bin it gets back and no step hands a bit
+    /// on to be merged later.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn first_empty_in_head(&self, probe: PreparedFastFunnelProbe) -> Option<Vacancy> {
+    fn first_empty_in_head(
+        &self,
+        probe: PreparedFastFunnelProbe,
+        bins: u16,
+    ) -> Option<HeadVacancy> {
         // One copy of the step per level, each with a constant index: the
         // walk then keeps no index and checks no bound.
         macro_rules! walk {
             ($($index:literal)*) => {
                 const { assert!([$($index),*].len() == OVERFLOW_LEVEL) };
                 $(
-                    if let Some(vacancy) = self.first_empty_in_head_level(probe, $index).ok()? {
+                    if let Some(vacancy) = self.first_empty_in_head_level(probe, $index, bins).ok()? {
                         return Some(vacancy);
                     }
                 )*
@@ -1557,7 +1574,8 @@ where
         &self,
         probe: PreparedFastFunnelProbe,
         index: usize,
-    ) -> Result<Option<Vacancy>, ()> {
+        bins: u16,
+    ) -> Result<Option<HeadVacancy>, ()> {
         let level = &self.shape.head[index];
         let bucket =
             probe::ordinary_funnel_first_certain_index(probe, level.multiplier, level.bucket_range)
@@ -1568,9 +1586,9 @@ where
         let empty = unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), CTRL_EMPTY) }
             .0
             & self.shape.bucket_lanes;
-        Ok((empty != 0).then(|| Vacancy {
+        Ok((empty != 0).then(|| HeadVacancy {
             slot: start + (empty.trailing_zeros() / BITMASK_STRIDE) as usize,
-            level_bit: level_bit_of(index),
+            bins: bins | level_bit_of(index),
         }))
     }
 
@@ -1890,14 +1908,15 @@ where
     /// Where an absent key goes in a table without tombstones and below its
     /// insertion limit: the first EMPTY lane of the placement walk over the
     /// levels that own a level-bin bit. `None` leaves the placement to the
-    /// general insert.
+    /// general insert. `bins` is the key's level bin, as for
+    /// [`Self::first_empty_in_head`].
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn head_vacancy(&self, probe: PreparedFastFunnelProbe) -> Option<Vacancy> {
+    fn head_vacancy(&self, probe: PreparedFastFunnelProbe, bins: u16) -> Option<HeadVacancy> {
         if self.tombstones != 0 || self.len >= self.shape.max_insertions {
             return None;
         }
-        self.first_empty_in_head(probe)
+        self.first_empty_in_head(probe, bins)
     }
 
     /// Stores an absent key at the vacancy [`Self::head_vacancy`] reported
@@ -1905,9 +1924,10 @@ where
     ///
     /// # Safety
     ///
-    /// `vacancy` must come from [`Self::head_vacancy`] and `gate` from the
-    /// filter word of `membership`, itself from [`Self::membership_slot`],
-    /// with no write to the table since any of them was read.
+    /// `gate` must come from the filter word of `membership`, itself from
+    /// [`Self::membership_slot`], and `vacancy` from [`Self::head_vacancy`]
+    /// over the gate's level bin, with no write to the table since any of
+    /// them was read.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     unsafe fn place_in_head(
@@ -1917,9 +1937,9 @@ where
         membership: MembershipSlot,
         gate: MembershipGate,
         probe: PreparedFastFunnelProbe,
-        vacancy: Vacancy,
+        vacancy: HeadVacancy,
     ) {
-        debug_assert_eq!(vacancy.level_bit, self.level_bit(vacancy.slot));
+        debug_assert_eq!(vacancy.bins, gate.levels | self.level_bit(vacancy.slot));
         debug_assert_ne!(self.membership.region.words, 0);
         // Every table word this insert needs is read before its first
         // store, which could otherwise force each to be loaded again:
@@ -1943,7 +1963,7 @@ where
         // `&mut self` makes the access exclusive.
         unsafe {
             (*metadata).membership = gate.word | membership.bits;
-            (*metadata).level_bins[membership.bin] |= vacancy.level_bit;
+            (*metadata).level_bins[membership.bin] = vacancy.bins;
         }
         self.len = len + 1;
     }
@@ -1955,28 +1975,28 @@ where
     fn insert_general(&mut self, key: K, value: V, hash: u64) -> Option<V> {
         // Same gate and, behind it, the same search as a lookup: a key the
         // filter never recorded is absent, and one it did is found by the
-        // levels its bin recorded. Either way the placement walk then runs
-        // on its own.
+        // levels its bin recorded. A recorded key that is absent gets the
+        // head placement the caller already tried for an unrecorded one.
         let mut membership = self.membership_slot(hash);
         let gate = self.membership_gate_at(membership);
-        if gate.passes()
-            && let Some(slot) = self.find_after_gate::<K, FoundSlot>(&key, hash, gate.levels)
-        {
-            return Some(map::TableBackend::replace_value(self, slot, value));
-        }
-        let probe = self.prf.prepare(hash);
-        if let Some(vacancy) = self.head_vacancy(probe) {
-            // SAFETY: slot, gate and vacancy were read just above, with no
-            // write since.
-            unsafe { self.place_in_head(key, value, membership, gate, probe, vacancy) };
-            return None;
+        if gate.passes() {
+            if let Some(slot) = self.find_after_gate::<K, FoundSlot>(&key, hash, gate.levels) {
+                return Some(map::TableBackend::replace_value(self, slot, value));
+            }
+            let probe = self.prf.prepare(hash);
+            if let Some(vacancy) = self.head_vacancy(probe, gate.levels) {
+                // SAFETY: slot, gate and vacancy were read just above, with
+                // no write since.
+                unsafe { self.place_in_head(key, value, membership, gate, probe, vacancy) };
+                return None;
+            }
         }
         if self.prepare_vacant_insert() {
             // Growth rebuilt the arena and its filter; the filter slot from
             // before it is stale.
             membership = self.membership_slot(hash);
         }
-        let vacancy = self.search_vacancy(probe);
+        let vacancy = self.search_vacancy(self.prf.prepare(hash));
         self.place_absent_after_search(key, value, hash, membership, vacancy);
         None
     }
@@ -2436,7 +2456,7 @@ where
         let gate = self.membership_gate_at(membership);
         if !gate.passes() {
             let probe = self.prf.prepare(hash);
-            if let Some(vacancy) = self.head_vacancy(probe) {
+            if let Some(vacancy) = self.head_vacancy(probe, gate.levels) {
                 // SAFETY: slot, gate and vacancy were read just above, with
                 // no write since.
                 unsafe { self.place_in_head(key, value, membership, gate, probe, vacancy) };
