@@ -55,8 +55,9 @@ enum FunnelScanMode {
 }
 
 /// Entries of [`FunnelShape::head`]: one per level that owns a level-bin bit,
-/// then absent entries up to a power of two.
-const HEAD_LEVELS: usize = (OVERFLOW_LEVEL + 1).next_power_of_two();
+/// then absent entries up to the one that the leading zeros of an empty
+/// recorded set index.
+const HEAD_ENTRIES: usize = u32::BITS as usize + 1;
 
 // Declaration order is layout order: a draw reads the multiplier with the
 // bucket count, and a tested draw the threshold with the offset.
@@ -92,7 +93,7 @@ struct FunnelShape {
     /// index them without the pointer chase or a bounds check. Every other
     /// entry, the last one always among them, is [`LevelShape::ABSENT`], and
     /// so is every entry of a shape without [`Self::bucket_lanes`].
-    head: [LevelShape; HEAD_LEVELS],
+    head: [LevelShape; HEAD_ENTRIES],
 }
 
 impl LevelShape {
@@ -112,7 +113,7 @@ struct RecordedHead<'a> {
     /// stands for the head entry `distance` entries past `entry`.
     pending: u32,
     entry: *const LevelShape,
-    head: PhantomData<&'a [LevelShape; HEAD_LEVELS]>,
+    head: PhantomData<&'a [LevelShape; HEAD_ENTRIES]>,
 }
 
 impl<'a> RecordedHead<'a> {
@@ -155,7 +156,7 @@ impl FunnelShape {
             n: 0,
             max_insertions: 0,
             levels: Box::new([]),
-            head: [LevelShape::ABSENT; HEAD_LEVELS],
+            head: [LevelShape::ABSENT; HEAD_ENTRIES],
             beta: 0,
             loglog_ceiling: 0,
             primary_offset: 0,
@@ -227,7 +228,7 @@ impl FunnelShape {
         let loglog_ceiling =
             u8::try_from(plan.loglog_ceiling()).map_err(|_| TryReserveError::CapacityOverflow)?;
         let bucket_lanes = bucket_lanes(plan.beta());
-        let mut head = [LevelShape::ABSENT; HEAD_LEVELS];
+        let mut head = [LevelShape::ABSENT; HEAD_ENTRIES];
         if bucket_lanes != 0 {
             for (slot, level) in head.iter_mut().zip(levels.iter().take(OVERFLOW_LEVEL)) {
                 *slot = *level;
@@ -1314,9 +1315,23 @@ where
             let found = unsafe { self.found_at(slot) };
             key.equivalent(&found.entry.key).then_some(found)
         };
-        // Without lanes no scan matches.
-        for level in RecordedHead::new(&self.shape, levels) {
-            let (start, mut matches) = scan(level);
+        // The walk tests for the end after a scan, not before one. An empty
+        // set scans the head's last entry, which is absent and so matches
+        // nothing, as does every scan of a shape without lanes.
+        // A passed gate means a recorded key, so the table has slots.
+        debug_assert_ne!(self.shape.n, 0);
+        let mut pending = recorded_head_levels(levels);
+        let mut entry = self.shape.head.as_ptr();
+        loop {
+            let distance = pending.leading_zeros();
+            // SAFETY: as in `RecordedHead::next`, except that an empty set
+            // has `u32::BITS` leading zeros and is stepped only from the
+            // head's first entry, to its entry at that index.
+            entry = unsafe { entry.add(distance as usize) };
+            // An empty set shifts by its whole width, which wraps to none.
+            pending = pending.wrapping_shl(distance) & !SHALLOWEST_LEVEL;
+            // SAFETY: as above; the head outlives the borrow of `self`.
+            let (start, mut matches) = scan(unsafe { &*entry });
             while matches != 0 {
                 if let Some(found) = holding_key(start, matches) {
                     return Some(found);
@@ -1325,8 +1340,10 @@ where
                 rarely_taken();
                 matches &= matches - 1;
             }
+            if pending == 0 {
+                return None;
+            }
         }
-        None
     }
 
     /// Whether a lookup [`Self::first_match`] found nothing for is absent.

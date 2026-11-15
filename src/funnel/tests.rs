@@ -963,7 +963,7 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
         assert_eq!(shape.bucket_lanes, 0, "n {}", shape.n);
         assert_eq!(
             shape.head,
-            [LevelShape::ABSENT; HEAD_LEVELS],
+            [LevelShape::ABSENT; HEAD_ENTRIES],
             "n {}",
             shape.n
         );
