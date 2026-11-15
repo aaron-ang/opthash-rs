@@ -881,8 +881,9 @@ unsafe fn first_free_in_bucket(ctrl_ptr: *const u8, start: usize, length: usize)
 /// Paper-exact Funnel hashing within each table epoch. Deletion, growth, and
 /// exceptional collision recovery are built-in dynamic-map behavior beyond
 /// the paper's fixed-size insertion model.
-// Declaration order is layout order; see [`FunnelShape`], which comes last
-// for its head array.
+// Declaration order is layout order. The hasher and the allocator come last,
+// so their sizes move no other field, and the shape, with its head array,
+// comes after every other word of the table.
 #[repr(C)]
 pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     storage: FlatStorage<SlotEntry<K, V>>,
@@ -893,9 +894,7 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// Cached location of the membership filter tail. Lookups load one word
     /// from it before probing; see [`crate::membership`].
     membership: FilterTail,
-    hash_builder: S,
     reserve_fraction: ReserveFraction,
-    alloc: A,
     arena: Arena,
     epoch: EpochState,
     exceptional_placement: bool,
@@ -905,6 +904,8 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     tombstones: usize,
     len: usize,
     shape: FunnelShape,
+    hash_builder: S,
+    alloc: A,
 }
 
 // SAFETY: the table uniquely owns its arena and every `K`/`V` in it; no
