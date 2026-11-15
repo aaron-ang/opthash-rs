@@ -292,6 +292,55 @@ fn refresh_membership_rebuilds_the_recorded_filter() {
     );
 }
 
+/// Every control byte and filter word of `table`.
+fn controls_and_filter(
+    table: &FunnelTable<u64, u64, IdentityBuildHasher>,
+) -> (Vec<u8>, Vec<MetadataWord>) {
+    // SAFETY: `slot < n`, the storage capacity.
+    let controls = (0..table.shape.n)
+        .map(|slot| unsafe { table.storage.control_at(slot) })
+        .collect();
+    // SAFETY: the filter tail holds `membership.region.words` initialized words.
+    let filter = unsafe {
+        core::slice::from_raw_parts(table.membership_ptr(), table.membership.region.words).to_vec()
+    };
+    (controls, filter)
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn frameless_insert_places_and_records_like_the_general_insert() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    for (n, d) in [(344, 4), (4096, 3), (1 << 14, 3)] {
+        let mut inline = raw_table(n, d);
+        let mut general = raw_table(n, d);
+        let budget = inline.shape.max_insertions as u64;
+        for index in 0..budget {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(
+                map::TableBackend::insert(&mut inline, key, index, key),
+                None
+            );
+            assert_eq!(general.insert_general(key, index, key), None);
+        }
+        assert_eq!(inline.len, general.len);
+        assert_eq!(controls_and_filter(&inline), controls_and_filter(&general));
+        for index in 0..budget {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(
+                inline.find_location(&key, key),
+                general.find_location(&key, key),
+                "n {n} d {d} index {index}"
+            );
+            assert_eq!(
+                map::TableBackend::insert(&mut inline, key, index + 1, key),
+                Some(index)
+            );
+        }
+        assert_eq!(inline.len, general.len);
+    }
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn clean_and_dirty_search_modes_agree_without_tombstones() {
