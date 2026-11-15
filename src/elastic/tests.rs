@@ -7,6 +7,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::exact::reference::{ScalarElastic, ScalarElasticLimits};
+use crate::map::TableBackend;
 use crate::test_support::{
     self, CountDrop, Deterministic, FixedElasticHashMap, FixedHashBuilder, IdentityBuildHasher,
     PanicHashKey, PanicOnFirstDrop, ToggleAllocator, fixed_hasher,
@@ -1536,4 +1537,370 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
         .choose_slot_for_new_key(prepared.route.probe, BatchTarget::LevelPair(LEVEL))
         .expect("Case 1 falls through to the next level");
     assert_eq!(placement.level, LEVEL + 1);
+}
+
+/// Every key of a full map whose level-`level` route starts at a slot other
+/// than its own, with the key that holds that first slot.
+fn keys_behind_another_on_their_route(
+    map: &FixedElasticHashMap<u64, u64>,
+    keys: u64,
+) -> Vec<(u64, u64, usize, usize)> {
+    let table = map.table();
+    let mut behind = Vec::new();
+    for key in 0..keys {
+        let hash = table.hash_builder.hash_one(key);
+        let (level, slot) = table.find(&key, hash).unwrap();
+        let region = &table.levels[level];
+        let (word, _) = PreparedElasticKey::new(hash)
+            .route
+            .probe
+            .sequence(table.fold_multiplier)
+            .level_run(level);
+        let first = probe::shifted_elastic_index(word, region.index_shift);
+        if first != slot {
+            assert!(control::is_occupied(region.checked_control(first)));
+            // SAFETY: the slot is in bounds and occupied, checked above.
+            let ahead = unsafe { region.get_ref(first) }.key;
+            behind.push((ahead, key, level, first));
+        }
+    }
+    behind
+}
+
+#[test]
+fn lookup_passes_a_tombstone_ahead_of_a_live_key_on_its_route() {
+    const KEYS: u64 = 2_048;
+    let mut map: FixedElasticHashMap<u64, u64> =
+        FixedElasticHashMap::with_capacity(usize::try_from(KEYS).unwrap());
+    for key in 0..KEYS {
+        map.insert(key, key);
+    }
+    assert_ne!(map.table().levels[0].index_shift, GENERAL_REDUCTION);
+    let behind = keys_behind_another_on_their_route(&map, KEYS);
+    assert!(behind.len() > 64);
+
+    let mut removed = alloc::collections::BTreeSet::new();
+    for &(ahead, survivor, level, first) in &behind {
+        if removed.contains(&survivor) || !removed.insert(ahead) {
+            continue;
+        }
+        assert_eq!(map.remove(&ahead), Some(ahead));
+        assert_eq!(
+            map.table().levels[level].checked_control(first),
+            CTRL_TOMBSTONE
+        );
+        assert_eq!(map.get(&survivor), Some(&survivor));
+    }
+    for key in 0..KEYS {
+        assert_eq!(map.get(&key).is_some(), !removed.contains(&key));
+    }
+}
+
+/// Logical probes of `level` the schedule holds, in order.
+fn scheduled_logical_probes<K, V, S, A: Allocator + Clone>(
+    table: &ElasticTable<K, V, S, A>,
+    level: usize,
+) -> Vec<u64> {
+    let mut logical = table
+        .probe_schedule
+        .routes()
+        .iter()
+        .filter(|route| route.level as usize == level)
+        .map(|route| probe::elastic_sequence_coordinates(route.sequence_index).1)
+        .collect::<Vec<_>>();
+    logical.sort_unstable();
+    logical
+}
+
+#[test]
+fn first_entry_in_a_deeper_level_reschedules_through_that_level() {
+    const KEYS: u64 = 3_000;
+    let mut map: FixedElasticHashMap<u64, u64> =
+        FixedElasticHashMap::with_capacity(usize::try_from(KEYS).unwrap());
+    let mut reschedules = 0;
+    let mut scheduled_levels = 0;
+    for key in 0..KEYS {
+        map.insert(key, key);
+        let table = map.table();
+        let deepest = table
+            .levels
+            .iter()
+            .rposition(|level| level.len > 0)
+            .unwrap();
+        assert!(deepest < table.scheduled_levels as usize);
+        if table.scheduled_levels != scheduled_levels {
+            assert_eq!(table.scheduled_levels as usize, deepest + 1);
+            assert_eq!(table.levels[deepest].len, 1);
+            scheduled_levels = table.scheduled_levels;
+            reschedules += 1;
+        }
+
+        // Every scheduled level holds its first `scheduled_probes` probes
+        // (level zero's first is the direct slot), and the deepest holds no
+        // more than that.
+        let covered = u64::from(table.scheduled_probes);
+        for level in 0..table.scheduled_levels as usize {
+            let direct = u64::from(level == 0);
+            let logical = scheduled_logical_probes(table, level);
+            assert!(
+                logical
+                    .iter()
+                    .copied()
+                    .eq(direct..direct + logical.len() as u64)
+            );
+            assert!(direct + logical.len() as u64 >= covered);
+        }
+        let deepest_scheduled = table.scheduled_levels as usize - 1;
+        let direct = u64::from(deepest_scheduled == 0);
+        assert_eq!(
+            direct + scheduled_logical_probes(table, deepest_scheduled).len() as u64,
+            covered
+        );
+        assert_eq!(map.get(&key), Some(&key));
+    }
+    assert!(reschedules >= 3);
+    for key in 0..KEYS {
+        assert_eq!(map.get(&key), Some(&key));
+    }
+}
+
+fn assert_reinsert_replaces<S: BuildHasher + Clone>(
+    table: &mut ElasticTable<u64, u64, S>,
+    keys: u64,
+) {
+    let len = table.len;
+    for key in 0..keys {
+        let hash = table.hash_builder.hash_one(key);
+        assert_eq!(table.insert(key, key ^ 0xff, hash), Some(key));
+        assert_eq!(table.find_value(&key, hash), Some(&(key ^ 0xff)));
+    }
+    assert_eq!(table.len, len);
+    let hash = table.hash_builder.hash_one(keys);
+    assert_eq!(table.insert(keys, 1, hash), None);
+    assert_eq!(table.len, len + 1);
+    assert_eq!(table.find_value(&keys, hash), Some(&1));
+}
+
+#[test]
+fn reinsert_replaces_the_value_on_a_general_reduction_table() {
+    const KEYS: u64 = 600;
+    let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            1_000,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+    assert_eq!(table.levels[0].index_shift, GENERAL_REDUCTION);
+    for key in 0..KEYS {
+        let hash = table.hash_builder.hash_one(key);
+        assert_eq!(table.insert(key, key, hash), None);
+    }
+    assert_reinsert_replaces(&mut table, KEYS);
+}
+
+#[test]
+fn reinsert_replaces_the_value_on_a_table_flagged_exceptional() {
+    const KEYS: u64 = 600;
+    let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            1_024,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+    assert_ne!(table.levels[0].index_shift, GENERAL_REDUCTION);
+    for key in 0..KEYS {
+        let hash = table.hash_builder.hash_one(key);
+        assert_eq!(table.insert(key, key, hash), None);
+    }
+    // The flag only widens a lookup, so raising it by hand is a valid state.
+    table.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG;
+    assert_reinsert_replaces(&mut table, KEYS);
+}
+
+#[test]
+fn shifted_vacancy_search_agrees_with_the_general_one() {
+    let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(1_024);
+    for key in 0..900 {
+        map.insert(key, key);
+    }
+    let table = map.table();
+    assert_ne!(table.levels[0].index_shift, GENERAL_REDUCTION);
+    let mut found = 0;
+    let mut missed = 0;
+    for key in 0..2_000_u64 {
+        let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
+            .route
+            .probe;
+        for level in 0..table.levels.len() {
+            for budget in [0, 1, 2, 7, 64] {
+                // SAFETY: level zero reduces by shift, so every level does.
+                let shifted = unsafe { table.first_shifted_vacancy(probe, level, budget) };
+                assert_eq!(shifted, table.first_vacancy_general(probe, level, budget));
+                if shifted.is_some() {
+                    found += 1;
+                } else {
+                    missed += 1;
+                }
+            }
+        }
+    }
+    assert!(found > 1_000 && missed > 1_000);
+}
+
+#[test]
+fn levels_reduce_all_by_shift_or_all_by_the_general_reduction() {
+    let mut shifted_tables = 0;
+    let mut general_tables = 0;
+    let mut single_slot_levels = 0;
+    for slots in [
+        1, 2, 3, 4, 7, 8, 16, 31, 64, 100, 1_000, 1_024, 4_096, 5_000, 65_536,
+    ] {
+        let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                slots,
+                ReserveFraction::DEFAULT,
+                fixed_hasher(),
+                Global,
+            )
+            .unwrap();
+        let shifts = table
+            .levels
+            .iter()
+            .map(|level| probe::elastic_index_shift(level.capacity()))
+            .collect::<Vec<_>>();
+        single_slot_levels += table
+            .levels
+            .iter()
+            .filter(|level| level.capacity() == 1)
+            .count();
+        if shifts.iter().all(Option::is_some) {
+            shifted_tables += 1;
+            for (level, shift) in table.levels.iter().zip(&shifts) {
+                assert_eq!(Some(level.index_shift), *shift);
+            }
+        } else {
+            general_tables += 1;
+            for level in &table.levels {
+                assert_eq!(level.index_shift, GENERAL_REDUCTION);
+            }
+        }
+
+        let keys = table.max_insertions as u64;
+        for key in 0..keys {
+            let hash = table.hash_builder.hash_one(key);
+            assert_eq!(table.insert(key, key, hash), None);
+        }
+        for key in 0..keys {
+            let hash = table.hash_builder.hash_one(key);
+            assert_eq!(table.find_value(&key, hash), Some(&key));
+        }
+    }
+    assert!(shifted_tables > 0 && general_tables > 0 && single_slot_levels > 0);
+}
+
+#[test]
+fn clone_carries_the_schedule_onto_its_own_levels() {
+    const KEYS: u64 = 3_000;
+    let mut map: FixedElasticHashMap<u64, u64> =
+        FixedElasticHashMap::with_capacity(usize::try_from(KEYS).unwrap());
+    for key in 0..KEYS - 64 {
+        map.insert(key, key);
+    }
+    let mut cloned = map.clone();
+    {
+        let (source, copy) = (map.table(), cloned.table());
+        assert!(source.scheduled_levels >= 3);
+        assert_eq!(copy.scheduled_levels, source.scheduled_levels);
+        assert_eq!(copy.scheduled_probes, source.scheduled_probes);
+        assert_eq!(copy.probe_high_water, source.probe_high_water);
+        assert_eq!(
+            copy.probe_schedule.routes().len(),
+            source.probe_schedule.routes().len()
+        );
+        for (ours, theirs) in copy
+            .probe_schedule
+            .routes()
+            .iter()
+            .zip(source.probe_schedule.routes())
+        {
+            assert_eq!(
+                (ours.level, ours.index_shift, ours.sequence_index),
+                (theirs.level, theirs.index_shift, theirs.sequence_index)
+            );
+            assert_eq!(
+                ours.control,
+                copy.levels[ours.level as usize].ctrl_ptr.cast_const()
+            );
+            assert_ne!(ours.control, theirs.control);
+        }
+        assert_eq!(
+            copy.probe_schedule.routes.last(),
+            Some(&ProbeSchedule::SENTINEL)
+        );
+    }
+    drop(map);
+    for key in 0..KEYS - 64 {
+        assert_eq!(cloned.get(&key), Some(&key));
+    }
+    for key in KEYS - 64..KEYS {
+        cloned.insert(key, key);
+    }
+    for key in 0..KEYS {
+        assert_eq!(cloned.get(&key), Some(&key));
+    }
+    assert_eq!(cloned.get(&KEYS), None);
+}
+
+#[test]
+fn seeded_operation_mix_matches_std_hash_map() {
+    const KEY_SPACE: u64 = 3_000;
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(16);
+    let mut model = std::collections::HashMap::<u64, u64>::new();
+    for step in 0..200_000_u64 {
+        let roll = next() % 10_000;
+        let key = next() % KEY_SPACE;
+        match roll {
+            0..5_000 => assert_eq!(map.insert(key, step), model.insert(key, step)),
+            5_000..7_500 => assert_eq!(map.remove(&key), model.remove(&key)),
+            7_500..9_980 => assert_eq!(map.get(&key), model.get(&key)),
+            9_980..9_988 => {
+                let modulus = 2 + next() % 5;
+                map.retain(|key, _| key % modulus != 0);
+                model.retain(|key, _| key % modulus != 0);
+            }
+            9_988..9_992 => {
+                let mut drained = map.drain().collect::<Vec<_>>();
+                let mut expected = model.drain().collect::<Vec<_>>();
+                drained.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(drained, expected);
+            }
+            9_992..9_995 => {
+                map.clear();
+                model.clear();
+            }
+            _ => map = map.clone(),
+        }
+        assert_eq!(map.len(), model.len());
+        if step % 4_096 == 0 {
+            for key in 0..KEY_SPACE {
+                assert_eq!(map.get(&key), model.get(&key));
+            }
+            assert_eq!(map.iter().count(), model.len());
+        }
+    }
+    for key in 0..KEY_SPACE {
+        assert_eq!(map.get(&key), model.get(&key));
+    }
 }
