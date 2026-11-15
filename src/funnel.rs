@@ -62,7 +62,8 @@ enum FunnelScanMode {
 struct LevelShape {
     offset: usize,
     bucket_range: PreparedProbeRange,
-    ordinary_counter_base: u64,
+    /// See [`FunnelPrf::ordinary_multiplier`].
+    multiplier: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -126,7 +127,7 @@ impl FunnelShape {
                 offset,
                 bucket_range: PreparedProbeRange::new(bucket_count)
                     .map_err(|_| TryReserveError::CapacityOverflow)?,
-                ordinary_counter_base: FunnelPrf::ordinary_counter_base(level_index as u64)
+                multiplier: FunnelPrf::ordinary_multiplier(level_index as u64)
                     .ok_or(TryReserveError::CapacityOverflow)?,
             });
             offset = offset
@@ -819,6 +820,17 @@ where
         Self::try_from_shape(shape, reserve_fraction, hash_builder, alloc).map_err(Into::into)
     }
 
+    /// Bucket of the key in ordinary level `index`, whose shape is `level`.
+    #[inline]
+    fn sample_ordinary(
+        probe: PreparedFastFunnelProbe,
+        level: &LevelShape,
+        index: usize,
+    ) -> Option<usize> {
+        probe::ordinary_funnel_first_index(probe, level.multiplier, level.bucket_range)
+            .or_else(|| probe::ordinary_funnel_retry_index(probe, index, level.bucket_range))
+    }
+
     #[inline]
     fn sample(
         prepared: &PreparedFastFunnelDomainProbe,
@@ -922,9 +934,8 @@ where
         }
         let mut first_tombstone = None;
 
-        for level in &self.shape.levels {
-            let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
-            let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) else {
+        for (index, level) in self.shape.levels.iter().enumerate() {
+            let Some(bucket) = Self::sample_ordinary(probe, level, index) else {
                 return first_tombstone.map_or(SearchResult::RangeFailure, SearchResult::Vacant);
             };
             let start = level.offset + bucket * self.shape.beta;
@@ -1057,10 +1068,10 @@ where
     {
         let mut ordinary = levels & !OVERFLOW_LEVEL_BIT;
         while ordinary != 0 {
-            let level = &self.shape.levels[ordinary.trailing_zeros() as usize];
+            let index = ordinary.trailing_zeros() as usize;
             ordinary &= ordinary - 1;
             // A range failure here ended the key's placement walk too.
-            match self.lookup_level(key, probe, level, key_fingerprint)? {
+            match self.lookup_level(key, probe, index, key_fingerprint)? {
                 BucketScanResult::Hit(slot) => return Some(slot),
                 BucketScanResult::Empty(_) => return None,
                 BucketScanResult::Full => {}
@@ -1108,9 +1119,9 @@ where
         // bucket's first slot.
         let scan = |level: u32| -> Result<(usize, u64), ()> {
             let level = self.shape.levels.get(level as usize).ok_or(())?;
-            let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
-            let bucket = probe::first_word_funnel_probe_index(&level_probe, 0, level.bucket_range)
-                .ok_or(())?;
+            let bucket =
+                probe::ordinary_funnel_first_index(probe, level.multiplier, level.bucket_range)
+                    .ok_or(())?;
             let start = level.offset + bucket * self.shape.beta;
             // SAFETY: an ordinary bucket ends at or before `n`, and the control
             // array pads `GROUP_SIZE - 1` bytes past `n`.
@@ -1168,8 +1179,8 @@ where
         Ok(None)
     }
 
-    /// Tombstone-blind scan of the key's bucket in one ordinary level; `None`
-    /// is a range failure.
+    /// Tombstone-blind scan of the key's bucket in ordinary level `index`;
+    /// `None` is a range failure.
     ///
     /// Forced inline: with two callers LLVM outlines it, and the call per
     /// visited level costs more than the scan.
@@ -1179,14 +1190,14 @@ where
         &self,
         key: &Q,
         probe: PreparedFastFunnelProbe,
-        level: &LevelShape,
+        index: usize,
         key_fingerprint: u8,
     ) -> Option<BucketScanResult<usize>>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
-        let bucket = Self::sample(&level_probe, 0, level.bucket_range)?;
+        let level = &self.shape.levels[index];
+        let bucket = Self::sample_ordinary(probe, level, index)?;
         let start = level.offset + bucket * self.shape.beta;
         // SAFETY: an ordinary bucket ends at or before `n`, and the control
         // array pads `GROUP_SIZE - 1` bytes past `n`; matched lanes carry the
@@ -1224,8 +1235,8 @@ where
         if self.shape.n == 0 {
             return None;
         }
-        for level in self.shape.levels.get(OVERFLOW_LEVEL..).unwrap_or_default() {
-            match self.lookup_level(key, probe, level, key_fingerprint)? {
+        for index in OVERFLOW_LEVEL..self.shape.levels.len() {
+            match self.lookup_level(key, probe, index, key_fingerprint)? {
                 BucketScanResult::Hit(slot) => return Some(slot),
                 BucketScanResult::Empty(_) => return None,
                 BucketScanResult::Full => {}
@@ -1307,8 +1318,7 @@ where
         }
         let ctrl_ptr = self.storage.ctrl_ptr();
         for (index, level) in self.shape.levels.iter().enumerate() {
-            let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
-            let bucket = Self::sample(&level_probe, 0, level.bucket_range)?;
+            let bucket = Self::sample_ordinary(probe, level, index)?;
             let start = level.offset + bucket * self.shape.beta;
             // SAFETY: an ordinary bucket ends at or before `n`, and the control
             // array pads `GROUP_SIZE - 1` bytes past `n`.
@@ -1904,8 +1914,7 @@ where
             return;
         };
         let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
-        let level_probe = probe.prepare_counter_base(level.ordinary_counter_base);
-        if let Some(bucket) = Self::sample(&level_probe, 0, level.bucket_range) {
+        if let Some(bucket) = Self::sample_ordinary(probe, level, 0) {
             self.storage
                 .prefetch_slot(level.offset + bucket * self.shape.beta);
         }

@@ -63,6 +63,10 @@ pub(crate) struct CounterPrf {
 /// The packed counter preserves the paper algorithm's distinct ordinary,
 /// primary, and two fallback choices. The construction is deterministic and
 /// does not establish the paper's random-oracle assumptions.
+///
+/// The first word of an ordinary level is the exception: it comes from
+/// [`Self::ordinary_multiplier`], not from a counter. Retries in that level
+/// and the special arrays draw counter words.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FunnelPrf {
     seed: u64,
@@ -154,6 +158,15 @@ impl FunnelPrf {
         }
     }
 
+    /// Odd multiplier that turns a key's mixed word into its first random
+    /// word in ordinary level `level`.
+    pub(crate) const fn ordinary_multiplier(level: u64) -> Option<u64> {
+        match Self::ordinary_counter_base(level) {
+            Some(counter_base) => Some(mix64(counter_base ^ INITIAL_LANE) | 1),
+            None => None,
+        }
+    }
+
     pub(crate) const fn ordinary_counter_base(level: u64) -> Option<u64> {
         try_pack_funnel_counter(ProbeDomain::FunnelOrdinary { level }, 0, 0)
     }
@@ -186,6 +199,14 @@ impl ProbeOracle for FunnelPrf {
         logical_probe_index: u64,
         rejection_index: u32,
     ) -> u64 {
+        if let ProbeDomain::FunnelOrdinary { level } = domain
+            && logical_probe_index == 0
+            && rejection_index == 0
+        {
+            let multiplier = Self::ordinary_multiplier(level)
+                .expect("Funnel level exceeds its checked library encoding");
+            return self.prepare(key_hash).ordinary_first_word(multiplier);
+        }
         let counter = try_pack_funnel_counter(domain, logical_probe_index, rejection_index)
             .expect("Funnel counter tuple exceeds its checked library encoding");
         self.prepare(key_hash).word_from_counter(counter)
@@ -238,6 +259,11 @@ impl PreparedFastFunnelProbe {
     ) -> Option<PreparedFastFunnelDomainProbe> {
         let counter_base = try_pack_funnel_counter(domain, 0, 0)?;
         Some(self.prepare_counter_base(counter_base))
+    }
+
+    #[inline]
+    const fn ordinary_first_word(self, multiplier: u64) -> u64 {
+        self.key_out.wrapping_mul(multiplier)
     }
 
     #[inline]
@@ -487,28 +513,56 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
         });
     };
 
-    if let Some(index) = first_word_funnel_probe_index(probe, logical_probe_index, range) {
+    let upper_word = range.upper as u64;
+    let product =
+        u128::from(probe.word_from_indices(logical_probe_index, 0)) * u128::from(upper_word);
+    if product as u64 >= range.rejection_threshold {
         return Ok(ProbeIndex {
-            index,
+            index: (product >> u64::BITS) as usize,
             random_word_count: 1,
         });
     }
     reduce_prepared_funnel_retries(probe, logical_probe_index, range, last_rejection_index)
 }
 
-/// The index the first random word selects, or `None` when that word is
-/// rejected and the probe needs the retry path of
-/// [`unbiased_prepared_funnel_probe_index_in_range`].
+/// The bucket an ordinary level's first random word selects, or `None` when
+/// that word is rejected and the probe needs [`ordinary_funnel_retry_index`].
+///
+/// The first word of an ordinary level is the mixed key times that level's
+/// multiplier, not a counter word: `key_out` is already a full mix of the
+/// key, and a distinct odd multiplier per level decorrelates the levels with
+/// one multiply.
 #[allow(clippy::cast_possible_truncation)]
 #[inline]
-pub(crate) fn first_word_funnel_probe_index(
-    probe: &PreparedFastFunnelDomainProbe,
-    logical_probe_index: u8,
+pub(crate) fn ordinary_funnel_first_index(
+    probe: PreparedFastFunnelProbe,
+    multiplier: u64,
     range: PreparedProbeRange,
 ) -> Option<usize> {
-    let product = u128::from(probe.word_from_indices(logical_probe_index, 0))
-        * u128::from(range.upper as u64);
+    let product =
+        u128::from(probe.ordinary_first_word(multiplier)) * u128::from(range.upper as u64);
     (product as u64 >= range.rejection_threshold).then_some((product >> u64::BITS) as usize)
+}
+
+/// Counter words one to [`RANGE_WORD_CAP`] of ordinary level `level`, for a
+/// probe whose first word was rejected. `None` is a range failure.
+#[cold]
+#[inline(never)]
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn ordinary_funnel_retry_index(
+    probe: PreparedFastFunnelProbe,
+    level: usize,
+    range: PreparedProbeRange,
+) -> Option<usize> {
+    let counter_base = FunnelPrf::ordinary_counter_base(level as u64)?;
+    reduce_prepared_funnel_retries(
+        &probe.prepare_counter_base(counter_base),
+        0,
+        range,
+        (RANGE_WORD_CAP - 1) as u8,
+    )
+    .ok()
+    .map(|probe| probe.index)
 }
 
 #[cold]
