@@ -1371,9 +1371,9 @@ where
     }
 
     /// Whether a lookup [`Self::first_match`] found nothing for is absent.
-    /// Otherwise the ordered walk decides: a rejected probe word, which is
-    /// every word of a shape without lanes, or a key that may sit in the
-    /// overflow levels or outside its funnel.
+    /// Otherwise the ordered walk decides: a probe word not accepted for
+    /// certain, which is every word of a shape without lanes, or a key that
+    /// may sit in the overflow levels or outside its funnel.
     #[inline]
     fn unmatched_is_absent(&self, probe: PreparedFastFunnelProbe, levels: u16) -> bool {
         if levels & OVERFLOW_LEVEL_BIT != 0 || self.exceptional_placement {
@@ -1383,9 +1383,12 @@ where
         while unchecked != 0 {
             let level = self.shape.head_level(unchecked.trailing_zeros());
             unchecked &= unchecked - 1;
-            let (_, accepted) =
-                probe::ordinary_funnel_first_draw(probe, level.multiplier, level.bucket_range);
-            if !accepted {
+            let certain = probe::ordinary_funnel_first_certain_index(
+                probe,
+                level.multiplier,
+                level.bucket_range,
+            );
+            if certain.is_none() {
                 return false;
             }
         }
@@ -1551,8 +1554,8 @@ where
     /// [`Self::search_vacancy`] for a table without tombstones, over the levels
     /// that own a level-bin bit: the first EMPTY lane of the walk, which is
     /// then its first free slot. `None` hands the insert to the general walk:
-    /// a rejected probe word, which is every word of a shape without lanes,
-    /// or no vacancy in those levels.
+    /// a probe word not accepted for certain, which is every word of a shape
+    /// without lanes, or no vacancy in those levels.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn first_empty_in_head(&self, probe: PreparedFastFunnelProbe) -> Option<Vacancy> {
@@ -1573,8 +1576,8 @@ where
     }
 
     /// One step of [`Self::first_empty_in_head`]: the first EMPTY lane of the
-    /// key's bucket in head entry `index`, if it has one. `Err` is a rejected
-    /// probe word.
+    /// key's bucket in head entry `index`, if it has one. `Err` is a probe
+    /// word the exact test must decide.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn first_empty_in_head_level(
@@ -1584,7 +1587,7 @@ where
     ) -> Result<Option<Vacancy>, ()> {
         let level = &self.shape.head[index];
         let bucket =
-            probe::ordinary_funnel_first_index(probe, level.multiplier, level.bucket_range)
+            probe::ordinary_funnel_first_certain_index(probe, level.multiplier, level.bucket_range)
                 .ok_or(())?;
         let start = level.offset + bucket * self.shape.beta;
         // SAFETY: an ordinary bucket ends at or before `n`, and the control
@@ -2420,24 +2423,22 @@ where
         let membership = self.membership_slot(hash);
         let gate = self.membership_gate_at(membership);
         let probe = self.prf.prepare(hash);
+        let len = self.len;
         if !gate.passes()
             && self.tombstones == 0
-            && self.len < self.shape.max_insertions
+            && len < self.shape.max_insertions
             && let Some(vacancy) = self.first_empty_in_head(probe)
         {
             debug_assert_eq!(vacancy.level_bit, self.level_bit(vacancy.slot));
             debug_assert_ne!(self.membership.region.words, 0);
-            // Recorded ahead of the slot write, from the word the gate
-            // loaded: nothing wrote the filter in between, and a store to the
-            // slots would otherwise force the word to be loaded again.
+            // Every table word this insert needs is read before its first
+            // store, which could otherwise force each to be loaded again:
+            // the filter word's address here, the word itself by the gate,
+            // and the length above.
             // SAFETY: a table under a non-zero insertion limit has slots, so
             // its filter has words and `membership.index` is below their
-            // count; `&mut self` makes the borrow exclusive.
-            unsafe {
-                let metadata = &mut *self.membership_ptr().add(membership.index);
-                metadata.membership = gate.word | membership.bits;
-                metadata.level_bins[membership.bin] |= vacancy.level_bit;
-            }
+            // count.
+            let metadata = unsafe { self.membership_ptr().add(membership.index) };
             let key_fingerprint = probe.fingerprint();
             // SAFETY: the vacancy is an EMPTY lane of an ordinary bucket, and
             // `key_fingerprint` is an occupied control.
@@ -2448,7 +2449,13 @@ where
                     key_fingerprint,
                 );
             }
-            self.len += 1;
+            // SAFETY: `metadata` is this key's filter word, as above, and
+            // `&mut self` makes the access exclusive.
+            unsafe {
+                (*metadata).membership = gate.word | membership.bits;
+                (*metadata).level_bins[membership.bin] |= vacancy.level_bit;
+            }
+            self.len = len + 1;
             return None;
         }
         self.insert_general(key, value, hash)

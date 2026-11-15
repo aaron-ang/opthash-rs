@@ -613,6 +613,23 @@ pub(crate) fn ordinary_funnel_first_index(
     accepted.then_some(bucket)
 }
 
+/// [`ordinary_funnel_first_draw`]'s bucket when the range's upper bound alone
+/// shows the word accepted: the rejection threshold is below that bound, so a
+/// low product above the bound is at or above the threshold. `None` leaves
+/// the word to the exact test, and is the answer for every word of a range
+/// with no index.
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+pub(crate) fn ordinary_funnel_first_certain_index(
+    probe: PreparedFastFunnelProbe,
+    multiplier: u64,
+    range: PreparedProbeRange,
+) -> Option<usize> {
+    let upper = range.upper as u64;
+    let product = u128::from(probe.ordinary_first_word(multiplier)) * u128::from(upper);
+    (product as u64 > upper).then_some((product >> u64::BITS) as usize)
+}
+
 /// Counter words one to [`RANGE_WORD_CAP`] of ordinary level `level`, for a
 /// probe whose first word was rejected. `None` is a range failure.
 #[cold]
