@@ -358,7 +358,39 @@ struct FunnelLayout {
     membership: MembershipRegion,
 }
 
-type FunnelStorageBuild<K, V> = (Arena, FlatStorage<SlotEntry<K, V>>, MembershipRegion);
+/// A table's filter tail: where it sits in the arena, and its base address.
+#[derive(Clone, Copy)]
+struct FilterTail {
+    region: MembershipRegion,
+    /// The gate is a lookup's first dependent load, so its base is cached
+    /// rather than rebuilt from the arena base and region offset. An empty
+    /// region points at [`NO_FILTER_WORD`], which rejects every key, so the
+    /// gate needs no emptiness test; nothing writes through that pointer.
+    base: *mut MetadataWord,
+}
+
+/// The word an empty table's gate reads: nothing recorded.
+static NO_FILTER_WORD: MetadataWord = MetadataWord {
+    membership: 0,
+    level_bins: [0; 4],
+};
+
+impl FilterTail {
+    /// # Safety
+    ///
+    /// `region` must have been laid out for the arena at `arena_base`.
+    unsafe fn new(region: MembershipRegion, arena_base: *mut u8) -> Self {
+        let base = if region.words == 0 {
+            core::ptr::from_ref(&NO_FILTER_WORD).cast_mut()
+        } else {
+            // SAFETY: the caller's contract is `ptr`'s.
+            unsafe { region.ptr::<MetadataWord>(arena_base) }
+        };
+        Self { region, base }
+    }
+}
+
+type FunnelStorageBuild<K, V> = (Arena, FlatStorage<SlotEntry<K, V>>, FilterTail);
 
 fn try_allocate_storage<K, V, A: Allocator>(
     n: usize,
@@ -382,7 +414,9 @@ fn try_allocate_storage<K, V, A: Allocator>(
         },
         capacity: n,
     };
-    Ok((arena, storage, shape.membership))
+    // SAFETY: as above.
+    let membership = unsafe { FilterTail::new(shape.membership, arena.as_ptr()) };
+    Ok((arena, storage, membership))
 }
 
 fn funnel_layout<K, V>(n: usize) -> Result<FunnelLayout, TryReserveError> {
@@ -738,7 +772,7 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     prf: FunnelPrf,
     /// Cached location of the membership filter tail. Lookups load one word
     /// from it before probing; see [`crate::membership`].
-    membership: MembershipRegion,
+    membership: FilterTail,
     /// Deletes since the filter last matched the live set; see
     /// [`membership::refresh_deletes`].
     stale_membership: usize,
@@ -1504,16 +1538,14 @@ where
 
     #[inline]
     fn membership_ptr(&self) -> *mut MetadataWord {
-        // SAFETY: `self.membership` was laid out for `self.arena`; both are
-        // replaced together on every resize.
-        unsafe { self.membership.ptr::<MetadataWord>(self.arena.as_ptr()) }
+        self.membership.base
     }
 
     /// `false` proves no insert ever recorded this key.
     #[cfg(test)]
     #[inline]
     fn membership_maybe_contains(&self, key_hash: u64) -> bool {
-        let words = self.membership.words;
+        let words = self.membership.region.words;
         if words == 0 {
             return false;
         }
@@ -1529,7 +1561,7 @@ where
     #[inline]
     fn membership_slot(&self, key_hash: u64) -> MembershipSlot {
         MembershipSlot {
-            index: MembershipKey::word(key_hash, self.membership.words),
+            index: MembershipKey::word(key_hash, self.membership.region.words),
             bits: MembershipKey::from_signature::<MEMBERSHIP_BITS>(key_hash).bits(),
             bin: level_bin(key_hash),
         }
@@ -1546,16 +1578,10 @@ where
     /// record at the same slot without re-deriving it after placement.
     #[inline]
     fn membership_gate_at(&self, slot: MembershipSlot) -> MembershipGate {
-        if self.membership.words == 0 {
-            return MembershipGate {
-                word: 0,
-                bits: u64::MAX,
-                levels: 0,
-            };
-        }
         // SAFETY: `slot.index` is a multiply-high reduction below `words`, and
-        // the arena's tail holds exactly that many words. Two field loads, not
-        // a copy of the whole word, so the bin needs no dynamic extraction.
+        // the arena's tail holds exactly that many words; with no words it is
+        // zero, and the base is the shared empty word. Two field loads, not a
+        // copy of the whole word, so the bin needs no dynamic extraction.
         let (word, levels) = unsafe {
             let metadata = self.membership_ptr().add(slot.index);
             ((*metadata).membership, (*metadata).level_bins[slot.bin])
@@ -1597,7 +1623,7 @@ where
     #[inline]
     fn record_membership(&mut self, membership: MembershipSlot, level_bit: u16) {
         debug_assert!(level_bit.is_power_of_two());
-        if self.membership.words != 0 {
+        if self.membership.region.words != 0 {
             // SAFETY: as in `membership_gate`; `&mut self` makes the borrow
             // exclusive.
             let metadata = unsafe { &mut *self.membership_ptr().add(membership.index) };
@@ -1609,7 +1635,9 @@ where
     fn clear_membership(&mut self) {
         // SAFETY: as in `membership_ptr`.
         unsafe {
-            self.membership.clear::<MetadataWord>(self.arena.as_ptr());
+            self.membership
+                .region
+                .clear::<MetadataWord>(self.arena.as_ptr());
         }
         self.stale_membership = 0;
     }
@@ -1669,9 +1697,9 @@ where
         // SAFETY: each region belongs to its own table's arena; the source has
         // the same shape, so equal word counts; distinct arenas never overlap.
         unsafe {
-            self.membership.copy_from::<MetadataWord>(
+            self.membership.region.copy_from::<MetadataWord>(
                 self.arena.as_ptr(),
-                source.membership,
+                source.membership.region,
                 source.arena.as_ptr(),
             );
         };
@@ -2008,7 +2036,7 @@ pub(crate) struct FunnelGeneration<K, V> {
     arena: Arena,
     exceptional_placement: bool,
     prf: FunnelPrf,
-    membership: MembershipRegion,
+    membership: FilterTail,
     stale_membership: usize,
 }
 
@@ -2053,7 +2081,7 @@ where
     #[inline]
     fn prefetch_placement(&self, key_hash: u64) {
         let membership = self.membership_slot(key_hash);
-        if self.membership.words != 0 {
+        if self.membership.region.words != 0 {
             prefetch::prefetch_write(self.membership_ptr().wrapping_add(membership.index));
         }
         let Some(level) = self.shape.levels.first() else {
