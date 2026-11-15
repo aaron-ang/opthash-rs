@@ -1285,6 +1285,8 @@ fn vacant_insert_uses_the_table_insertion_limit() {
         );
     }
     table.max_insertions = table.len;
+    table.scheduler.settled_limit = table.len;
+    table.scheduler.sync(table.len);
     let previous_slots = table.total_slots;
 
     let key = bootstrap_quota;
@@ -1902,5 +1904,35 @@ fn seeded_operation_mix_matches_std_hash_map() {
     }
     for key in 0..KEY_SPACE {
         assert_eq!(map.get(&key), model.get(&key));
+    }
+}
+
+#[test]
+fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
+    for (slots, shifted) in [(1_024, true), (1_000, false), (4_096, true)] {
+        let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                slots,
+                ReserveFraction::DEFAULT,
+                fixed_hasher(),
+                Global,
+            )
+            .unwrap();
+        assert_eq!(table.levels[0].index_shift != GENERAL_REDUCTION, shifted);
+        let mut settled_inserts = 0;
+        for key in 0..table.max_insertions as u64 {
+            for len in [table.len.saturating_sub(1), table.len, table.len + 1] {
+                assert_eq!(
+                    table.scheduler.settles(len),
+                    shifted && len < table.max_insertions && table.scheduler.covers(len)
+                );
+            }
+            settled_inserts += usize::from(table.scheduler.settles(table.len));
+            let hash = table.hash_builder.hash_one(key);
+            assert_eq!(table.insert(key, key, hash), None);
+        }
+        assert!(!table.scheduler.settles(table.len));
+        assert_eq!(settled_inserts > table.max_insertions / 2, shifted);
+        assert_eq!(settled_inserts == 0, !shifted);
     }
 }

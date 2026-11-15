@@ -310,6 +310,7 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     levels: LevelSlice<K, V>,
     len: usize,
     total_slots: usize,
+    /// Fixed for the allocation; the scheduler's settled limit mirrors it.
     max_insertions: usize,
     reserve_fraction: ReserveFraction,
     /// Schedule batch progression and epoch boundaries.
@@ -650,6 +651,15 @@ const fn level_route_count(level: usize) -> usize {
     count
 }
 
+/// [`BatchScheduler`]'s settled limit for a table of `levels` that takes
+/// `max_insertions` entries.
+fn settled_limit<T>(levels: &[Level<T>], max_insertions: usize) -> usize {
+    match levels.first() {
+        Some(level) if level.index_shift != GENERAL_REDUCTION => max_insertions,
+        _ => 0,
+    }
+}
+
 /// Schedule paper batches and allocation-epoch boundaries.
 ///
 /// The active batch is a function of the live count alone: batch `i` covers
@@ -666,6 +676,13 @@ pub(crate) struct BatchScheduler {
     batch_start: usize,
     /// `batch_ends[current_batch_index]`, or `usize::MAX` for an empty plan.
     batch_end: usize,
+    /// Live count below which [`ElasticTable::settled_placement`] can place: the
+    /// table's insertion limit, or zero when its levels do not all reduce by
+    /// shift.
+    settled_limit: usize,
+    /// Live counts from `batch_start` that are inside the cached batch and
+    /// below `settled_limit`.
+    settled_span: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -675,7 +692,7 @@ enum BatchTarget {
 }
 
 impl BatchScheduler {
-    pub(crate) fn new(batch_plan: &[usize]) -> Self {
+    pub(crate) fn new(batch_plan: &[usize], settled_limit: usize) -> Self {
         let mut total = 0_usize;
         let batch_ends = batch_plan
             .iter()
@@ -689,9 +706,19 @@ impl BatchScheduler {
             current_batch_index: 0,
             batch_start: 0,
             batch_end: usize::MAX,
+            settled_limit,
+            settled_span: settled_limit,
         };
         scheduler.reset();
         scheduler
+    }
+
+    /// The cached batch is current for `len` live entries and `len` is below
+    /// the settled limit, in one compare: a `len` under `batch_start` wraps
+    /// past any span.
+    #[inline]
+    fn settles(&self, len: usize) -> bool {
+        len.wrapping_sub(self.batch_start) < self.settled_span
     }
 
     /// [`Self::target`] on a copy, for assertions through a shared borrow.
@@ -742,6 +769,10 @@ impl BatchScheduler {
         self.current_batch_index = index;
         self.batch_start = if index == 0 { 0 } else { ends[index - 1] };
         self.batch_end = ends[index];
+        self.settled_span = self
+            .batch_end
+            .min(self.settled_limit)
+            .saturating_sub(self.batch_start);
     }
 
     /// Reset batch progress after resize or clear.
@@ -964,13 +995,14 @@ where
         let (arena, levels, membership) =
             try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
 
+        let settled_limit = settled_limit(&levels, geometry.max_insertions);
         Ok(Self {
             levels,
             len: 0,
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(&geometry.batch_plan),
+            scheduler: BatchScheduler::new(&geometry.batch_plan, settled_limit),
             hash_builder,
             alloc,
             metadata_words: metadata_words(&arena, membership),
@@ -1179,14 +1211,12 @@ where
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn settled_placement(&self, probe: PreparedElasticProbe) -> Option<ExactPlacement> {
-        if self.len >= self.max_insertions || !self.scheduler.covers(self.len) {
-            return None;
-        }
-        if self.levels.first()?.index_shift == GENERAL_REDUCTION {
+        if !self.scheduler.settles(self.len) {
             return None;
         }
         self.choose_slot_with(self.scheduler.cached_target(), |level, budget| {
-            // SAFETY: level zero reducing by shift means every level does.
+            // SAFETY: a settled table's level zero reduces by shift, which
+            // means every level does.
             unsafe { self.first_shifted_vacancy(probe, level, budget) }
         })
     }
@@ -1854,6 +1884,7 @@ where
         let probe_schedule = ProbeSchedule::try_for_levels(geometry.level_capacities.len())?;
         let (arena, levels, membership) =
             try_alloc_elastic_arena(&geometry.level_capacities, &self.alloc)?;
+        let settled_limit = settled_limit(&levels, geometry.max_insertions);
         let used_exceptional_placement = rebuild::rebuild(
             self,
             ElasticGeneration {
@@ -1861,7 +1892,7 @@ where
                 len: 0,
                 total_slots: geometry.total_slots,
                 max_insertions: geometry.max_insertions,
-                scheduler: BatchScheduler::new(&geometry.batch_plan),
+                scheduler: BatchScheduler::new(&geometry.batch_plan, settled_limit),
                 metadata_words: metadata_words(&arena, membership),
                 arena,
                 probe_high_water: 0,
