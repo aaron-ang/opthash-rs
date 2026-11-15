@@ -32,6 +32,16 @@ pub(crate) fn control_fingerprint(hash: u64) -> u8 {
     fingerprint | OCCUPIED_BIT
 }
 
+/// Occupied control byte for a word that is already mixed: its low seven
+/// bits under `OCCUPIED_BIT`.
+#[inline]
+#[must_use]
+pub(crate) const fn control_fingerprint_low(word: u64) -> u8 {
+    #[allow(clippy::cast_possible_truncation)]
+    let low = word as u8;
+    low | OCCUPIED_BIT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,6 +55,16 @@ mod tests {
         assert_eq!(control_fingerprint(1 << 57), OCCUPIED_BIT | 0x01);
         // Bits below the shift do not reach the control byte.
         assert_eq!(control_fingerprint((1 << 57) - 1), OCCUPIED_BIT);
+    }
+
+    #[test]
+    fn control_fingerprint_low_is_occupied_and_keeps_the_low_word_bits() {
+        assert_eq!(control_fingerprint_low(0), OCCUPIED_BIT);
+        assert_eq!(control_fingerprint_low(u64::MAX), u8::MAX);
+        assert_eq!(control_fingerprint_low(0x7F), u8::MAX);
+        assert_eq!(control_fingerprint_low(0x2A), OCCUPIED_BIT | 0x2A);
+        // Bits above the low seven do not reach the control byte.
+        assert_eq!(control_fingerprint_low(!0x7F), OCCUPIED_BIT);
     }
 
     #[test]

@@ -1281,8 +1281,8 @@ where
     {
         let lanes = self.shape.bucket_lanes;
         let beta = self.shape.beta;
-        let key_fingerprint = control::control_fingerprint(key_hash);
         let probe = self.prf.prepare(key_hash);
+        let key_fingerprint = probe.fingerprint();
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
         let scan = |level: u32| -> (usize, u64) {
@@ -1879,8 +1879,8 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let key_fingerprint = control::control_fingerprint(key_hash);
         let probe = self.prf.prepare(key_hash);
+        let key_fingerprint = probe.fingerprint();
         match self.lookup_recorded_levels(key, probe, key_fingerprint, levels) {
             Some(slot) => Some(slot),
             None if self.exceptional_placement => self.find_by_full_scan(key, key_fingerprint),
@@ -1911,7 +1911,7 @@ where
         let mut membership = self.membership_slot(hash);
         let gate = self.membership_gate_at(membership);
         let probe = self.prf.prepare(hash);
-        let fingerprint = control::control_fingerprint(hash);
+        let fingerprint = probe.fingerprint();
         let mut exact = None;
         if gate.passes() {
             let search = self.search_exact_prepared_for_insert(&key, probe, fingerprint);
@@ -1948,7 +1948,6 @@ where
         &self,
         key: &Q,
         key_hash: u64,
-        key_fingerprint: u8,
         on_miss: impl FnOnce(SearchResult) -> R,
     ) -> Result<usize, Option<R>>
     where
@@ -1962,6 +1961,7 @@ where
         if !gate.passes() {
             return Err(None);
         }
+        let key_fingerprint = probe.fingerprint();
         match self.search_exact_prepared(key, probe, key_fingerprint) {
             SearchResult::Hit(slot) => Ok(slot),
             miss if self.exceptional_placement => self
@@ -2058,7 +2058,6 @@ where
         mut membership: MembershipSlot,
         vacancy: Option<Vacancy>,
     ) -> usize {
-        let key_fingerprint = control::control_fingerprint(key_hash);
         // An epoch that already placed outside its funnels was either rebuilt
         // for this reason or failed in its own rebuild; another would cost
         // O(n) per insert without helping.
@@ -2071,6 +2070,8 @@ where
             vacancy
         };
         let (vacancy, exceptional) = self.resolve_vacancy(vacancy);
+        // Derived past the rebuild, whose fresh seed changes the fingerprint.
+        let key_fingerprint = self.prf.prepare(key_hash).fingerprint();
         self.place_new_entry(
             vacancy,
             key,
@@ -2249,8 +2250,8 @@ where
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
-        let key_fingerprint = control::control_fingerprint(key_hash);
         let probe = self.prf.prepare(key_hash);
+        let key_fingerprint = probe.fingerprint();
         let (vacancy, exceptional) = self.resolve_vacancy(self.search_vacancy(probe));
         let membership = self.membership_slot(key_hash);
         self.place_new_entry(
@@ -2352,15 +2353,10 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let found = self.locate(
-            key,
-            hash,
-            control::control_fingerprint(hash),
-            |miss| match miss {
-                SearchResult::Vacant(slot) => slot,
-                _ => FunnelVacant::EXHAUSTED,
-            },
-        );
+        let found = self.locate(key, hash, |miss| match miss {
+            SearchResult::Vacant(slot) => slot,
+            _ => FunnelVacant::EXHAUSTED,
+        });
         let exact = match found {
             Ok(slot) => return Ok(slot),
             Err(exact) => exact.unwrap_or(FunnelVacant::UNSEARCHED),
@@ -2397,10 +2393,11 @@ where
         // keeps no frame; every other case is the general insert's.
         let membership = self.membership_slot(hash);
         let gate = self.membership_gate_at(membership);
+        let probe = self.prf.prepare(hash);
         if !gate.passes()
             && self.tombstones == 0
             && self.len < self.shape.max_insertions
-            && let Some(vacancy) = self.first_empty_in_head(self.prf.prepare(hash))
+            && let Some(vacancy) = self.first_empty_in_head(probe)
         {
             debug_assert_eq!(vacancy.level_bit, self.level_bit(vacancy.slot));
             debug_assert_ne!(self.membership.region.words, 0);
@@ -2415,7 +2412,7 @@ where
                 metadata.membership = gate.word | membership.bits;
                 metadata.level_bins[membership.bin] |= vacancy.level_bit;
             }
-            let key_fingerprint = control::control_fingerprint(hash);
+            let key_fingerprint = probe.fingerprint();
             // SAFETY: the vacancy is an EMPTY lane of an ordinary bucket, and
             // `key_fingerprint` is an occupied control.
             unsafe {

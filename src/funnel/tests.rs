@@ -110,7 +110,7 @@ fn entry_search_checks_exceptional_hits_before_reusing_vacancy() {
 
     let mut table = raw_table(512, 3);
     let key = 42;
-    let fingerprint = control::control_fingerprint(key);
+    let fingerprint = table.prf.prepare(key).fingerprint();
     let exact = table.search_exact_for_insert(&key, key, fingerprint);
     let slot = table.shape.n - 1;
     assert_ne!(exact, SearchResult::Vacant(slot));
@@ -156,7 +156,7 @@ fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement(
 
     let mut table = raw_table(512, 3);
     let hash = 42;
-    let fingerprint = control::control_fingerprint(hash);
+    let fingerprint = table.prf.prepare(hash).fingerprint();
     let absent = u64::MAX;
     while let SearchResult::Vacant(_) = table.search_exact_for_insert(&absent, hash, fingerprint) {
         let key = table.len as u64;
@@ -225,7 +225,7 @@ fn dense_scan_preserves_order_while_removals_make_the_table_sparse() {
             key,
             key + 100,
             table.membership_slot(hash),
-            control::control_fingerprint(hash),
+            table.prf.prepare(hash).fingerprint(),
             true,
         );
     }
@@ -256,7 +256,7 @@ fn sparse_scan_visits_group_boundaries_and_tail_once_in_slot_order() {
             key,
             key + 100,
             table.membership_slot(hash),
-            control::control_fingerprint(hash),
+            table.prf.prepare(hash).fingerprint(),
             true,
         );
     }
@@ -453,7 +453,7 @@ fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
             key,
             index,
             table.membership_slot(key),
-            control::control_fingerprint(key),
+            table.prf.prepare(key).fingerprint(),
             true,
         );
         accepted_elsewhere += usize::from(own.is_some());
@@ -957,7 +957,7 @@ fn clean_and_dirty_search_modes_agree_without_tombstones() {
 
     for key in 0..256_u64 {
         let hash = table.hash_builder.hash_one(key);
-        let fingerprint = control::control_fingerprint(hash);
+        let fingerprint = table.prf.prepare(hash).fingerprint();
         let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(hash);
         let clean = table.search_exact_mode::<_, true>(&key, probe, fingerprint);
         let dirty = table.search_exact_mode::<_, false>(&key, probe, fingerprint);
@@ -982,7 +982,7 @@ fn vacancy_walk_matches_exact_search_for_absent_keys() {
         let mut vacant = 0_usize;
         for key in live..live + 4_096 {
             let hash = table.hash_builder.hash_one(key);
-            let fingerprint = control::control_fingerprint(hash);
+            let fingerprint = table.prf.prepare(hash).fingerprint();
             let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(hash);
             let exact = table.search_exact_for_insert(&key, hash, fingerprint);
             assert_eq!(
@@ -1026,7 +1026,7 @@ fn lookup_walk_matches_exact_search_hits() {
     let check = |table: &FunnelTable<u64, u64, IdentityBuildHasher>, label: &str| {
         for key in 0..live + 4_096 {
             let hash = table.hash_builder.hash_one(key);
-            let fingerprint = control::control_fingerprint(hash);
+            let fingerprint = table.prf.prepare(hash).fingerprint();
             let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(hash);
             let expected = match table.search_exact_for_insert(&key, hash, fingerprint) {
                 SearchResult::Hit(slot) => Some(slot),
@@ -1291,7 +1291,7 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
             )
         })
         .unwrap();
-    let fingerprint = control::control_fingerprint(identity);
+    let fingerprint = table.prf.prepare(identity).fingerprint();
     let dummy_fingerprint = fingerprint ^ 1;
 
     for level_index in 0..table.shape.levels.len() {
@@ -1412,7 +1412,7 @@ fn membership_filter_records_every_inserted_key() {
             table.find_location(&key, key),
             Some(
                 table
-                    .find_by_full_scan(&key, control::control_fingerprint(key))
+                    .find_by_full_scan(&key, table.prf.prepare(key).fingerprint())
                     .unwrap()
             ),
             "filter must not hide key {key}"
@@ -2142,7 +2142,6 @@ fn large_reserve_exponent_sizes_without_scanning_every_slot_count() {
 #[cfg_attr(miri, ignore = "walks hundreds of thousands of lookups twice")]
 fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
     const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
-    const FINGERPRINT_LANE: u64 = 0x7F << 57;
     let feasible = |n: &usize, d: u32| {
         FunnelShape::from_slots(*n, ReserveFraction::from_exponent(d).unwrap()).is_ok()
     };
@@ -2160,16 +2159,17 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
     shapes.extend([(selecting.unwrap(), 3), (branching.unwrap(), 3)]);
     for (n, d) in shapes {
         for shared_fingerprint in [false, true] {
-            let key_of = |index: u64| {
-                let key = index.wrapping_mul(SPREAD);
-                if shared_fingerprint {
-                    (key & !FINGERPRINT_LANE) | (0x2A << 57)
-                } else {
-                    key
-                }
-            };
             let mut table = raw_table(n, d);
             let inserted = table.shape.max_insertions as u64;
+            // Under the table's first seed, which only a rebuild replaces.
+            let prf = table.prf;
+            let shared = prf.prepare(0).fingerprint();
+            let keys: Vec<u64> = (0..)
+                .map(|index: u64| index.wrapping_mul(SPREAD))
+                .filter(|&key| !shared_fingerprint || prf.prepare(key).fingerprint() == shared)
+                .take(2 * table.shape.max_insertions)
+                .collect();
+            let key_of = |index: u64| keys[usize::try_from(index).unwrap()];
             for index in 0..inserted {
                 let key = key_of(index);
                 assert_eq!(map::TableBackend::insert(&mut table, key, index, key), None);
