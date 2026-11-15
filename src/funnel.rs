@@ -2548,10 +2548,11 @@ where
             return;
         };
         let probe = self.prf.prepare(key_hash);
-        if let Some(bucket) = Self::sample_ordinary(probe, level, 0) {
-            self.storage
-                .prefetch_slot(level.offset + bucket * self.shape.stride);
-        }
+        // The bucket of the first draw, accepted or not: a hint may miss.
+        let (bucket, _) =
+            probe::ordinary_funnel_first_draw(probe, level.multiplier, level.bucket_range);
+        self.storage
+            .prefetch_slot(level.offset + bucket * self.shape.stride);
     }
 
     /// Inlined into both rebuild loops: outlining it costs a call per entry
