@@ -6,6 +6,14 @@ pub(crate) const BITMASK_STRIDE: u32 = 8;
 #[cfg(opthash_x86_16_group)]
 pub(crate) const BITMASK_STRIDE: u32 = 1;
 
+/// A bit of each slot's stride that every group mask sets for a matching
+/// slot: the lowest where a match fills the stride, so the bit index of a
+/// match is a multiple of the stride.
+#[cfg(opthash_scalar_group)]
+pub(crate) const BITMASK_SLOT_BIT: u32 = BITMASK_STRIDE - 1;
+#[cfg(not(opthash_scalar_group))]
+pub(crate) const BITMASK_SLOT_BIT: u32 = 0;
+
 /// Per-slot match mask over a control group.
 #[derive(Debug, Clone)]
 pub(crate) struct BitMask(pub(crate) BitMaskWord);

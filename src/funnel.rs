@@ -21,7 +21,7 @@ use crate::exact::probe::{
 use crate::hasher::DefaultHashBuilder;
 use crate::membership::{self, MembershipKey, MembershipRegion, MetadataWord};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
-use crate::raw::bitmask::BITMASK_STRIDE;
+use crate::raw::bitmask::{BITMASK_SLOT_BIT, BITMASK_STRIDE};
 use crate::raw::config::GROUP_SIZE;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::raw::iter::OccupiedIndices;
@@ -88,7 +88,9 @@ struct FunnelShape {
     /// the shape is empty: such a table answers no lookup from first matches.
     bucket_lanes: u64,
     /// Whether lookups select between the first two recorded levels; see
-    /// [`SELECT_MAX_SLOTS`].
+    /// [`SELECT_MAX_SLOTS`]. Also set for a shape without lanes, whose
+    /// lookups test for that on the selecting side, so the level walk of a
+    /// large table never does.
     selects: bool,
     levels: Box<[LevelShape]>,
     loglog_ceiling: usize,
@@ -99,7 +101,8 @@ struct FunnelShape {
     fallback_bucket_range: PreparedProbeRange,
     /// The levels that own a level-bin bit, copied inline so the hot paths
     /// index them without the pointer chase or a bounds check. Every other
-    /// entry, the last one always among them, is [`LevelShape::ABSENT`].
+    /// entry, the last one always among them, is [`LevelShape::ABSENT`], and
+    /// so is every entry of a shape without [`Self::bucket_lanes`].
     head: [LevelShape; HEAD_LEVELS],
 }
 
@@ -133,7 +136,7 @@ impl FunnelShape {
             fallback_bucket_width: 0,
             fallback_bucket_range: PreparedProbeRange::empty(),
             bucket_lanes: 0,
-            selects: false,
+            selects: true,
         }
     }
 
@@ -196,9 +199,12 @@ impl FunnelShape {
         }
         let loglog_ceiling =
             u8::try_from(plan.loglog_ceiling()).map_err(|_| TryReserveError::CapacityOverflow)?;
+        let bucket_lanes = bucket_lanes(plan.beta());
         let mut head = [LevelShape::ABSENT; HEAD_LEVELS];
-        for (slot, level) in head.iter_mut().zip(levels.iter().take(OVERFLOW_LEVEL)) {
-            *slot = *level;
+        if bucket_lanes != 0 {
+            for (slot, level) in head.iter_mut().zip(levels.iter().take(OVERFLOW_LEVEL)) {
+                *slot = *level;
+            }
         }
         Ok(Self {
             n,
@@ -213,8 +219,8 @@ impl FunnelShape {
             fallback_bucket_width: plan.fallback_bucket_width(),
             fallback_bucket_range: PreparedProbeRange::new(plan.fallback_bucket_count())
                 .map_err(|_| TryReserveError::CapacityOverflow)?,
-            bucket_lanes: bucket_lanes(plan.beta()),
-            selects: n <= SELECT_MAX_SLOTS,
+            bucket_lanes,
+            selects: bucket_lanes == 0 || n <= SELECT_MAX_SLOTS,
         })
     }
 
@@ -261,12 +267,30 @@ fn bucket_lanes(beta: usize) -> u64 {
     if beta > GROUP_SIZE {
         return 0;
     }
-    // One bit per lane, the top of its stride, which every group mask sets
-    // for a matching lane. A set of matches is then walked by clearing its
-    // lowest bit.
+    // One bit per lane, which every group mask sets for a matching lane. A
+    // set of matches is then walked by clearing its lowest bit.
     (0..beta).fold(0, |lanes, lane| {
-        lanes | 1 << (lane * BITMASK_STRIDE as usize + BITMASK_STRIDE as usize - 1)
+        lanes | 1 << (lane * BITMASK_STRIDE as usize + BITMASK_SLOT_BIT as usize)
     })
+}
+
+/// Lane of the lowest bit of `matches`.
+///
+/// # Safety
+///
+/// `matches` must be a non-empty subset of a [`bucket_lanes`] mask, which
+/// sets one bit per lane, at `BITMASK_SLOT_BIT` of its stride.
+#[inline]
+// The stride is one where a group mask holds one bit per slot.
+#[allow(clippy::modulo_one)]
+unsafe fn lowest_lane(matches: u64) -> usize {
+    debug_assert_ne!(matches, 0);
+    let bit = matches.trailing_zeros();
+    debug_assert_eq!(bit % BITMASK_STRIDE, BITMASK_SLOT_BIT);
+    // SAFETY: the caller's contract. Stating it lets the division fold into
+    // the slot's address scaling.
+    unsafe { core::hint::assert_unchecked(bit % BITMASK_STRIDE == BITMASK_SLOT_BIT) };
+    (bit / BITMASK_STRIDE) as usize
 }
 
 pub(crate) struct FlatStorage<T> {
@@ -1256,9 +1280,7 @@ where
         Q: Equivalent<K> + ?Sized,
     {
         let lanes = self.shape.bucket_lanes;
-        if lanes == 0 {
-            return Err(());
-        }
+        let beta = self.shape.beta;
         let key_fingerprint = control::control_fingerprint(key_hash);
         let probe = self.prf.prepare(key_hash);
         // Fingerprint matches of the key's bucket in one level, with the
@@ -1267,7 +1289,7 @@ where
             let level = self.shape.head_level(level);
             let (bucket, _) =
                 probe::ordinary_funnel_first_draw(probe, level.multiplier, level.bucket_range);
-            let start = level.offset + bucket * self.shape.beta;
+            let start = level.offset + bucket * beta;
             // SAFETY: a first draw is below the level's bucket count whether
             // or not its word is accepted, an ordinary bucket ends at or
             // before `n`, and the control array pads `GROUP_SIZE - 1` bytes
@@ -1277,7 +1299,12 @@ where
                 unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), key_fingerprint) };
             (start, matches.0 & lanes)
         };
-        let holding_key = |slot: usize| -> Option<Found<'_, K, V>> {
+        // The entry at the lowest match of a bucket starting at `start`, if
+        // it holds the key.
+        let holding_key = |start: usize, matches: u64| -> Option<Found<'_, K, V>> {
+            // SAFETY: every caller passes a non-empty set that `scan` masked
+            // with the shape's lanes, less the bits cleared since.
+            let slot = start + unsafe { lowest_lane(matches) };
             // SAFETY: a matched lane lies inside its bucket and carries the
             // fingerprint, so the slot is in bounds and occupied.
             let found = unsafe { self.found_at(slot) };
@@ -1285,48 +1312,62 @@ where
         };
         // Widened so clearing the lowest set bit also tests for an empty set.
         let recorded = u32::from(levels & !OVERFLOW_LEVEL_BIT);
-        let mut pending = recorded;
-        if pending != 0 && self.shape.selects {
-            // The first two recorded levels are scanned together and the
-            // holder is selected, not branched on: which of them holds the key
-            // is unpredictable.
-            let first = pending.trailing_zeros();
-            pending &= pending - 1;
-            let second = if pending == 0 {
-                first
-            } else {
-                pending.trailing_zeros()
-            };
-            pending &= pending.wrapping_sub(1);
-            let (first_start, first_matches) = scan(first);
-            let (second_start, second_matches) = scan(second);
-            let in_first = first_matches != 0;
-            let start = if in_first { first_start } else { second_start };
-            let matches = if in_first {
-                first_matches
-            } else {
-                second_matches
-            };
-            if matches != 0 {
-                let slot = start + (matches.trailing_zeros() / BITMASK_STRIDE) as usize;
-                if let Some(found) = holding_key(slot) {
-                    return Ok(Some(found));
+        // Compares every match of every level in a non-empty set.
+        let walk = |mut pending: u32| -> Option<Found<'_, K, V>> {
+            loop {
+                let (start, matches) = scan(pending.trailing_zeros());
+                let mut matches = matches;
+                while matches != 0 {
+                    if let Some(found) = holding_key(start, matches) {
+                        return Some(found);
+                    }
+                    matches &= matches - 1;
                 }
-                // Another key shares the fingerprint. Start over, comparing
-                // every match of every recorded level.
-                pending = recorded;
+                pending &= pending - 1;
+                if pending == 0 {
+                    return None;
+                }
             }
-        }
-        while pending != 0 {
-            let (start, matches) = scan(pending.trailing_zeros());
-            pending &= pending - 1;
-            let mut matches = matches;
-            while matches != 0 {
-                let slot = start + (matches.trailing_zeros() / BITMASK_STRIDE) as usize;
-                if let Some(found) = holding_key(slot) {
-                    return Ok(Some(found));
+        };
+        if recorded != 0 {
+            let found = if !self.shape.selects {
+                walk(recorded)
+            } else if lanes == 0 {
+                return Err(());
+            } else {
+                // The first two recorded levels are scanned together and the
+                // holder is selected, not branched on: which of them holds the
+                // key is unpredictable.
+                let mut pending = recorded;
+                let first = pending.trailing_zeros();
+                pending &= pending - 1;
+                let second = if pending == 0 {
+                    first
+                } else {
+                    pending.trailing_zeros()
+                };
+                pending &= pending.wrapping_sub(1);
+                let (first_start, first_matches) = scan(first);
+                let (second_start, second_matches) = scan(second);
+                let in_first = first_matches != 0;
+                let start = if in_first { first_start } else { second_start };
+                let matches = if in_first {
+                    first_matches
+                } else {
+                    second_matches
+                };
+                if matches != 0 {
+                    if let Some(found) = holding_key(start, matches) {
+                        return Ok(Some(found));
+                    }
+                    // Another key shares the fingerprint. Start over,
+                    // comparing every match of every recorded level.
+                    pending = recorded;
                 }
-                matches &= matches - 1;
+                if pending == 0 { None } else { walk(pending) }
+            };
+            if found.is_some() {
+                return Ok(found);
             }
         }
         if levels & OVERFLOW_LEVEL_BIT != 0 || self.exceptional_placement {
