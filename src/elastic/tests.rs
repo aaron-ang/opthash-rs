@@ -490,10 +490,11 @@ fn query_schedule_holds_every_route_once_in_position_order() {
         .map(|route| {
             let (level, logical) = route.coordinates();
             assert_eq!(level, u32::from(route.level()));
-            // The route opens and closes its own level's bit and no other.
-            let bit = 1_u64 << level;
-            assert!(route.is_open(bit) && !route.is_open(!bit));
-            assert_eq!(route.close(u64::MAX), !bit);
+            // The route tests and closes its own level's bit, one above the
+            // level, and no other.
+            let bit = 2_u64 << level;
+            assert!(route.is_closed(bit) && !route.is_closed(!bit));
+            assert_eq!(route.close(0), bit);
             let region = &table.levels[level as usize];
             assert_eq!(
                 route.control() == region.ctrl_ptr.cast_const(),
@@ -760,7 +761,7 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
         // SAFETY: `word < words` indexes an initialized metadata word.
         let metadata = unsafe { *table.membership_ptr().add(word) };
         assert_eq!(metadata.membership, 0);
-        assert_eq!(metadata.level_bins, [0; 4]);
+        assert_eq!(metadata.level_bins, [NO_LEVELS_OCCUPIED; 4]);
     }
     assert_eq!(
         table.levels[0].data_ptr().addr() % mem::align_of::<OverAligned>(),
@@ -1080,7 +1081,7 @@ fn route_summary_conservatively_records_every_live_level() {
         assert_eq!(
             // SAFETY: `word < words` indexes an initialized metadata word.
             unsafe { (*map.table().membership_ptr().add(word)).level_bins },
-            [0; 4]
+            [NO_LEVELS_OCCUPIED; 4]
         );
     }
 }
@@ -2204,7 +2205,7 @@ fn levels_reduce_all_by_shift_or_all_by_the_general_reduction() {
 /// for, and the flag that leaves a walk unresolved.
 fn assert_cached_state_matches<S>(table: &ElasticTable<u64, u64, S>) {
     for (index, level) in table.levels.iter().enumerate() {
-        assert_eq!(level.summary_bit, 1 << summary_level(index));
+        assert_eq!(level.summary_bit, 2 << summary_level(index));
         assert_eq!(level.sequence_run, probe::elastic_level_run(index));
         assert_eq!(
             level.half_reserve as usize,
@@ -2603,8 +2604,8 @@ fn the_fold_multiplier_as_a_hash_stays_findable_and_unflagged() {
     }
 }
 
-/// Each level's counters against its control bytes, and the table's live
-/// count against the levels'.
+/// Each level's counters against its control bytes, the table's live count
+/// against the levels', and every stored route summary's sentinel bit.
 fn assert_counters_match_controls(table: &ElasticTable<u64, u64, FixedHashBuilder>) {
     let mut live = 0;
     for level in &table.levels {
@@ -2620,6 +2621,15 @@ fn assert_counters_match_controls(table: &ElasticTable<u64, u64, FixedHashBuilde
         live += occupied;
     }
     assert_eq!(table.len, live);
+    // A walk stops at the sentinel only while every stored summary keeps
+    // the sentinel's bit clear.
+    for word in 0..table.membership.words {
+        // SAFETY: `word < words` indexes an initialized metadata word.
+        let metadata = unsafe { *table.membership_ptr().add(word) };
+        for bin in metadata.level_bins {
+            assert_eq!(u64::from(bin) & SENTINEL_BIT, 0);
+        }
+    }
 }
 
 #[test]

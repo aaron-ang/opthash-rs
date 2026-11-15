@@ -74,9 +74,12 @@ const fn empty_high_water(settled_limit: usize) -> u32 {
 const QUERY_PROBE_LIMIT: usize = 384;
 /// Largest table: slot positions and schedule bounds are stored as `u32`.
 const MAX_ELASTIC_SLOTS: u64 = 1 << u32::BITS;
-/// Levels a key's route summary tracks, one `u16` bit each; the last bit
-/// stands for every deeper level.
-const ROUTE_SUMMARY_LEVELS: usize = u16::BITS as usize;
+/// Levels a key's route summary tracks, one `u16` bit each above the
+/// sentinel's; the last bit stands for every deeper level.
+const ROUTE_SUMMARY_LEVELS: usize = u16::BITS as usize - 1;
+/// A stored route summary no level has recorded a key in: every level's bit
+/// set, the sentinel's clear.
+const NO_LEVELS_OCCUPIED: u16 = !1;
 /// Bits each key sets in its membership-filter word. A lookup whose bits are
 /// not all set skips the probe walk, since the key cannot be present. A false
 /// positive walks every level's full schedule, so a third bit rejects enough
@@ -113,7 +116,7 @@ impl ExactPlacement {
 
 const _: () = assert!(GENERAL_REDUCTION <= u8::MAX as u32);
 const _: () = assert!(UNIFORM_SEARCH_CAP <= u16::MAX as u64);
-const _: () = assert!(MAX_LEVELS <= SENTINEL_LEVEL as usize);
+const _: () = assert!(MAX_LEVELS < SENTINEL_LEVEL as usize);
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
@@ -141,7 +144,9 @@ pub(crate) struct Level<T> {
     /// Case 2's threshold: half the reserve of `capacity`
     /// ([`ReserveFraction::floor_half_reserved`]).
     half_reserve: u32,
-    /// This level's bit in a route summary: `1 << summary_level(level)`.
+    /// This level's bit in a stored route summary, one above its
+    /// [`summary_level`]: clear once the level holds a key of the summary's
+    /// bin.
     summary_bit: u16,
     /// [`probe::elastic_level_run`] of this level, beside the fields a
     /// vacancy search reads with it.
@@ -203,7 +208,7 @@ impl<T> Level<T> {
             // At most the capacity, which fits.
             #[allow(clippy::cast_possible_truncation)]
             half_reserve: reserve_fraction.floor_half_reserved(cap_u32 as usize) as u32,
-            summary_bit: 1 << summary_level(level),
+            summary_bit: 2 << summary_level(level),
             sequence_run: probe::elastic_level_run(level),
         }
     }
@@ -531,7 +536,17 @@ impl ElasticRouteFilter<'_> {
     /// does not load them.
     #[inline]
     fn level_mask(self, route: PreparedElasticRoute) -> u16 {
-        self.word.level_bins[route.summary_bin()]
+        !self.word.level_bins[route.summary_bin()] >> 1
+    }
+
+    /// The stored summary as a schedule walk's closed-level set: bit zero,
+    /// the sentinel's, is clear, and bit `i + 1` is set for a level `i` the
+    /// bin never occupied. The stored word keeps unoccupied levels set and
+    /// its last bit is its sign, so sign extension alone gives every deeper
+    /// level its own bit and leaves the sentinel open.
+    #[inline]
+    fn closed_levels(self, route: PreparedElasticRoute) -> u64 {
+        i64::from(self.word.level_bins[route.summary_bin()].cast_signed()).cast_unsigned()
     }
 
     /// [`Self::level_mask`] widened by [`expand_level_mask`].
@@ -543,12 +558,12 @@ impl ElasticRouteFilter<'_> {
 
 /// Widens the saturating last summary bit over every level index it stands
 /// for, so a lookup tests `1 << level` directly instead of clamping the
-/// level on each schedule step. The last bit is the summary's sign bit, so
-/// sign extension is the widening.
+/// level on each schedule step.
 #[inline]
 const fn expand_level_mask(level_mask: u16) -> u64 {
-    const { assert!(ROUTE_SUMMARY_LEVELS == u16::BITS as usize) };
-    (level_mask.cast_signed() as i64).cast_unsigned()
+    const { assert!(ROUTE_SUMMARY_LEVELS == u16::BITS as usize - 1) };
+    // The last bit moves to the sign, extends, and moves back.
+    (((level_mask << 1).cast_signed() as i64) >> 1).cast_unsigned()
 }
 
 /// Maps a level index onto its route-summary bit. Levels past the summary's
@@ -932,7 +947,7 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     // The arena zeroes control bytes only; an empty filter must read as
     // "nothing recorded".
     // SAFETY: `membership` was laid out by `elastic_arena_layout` for this arena.
-    unsafe { membership.clear::<MetadataWord>(arena.as_ptr()) };
+    unsafe { reset_metadata(membership, arena.as_ptr()) };
 
     // `Arena` has no `Drop`: deallocate explicitly if level construction fails.
     match build_elastic_levels::<K, V>(
@@ -952,9 +967,40 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
 /// The word a table without a metadata tail reads: it records no key, so
 /// the filter rejects every lookup without testing for the missing tail.
 static NO_METADATA: MetadataWord = MetadataWord {
-    level_bins: [0; 4],
+    level_bins: [NO_LEVELS_OCCUPIED; 4],
     membership: 0,
 };
+
+/// [`NO_METADATA`] as the two machine words it occupies: the four equal
+/// level bins, then the membership lane.
+const NO_METADATA_WORDS: [u64; 2] = {
+    assert!(
+        size_of::<MetadataWord>() == size_of::<[u64; 2]>()
+            && mem::offset_of!(MetadataWord, membership) == size_of::<u64>()
+    );
+    let bin = NO_LEVELS_OCCUPIED as u64;
+    [bin | bin << 16 | bin << 32 | bin << 48, 0]
+};
+
+/// Writes [`NO_METADATA`] over every word of `membership`'s tail, as plain
+/// machine words so the fill is a wide store loop.
+///
+/// # Safety
+///
+/// `membership` was laid out for the arena at `base`.
+unsafe fn reset_metadata(membership: MembershipRegion, base: *mut u8) {
+    if membership.words != 0 {
+        // SAFETY: the caller's arena holds the region's words.
+        let words = unsafe { membership.ptr::<MetadataWord>(base) };
+        // SAFETY: as above, nothing else borrows the words, and a metadata
+        // word is two machine words, by the assertion beside the pattern.
+        let tail =
+            unsafe { core::slice::from_raw_parts_mut(words.cast::<[u64; 2]>(), membership.words) };
+        // Rebuilt from its elements: the fill then stores a value it holds
+        // in registers, which is what makes the loop a wide one.
+        tail.fill([NO_METADATA_WORDS[0], NO_METADATA_WORDS[1]]);
+    }
+}
 
 /// First metadata word of `membership`'s tail inside `arena`, or
 /// [`NO_METADATA`] when it has none. Only a tail with words is written to.
@@ -1129,14 +1175,14 @@ where
             // makes the borrow exclusive.
             let metadata = unsafe { &mut *self.membership_ptr().add(word) };
             metadata.membership |= membership.bits();
-            metadata.level_bins[route.summary_bin()] |= summary_bit;
+            metadata.level_bins[route.summary_bin()] &= !summary_bit;
         }
     }
 
     fn clear_membership(&mut self) {
         // SAFETY: `self.membership` was laid out together with `self.arena`.
         unsafe {
-            self.membership.clear::<MetadataWord>(self.arena.as_ptr());
+            reset_metadata(self.membership, self.arena.as_ptr());
         }
         self.stale_membership = 0;
     }
@@ -2363,14 +2409,34 @@ where
                 }))
             }
             ScheduleSearch::Absent => None,
-            ScheduleSearch::Unresolved => self.find_by_general_schedule(
-                key,
-                route,
-                filter.expanded_level_mask(route),
-                key_fingerprint,
-                on_hit,
-            ),
+            ScheduleSearch::Unresolved => {
+                self.find_unresolved(key, route, key_fingerprint, filter, on_hit)
+            }
         }
+    }
+
+    /// [`Self::find_by_general_schedule`] for a walk that ended unresolved.
+    /// Out of line with the filter, so the summary is read here and the walk
+    /// keeps no copy of it for this path.
+    #[inline(never)]
+    fn find_unresolved<'a, Q, R>(
+        &'a self,
+        key: &Q,
+        route: PreparedElasticRoute,
+        key_fingerprint: u8,
+        filter: ElasticRouteFilter<'_>,
+        on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
+    ) -> Option<R>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        self.find_by_general_schedule(
+            key,
+            route,
+            filter.expanded_level_mask(route),
+            key_fingerprint,
+            on_hit,
+        )
     }
 
     /// Whether a walk that finds no key leaves it unresolved: a table that
@@ -2416,7 +2482,7 @@ where
             }
         }
 
-        let mut open_levels = filter.expanded_level_mask(prepared) | SENTINEL_BIT;
+        let mut closed_levels = filter.closed_levels(prepared);
         let mut next = direct;
         loop {
             // SAFETY: the schedule ends with its sentinel, and the walk
@@ -2425,7 +2491,7 @@ where
             next = unsafe { next.add(1) };
             // SAFETY: as above, `next` is at most the sentinel.
             let route = unsafe { PhiRoute::load(next) };
-            if !route.is_open(open_levels) {
+            if route.is_closed(closed_levels) {
                 continue;
             }
             // The route holds a shift whichever reduction its level needs.
@@ -2453,10 +2519,10 @@ where
                 // removal leaves a tombstone, and so does a `clear` until its
                 // last entry is out, even one a panicking drop interrupts. So
                 // the key cannot sit at a later probe of this level.
-                open_levels = route.close(open_levels);
-                // Either no real level is left open, or this was the
-                // sentinel.
-                if open_levels <= SENTINEL_BIT {
+                closed_levels = route.close(closed_levels);
+                // Either this was the sentinel, or no real level is left
+                // open.
+                if closed_levels & SENTINEL_BIT != 0 || closed_levels == !SENTINEL_BIT {
                     break;
                 }
             }

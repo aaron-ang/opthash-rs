@@ -13,11 +13,12 @@ use crate::raw::control::CTRL_EMPTY;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub(super) struct PhiRoute {
-    /// The level's distance below [`SENTINEL_LEVEL`] in the low byte, the
-    /// index shift in the next and the sequence index in the high half, so
-    /// one load brings all three. Both byte fields are below the word width:
-    /// used as a shift amount, the word itself moves the level's bit of an
-    /// open-level set to the top, and the sentinel's bit down to the level's.
+    /// The distance of the level's bit of a closed-level set below the top
+    /// bit in the low byte, the index shift in the next and the sequence
+    /// index in the high half, so one load brings all three. Both byte
+    /// fields are below the word width: used as a shift amount, the word
+    /// itself moves the level's bit to the top, and the top bit down to the
+    /// level's.
     packed: u64,
     control: *const u8,
 }
@@ -29,7 +30,7 @@ const SEQUENCE_INDEX_BIT: u32 = u32::BITS;
 
 const fn pack(level: u8, index_shift: u8, sequence_index: u32) -> u64 {
     assert!(level <= SENTINEL_LEVEL && (index_shift as u32) < u64::BITS);
-    (SENTINEL_LEVEL - level) as u64
+    (TOP_LEVEL_BIT - level_bit(level)) as u64
         | (index_shift as u64) << INDEX_SHIFT_BIT
         | (sequence_index as u64) << SEQUENCE_INDEX_BIT
 }
@@ -122,21 +123,21 @@ impl PhiRoute {
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub(super) fn level(&self) -> u8 {
-        SENTINEL_LEVEL - self.packed as u8
+        (TOP_LEVEL_BIT - (self.packed as u8 & TOP_LEVEL_BIT)).wrapping_sub(1) & TOP_LEVEL_BIT
     }
 
-    /// Whether `open_levels` holds the route's level.
+    /// Whether `closed_levels` holds the route's level.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn is_open(&self, open_levels: u64) -> bool {
-        open_levels.wrapping_shl(self.packed as u32) & SENTINEL_BIT != 0
+    pub(super) fn is_closed(&self, closed_levels: u64) -> bool {
+        closed_levels.wrapping_shl(self.packed as u32) >> TOP_LEVEL_BIT != 0
     }
 
-    /// `open_levels` without the route's level.
+    /// `closed_levels` with the route's level.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn close(&self, open_levels: u64) -> u64 {
-        open_levels & !SENTINEL_BIT.wrapping_shr(self.packed as u32)
+    pub(super) fn close(&self, closed_levels: u64) -> u64 {
+        closed_levels | (1_u64 << TOP_LEVEL_BIT).wrapping_shr(self.packed as u32)
     }
 
     /// Shift that reduces a probe word to a slot of the route's level.
@@ -175,14 +176,22 @@ impl PhiRoute {
 /// Control bytes the sentinel route probes: its shift leaves one index bit.
 static SENTINEL_CONTROL: [u8; 2] = [CTRL_EMPTY; 2];
 
-/// Level of the sentinel route, above every real level: the top bit of a
-/// lookup's open-level set.
+/// Level of the sentinel route, above every real level.
 pub(super) const SENTINEL_LEVEL: u8 = 63;
 const _: () = assert!(SENTINEL_LEVEL as u32 == u64::BITS - 1);
 
-/// The sentinel's bit of an open-level set: a set that holds no more is at
-/// most this.
-pub(super) const SENTINEL_BIT: u64 = 1 << SENTINEL_LEVEL;
+/// Top bit position of a lookup's closed-level set.
+const TOP_LEVEL_BIT: u8 = 63;
+
+/// The sentinel's bit of a closed-level set, the lowest: a stored route
+/// summary keeps it clear, so a walk always stops at the sentinel.
+pub(super) const SENTINEL_BIT: u64 = 1;
+
+/// Bit position of `level` in a closed-level set: one above the level for a
+/// real level, the lowest for the sentinel.
+const fn level_bit(level: u8) -> u8 {
+    level.wrapping_add(1) & TOP_LEVEL_BIT
+}
 
 const SENTINEL: PhiRoute = PhiRoute {
     packed: pack(SENTINEL_LEVEL, SENTINEL_LEVEL, 0),
