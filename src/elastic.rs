@@ -109,7 +109,13 @@ pub(crate) struct Level<T> {
     capacity: u32,
     len: u32,
     tombstones: u32,
+    /// [`probe::elastic_index_shift`] of `capacity`, or [`GENERAL_REDUCTION`].
+    index_shift: u32,
 }
+
+/// [`Level::index_shift`] of a level whose probes need the general range
+/// reduction.
+const GENERAL_REDUCTION: u32 = u64::BITS;
 
 // SAFETY: the raw pointers address slots this descriptor's table owns
 // exclusively, like `Box<[T]>`; no shared interior state outlives the borrow.
@@ -149,6 +155,10 @@ impl<T> Level<T> {
             capacity: cap_u32,
             len: 0,
             tombstones: 0,
+            index_shift: match probe::elastic_index_shift(cap_u32 as usize) {
+                Some(shift) => shift,
+                None => GENERAL_REDUCTION,
+            },
         }
     }
 
@@ -1749,6 +1759,10 @@ where
         self.find_by_exact_schedule(key, prepared, key_fingerprint, |_level, _slot, entry| entry)
     }
 
+    /// Walks the key's candidates in schedule order while every level it
+    /// reaches reduces by shift. It calls nothing but the key comparison and
+    /// leaves through tail calls, so it keeps no stack frame.
+    #[inline]
     fn find_by_exact_schedule<'a, Q, R>(
         &'a self,
         key: &Q,
@@ -1759,9 +1773,81 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        if self.len == 0 || self.levels.is_empty() {
+        // A key the filter never recorded was never inserted, so neither the
+        // candidates nor the exceptional full scan can hold it.
+        let filter = self.route_filter(prepared);
+        if !filter.maybe_present {
             return None;
         }
+        let level_mask = filter.expanded_level_mask();
+        // SAFETY: the filter only passes when it has words, and those are laid
+        // out for a non-zero slot count, which gives the table a level zero.
+        let h11_shift = unsafe { self.levels.get_unchecked(0) }.index_shift;
+        if h11_shift == GENERAL_REDUCTION {
+            return self.find_by_general_schedule(
+                key,
+                prepared,
+                key_fingerprint,
+                level_mask,
+                on_hit,
+            );
+        }
+        let h11_slot =
+            probe::shifted_elastic_probe_index(prepared.route.probe, H11_COUNTER_BASE, h11_shift);
+        // SAFETY: the shifted index maps into level zero's capacity.
+        if let Some(entry) = unsafe { self.entry_if_match(0, h11_slot, key_fingerprint, key) } {
+            return Some(on_hit(0, h11_slot, entry));
+        }
+
+        for route in &self.probe_schedule {
+            let level = route.level();
+            if level_mask & (1_u32 << level) == 0 {
+                continue;
+            }
+            // SAFETY: schedule routes name real levels.
+            let index_shift = unsafe { self.levels.get_unchecked(level) }.index_shift;
+            if index_shift == GENERAL_REDUCTION {
+                return self.find_by_general_schedule(
+                    key,
+                    prepared,
+                    key_fingerprint,
+                    level_mask,
+                    on_hit,
+                );
+            }
+            let slot = probe::shifted_elastic_probe_index(
+                prepared.route.probe,
+                route.counter_base,
+                index_shift,
+            );
+            // SAFETY: the route names a real level and the shifted index maps
+            // into its capacity.
+            if let Some(entry) = unsafe { self.entry_if_match(level, slot, key_fingerprint, key) } {
+                return Some(on_hit(level, slot, entry));
+            }
+        }
+        if self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG != 0 {
+            self.find_by_full_scan(key, key_fingerprint, on_hit)
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::find_by_exact_schedule`] from the first candidate, for a key
+    /// that passed the filter in a table with a level needing the general
+    /// range reduction.
+    #[inline(never)]
+    fn find_by_general_schedule<'a, Q, R>(
+        &'a self,
+        key: &Q,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
+        level_mask: u32,
+        mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
+    ) -> Option<R>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
         let Some(h11_slot) = Self::route_prepared_counter_for_upper(
             prepared.route.probe,
             H11_COUNTER_BASE,
@@ -1769,20 +1855,11 @@ where
         ) else {
             return self.find_by_full_scan(key, key_fingerprint, on_hit);
         };
-        // The metadata load is issued while the level-zero control byte is still
-        // in flight: neither depends on the other.
-        let filter = self.route_filter(prepared);
         // SAFETY: the counter route maps into level zero's capacity.
         if let Some(entry) = unsafe { self.entry_if_match(0, h11_slot, key_fingerprint, key) } {
             return Some(on_hit(0, h11_slot, entry));
         }
-        // A key the filter never recorded was never inserted, so neither the
-        // remaining candidates nor the exceptional full scan can hold it.
-        if !filter.maybe_present {
-            return None;
-        }
 
-        let level_mask = filter.expanded_level_mask();
         for route in &self.probe_schedule {
             let level = route.level();
             if level_mask & (1_u32 << level) == 0 {
