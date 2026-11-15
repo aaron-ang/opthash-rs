@@ -1,6 +1,7 @@
 //! Paper-exact Funnel placement with explicit dynamic-map epoch extensions.
 use core::fmt;
 use core::hash::{BuildHasher, Hash};
+use core::marker::PhantomData;
 use core::mem::{self, MaybeUninit};
 
 use alloc::boxed::Box;
@@ -59,9 +60,8 @@ enum FunnelScanMode {
     Sparse(OccupiedIndices),
 }
 
-/// Entries of [`FunnelShape::head`]: the levels that own a level-bin bit plus
-/// at least one absent entry, rounded up to a power of two so indexing masks
-/// instead of bounds-checking.
+/// Entries of [`FunnelShape::head`]: one per level that owns a level-bin bit,
+/// then absent entries up to a power of two.
 const HEAD_LEVELS: usize = (OVERFLOW_LEVEL + 1).next_power_of_two();
 
 // Declaration order is layout order: a draw reads the multiplier with the
@@ -114,13 +114,55 @@ impl LevelShape {
     };
 }
 
-impl FunnelShape {
-    /// Shape of ordinary level `level`, which owns a level-bin bit.
+/// The head entries of the levels below `OVERFLOW_LEVEL` that a level bin
+/// records, shallowest first.
+#[derive(Clone)]
+struct RecordedHead<'a> {
+    /// The levels still to yield: a bit `distance` places below the top bit
+    /// stands for the head entry `distance` entries past `entry`.
+    pending: u32,
+    entry: *const LevelShape,
+    head: PhantomData<&'a [LevelShape; HEAD_LEVELS]>,
+}
+
+impl<'a> RecordedHead<'a> {
     #[inline]
-    fn head_level(&self, level: u32) -> &LevelShape {
-        &self.head[level as usize % HEAD_LEVELS]
+    fn new(shape: &'a FunnelShape, levels: u16) -> Self {
+        Self {
+            pending: recorded_head_levels(levels),
+            entry: shape.head.as_ptr(),
+            head: PhantomData,
+        }
     }
 
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.pending == 0
+    }
+}
+
+impl<'a> Iterator for RecordedHead<'a> {
+    type Item = &'a LevelShape;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a LevelShape> {
+        if self.pending == 0 {
+            return None;
+        }
+        let distance = self.pending.leading_zeros();
+        debug_assert!((distance as usize) < OVERFLOW_LEVEL);
+        // SAFETY: a pending bit stands for a level below `OVERFLOW_LEVEL`,
+        // whose entry the head holds, at the bit's distance from `entry`.
+        self.entry = unsafe { self.entry.add(distance as usize) };
+        // The yielded level's bit moves to the top and is cleared, so the
+        // rest keep their distances from its entry.
+        self.pending = (self.pending << distance) & !SHALLOWEST_LEVEL;
+        // SAFETY: as above; the head outlives `'a`.
+        Some(unsafe { &*self.entry })
+    }
+}
+
+impl FunnelShape {
     fn empty() -> Self {
         Self {
             n: 0,
@@ -355,14 +397,32 @@ impl<T> arena::RegionSet for FlatStorage<T> {
 }
 
 /// Level-bin bit shared by every ordinary level from this index on and by both
-/// special arrays. Shallower levels each own the bit at their index.
+/// special arrays: the top bit. Shallower levels each own a bit below it,
+/// level zero the highest, so the leading zeros of a bin count up to its
+/// shallowest recorded level.
 const OVERFLOW_LEVEL: usize = u16::BITS as usize - 1;
 const OVERFLOW_LEVEL_BIT: u16 = 1 << OVERFLOW_LEVEL;
 
 /// Level-bin bit of ordinary level `level`.
 #[inline]
 fn level_bit_of(level: usize) -> u16 {
-    1 << level.min(OVERFLOW_LEVEL)
+    if level < OVERFLOW_LEVEL {
+        (OVERFLOW_LEVEL_BIT >> 1) >> level
+    } else {
+        OVERFLOW_LEVEL_BIT
+    }
+}
+
+/// Bit of level zero in [`recorded_head_levels`].
+const SHALLOWEST_LEVEL: u32 = 1 << (u32::BITS - 1);
+
+/// The levels below `OVERFLOW_LEVEL` that a level bin records, level zero in
+/// the top bit, so the leading zeros of a non-empty set are the index of its
+/// shallowest level.
+#[inline]
+fn recorded_head_levels(levels: u16) -> u32 {
+    // One place past the top half, which shifts the overflow bit out.
+    u32::from(levels) << (u32::BITS - u16::BITS + 1)
 }
 
 /// Level bin of a key. Bits 6 and 7 of the hash: disjoint from both membership
@@ -1208,10 +1268,11 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let mut ordinary = levels & !OVERFLOW_LEVEL_BIT;
+        let mut ordinary = recorded_head_levels(levels);
         while ordinary != 0 {
-            let index = ordinary.trailing_zeros() as usize;
-            ordinary &= ordinary - 1;
+            let index = ordinary.leading_zeros();
+            ordinary ^= SHALLOWEST_LEVEL >> index;
+            let index = index as usize;
             // A range failure here ended the key's placement walk too.
             match self.lookup_level(key, probe, index, key_fingerprint)? {
                 BucketScanResult::Hit(slot) => return Some(slot),
@@ -1258,9 +1319,8 @@ where
         let key_fingerprint = probe.fingerprint();
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
-        let scan = |level: u32, lanes: u64| -> (usize, u64) {
+        let scan = |level: &LevelShape, lanes: u64| -> (usize, u64) {
             debug_assert_ne!(lanes, 0);
-            let level = self.shape.head_level(level);
             let (bucket, _) =
                 probe::ordinary_funnel_first_draw(probe, level.multiplier, level.bucket_range);
             let start = level.offset + bucket * beta;
@@ -1284,13 +1344,10 @@ where
             let found = unsafe { self.found_at(slot) };
             key.equivalent(&found.entry.key).then_some(found)
         };
-        // Widened so clearing the lowest set bit also tests for an empty set.
-        let recorded = u32::from(levels & !OVERFLOW_LEVEL_BIT);
-        // Compares every match of every level in a non-empty set.
-        let walk = |mut pending: u32, lanes: u64| -> Option<Found<'_, K, V>> {
+        // Compares every match of every level left in a set.
+        let walk = |mut recorded: RecordedHead<'_>, lanes: u64| -> Option<Found<'_, K, V>> {
             loop {
-                let (start, matches) = scan(pending.trailing_zeros(), lanes);
-                let mut matches = matches;
+                let (start, mut matches) = scan(recorded.next()?, lanes);
                 while matches != 0 {
                     if let Some(found) = holding_key(start, matches) {
                         return Some(found);
@@ -1299,13 +1356,10 @@ where
                     rarely_taken();
                     matches &= matches - 1;
                 }
-                pending &= pending - 1;
-                if pending == 0 {
-                    return None;
-                }
             }
         };
-        if recorded == 0 {
+        let recorded = RecordedHead::new(&self.shape, levels);
+        if recorded.is_empty() {
             return None;
         }
         if lookup_lanes & LOOKUP_SELECTS == 0 {
@@ -1319,15 +1373,9 @@ where
         // The first two recorded levels are scanned together and the
         // holder is selected, not branched on: which of them holds the
         // key is unpredictable.
-        let mut pending = recorded;
-        let first = pending.trailing_zeros();
-        pending &= pending - 1;
-        let second = if pending == 0 {
-            first
-        } else {
-            pending.trailing_zeros()
-        };
-        pending &= pending.wrapping_sub(1);
+        let mut pending = recorded.clone();
+        let first = pending.next()?;
+        let second = pending.next().unwrap_or(first);
         let (first_start, first_matches) = scan(first, lanes);
         let (second_start, second_matches) = scan(second, lanes);
         let in_first = first_matches != 0;
@@ -1345,11 +1393,7 @@ where
             // comparing every match of every recorded level.
             pending = recorded;
         }
-        if pending == 0 {
-            None
-        } else {
-            walk(pending, lanes)
-        }
+        walk(pending, lanes)
     }
 
     /// Whether a lookup [`Self::first_match`] found nothing for is absent.
@@ -1361,10 +1405,7 @@ where
         if levels & OVERFLOW_LEVEL_BIT != 0 || self.exceptional_placement {
             return false;
         }
-        let mut unchecked = u32::from(levels & !OVERFLOW_LEVEL_BIT);
-        while unchecked != 0 {
-            let level = self.shape.head_level(unchecked.trailing_zeros());
-            unchecked &= unchecked - 1;
+        for level in RecordedHead::new(&self.shape, levels) {
             let certain = probe::ordinary_funnel_first_certain_index(
                 probe,
                 level.multiplier,

@@ -447,7 +447,7 @@ fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
             })
             .unwrap();
         let vacancy = table.vacancy_at(slot);
-        assert_eq!(vacancy.level_bit, 1);
+        assert_eq!(vacancy.level_bit, level_bit_of(0));
         table.place_new_entry(
             vacancy,
             key,
@@ -911,6 +911,48 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
 /// buckets for first matches, and it keeps an all-absent head, which ends
 /// the insert's head walk at once. A shape with lanes copies its levels into
 /// the head and flags the lookups of a table small enough to select.
+#[test]
+fn recorded_head_yields_the_entry_of_every_recorded_level_shallowest_first() {
+    let shape = FunnelShape::for_insert_budget(1 << 12, ReserveFraction::from_exponent(3).unwrap())
+        .unwrap();
+    let yielded = |levels: u16| -> Vec<*const LevelShape> {
+        RecordedHead::new(&shape, levels)
+            .map(core::ptr::from_ref)
+            .collect()
+    };
+    let entries = |levels: &[usize]| -> Vec<*const LevelShape> {
+        levels
+            .iter()
+            .map(|&level| core::ptr::from_ref(&shape.head[level]))
+            .collect()
+    };
+    assert_eq!(yielded(0), []);
+    assert_eq!(yielded(OVERFLOW_LEVEL_BIT), []);
+    assert_eq!(
+        yielded(u16::MAX),
+        entries(&(0..OVERFLOW_LEVEL).collect::<Vec<_>>())
+    );
+    for shallow in 0..OVERFLOW_LEVEL {
+        assert_eq!(
+            yielded(level_bit_of(shallow)),
+            entries(&[shallow]),
+            "level {shallow}"
+        );
+        for deep in shallow + 1..OVERFLOW_LEVEL {
+            for overflow in [0, OVERFLOW_LEVEL_BIT] {
+                assert_eq!(
+                    yielded(level_bit_of(shallow) | level_bit_of(deep) | overflow),
+                    entries(&[shallow, deep]),
+                    "levels {shallow} and {deep}"
+                );
+            }
+        }
+    }
+    // A deeper level shares the overflow bit, which names no head entry.
+    assert_eq!(level_bit_of(OVERFLOW_LEVEL), OVERFLOW_LEVEL_BIT);
+    assert_eq!(level_bit_of(usize::MAX), OVERFLOW_LEVEL_BIT);
+}
+
 #[test]
 fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     let (wide, smallest_wide) = smallest_wide_shape();
