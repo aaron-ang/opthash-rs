@@ -1,6 +1,7 @@
 use core::fmt;
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
+use core::ptr::NonNull;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -314,6 +315,8 @@ unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
     for ElasticTable<K, V, S, A>
 {
 }
+
+type LevelPtr<K, V> = NonNull<Level<SlotEntry<K, V>>>;
 
 impl<K, V, S, A: Allocator + Clone> fmt::Debug for ElasticTable<K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1171,9 +1174,11 @@ where
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
-        let Some((level, slot, control)) = self.settled_slot(prepared.route.probe) else {
+        let Some((region, slot, control)) = self.settled_level_slot(prepared.route.probe) else {
             return self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
         };
+        // SAFETY: the settled search returns one of this table's levels.
+        let level = unsafe { region.as_ptr().offset_from_unsigned(self.levels.as_ptr()) };
         self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control)
     }
 
@@ -1182,9 +1187,22 @@ where
     /// by shift, and the batch's first choice of level has a free slot among
     /// its scheduled probes. `None` leaves the insert to
     /// [`Self::insert_for_vacant_entry_prepared`].
+    #[cfg(test)]
+    fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize, u8)> {
+        let (region, slot, control) = self.settled_level_slot(probe)?;
+        // SAFETY: the settled search returns one of this table's levels.
+        let level = unsafe { region.as_ptr().offset_from_unsigned(self.levels.as_ptr()) };
+        Some((level, slot, control))
+    }
+
+    /// [`Self::settled_slot`] with the level by address, so a caller that
+    /// writes the slot does not index the levels again.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize, u8)> {
+    fn settled_level_slot(
+        &self,
+        probe: PreparedElasticProbe,
+    ) -> Option<(LevelPtr<K, V>, usize, u8)> {
         if !self.scheduler.settles(self.len) {
             return None;
         }
@@ -1217,7 +1235,7 @@ where
         // means every level does.
         let (slot, _, control) =
             unsafe { self.first_shifted_vacancy(probe, case.level, case.region, budget) }?;
-        Some((case.level, slot, control))
+        Some((NonNull::from(case.region), slot, control))
     }
 
     fn insert_for_vacant_entry_prepared(
@@ -1381,10 +1399,46 @@ where
         slot_idx: usize,
         prev_ctrl: u8,
     ) -> (usize, usize) {
+        debug_assert!(level_idx < self.levels.len());
+        // SAFETY: callers pass a level they found a free slot in.
+        let level = unsafe { self.levels.as_mut_ptr().add(level_idx) };
+        // SAFETY: as above, and the slot is a free one of that level.
+        unsafe {
+            self.write_new_entry_at(
+                key,
+                value,
+                prepared,
+                key_fingerprint,
+                level,
+                slot_idx,
+                prev_ctrl,
+            );
+        }
+        (level_idx, slot_idx)
+    }
+
+    /// [`Self::write_new_entry`] for a level by address.
+    ///
+    /// # Safety
+    ///
+    /// `level` is one of this table's levels, derived from their pointer,
+    /// `slot_idx` is a free slot of it and `prev_ctrl` its control byte.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn write_new_entry_at(
+        &mut self,
+        key: K,
+        value: V,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
+        level: *mut Level<SlotEntry<K, V>>,
+        slot_idx: usize,
+        prev_ctrl: u8,
+    ) {
         let summary_bit = {
-            debug_assert!(level_idx < self.levels.len());
-            // SAFETY: callers pass a level they found a free slot in.
-            let level = unsafe { self.levels.get_unchecked_mut(level_idx) };
+            // SAFETY: the caller's contract; `&mut self` borrows the levels
+            // alone.
+            let level = unsafe { &mut *level };
             // SAFETY: callers pass a free slot found within this level.
             debug_assert_eq!(prev_ctrl, unsafe { level.control_at(slot_idx) });
             debug_assert!(control::is_free(prev_ctrl));
@@ -1401,7 +1455,6 @@ where
         };
         self.record_membership(prepared.route, prepared.membership, summary_bit);
         self.len += 1;
-        (level_idx, slot_idx)
     }
 
     /// Extends the schedule to cover a placement outside the scheduled levels
@@ -1637,8 +1690,23 @@ where
                     ScheduleSearch::Unresolved => break 'common,
                 }
             }
-            if let Some((level, slot, control)) = self.settled_slot(prepared.route.probe) {
-                self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control);
+            if let Some((region, slot, control)) = self.settled_level_slot(prepared.route.probe) {
+                // The search borrowed the level shared; the write takes it
+                // again through the levels' own pointer.
+                let level = self.levels.as_mut_ptr().with_addr(region.addr().get());
+                // SAFETY: the settled search returns one of this table's
+                // levels and a free slot of it with its control byte.
+                unsafe {
+                    self.write_new_entry_at(
+                        key,
+                        value,
+                        prepared,
+                        key_fingerprint,
+                        level,
+                        slot,
+                        control,
+                    );
+                }
                 return None;
             }
         }
