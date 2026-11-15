@@ -273,7 +273,10 @@ impl<T> Level<T> {
 /// probes. Query positions are compressed without changing their order.
 pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     levels: LevelSlice<K, V>,
-    len: usize,
+    /// Live entries plus the removals the scheduler's countdown has counted,
+    /// so a removal moves the countdown alone. [`Self::live`] is the live
+    /// count.
+    placed: usize,
     total_slots: usize,
     /// Fixed for the allocation. The scheduler's settled limit is taken from
     /// it once, when the two are built ([`settled_limit`]).
@@ -300,11 +303,6 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     /// First word of the metadata tail, so the gate's address needs one load;
     /// [`NO_METADATA`] while `membership` has no words.
     metadata_words: *mut MetadataWord,
-    /// Removals the filter still tolerates, counted down from
-    /// [`membership::refresh_deletes`]; maintenance is due once it is
-    /// negative as a signed count, so the test is its sign bit. A scan's
-    /// removals may take it further down before the scan can settle.
-    deletes_left: usize,
 }
 
 // SAFETY: the table uniquely owns its arena and every entry in it, like
@@ -660,7 +658,11 @@ fn settled_limit<T>(
 /// positions in `[batch_ends[i-1], batch_ends[i])`, the prefix-sum test the
 /// scalar oracle applies, so under deletion it tracks occupancy rather than
 /// an insert tally.
+///
+/// It also counts removals, in the word next to the gate a removal closes:
+/// `repr(C)` keeps the two adjacent, so a removal writes both together.
 #[derive(Clone)]
+#[repr(C)]
 pub(crate) struct BatchScheduler {
     /// Cumulative quota through each batch: the exclusive `len` bound at
     /// which the batch ends. Zero-quota batches repeat the previous end.
@@ -674,12 +676,18 @@ pub(crate) struct BatchScheduler {
     /// table's insertion limit, or zero where [`settled_limit()`] rules a
     /// settled insert out.
     settled_limit: usize,
-    /// Exclusive live-count bound of the cached batch's settled inserts: the
-    /// lower of `batch_end` and `settled_limit`, or zero since a removal.
-    /// Every path that lowers the table's live count closes it through
-    /// [`Self::note_removal`] or re-syncs the batch, and only
-    /// [`Self::reopen`] and a re-sync raise it, so a live count under this
-    /// bound is inside the cached batch.
+    /// Removals the table's filter still tolerates, counted down from
+    /// [`membership::refresh_deletes`]; maintenance is due once it is
+    /// negative as a signed count, so the test is its sign bit. A scan's
+    /// removals may take it further down before the scan can settle.
+    deletes_left: usize,
+    /// Exclusive bound of the cached batch's settled inserts, on the table's
+    /// placed count: the lower of `batch_end` and `settled_limit` plus the
+    /// removals the placed count still holds, or zero since a removal or a
+    /// re-sync. Every path that lowers the table's live count or changes
+    /// those removals closes it through [`Self::note_removal`] or
+    /// [`Self::close`], or re-syncs the batch, and only [`Self::reopen`] raises it, so a placed count
+    /// under this bound is a live count inside the cached batch.
     settled_end: usize,
 }
 
@@ -701,7 +709,7 @@ enum BatchTarget {
 }
 
 impl BatchScheduler {
-    pub(crate) fn new(batch_plan: &[usize], settled_limit: usize) -> Self {
+    pub(crate) fn new(batch_plan: &[usize], settled_limit: usize, deletes_left: usize) -> Self {
         let mut total = 0_usize;
         let batch_ends = batch_plan
             .iter()
@@ -716,36 +724,66 @@ impl BatchScheduler {
             batch_start: 0,
             batch_end: usize::MAX,
             settled_limit,
-            settled_end: settled_limit,
+            deletes_left,
+            settled_end: 0,
         };
         scheduler.reset();
         scheduler
     }
 
-    /// The cached batch is current for the table's `len` live entries and
-    /// `len` is below the settled limit. One compare, which
-    /// [`Self::note_removal`] keeps sound for a live count that falls back
-    /// under the cached batch.
+    /// The cached batch is current for the live entries of a table at
+    /// `placed`, and their count is below the settled limit. One compare,
+    /// which [`Self::note_removal`] keeps sound for a live count that falls
+    /// back under the cached batch.
     #[inline]
-    fn settles(&self, len: usize) -> bool {
-        len < self.settled_end
+    fn settles(&self, placed: usize) -> bool {
+        placed < self.settled_end
     }
 
-    /// Records a removal by closing the settled gate, whatever the live
-    /// count: one store, with no test of where the count fell.
+    /// Records a removal: counts it and closes the settled gate, whatever
+    /// the live count, with no test of where the count fell.
     #[inline]
     fn note_removal(&mut self) {
+        self.deletes_left = self.deletes_left.wrapping_sub(1);
         self.settled_end = 0;
     }
 
-    /// Reopens a gate that a removal closed while the cached batch still
-    /// covers the `len` live entries, and reports whether `len` settles.
+    /// Closes the settled gate for a change of the placed count that is not
+    /// a counted removal.
     #[inline]
-    fn reopen(&mut self, len: usize) -> bool {
-        if self.covers(len) {
-            self.settled_end = self.batch_end.min(self.settled_limit);
+    fn close(&mut self) {
+        self.settled_end = 0;
+    }
+
+    /// Starts the removal countdown over from `budget`. The removals a
+    /// placed count holds change with it, so the gate closes.
+    #[inline]
+    fn rearm(&mut self, budget: usize) {
+        self.deletes_left = budget;
+        self.close();
+    }
+
+    /// Removals passed the budget the countdown started from.
+    #[inline]
+    fn maintenance_is_due(&self) -> bool {
+        self.deletes_left.cast_signed() < 0
+    }
+
+    /// Removals counted since the countdown started from `budget`.
+    #[inline]
+    fn removed(&self, budget: usize) -> usize {
+        budget.wrapping_sub(self.deletes_left)
+    }
+
+    /// Reopens a closed gate while the cached batch still covers the live
+    /// entries of a table at `placed`, `removed` of which have left, and
+    /// reports whether that table settles.
+    #[inline]
+    fn reopen(&mut self, placed: usize, removed: usize) -> bool {
+        if self.covers(placed - removed) {
+            self.settled_end = self.batch_end.min(self.settled_limit) + removed;
         }
-        self.settles(len)
+        self.settles(placed)
     }
 
     /// Counts an insert into one of `level`'s tombstones. In a level past
@@ -762,10 +800,11 @@ impl BatchScheduler {
         level.tombstones -= 1;
     }
 
-    /// [`Self::reopen`] on a copy: whether an insert at `len` settles.
+    /// [`Self::reopen`] on a copy: whether an insert into that table
+    /// settles.
     #[cfg(test)]
-    fn would_settle(&self, len: usize) -> bool {
-        self.clone().reopen(len)
+    fn would_settle(&self, placed: usize, removed: usize) -> bool {
+        self.clone().reopen(placed, removed)
     }
 
     /// [`Self::target`] on a copy, for assertions through a shared borrow.
@@ -816,7 +855,7 @@ impl BatchScheduler {
         self.current_batch_index = index;
         self.batch_start = if index == 0 { 0 } else { ends[index - 1] };
         self.batch_end = ends[index];
-        self.settled_end = self.batch_end.min(self.settled_limit);
+        self.settled_end = 0;
     }
 
     /// Reset batch progress after resize or clear.
@@ -1111,11 +1150,15 @@ where
         let probe_schedule = schedule_room.schedule(&levels);
         Ok(Self {
             levels,
-            len: 0,
+            placed: 0,
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(&geometry.batch_plan, settled_limit),
+            scheduler: BatchScheduler::new(
+                &geometry.batch_plan,
+                settled_limit,
+                membership::refresh_deletes(geometry.max_insertions),
+            ),
             hash_builder,
             alloc,
             metadata_words: metadata_words(&arena, membership),
@@ -1126,7 +1169,6 @@ where
             probe_schedule,
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
-            deletes_left: membership::refresh_deletes(geometry.max_insertions),
         })
     }
 
@@ -1242,7 +1284,21 @@ where
         unsafe {
             reset_metadata(self.membership, self.arena.as_ptr());
         }
-        self.deletes_left = membership::refresh_deletes(self.max_insertions);
+        self.rearm_deletes();
+    }
+
+    /// Starts the delete countdown over at the same live count. The placed
+    /// count moves with it, so the settled gate closes.
+    fn rearm_deletes(&mut self) {
+        self.placed = self.live();
+        self.scheduler
+            .rearm(membership::refresh_deletes(self.max_insertions));
+    }
+
+    /// Live entries.
+    #[inline]
+    fn live(&self) -> usize {
+        self.placed - self.stale_membership()
     }
 
     fn copy_membership_from(&mut self, source: &Self) {
@@ -1260,14 +1316,14 @@ where
     fn clear(&mut self) {
         for level in &mut self.levels {
             level.drain_reset(|entry| {
-                self.len -= 1;
+                self.placed -= 1;
                 // Before the drop: one that panics leaves the table live
                 // with this count.
-                self.scheduler.note_removal();
+                self.scheduler.close();
                 drop(entry);
             });
         }
-        debug_assert_eq!(self.len, 0);
+        debug_assert_eq!(self.live(), 0);
         self.reset_after_clear();
     }
 
@@ -1302,13 +1358,11 @@ where
     /// the scheduler so a shared borrow can ask.
     #[cfg(test)]
     fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize, u8)> {
-        if !self.scheduler.would_settle(self.len) {
+        // The gate a reopening leaves is the one the copy reports.
+        let mut scheduler = self.scheduler.clone();
+        if !scheduler.reopen(self.placed, self.stale_membership()) {
             return None;
         }
-        // The gate a reopening leaves is the one the copy reported.
-        let mut scheduler = self.scheduler.clone();
-        scheduler.reopen(self.len);
-        debug_assert!(scheduler.settles(self.len));
         // SAFETY: the scheduler settles this live count once reopened, and
         // the search reads the cached batch, which reopening leaves alone.
         let (region, slot, control) = unsafe { self.settled_level_slot_in_batch(probe) }?;
@@ -1331,7 +1385,9 @@ where
         &mut self,
         probe: PreparedElasticProbe,
     ) -> Option<(LevelPtr<K, V>, usize, u8)> {
-        if !self.scheduler.settles(self.len) && !self.scheduler.reopen(self.len) {
+        if !self.scheduler.settles(self.placed)
+            && !self.scheduler.reopen(self.placed, self.stale_membership())
+        {
             return None;
         }
         // SAFETY: the scheduler settles the live count.
@@ -1390,7 +1446,7 @@ where
         prepared: PreparedElasticKey,
         key_fingerprint: u8,
     ) -> (usize, usize) {
-        if self.len >= self.max_insertions {
+        if self.live() >= self.max_insertions {
             let new_cap = if self.total_slots == 0 {
                 INITIAL_CAPACITY
             } else {
@@ -1399,7 +1455,7 @@ where
             self.resize_with_transition(new_cap, EpochTransition::Growth);
         }
 
-        if !self.scheduler.covers(self.len) {
+        if !self.scheduler.covers(self.live()) {
             self.enter_batch();
         }
         let target = self.scheduler.cached_target();
@@ -1462,7 +1518,7 @@ where
             return self.place_exceptional_entry(key, value, prepared, key_fingerprint);
         }
         self.resize_with_transition(self.total_slots, EpochTransition::PlacementRecovery);
-        let target = self.scheduler.target(self.len);
+        let target = self.scheduler.target(self.live());
         if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             self.place_new_entry(key, value, prepared, key_fingerprint, placement)
         } else {
@@ -1604,7 +1660,7 @@ where
             }
             level.len += 1;
         }
-        self.len += 1;
+        self.placed += 1;
         // A free slot that is not empty is a tombstone. Last, so the call
         // sits after every store of the common path.
         if prev_ctrl != CTRL_EMPTY {
@@ -1712,7 +1768,7 @@ where
 
     #[inline]
     fn len(&self) -> usize {
-        self.len
+        self.live()
     }
 
     #[inline]
@@ -1733,7 +1789,7 @@ where
     fn epoch_snapshot(&self) -> EpochSnapshot {
         let mut epoch = self.epoch;
         epoch.note_deletes(self.stale_membership());
-        epoch.snapshot(self.len)
+        epoch.snapshot(self.live())
     }
 
     #[inline]
@@ -1900,9 +1956,7 @@ where
             level.len -= 1;
             level.tombstones += 1;
         }
-        self.len -= 1;
         self.scheduler.note_removal();
-        self.deletes_left = self.deletes_left.wrapping_sub(1);
     }
 
     fn finish_deferred_removals(&mut self) {
@@ -1986,7 +2040,7 @@ where
             level.len = 0;
             level.tombstones = 0;
         }
-        self.len = 0;
+        self.placed = self.stale_membership();
         self.reset_after_clear();
     }
 
@@ -2024,7 +2078,7 @@ where
 
         let mut cloned = Self {
             levels,
-            len: self.len,
+            placed: self.placed,
             total_slots: self.total_slots,
             max_insertions: self.max_insertions,
             reserve_fraction: self.reserve_fraction,
@@ -2039,7 +2093,6 @@ where
             probe_schedule,
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
-            deletes_left: self.deletes_left,
         };
         cloned.copy_membership_from(self);
         cloned
@@ -2063,13 +2116,14 @@ where
     /// since the last maintenance pay for a pass over the live entries.
     #[inline]
     fn maintenance_is_due(&self) -> bool {
-        self.deletes_left.cast_signed() < 0
+        self.scheduler.maintenance_is_due()
     }
 
     /// Deletes since the filter last matched the live set. They are also the
     /// deletes the epoch has not counted yet.
     fn stale_membership(&self) -> usize {
-        membership::refresh_deletes(self.max_insertions).wrapping_sub(self.deletes_left)
+        self.scheduler
+            .removed(membership::refresh_deletes(self.max_insertions))
     }
 
     /// Same-size cleanup when a level passed its tombstone threshold;
@@ -2101,7 +2155,8 @@ where
         if self.levels.iter().any(Level::needs_cleanup) {
             self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
         }
-        self.scheduler.sync(self.len);
+        self.scheduler.sync(self.live());
+        self.scheduler.reopen(self.placed, self.stale_membership());
     }
 
     /// Re-record the filter from the live entries, dropping the bits departed
@@ -2168,17 +2223,20 @@ where
             self,
             ElasticGeneration {
                 levels,
-                len: 0,
+                placed: 0,
                 total_slots: geometry.total_slots,
                 max_insertions: geometry.max_insertions,
-                scheduler: BatchScheduler::new(&geometry.batch_plan, settled_limit),
+                scheduler: BatchScheduler::new(
+                    &geometry.batch_plan,
+                    settled_limit,
+                    membership::refresh_deletes(geometry.max_insertions),
+                ),
                 metadata_words: metadata_words(&arena, membership),
                 arena,
                 probe_high_water: empty_high_water(settled_limit),
                 scheduled_levels: 0,
                 probe_schedule,
                 membership,
-                deletes_left: membership::refresh_deletes(geometry.max_insertions),
             },
         );
         self.epoch.start_epoch(
@@ -2794,7 +2852,7 @@ where
 /// The fields a resize replaces as a unit.
 pub(crate) struct ElasticGeneration<K, V> {
     levels: LevelSlice<K, V>,
-    len: usize,
+    placed: usize,
     total_slots: usize,
     max_insertions: usize,
     scheduler: BatchScheduler,
@@ -2804,7 +2862,6 @@ pub(crate) struct ElasticGeneration<K, V> {
     probe_schedule: ProbeSchedule,
     membership: MembershipRegion,
     metadata_words: *mut MetadataWord,
-    deletes_left: usize,
 }
 
 impl<K, V, S, A> Rebuildable for ElasticTable<K, V, S, A>
@@ -2820,7 +2877,7 @@ where
 
     fn swap_generation(&mut self, other: &mut ElasticGeneration<K, V>) {
         mem::swap(&mut self.levels, &mut other.levels);
-        mem::swap(&mut self.len, &mut other.len);
+        mem::swap(&mut self.placed, &mut other.placed);
         mem::swap(&mut self.total_slots, &mut other.total_slots);
         mem::swap(&mut self.max_insertions, &mut other.max_insertions);
         mem::swap(&mut self.scheduler, &mut other.scheduler);
@@ -2830,7 +2887,6 @@ where
         mem::swap(&mut self.probe_schedule, &mut other.probe_schedule);
         mem::swap(&mut self.membership, &mut other.membership);
         mem::swap(&mut self.metadata_words, &mut other.metadata_words);
-        mem::swap(&mut self.deletes_left, &mut other.deletes_left);
     }
 
     fn regions(generation: &ElasticGeneration<K, V>) -> &[Level<SlotEntry<K, V>>] {
@@ -2882,7 +2938,7 @@ where
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
-        let target = self.scheduler.target(self.len);
+        let target = self.scheduler.target(self.live());
         if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             self.place_new_entry(entry.key, entry.value, prepared, key_fingerprint, placement);
             false
