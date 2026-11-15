@@ -21,7 +21,7 @@ use crate::exact::probe::{
 use crate::hasher::DefaultHashBuilder;
 use crate::membership::{self, MembershipKey, MembershipRegion, MetadataWord};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
-use crate::raw::bitmask::{BITMASK_STRIDE, BitMask};
+use crate::raw::bitmask::BITMASK_STRIDE;
 use crate::raw::config::GROUP_SIZE;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::raw::iter::OccupiedIndices;
@@ -86,9 +86,9 @@ struct FunnelShape {
     fallback_offset: usize,
     fallback_bucket_width: usize,
     fallback_bucket_range: PreparedProbeRange,
-    /// Mask over one bucket's lanes of a group's fingerprint matches. Zero
-    /// when a bucket is wider than one group, or the shape is empty: such a
-    /// table answers no lookup from first matches.
+    /// One bit per lane of a bucket, selecting its lanes from a group's
+    /// fingerprint matches. Zero when a bucket is wider than one group, or
+    /// the shape is empty: such a table answers no lookup from first matches.
     bucket_lanes: u64,
     /// Whether lookups select between the first two recorded levels; see
     /// [`SELECT_MAX_SLOTS`].
@@ -249,12 +249,15 @@ impl FunnelShape {
 
 /// See [`FunnelShape::bucket_lanes`].
 fn bucket_lanes(beta: usize) -> u64 {
-    if beta == 0 || beta > GROUP_SIZE {
+    if beta > GROUP_SIZE {
         return 0;
     }
-    #[allow(clippy::cast_possible_truncation)]
-    let lane_bits = beta as u32 * BITMASK_STRIDE;
-    u64::MAX >> (u64::BITS - lane_bits)
+    // One bit per lane, the top of its stride, which every group mask sets
+    // for a matching lane. A set of matches is then walked by clearing its
+    // lowest bit.
+    (0..beta).fold(0, |lanes, lane| {
+        lanes | 1 << (lane * BITMASK_STRIDE as usize + BITMASK_STRIDE as usize - 1)
+    })
 }
 
 pub(crate) struct FlatStorage<T> {
@@ -1268,7 +1271,8 @@ where
             let found = unsafe { self.found_at(slot) };
             key.equivalent(&found.entry.key).then_some(found)
         };
-        let recorded = levels & !OVERFLOW_LEVEL_BIT;
+        // Widened so clearing the lowest set bit also tests for an empty set.
+        let recorded = u32::from(levels & !OVERFLOW_LEVEL_BIT);
         let mut pending = recorded;
         if pending != 0 && self.shape.selects {
             // The first two recorded levels are scanned together and the
@@ -1304,11 +1308,13 @@ where
         while pending != 0 {
             let (start, matches) = scan(pending.trailing_zeros());
             pending &= pending - 1;
-            for lane in BitMask(matches) {
-                let slot = start + lane;
+            let mut matches = matches;
+            while matches != 0 {
+                let slot = start + (matches.trailing_zeros() / BITMASK_STRIDE) as usize;
                 if let Some(found) = holding_key(slot) {
                     return Ok(Some(found));
                 }
+                matches &= matches - 1;
             }
         }
         if levels & OVERFLOW_LEVEL_BIT != 0 || self.exceptional_placement {
