@@ -48,6 +48,8 @@ impl PhiRoute {
                 region.ctrl_ptr.cast_const(),
             )
         };
+        // [`Self::load`] rebuilds the pointer from its address.
+        let _ = control.expose_provenance();
         Self {
             packed: pack(
                 u8::try_from(level).expect("Elastic level count fits u8"),
@@ -75,6 +77,40 @@ impl PhiRoute {
         Self {
             packed: u64::from(route.index_shift()),
             control: route.control,
+        }
+    }
+
+    /// The route at `route`, both words in one load where the target has a
+    /// load that wide: a walk that skips the route then reads it once and
+    /// keeps no second pointer to it.
+    ///
+    /// # Safety
+    ///
+    /// `route` addresses a route of a [`ProbeSchedule`].
+    #[inline]
+    pub(super) unsafe fn load(route: *const Self) -> Self {
+        #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+        {
+            const _: () = assert!(
+                size_of::<PhiRoute>() == size_of::<u128>()
+                    && core::mem::offset_of!(PhiRoute, packed) == 0
+                    && core::mem::offset_of!(PhiRoute, control) == size_of::<u64>()
+            );
+            // SAFETY: the route is sixteen initialized bytes, by the
+            // caller's contract and the layout asserted above.
+            let both = unsafe { route.cast::<u128>().read_unaligned() };
+            #[allow(clippy::cast_possible_truncation)]
+            Self {
+                packed: both as u64,
+                // Every schedule route's control pointer is exposed where
+                // the route is built.
+                control: core::ptr::with_exposed_provenance((both >> u64::BITS) as usize),
+            }
+        }
+        #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
+        // SAFETY: the caller's contract.
+        unsafe {
+            *route
         }
     }
 
@@ -151,6 +187,12 @@ const _: () = assert!(SENTINEL_LEVEL as u32 == u64::BITS - 1);
 /// most this.
 pub(super) const SENTINEL_BIT: u64 = 1 << SENTINEL_LEVEL;
 
+/// [`SENTINEL`], its control bytes exposed for [`PhiRoute::load`].
+fn exposed_sentinel() -> PhiRoute {
+    let _ = SENTINEL.control.expose_provenance();
+    SENTINEL
+}
+
 const SENTINEL: PhiRoute = PhiRoute {
     packed: pack(SENTINEL_LEVEL, SENTINEL_LEVEL, 0),
     control: SENTINEL_CONTROL.as_ptr(),
@@ -176,7 +218,7 @@ impl ProbeScheduleRoom {
     pub(super) fn schedule<T>(self, levels: &[Level<T>]) -> ProbeSchedule {
         let mut routes = self.routes;
         routes.push(PhiRoute::direct(levels));
-        routes.push(SENTINEL);
+        routes.push(exposed_sentinel());
         ProbeSchedule {
             routes,
             entry_origin: entry_origin(levels),
@@ -252,7 +294,7 @@ impl ProbeSchedule {
             let level = level as usize;
             PhiRoute::new(level, &levels[level], logical_probe_index)
         }));
-        routes.push(SENTINEL);
+        routes.push(exposed_sentinel());
         Self {
             routes,
             entry_origin: entry_origin(levels),
@@ -276,7 +318,7 @@ impl ProbeSchedule {
     /// Drops the pushed routes.
     pub(super) fn clear(&mut self) {
         self.routes.truncate(1);
-        self.routes.push(SENTINEL);
+        self.routes.push(exposed_sentinel());
     }
 
     /// Appends the route of logical probe `logical_probe_index` of level
@@ -285,7 +327,7 @@ impl ProbeSchedule {
     pub(super) fn push<T>(&mut self, levels: &[Level<T>], level: usize, logical_probe_index: u64) {
         let sentinel = self.routes.len() - 1;
         self.routes[sentinel] = PhiRoute::new(level, &levels[level], logical_probe_index);
-        self.routes.push(SENTINEL);
+        self.routes.push(exposed_sentinel());
     }
 
     /// Whether every route is the one its level in `levels` gives.

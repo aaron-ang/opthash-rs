@@ -26,7 +26,7 @@ use crate::raw::rebuild::{self, Rebuildable};
 
 mod schedule;
 
-use schedule::{ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL};
+use schedule::{PhiRoute, ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -2323,7 +2323,7 @@ where
             // probe, which reads `EMPTY` and ends the walk below.
             next = unsafe { next.add(1) };
             // SAFETY: as above, `next` is at most the sentinel.
-            let route = unsafe { &*next };
+            let route = unsafe { PhiRoute::load(next) };
             if !route.is_open(open_levels) {
                 continue;
             }
