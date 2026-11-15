@@ -287,6 +287,12 @@ fn bucket_lanes(beta: usize) -> u64 {
     })
 }
 
+/// Marks the path that calls it as rarely taken, so the paths around it are
+/// laid out to fall through.
+#[cold]
+#[inline]
+const fn rarely_taken() {}
+
 /// Lane of the lowest bit of `matches`.
 ///
 /// # Safety
@@ -1280,6 +1286,8 @@ where
                     if let Some(found) = holding_key(start, matches) {
                         return Some(found);
                     }
+                    // Another key shares the fingerprint.
+                    rarely_taken();
                     matches &= matches - 1;
                 }
                 pending &= pending - 1;
