@@ -1974,7 +1974,7 @@ where
 
     /// The whole insert: duplicate search behind the filter gate, growth, then
     /// placement with its recovery paths. Out of line so the common insert in
-    /// [`map::TableBackend::insert`] keeps no frame.
+    /// [`map::TableBackend::insert`] makes no call.
     #[inline(never)]
     fn insert_general(&mut self, key: K, value: V, hash: u64) -> Option<V> {
         // Same gate and, behind it, the same search as a lookup: a key the
@@ -2449,13 +2449,16 @@ where
         self.place_absent_after_search(key, value, vacant.hash, membership, vacancy)
     }
 
-    #[inline]
+    // Forced inline with the shell's insert: the common insert then runs in
+    // its caller, which makes no call for it.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
     where
         K: Hash + Eq,
     {
         // A key the filter never recorded is absent, so it needs no duplicate
-        // search. That common insert calls nothing and keeps no frame; every
+        // search. That common insert calls nothing; every
         // other case is the general insert's.
         let membership = self.membership_slot(hash);
         let gate = self.membership_gate_at(membership);
