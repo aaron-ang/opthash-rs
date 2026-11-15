@@ -125,7 +125,7 @@ const ELASTIC_LEVEL_SHIFT: u32 = 16;
 const ELASTIC_LOGICAL_SHIFT: u32 = 3;
 const ELASTIC_REJECTION_MASK: u32 = (1 << ELASTIC_LOGICAL_SHIFT) - 1;
 /// Folds an Elastic signature into its probe origin.
-const ELASTIC_FOLD_MULTIPLIER: u64 = WYHASH_DEFAULT_SECRET[2] | 1;
+pub(crate) const ELASTIC_FOLD_MULTIPLIER: u64 = WYHASH_DEFAULT_SECRET[2] | 1;
 pub(crate) const ELASTIC_LEVEL_LIMIT: u64 = 1 << 5;
 pub(crate) const ELASTIC_LOGICAL_LIMIT: u64 = 1 << 13;
 /// Sequence positions between the first probes of consecutive levels. Odd
@@ -306,43 +306,20 @@ impl PreparedElasticProbe {
         self.key
     }
 
-    /// The key's probe word in level zero at logical probe zero, and the
-    /// origin every other probe word is derived from: both halves of the
-    /// signature's product with a fixed odd constant, folded together.
+    /// The key's probe sequence, folding its signature with
+    /// `fold_multiplier`, which must be [`ELASTIC_FOLD_MULTIPLIER`]. A table
+    /// passes its stored copy so the fold reads the constant instead of
+    /// building it.
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
-    pub(crate) const fn origin(self) -> u64 {
-        let product = self.key as u128 * ELASTIC_FOLD_MULTIPLIER as u128;
-        (product as u64) ^ (product >> u64::BITS) as u64
-    }
-
-    /// Odd distance between consecutive probes of the key's sequence. Its
-    /// high half is the origin's low half, which the top bits that pick a
-    /// level-zero slot do not reach.
-    #[inline]
-    pub(crate) const fn stride(self) -> u64 {
-        self.origin().rotate_left(u32::BITS) | 1
-    }
-
-    /// First random word of the probe at `sequence_index`
-    /// ([`elastic_sequence_index`]). Every level owns a disjoint run of the
-    /// one sequence, so a key's words never repeat across its probes.
-    #[allow(clippy::cast_lossless)]
-    #[inline]
-    pub(crate) const fn probe_word(self, sequence_index: u32) -> u64 {
-        self.origin()
-            .wrapping_add((sequence_index as u64).wrapping_mul(self.stride()))
-    }
-
-    /// `(first word, distance between consecutive words)` of the key's probes
-    /// in `level`; word `j` is `first + j * distance`.
-    #[allow(clippy::cast_possible_truncation)]
-    #[inline]
-    pub(crate) const fn level_sequence(self, level: usize) -> (u64, u64) {
-        (
-            self.probe_word(elastic_sequence_index(level as u32, 0)),
-            self.stride(),
-        )
+    pub(crate) const fn sequence(self, fold_multiplier: u64) -> ElasticProbeSequence {
+        debug_assert!(fold_multiplier == ELASTIC_FOLD_MULTIPLIER);
+        let product = self.key as u128 * fold_multiplier as u128;
+        let origin = (product as u64) ^ (product >> u64::BITS) as u64;
+        ElasticProbeSequence {
+            origin,
+            stride: origin.rotate_left(u32::BITS) | 1,
+        }
     }
 
     /// Word `rejection_index` of the logical probe `counter` packs. Retries
@@ -350,10 +327,12 @@ impl PreparedElasticProbe {
     #[allow(clippy::cast_lossless)]
     #[inline]
     const fn word_from_packed(self, counter: u32) -> u64 {
-        let first = self.probe_word(elastic_sequence_index(
-            elastic_counter_level(counter),
-            elastic_counter_logical(counter),
-        ));
+        let first = self
+            .sequence(ELASTIC_FOLD_MULTIPLIER)
+            .word(elastic_sequence_index(
+                elastic_counter_level(counter),
+                elastic_counter_logical(counter),
+            ));
         let rejection_index = counter & ELASTIC_REJECTION_MASK;
         if rejection_index == 0 {
             first
@@ -367,6 +346,41 @@ impl PreparedElasticProbe {
         debug_assert!(counter_base & ELASTIC_REJECTION_MASK == 0);
         debug_assert!(rejection_index < ELASTIC_REJECTION_LIMIT);
         self.word_from_packed(counter_base | rejection_index)
+    }
+}
+
+/// One key's Elastic probe words: a double-hashing sequence every level
+/// owns a disjoint run of.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ElasticProbeSequence {
+    /// Word at sequence index zero, the key's level-zero first probe: both
+    /// halves of the signature's product with the fold multiplier, folded
+    /// together.
+    origin: u64,
+    /// Odd distance between consecutive words. Its high half is the origin's
+    /// low half, which the top bits that pick a level-zero slot do not reach.
+    stride: u64,
+}
+
+impl ElasticProbeSequence {
+    /// First random word of the probe at `sequence_index`
+    /// ([`elastic_sequence_index`]).
+    #[allow(clippy::cast_lossless)]
+    #[inline]
+    pub(crate) const fn word(self, sequence_index: u32) -> u64 {
+        self.origin
+            .wrapping_add((sequence_index as u64).wrapping_mul(self.stride))
+    }
+
+    /// `(first word, distance between consecutive words)` of the key's probes
+    /// in `level`; word `j` is `first + j * distance`.
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline]
+    pub(crate) const fn level_run(self, level: usize) -> (u64, u64) {
+        (
+            self.word(elastic_sequence_index(level as u32, 0)),
+            self.stride,
+        )
     }
 }
 

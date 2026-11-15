@@ -249,6 +249,9 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     /// placement within them, in a scheduled level, needs no extension.
     scheduled_probes: u32,
     probe_schedule: Vec<PhiRoute>,
+    /// [`probe::ELASTIC_FOLD_MULTIPLIER`], kept in the table so the hot
+    /// paths load it rather than build it.
+    fold_multiplier: u64,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
     /// First word of the metadata tail, so the gate's address needs one load.
@@ -906,6 +909,7 @@ where
             scheduled_levels: 0,
             scheduled_probes: 0,
             probe_schedule,
+            fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
             stale_membership: 0,
         })
@@ -1676,6 +1680,7 @@ where
             scheduled_levels: self.scheduled_levels,
             scheduled_probes: self.scheduled_probes,
             probe_schedule,
+            fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
             stale_membership: self.stale_membership,
         };
@@ -1936,7 +1941,7 @@ where
         let region = self.levels.get(level)?;
         debug_assert_ne!(region.index_shift, GENERAL_REDUCTION);
         let index_shift = region.index_shift;
-        let (mut word, distance) = probe.level_sequence(level);
+        let (mut word, distance) = probe.sequence(self.fold_multiplier).level_run(level);
         for paper_probe in 1..=budget {
             let slot = probe::shifted_elastic_index(word, index_shift);
             // SAFETY: the caller's shift maps the index into the level's
@@ -2089,7 +2094,8 @@ where
         if h11_shift == GENERAL_REDUCTION {
             return ScheduleSearch::Unresolved(filter.expanded_level_mask());
         }
-        let h11_slot = probe::shifted_elastic_index(prepared.route.probe.probe_word(0), h11_shift);
+        let sequence = prepared.route.probe.sequence(self.fold_multiplier);
+        let h11_slot = probe::shifted_elastic_index(sequence.word(0), h11_shift);
         // SAFETY: the shifted index maps into level zero's capacity.
         if let Some(entry) = unsafe { self.entry_if_match(0, h11_slot, key_fingerprint, key) } {
             return ScheduleSearch::Hit(on_hit(0, h11_slot, entry));
@@ -2107,7 +2113,7 @@ where
             // Level zero reducing by shift means every level of the table
             // does.
             let slot = probe::shifted_elastic_index(
-                prepared.route.probe.probe_word(route.sequence_index),
+                sequence.word(route.sequence_index),
                 region.index_shift,
             );
             // SAFETY: the shifted index maps into the level's capacity.
