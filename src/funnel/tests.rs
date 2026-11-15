@@ -279,13 +279,15 @@ fn refresh_membership_rebuilds_the_recorded_filter() {
     }
     // SAFETY: the filter tail holds `membership.words` initialized words.
     let recorded = unsafe {
-        core::slice::from_raw_parts(table.membership_ptr(), table.membership.words).to_vec()
+        core::slice::from_raw_parts(table.membership_ptr(), table.membership.region.words).to_vec()
     };
     table.clear_membership();
     table.refresh_membership();
     assert_eq!(
         // SAFETY: as above.
-        unsafe { core::slice::from_raw_parts(table.membership_ptr(), table.membership.words) },
+        unsafe {
+            core::slice::from_raw_parts(table.membership_ptr(), table.membership.region.words)
+        },
         recorded
     );
 }
