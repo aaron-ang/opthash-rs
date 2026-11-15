@@ -79,8 +79,9 @@ struct LevelShape {
 struct FunnelShape {
     max_insertions: usize,
     /// One bit per lane of a bucket, selecting its lanes from a group's
-    /// fingerprint matches. Zero when a bucket is wider than one group, or
-    /// the shape is empty: such a table scans no bucket for first matches.
+    /// EMPTY controls, which its padding lanes are too. Zero when a bucket
+    /// is wider than one group, or the shape is empty: such a table has no
+    /// head level to place in or to scan for first matches.
     bucket_lanes: u64,
     beta: usize,
     n: usize,
@@ -96,6 +97,13 @@ struct FunnelShape {
     fallback_offset: usize,
     fallback_bucket_width: usize,
     fallback_bucket_range: PreparedProbeRange,
+    /// Slots between the starts of two buckets of an ordinary level. A
+    /// bucket no wider than a group is padded to one, so a group read at its
+    /// start covers no other bucket; the padding lanes stay EMPTY and hold
+    /// no entry.
+    stride: usize,
+    /// Slots of the storage, padding lanes included; `n` counts the rest.
+    slots: usize,
 }
 
 impl LevelShape {
@@ -167,6 +175,8 @@ impl FunnelShape {
             fallback_bucket_width: 0,
             fallback_bucket_range: PreparedProbeRange::empty(),
             bucket_lanes: 0,
+            stride: 0,
+            slots: 0,
         }
     }
 
@@ -191,7 +201,13 @@ impl FunnelShape {
         let plan = config
             .funnel_plan()
             .map_err(|_| TryReserveError::CapacityOverflow)?;
+        let stride = if plan.beta() <= GROUP_SIZE {
+            GROUP_SIZE
+        } else {
+            plan.beta()
+        };
         let mut offset = 0_usize;
+        let mut unpadded = 0_usize;
         let mut levels = Vec::new();
         levels
             .try_reserve_exact(plan.alpha())
@@ -207,10 +223,12 @@ impl FunnelShape {
             offset = offset
                 .checked_add(
                     bucket_count
-                        .checked_mul(plan.beta())
+                        .checked_mul(stride)
                         .ok_or(TryReserveError::CapacityOverflow)?,
                 )
                 .ok_or(TryReserveError::CapacityOverflow)?;
+            // No overflow: at most the padded count above.
+            unpadded += bucket_count * plan.beta();
         }
         let primary_offset = offset;
         let primary_len = plan.special_primary_len();
@@ -220,11 +238,10 @@ impl FunnelShape {
             .checked_add(primary_len)
             .ok_or(TryReserveError::CapacityOverflow)?;
         let fallback_len = plan.special_fallback_len();
-        if fallback_offset
+        let slots = fallback_offset
             .checked_add(fallback_len)
-            .ok_or(TryReserveError::CapacityOverflow)?
-            != n
-        {
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        if slots - (offset - unpadded) != n {
             return Err(TryReserveError::CapacityOverflow);
         }
         let loglog_ceiling =
@@ -250,6 +267,8 @@ impl FunnelShape {
             fallback_bucket_range: PreparedProbeRange::new(plan.fallback_bucket_count())
                 .map_err(|_| TryReserveError::CapacityOverflow)?,
             bucket_lanes,
+            stride,
+            slots,
         })
     }
 
@@ -292,15 +311,19 @@ impl FunnelShape {
 }
 
 /// See [`FunnelShape::bucket_lanes`].
-fn bucket_lanes(beta: usize) -> u64 {
+const fn bucket_lanes(beta: usize) -> u64 {
     if beta > GROUP_SIZE {
         return 0;
     }
     // One bit per lane, which every group mask sets for a matching lane. A
     // set of matches is then walked by clearing its lowest bit.
-    (0..beta).fold(0, |lanes, lane| {
-        lanes | 1 << (lane * BITMASK_STRIDE as usize + BITMASK_SLOT_BIT as usize)
-    })
+    let mut lanes = 0;
+    let mut lane = 0;
+    while lane < beta {
+        lanes |= 1 << (lane * BITMASK_STRIDE as usize + BITMASK_SLOT_BIT as usize);
+        lane += 1;
+    }
+    lanes
 }
 
 /// Marks the path that calls it as rarely taken, so the paths around it are
@@ -519,10 +542,11 @@ impl FilterTail {
 type FunnelStorageBuild<K, V> = (Arena, FlatStorage<SlotEntry<K, V>>, FilterTail);
 
 fn try_allocate_storage<K, V, A: Allocator>(
-    n: usize,
+    geometry: &FunnelShape,
     alloc: &A,
 ) -> Result<FunnelStorageBuild<K, V>, TryReserveError> {
-    let shape = funnel_layout::<K, V>(n)?;
+    let n = geometry.slots;
+    let shape = funnel_layout::<K, V>(geometry.slots, geometry.n)?;
     let arena = Arena::try_allocate_with_ctrl_zeroed(shape.layout, shape.control_bytes, alloc)?;
     // The arena zeroes control bytes only; an empty filter must read as
     // "nothing recorded".
@@ -545,14 +569,16 @@ fn try_allocate_storage<K, V, A: Allocator>(
     Ok((arena, storage, membership))
 }
 
-fn funnel_layout<K, V>(n: usize) -> Result<FunnelLayout, TryReserveError> {
-    let control_bytes = if n == 0 {
+/// Layout of an arena with `slots` slots, `n` of which hold entries.
+fn funnel_layout<K, V>(slots: usize, n: usize) -> Result<FunnelLayout, TryReserveError> {
+    let control_bytes = if slots == 0 {
         0
     } else {
-        n.checked_add(GROUP_SIZE - 1)
+        slots
+            .checked_add(GROUP_SIZE - 1)
             .ok_or(TryReserveError::CapacityOverflow)?
     };
-    let (base_layout, data_offset) = arena::layout_for_extents::<K, V>(control_bytes, n)?;
+    let (base_layout, data_offset) = arena::layout_for_extents::<K, V>(control_bytes, slots)?;
     let (layout, membership) = MembershipRegion::extend::<MetadataWord>(base_layout, n)?;
     Ok(FunnelLayout {
         layout,
@@ -1059,7 +1085,7 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let (arena, storage, membership) = try_allocate_storage(shape.n, &alloc)?;
+        let (arena, storage, membership) = try_allocate_storage(&shape, &alloc)?;
         Ok(Self {
             entries_base: shape.max_insertions,
             head_left: shape.max_insertions,
@@ -1178,9 +1204,9 @@ where
             let Some(bucket) = Self::sample_ordinary(probe, level, index) else {
                 return first_tombstone.map_or(SearchResult::RangeFailure, SearchResult::Vacant);
             };
-            let start = level.offset + bucket * self.shape.beta;
-            // SAFETY: an ordinary bucket ends at or before `n`, and the
-            // control array pads `GROUP_SIZE - 1` bytes past `n`; matched
+            let start = level.offset + bucket * self.shape.stride;
+            // SAFETY: an ordinary bucket ends at or before `slots`, and the
+            // control array pads `GROUP_SIZE - 1` bytes past them; matched
             // lanes carry the fingerprint, so they are occupied.
             let scan = unsafe {
                 scan_funnel_bucket(
@@ -1332,23 +1358,23 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let lanes = self.shape.bucket_lanes;
-        let beta = self.shape.beta;
         let key_fingerprint = probe.fingerprint();
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
         let scan = |level: &LevelShape| -> (usize, u64) {
             let (bucket, _) =
                 probe::ordinary_funnel_first_draw(probe, level.multiplier, level.bucket_range);
-            let start = level.offset + bucket * beta;
+            let start = level.offset + bucket * GROUP_SIZE;
             // SAFETY: a first draw is below the level's bucket count whether
             // or not its word is accepted, an ordinary bucket ends at or
-            // before `n`, and the control array pads `GROUP_SIZE - 1` bytes
-            // past `n`. An absent head entry has no buckets and draws slot
-            // zero, which every shape that recorded a level has.
+            // before `slots`, and the control array pads `GROUP_SIZE - 1`
+            // bytes past them. An absent head entry has no buckets and
+            // draws slot zero, which every shape that recorded a level has.
+            // The group is the whole bucket: its padding lanes are EMPTY,
+            // which no fingerprint matches.
             let matches =
                 unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), key_fingerprint) };
-            (start, matches.0 & lanes)
+            (start, matches.0)
         };
         // The entry at the lowest match of a bucket starting at `start`, if
         // it holds the key.
@@ -1366,11 +1392,12 @@ where
         // The bin is walked as it is, in the low half of the word: its
         // leading zeros are `BIN_LEAD` more than the index of the shallowest
         // level, so the walk starts that many entries ahead of the head. Two
-        // sets reach an absent entry, which matches nothing, as every scan of
-        // a shape without lanes does: the overflow bit stands where the level
-        // past the last recorded one would, and an empty set, which the walk
-        // tests for after a scan and not before one, has a whole word of
-        // leading zeros.
+        // sets reach an absent entry, as every scan of a shape without lanes
+        // does: the overflow bit stands where the level past the last
+        // recorded one would, and an empty set, which the walk tests for
+        // after a scan and not before one, has a whole word of leading
+        // zeros. An absent entry scans the storage's first group, where a
+        // match that holds the key is the key's own entry.
         let mut pending = levels.get();
         let mut entry = self.shape.head.as_ptr().wrapping_sub(BIN_LEAD);
         loop {
@@ -1392,6 +1419,7 @@ where
                 }
                 // Another key shares the fingerprint.
                 rarely_taken();
+                matches &= const { bucket_lanes(GROUP_SIZE) };
                 matches &= matches - 1;
             }
             if pending == 0 {
@@ -1441,9 +1469,9 @@ where
     {
         let level = &self.shape.levels[index];
         let bucket = Self::sample_ordinary(probe, level, index)?;
-        let start = level.offset + bucket * self.shape.beta;
-        // SAFETY: an ordinary bucket ends at or before `n`, and the control
-        // array pads `GROUP_SIZE - 1` bytes past `n`; matched lanes carry the
+        let start = level.offset + bucket * self.shape.stride;
+        // SAFETY: an ordinary bucket ends at or before `slots`, and the control
+        // array pads `GROUP_SIZE - 1` bytes past them; matched lanes carry the
         // fingerprint, so they are occupied.
         Some(unsafe {
             scan_clean_funnel_bucket(
@@ -1562,9 +1590,9 @@ where
         let ctrl_ptr = self.storage.ctrl_ptr();
         for (index, level) in self.shape.levels.iter().enumerate() {
             let bucket = Self::sample_ordinary(probe, level, index)?;
-            let start = level.offset + bucket * self.shape.beta;
-            // SAFETY: an ordinary bucket ends at or before `n`, and the control
-            // array pads `GROUP_SIZE - 1` bytes past `n`.
+            let start = level.offset + bucket * self.shape.stride;
+            // SAFETY: an ordinary bucket ends at or before `slots`, and the control
+            // array pads `GROUP_SIZE - 1` bytes past them.
             if let Some(slot) = unsafe { first_free_in_bucket(ctrl_ptr, start, self.shape.beta) } {
                 return Some(Vacancy {
                     slot,
@@ -1635,9 +1663,9 @@ where
             *bins = unsafe { *self.level_bin_ptr(slot) };
         }
         let bins = *bins;
-        let start = level.offset + bucket * self.shape.beta;
-        // SAFETY: an ordinary bucket ends at or before `n`, and the control
-        // array pads `GROUP_SIZE - 1` bytes past `n`.
+        let start = level.offset + bucket * GROUP_SIZE;
+        // SAFETY: an ordinary bucket ends at or before `slots`, and the control
+        // array pads `GROUP_SIZE - 1` bytes past them.
         let empty = unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), CTRL_EMPTY) }
             .0
             & self.shape.bucket_lanes;
@@ -1692,9 +1720,9 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        // SAFETY: `slot < n`, the storage capacity, and a fingerprint match
+        // SAFETY: `slot < slots`, the storage capacity, and a fingerprint match
         // means the slot is occupied.
-        (0..self.shape.n).find(|&slot| unsafe {
+        (0..self.shape.slots).find(|&slot| unsafe {
             self.storage.control_at(slot) == key_fingerprint
                 && key.equivalent(&self.storage.get_ref(slot).key)
         })
@@ -2169,8 +2197,14 @@ where
     #[cold]
     #[inline(never)]
     fn first_free_global(&self) -> Option<usize> {
-        // SAFETY: `slot < n`, the storage capacity.
-        (0..self.shape.n).find(|&slot| control::is_free(unsafe { self.storage.control_at(slot) }))
+        let shape = &self.shape;
+        // A padding lane is never placed in.
+        let padding =
+            |slot: usize| slot < shape.primary_offset && slot % shape.stride >= shape.beta;
+        (0..shape.slots).find(|&slot| {
+            // SAFETY: `slot` is below the storage capacity.
+            !padding(slot) && control::is_free(unsafe { self.storage.control_at(slot) })
+        })
     }
 
     fn place_new_entry(
@@ -2323,9 +2357,9 @@ where
     fn resize_with_transition(&mut self, slots: usize, transition: EpochTransition) {
         let shape = FunnelShape::from_slots(slots, self.reserve_fraction)
             .expect("compatible Funnel resize geometry");
-        let n = shape.n;
+        let (padded, n) = (shape.slots, shape.n);
         if self.try_resize_to(shape, transition).is_err() {
-            let layout = funnel_layout::<K, V>(n).expect("constructed Funnel layout");
+            let layout = funnel_layout::<K, V>(padded, n).expect("constructed Funnel layout");
             allocator_api2::alloc::handle_alloc_error(layout.layout)
         }
     }
@@ -2339,7 +2373,7 @@ where
         shape: FunnelShape,
         transition: EpochTransition,
     ) -> Result<(), TryReserveError> {
-        let (arena, storage, membership) = try_allocate_storage(shape.n, &self.alloc)?;
+        let (arena, storage, membership) = try_allocate_storage(&shape, &self.alloc)?;
         let prf = if matches!(transition, EpochTransition::PlacementRecovery) {
             self.prf.reseeded(FUNNEL_RESEED_STEP)
         } else {
@@ -2428,7 +2462,7 @@ where
         let probe = self.prf.prepare(key_hash);
         if let Some(bucket) = Self::sample_ordinary(probe, level, 0) {
             self.storage
-                .prefetch_slot(level.offset + bucket * self.shape.beta);
+                .prefetch_slot(level.offset + bucket * self.shape.stride);
         }
     }
 
@@ -2632,7 +2666,7 @@ where
             // Dense scans avoid lane extraction for nearly every slot. Only
             // sparse tables amortize masks over enough empty controls; choose
             // once so draining cannot switch modes midway through a group.
-            mode: if self.entries() <= self.shape.n / 4 {
+            mode: if self.entries() <= self.shape.slots / 4 {
                 FunnelScanMode::Sparse(OccupiedIndices::new())
             } else {
                 FunnelScanMode::Dense(0)
@@ -2644,10 +2678,10 @@ where
     fn scan_next(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, usize)> {
         match &mut scan.mode {
             FunnelScanMode::Dense(next) => {
-                while *next < self.shape.n {
+                while *next < self.shape.slots {
                     let slot = *next;
                     *next += 1;
-                    // SAFETY: `slot < n`, the storage capacity.
+                    // SAFETY: `slot < slots`, the storage capacity.
                     unsafe {
                         if control::is_occupied(self.storage.control_at(slot)) {
                             return Some((self.storage.slot_ptr(slot), slot));

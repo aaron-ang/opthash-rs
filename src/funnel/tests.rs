@@ -112,7 +112,7 @@ fn entry_search_checks_exceptional_hits_before_reusing_vacancy() {
     let key = 42;
     let fingerprint = table.prf.prepare(key).fingerprint();
     let exact = table.search_exact_for_insert(&key, key, fingerprint);
-    let slot = table.shape.n - 1;
+    let slot = table.shape.slots - 1;
     assert_ne!(exact, SearchResult::Vacant(slot));
     table.place_new_entry(
         table.vacancy_at(slot),
@@ -306,7 +306,7 @@ fn filter_tail(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> Vec<u64> {
 /// Every control byte and filter word of `table`.
 fn controls_and_filter(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> (Vec<u8>, Vec<u64>) {
     // SAFETY: `slot < n`, the storage capacity.
-    let controls = (0..table.shape.n)
+    let controls = (0..table.shape.slots)
         .map(|slot| unsafe { table.storage.control_at(slot) })
         .collect();
     (controls, filter_tail(table))
@@ -433,7 +433,7 @@ fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
         // The first lane of an untouched level-zero bucket the probe does
         // not select.
         let (_, slot) = (0..buckets)
-            .map(|bucket| (bucket, level.offset + bucket * table.shape.beta))
+            .map(|bucket| (bucket, level.offset + bucket * table.shape.stride))
             .find(|&(bucket, slot)| {
                 // SAFETY: a level-zero bucket starts inside the storage.
                 own != Some(bucket) && control::is_free(unsafe { table.storage.control_at(slot) })
@@ -592,6 +592,10 @@ fn assert_matches_model(
             table.membership_gate(key.hash).levels & table.level_bit(slot),
             0,
             "{key:?} lost its level bit"
+        );
+        assert!(
+            slot >= table.shape.primary_offset || slot % table.shape.stride < table.shape.beta,
+            "{key:?} sits in a padding lane"
         );
         coverage.overflow_entries |= slot >= overflow_start;
         if let Some(level) = table.shape.levels.first() {
@@ -1207,7 +1211,7 @@ fn decompose_scalar_location(shape: &FunnelShape, location: ScalarFunnelLocation
         } => {
             assert!(bucket < shape.levels[level].bucket_range.upper());
             assert!(slot_in_bucket < shape.beta);
-            shape.levels[level].offset + bucket * shape.beta + slot_in_bucket
+            shape.levels[level].offset + bucket * shape.stride + slot_in_bucket
         }
         ScalarFunnelLocation::SpecialPrimary { slot, .. } => {
             assert!(slot < shape.primary_range.upper());
@@ -1252,7 +1256,13 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
                 None
             );
             let actual = table.find_location(&identity, identity).unwrap();
-            assert_eq!(actual, expected.global_slot(), "n={n} key={identity}");
+            // The oracle numbers its slots without the padding lanes, so the
+            // two are compared by level, bucket and lane.
+            assert_eq!(
+                actual,
+                decompose_scalar_location(&table.shape, expected),
+                "n={n} key={identity}"
+            );
             locations.push((
                 identity,
                 actual,
@@ -1264,7 +1274,6 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
         assert_eq!(scalar.locations().count(), locations.len());
         for (expected, identity) in scalar.locations() {
             let global_slot = locations[usize::try_from(identity).unwrap()].1;
-            assert_eq!(expected.global_slot(), global_slot, "n={n} key={identity}");
             assert_eq!(
                 decompose_scalar_location(&table.shape, expected),
                 global_slot,
@@ -1368,7 +1377,7 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
             0,
             level.bucket_range.upper(),
         );
-        let start = level.offset + bucket * table.shape.beta;
+        let start = level.offset + bucket * table.shape.stride;
         for lane in 0..table.shape.beta {
             occupy(
                 &mut table,
@@ -1576,7 +1585,7 @@ fn level_bits_follow_slot_levels_into_the_special_arrays() {
     for slot in [
         table.shape.primary_offset,
         table.shape.fallback_offset,
-        table.shape.n - 1,
+        table.shape.slots - 1,
     ] {
         assert_eq!(
             table.level_bit(slot),
@@ -1674,7 +1683,14 @@ fn exact_geometry_sums_to_n() {
             + table.shape.fallback_bucket_range.upper() * table.shape.fallback_bucket_width,
         table.shape.n
     );
-    assert_eq!(table.storage.capacity(), table.shape.n);
+    let padding = table
+        .shape
+        .levels
+        .iter()
+        .map(|level| level.bucket_range.upper() * (table.shape.stride - table.shape.beta))
+        .sum::<usize>();
+    assert_eq!(table.storage.capacity(), table.shape.n + padding);
+    assert_eq!(table.shape.slots, table.shape.n + padding);
 }
 
 #[test]
@@ -1737,7 +1753,7 @@ fn clear_tombstones_each_slot_before_dropping_its_value() {
     for key in 0..3 {
         table.insert_for_vacant_entry(key, PanicOnFirstDrop(drops.clone()), key);
     }
-    let first_occupied = (0..table.shape.n)
+    let first_occupied = (0..table.shape.slots)
         .find(|&slot| control::is_occupied(table.storage.checked_control(slot)))
         .unwrap();
 
@@ -1751,7 +1767,7 @@ fn clear_tombstones_each_slot_before_dropping_its_value() {
     );
     assert_eq!(
         table.entries(),
-        (0..table.shape.n)
+        (0..table.shape.slots)
             .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
     );
@@ -1831,7 +1847,7 @@ fn panicking_hasher_during_resize_keeps_every_entry() {
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert_eq!(
         table.entries(),
-        (0..table.shape.n)
+        (0..table.shape.slots)
             .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
     );
@@ -1865,7 +1881,7 @@ fn panicking_hasher_during_resize_keeps_every_entry() {
     );
     assert_eq!(
         table.entries(),
-        (0..table.shape.n)
+        (0..table.shape.slots)
             .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
     );
@@ -2270,9 +2286,12 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 if found.is_some() || table.unmatched_is_absent(probe, gate.levels) {
                     assert_eq!(found, walk, "n {n} d {d} index {index}");
                     // A bucket wider than a group is never scanned here:
-                    // only a key no level recorded is answered.
+                    // only a key no level recorded is answered, or one the
+                    // scan of an absent entry meets in the first group.
                     assert!(
-                        !wide || gate.levels & !OVERFLOW_LEVEL_BIT == 0,
+                        !wide
+                            || gate.levels & !OVERFLOW_LEVEL_BIT == 0
+                            || found.is_some_and(|slot| slot < GROUP_SIZE),
                         "n {n} d {d} index {index}"
                     );
                     answered += 1;
