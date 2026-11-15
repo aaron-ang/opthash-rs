@@ -2603,6 +2603,99 @@ fn the_fold_multiplier_as_a_hash_stays_findable_and_unflagged() {
     }
 }
 
+/// Each level's counters against its control bytes, and the table's live
+/// count against the levels'.
+fn assert_counters_match_controls(table: &ElasticTable<u64, u64, FixedHashBuilder>) {
+    let mut live = 0;
+    for level in &table.levels {
+        let (mut occupied, mut tombstones) = (0, 0);
+        for slot in 0..level.capacity() {
+            // SAFETY: `slot` is below the level's capacity.
+            let control = unsafe { level.control_at(slot) };
+            occupied += usize::from(!control::is_free(control));
+            tombstones += usize::from(control == crate::raw::control::CTRL_TOMBSTONE);
+        }
+        assert_eq!(level.len as usize, occupied);
+        assert_eq!(level.tombstones as usize, tombstones);
+        live += occupied;
+    }
+    assert_eq!(table.len, live);
+}
+
+#[test]
+fn settled_inserts_match_an_ordered_map_model() {
+    const STEPS: u64 = if cfg!(miri) { 1_500 } else { 60_000 };
+    let slot_counts: &[usize] = if cfg!(miri) { &[256] } else { &[1_024, 4_096] };
+    for &slots in slot_counts {
+        let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                slots,
+                ReserveFraction::DEFAULT,
+                fixed_hasher(),
+                Global,
+            )
+            .unwrap();
+        assert_ne!(table.levels[0].index_shift(), GENERAL_REDUCTION);
+        let key_space = table.max_insertions as u64 * 2;
+        let mut model = alloc::collections::BTreeMap::<u64, u64>::new();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut settled, mut reused) = (0, 0);
+        for step in 0..STEPS {
+            let roll = next() % 100;
+            let key = next() % key_space;
+            let hash = table.hash_builder.hash_one(key);
+            if roll < 55 {
+                if model.len() == table.max_insertions && !model.contains_key(&key) {
+                    continue;
+                }
+                let fresh = !model.contains_key(&key);
+                let settles = fresh && table.scheduler.settles(table.len);
+                let tombstones = |table: &ElasticTable<u64, u64, FixedHashBuilder>| {
+                    table
+                        .levels
+                        .iter()
+                        .map(|level| level.tombstones)
+                        .sum::<u32>()
+                };
+                let before = tombstones(&table);
+                assert_eq!(table.insert(key, step, hash), model.insert(key, step));
+                if settles {
+                    settled += 1;
+                    reused += usize::from(tombstones(&table) < before);
+                    assert!(membership_maybe_contains_prepared(
+                        &table,
+                        PreparedElasticKey::new(hash)
+                    ));
+                }
+            } else if roll < 85 {
+                let removed = table
+                    .find_for_entry(&key, hash)
+                    .ok()
+                    .map(|location| table.remove(location).1);
+                assert_eq!(removed, model.remove(&key));
+            }
+            assert_eq!(table.find_value(&key, hash), model.get(&key));
+            assert_eq!(table.len, model.len());
+            if step % 512 == 0 {
+                assert_counters_match_controls(&table);
+                for key in 0..key_space {
+                    let hash = table.hash_builder.hash_one(key);
+                    assert_eq!(table.find_value(&key, hash), model.get(&key));
+                }
+            }
+        }
+        assert_counters_match_controls(&table);
+        assert!(settled > 0);
+        assert!(reused > 0);
+    }
+}
+
 /// The settled gate holds exactly for a live count inside the cached batch
 /// and under the insertion limit.
 fn assert_settled_gate(table: &ElasticTable<u64, u64, FixedHashBuilder>, shifted: bool) {
