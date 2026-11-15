@@ -2190,22 +2190,27 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 let walk = table.find_location_by_walk(&key, key, gate.levels);
                 let live = index < inserted && index % 3 != 0;
                 assert_eq!(walk.is_some(), live, "n {n} d {d} index {index}");
-                match table.lookup_first_matches(&key, key, gate.levels) {
-                    Ok(found) => {
-                        assert_eq!(
-                            found.map(|found| found.slot),
-                            walk,
-                            "n {n} d {d} index {index}"
-                        );
-                        // A bucket wider than a group is never scanned here:
-                        // only a key no level recorded is answered.
-                        assert!(
-                            !wide || gate.levels & !OVERFLOW_LEVEL_BIT == 0,
-                            "n {n} d {d} index {index}"
-                        );
-                        answered += 1;
-                    }
-                    Err(()) => handed_off += 1,
+                // The whole lookup, through whichever path settles it.
+                assert_eq!(
+                    table.find_location(&key, key),
+                    walk,
+                    "n {n} d {d} index {index}"
+                );
+                let probe = table.prf.prepare(key);
+                let found = table
+                    .first_match(&key, probe, gate.levels)
+                    .map(|found| found.slot);
+                if found.is_some() || table.unmatched_is_absent(probe, gate.levels) {
+                    assert_eq!(found, walk, "n {n} d {d} index {index}");
+                    // A bucket wider than a group is never scanned here:
+                    // only a key no level recorded is answered.
+                    assert!(
+                        !wide || gate.levels & !OVERFLOW_LEVEL_BIT == 0,
+                        "n {n} d {d} index {index}"
+                    );
+                    answered += 1;
+                } else {
+                    handed_off += 1;
                 }
             }
             // A wide table still answers the lookups with no level to scan,

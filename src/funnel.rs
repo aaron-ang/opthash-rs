@@ -1222,7 +1222,7 @@ where
     /// bits only accumulate and a refresh re-records every live entry. Entries
     /// placed outside their funnel are the caller's full scan's concern.
     ///
-    /// [`Self::lookup_first_matches`] hands every lookup it cannot settle to
+    /// [`Self::find_unmatched`] hands every lookup it cannot settle to
     /// this walk, which therefore decides them all.
     fn lookup_recorded_levels<Q>(
         &self,
@@ -1252,10 +1252,9 @@ where
     }
 
     /// Lookup over the ordinary levels the key's bin recorded, comparing the
-    /// key against each bucket's fingerprint matches. `Ok` is the lookup's
-    /// answer. `Err` hands the lookup to the ordered walk: a rejected probe
-    /// word, a recorded level whose buckets are wider than one group, or a
-    /// key that may sit in the overflow levels or outside its funnel.
+    /// key against each bucket's fingerprint matches. `None` is not yet an
+    /// answer: [`Self::unmatched_is_absent`] settles it or hands the lookup to
+    /// the ordered walk.
     ///
     /// A level without the fingerprint cannot hold the key, so the walk moves
     /// on without the ordered walk's `EMPTY` test, which only shortens misses
@@ -1264,24 +1263,24 @@ where
     /// Each level is scanned at the bucket its first probe word selects,
     /// before that word is known to be accepted. A key found there is the
     /// answer either way, so only a lookup that finds nothing tests the
-    /// words, and hands off if one was rejected.
+    /// words.
     ///
-    /// Calls nothing but the key comparison, so a caller that hands off by
-    /// tail call keeps no frame.
+    /// Calls nothing but the key comparison, and keeps nothing for the lookup
+    /// that finds nothing, so a caller that hands that lookup off by tail
+    /// call keeps no frame.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn lookup_first_matches<Q>(
+    fn first_match<Q>(
         &self,
         key: &Q,
-        key_hash: u64,
+        probe: PreparedFastFunnelProbe,
         levels: u16,
-    ) -> Result<Option<Found<'_, K, V>>, ()>
+    ) -> Option<Found<'_, K, V>>
     where
         Q: Equivalent<K> + ?Sized,
     {
         let lanes = self.shape.bucket_lanes;
         let beta = self.shape.beta;
-        let probe = self.prf.prepare(key_hash);
         let key_fingerprint = probe.fingerprint();
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
@@ -1330,61 +1329,67 @@ where
                 }
             }
         };
-        if recorded != 0 {
-            let found = if !self.shape.selects {
-                walk(recorded)
-            } else if lanes == 0 {
-                return Err(());
-            } else {
-                // The first two recorded levels are scanned together and the
-                // holder is selected, not branched on: which of them holds the
-                // key is unpredictable.
-                let mut pending = recorded;
-                let first = pending.trailing_zeros();
-                pending &= pending - 1;
-                let second = if pending == 0 {
-                    first
-                } else {
-                    pending.trailing_zeros()
-                };
-                pending &= pending.wrapping_sub(1);
-                let (first_start, first_matches) = scan(first);
-                let (second_start, second_matches) = scan(second);
-                let in_first = first_matches != 0;
-                let start = if in_first { first_start } else { second_start };
-                let matches = if in_first {
-                    first_matches
-                } else {
-                    second_matches
-                };
-                if matches != 0 {
-                    if let Some(found) = holding_key(start, matches) {
-                        return Ok(Some(found));
-                    }
-                    // Another key shares the fingerprint. Start over,
-                    // comparing every match of every recorded level.
-                    pending = recorded;
-                }
-                if pending == 0 { None } else { walk(pending) }
-            };
-            if found.is_some() {
-                return Ok(found);
+        if recorded == 0 {
+            return None;
+        }
+        if !self.shape.selects {
+            return walk(recorded);
+        }
+        if lanes == 0 {
+            return None;
+        }
+        // The first two recorded levels are scanned together and the
+        // holder is selected, not branched on: which of them holds the
+        // key is unpredictable.
+        let mut pending = recorded;
+        let first = pending.trailing_zeros();
+        pending &= pending - 1;
+        let second = if pending == 0 {
+            first
+        } else {
+            pending.trailing_zeros()
+        };
+        pending &= pending.wrapping_sub(1);
+        let (first_start, first_matches) = scan(first);
+        let (second_start, second_matches) = scan(second);
+        let in_first = first_matches != 0;
+        let start = if in_first { first_start } else { second_start };
+        let matches = if in_first {
+            first_matches
+        } else {
+            second_matches
+        };
+        if matches != 0 {
+            if let Some(found) = holding_key(start, matches) {
+                return Some(found);
             }
+            // Another key shares the fingerprint. Start over,
+            // comparing every match of every recorded level.
+            pending = recorded;
         }
+        if pending == 0 { None } else { walk(pending) }
+    }
+
+    /// Whether a lookup [`Self::first_match`] found nothing for is absent.
+    /// Otherwise the ordered walk decides: a rejected probe word, which is
+    /// every word of a shape without lanes, or a key that may sit in the
+    /// overflow levels or outside its funnel.
+    #[inline]
+    fn unmatched_is_absent(&self, probe: PreparedFastFunnelProbe, levels: u16) -> bool {
         if levels & OVERFLOW_LEVEL_BIT != 0 || self.exceptional_placement {
-            return Err(());
+            return false;
         }
-        let mut unchecked = recorded;
+        let mut unchecked = u32::from(levels & !OVERFLOW_LEVEL_BIT);
         while unchecked != 0 {
             let level = self.shape.head_level(unchecked.trailing_zeros());
             unchecked &= unchecked - 1;
             let (_, accepted) =
                 probe::ordinary_funnel_first_draw(probe, level.multiplier, level.bucket_range);
             if !accepted {
-                return Err(());
+                return false;
             }
         }
-        Ok(None)
+        true
     }
 
     /// Tombstone-blind scan of the key's bucket in ordinary level `index`;
@@ -1846,18 +1851,39 @@ where
     }
 
     /// Out of line so a filter-rejected miss pays for no probe preparation.
-    /// The ordered walk sits in tail position, so its call needs no frame
-    /// here and the lookups this function answers itself can skip the
-    /// register saves.
+    /// A lookup that finds its key returns from here without a frame.
     #[inline(never)]
     fn find_after_gate<'a, Q, P>(&'a self, key: &Q, key_hash: u64, levels: u16) -> Option<P::Part>
     where
         Q: Equivalent<K> + ?Sized,
         P: FoundPart<'a, K, V>,
     {
-        match self.lookup_first_matches(key, key_hash, levels) {
-            Ok(found) => found.map(P::of),
-            Err(()) => self.find_by_walk::<Q, P>(key, key_hash, levels),
+        let probe = self.prf.prepare(key_hash);
+        match self.first_match(key, probe, levels) {
+            Some(found) => Some(P::of(found)),
+            None => self.find_unmatched::<Q, P>(key, key_hash, levels, probe),
+        }
+    }
+
+    /// Out of line so the first-match scan keeps none of its state for the
+    /// lookup that found nothing. The ordered walk sits in tail position, so
+    /// its call needs no frame here.
+    #[inline(never)]
+    fn find_unmatched<'a, Q, P>(
+        &'a self,
+        key: &Q,
+        key_hash: u64,
+        levels: u16,
+        probe: PreparedFastFunnelProbe,
+    ) -> Option<P::Part>
+    where
+        Q: Equivalent<K> + ?Sized,
+        P: FoundPart<'a, K, V>,
+    {
+        if self.unmatched_is_absent(probe, levels) {
+            None
+        } else {
+            self.find_by_walk::<Q, P>(key, key_hash, levels)
         }
     }
 
