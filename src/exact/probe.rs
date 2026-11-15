@@ -47,12 +47,14 @@ pub(crate) trait ProbeOracle {
     ) -> u64;
 }
 
-/// A seeded, copyable counter permutation for reproducible Elastic probing.
+/// A seeded, copyable probe-word family for reproducible Elastic probing.
 ///
-/// The construction packs every supported Elastic tuple without collisions,
-/// then keys a 64-bit permutation. It is an engineering random-oracle model
-/// only: its outputs are not evidence of statistical independence, and the
-/// construction is not cryptographic.
+/// A key's probes in one level form a double-hashing sequence: the key's
+/// folded word plus the logical probe index times an odd step taken from the
+/// same word, scaled by the level's odd multiplier, so levels draw from
+/// decorrelated sequences. It is an engineering random-oracle model only: its
+/// outputs are not evidence of statistical independence, and the construction
+/// is not cryptographic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CounterPrf {
     seed: u64,
@@ -122,7 +124,22 @@ const DOMAIN_KIND_LANE: u64 = WYHASH_DEFAULT_SECRET[1];
 const ELASTIC_LEVEL_SHIFT: u32 = 16;
 const ELASTIC_LOGICAL_SHIFT: u32 = 3;
 const ELASTIC_REJECTION_MASK: u32 = (1 << ELASTIC_LOGICAL_SHIFT) - 1;
-pub(crate) const ELASTIC_LEVEL_LIMIT: u64 = 1 << 5;
+const ELASTIC_LOGICAL_MASK: u32 = (1 << ELASTIC_LEVEL_SHIFT) - 1;
+/// Folds an Elastic signature into its probe origin.
+const ELASTIC_FOLD_MULTIPLIER: u64 = WYHASH_DEFAULT_SECRET[2] | 1;
+/// Odd per-level scale of a key's probe sequence. Level zero keeps the
+/// sequence as it is, so its first probe is the origin's top bits.
+const ELASTIC_LEVEL_MULTIPLIER: [u64; ELASTIC_LEVEL_COUNT] = {
+    let mut multipliers = [1; ELASTIC_LEVEL_COUNT];
+    let mut level = 1;
+    while level < multipliers.len() {
+        multipliers[level] = mix64(level as u64 ^ INITIAL_LANE) | 1;
+        level += 1;
+    }
+    multipliers
+};
+const ELASTIC_LEVEL_COUNT: usize = 1 << 5;
+pub(crate) const ELASTIC_LEVEL_LIMIT: u64 = ELASTIC_LEVEL_COUNT as u64;
 pub(crate) const ELASTIC_LOGICAL_LIMIT: u64 = 1 << 13;
 const ELASTIC_REJECTION_LIMIT: u32 = 1 << ELASTIC_LOGICAL_SHIFT;
 /// Random words both backends spend per rejection-sampled probe before the
@@ -140,13 +157,12 @@ impl CounterPrf {
         Self { seed }
     }
 
-    /// Keys the hash without a finaliser. Every probe word still passes through
-    /// `mix64` against the counter, so the permutation keeps its avalanche; the
-    /// routing signature is the keyed hash itself, like the Funnel `key_in`.
+    /// Keys the hash without a finaliser: the routing signature is the keyed
+    /// hash itself, and the probe words fold it once per operation.
     #[inline]
-    pub(crate) fn prepare_elastic(self, key_hash: u64) -> PreparedElasticProbe {
+    pub(crate) const fn prepare_elastic(self, key_hash: u64) -> PreparedElasticProbe {
         PreparedElasticProbe {
-            key: key_hash.wrapping_add(self.seed).wrapping_add(INITIAL_LANE),
+            key: key_hash ^ self.seed,
         }
     }
 }
@@ -212,9 +228,49 @@ impl ProbeOracle for CounterPrf {
         let ProbeDomain::ElasticOrdinary { level } = domain else {
             panic!("Elastic counter permutation used with a different domain");
         };
-        let counter = try_pack_elastic_counter(level, logical_probe_index, rejection_index)
-            .expect("Elastic counter tuple exceeds its checked library encoding");
-        self.prepare_elastic(key_hash).word_from_packed(counter)
+        assert!(
+            try_pack_elastic_counter(level, logical_probe_index, rejection_index).is_some(),
+            "Elastic counter tuple exceeds its checked library encoding"
+        );
+        self.specified_word(key_hash, level, logical_probe_index, rejection_index)
+    }
+}
+
+/// The Elastic word family written out from its definition in wide
+/// arithmetic, sharing no step with [`PreparedElasticProbe`]'s production
+/// words, which the tests hold against it.
+#[cfg(test)]
+impl CounterPrf {
+    fn specified_word(
+        self,
+        key_hash: u64,
+        level: u64,
+        logical_probe_index: u64,
+        rejection_index: u32,
+    ) -> u64 {
+        const WORD: u128 = 1 << u64::BITS;
+        let signature = u128::from(key_hash ^ self.seed);
+        let product = signature * u128::from(WYHASH_DEFAULT_SECRET[2] | 1);
+        let origin = (product % WORD) ^ (product / WORD);
+        let half = 1_u128 << u32::BITS;
+        let stride = (((origin % half) * half) + origin / half) | 1;
+        let multiplier = if level == 0 {
+            1
+        } else {
+            let mut mixed = level ^ 0x9e37_79b9_7f4a_7c15;
+            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            u128::from((mixed ^ (mixed >> 31)) | 1)
+        };
+        let position = (origin + u128::from(logical_probe_index) * stride) % WORD;
+        let first = u64::try_from((position * multiplier) % WORD).expect("reduced to one word");
+        if rejection_index == 0 {
+            return first;
+        }
+        let mut mixed = first ^ u64::from(rejection_index);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^ (mixed >> 31)
     }
 }
 
@@ -265,15 +321,63 @@ impl PreparedElasticProbe {
         self.key
     }
 
+    /// The key's probe word in level zero at logical probe zero, and the
+    /// origin every other probe word is derived from: both halves of the
+    /// signature's product with a fixed odd constant, folded together.
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline]
+    pub(crate) const fn origin(self) -> u64 {
+        let product = self.key as u128 * ELASTIC_FOLD_MULTIPLIER as u128;
+        (product as u64) ^ (product >> u64::BITS) as u64
+    }
+
+    /// Odd distance between consecutive logical probes before the level's
+    /// multiplier. Its high half is the origin's low half, which the top bits
+    /// that pick a level-zero slot do not reach.
+    #[inline]
+    pub(crate) const fn stride(self) -> u64 {
+        self.origin().rotate_left(u32::BITS) | 1
+    }
+
+    /// First random word of logical probe `logical_probe_index` in `level`.
+    #[inline]
+    pub(crate) const fn probe_word(self, level: usize, logical_probe_index: u64) -> u64 {
+        self.origin()
+            .wrapping_add(logical_probe_index.wrapping_mul(self.stride()))
+            .wrapping_mul(ELASTIC_LEVEL_MULTIPLIER[level % ELASTIC_LEVEL_MULTIPLIER.len()])
+    }
+
+    /// `(first word, distance between consecutive words)` of the key's probe
+    /// sequence in `level`; word `j` is `first + j * distance`.
+    #[inline]
+    pub(crate) const fn level_sequence(self, level: usize) -> (u64, u64) {
+        let multiplier = ELASTIC_LEVEL_MULTIPLIER[level % ELASTIC_LEVEL_MULTIPLIER.len()];
+        (
+            self.origin().wrapping_mul(multiplier),
+            self.stride().wrapping_mul(multiplier),
+        )
+    }
+
+    /// Word `rejection_index` of the logical probe `counter` packs. Retries
+    /// past the first word remix it with their index.
     #[allow(clippy::cast_lossless)]
     #[inline]
     const fn word_from_packed(self, counter: u32) -> u64 {
-        mix64(counter as u64 ^ self.key) ^ self.key
+        let first = self.probe_word(
+            elastic_counter_level(counter) as usize,
+            elastic_counter_logical(counter & ELASTIC_LOGICAL_MASK),
+        );
+        let rejection_index = counter & ELASTIC_REJECTION_MASK;
+        if rejection_index == 0 {
+            first
+        } else {
+            mix64(first ^ rejection_index as u64)
+        }
     }
 
     #[inline]
-    fn word_from_counter_base(self, counter_base: u32, rejection_index: u32) -> u64 {
-        debug_assert_eq!(counter_base & ELASTIC_REJECTION_MASK, 0);
+    const fn word_from_counter_base(self, counter_base: u32, rejection_index: u32) -> u64 {
+        debug_assert!(counter_base & ELASTIC_REJECTION_MASK == 0);
         debug_assert!(rejection_index < ELASTIC_REJECTION_LIMIT);
         self.word_from_packed(counter_base | rejection_index)
     }
@@ -355,6 +459,7 @@ impl PreparedFastFunnelDomainProbe {
 /// Bits 16..=20 hold the level, bits 3..=15 the logical probe, and bits
 /// 0..=2 the exact-reduction retry. Unsupported tuples fail instead of
 /// truncating.
+#[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) const fn try_pack_elastic_counter(
     level: u64,
@@ -377,9 +482,6 @@ pub(crate) const fn elastic_counter_base(level: u32, logical_probe_index: u64) -
     debug_assert!(logical_probe_index < ELASTIC_LOGICAL_LIMIT);
     (level << ELASTIC_LEVEL_SHIFT) | ((logical_probe_index as u32) << ELASTIC_LOGICAL_SHIFT)
 }
-
-/// Distance between the counter bases of consecutive logical probes.
-pub(crate) const ELASTIC_LOGICAL_STEP: u32 = 1 << ELASTIC_LOGICAL_SHIFT;
 
 /// Logical probe index packed in a level-zero counter base.
 #[inline]
@@ -569,17 +671,14 @@ pub(crate) const fn elastic_index_shift(upper: usize) -> Option<u32> {
     }
 }
 
-/// The index [`unbiased_prepared_elastic_probe_index`] yields for a level
-/// whose [`elastic_index_shift`] is `index_shift`.
+/// The index [`unbiased_prepared_elastic_probe_index`] yields from `word`,
+/// a probe's first random word, for a level whose [`elastic_index_shift`] is
+/// `index_shift`.
 #[allow(clippy::cast_possible_truncation)]
 #[inline]
-pub(crate) fn shifted_elastic_probe_index(
-    probe: PreparedElasticProbe,
-    counter_base: u32,
-    index_shift: u32,
-) -> usize {
+pub(crate) const fn shifted_elastic_index(word: u64, index_shift: u32) -> usize {
     debug_assert!(index_shift < u64::BITS);
-    (probe.word_from_counter_base(counter_base, 0) >> index_shift) as usize
+    (word >> index_shift) as usize
 }
 
 #[allow(clippy::cast_possible_truncation)]

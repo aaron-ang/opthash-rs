@@ -92,16 +92,32 @@ fn prepared_power_of_two_reduction_is_bit_identical_to_generic_reduction() {
 fn elastic_counter_permutation_has_fixed_golden_vectors() {
     let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
     let cases = [
-        (0, 0, 0, 0, 0x0000_0000, 0xa672_f2f4_5fc9_0bed),
-        (1, 31, 8_191, 7, 0x001f_ffff, 0x728c_b5c3_2967_b861),
-        (u64::MAX, 17, 383, 7, 0x0011_0bff, 0x3472_0d88_ba17_9868),
+        (0, 0, 0, 0, 0x0000_0000, 0x0c30_dbdd_cb5c_5ccb),
+        (1, 31, 8_191, 7, 0x001f_ffff, 0x0451_a9e8_6434_f8a2),
+        (u64::MAX, 17, 383, 7, 0x0011_0bff, 0x5218_5e94_4fad_021a),
         (
             0xd1b5_4a32_d192_ed03,
             7,
             7_687,
             0,
             0x0007_f038,
-            0x8778_e64f_a636_f5ca,
+            0x802e_a5ac_6975_87b1,
+        ),
+        (
+            0xd1b5_4a32_d192_ed03,
+            0,
+            1,
+            0,
+            0x0000_0008,
+            0x002d_f44f_002d_f44f,
+        ),
+        (
+            0xd1b5_4a32_d192_ed03,
+            1,
+            0,
+            0,
+            0x0001_0000,
+            0xd951_add9_e3ae_8876,
         ),
     ];
     for (key, level, logical_probe, rejection, counter, word) in cases {
