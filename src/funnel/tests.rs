@@ -1996,6 +1996,86 @@ fn panicking_hasher_during_resize_keeps_every_entry() {
     assert_eq!(drops.load(Ordering::SeqCst), 4);
 }
 
+/// A filter refresh hashes every live key. A hasher that panics part way
+/// through must leave the filter recording every live key.
+#[test]
+fn panicking_hasher_during_filter_refresh_keeps_every_key_recorded() {
+    const LIVE: u64 = 12;
+    const CHURN: u64 = LIVE;
+    let armed = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let reserve = ReserveFraction::from_exponent(3).unwrap();
+    let shape = FunnelShape::from_slots(144, reserve).unwrap();
+    let mut table = FunnelTable::<PanicHashKey, u64, IdentityBuildHasher>::try_from_shape(
+        shape,
+        reserve,
+        IdentityBuildHasher,
+        Global,
+    )
+    .unwrap();
+    let key_of = |id: u64| PanicHashKey {
+        id,
+        armed: armed.clone(),
+        drops: drops.clone(),
+    };
+    for id in 0..LIVE {
+        assert_eq!(
+            map::TableBackend::insert(&mut table, key_of(id), id, id),
+            None
+        );
+    }
+
+    // Cycling one key re-takes its tombstone, so only the stale-filter count
+    // grows and the delete that passes its threshold refreshes the filter.
+    let threshold = membership::refresh_deletes(table.shape.max_insertions);
+    for cycle in 0..=threshold {
+        assert_eq!(
+            map::TableBackend::insert(&mut table, key_of(CHURN), CHURN, CHURN),
+            None
+        );
+        let slot = table.find_location(&key_of(CHURN), CHURN).unwrap();
+        if cycle < threshold {
+            map::TableBackend::remove(&mut table, slot);
+            assert_eq!(table.stale_membership(), cycle + 1);
+            continue;
+        }
+        armed.store(true, Ordering::SeqCst);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            map::TableBackend::remove(&mut table, slot);
+        }));
+        armed.store(false, Ordering::SeqCst);
+        assert!(result.is_err(), "the refresh hashed no key");
+    }
+
+    assert_eq!(table.entries() as u64, LIVE);
+    for id in 0..LIVE {
+        assert!(table.membership_gate(id).passes(), "key {id} unrecorded");
+        assert_eq!(
+            map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
+            Some(id)
+        );
+    }
+    assert_eq!(
+        map::TableBackend::find_entry(&table, &key_of(CHURN), CHURN).map(|entry| entry.value),
+        None
+    );
+
+    // The refresh is still owed, and runs at the next settling delete.
+    assert_eq!(
+        map::TableBackend::insert(&mut table, key_of(CHURN), CHURN, CHURN),
+        None
+    );
+    let slot = table.find_location(&key_of(CHURN), CHURN).unwrap();
+    map::TableBackend::remove(&mut table, slot);
+    assert_eq!(table.stale_membership(), 0);
+    for id in 0..LIVE {
+        assert_eq!(
+            map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
+            Some(id)
+        );
+    }
+}
+
 #[test]
 fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
     let fail = Arc::new(AtomicBool::new(true));
