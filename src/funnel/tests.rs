@@ -289,34 +289,27 @@ fn refresh_membership_rebuilds_the_recorded_filter() {
             table.hash_builder.hash_one(key)
         ));
     }
-    // SAFETY: the filter tail holds `membership.words` initialized words.
-    let recorded = unsafe {
-        core::slice::from_raw_parts(table.membership_ptr(), table.membership.region.words).to_vec()
-    };
+    let recorded = filter_tail(&table);
     table.clear_membership();
     table.refresh_membership();
-    assert_eq!(
-        // SAFETY: as above.
-        unsafe {
-            core::slice::from_raw_parts(table.membership_ptr(), table.membership.region.words)
-        },
-        recorded
-    );
+    assert_eq!(filter_tail(&table), recorded);
+}
+
+/// Every word of `table`'s filter tail, level bins and membership alike.
+fn filter_tail(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> Vec<u64> {
+    let words = table.membership.region.words;
+    // SAFETY: the tail holds `words` words of level bins below its base and
+    // as many membership words from it on, all initialized.
+    unsafe { core::slice::from_raw_parts(table.membership_ptr().sub(words), 2 * words).to_vec() }
 }
 
 /// Every control byte and filter word of `table`.
-fn controls_and_filter(
-    table: &FunnelTable<u64, u64, IdentityBuildHasher>,
-) -> (Vec<u8>, Vec<MetadataWord>) {
+fn controls_and_filter(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> (Vec<u8>, Vec<u64>) {
     // SAFETY: `slot < n`, the storage capacity.
     let controls = (0..table.shape.n)
         .map(|slot| unsafe { table.storage.control_at(slot) })
         .collect();
-    // SAFETY: the filter tail holds `membership.region.words` initialized words.
-    let filter = unsafe {
-        core::slice::from_raw_parts(table.membership_ptr(), table.membership.region.words).to_vec()
-    };
-    (controls, filter)
+    (controls, filter_tail(table))
 }
 
 /// The reference side inserts through the vacant-entry placement walk, which
@@ -2170,9 +2163,13 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
             // Under the table's first seed, which only a rebuild replaces.
             let prf = table.prf;
             let shared = prf.prepare(0).fingerprint();
+            let kept = |key: &u64| !shared_fingerprint || prf.prepare(*key).fingerprint() == shared;
+            // Two rounds: multiples of the spread alone fill the bins of a
+            // filter word too evenly to leave one empty.
             let keys: Vec<u64> = (0..)
                 .map(|index: u64| index.wrapping_mul(SPREAD))
-                .filter(|&key| !shared_fingerprint || prf.prepare(key).fingerprint() == shared)
+                .map(|key| (key ^ (key >> 32)).wrapping_mul(SPREAD))
+                .filter(kept)
                 .take(2 * table.shape.max_insertions)
                 .collect();
             let key_of = |index: u64| keys[usize::try_from(index).unwrap()];
@@ -2263,13 +2260,17 @@ fn head_vacancy_agrees_with_the_placement_walk_whenever_it_answers() {
             let key = index.wrapping_mul(SPREAD);
             let probe = table.prf.prepare(key);
             let general = table.search_vacancy(probe);
-            // An empty bin comes back holding the level's bit alone.
-            if let Some(head) = table.first_empty_in_head(probe, 0) {
-                let head = Vacancy {
-                    slot: head.slot,
-                    level_bit: head.bins,
-                };
-                assert_eq!(Some(head), general, "n {n} d {d} index {index}");
+            let membership = table.membership_slot(key);
+            let recorded = table.membership_gate_at(membership).levels;
+            if let Some(head) = table.first_empty_in_head(probe, membership) {
+                let general = general.unwrap();
+                assert_eq!(head.slot, general.slot, "n {n} d {d} index {index}");
+                // The bin comes back with the level's bit set in it.
+                assert_eq!(
+                    head.bins,
+                    recorded | general.level_bit,
+                    "n {n} d {d} index {index}"
+                );
                 answered += 1;
             }
             assert_eq!(map::TableBackend::insert(&mut table, key, index, key), None);

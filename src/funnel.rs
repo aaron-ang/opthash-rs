@@ -398,12 +398,20 @@ fn recorded_head_levels(levels: u16) -> u32 {
     u32::from(levels & !OVERFLOW_LEVEL_BIT) << (u32::BITS - u16::BITS)
 }
 
-/// Level bin of a key. Bits 6 and 7 of the hash: disjoint from both membership
-/// bit fields (bits 0..6 and 32..38), while the word index draws on the high
-/// half.
+/// Level bin of a key, as the negative index [`FunnelTable::level_bin_ptr`]
+/// counts back by. The top two bits of the hash's low half: disjoint from both
+/// membership bit fields (bits 0..6 and 32..38), while the word index draws on
+/// the high half.
 #[inline]
-const fn level_bin(key_hash: u64) -> usize {
-    ((key_hash >> 6) & 3) as usize
+const fn level_bin(key_hash: u64) -> isize {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "two bits, complemented into an index below zero"
+    )]
+    {
+        !((key_hash as u32) >> (u32::BITS - 2)) as i32 as isize
+    }
 }
 
 /// One key's filter location: which word, which bits, and which level bin.
@@ -413,7 +421,7 @@ const fn level_bin(key_hash: u64) -> usize {
 struct MembershipSlot {
     index: usize,
     bits: u64,
-    bin: usize,
+    bin: isize,
 }
 
 /// A loaded filter word paired with the key's bits, split from the test so the
@@ -454,14 +462,17 @@ struct FilterTail {
     /// rather than rebuilt from the arena base and region offset. An empty
     /// region points at [`NO_FILTER_WORD`], which rejects every key, so the
     /// gate needs no emptiness test; nothing writes through that pointer.
-    base: *mut MetadataWord,
+    ///
+    /// The base is the first membership word. Those words run upward from
+    /// it and the level bins downward, the bins of word `index` in the word
+    /// `index + 1` before it, so a gate indexes its word off the base
+    /// without forming the address of a pair.
+    base: *mut u64,
 }
 
-/// The word an empty table's gate reads: nothing recorded.
-static NO_FILTER_WORD: MetadataWord = MetadataWord {
-    membership: 0,
-    level_bins: [0; 4],
-};
+/// The level bins and membership word an empty table's gate reads: nothing
+/// recorded.
+static NO_FILTER_WORD: [u64; 2] = [0; 2];
 
 impl FilterTail {
     /// # Safety
@@ -469,10 +480,12 @@ impl FilterTail {
     /// `region` must have been laid out for the arena at `arena_base`.
     unsafe fn new(region: MembershipRegion, arena_base: *mut u8) -> Self {
         let base = if region.words == 0 {
-            core::ptr::from_ref(&NO_FILTER_WORD).cast_mut()
+            NO_FILTER_WORD.as_ptr().wrapping_add(1).cast_mut()
         } else {
-            // SAFETY: the caller's contract is `ptr`'s.
-            unsafe { region.ptr::<MetadataWord>(arena_base) }
+            // SAFETY: the caller's contract is `ptr`'s; the region holds a
+            // `MetadataWord` per filter word, which is two words, the bins
+            // in its first half.
+            unsafe { region.ptr::<u64>(arena_base).add(region.words) }
         };
         Self { region, base }
     }
@@ -1546,23 +1559,27 @@ where
     /// a probe word not accepted for certain, which is every word of a shape
     /// without lanes, or no vacancy in those levels.
     ///
-    /// `bins` is the key's level bin. Each step sets its own level's bit in
-    /// it, so the insert stores the bin it gets back and no step hands a bit
-    /// on to be merged later.
+    /// `slot` names the key's level bin, which the first step loads once its
+    /// probe word is accepted. Each step sets its own level's bit in it, so
+    /// the insert stores the bin it gets back and no step hands a bit on to
+    /// be merged later.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn first_empty_in_head(
         &self,
         probe: PreparedFastFunnelProbe,
-        bins: u16,
+        slot: MembershipSlot,
     ) -> Option<HeadVacancy> {
+        let mut bins = 0;
         // One copy of the step per level, each with a constant index: the
         // walk then keeps no index and checks no bound.
         macro_rules! walk {
             ($($index:literal)*) => {
                 const { assert!([$($index),*].len() == OVERFLOW_LEVEL) };
                 $(
-                    if let Some(vacancy) = self.first_empty_in_head_level(probe, $index, bins).ok()? {
+                    if let Some(vacancy) =
+                        self.first_empty_in_head_level(probe, $index, slot, &mut bins).ok()?
+                    {
                         return Some(vacancy);
                     }
                 )*
@@ -1581,12 +1598,18 @@ where
         &self,
         probe: PreparedFastFunnelProbe,
         index: usize,
-        bins: u16,
+        slot: MembershipSlot,
+        bins: &mut u16,
     ) -> Result<Option<HeadVacancy>, ()> {
         let level = &self.shape.head[index];
         let bucket =
             probe::ordinary_funnel_first_certain_index(probe, level.multiplier, level.bucket_range)
                 .ok_or(())?;
+        if index == 0 {
+            // SAFETY: the caller derived `slot` for this geometry.
+            *bins = unsafe { *self.level_bin_ptr(slot) };
+        }
+        let bins = *bins;
         let start = level.offset + bucket * self.shape.beta;
         // SAFETY: an ordinary bucket ends at or before `n`, and the control
         // array pads `GROUP_SIZE - 1` bytes past `n`.
@@ -1653,8 +1676,26 @@ where
     }
 
     #[inline]
-    fn membership_ptr(&self) -> *mut MetadataWord {
+    fn membership_ptr(&self) -> *mut u64 {
         self.membership.base
+    }
+
+    /// The level bin of `slot`.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must come from [`Self::membership_slot`] with no change of
+    /// geometry since.
+    #[inline]
+    unsafe fn level_bin_ptr(&self, slot: MembershipSlot) -> *mut u16 {
+        // SAFETY: the bins of word `index` are the word `index + 1` words
+        // before the base, and `slot.bin` counts back from that word's end.
+        unsafe {
+            self.membership_ptr()
+                .sub(slot.index)
+                .cast::<u16>()
+                .offset(slot.bin)
+        }
     }
 
     /// `false` proves no insert ever recorded this key.
@@ -1669,7 +1710,7 @@ where
         let word = MembershipKey::word(key_hash, words);
         // SAFETY: `word` is a multiply-high reduction below `words`, and the
         // arena's tail holds exactly that many zero-initialized words.
-        unsafe { (*self.membership_ptr().add(word)).membership & bits == bits }
+        unsafe { *self.membership_ptr().add(word) & bits == bits }
     }
 
     /// This key's filter word index and bits for the current epoch. Only an
@@ -1700,8 +1741,10 @@ where
         // zero, and the base is the shared empty word. Two field loads, not a
         // copy of the whole word, so the bin needs no dynamic extraction.
         let (word, levels) = unsafe {
-            let metadata = self.membership_ptr().add(slot.index);
-            ((*metadata).membership, (*metadata).level_bins[slot.bin])
+            (
+                *self.membership_ptr().add(slot.index),
+                *self.level_bin_ptr(slot),
+            )
         };
         MembershipGate {
             word,
@@ -1743,9 +1786,10 @@ where
         if self.membership.region.words != 0 {
             // SAFETY: as in `membership_gate`; `&mut self` makes the borrow
             // exclusive.
-            let metadata = unsafe { &mut *self.membership_ptr().add(membership.index) };
-            metadata.membership |= membership.bits;
-            metadata.level_bins[membership.bin] |= level_bit;
+            unsafe {
+                *self.membership_ptr().add(membership.index) |= membership.bits;
+                *self.level_bin_ptr(membership) |= level_bit;
+            }
         }
     }
 
@@ -1920,11 +1964,15 @@ where
     /// Where an absent key goes in a table without tombstones and below its
     /// insertion limit: the first EMPTY lane of the placement walk over the
     /// levels that own a level-bin bit. `None` leaves the placement to the
-    /// general insert. `bins` is the key's level bin, as for
+    /// general insert. `slot` names the key's level bin, as for
     /// [`Self::first_empty_in_head`].
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn head_vacancy(&self, probe: PreparedFastFunnelProbe, bins: u16) -> Option<HeadVacancy> {
+    fn head_vacancy(
+        &self,
+        probe: PreparedFastFunnelProbe,
+        slot: MembershipSlot,
+    ) -> Option<HeadVacancy> {
         debug_assert_eq!(
             self.head_left,
             self.head_limit().saturating_sub(self.entries())
@@ -1932,7 +1980,7 @@ where
         if self.head_left == 0 {
             return None;
         }
-        self.first_empty_in_head(probe, bins)
+        self.first_empty_in_head(probe, slot)
     }
 
     /// Entry count below which the head placement may run.
@@ -1961,10 +2009,10 @@ where
     ///
     /// # Safety
     ///
-    /// `gate` must come from the filter word of `membership`, itself from
+    /// `word` must be the filter word of `membership`, itself from
     /// [`Self::membership_slot`], and `vacancy` from [`Self::head_vacancy`]
-    /// over the gate's level bin, with no write to the table since any of
-    /// them was read.
+    /// over the same slot, with no write to the table since any of them was
+    /// read.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     unsafe fn place_in_head(
@@ -1972,11 +2020,10 @@ where
         key: K,
         value: V,
         membership: MembershipSlot,
-        gate: MembershipGate,
+        word: u64,
         probe: PreparedFastFunnelProbe,
         vacancy: HeadVacancy,
     ) {
-        debug_assert_eq!(vacancy.bins, gate.levels | self.level_bit(vacancy.slot));
         debug_assert_ne!(self.membership.region.words, 0);
         // Every table word this insert needs is read before its first
         // store, which could otherwise force each to be loaded again:
@@ -1985,7 +2032,17 @@ where
         let head_left = self.head_left;
         // SAFETY: a vacancy exists only in a table with slots, so its
         // filter has words and `membership.index` is below their count.
-        let metadata = unsafe { self.membership_ptr().add(membership.index) };
+        let (metadata, bin) = unsafe {
+            (
+                self.membership_ptr().add(membership.index),
+                self.level_bin_ptr(membership),
+            )
+        };
+        debug_assert_eq!(
+            vacancy.bins,
+            // SAFETY: `bin` is the key's level bin, as above.
+            unsafe { *bin } | self.level_bit(vacancy.slot)
+        );
         let key_fingerprint = probe.fingerprint();
         // SAFETY: the vacancy is an EMPTY lane of an ordinary bucket, and
         // `key_fingerprint` is an occupied control.
@@ -1999,8 +2056,8 @@ where
         // SAFETY: `metadata` is this key's filter word, as above, and
         // `&mut self` makes the access exclusive.
         unsafe {
-            (*metadata).membership = gate.word | membership.bits;
-            (*metadata).level_bins[membership.bin] = vacancy.bins;
+            *metadata = word | membership.bits;
+            *bin = vacancy.bins;
         }
         self.head_left = head_left - 1;
     }
@@ -2022,10 +2079,10 @@ where
                 return Some(map::TableBackend::replace_value(self, slot, value));
             }
             let probe = self.prf.prepare(hash);
-            if let Some(vacancy) = self.head_vacancy(probe, gate.levels) {
+            if let Some(vacancy) = self.head_vacancy(probe, membership) {
                 // SAFETY: slot, gate and vacancy were read just above, with
                 // no write since.
-                unsafe { self.place_in_head(key, value, membership, gate, probe, vacancy) };
+                unsafe { self.place_in_head(key, value, membership, gate.word, probe, vacancy) };
                 return None;
             }
         }
@@ -2495,13 +2552,16 @@ where
         // search. That common insert calls nothing; every
         // other case is the general insert's.
         let membership = self.membership_slot(hash);
-        let gate = self.membership_gate_at(membership);
-        if !gate.passes() {
+        // SAFETY: as in `membership_gate_at`. Only the word is loaded: the
+        // head walk loads the level bin, once its first probe word is
+        // accepted.
+        let word = unsafe { *self.membership_ptr().add(membership.index) };
+        if word & membership.bits != membership.bits {
             let probe = self.prf.prepare(hash);
-            if let Some(vacancy) = self.head_vacancy(probe, gate.levels) {
-                // SAFETY: slot, gate and vacancy were read just above, with
+            if let Some(vacancy) = self.head_vacancy(probe, membership) {
+                // SAFETY: slot, word and vacancy were read just above, with
                 // no write since.
-                unsafe { self.place_in_head(key, value, membership, gate, probe, vacancy) };
+                unsafe { self.place_in_head(key, value, membership, word, probe, vacancy) };
                 return None;
             }
         }
