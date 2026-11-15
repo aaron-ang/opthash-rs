@@ -1600,7 +1600,8 @@ where
     }
 
     /// This key's filter word index and bits for the current epoch. Only an
-    /// empty geometry has no words; its slot is never dereferenced.
+    /// empty geometry has no words; its index is then zero, and the gate reads
+    /// the shared all-zero word, which no key passes.
     #[inline]
     fn membership_slot(&self, key_hash: u64) -> MembershipSlot {
         MembershipSlot {
@@ -1676,7 +1677,7 @@ where
     }
 
     fn clear_membership(&mut self) {
-        // SAFETY: as in `membership_ptr`.
+        // SAFETY: `region` was laid out for `self.arena`.
         unsafe {
             self.membership
                 .region
