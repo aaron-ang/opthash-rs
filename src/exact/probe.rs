@@ -548,6 +548,31 @@ pub(crate) fn unbiased_prepared_elastic_probe_index(
     reduce_prepared_elastic_non_power(probe, counter_base, upper, max_random_words)
 }
 
+/// Shift that reduces a random word to an index in `[0, upper)` by keeping
+/// its top bits, or `None` when `upper` needs the general reduction. For a
+/// power of two the multiply-high reduction never rejects a word and its high
+/// half is exactly those top bits.
+pub(crate) const fn elastic_index_shift(upper: usize) -> Option<u32> {
+    if upper.is_power_of_two() && upper > 1 {
+        Some(u64::BITS - upper.trailing_zeros())
+    } else {
+        None
+    }
+}
+
+/// The index [`unbiased_prepared_elastic_probe_index`] yields for a level
+/// whose [`elastic_index_shift`] is `index_shift`.
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+pub(crate) fn shifted_elastic_probe_index(
+    probe: PreparedElasticProbe,
+    counter_base: u32,
+    index_shift: u32,
+) -> usize {
+    debug_assert!(index_shift < u64::BITS);
+    (probe.word_from_counter_base(counter_base, 0) >> index_shift) as usize
+}
+
 #[allow(clippy::cast_possible_truncation)]
 #[inline]
 pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
