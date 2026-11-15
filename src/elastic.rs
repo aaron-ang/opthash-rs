@@ -1464,17 +1464,34 @@ where
 
     /// Re-record the filter from the live entries, dropping the bits departed
     /// keys left behind. Entries stay put; only the metadata tail is rewritten.
+    ///
+    /// Every key is hashed before the filter is cleared, so a hasher that
+    /// unwinds leaves it recording every live key. The hashes need scratch
+    /// memory; without it the filter stays as it was. Either way the refresh
+    /// stays owed to the next settling delete.
     #[cold]
     #[inline(never)]
     fn refresh_membership(&mut self) {
+        let mut hashes = allocator_api2::vec::Vec::new_in(self.alloc.clone());
+        if hashes.try_reserve_exact(self.len).is_err() {
+            return;
+        }
+        for level in &self.levels {
+            let mut scan = OccupiedIndices::new();
+            while let Some(slot_idx) = scan.step(level) {
+                // SAFETY: `step` yields occupied in-bounds slots.
+                let entry = unsafe { level.get_ref(slot_idx) };
+                hashes.push(self.hash_builder.hash_one(&entry.key));
+            }
+        }
         self.clear_membership();
+        // The same scan order as above pairs each entry with its hash.
+        let mut hashes = hashes.into_iter();
         for level_idx in 0..self.levels.len() {
             let mut scan = OccupiedIndices::new();
-            while let Some(slot_idx) = scan.step(&self.levels[level_idx]) {
-                let hash = {
-                    // SAFETY: `step` yields occupied in-bounds slots.
-                    let entry = unsafe { self.levels[level_idx].get_ref(slot_idx) };
-                    self.hash_builder.hash_one(&entry.key)
+            while scan.step(&self.levels[level_idx]).is_some() {
+                let Some(hash) = hashes.next() else {
+                    return;
                 };
                 let prepared = PreparedElasticKey::new(hash);
                 self.record_membership(prepared.route, prepared.membership, level_idx);
