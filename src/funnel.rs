@@ -661,7 +661,7 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// Seeds every probe sequence. Starts at [`FUNNEL_PROBE_SEED`]; a
     /// placement-recovery rebuild advances it, because survivors of slot-order
     /// deletes are skewed toward the buckets the old seed left full.
-    probe_seed: u64,
+    prf: FunnelPrf,
     /// Cached location of the membership filter tail. Lookups load one word
     /// from it before probing; see [`crate::membership`].
     membership: MembershipRegion,
@@ -819,7 +819,7 @@ where
             arena,
             epoch: EpochState::initial(),
             exceptional_placement: false,
-            probe_seed: FUNNEL_PROBE_SEED,
+            prf: FunnelPrf::new(FUNNEL_PROBE_SEED),
             membership,
             stale_membership: 0,
         })
@@ -915,7 +915,7 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
+        let probe = self.prf.prepare(key_hash);
         self.search_exact_prepared_for_insert(key, probe, key_fingerprint)
     }
 
@@ -1133,7 +1133,7 @@ where
         if lanes == 0 {
             return Err(());
         }
-        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
+        let probe = self.prf.prepare(key_hash);
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
         let scan = |level: u32| -> Result<(usize, u64), ()> {
@@ -1635,7 +1635,7 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
+        let probe = self.prf.prepare(key_hash);
         match self.lookup_recorded_levels(key, probe, key_fingerprint, levels) {
             Some(slot) => Some(slot),
             None if self.exceptional_placement => self.find_by_full_scan(key, key_fingerprint),
@@ -1662,7 +1662,7 @@ where
         // key the filter never recorded was never inserted, so neither the walk
         // nor the exceptional full scan can find it.
         let gate = self.membership_gate(key_hash);
-        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
+        let probe = self.prf.prepare(key_hash);
         if !gate.passes() {
             return Err(None);
         }
@@ -1806,7 +1806,7 @@ where
     fn rebuild_for_placement(&mut self, key_hash: u64) -> (Option<Vacancy>, MembershipSlot) {
         self.resize_with_transition(self.shape.n, EpochTransition::PlacementRecovery);
         let membership = self.membership_slot(key_hash);
-        let vacancy = self.search_vacancy(FunnelPrf::new(self.probe_seed).prepare(key_hash));
+        let vacancy = self.search_vacancy(self.prf.prepare(key_hash));
         (vacancy, membership)
     }
 
@@ -1863,10 +1863,10 @@ where
         transition: EpochTransition,
     ) -> Result<(), TryReserveError> {
         let (arena, storage, membership) = try_allocate_storage(shape.n, &self.alloc)?;
-        let probe_seed = if matches!(transition, EpochTransition::PlacementRecovery) {
-            self.probe_seed.wrapping_add(FUNNEL_RESEED_STEP)
+        let prf = if matches!(transition, EpochTransition::PlacementRecovery) {
+            self.prf.reseeded(FUNNEL_RESEED_STEP)
         } else {
-            self.probe_seed
+            self.prf
         };
         let recovered = rebuild::rebuild(
             self,
@@ -1877,7 +1877,7 @@ where
                 tombstones: 0,
                 arena,
                 exceptional_placement: false,
-                probe_seed,
+                prf,
                 membership,
                 stale_membership: 0,
             },
@@ -1895,7 +1895,7 @@ pub(crate) struct FunnelGeneration<K, V> {
     tombstones: usize,
     arena: Arena,
     exceptional_placement: bool,
-    probe_seed: u64,
+    prf: FunnelPrf,
     membership: MembershipRegion,
     stale_membership: usize,
 }
@@ -1921,7 +1921,7 @@ where
             &mut self.exceptional_placement,
             &mut other.exceptional_placement,
         );
-        mem::swap(&mut self.probe_seed, &mut other.probe_seed);
+        mem::swap(&mut self.prf, &mut other.prf);
         mem::swap(&mut self.membership, &mut other.membership);
         mem::swap(&mut self.stale_membership, &mut other.stale_membership);
     }
@@ -1947,7 +1947,7 @@ where
         let Some(level) = self.shape.levels.first() else {
             return;
         };
-        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
+        let probe = self.prf.prepare(key_hash);
         if let Some(bucket) = Self::sample_ordinary(probe, level, 0) {
             self.storage
                 .prefetch_slot(level.offset + bucket * self.shape.beta);
@@ -1960,7 +1960,7 @@ where
     #[inline(always)]
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let key_fingerprint = control::control_fingerprint(key_hash);
-        let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
+        let probe = self.prf.prepare(key_hash);
         let (vacancy, exceptional) = self.resolve_vacancy(self.search_vacancy(probe));
         let membership = self.membership_slot(key_hash);
         self.place_new_entry(
@@ -2083,7 +2083,7 @@ where
         let vacancy = if self.prepare_vacant_insert() || vacant.exact == FunnelVacant::UNSEARCHED {
             // Growth invalidates any recorded slot or exhaustion; an unsearched
             // token never had one.
-            let probe = FunnelPrf::new(self.probe_seed).prepare(vacant.hash);
+            let probe = self.prf.prepare(vacant.hash);
             self.search_vacancy(probe)
         } else if vacant.exact == FunnelVacant::EXHAUSTED {
             // Both exhaustion reasons take the same recovery path.
@@ -2105,7 +2105,7 @@ where
         // only the placement walk runs.
         let mut membership = self.membership_slot(hash);
         let gate = self.membership_gate_at(membership);
-        let probe = FunnelPrf::new(self.probe_seed).prepare(hash);
+        let probe = self.prf.prepare(hash);
         let fingerprint = control::control_fingerprint(hash);
         let mut exact = None;
         if gate.passes() {
@@ -2296,7 +2296,7 @@ where
         cloned.tombstones = self.tombstones;
         cloned.epoch = self.epoch;
         cloned.exceptional_placement = self.exceptional_placement;
-        cloned.probe_seed = self.probe_seed;
+        cloned.prf = self.prf;
         // Slots are copied rather than reinserted, so the filter comes with them.
         cloned.copy_membership_from(self);
         cloned.stale_membership = self.stale_membership;

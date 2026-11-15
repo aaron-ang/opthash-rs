@@ -69,7 +69,9 @@ pub(crate) struct CounterPrf {
 /// and the special arrays draw counter words.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FunnelPrf {
-    seed: u64,
+    /// The seed plus [`DOMAIN_KIND_LANE`], so preparing a probe is one add
+    /// ahead of the mix.
+    lane_seed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,7 +81,9 @@ pub(crate) struct PreparedElasticProbe {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedFastFunnelProbe {
-    key_in: u64,
+    /// The key hash plus the oracle's lane seed; counter words derive their
+    /// input lane from it.
+    keyed: u64,
     key_out: u64,
 }
 
@@ -146,15 +150,25 @@ impl FunnelPrf {
     /// Creates the deterministic Funnel counter permutation for `seed`.
     #[must_use]
     pub(crate) const fn new(seed: u64) -> Self {
-        Self { seed }
+        Self {
+            lane_seed: seed.wrapping_add(DOMAIN_KIND_LANE),
+        }
+    }
+
+    /// The oracle for a seed `step` past this one.
+    #[must_use]
+    pub(crate) const fn reseeded(self, step: u64) -> Self {
+        Self {
+            lane_seed: self.lane_seed.wrapping_add(step),
+        }
     }
 
     #[inline]
     pub(crate) fn prepare(self, key_hash: u64) -> PreparedFastFunnelProbe {
-        let keyed = key_hash.wrapping_add(self.seed);
+        let keyed = key_hash.wrapping_add(self.lane_seed);
         PreparedFastFunnelProbe {
-            key_in: keyed.wrapping_add(KEY_LANE),
-            key_out: mix64(keyed.wrapping_add(DOMAIN_KIND_LANE)),
+            keyed,
+            key_out: mix64(keyed),
         }
     }
 
@@ -261,6 +275,15 @@ impl PreparedFastFunnelProbe {
         Some(self.prepare_counter_base(counter_base))
     }
 
+    /// Input lane of the counter words: the key hash plus the seed and
+    /// [`KEY_LANE`].
+    #[inline]
+    const fn key_in(self) -> u64 {
+        self.keyed
+            .wrapping_sub(DOMAIN_KIND_LANE)
+            .wrapping_add(KEY_LANE)
+    }
+
     #[inline]
     const fn ordinary_first_word(self, multiplier: u64) -> u64 {
         self.key_out.wrapping_mul(multiplier)
@@ -272,7 +295,7 @@ impl PreparedFastFunnelProbe {
         counter_base: u64,
     ) -> PreparedFastFunnelDomainProbe {
         PreparedFastFunnelDomainProbe {
-            key_in: self.key_in,
+            key_in: self.key_in(),
             key_out: self.key_out,
             counter_base,
         }
@@ -894,7 +917,7 @@ const fn append_bit(prefix: u128, bit: u128) -> Option<u128> {
 impl PreparedFastFunnelProbe {
     #[inline]
     fn word_from_counter(self, counter: u64) -> u64 {
-        mix64(counter ^ self.key_in) ^ self.key_out
+        mix64(counter ^ self.key_in()) ^ self.key_out
     }
 }
 

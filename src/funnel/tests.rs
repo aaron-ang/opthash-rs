@@ -169,7 +169,7 @@ fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement(
     );
     let vacant = table.find_for_entry(&absent, hash).err().unwrap();
     let old_len = table.len;
-    let old_seed = table.probe_seed;
+    let old_seed = table.prf;
     VACANCY_WALKS.with(|walks| walks.set(0));
     let inserted = table.insert_for_vacant(absent, 99, vacant);
 
@@ -180,7 +180,7 @@ fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement(
         old_len + 1,
         "one walk per survivor, then one for the new key"
     );
-    assert_ne!(table.probe_seed, old_seed);
+    assert_ne!(table.prf, old_seed);
     assert!(!table.exceptional_placement);
     assert_eq!(
         table.epoch_snapshot().transition,
