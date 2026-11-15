@@ -26,7 +26,7 @@ use crate::raw::rebuild::{self, Rebuildable};
 
 mod schedule;
 
-use schedule::{ProbeSchedule, SENTINEL_LEVEL};
+use schedule::{ProbeSchedule, ProbeScheduleRoom, SENTINEL_LEVEL};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -931,13 +931,14 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let probe_schedule = ProbeSchedule::try_with_capacity(
+        let schedule_room = ProbeScheduleRoom::try_with_capacity(
             PROBE_SCHEDULE_CAPACITY[geometry.level_capacities.len()],
         )?;
         let (arena, levels, membership) =
             try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
 
         let settled_limit = settled_limit(&levels, geometry.max_insertions);
+        let probe_schedule = schedule_room.schedule(&levels);
         Ok(Self {
             levels,
             len: 0,
@@ -1705,9 +1706,7 @@ where
         let regions = guard.regions_mut();
         let probe_schedule = self
             .probe_schedule
-            .clone_onto(PROBE_SCHEDULE_CAPACITY[regions.len()], |level| {
-                regions[level].ctrl_ptr
-            });
+            .clone_onto(PROBE_SCHEDULE_CAPACITY[regions.len()], regions);
 
         // Success: reclaim arena + levels so the guard's Drop no-ops.
         let (arena, levels) = guard.disarm();
@@ -1803,12 +1802,13 @@ where
         geometry: &ElasticGeometry,
         transition: EpochTransition,
     ) -> Result<(), TryReserveError> {
-        let probe_schedule = ProbeSchedule::try_with_capacity(
+        let schedule_room = ProbeScheduleRoom::try_with_capacity(
             PROBE_SCHEDULE_CAPACITY[geometry.level_capacities.len()],
         )?;
         let (arena, levels, membership) =
             try_alloc_elastic_arena(&geometry.level_capacities, &self.alloc)?;
         let settled_limit = settled_limit(&levels, geometry.max_insertions);
+        let probe_schedule = schedule_room.schedule(&levels);
         let used_exceptional_placement = rebuild::rebuild(
             self,
             ElasticGeneration {
@@ -2165,8 +2165,9 @@ where
         }
     }
 
-    /// Walks the key's candidates in schedule order while the table reduces
-    /// by shift. It calls nothing but the key comparison, so a caller that
+    /// Walks the key's candidates in schedule order. A table that needs the
+    /// general reduction has routes that probe nothing, so its walk ends
+    /// unresolved. It calls nothing but the key comparison, so a caller that
     /// hands [`ScheduleSearch::Unresolved`] on in tail position keeps no
     /// stack frame.
     #[allow(clippy::inline_always)]
@@ -2187,22 +2188,26 @@ where
         if !filter.maybe_present {
             return ScheduleSearch::Absent;
         }
-        // SAFETY: the filter only passes when it has words, and those are laid
-        // out for a non-zero slot count, which gives the table a level zero.
-        let h11_shift = unsafe { self.levels.get_unchecked(0) }.index_shift();
-        if h11_shift == GENERAL_REDUCTION {
-            return ScheduleSearch::Unresolved(filter.expanded_level_mask());
-        }
         let sequence = prepared.route.probe.sequence(self.fold_multiplier);
-        let h11_slot = probe::shifted_elastic_index(sequence.word(0), h11_shift);
-        // SAFETY: the shifted index maps into level zero's capacity.
-        if let Some(entry) = unsafe { self.entry_if_match(0, h11_slot, key_fingerprint, key) } {
-            return ScheduleSearch::Hit(on_hit(0, h11_slot, entry));
+        let direct = self.probe_schedule.direct();
+        // SAFETY: the schedule starts with its direct route and ends with
+        // its sentinel, so the route after the direct one is in bounds.
+        let (direct, mut next) = unsafe { (&*direct, direct.add(1)) };
+        let h11_slot = probe::shifted_elastic_index(sequence.word(0), direct.index_shift());
+        // SAFETY: the route's shifted index maps into the control bytes it
+        // holds.
+        if unsafe { *direct.control().add(h11_slot) } == key_fingerprint {
+            // SAFETY: only level zero's own control bytes hold a
+            // fingerprint, so the table has that level and the slot is one
+            // of its occupied ones.
+            let entry = unsafe { self.levels.get_unchecked(0).get_ref(h11_slot) };
+            if key.equivalent(&entry.key) {
+                return ScheduleSearch::Hit(on_hit(0, h11_slot, entry));
+            }
         }
 
         let level_mask = filter.expanded_level_mask();
         let mut open_levels = u64::from(level_mask) | (1 << SENTINEL_LEVEL);
-        let mut next = self.probe_schedule.first();
         loop {
             // SAFETY: the schedule ends with its sentinel, and the walk
             // cannot pass it: the sentinel's level stays open until its own
@@ -2214,8 +2219,7 @@ where
             if (open_levels >> route.level()) & 1 == 0 {
                 continue;
             }
-            // Level zero reducing by shift means every level of the table
-            // does.
+            // The route holds a shift whichever reduction its level needs.
             let slot = probe::shifted_elastic_index(
                 sequence.word(route.sequence_index()),
                 route.index_shift(),
@@ -2246,7 +2250,12 @@ where
                 }
             }
         }
-        if self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG != 0 {
+        // A table that needs the general reduction walked routes that probe
+        // nothing.
+        // SAFETY: the filter only passes when it has words, and those are laid
+        // out for a non-zero slot count, which gives the table a level zero.
+        let general = unsafe { self.levels.get_unchecked(0) }.index_shift() == GENERAL_REDUCTION;
+        if general || self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG != 0 {
             ScheduleSearch::Unresolved(level_mask)
         } else {
             ScheduleSearch::Absent
