@@ -1284,6 +1284,7 @@ fn deletes_past_the_threshold_refresh_the_membership_filter() {
                 .passes()
         },
         FunnelTable::stale_membership,
+        |threshold| threshold + 1,
     );
 }
 

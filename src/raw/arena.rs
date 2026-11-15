@@ -48,7 +48,7 @@ impl Arena {
         debug_assert!(ctrl_bytes <= layout.size(), "ctrl prefix exceeds layout");
         if ctrl_bytes > 0 {
             // SAFETY: `ptr` is a fresh allocation of `layout`, whose ctrl
-            // prefix spans `ctrl_bytes` by construction in `layout_for*`.
+            // prefix spans `ctrl_bytes` by construction in `layout_for_extents`.
             unsafe { ptr::write_bytes(ptr.as_ptr(), 0, ctrl_bytes) };
         }
         Ok(Self { ptr, layout })
@@ -89,14 +89,8 @@ impl Arena {
     }
 }
 
-/// Combined ctrl+data layout for an arena whose ctrl section holds
-/// `total_ctrl` bytes and data section holds `total_ctrl` slots.
-/// Returns `(layout, data_offset_within_arena)`.
-pub(crate) fn layout_for<K, V>(total_ctrl: usize) -> Result<(Layout, usize), TryReserveError> {
-    layout_for_extents::<K, V>(total_ctrl, total_ctrl)
-}
-
-/// Combined ctrl+data layout with independently sized control and slot extents.
+/// Combined ctrl+data layout with independently sized control and slot
+/// extents. Returns `(layout, data_offset_within_arena)`.
 pub(crate) fn layout_for_extents<K, V>(
     ctrl_bytes: usize,
     data_slots: usize,
@@ -128,7 +122,8 @@ pub(crate) struct LayoutCursor<T> {
 }
 
 impl<T> LayoutCursor<T> {
-    /// `data_base_off` is the data section's byte offset (from [`layout_for`]).
+    /// `data_base_off` is the data section's byte offset (from
+    /// [`layout_for_extents`]).
     pub(crate) fn new(base: *mut u8, data_base_off: usize) -> Result<Self, TryReserveError> {
         Ok(Self {
             base,
@@ -141,11 +136,34 @@ impl<T> LayoutCursor<T> {
         })
     }
 
+    /// Advances the ctrl offset to an aligned `H` and past it, so the next
+    /// region's ctrl bytes directly follow a header of that type. The data
+    /// offset skips as many slots, which keeps every region's slots at one
+    /// fixed displacement from its ctrl bytes.
+    pub(crate) fn reserve_ctrl_header<H>(&mut self) -> Result<(), TryReserveError> {
+        let align =
+            u32::try_from(mem::align_of::<H>()).map_err(|_| TryReserveError::CapacityOverflow)?;
+        let size =
+            u32::try_from(mem::size_of::<H>()).map_err(|_| TryReserveError::CapacityOverflow)?;
+        let next_ctrl_off = self
+            .ctrl_off
+            .checked_next_multiple_of(align)
+            .and_then(|offset| offset.checked_add(size))
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        let next_data_off = (next_ctrl_off - self.ctrl_off)
+            .checked_mul(self.slot_size)
+            .and_then(|bytes| self.data_off.checked_add(bytes))
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        self.ctrl_off = next_ctrl_off;
+        self.data_off = next_data_off;
+        Ok(())
+    }
+
     /// Current region's `(ctrl_ptr, data_ptr)`, then advances past its `cap`
     /// ctrl bytes + `cap * slot_size` data bytes.
     ///
     /// # Safety
-    /// `base` must point at a [`layout_for`] arena covering every reserved
+    /// `base` must point at a [`layout_for_extents`] arena covering every reserved
     /// region, in order.
     pub(crate) unsafe fn reserve(
         &mut self,
@@ -532,7 +550,7 @@ mod tests {
 
     #[test]
     fn zero_ctrl_layout_does_not_allocate() {
-        let (layout, data_offset) = layout_for::<u64, u64>(0).unwrap();
+        let (layout, data_offset) = layout_for_extents::<u64, u64>(0, 0).unwrap();
         assert_eq!(layout.size(), 0);
         assert_eq!(data_offset, 0);
     }

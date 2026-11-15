@@ -14,11 +14,11 @@ use crate::raw::control::CTRL_EMPTY;
 #[repr(C)]
 pub(super) struct PhiRoute {
     /// The distance of the level's bit of a closed-level set below the top
-    /// bit in the low byte, the index shift in the next and the sequence
-    /// index in the high half, so one load brings all three. Both byte
-    /// fields are below the word width: used as a shift amount, the word
-    /// itself moves the level's bit to the top, and the top bit down to the
-    /// level's.
+    /// bit in the low byte, the index shift in the next, the level in the
+    /// third and the sequence index in the high half, so one load brings
+    /// them all. The first two byte fields are below the word width: used
+    /// as a shift amount, the word itself moves the level's bit to the top,
+    /// and the top bit down to the level's.
     packed: u64,
     control: *const u8,
 }
@@ -26,12 +26,14 @@ pub(super) struct PhiRoute {
 const _: () = assert!(size_of::<PhiRoute>() <= 16);
 
 const INDEX_SHIFT_BIT: u32 = u8::BITS;
+const LEVEL_BIT: u32 = 2 * u8::BITS;
 const SEQUENCE_INDEX_BIT: u32 = u32::BITS;
 
 const fn pack(level: u8, index_shift: u8, sequence_index: u32) -> u64 {
     assert!(level <= SENTINEL_LEVEL && (index_shift as u32) < u64::BITS);
     (TOP_LEVEL_BIT - level_bit(level)) as u64
         | (index_shift as u64) << INDEX_SHIFT_BIT
+        | (level as u64) << LEVEL_BIT
         | (sequence_index as u64) << SEQUENCE_INDEX_BIT
 }
 
@@ -123,7 +125,7 @@ impl PhiRoute {
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub(super) fn level(&self) -> u8 {
-        (TOP_LEVEL_BIT - (self.packed as u8 & TOP_LEVEL_BIT)).wrapping_sub(1) & TOP_LEVEL_BIT
+        (self.packed >> LEVEL_BIT) as u8
     }
 
     /// Whether `closed_levels` holds the route's level.
@@ -219,10 +221,7 @@ impl ProbeScheduleRoom {
         let mut routes = self.routes;
         routes.push(PhiRoute::direct(levels));
         routes.push(SENTINEL);
-        ProbeSchedule {
-            routes,
-            entry_origin: entry_origin(levels),
-        }
+        ProbeSchedule::assemble(routes, entry_origin(levels))
     }
 }
 
@@ -239,19 +238,28 @@ const FIXED_ROUTES: usize = 2;
 /// [`ProbeScheduleRoom::schedule`], [`Self::clone_onto`] and [`Self::push`]
 /// each take that slice, and a route holds only what [`PhiRoute::new`]
 /// derives from one of its levels.
+///
+/// `repr(C)` keeps the two addresses a lookup starts from adjacent, so one
+/// load brings both.
+#[repr(C)]
 pub(super) struct ProbeSchedule {
+    /// `routes.as_ptr()`. The routes never move: [`Self::clear`] only
+    /// shortens them, and [`Self::push`] writes into room they already
+    /// hold or panics.
+    direct: *const PhiRoute,
+    /// See [`entry_origin`].
+    entry_origin: *mut u8,
     /// The direct route, the pushed routes, then the sentinel. No method
     /// leaves the first or the last off, so a walk from [`Self::direct`]
     /// always reaches the sentinel.
     routes: Vec<PhiRoute>,
-    /// See [`entry_origin`].
-    entry_origin: *mut u8,
 }
 
 /// Where the entry of a control byte at address zero would lie. The arena
-/// lays the levels' control bytes out back to back and their entries in the
-/// same order, so an entry's address is this plus its control byte's address
-/// times the entry size.
+/// lays the levels' control bytes and their entries out in the same order
+/// and leaves the same number of slots between two levels in both, so an
+/// entry's address is this plus its control byte's address times the entry
+/// size.
 fn entry_origin<T>(levels: &[Level<T>]) -> *mut u8 {
     let origin_of = |region: &Level<T>| {
         region
@@ -264,7 +272,20 @@ fn entry_origin<T>(levels: &[Level<T>]) -> *mut u8 {
     origin
 }
 
+const _: () = assert!(
+    core::mem::offset_of!(ProbeSchedule, entry_origin)
+        == core::mem::offset_of!(ProbeSchedule, direct) + size_of::<*const PhiRoute>()
+);
+
 impl ProbeSchedule {
+    fn assemble(routes: Vec<PhiRoute>, entry_origin: *mut u8) -> Self {
+        Self {
+            direct: routes.as_ptr(),
+            entry_origin,
+            routes,
+        }
+    }
+
     /// Byte offset from the entry origin of the entry beside control byte
     /// `slot` of the control bytes at `control`.
     #[inline]
@@ -297,10 +318,7 @@ impl ProbeSchedule {
             PhiRoute::new(level, &levels[level], logical_probe_index)
         }));
         routes.push(SENTINEL);
-        Self {
-            routes,
-            entry_origin: entry_origin(levels),
-        }
+        Self::assemble(routes, entry_origin(levels))
     }
 
     /// The pushed routes, in query-position order.
@@ -314,7 +332,8 @@ impl ProbeSchedule {
     /// [`SENTINEL_LEVEL`], may be read.
     #[inline]
     pub(super) fn direct(&self) -> *const PhiRoute {
-        self.routes.as_ptr()
+        debug_assert_eq!(self.direct, self.routes.as_ptr());
+        self.direct
     }
 
     /// Drops the pushed routes.
@@ -328,6 +347,11 @@ impl ProbeSchedule {
     /// prefix of it. The caller appends routes in query-position order.
     pub(super) fn push<T>(&mut self, levels: &[Level<T>], level: usize, logical_probe_index: u64) {
         let sentinel = self.routes.len() - 1;
+        // Growing would move the routes away from `direct`.
+        assert!(
+            self.routes.len() < self.routes.capacity(),
+            "probe schedule outgrew its room"
+        );
         self.routes[sentinel] = PhiRoute::new(level, &levels[level], logical_probe_index);
         self.routes.push(SENTINEL);
     }
@@ -335,7 +359,8 @@ impl ProbeSchedule {
     /// Whether every route is the one its level in `levels` gives.
     #[cfg(test)]
     pub(super) fn addresses<T>(&self, levels: &[Level<T>]) -> bool {
-        self.routes[0] == PhiRoute::direct(levels)
+        self.direct == self.routes.as_ptr()
+            && self.routes[0] == PhiRoute::direct(levels)
             && self.entry_origin == entry_origin(levels)
             && self.routes().iter().all(|route| {
                 let (level, logical_probe_index) = route.coordinates();
