@@ -663,6 +663,64 @@ fn clear_tombstones_each_slot_before_dropping_its_value() {
 }
 
 #[test]
+fn caught_hash_panic_during_a_filter_refresh_keeps_every_entry_reachable() {
+    const LIVE: u64 = 55;
+    const CHURNED: u64 = LIVE;
+    let armed = Arc::new(AtomicBool::new(false));
+    let never = Arc::new(AtomicBool::new(false));
+    let key_drops = Arc::new(AtomicUsize::new(0));
+    let key = |id: u64| PanicHashKey {
+        id,
+        // The churned key is hashed by its own removal, so it stays unarmed.
+        armed: if id == CHURNED {
+            never.clone()
+        } else {
+            armed.clone()
+        },
+        drops: key_drops.clone(),
+    };
+    let mut map = FixedElasticHashMap::<PanicHashKey, u64>::with_capacity(56);
+    let capacity = map.capacity();
+    for id in 0..LIVE {
+        map.insert(key(id), id);
+    }
+    let generation = map.epoch().generation;
+
+    // Churn one key until a removal refreshes the filter, which hashes the
+    // armed live keys.
+    let mut unwound = false;
+    for _ in 0..=2 * capacity {
+        map.insert(key(CHURNED), CHURNED);
+        armed.store(true, Ordering::SeqCst);
+        let result = catch_unwind(AssertUnwindSafe(|| map.remove(&key(CHURNED))));
+        armed.store(false, Ordering::SeqCst);
+        if result.is_err() {
+            unwound = true;
+            break;
+        }
+    }
+    assert!(unwound);
+    // The refresh, not a rebuild, is what unwound.
+    assert_eq!(map.epoch().generation, generation);
+
+    assert_eq!(map.len() as u64, LIVE);
+    assert!(map.get(&key(CHURNED)).is_none());
+    for id in 0..LIVE {
+        assert_eq!(map.get(&key(id)), Some(&id));
+    }
+
+    // The table keeps working: the next refresh re-records the filter.
+    for _ in 0..=2 * capacity {
+        map.insert(key(CHURNED), CHURNED);
+        assert_eq!(map.remove(&key(CHURNED)), Some(CHURNED));
+    }
+    for id in 0..LIVE {
+        assert_eq!(map.remove(&key(id)), Some(id));
+    }
+    assert!(map.is_empty());
+}
+
+#[test]
 fn caught_hash_panic_during_try_resize_keeps_every_entry() {
     let panic = Arc::new(AtomicBool::new(false));
     let drops = Arc::new(AtomicUsize::new(0));

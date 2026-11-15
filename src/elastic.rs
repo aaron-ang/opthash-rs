@@ -1109,6 +1109,40 @@ unsafe fn reset_metadata(membership: MembershipRegion, base: *mut u8) {
     }
 }
 
+/// Writes a word every key passes and no level is closed in over every word
+/// of `membership`'s tail: the filter then sends each lookup to its walk.
+///
+/// # Safety
+///
+/// `membership` was laid out for the arena at `base`, and its words are
+/// initialized.
+unsafe fn saturate_metadata(membership: MembershipRegion, base: *mut u8) {
+    if membership.words != 0 {
+        // SAFETY: the caller's arena holds the region's words.
+        let words = unsafe { membership.ptr::<MetadataWord>(base) };
+        // SAFETY: as above, the words are initialized, and nothing else
+        // borrows them.
+        let tail = unsafe { core::slice::from_raw_parts_mut(words, membership.words) };
+        tail.fill(MetadataWord {
+            level_bins: [0; 4],
+            membership: u64::MAX,
+        });
+    }
+}
+
+/// Saturates the table's filter when dropped. A filter refresh holds one
+/// while it re-records the live keys and forgets it at the end, so a key
+/// whose hasher unwinds leaves a filter that still passes every live key.
+struct SaturateOnUnwind<'a, K, V, S, A: Allocator + Clone>(&'a mut ElasticTable<K, V, S, A>);
+
+impl<K, V, S, A: Allocator + Clone> Drop for SaturateOnUnwind<'_, K, V, S, A> {
+    fn drop(&mut self) {
+        // SAFETY: `membership` was laid out together with `arena`, and the
+        // refresh cleared its words before it made this guard.
+        unsafe { saturate_metadata(self.0.membership, self.0.arena.as_ptr()) };
+    }
+}
+
 /// First metadata word of `membership`'s tail inside `arena`, or
 /// [`NO_METADATA`] when it has none. Only a tail with words is written to.
 fn metadata_words(arena: &Arena, membership: MembershipRegion) -> *mut MetadataWord {
@@ -2244,24 +2278,29 @@ where
 
     /// Re-record the filter from the live entries, dropping the bits departed
     /// keys left behind. Entries stay put; only the metadata tail is rewritten.
+    /// A key's hasher that unwinds leaves the filter saturated, so every live
+    /// key still passes it.
     #[cold]
     #[inline(never)]
     fn refresh_membership(&mut self) {
         self.epoch.note_deletes(self.stale_membership());
         self.clear_membership();
-        for level_idx in 0..self.levels.len() {
+        let guard = SaturateOnUnwind(self);
+        let table = &mut *guard.0;
+        for level_idx in 0..table.levels.len() {
             let mut scan = OccupiedIndices::new();
-            while let Some(slot_idx) = scan.step(&self.levels[level_idx]) {
+            while let Some(slot_idx) = scan.step(&table.levels[level_idx]) {
                 let hash = {
                     // SAFETY: `step` yields occupied in-bounds slots.
-                    let entry = unsafe { self.levels[level_idx].get_ref(slot_idx) };
-                    self.hash_builder.hash_one(&entry.key)
+                    let entry = unsafe { table.levels[level_idx].get_ref(slot_idx) };
+                    table.hash_builder.hash_one(&entry.key)
                 };
                 let prepared = PreparedElasticKey::new(hash);
-                let summary_bit = self.levels[level_idx].summary_bit;
-                self.record_membership(prepared.route, prepared.membership, summary_bit);
+                let summary_bit = table.levels[level_idx].summary_bit;
+                table.record_membership(prepared.route, prepared.membership, summary_bit);
             }
         }
+        mem::forget(guard);
     }
 
     /// Rebuilds levels at `new_capacity` and moves every live entry across.
