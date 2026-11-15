@@ -411,6 +411,14 @@ impl PreparedProbeRange {
         }
     }
 
+    /// A range with no index, which rejects every word.
+    pub(crate) const fn rejecting() -> Self {
+        Self {
+            upper: 0,
+            rejection_threshold: u64::MAX,
+        }
+    }
+
     pub(crate) fn new(upper: usize) -> Result<Self, RangeReductionError> {
         if upper == 0 {
             return Err(RangeReductionError::ZeroUpperBound);

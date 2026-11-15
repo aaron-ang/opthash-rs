@@ -58,8 +58,9 @@ enum FunnelScanMode {
     Sparse(OccupiedIndices),
 }
 
-/// Ordinary levels a lookup can name by level-bin bit, rounded up to a power
-/// of two so indexing masks instead of bounds-checking.
+/// Entries of [`FunnelShape::head`]: the levels that own a level-bin bit plus
+/// at least one absent entry, rounded up to a power of two so indexing masks
+/// instead of bounds-checking.
 const HEAD_LEVELS: usize = (OVERFLOW_LEVEL + 1).next_power_of_two();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,9 +76,9 @@ struct FunnelShape {
     n: usize,
     max_insertions: usize,
     levels: Box<[LevelShape]>,
-    /// The levels that own a level-bin bit, copied inline so a lookup indexes
-    /// them without the pointer chase or a bounds check. Entries past the
-    /// last level have no buckets.
+    /// The levels that own a level-bin bit, copied inline so the hot paths
+    /// index them without the pointer chase or a bounds check. Every other
+    /// entry, the last one always among them, is [`LevelShape::ABSENT`].
     head: [LevelShape; HEAD_LEVELS],
     beta: usize,
     loglog_ceiling: usize,
@@ -96,9 +97,10 @@ struct FunnelShape {
 }
 
 impl LevelShape {
+    /// A level with no buckets, which rejects every probe word.
     const ABSENT: Self = Self {
         offset: 0,
-        bucket_range: PreparedProbeRange::empty(),
+        bucket_range: PreparedProbeRange::rejecting(),
         multiplier: 0,
     };
 }
@@ -188,7 +190,7 @@ impl FunnelShape {
         let loglog_ceiling =
             u8::try_from(plan.loglog_ceiling()).map_err(|_| TryReserveError::CapacityOverflow)?;
         let mut head = [LevelShape::ABSENT; HEAD_LEVELS];
-        for (slot, level) in head.iter_mut().zip(&levels) {
+        for (slot, level) in head.iter_mut().zip(levels.iter().take(OVERFLOW_LEVEL)) {
             *slot = *level;
         }
         Ok(Self {
@@ -1489,6 +1491,41 @@ where
         })
     }
 
+    /// [`Self::search_vacancy`] for a table without tombstones, over the levels
+    /// that own a level-bin bit: the first EMPTY lane of the walk, which is
+    /// then its first free slot. `None` hands the insert to the general walk:
+    /// a rejected probe word, a bucket wider than one group, or no vacancy in
+    /// those levels.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn first_empty_in_head(&self, probe: PreparedFastFunnelProbe) -> Option<Vacancy> {
+        let lanes = self.shape.bucket_lanes;
+        if lanes == 0 {
+            return None;
+        }
+        let ctrl_ptr = self.storage.ctrl_ptr();
+        let mut index = 0;
+        // The head's last entry is always absent and accepts no word, so the
+        // walk ends there at the latest.
+        loop {
+            let level = self.shape.head_level(index);
+            let bucket =
+                probe::ordinary_funnel_first_index(probe, level.multiplier, level.bucket_range)?;
+            let start = level.offset + bucket * self.shape.beta;
+            // SAFETY: an ordinary bucket ends at or before `n`, and the control
+            // array pads `GROUP_SIZE - 1` bytes past `n`.
+            let empty = unsafe { simd::eq_mask_group(ctrl_ptr.add(start), CTRL_EMPTY) }.0 & lanes;
+            if empty != 0 {
+                debug_assert!((index as usize) < OVERFLOW_LEVEL);
+                return Some(Vacancy {
+                    slot: start + (empty.trailing_zeros() / BITMASK_STRIDE) as usize,
+                    level_bit: 1 << index,
+                });
+            }
+            index += 1;
+        }
+    }
+
     /// Special-array leg of [`Self::search_vacancy`]: primary probes, then the
     /// two fallback buckets, in the exact search's order. Returns the bare
     /// slot: every special slot shares the overflow bit, and a slot alone
@@ -1793,6 +1830,45 @@ where
             // SAFETY: the caller's contract is `get_ref`'s.
             entry: unsafe { self.storage.get_ref(slot) },
         }
+    }
+
+    /// The whole insert: duplicate search behind the filter gate, growth, then
+    /// placement with its recovery paths. Out of line so the common insert in
+    /// [`map::TableBackend::insert`] keeps no frame.
+    #[inline(never)]
+    fn insert_general(&mut self, key: K, value: V, hash: u64) -> Option<V> {
+        // Same gate as a lookup: a key the filter never recorded is absent, so
+        // the duplicate search and the exceptional full scan are skipped and
+        // only the placement walk runs.
+        let mut membership = self.membership_slot(hash);
+        let gate = self.membership_gate_at(membership);
+        let probe = self.prf.prepare(hash);
+        let fingerprint = control::control_fingerprint(hash);
+        let mut exact = None;
+        if gate.passes() {
+            let search = self.search_exact_prepared_for_insert(&key, probe, fingerprint);
+            if let SearchResult::Hit(slot) = search {
+                return Some(map::TableBackend::replace_value(self, slot, value));
+            }
+            if self.exceptional_placement
+                && let Some(slot) = self.find_by_full_scan(&key, fingerprint)
+            {
+                return Some(map::TableBackend::replace_value(self, slot, value));
+            }
+            exact = Some(search);
+        }
+        let vacancy = if self.prepare_vacant_insert() {
+            // Growth rebuilt the arena and its filter; both the search and the
+            // filter slot from before it are stale.
+            membership = self.membership_slot(hash);
+            self.search_vacancy(probe)
+        } else if let Some(exact) = exact {
+            self.vacancy_of(exact)
+        } else {
+            self.search_vacancy(probe)
+        };
+        self.place_absent_after_search(key, value, hash, membership, vacancy);
+        None
     }
 
     /// Entry-side lookup, which keeps the exact walk's vacancy for the insert
@@ -2242,42 +2318,37 @@ where
         self.place_absent_after_search(key, value, vacant.hash, membership, vacancy)
     }
 
+    #[inline]
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
     where
         K: Hash + Eq,
     {
-        // Same gate as a lookup: a key the filter never recorded is absent, so
-        // the duplicate search and the exceptional full scan are skipped and
-        // only the placement walk runs.
-        let mut membership = self.membership_slot(hash);
-        let gate = self.membership_gate_at(membership);
-        let probe = self.prf.prepare(hash);
-        let fingerprint = control::control_fingerprint(hash);
-        let mut exact = None;
-        if gate.passes() {
-            let search = self.search_exact_prepared_for_insert(&key, probe, fingerprint);
-            if let SearchResult::Hit(slot) = search {
-                return Some(self.replace_value(slot, value));
+        // A key the filter never recorded is absent, so it needs no duplicate
+        // search, and a table without tombstones takes it at the first EMPTY
+        // lane of the placement walk. That common insert calls nothing and
+        // keeps no frame; every other case is the general insert's.
+        let membership = self.membership_slot(hash);
+        if !self.membership_gate_at(membership).passes()
+            && self.tombstones == 0
+            && self.len < self.shape.max_insertions
+            && let Some(vacancy) = self.first_empty_in_head(self.prf.prepare(hash))
+        {
+            let key_fingerprint = control::control_fingerprint(hash);
+            // SAFETY: the vacancy is an EMPTY lane of an ordinary bucket, and
+            // `key_fingerprint` is an occupied control.
+            unsafe {
+                self.storage.write_with_control(
+                    vacancy.slot,
+                    SlotEntry { key, value },
+                    key_fingerprint,
+                );
             }
-            if self.exceptional_placement
-                && let Some(slot) = self.find_by_full_scan(&key, fingerprint)
-            {
-                return Some(self.replace_value(slot, value));
-            }
-            exact = Some(search);
+            debug_assert_eq!(vacancy.level_bit, self.level_bit(vacancy.slot));
+            self.record_membership(membership, vacancy.level_bit);
+            self.len += 1;
+            return None;
         }
-        let vacancy = if self.prepare_vacant_insert() {
-            // Growth rebuilt the arena and its filter; both the search and the
-            // filter slot from before it are stale.
-            membership = self.membership_slot(hash);
-            self.search_vacancy(probe)
-        } else if let Some(exact) = exact {
-            self.vacancy_of(exact)
-        } else {
-            self.search_vacancy(probe)
-        };
-        self.place_absent_after_search(key, value, hash, membership, vacancy);
-        None
+        self.insert_general(key, value, hash)
     }
 
     fn remove(&mut self, slot: usize) -> (K, V) {
