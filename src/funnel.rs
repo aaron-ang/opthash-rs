@@ -419,6 +419,52 @@ struct Vacancy {
     level_bit: u16,
 }
 
+/// A live entry and the slot that holds it. Lookups return both, so a caller
+/// that wants the entry need not re-derive its address from the slot.
+struct Found<'a, K, V> {
+    slot: usize,
+    entry: &'a SlotEntry<K, V>,
+}
+
+impl<K, V> Clone for Found<'_, K, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<K, V> Copy for Found<'_, K, V> {}
+
+/// The part of a [`Found`] a lookup's caller wants. The out-of-line lookup is
+/// instantiated per projection, so each returns one word and the hand-off to
+/// the ordered walk stays a tail call.
+trait FoundPart<'a, K, V> {
+    type Part;
+
+    fn of(found: Found<'a, K, V>) -> Self::Part;
+}
+
+struct FoundSlot;
+
+impl<'a, K, V> FoundPart<'a, K, V> for FoundSlot {
+    type Part = usize;
+
+    #[inline]
+    fn of(found: Found<'a, K, V>) -> usize {
+        found.slot
+    }
+}
+
+struct FoundEntry;
+
+impl<'a, K: 'a, V: 'a> FoundPart<'a, K, V> for FoundEntry {
+    type Part = &'a SlotEntry<K, V>;
+
+    #[inline]
+    fn of(found: Found<'a, K, V>) -> &'a SlotEntry<K, V> {
+        found.entry
+    }
+}
+
 /// A known-absent search, retained only while the entry borrows its map.
 #[derive(Debug)]
 pub struct FunnelVacant {
@@ -1155,9 +1201,8 @@ where
         &self,
         key: &Q,
         key_hash: u64,
-        key_fingerprint: u8,
         levels: u16,
-    ) -> Result<Option<usize>, ()>
+    ) -> Result<Option<Found<'_, K, V>>, ()>
     where
         Q: Equivalent<K> + ?Sized,
     {
@@ -1165,6 +1210,7 @@ where
         if lanes == 0 {
             return Err(());
         }
+        let key_fingerprint = control::control_fingerprint(key_hash);
         let probe = self.prf.prepare(key_hash);
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
@@ -1182,11 +1228,11 @@ where
                 unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), key_fingerprint) };
             (start, matches.0 & lanes)
         };
-        let holds_key = |slot: usize| -> bool {
+        let holding_key = |slot: usize| -> Option<Found<'_, K, V>> {
             // SAFETY: a matched lane lies inside its bucket and carries the
             // fingerprint, so the slot is in bounds and occupied.
-            let entry = unsafe { self.storage.get_ref(slot) };
-            key.equivalent(&entry.key)
+            let found = unsafe { self.found_at(slot) };
+            key.equivalent(&found.entry.key).then_some(found)
         };
         let recorded = levels & !OVERFLOW_LEVEL_BIT;
         let mut pending = recorded;
@@ -1213,8 +1259,8 @@ where
             };
             if matches != 0 {
                 let slot = start + (matches.trailing_zeros() / BITMASK_STRIDE) as usize;
-                if holds_key(slot) {
-                    return Ok(Some(slot));
+                if let Some(found) = holding_key(slot) {
+                    return Ok(Some(found));
                 }
                 // Another key shares the fingerprint. Start over, comparing
                 // every match of every recorded level.
@@ -1226,8 +1272,8 @@ where
             pending &= pending - 1;
             for lane in BitMask(matches) {
                 let slot = start + lane;
-                if holds_key(slot) {
-                    return Ok(Some(slot));
+                if let Some(found) = holding_key(slot) {
+                    return Ok(Some(found));
                 }
             }
         }
@@ -1622,17 +1668,27 @@ where
     ///
     /// Only the filter test is inline: the walk keeps many registers live, and
     /// LLVM saves them all ahead of the test, so filter-rejected misses would
-    /// pay for a walk they never run.
+    /// pay for a walk they never run. The fingerprint is derived past the
+    /// gate for the same reason.
     #[inline]
-    fn find_location<Q>(&self, key: &Q, key_hash: u64, key_fingerprint: u8) -> Option<usize>
+    fn find_live<'a, Q, P>(&'a self, key: &Q, key_hash: u64) -> Option<P::Part>
     where
         Q: Equivalent<K> + ?Sized,
+        P: FoundPart<'a, K, V>,
     {
         let gate = self.membership_gate(key_hash);
         if !gate.passes() {
             return None;
         }
-        self.find_location_after_gate(key, key_hash, key_fingerprint, gate.levels)
+        self.find_after_gate::<Q, P>(key, key_hash, gate.levels)
+    }
+
+    #[inline]
+    fn find_location<Q>(&self, key: &Q, key_hash: u64) -> Option<usize>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        self.find_live::<Q, FoundSlot>(key, key_hash)
     }
 
     /// Out of line so a filter-rejected miss pays for no probe preparation.
@@ -1640,40 +1696,53 @@ where
     /// here and the lookups this function answers itself can skip the
     /// register saves.
     #[inline(never)]
-    fn find_location_after_gate<Q>(
-        &self,
-        key: &Q,
-        key_hash: u64,
-        key_fingerprint: u8,
-        levels: u16,
-    ) -> Option<usize>
+    fn find_after_gate<'a, Q, P>(&'a self, key: &Q, key_hash: u64, levels: u16) -> Option<P::Part>
     where
         Q: Equivalent<K> + ?Sized,
+        P: FoundPart<'a, K, V>,
     {
-        match self.lookup_first_matches(key, key_hash, key_fingerprint, levels) {
-            Ok(found) => found,
-            Err(()) => self.find_location_by_walk(key, key_hash, key_fingerprint, levels),
+        match self.lookup_first_matches(key, key_hash, levels) {
+            Ok(found) => found.map(P::of),
+            Err(()) => self.find_by_walk::<Q, P>(key, key_hash, levels),
         }
     }
 
     /// Probe preparation stays next to the walk so the prepared probe never
     /// crosses a call boundary.
     #[inline(never)]
-    fn find_location_by_walk<Q>(
-        &self,
-        key: &Q,
-        key_hash: u64,
-        key_fingerprint: u8,
-        levels: u16,
-    ) -> Option<usize>
+    fn find_by_walk<'a, Q, P>(&'a self, key: &Q, key_hash: u64, levels: u16) -> Option<P::Part>
+    where
+        Q: Equivalent<K> + ?Sized,
+        P: FoundPart<'a, K, V>,
+    {
+        let slot = self.find_location_by_walk(key, key_hash, levels)?;
+        // SAFETY: the walk returns only occupied in-bounds slots.
+        Some(P::of(unsafe { self.found_at(slot) }))
+    }
+
+    #[inline]
+    fn find_location_by_walk<Q>(&self, key: &Q, key_hash: u64, levels: u16) -> Option<usize>
     where
         Q: Equivalent<K> + ?Sized,
     {
+        let key_fingerprint = control::control_fingerprint(key_hash);
         let probe = self.prf.prepare(key_hash);
         match self.lookup_recorded_levels(key, probe, key_fingerprint, levels) {
             Some(slot) => Some(slot),
             None if self.exceptional_placement => self.find_by_full_scan(key, key_fingerprint),
             None => None,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `slot` is in bounds and occupied.
+    #[inline]
+    unsafe fn found_at(&self, slot: usize) -> Found<'_, K, V> {
+        Found {
+            slot,
+            // SAFETY: the caller's contract is `get_ref`'s.
+            entry: unsafe { self.storage.get_ref(slot) },
         }
     }
 
@@ -1709,18 +1778,12 @@ where
         }
     }
 
-    fn find_entry_ref<'a, Q>(
-        &'a self,
-        key: &Q,
-        key_hash: u64,
-        key_fingerprint: u8,
-    ) -> Option<&'a SlotEntry<K, V>>
+    #[inline]
+    fn find_entry_ref<'a, Q>(&'a self, key: &Q, key_hash: u64) -> Option<&'a SlotEntry<K, V>>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let slot = self.find_location(key, key_hash, key_fingerprint)?;
-        // SAFETY: `find_location` returns only occupied in-bounds slots.
-        Some(unsafe { self.storage.get_ref(slot) })
+        self.find_live::<Q, FoundEntry>(key, key_hash)
     }
 
     /// Only an exhausted placement walk reaches this scan.
@@ -2080,7 +2143,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_location(key, hash, control::control_fingerprint(hash))
+        self.find_location(key, hash)
     }
 
     #[inline]
@@ -2088,7 +2151,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_entry_ref(key, hash, control::control_fingerprint(hash))
+        self.find_entry_ref(key, hash)
     }
 
     #[inline]

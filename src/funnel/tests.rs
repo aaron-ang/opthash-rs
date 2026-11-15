@@ -131,8 +131,8 @@ fn entry_search_checks_exceptional_hits_before_reusing_vacancy() {
     let inserted = table.insert_for_vacant(99, 8, vacant);
     assert_eq!(VACANCY_WALKS.with(Cell::get), 0);
     assert_eq!(exact, SearchResult::Vacant(inserted));
-    assert_eq!(table.find_location(&99, key, fingerprint), Some(inserted));
-    assert_eq!(table.find_location(&key, key, fingerprint), Some(slot));
+    assert_eq!(table.find_location(&99, key), Some(inserted));
+    assert_eq!(table.find_location(&key, key), Some(slot));
 }
 
 #[test]
@@ -187,10 +187,7 @@ fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement(
         EpochTransition::PlacementRecovery
     );
     assert_eq!(table.len, old_len + 1);
-    assert_eq!(
-        table.find_location(&absent, hash, fingerprint),
-        Some(inserted)
-    );
+    assert_eq!(table.find_location(&absent, hash), Some(inserted));
 }
 
 fn raw_table(n: usize, d: u32) -> FunnelTable<u64, u64, IdentityBuildHasher> {
@@ -348,8 +345,7 @@ fn vacancy_walk_matches_exact_search_for_absent_keys() {
 
     for key in (0..live).step_by(3) {
         let hash = table.hash_builder.hash_one(key);
-        let fingerprint = control::control_fingerprint(hash);
-        let slot = table.find_location(&key, hash, fingerprint).unwrap();
+        let slot = table.find_location(&key, hash).unwrap();
         map::TableBackend::remove(&mut table, slot);
     }
     assert!(table.tombstones > 0);
@@ -394,8 +390,7 @@ fn lookup_walk_matches_exact_search_hits() {
 
     for key in (0..live).step_by(3) {
         let hash = table.hash_builder.hash_one(key);
-        let fingerprint = control::control_fingerprint(hash);
-        let slot = table.find_location(&key, hash, fingerprint).unwrap();
+        let slot = table.find_location(&key, hash).unwrap();
         map::TableBackend::remove(&mut table, slot);
     }
     assert!(table.tombstones > 0);
@@ -444,8 +439,7 @@ fn gated_insert_skips_the_duplicate_walk_only_for_unrecorded_keys() {
     assert_eq!(table.len, 64);
     for key in 0..64_u64 {
         let hash = table.hash_builder.hash_one(key);
-        let fingerprint = control::control_fingerprint(hash);
-        let slot = table.find_location(&key, hash, fingerprint).unwrap();
+        let slot = table.find_location(&key, hash).unwrap();
         // SAFETY: `find_location` returns occupied in-bounds slots.
         assert_eq!(unsafe { table.storage.get_ref(slot) }.value, key + 1);
     }
@@ -540,19 +534,14 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
                 ),
                 None
             );
-            let actual = table
-                .find_location(&identity, identity, control::control_fingerprint(identity))
-                .unwrap();
+            let actual = table.find_location(&identity, identity).unwrap();
             assert_eq!(actual, expected.global_slot(), "n={n} key={identity}");
             locations.push((
                 identity,
                 actual,
                 table.storage.checked_slot_ptr(actual) as usize,
             ));
-            assert_eq!(
-                table.find_location(&identity, identity, control::control_fingerprint(identity),),
-                Some(actual)
-            );
+            assert_eq!(table.find_location(&identity, identity), Some(actual));
         }
         assert_eq!(table.len, scalar.len());
         assert_eq!(scalar.locations().count(), locations.len());
@@ -567,7 +556,7 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
         }
         for &(identity, location, pointer) in &locations {
             assert_eq!(
-                table.find_location(&identity, identity, control::control_fingerprint(identity),),
+                table.find_location(&identity, identity),
                 Some(location),
                 "moved n={n} key={identity}"
             );
@@ -587,19 +576,12 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
         );
         assert_eq!(table.len, len);
         assert_eq!(
-            table.find_location(
-                &duplicate,
-                duplicate,
-                control::control_fingerprint(duplicate),
-            ),
+            table.find_location(&duplicate, duplicate),
             Some(locations[duplicate as usize].1)
         );
 
         let absent = config.max_insertions() as u64 + 1_000_000;
-        assert_eq!(
-            table.find_location(&absent, absent, control::control_fingerprint(absent)),
-            None
-        );
+        assert_eq!(table.find_location(&absent, absent), None);
     }
 }
 
@@ -752,11 +734,7 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
     );
 
     occupy(&mut table, second_bucket_slot_one, identity, fingerprint);
-    let direct = core::ptr::from_ref(
-        table
-            .find_entry_ref(&identity, identity, fingerprint)
-            .unwrap(),
-    );
+    let direct = core::ptr::from_ref(table.find_entry_ref(&identity, identity).unwrap());
     assert_eq!(
         direct,
         table
@@ -778,7 +756,7 @@ fn membership_filter_records_every_inserted_key() {
             "inserted key {key} must pass its own filter"
         );
         assert_eq!(
-            table.find_location(&key, key, control::control_fingerprint(key)),
+            table.find_location(&key, key),
             Some(
                 table
                     .find_by_full_scan(&key, control::control_fingerprint(key))
@@ -807,15 +785,13 @@ fn membership_filter_keeps_survivors_after_removals() {
     }
     for key in (0..200_u64).step_by(2) {
         let slot = table
-            .find_location(&key, key, control::control_fingerprint(key))
+            .find_location(&key, key)
             .expect("inserted key is present");
         <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::remove(&mut table, slot);
     }
     for key in (1..200_u64).step_by(2) {
         assert!(
-            table
-                .find_location(&key, key, control::control_fingerprint(key))
-                .is_some(),
+            table.find_location(&key, key).is_some(),
             "removals must not clear the filter bits of surviving key {key}"
         );
     }
@@ -838,9 +814,7 @@ fn membership_filter_survives_growth_and_clone() {
             "growth must rebuild the filter for key {probe}"
         );
         assert!(
-            cloned
-                .find_location(&probe, probe, control::control_fingerprint(probe))
-                .is_some(),
+            cloned.find_location(&probe, probe).is_some(),
             "clone must carry the filter for key {probe}"
         );
     }
@@ -911,7 +885,7 @@ fn assert_level_masks_cover_live(table: &FunnelTable<u64, u64, IdentityBuildHash
             "slot {slot} lost its level bit"
         );
         assert_eq!(
-            table.find_location(&key, hash, control::control_fingerprint(hash)),
+            table.find_location(&key, hash),
             Some(slot),
             "masked lookup missed slot {slot}"
         );
@@ -941,15 +915,12 @@ fn level_masks_never_lose_a_live_key() {
     // walk early never turns into a false hit.
     for i in live..live + 4_096 {
         let key = spread(i);
-        let fingerprint = control::control_fingerprint(key);
-        assert_eq!(table.find_location(&key, key, fingerprint), None);
+        assert_eq!(table.find_location(&key, key), None);
     }
 
     for i in (0..live).step_by(3) {
         let key = spread(i);
-        let slot = table
-            .find_location(&key, key, control::control_fingerprint(key))
-            .unwrap();
+        let slot = table.find_location(&key, key).unwrap();
         table.remove(slot);
     }
     assert_level_masks_cover_live(&table);
@@ -962,8 +933,7 @@ fn level_masks_never_lose_a_live_key() {
     assert_level_masks_cover_live(&table);
     for i in (0..live).filter(|i| i % 3 != 0) {
         let key = spread(i);
-        let fingerprint = control::control_fingerprint(key);
-        let slot = table.find_location(&key, key, fingerprint).unwrap();
+        let slot = table.find_location(&key, key).unwrap();
         // SAFETY: `find_location` returns occupied in-bounds slots.
         assert_eq!(unsafe { table.storage.get_ref(slot) }.value, i);
     }
@@ -996,20 +966,13 @@ fn tombstones_never_hide_survivors_and_are_reused() {
     for key in 0..200_u64 {
         table.insert_for_vacant_entry(key, key, key);
     }
-    let removed = table
-        .find_location(&7, 7, control::control_fingerprint(7))
-        .unwrap();
+    let removed = table.find_location(&7, 7).unwrap();
     let (key, value) =
         <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::remove(&mut table, removed);
     assert_eq!((key, value), (7, 7));
     for key in 0..200_u64 {
         if key != 7 {
-            assert!(
-                table
-                    .find_location(&key, key, control::control_fingerprint(key))
-                    .is_some(),
-                "lost key {key}"
-            );
+            assert!(table.find_location(&key, key).is_some(), "lost key {key}");
         }
     }
     let tombstones = table.tombstones;
@@ -1033,10 +996,7 @@ fn tombstone_before_a_duplicate_does_not_hide_the_duplicate() {
     );
     assert_eq!(table.len, 1);
     assert_eq!(table.tombstones, 1);
-    assert_eq!(
-        table.find_location(&200, 42, control::control_fingerprint(42)),
-        Some(second)
-    );
+    assert_eq!(table.find_location(&200, 42), Some(second));
 
     let reused = table.insert_for_vacant_entry(300, 3, 42);
     assert_eq!(reused, first);
@@ -1235,14 +1195,7 @@ fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
     }
     let arena_bytes = table.arena.layout_size();
     let locations: Vec<_> = (0..32_u64)
-        .map(|key| {
-            (
-                key,
-                table
-                    .find_location(&key, key, control::control_fingerprint(key))
-                    .unwrap(),
-            )
-        })
+        .map(|key| (key, table.find_location(&key, key).unwrap()))
         .collect();
     let next = FunnelShape::for_insert_budget(512, reserve).unwrap();
     fail.store(true, Ordering::SeqCst);
@@ -1254,10 +1207,7 @@ fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
     assert_eq!(table.shape.n, 144);
     assert_eq!(table.arena.layout_size(), arena_bytes);
     for (key, location) in locations {
-        assert_eq!(
-            table.find_location(&key, key, control::control_fingerprint(key)),
-            Some(location)
-        );
+        assert_eq!(table.find_location(&key, key), Some(location));
     }
 
     fail.store(false, Ordering::SeqCst);
@@ -1566,26 +1516,27 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
             }
             for index in (0..inserted).step_by(3) {
                 let key = key_of(index);
-                let slot = table
-                    .find_location(&key, key, control::control_fingerprint(key))
-                    .unwrap();
+                let slot = table.find_location(&key, key).unwrap();
                 map::TableBackend::remove(&mut table, slot);
             }
             let wide = table.shape.beta > GROUP_SIZE;
             let (mut answered, mut handed_off) = (0_usize, 0_usize);
             for index in 0..2 * inserted {
                 let key = key_of(index);
-                let fingerprint = control::control_fingerprint(key);
                 let gate = table.membership_gate(key);
                 if !gate.passes() {
                     continue;
                 }
-                let walk = table.find_location_by_walk(&key, key, fingerprint, gate.levels);
+                let walk = table.find_location_by_walk(&key, key, gate.levels);
                 let live = index < inserted && index % 3 != 0;
                 assert_eq!(walk.is_some(), live, "n {n} d {d} index {index}");
-                match table.lookup_first_matches(&key, key, fingerprint, gate.levels) {
+                match table.lookup_first_matches(&key, key, gate.levels) {
                     Ok(found) => {
-                        assert_eq!(found, walk, "n {n} d {d} index {index}");
+                        assert_eq!(
+                            found.map(|found| found.slot),
+                            walk,
+                            "n {n} d {d} index {index}"
+                        );
                         answered += 1;
                     }
                     Err(()) => handed_off += 1,
