@@ -1292,7 +1292,7 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
         })
         .unwrap();
     let fingerprint = control::control_fingerprint(identity);
-    let dummy_fingerprint = if fingerprint == 1 { 2 } else { 1 };
+    let dummy_fingerprint = fingerprint ^ 1;
 
     for level_index in 0..table.shape.levels.len() {
         let level = table.shape.levels[level_index];

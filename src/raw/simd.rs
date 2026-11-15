@@ -13,7 +13,6 @@ mod neon {
     use core::arch::aarch64;
 
     use super::BitMask;
-    use crate::raw::control::FINGERPRINT_MASK;
 
     /// Collapses an 8-lane compare into its `BitMask` bit pattern.
     #[inline]
@@ -39,8 +38,8 @@ mod neon {
         // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         unsafe {
             let bytes = aarch64::vld1_u8(ptr);
-            let masked = aarch64::vand_u8(bytes, aarch64::vdup_n_u8(FINGERPRINT_MASK));
-            lane_mask(aarch64::vceq_u8(masked, aarch64::vdup_n_u8(0)))
+            // `OCCUPIED_BIT` is the sign bit of each lane.
+            lane_mask(aarch64::vcgez_s8(aarch64::vreinterpret_s8_u8(bytes)))
         }
     }
 
@@ -51,34 +50,31 @@ mod neon {
         // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         unsafe {
             let bytes = aarch64::vld1_u8(ptr);
-            lane_mask(aarch64::vtst_u8(
-                bytes,
-                aarch64::vdup_n_u8(FINGERPRINT_MASK),
-            ))
+            lane_mask(aarch64::vcltz_s8(aarch64::vreinterpret_s8_u8(bytes)))
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
+        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE, OCCUPIED_BIT};
 
         #[test]
         fn eight_lane_masks_preserve_control_order() {
             let controls = [
                 CTRL_EMPTY,
                 CTRL_TOMBSTONE,
-                1,
-                7,
+                OCCUPIED_BIT,
+                OCCUPIED_BIT | 7,
                 CTRL_EMPTY,
-                7,
+                OCCUPIED_BIT | 7,
                 CTRL_TOMBSTONE,
-                2,
+                u8::MAX,
             ];
 
             // SAFETY: `controls` holds exactly one 8-byte group.
             let matches: alloc::vec::Vec<_> =
-                unsafe { eq_mask_group(controls.as_ptr(), 7) }.collect();
+                unsafe { eq_mask_group(controls.as_ptr(), OCCUPIED_BIT | 7) }.collect();
             // SAFETY: as above.
             let free: alloc::vec::Vec<_> = unsafe { free_mask_group(controls.as_ptr()) }.collect();
             // SAFETY: as above.
@@ -101,17 +97,17 @@ mod sse2 {
     use core::arch::x86_64::{self, __m128i};
 
     use super::BitMask;
-    use crate::raw::control::FINGERPRINT_MASK;
 
-    /// Loads a 16-byte control group with only the fingerprint bits kept.
+    /// One bit per lane, set where the control byte carries `OCCUPIED_BIT`
+    /// (the sign bit `movemask` extracts).
     #[inline]
     #[must_use]
-    unsafe fn load_fingerprints(ptr: *const u8) -> __m128i {
+    unsafe fn occupied_bits(ptr: *const u8) -> u32 {
         // SAFETY: SSE2 is baseline on x86_64; caller guarantees 16 readable
         // bytes and `loadu` has no alignment requirement.
         unsafe {
             let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
-            x86_64::_mm_and_si128(data, x86_64::_mm_set1_epi8(FINGERPRINT_MASK.cast_signed()))
+            x86_64::_mm_movemask_epi8(data).cast_unsigned() & 0xFFFF
         }
     }
 
@@ -139,22 +135,16 @@ mod sse2 {
     #[inline]
     #[must_use]
     pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
-        // SAFETY: SSE2 is baseline on x86_64; caller guarantees 16 readable bytes.
-        unsafe {
-            let masked = load_fingerprints(ptr);
-            lane_mask(x86_64::_mm_cmpeq_epi8(masked, x86_64::_mm_setzero_si128()))
-        }
+        // SAFETY: caller guarantees 16 readable bytes.
+        BitMask(u64::from(unsafe { occupied_bits(ptr) } ^ 0xFFFF))
     }
 
     /// Bitmask of occupied slots; padding and tombstones are excluded.
     #[inline]
     #[must_use]
     pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
-        // SAFETY: SSE2 is baseline on x86_64; caller guarantees 16 readable bytes.
-        unsafe {
-            let masked = load_fingerprints(ptr);
-            lane_mask(x86_64::_mm_cmpgt_epi8(masked, x86_64::_mm_setzero_si128()))
-        }
+        // SAFETY: caller guarantees 16 readable bytes.
+        BitMask(u64::from(unsafe { occupied_bits(ptr) }))
     }
 }
 
@@ -182,8 +172,8 @@ mod swar {
         raw.to_le()
     }
 
-    /// 0x80 in each lane equal to `target`. Exact: matching `CTRL_EMPTY` (0x00) never
-    /// flags a tombstone (0x80) or an occupied byte.
+    /// 0x80 in each lane equal to `target`. Exact: matching `CTRL_EMPTY` never
+    /// flags a tombstone or an occupied byte.
     #[inline]
     fn eq_mask(word: u64, target: u8) -> u64 {
         let cmp = word ^ (u64::from(target).wrapping_mul(ONES));
@@ -191,10 +181,10 @@ mod swar {
         ne ^ HI
     }
 
-    /// 0x80 in each occupied lane (fingerprint bits nonzero).
+    /// 0x80 in each occupied lane (`OCCUPIED_BIT` set).
     #[inline]
     fn occupied_mask(word: u64) -> u64 {
-        ((word & LO7).wrapping_add(LO7)) & HI
+        word & HI
     }
 
     /// 0x80 in each EMPTY|TOMBSTONE lane.
@@ -228,7 +218,7 @@ mod swar {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE, FINGERPRINT_MASK};
+        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE, OCCUPIED_BIT};
 
         fn word(bytes: [u8; 8]) -> u64 {
             u64::from_le_bytes(bytes)
@@ -247,7 +237,7 @@ mod swar {
         fn ref_occupied(bytes: [u8; 8]) -> u64 {
             let mut m = 0u64;
             for (i, &b) in bytes.iter().enumerate() {
-                if b & FINGERPRINT_MASK != 0 {
+                if b & OCCUPIED_BIT != 0 {
                     m |= 0x80u64 << (8 * i);
                 }
             }
@@ -312,7 +302,7 @@ mod swar {
             assert_eq!(free_mask(word([CTRL_TOMBSTONE; 8])), HI);
             assert_eq!(occupied_mask(word([CTRL_EMPTY; 8])), 0);
             assert_eq!(occupied_mask(word([CTRL_TOMBSTONE; 8])), 0);
-            for fp in 1..=FINGERPRINT_MASK {
+            for fp in OCCUPIED_BIT..=u8::MAX {
                 assert_eq!(occupied_mask(word([fp; 8])), HI, "fp {fp:#04x}");
                 assert_eq!(free_mask(word([fp; 8])), 0, "fp {fp:#04x}");
             }
@@ -321,9 +311,9 @@ mod swar {
         #[test]
         fn no_cross_byte_borrow() {
             // A lone occupied byte among empties flags exactly its own lane.
-            let bytes = [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            let bytes = [0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
             assert_eq!(occupied_mask(word(bytes)), 0x80u64 << 8);
-            assert_eq!(eq_mask(word(bytes), 0x01), 0x80u64 << 8);
+            assert_eq!(eq_mask(word(bytes), 0x81), 0x80u64 << 8);
             // Ascending distinct bytes: eq to byte i flags only lane i.
             let asc = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
             for (i, &b) in asc.iter().enumerate() {

@@ -1,10 +1,10 @@
 /// Empty-slot sentinel control byte.
 pub(crate) const CTRL_EMPTY: u8 = 0;
-/// Tombstone sentinel; high bit set distinguishes a deleted slot from occupied.
-pub(crate) const CTRL_TOMBSTONE: u8 = 0x80;
-/// Low 7 bits hold the fingerprint; high bit distinguishes occupied (0) from
-/// the tombstone sentinel (`CTRL_TOMBSTONE`).
-pub(crate) const FINGERPRINT_MASK: u8 = 0x7F;
+/// Tombstone sentinel; like `CTRL_EMPTY` it leaves `OCCUPIED_BIT` clear.
+pub(crate) const CTRL_TOMBSTONE: u8 = 0x01;
+/// Set on every occupied control byte and on neither sentinel, so a group
+/// scan tells live slots from free ones by the sign bit alone.
+pub(crate) const OCCUPIED_BIT: u8 = 0x80;
 /// Shift that pulls the 7 high bits of a 64-bit hash into bits [6:0].
 const FINGERPRINT_SHIFT: u32 = 57;
 
@@ -12,22 +12,24 @@ const FINGERPRINT_SHIFT: u32 = 57;
 #[inline]
 #[must_use]
 pub(crate) fn is_occupied(byte: u8) -> bool {
-    (byte & FINGERPRINT_MASK) != 0
+    byte & OCCUPIED_BIT != 0
 }
 
 /// True for `CTRL_EMPTY` and `CTRL_TOMBSTONE`: the slot holds no live entry.
 #[inline]
 #[must_use]
 pub(crate) fn is_free(byte: u8) -> bool {
-    (byte & FINGERPRINT_MASK) == 0
+    byte & OCCUPIED_BIT == 0
 }
 
+/// Occupied control byte for `hash`: its top seven bits under `OCCUPIED_BIT`.
 #[inline]
 #[must_use]
 pub(crate) fn control_fingerprint(hash: u64) -> u8 {
-    // Masked to 7 bits, so `try_from` cannot fail; `.max(1)` keeps it off `CTRL_EMPTY`.
-    let masked = (hash >> FINGERPRINT_SHIFT) & u64::from(FINGERPRINT_MASK);
-    u8::try_from(masked).unwrap_or(0).max(1)
+    // Seven bits remain after the shift, so the narrowing cast keeps them all.
+    #[allow(clippy::cast_possible_truncation)]
+    let fingerprint = (hash >> FINGERPRINT_SHIFT) as u8;
+    fingerprint | OCCUPIED_BIT
 }
 
 #[cfg(test)]
@@ -35,31 +37,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_fingerprint_never_zero_and_in_range() {
-        // The `.max(1)` guarantees a non-zero fingerprint even for a zero hash,
-        // so an occupied slot never collides with the EMPTY sentinel.
-        assert_eq!(control_fingerprint(0), 1);
-        // Bit 63 of the hash lands in bit 6 of the fingerprint.
-        assert_eq!(control_fingerprint(1 << 63), 64);
-        for hash in [0u64, 1, 42, u64::MAX, 0x8000_0000_0000_0000, 12_345_678] {
-            let fp = control_fingerprint(hash);
-            assert!(
-                (1..=FINGERPRINT_MASK).contains(&fp),
-                "fp {fp} out of [1,127]"
-            );
-        }
+    fn control_fingerprint_is_occupied_and_keeps_the_top_hash_bits() {
+        assert_eq!(control_fingerprint(0), OCCUPIED_BIT);
+        assert_eq!(control_fingerprint(u64::MAX), u8::MAX);
+        // Bit 63 of the hash lands in bit 6 of the control byte.
+        assert_eq!(control_fingerprint(1 << 63), OCCUPIED_BIT | 0x40);
+        assert_eq!(control_fingerprint(1 << 57), OCCUPIED_BIT | 0x01);
+        // Bits below the shift do not reach the control byte.
+        assert_eq!(control_fingerprint((1 << 57) - 1), OCCUPIED_BIT);
     }
 
     #[test]
     fn control_byte_occupied_vs_free() {
-        assert!(is_free(CTRL_EMPTY));
-        assert!(!is_occupied(CTRL_EMPTY));
-        // Tombstone's fingerprint bits are zero: free, not occupied.
-        assert!(is_free(CTRL_TOMBSTONE));
-        assert!(!is_occupied(CTRL_TOMBSTONE));
-        for fp in 1..=FINGERPRINT_MASK {
-            assert!(is_occupied(fp), "fp byte {fp} should read occupied");
-            assert!(!is_free(fp));
+        for sentinel in [CTRL_EMPTY, CTRL_TOMBSTONE] {
+            assert!(is_free(sentinel));
+            assert!(!is_occupied(sentinel));
+        }
+        for byte in OCCUPIED_BIT..=u8::MAX {
+            assert!(is_occupied(byte), "byte {byte:#04x} should read occupied");
+            assert!(!is_free(byte));
         }
     }
 }
