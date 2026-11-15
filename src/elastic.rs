@@ -665,7 +665,7 @@ pub(crate) struct BatchScheduler {
     batch_start: usize,
     /// `batch_ends[current_batch_index]`, or `usize::MAX` for an empty plan.
     batch_end: usize,
-    /// Live count below which [`ElasticTable::settled_slot`] can place: the
+    /// Live count below which [`ElasticTable::settled_level_slot`] can place: the
     /// table's insertion limit, or zero where [`settled_limit()`] rules a
     /// settled insert out.
     settled_limit: usize,
@@ -1246,11 +1246,7 @@ where
         self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control)
     }
 
-    /// The slot [`Self::choose_slot_for_new_key`] gives a new key, when the
-    /// table needs no growth, the cached batch is current, its levels reduce
-    /// by shift, and the batch's first choice of level has a free slot among
-    /// its scheduled probes. `None` leaves the insert to
-    /// [`Self::insert_for_vacant_entry_prepared`].
+    /// [`Self::settled_level_slot`] with the level by index.
     #[cfg(test)]
     fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize, u8)> {
         let (region, slot, control) = self.settled_level_slot(probe)?;
@@ -1259,8 +1255,13 @@ where
         Some((level, slot, control))
     }
 
-    /// [`Self::settled_slot`] with the level by address, so a caller that
-    /// writes the slot does not index the levels again.
+    /// The slot [`Self::choose_slot_for_new_key`] gives a new key, when the
+    /// table needs no growth, the cached batch is current, its levels reduce
+    /// by shift, and the batch's first choice of level has a free slot among
+    /// its scheduled probes. `None` leaves the insert to
+    /// [`Self::insert_for_vacant_entry_prepared`]. The level comes by
+    /// address, so a caller that writes the slot does not index the levels
+    /// again.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn settled_level_slot(
@@ -2386,8 +2387,8 @@ where
         self.find_after_filter(key, prepared.route, key_fingerprint, filter, on_hit)
     }
 
-    /// The lookup of a key that passed `filter`. Out of line so the filter
-    /// test inlines alone.
+    /// The lookup of a key that passed `filter`: the schedule walk, then the
+    /// general schedule for a walk that ends unresolved.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn find_after_filter<'a, Q, R>(
@@ -2457,7 +2458,8 @@ where
     }
 
     /// Walks the candidates of a key that passed `filter` in schedule order
-    /// and hands `on_hit` the level, slot and entry that holds the key. A
+    /// and hands `on_hit` the level and slot that hold the key and the
+    /// entry's offset for [`ProbeSchedule::entry_at`]. A
     /// table that needs the general reduction has routes that probe
     /// nothing, so its walk ends unresolved.
     #[allow(clippy::inline_always)]
