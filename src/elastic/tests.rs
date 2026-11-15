@@ -2819,3 +2819,77 @@ fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
         assert_eq!(reopened != 0, shifted);
     }
 }
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn schedule_lookup_agrees_past_the_summary_width() {
+    const SAMPLE_STRIDE: u64 = 4_099;
+    const DEEP_MISS_STRIDE: u64 = 61;
+    // A thin reserve lets the fill reach the levels that share the
+    // summary's last bit, and the ones past it.
+    let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            1 << 18,
+            ReserveFraction::from_exponent(17).unwrap(),
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+    assert!(table.levels.len() > ROUTE_SUMMARY_LEVELS);
+    let budget = table.max_insertions as u64;
+    for key in 0..budget {
+        let hash = table.hash_builder.hash_one(key);
+        assert_eq!(table.insert(key, key, hash), None);
+    }
+    assert!(table.probe_schedule.addresses(&table.levels));
+    // Otherwise every lookup below is the full scan.
+    assert_eq!(table.probe_high_water & HIGH_WATER_FLAGS, 0);
+
+    let saturated = ROUTE_SUMMARY_LEVELS - 1;
+    let mut saturated_hits = 0;
+    let mut hits_past_the_summary = 0;
+    let mut deep_walked_misses = 0;
+    let mut shallow_walked_misses = 0;
+    let mut filtered_misses = 0;
+    for key in 0..2 * budget {
+        let hash = table.hash_builder.hash_one(key);
+        let prepared = PreparedElasticKey::new(hash);
+        let fingerprint = control::control_fingerprint(hash);
+        let scheduled = table.find_slot_indices_prepared(&key, prepared, fingerprint);
+        assert_eq!(scheduled.is_some(), key < budget, "key {key}");
+        let filter = table.route_filter(prepared);
+        let mask = filter.expanded_level_mask(prepared.route);
+        let deep_open = filter.maybe_present && mask >> saturated != 0;
+        if filter.maybe_present {
+            let walked = table.find_by_general_schedule(
+                &key,
+                prepared.route,
+                mask,
+                fingerprint,
+                |level, slot, _| (level, slot),
+            );
+            assert_eq!(scheduled, walked, "key {key}");
+        }
+        let deep_hit = scheduled.is_some_and(|(level, _)| level >= saturated);
+        if let Some((level, _)) = scheduled {
+            assert_ne!(mask & (1 << level), 0, "key {key} level {level}");
+            saturated_hits += usize::from(level == saturated);
+            hits_past_the_summary += usize::from(level > saturated);
+        } else if deep_open {
+            deep_walked_misses += 1;
+        } else if filter.maybe_present {
+            shallow_walked_misses += 1;
+        } else {
+            filtered_misses += 1;
+        }
+        // The scan reads every slot, so it runs on the deep hits and a
+        // sample of the rest.
+        if deep_hit || key % SAMPLE_STRIDE == 0 || (deep_open && key % DEEP_MISS_STRIDE == 0) {
+            let scanned =
+                table.find_by_full_scan(&key, fingerprint, |level, slot, _| (level, slot));
+            assert_eq!(scheduled, scanned, "key {key}");
+        }
+    }
+    assert!(saturated_hits > 0 && hits_past_the_summary > 0);
+    assert!(deep_walked_misses > 0 && shallow_walked_misses > 0 && filtered_misses > 0);
+}
