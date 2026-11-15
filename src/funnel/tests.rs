@@ -951,20 +951,16 @@ fn recorded_head_yields_the_entry_of_every_recorded_level_shallowest_first() {
     assert_eq!(level_bit_of(usize::MAX), OVERFLOW_LEVEL_BIT);
 }
 
-/// A shape without lanes gives lookups no lanes either, so none scans its
-/// buckets for first matches, and it keeps an all-absent head, which ends
-/// the insert's head walk at once. A shape with lanes copies its levels into
-/// the head and flags the lookups of a table small enough to select.
+/// A shape without lanes matches nothing in a first-match scan, and it keeps
+/// an all-absent head, which ends the insert's head walk at once. A shape
+/// with lanes copies its levels into the head.
 #[test]
 fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     let (wide, smallest_wide) = smallest_wide_shape();
     let wide_reserve = ReserveFraction::from_exponent(wide).unwrap();
-    let past_select_limit =
-        FunnelShape::for_insert_budget(2 * SELECT_MAX_SLOTS, wide_reserve).unwrap();
-    assert!(past_select_limit.n > SELECT_MAX_SLOTS);
-    for shape in [FunnelShape::empty(), smallest_wide, past_select_limit] {
+    let large_wide = FunnelShape::for_insert_budget(1 << 19, wide_reserve).unwrap();
+    for shape in [FunnelShape::empty(), smallest_wide, large_wide] {
         assert_eq!(shape.bucket_lanes, 0, "n {}", shape.n);
-        assert_eq!(shape.lookup_lanes, 0, "n {}", shape.n);
         assert_eq!(
             shape.head,
             [LevelShape::ABSENT; HEAD_LEVELS],
@@ -974,17 +970,9 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     }
 
     let narrow_reserve = ReserveFraction::from_exponent(3).unwrap();
-    for (budget, selects) in [(1, true), (2 * SELECT_MAX_SLOTS, false)] {
+    for budget in [1, 1 << 19] {
         let shape = FunnelShape::for_insert_budget(budget, narrow_reserve).unwrap();
         assert_eq!(shape.bucket_lanes.count_ones() as usize, shape.beta);
-        assert_eq!(shape.bucket_lanes & LOOKUP_SELECTS, 0);
-        let flag = if selects { LOOKUP_SELECTS } else { 0 };
-        assert_eq!(
-            shape.lookup_lanes,
-            shape.bucket_lanes | flag,
-            "n {}",
-            shape.n
-        );
         let recorded = shape.levels.len().min(OVERFLOW_LEVEL);
         assert_eq!(shape.head[..recorded], shape.levels[..recorded]);
         assert!(
@@ -2158,8 +2146,8 @@ fn large_reserve_exponent_sizes_without_scanning_every_slot_count() {
 }
 
 /// Whatever the first-match lookup answers itself, the ordered walk answers
-/// the same; every other lookup is handed to that walk. Covers table sizes on
-/// both sides of the select limit, shared fingerprints, deletes, absent keys,
+/// the same; every other lookup is handed to that walk. Covers small and
+/// large tables, shared fingerprints, deletes, absent keys,
 /// and a bucket wider than one group.
 #[test]
 #[cfg_attr(miri, ignore = "walks hundreds of thousands of lookups twice")]
@@ -2168,18 +2156,13 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
     let feasible = |n: &usize, d: u32| {
         FunnelShape::from_slots(*n, ReserveFraction::from_exponent(d).unwrap()).is_ok()
     };
-    let mut shapes: Vec<(usize, u32)> = [(600, 3), (6_000, 3), (6_000, 4), (60_000, 9)]
+    let shapes: Vec<(usize, u32)> = [(600, 3), (6_000, 3), (6_000, 4), (60_000, 9), (300_000, 3)]
         .into_iter()
         .map(|(at_least, d)| {
             let n = (at_least..2 * at_least).find(|n| feasible(n, d));
             (n.unwrap(), d)
         })
         .collect();
-    // The last table that selects between two levels and the first that
-    // branches on each.
-    let selecting = (1..=SELECT_MAX_SLOTS).rev().find(|n| feasible(n, 3));
-    let branching = (SELECT_MAX_SLOTS + 1..2 * SELECT_MAX_SLOTS).find(|n| feasible(n, 3));
-    shapes.extend([(selecting.unwrap(), 3), (branching.unwrap(), 3)]);
     for (n, d) in shapes {
         for shared_fingerprint in [false, true] {
             let mut table = raw_table(n, d);

@@ -38,12 +38,6 @@ const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
 /// added to the key hash ahead of the fold, so a reseed translates every hash
 /// by this step.
 const FUNNEL_RESEED_STEP: u64 = probe::WYHASH_DEFAULT_SECRET[0];
-/// Largest table whose lookups select between the first two recorded levels
-/// instead of branching on the first. The second scan is a few instructions
-/// while the control bytes, one per slot, stay in a core's private cache; past
-/// that it is one more cache miss per lookup. The bound is a size such caches
-/// commonly hold, not a measured crossover.
-const SELECT_MAX_SLOTS: usize = 1 << 18;
 /// Bits each key sets in its membership-filter word. A lookup whose bits are
 /// not all set skips the probe walk, since the key cannot be present.
 const MEMBERSHIP_BITS: usize = 2;
@@ -86,10 +80,6 @@ struct FunnelShape {
     /// the shape is empty: such a table scans no bucket for first matches.
     bucket_lanes: u64,
     beta: usize,
-    /// [`Self::bucket_lanes`] for lookups, with [`LOOKUP_SELECTS`] set when
-    /// they select between the first two recorded levels; see
-    /// [`SELECT_MAX_SLOTS`]. Next to `beta` so a lookup loads the pair.
-    lookup_lanes: u64,
     n: usize,
     levels: Box<[LevelShape]>,
     loglog_ceiling: usize,
@@ -134,11 +124,6 @@ impl<'a> RecordedHead<'a> {
             head: PhantomData,
         }
     }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.pending == 0
-    }
 }
 
 impl<'a> Iterator for RecordedHead<'a> {
@@ -179,7 +164,6 @@ impl FunnelShape {
             fallback_bucket_width: 0,
             fallback_bucket_range: PreparedProbeRange::empty(),
             bucket_lanes: 0,
-            lookup_lanes: 0,
         }
     }
 
@@ -263,11 +247,6 @@ impl FunnelShape {
             fallback_bucket_range: PreparedProbeRange::new(plan.fallback_bucket_count())
                 .map_err(|_| TryReserveError::CapacityOverflow)?,
             bucket_lanes,
-            lookup_lanes: if bucket_lanes != 0 && n <= SELECT_MAX_SLOTS {
-                bucket_lanes | LOOKUP_SELECTS
-            } else {
-                bucket_lanes
-            },
         })
     }
 
@@ -308,16 +287,6 @@ impl FunnelShape {
         }
     }
 }
-
-/// Bit of [`FunnelShape::lookup_lanes`] that no lane owns.
-const LOOKUP_SELECTS_BIT: u32 = u64::BITS - 1 - BITMASK_SLOT_BIT;
-const LOOKUP_SELECTS: u64 = 1 << LOOKUP_SELECTS_BIT;
-// The stride is one where a group mask holds one bit per slot.
-#[allow(clippy::modulo_one)]
-const _: () = assert!(
-    LOOKUP_SELECTS_BIT % BITMASK_STRIDE != BITMASK_SLOT_BIT
-        || LOOKUP_SELECTS_BIT as usize >= BITMASK_STRIDE as usize * GROUP_SIZE
-);
 
 /// See [`FunnelShape::bucket_lanes`].
 fn bucket_lanes(beta: usize) -> u64 {
@@ -1316,21 +1285,20 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let lookup_lanes = self.shape.lookup_lanes;
+        let lanes = self.shape.bucket_lanes;
         let beta = self.shape.beta;
         let key_fingerprint = probe.fingerprint();
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
-        let scan = |level: &LevelShape, lanes: u64| -> (usize, u64) {
-            debug_assert_ne!(lanes, 0);
+        let scan = |level: &LevelShape| -> (usize, u64) {
             let (bucket, _) =
                 probe::ordinary_funnel_first_draw(probe, level.multiplier, level.bucket_range);
             let start = level.offset + bucket * beta;
             // SAFETY: a first draw is below the level's bucket count whether
             // or not its word is accepted, an ordinary bucket ends at or
             // before `n`, and the control array pads `GROUP_SIZE - 1` bytes
-            // past `n`. A level past the shape's last has no buckets and
-            // draws slot zero, which a shape with lanes has.
+            // past `n`. An absent head entry has no buckets and draws slot
+            // zero, which every shape that recorded a level has.
             let matches =
                 unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), key_fingerprint) };
             (start, matches.0 & lanes)
@@ -1346,56 +1314,19 @@ where
             let found = unsafe { self.found_at(slot) };
             key.equivalent(&found.entry.key).then_some(found)
         };
-        // Compares every match of every level left in a set.
-        let walk = |mut recorded: RecordedHead<'_>, lanes: u64| -> Option<Found<'_, K, V>> {
-            loop {
-                let (start, mut matches) = scan(recorded.next()?, lanes);
-                while matches != 0 {
-                    if let Some(found) = holding_key(start, matches) {
-                        return Some(found);
-                    }
-                    // Another key shares the fingerprint.
-                    rarely_taken();
-                    matches &= matches - 1;
+        // Without lanes no scan matches.
+        for level in RecordedHead::new(&self.shape, levels) {
+            let (start, mut matches) = scan(level);
+            while matches != 0 {
+                if let Some(found) = holding_key(start, matches) {
+                    return Some(found);
                 }
+                // Another key shares the fingerprint.
+                rarely_taken();
+                matches &= matches - 1;
             }
-        };
-        let recorded = RecordedHead::new(&self.shape, levels);
-        if recorded.is_empty() {
-            return None;
         }
-        if lookup_lanes & LOOKUP_SELECTS == 0 {
-            // Without lanes no scan can match, and the head is absent.
-            if lookup_lanes == 0 {
-                return None;
-            }
-            return walk(recorded, lookup_lanes);
-        }
-        let lanes = lookup_lanes & !LOOKUP_SELECTS;
-        // The first two recorded levels are scanned together and the
-        // holder is selected, not branched on: which of them holds the
-        // key is unpredictable.
-        let mut pending = recorded.clone();
-        let first = pending.next()?;
-        let second = pending.next().unwrap_or(first);
-        let (first_start, first_matches) = scan(first, lanes);
-        let (second_start, second_matches) = scan(second, lanes);
-        let in_first = first_matches != 0;
-        let start = if in_first { first_start } else { second_start };
-        let matches = if in_first {
-            first_matches
-        } else {
-            second_matches
-        };
-        if matches != 0 {
-            if let Some(found) = holding_key(start, matches) {
-                return Some(found);
-            }
-            // Another key shares the fingerprint. Start over,
-            // comparing every match of every recorded level.
-            pending = recorded;
-        }
-        walk(pending, lanes)
+        None
     }
 
     /// Whether a lookup [`Self::first_match`] found nothing for is absent.
