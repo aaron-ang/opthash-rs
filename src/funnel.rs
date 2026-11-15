@@ -75,8 +75,8 @@ struct LevelShape {
     offset: usize,
 }
 
-// Declaration order is layout order, so the words every operation reads sit
-// at small offsets and pair up, and the large head array comes last.
+// Declaration order is layout order: the words every operation reads are
+// adjacent at the front, and the large head array comes last.
 #[repr(C)]
 #[derive(Clone, Debug)]
 struct FunnelShape {
@@ -85,7 +85,7 @@ struct FunnelShape {
     beta: usize,
     /// One bit per lane of a bucket, selecting its lanes from a group's
     /// fingerprint matches. Zero when a bucket is wider than one group, or
-    /// the shape is empty: such a table answers no lookup from first matches.
+    /// the shape is empty: such a table scans no bucket for first matches.
     bucket_lanes: u64,
     /// Whether lookups select between the first two recorded levels; see
     /// [`SELECT_MAX_SLOTS`]. Also set for a shape without lanes, whose
@@ -1254,8 +1254,8 @@ where
     /// Lookup over the ordinary levels the key's bin recorded, comparing the
     /// key against each bucket's fingerprint matches. `Ok` is the lookup's
     /// answer. `Err` hands the lookup to the ordered walk: a rejected probe
-    /// word, a bucket wider than one group, or a key that may sit in the
-    /// overflow levels or outside its funnel.
+    /// word, a recorded level whose buckets are wider than one group, or a
+    /// key that may sit in the overflow levels or outside its funnel.
     ///
     /// A level without the fingerprint cannot hold the key, so the walk moves
     /// on without the ordered walk's `EMPTY` test, which only shortens misses
