@@ -873,11 +873,13 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// [`membership::refresh_deletes`].
     stale_membership: usize,
     tombstones: usize,
-    len: usize,
-    /// Entry count below which the head placement may run: the insertion
-    /// limit of a table without tombstones, zero with any. Kept by
-    /// [`Self::sync_head_limit`], so that placement tests one bound.
-    head_limit: usize,
+    /// The entry count plus [`Self::head_left`]; see [`Self::entries`].
+    entries_base: usize,
+    /// Inserts the head placement may still make: the insertion limit less
+    /// the entry count in a table without tombstones, zero with any. Kept by
+    /// [`Self::set_entries`], so that placement tests and counts with one
+    /// word.
+    head_left: usize,
     shape: FunnelShape,
 }
 
@@ -1020,10 +1022,10 @@ where
     ) -> Result<Self, TryReserveError> {
         let (arena, storage, membership) = try_allocate_storage(shape.n, &alloc)?;
         Ok(Self {
-            head_limit: shape.max_insertions,
+            entries_base: shape.max_insertions,
+            head_left: shape.max_insertions,
             shape,
             storage,
-            len: 0,
             tombstones: 0,
             reserve_fraction,
             hash_builder,
@@ -1922,14 +1924,18 @@ where
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn head_vacancy(&self, probe: PreparedFastFunnelProbe, bins: u16) -> Option<HeadVacancy> {
-        debug_assert_eq!(self.head_limit, self.head_limit_now());
-        if self.len >= self.head_limit {
+        debug_assert_eq!(
+            self.head_left,
+            self.head_limit().saturating_sub(self.entries())
+        );
+        if self.head_left == 0 {
             return None;
         }
         self.first_empty_in_head(probe, bins)
     }
 
-    fn head_limit_now(&self) -> usize {
+    /// Entry count below which the head placement may run.
+    fn head_limit(&self) -> usize {
         if self.tombstones == 0 {
             self.shape.max_insertions
         } else {
@@ -1937,10 +1943,16 @@ where
         }
     }
 
-    /// Restores [`Self::head_limit`] after a change to the tombstone count
-    /// or the shape.
-    fn sync_head_limit(&mut self) {
-        self.head_limit = self.head_limit_now();
+    #[inline]
+    fn entries(&self) -> usize {
+        self.entries_base - self.head_left
+    }
+
+    /// Sets the entry count, and with it [`Self::head_left`]. Also restores
+    /// that word after a change to the tombstone count or the shape.
+    fn set_entries(&mut self, entries: usize) {
+        self.head_left = self.head_limit().saturating_sub(entries);
+        self.entries_base = entries + self.head_left;
     }
 
     /// Stores an absent key at the vacancy [`Self::head_vacancy`] reported
@@ -1969,7 +1981,7 @@ where
         // store, which could otherwise force each to be loaded again:
         // the length and the filter word's address here, the word itself
         // by the gate.
-        let len = self.len;
+        let head_left = self.head_left;
         // SAFETY: a vacancy exists only in a table with slots, so its
         // filter has words and `membership.index` is below their count.
         let metadata = unsafe { self.membership_ptr().add(membership.index) };
@@ -1989,7 +2001,7 @@ where
             (*metadata).membership = gate.word | membership.bits;
             (*metadata).level_bins[membership.bin] = vacancy.bins;
         }
-        self.len = len + 1;
+        self.head_left = head_left - 1;
     }
 
     /// The whole insert: duplicate search behind the filter gate, growth, then
@@ -2093,11 +2105,10 @@ where
         }
         debug_assert_eq!(level_bit, self.level_bit(slot), "level bit of slot {slot}");
         self.record_membership(membership, level_bit);
-        self.len += 1;
         if was_tombstone {
             self.tombstones -= 1;
-            self.sync_head_limit();
         }
+        self.set_entries(self.entries() + 1);
         if exceptional {
             self.exceptional_placement = true;
         }
@@ -2117,7 +2128,7 @@ where
     /// Returns `true` when a resize ran, so a search from before it is stale.
     #[inline]
     fn prepare_vacant_insert(&mut self) -> bool {
-        if self.len >= self.shape.max_insertions {
+        if self.entries() >= self.shape.max_insertions {
             self.grow_for_next_insert();
             true
         } else {
@@ -2129,7 +2140,7 @@ where
     #[inline(never)]
     fn grow_for_next_insert(&mut self) {
         let slots = self
-            .next_growth_slots(self.len.saturating_add(1))
+            .next_growth_slots(self.entries().saturating_add(1))
             .expect("capacity overflow");
         self.resize_with_transition(slots, EpochTransition::Growth);
     }
@@ -2293,9 +2304,9 @@ where
     fn swap_generation(&mut self, other: &mut FunnelGeneration<K, V>) {
         mem::swap(&mut self.shape, &mut other.shape);
         mem::swap(&mut self.storage, &mut other.storage);
-        mem::swap(&mut self.len, &mut other.len);
+        let entries = mem::replace(&mut other.len, self.entries());
         mem::swap(&mut self.tombstones, &mut other.tombstones);
-        self.sync_head_limit();
+        self.set_entries(entries);
         mem::swap(&mut self.arena, &mut other.arena);
         mem::swap(
             &mut self.exceptional_placement,
@@ -2380,7 +2391,7 @@ where
 
     #[inline]
     fn len(&self) -> usize {
-        self.len
+        self.entries()
     }
 
     #[inline]
@@ -2399,7 +2410,7 @@ where
     }
 
     fn epoch_snapshot(&self) -> EpochSnapshot {
-        self.epoch.snapshot(self.len)
+        self.epoch.snapshot(self.entries())
     }
 
     #[inline]
@@ -2515,9 +2526,8 @@ where
     fn extract_finish(&mut self, slot: usize) {
         // SAFETY: a live location names an in-bounds slot.
         unsafe { self.storage.mark_tombstone(slot) };
-        self.len -= 1;
         self.tombstones += 1;
-        self.head_limit = 0;
+        self.set_entries(self.entries() - 1);
         self.stale_membership += 1;
         self.epoch.note_delete();
     }
@@ -2532,7 +2542,7 @@ where
             // Dense scans avoid lane extraction for nearly every slot. Only
             // sparse tables amortize masks over enough empty controls; choose
             // once so draining cannot switch modes midway through a group.
-            mode: if self.len <= self.shape.n / 4 {
+            mode: if self.entries() <= self.shape.n / 4 {
                 FunnelScanMode::Sparse(OccupiedIndices::new())
             } else {
                 FunnelScanMode::Dense(0)
@@ -2597,13 +2607,13 @@ where
     }
 
     fn shrink_to(&mut self, min_capacity: usize) {
-        if self.len == 0 && min_capacity == 0 {
+        if self.entries() == 0 && min_capacity == 0 {
             if self.shape.n != 0 {
                 self.resize_with_transition(0, EpochTransition::ExplicitResize);
             }
             return;
         }
-        let requested = self.len.max(min_capacity);
+        let requested = self.entries().max(min_capacity);
         let Ok(shape) = FunnelShape::for_insert_budget(requested, self.reserve_fraction) else {
             panic!("capacity overflow");
         };
@@ -2626,9 +2636,8 @@ where
                 let entry = unsafe { self.storage.take(slot) };
                 // SAFETY: `slot` is in bounds and its value was moved out.
                 unsafe { self.storage.set_control(slot, CTRL_TOMBSTONE) };
-                self.len -= 1;
                 self.tombstones += 1;
-                self.head_limit = 0;
+                self.set_entries(self.entries() - 1);
                 drop(entry);
             }
         }
@@ -2637,9 +2646,8 @@ where
 
     fn wipe_all(&mut self) {
         self.storage.clear_all_controls();
-        self.len = 0;
         self.tombstones = 0;
-        self.sync_head_limit();
+        self.set_entries(0);
         self.finish_clear();
     }
 
@@ -2657,9 +2665,8 @@ where
         )
         .unwrap_or_else(|error| panic!("Funnel clone allocation failed: {error}"));
         cloned.storage.clone_region_from(&self.storage);
-        cloned.len = self.len;
         cloned.tombstones = self.tombstones;
-        cloned.sync_head_limit();
+        cloned.set_entries(self.entries());
         cloned.epoch = self.epoch;
         cloned.exceptional_placement = self.exceptional_placement;
         cloned.prf = self.prf;

@@ -159,16 +159,16 @@ fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement(
     let fingerprint = table.prf.prepare(hash).fingerprint();
     let absent = u64::MAX;
     while let SearchResult::Vacant(_) = table.search_exact_for_insert(&absent, hash, fingerprint) {
-        let key = table.len as u64;
+        let key = table.entries() as u64;
         table.insert_for_vacant_entry(key, key, hash);
-        assert!(table.len < table.shape.max_insertions);
+        assert!(table.entries() < table.shape.max_insertions);
     }
     assert_eq!(
         table.search_exact_for_insert(&absent, hash, fingerprint),
         SearchResult::Full
     );
     let vacant = table.find_for_entry(&absent, hash).err().unwrap();
-    let old_len = table.len;
+    let old_len = table.entries();
     let old_seed = table.prf;
     VACANCY_WALKS.with(|walks| walks.set(0));
     let inserted = table.insert_for_vacant(absent, 99, vacant);
@@ -186,7 +186,7 @@ fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement(
         table.epoch_snapshot().transition,
         EpochTransition::PlacementRecovery
     );
-    assert_eq!(table.len, old_len + 1);
+    assert_eq!(table.entries(), old_len + 1);
     assert_eq!(table.find_location(&absent, hash), Some(inserted));
 }
 
@@ -241,7 +241,7 @@ fn dense_scan_preserves_order_while_removals_make_the_table_sparse() {
     }
     assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
     assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
-    assert_eq!(table.len, 0);
+    assert_eq!(table.entries(), 0);
 }
 
 #[test]
@@ -277,7 +277,7 @@ fn sparse_scan_visits_group_boundaries_and_tail_once_in_slot_order() {
     }
     assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
     assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
-    assert_eq!(table.len, 0);
+    assert_eq!(table.entries(), 0);
 }
 
 #[test]
@@ -349,7 +349,7 @@ fn frameless_insert_places_and_records_like_the_placement_walk() {
                 "n {n} d {d} index {index}"
             );
         }
-        assert_eq!(inline.len, walked.len);
+        assert_eq!(inline.entries(), walked.entries());
         assert_eq!(controls_and_filter(&inline), controls_and_filter(&walked));
         for index in 0..budget {
             let key = index.wrapping_mul(SPREAD);
@@ -362,17 +362,17 @@ fn frameless_insert_places_and_records_like_the_placement_walk() {
                 Some(index + 1)
             );
         }
-        assert_eq!(inline.len, walked.len);
+        assert_eq!(inline.entries(), walked.entries());
         assert_eq!(controls_and_filter(&inline), controls_and_filter(&walked));
         // The budget is spent, so an unrecorded key grows the table first.
         let key = (budget..2 * budget)
             .map(|index| index.wrapping_mul(SPREAD))
             .find(|&key| !inline.membership_gate(key).passes())
             .unwrap();
-        assert_eq!(inline.len, inline.shape.max_insertions);
+        assert_eq!(inline.entries(), inline.shape.max_insertions);
         assert_eq!(map::TableBackend::insert(&mut inline, key, 0, key), None);
         assert!(inline.shape.n > n, "n {n} d {d}");
-        assert!(inline.len <= inline.shape.max_insertions);
+        assert!(inline.entries() <= inline.shape.max_insertions);
     }
 }
 
@@ -537,8 +537,8 @@ fn assert_matches_model(
 ) {
     use crate::map::TableBackend;
 
-    assert_eq!(table.len, model.len());
-    assert!(table.len <= table.shape.max_insertions);
+    assert_eq!(table.entries(), model.len());
+    assert!(table.entries() <= table.shape.max_insertions);
     coverage.wide_buckets |= table.shape.beta > GROUP_SIZE;
     coverage.narrow_buckets |= table.shape.n != 0 && table.shape.beta <= GROUP_SIZE;
     let mut scan = OccupiedIndices::new();
@@ -661,7 +661,7 @@ fn run_differential(
             // The first insert allocates; only a later one meets a spent budget.
             coverage.full_budget_inserts += usize::from(
                 table.shape.max_insertions > 0
-                    && table.len == table.shape.max_insertions
+                    && table.entries() == table.shape.max_insertions
                     && !model.contains_key(&key),
             );
             let previous = model.insert(key, value);
@@ -687,7 +687,7 @@ fn run_differential(
             // A remove adds a tombstone unless it triggered the cleanup.
             coverage.tombstone_cleanups += usize::from(table.tombstones < tombstones);
         }
-        assert!(table.len <= table.shape.max_insertions, "step {step}");
+        assert!(table.entries() <= table.shape.max_insertions, "step {step}");
         // The first allocation is not a growth.
         coverage.growths += usize::from(slots != 0 && table.shape.n > slots);
         coverage.reseeds += usize::from(table.prf != prf);
@@ -851,7 +851,7 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
             model.insert(*key, key.id);
         }
         assert_eq!(table.shape.max_insertions, budget, "d {d}");
-        assert_eq!((table.len, table.tombstones), (budget, 0), "d {d}");
+        assert_eq!((table.entries(), table.tombstones), (budget, 0), "d {d}");
         check(&table, &model);
 
         // Tombstones on the walks, then inserts that reuse some of them.
@@ -1107,7 +1107,7 @@ fn gated_insert_skips_the_duplicate_walk_only_for_unrecorded_keys() {
             Some(key)
         );
     }
-    assert_eq!(table.len, 64);
+    assert_eq!(table.entries(), 64);
     for key in 0..64_u64 {
         let hash = table.hash_builder.hash_one(key);
         let slot = table.find_location(&key, hash).unwrap();
@@ -1214,7 +1214,7 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
             ));
             assert_eq!(table.find_location(&identity, identity), Some(actual));
         }
-        assert_eq!(table.len, scalar.len());
+        assert_eq!(table.entries(), scalar.len());
         assert_eq!(scalar.locations().count(), locations.len());
         for (expected, identity) in scalar.locations() {
             let global_slot = locations[usize::try_from(identity).unwrap()].1;
@@ -1235,7 +1235,7 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
         }
 
         let duplicate = config.max_insertions() as u64 / 2;
-        let len = table.len;
+        let len = table.entries();
         assert_eq!(
             <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::insert(
                 &mut table,
@@ -1245,7 +1245,7 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
             ),
             Some(duplicate ^ 0x55)
         );
-        assert_eq!(table.len, len);
+        assert_eq!(table.entries(), len);
         assert_eq!(
             table.find_location(&duplicate, duplicate),
             Some(locations[duplicate as usize].1)
@@ -1288,7 +1288,7 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
             // Placing a slot directly still owes the filter its record.
             let membership = table.membership_slot(key);
             table.record_membership(membership, table.level_bit(slot));
-            table.len += 1;
+            table.set_entries(table.entries() + 1);
         }
     }
 
@@ -1650,7 +1650,7 @@ fn tombstones_never_hide_survivors_and_are_reused() {
     let replacement = table.insert_for_vacant_entry(10_000, 1, 7);
     assert_eq!(replacement, removed);
     assert_eq!(table.tombstones, tombstones - 1);
-    assert_eq!(table.len, 200);
+    assert_eq!(table.entries(), 200);
 }
 
 #[test]
@@ -1665,7 +1665,7 @@ fn tombstone_before_a_duplicate_does_not_hide_the_duplicate() {
         <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::insert(&mut table, 200, 20, 42,),
         Some(2)
     );
-    assert_eq!(table.len, 1);
+    assert_eq!(table.entries(), 1);
     assert_eq!(table.tombstones, 1);
     assert_eq!(table.find_location(&200, 42), Some(second));
 
@@ -1704,14 +1704,14 @@ fn clear_tombstones_each_slot_before_dropping_its_value() {
         CTRL_TOMBSTONE
     );
     assert_eq!(
-        table.len,
+        table.entries(),
         (0..table.shape.n)
             .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
     );
 
     <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clear(&mut table);
-    assert_eq!(table.len, 0);
+    assert_eq!(table.entries(), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 3);
     // SAFETY: `table` is dropped once and not used afterward.
     unsafe { ManuallyDrop::drop(&mut table) };
@@ -1781,10 +1781,10 @@ fn panicking_hasher_during_resize_keeps_every_entry() {
     }));
     assert!(result.is_err());
     assert_eq!(table.shape.n, 144);
-    assert_eq!(table.len, 3);
+    assert_eq!(table.entries(), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert_eq!(
-        table.len,
+        table.entries(),
         (0..table.shape.n)
             .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
@@ -1818,7 +1818,7 @@ fn panicking_hasher_during_resize_keeps_every_entry() {
         None
     );
     assert_eq!(
-        table.len,
+        table.entries(),
         (0..table.shape.n)
             .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
@@ -1874,7 +1874,7 @@ fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
         map::TableBackend::try_resize(&mut table, next.n),
         Err(TryReserveError::AllocError)
     );
-    assert_eq!(table.len, 32);
+    assert_eq!(table.entries(), 32);
     assert_eq!(table.shape.n, 144);
     assert_eq!(table.arena.layout_size(), arena_bytes);
     for (key, location) in locations {
