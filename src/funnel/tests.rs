@@ -907,11 +907,12 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
     }
 }
 
-/// A shape without lanes selects, so no lookup scans its buckets for first
-/// matches, and it keeps an all-absent head, which ends the insert's head
-/// walk at once. A shape with lanes copies its levels into the head.
+/// A shape without lanes gives lookups no lanes either, so none scans its
+/// buckets for first matches, and it keeps an all-absent head, which ends
+/// the insert's head walk at once. A shape with lanes copies its levels into
+/// the head and flags the lookups of a table small enough to select.
 #[test]
-fn lane_less_shapes_select_and_keep_an_absent_head() {
+fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     let (wide, smallest_wide) = smallest_wide_shape();
     let wide_reserve = ReserveFraction::from_exponent(wide).unwrap();
     let past_select_limit =
@@ -919,7 +920,7 @@ fn lane_less_shapes_select_and_keep_an_absent_head() {
     assert!(past_select_limit.n > SELECT_MAX_SLOTS);
     for shape in [FunnelShape::empty(), smallest_wide, past_select_limit] {
         assert_eq!(shape.bucket_lanes, 0, "n {}", shape.n);
-        assert!(shape.selects, "n {}", shape.n);
+        assert_eq!(shape.lookup_lanes, 0, "n {}", shape.n);
         assert_eq!(
             shape.head,
             [LevelShape::ABSENT; HEAD_LEVELS],
@@ -932,7 +933,14 @@ fn lane_less_shapes_select_and_keep_an_absent_head() {
     for (budget, selects) in [(1, true), (2 * SELECT_MAX_SLOTS, false)] {
         let shape = FunnelShape::for_insert_budget(budget, narrow_reserve).unwrap();
         assert_eq!(shape.bucket_lanes.count_ones() as usize, shape.beta);
-        assert_eq!(shape.selects, selects, "n {}", shape.n);
+        assert_eq!(shape.bucket_lanes & LOOKUP_SELECTS, 0);
+        let flag = if selects { LOOKUP_SELECTS } else { 0 };
+        assert_eq!(
+            shape.lookup_lanes,
+            shape.bucket_lanes | flag,
+            "n {}",
+            shape.n
+        );
         let recorded = shape.levels.len().min(OVERFLOW_LEVEL);
         assert_eq!(shape.head[..recorded], shape.levels[..recorded]);
         assert!(

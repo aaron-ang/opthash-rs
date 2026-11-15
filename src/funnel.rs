@@ -81,17 +81,16 @@ struct LevelShape {
 #[derive(Clone, Debug)]
 struct FunnelShape {
     max_insertions: usize,
-    n: usize,
-    beta: usize,
     /// One bit per lane of a bucket, selecting its lanes from a group's
     /// fingerprint matches. Zero when a bucket is wider than one group, or
     /// the shape is empty: such a table scans no bucket for first matches.
     bucket_lanes: u64,
-    /// Whether lookups select between the first two recorded levels; see
-    /// [`SELECT_MAX_SLOTS`]. Also set for a shape without lanes, whose
-    /// lookups test for that on the selecting side, so the level walk of a
-    /// large table never does.
-    selects: bool,
+    beta: usize,
+    /// [`Self::bucket_lanes`] for lookups, with [`LOOKUP_SELECTS`] set when
+    /// they select between the first two recorded levels; see
+    /// [`SELECT_MAX_SLOTS`]. Next to `beta` so a lookup loads the pair.
+    lookup_lanes: u64,
+    n: usize,
     levels: Box<[LevelShape]>,
     loglog_ceiling: usize,
     primary_offset: usize,
@@ -136,7 +135,7 @@ impl FunnelShape {
             fallback_bucket_width: 0,
             fallback_bucket_range: PreparedProbeRange::empty(),
             bucket_lanes: 0,
-            selects: true,
+            lookup_lanes: 0,
         }
     }
 
@@ -220,7 +219,11 @@ impl FunnelShape {
             fallback_bucket_range: PreparedProbeRange::new(plan.fallback_bucket_count())
                 .map_err(|_| TryReserveError::CapacityOverflow)?,
             bucket_lanes,
-            selects: bucket_lanes == 0 || n <= SELECT_MAX_SLOTS,
+            lookup_lanes: if bucket_lanes != 0 && n <= SELECT_MAX_SLOTS {
+                bucket_lanes | LOOKUP_SELECTS
+            } else {
+                bucket_lanes
+            },
         })
     }
 
@@ -261,6 +264,16 @@ impl FunnelShape {
         }
     }
 }
+
+/// Bit of [`FunnelShape::lookup_lanes`] that no lane owns.
+const LOOKUP_SELECTS_BIT: u32 = u64::BITS - 1 - BITMASK_SLOT_BIT;
+const LOOKUP_SELECTS: u64 = 1 << LOOKUP_SELECTS_BIT;
+// The stride is one where a group mask holds one bit per slot.
+#[allow(clippy::modulo_one)]
+const _: () = assert!(
+    LOOKUP_SELECTS_BIT % BITMASK_STRIDE != BITMASK_SLOT_BIT
+        || LOOKUP_SELECTS_BIT as usize >= BITMASK_STRIDE as usize * GROUP_SIZE
+);
 
 /// See [`FunnelShape::bucket_lanes`].
 fn bucket_lanes(beta: usize) -> u64 {
@@ -1225,12 +1238,12 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let lanes = self.shape.bucket_lanes;
+        let lookup_lanes = self.shape.lookup_lanes;
         let beta = self.shape.beta;
         let key_fingerprint = probe.fingerprint();
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
-        let scan = |level: u32| -> (usize, u64) {
+        let scan = |level: u32, lanes: u64| -> (usize, u64) {
             debug_assert_ne!(lanes, 0);
             let level = self.shape.head_level(level);
             let (bucket, _) =
@@ -1259,9 +1272,9 @@ where
         // Widened so clearing the lowest set bit also tests for an empty set.
         let recorded = u32::from(levels & !OVERFLOW_LEVEL_BIT);
         // Compares every match of every level in a non-empty set.
-        let walk = |mut pending: u32| -> Option<Found<'_, K, V>> {
+        let walk = |mut pending: u32, lanes: u64| -> Option<Found<'_, K, V>> {
             loop {
-                let (start, matches) = scan(pending.trailing_zeros());
+                let (start, matches) = scan(pending.trailing_zeros(), lanes);
                 let mut matches = matches;
                 while matches != 0 {
                     if let Some(found) = holding_key(start, matches) {
@@ -1278,12 +1291,14 @@ where
         if recorded == 0 {
             return None;
         }
-        if !self.shape.selects {
-            return walk(recorded);
+        if lookup_lanes & LOOKUP_SELECTS == 0 {
+            // Without lanes no scan can match, and the head is absent.
+            if lookup_lanes == 0 {
+                return None;
+            }
+            return walk(recorded, lookup_lanes);
         }
-        if lanes == 0 {
-            return None;
-        }
+        let lanes = lookup_lanes & !LOOKUP_SELECTS;
         // The first two recorded levels are scanned together and the
         // holder is selected, not branched on: which of them holds the
         // key is unpredictable.
@@ -1296,8 +1311,8 @@ where
             pending.trailing_zeros()
         };
         pending &= pending.wrapping_sub(1);
-        let (first_start, first_matches) = scan(first);
-        let (second_start, second_matches) = scan(second);
+        let (first_start, first_matches) = scan(first, lanes);
+        let (second_start, second_matches) = scan(second, lanes);
         let in_first = first_matches != 0;
         let start = if in_first { first_start } else { second_start };
         let matches = if in_first {
@@ -1313,7 +1328,11 @@ where
             // comparing every match of every recorded level.
             pending = recorded;
         }
-        if pending == 0 { None } else { walk(pending) }
+        if pending == 0 {
+            None
+        } else {
+            walk(pending, lanes)
+        }
     }
 
     /// Whether a lookup [`Self::first_match`] found nothing for is absent.
