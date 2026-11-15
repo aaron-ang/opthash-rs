@@ -54,10 +54,11 @@ enum FunnelScanMode {
     Sparse(OccupiedIndices),
 }
 
-/// Entries of [`FunnelShape::head`]: one per level that owns a level-bin bit,
-/// then absent entries up to the one that the leading zeros of an empty
-/// recorded set index.
-const HEAD_ENTRIES: usize = u32::BITS as usize + 1;
+/// Leading zeros of a level bin widened to a word, ahead of its top bit.
+const BIN_LEAD: usize = (u32::BITS - u16::BITS) as usize;
+/// Entries of [`FunnelShape::head`]: one per level-bin bit, then one for the
+/// leading zeros of an empty bin.
+const HEAD_ENTRIES: usize = u16::BITS as usize + 1;
 
 // Declaration order is layout order: a draw reads the multiplier with the
 // bucket count, and a tested draw the threshold with the offset.
@@ -91,7 +92,7 @@ struct FunnelShape {
     fallback_bucket_range: PreparedProbeRange,
     /// The levels that own a level-bin bit, copied inline so the hot paths
     /// index them without the pointer chase or a bounds check. Every other
-    /// entry, the last one always among them, is [`LevelShape::ABSENT`], and
+    /// entry, the last two always among them, is [`LevelShape::ABSENT`], and
     /// so is every entry of a shape without [`Self::bucket_lanes`].
     head: [LevelShape; HEAD_ENTRIES],
 }
@@ -369,17 +370,17 @@ impl<T> arena::RegionSet for FlatStorage<T> {
 }
 
 /// Level-bin bit shared by every ordinary level from this index on and by both
-/// special arrays: the top bit. Shallower levels each own a bit below it,
+/// special arrays: the lowest bit. Shallower levels each own a bit above it,
 /// level zero the highest, so the leading zeros of a bin count up to its
 /// shallowest recorded level.
 const OVERFLOW_LEVEL: usize = u16::BITS as usize - 1;
-const OVERFLOW_LEVEL_BIT: u16 = 1 << OVERFLOW_LEVEL;
+const OVERFLOW_LEVEL_BIT: u16 = 1;
 
 /// Level-bin bit of ordinary level `level`.
 #[inline]
 fn level_bit_of(level: usize) -> u16 {
     if level < OVERFLOW_LEVEL {
-        (OVERFLOW_LEVEL_BIT >> 1) >> level
+        (1 << OVERFLOW_LEVEL) >> level
     } else {
         OVERFLOW_LEVEL_BIT
     }
@@ -393,8 +394,7 @@ const SHALLOWEST_LEVEL: u32 = 1 << (u32::BITS - 1);
 /// shallowest level.
 #[inline]
 fn recorded_head_levels(levels: u16) -> u32 {
-    // One place past the top half, which shifts the overflow bit out.
-    u32::from(levels) << (u32::BITS - u16::BITS + 1)
+    u32::from(levels & !OVERFLOW_LEVEL_BIT) << (u32::BITS - u16::BITS)
 }
 
 /// Level bin of a key. Bits 6 and 7 of the hash: disjoint from both membership
@@ -1281,7 +1281,7 @@ where
         &self,
         key: &Q,
         probe: PreparedFastFunnelProbe,
-        levels: u16,
+        levels: u32,
     ) -> Option<Found<'_, K, V>>
     where
         Q: Equivalent<K> + ?Sized,
@@ -1315,22 +1315,30 @@ where
             let found = unsafe { self.found_at(slot) };
             key.equivalent(&found.entry.key).then_some(found)
         };
-        // The walk tests for the end after a scan, not before one. An empty
-        // set scans the head's last entry, which is absent and so matches
-        // nothing, as does every scan of a shape without lanes.
         // A passed gate means a recorded key, so the table has slots.
         debug_assert_ne!(self.shape.n, 0);
-        let mut pending = recorded_head_levels(levels);
-        let mut entry = self.shape.head.as_ptr();
+        debug_assert!(u16::try_from(levels).is_ok());
+        // The bin is walked as it is, in the low half of the word: its
+        // leading zeros are `BIN_LEAD` more than the index of the shallowest
+        // level, so the walk starts that many entries ahead of the head. Two
+        // sets reach an absent entry, which matches nothing, as every scan of
+        // a shape without lanes does: the overflow bit stands where the level
+        // past the last recorded one would, and an empty set, which the walk
+        // tests for after a scan and not before one, has a whole word of
+        // leading zeros.
+        let mut pending = levels;
+        let mut entry = self.shape.head.as_ptr().wrapping_sub(BIN_LEAD);
         loop {
             let distance = pending.leading_zeros();
-            // SAFETY: as in `RecordedHead::next`, except that an empty set
-            // has `u32::BITS` leading zeros and is stepped only from the
-            // head's first entry, to its entry at that index.
-            entry = unsafe { entry.add(distance as usize) };
-            // An empty set shifts by its whole width, which wraps to none.
+            entry = entry.wrapping_add(distance as usize);
+            // The scanned level's bit moves to the top and is cleared, so
+            // the rest keep their distances from its entry. An empty set
+            // shifts by its whole width, which wraps to none.
             pending = pending.wrapping_shl(distance) & !SHALLOWEST_LEVEL;
-            // SAFETY: as above; the head outlives the borrow of `self`.
+            // SAFETY: the distances stepped so far add up to `BIN_LEAD` plus
+            // the index of a set bit, which is below `u16::BITS`, or to
+            // `u32::BITS` for an empty set. Either way the entry is one of
+            // the head's `HEAD_ENTRIES`, which outlive the borrow of `self`.
             let (start, mut matches) = scan(unsafe { &*entry });
             while matches != 0 {
                 if let Some(found) = holding_key(start, matches) {
@@ -1809,7 +1817,7 @@ where
         if !gate.passes() {
             return None;
         }
-        self.find_after_gate::<Q, P>(key, key_hash, gate.levels)
+        self.find_after_gate::<Q, P>(key, key_hash, u32::from(gate.levels))
     }
 
     #[inline]
@@ -1822,34 +1830,39 @@ where
 
     /// Out of line so a filter-rejected miss pays for no probe preparation.
     /// A lookup that finds its key returns from here without a frame.
+    ///
+    /// Takes the level bin at register width, as the gate's load left it, so
+    /// the walk does not widen it again.
     #[inline(never)]
-    fn find_after_gate<'a, Q, P>(&'a self, key: &Q, key_hash: u64, levels: u16) -> Option<P::Part>
+    fn find_after_gate<'a, Q, P>(&'a self, key: &Q, key_hash: u64, levels: u32) -> Option<P::Part>
     where
         Q: Equivalent<K> + ?Sized,
         P: FoundPart<'a, K, V>,
     {
+        debug_assert!(u16::try_from(levels).is_ok());
         let probe = self.prf.prepare(key_hash);
         match self.first_match(key, probe, levels) {
             Some(found) => Some(P::of(found)),
-            None => self.find_unmatched::<Q, P>(key, key_hash, levels, probe),
+            None => self.find_unmatched::<Q, P>(key, key_hash, probe),
         }
     }
 
     /// Out of line so the first-match scan keeps none of its state for the
-    /// lookup that found nothing. The ordered walk sits in tail position, so
-    /// its call needs no frame here.
+    /// lookup that found nothing, not even the level bin, which is loaded
+    /// again here. The ordered walk sits in tail position, so its call needs
+    /// no frame here.
     #[inline(never)]
     fn find_unmatched<'a, Q, P>(
         &'a self,
         key: &Q,
         key_hash: u64,
-        levels: u16,
         probe: PreparedFastFunnelProbe,
     ) -> Option<P::Part>
     where
         Q: Equivalent<K> + ?Sized,
         P: FoundPart<'a, K, V>,
     {
+        let levels = self.membership_gate(key_hash).levels;
         if self.unmatched_is_absent(probe, levels) {
             None
         } else {
@@ -1971,7 +1984,8 @@ where
         let mut membership = self.membership_slot(hash);
         let gate = self.membership_gate_at(membership);
         if gate.passes() {
-            if let Some(slot) = self.find_after_gate::<K, FoundSlot>(&key, hash, gate.levels) {
+            let found = self.find_after_gate::<K, FoundSlot>(&key, hash, u32::from(gate.levels));
+            if let Some(slot) = found {
                 return Some(map::TableBackend::replace_value(self, slot, value));
             }
             let probe = self.prf.prepare(hash);
