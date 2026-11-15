@@ -597,3 +597,66 @@ fn fingerprints_stay_spread_within_a_bucket_for_unmixed_key_families() {
         }
     }
 }
+
+/// The bound-only acceptance answers with the exact draw's bucket whenever it
+/// answers, and leaves to the exact test every rejected word, the accepted
+/// words at or below the bound, and every word of a range with no index.
+#[test]
+fn certain_first_index_agrees_with_the_exact_draw_whenever_it_answers() {
+    // Inverse of an odd word modulo 2^64, by Newton's iteration.
+    fn inverse(odd: u64) -> u64 {
+        let mut inverse = odd;
+        for _ in 0..6 {
+            inverse = inverse.wrapping_mul(2_u64.wrapping_sub(odd.wrapping_mul(inverse)));
+        }
+        assert_eq!(odd.wrapping_mul(inverse), 1);
+        inverse
+    }
+    let multiplier = FunnelPrf::ordinary_multiplier(3).unwrap();
+    // A probe whose first word in the level is `word`.
+    let probe_drawing = |word: u64| PreparedFastFunnelProbe {
+        keyed: 0,
+        key_out: word.wrapping_mul(inverse(multiplier)),
+    };
+    let (mut certain_count, mut deferred_accepted, mut deferred_rejected) = (0, 0, 0);
+    for upper in [1_usize, 2, 3, 7, 1_000, (1 << 20) + 1, (1 << 31) - 1] {
+        let range = PreparedProbeRange::new(upper).unwrap();
+        let bound = upper as u64;
+        // Words whose low product lands on, just above, and just below the
+        // bound and the threshold, then words spread over the whole range.
+        let near = (0..=4).flat_map(|quotient: u64| {
+            // Words wrap, so the first word past each multiple of 2^64 does too.
+            #[allow(clippy::cast_possible_truncation)]
+            let wrap = (u128::from(quotient) << 64).div_ceil(u128::from(bound)) as u64;
+            (0..=4).flat_map(move |step| [wrap.wrapping_add(step), wrap.wrapping_sub(step)])
+        });
+        let spread = (0..4_096_u64).map(|index| index.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        for word in near.chain(spread) {
+            let probe = probe_drawing(word);
+            let (bucket, accepted) = ordinary_funnel_first_draw(probe, multiplier, range);
+            match ordinary_funnel_first_certain_index(probe, multiplier, range) {
+                Some(certain) => {
+                    assert!(accepted, "upper {upper} word {word:#x}");
+                    assert_eq!(certain, bucket, "upper {upper} word {word:#x}");
+                    certain_count += 1;
+                }
+                None if accepted => {
+                    assert!(word.wrapping_mul(bound) <= bound);
+                    deferred_accepted += 1;
+                }
+                None => deferred_rejected += 1,
+            }
+        }
+    }
+    assert_ne!(certain_count, 0);
+    assert_ne!(deferred_accepted, 0);
+    assert_ne!(deferred_rejected, 0);
+    for word in [0, 1, u64::MAX, 0x9E37_79B9_7F4A_7C15] {
+        let none = ordinary_funnel_first_certain_index(
+            probe_drawing(word),
+            multiplier,
+            PreparedProbeRange::rejecting(),
+        );
+        assert_eq!(none, None);
+    }
+}
