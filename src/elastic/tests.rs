@@ -1842,7 +1842,9 @@ fn settled_insert_slot_agrees_with_the_general_placement() {
         let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
             .route
             .probe;
-        if let Some((level, slot)) = table.settled_slot(probe) {
+        if let Some((level, slot, control)) = table.settled_slot(probe) {
+            // SAFETY: the settled search returns a slot of `level`.
+            assert_eq!(control, unsafe { table.levels[level].control_at(slot) });
             let target = table.scheduler.target_at(table.len);
             let general = table
                 .choose_slot_for_new_key(probe, target)
@@ -1882,7 +1884,12 @@ fn shifted_vacancy_search_agrees_with_the_general_one() {
                 let region = &table.levels[level];
                 // SAFETY: `region` is `level`, and level zero reduces by
                 // shift, so every level does.
-                let shifted = unsafe { table.first_shifted_vacancy(probe, level, region, budget) };
+                let shifted = unsafe { table.first_shifted_vacancy(probe, level, region, budget) }
+                    .map(|(slot, paper_probe, control)| {
+                        // SAFETY: the search returns a slot of `region`.
+                        assert_eq!(control, unsafe { region.control_at(slot) });
+                        (slot, paper_probe)
+                    });
                 assert_eq!(shifted, table.first_vacancy_general(probe, level, budget));
                 if shifted.is_some() {
                     found += 1;
