@@ -1550,16 +1550,16 @@ where
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn first_empty_in_head(&self, probe: PreparedFastFunnelProbe) -> Option<Vacancy> {
+        // A shape without lanes has an absent head, which ends the walk at
+        // its first entry.
         let lanes = self.shape.bucket_lanes;
-        if lanes == 0 {
-            return None;
-        }
         let ctrl_ptr = self.storage.ctrl_ptr();
         let mut index = 0;
-        // The head's last entry is always absent and accepts no word, so the
-        // walk ends there at the latest.
         loop {
-            let level = self.shape.head_level(index);
+            // SAFETY: the head's last entry is always absent and accepts no
+            // word, so the walk returns there at the latest and `index` stays
+            // below `HEAD_LEVELS`.
+            let level = unsafe { self.shape.head.get_unchecked(index) };
             let bucket =
                 probe::ordinary_funnel_first_index(probe, level.multiplier, level.bucket_range)?;
             let start = level.offset + bucket * self.shape.beta;
@@ -1567,9 +1567,11 @@ where
             // array pads `GROUP_SIZE - 1` bytes past `n`.
             let empty = unsafe { simd::eq_mask_group(ctrl_ptr.add(start), CTRL_EMPTY) }.0 & lanes;
             if empty != 0 {
-                debug_assert!((index as usize) < OVERFLOW_LEVEL);
+                debug_assert!(index < OVERFLOW_LEVEL);
                 return Some(Vacancy {
-                    slot: start + (empty.trailing_zeros() / BITMASK_STRIDE) as usize,
+                    // SAFETY: `empty` is non-empty and masked with the
+                    // shape's lanes.
+                    slot: start + unsafe { lowest_lane(empty) },
                     level_bit: 1 << index,
                 });
             }
@@ -2365,11 +2367,25 @@ where
         // lane of the placement walk. That common insert calls nothing and
         // keeps no frame; every other case is the general insert's.
         let membership = self.membership_slot(hash);
-        if !self.membership_gate_at(membership).passes()
+        let gate = self.membership_gate_at(membership);
+        if !gate.passes()
             && self.tombstones == 0
             && self.len < self.shape.max_insertions
             && let Some(vacancy) = self.first_empty_in_head(self.prf.prepare(hash))
         {
+            debug_assert_eq!(vacancy.level_bit, self.level_bit(vacancy.slot));
+            debug_assert_ne!(self.membership.region.words, 0);
+            // Recorded ahead of the slot write, from the word the gate
+            // loaded: nothing wrote the filter in between, and a store to the
+            // slots would otherwise force the word to be loaded again.
+            // SAFETY: a table under a non-zero insertion limit has slots, so
+            // its filter has words and `membership.index` is below their
+            // count; `&mut self` makes the borrow exclusive.
+            unsafe {
+                let metadata = &mut *self.membership_ptr().add(membership.index);
+                metadata.membership = gate.word | membership.bits;
+                metadata.level_bins[membership.bin] |= vacancy.level_bit;
+            }
             let key_fingerprint = control::control_fingerprint(hash);
             // SAFETY: the vacancy is an EMPTY lane of an ordinary bucket, and
             // `key_fingerprint` is an occupied control.
@@ -2380,8 +2396,6 @@ where
                     key_fingerprint,
                 );
             }
-            debug_assert_eq!(vacancy.level_bit, self.level_bit(vacancy.slot));
-            self.record_membership(membership, vacancy.level_bit);
             self.len += 1;
             return None;
         }

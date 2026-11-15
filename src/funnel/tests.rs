@@ -2061,3 +2061,40 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
         }
     }
 }
+
+/// Whatever vacancy the head-only placement walk reports, the general walk
+/// reports the same; a bucket wider than one group is always handed to that
+/// walk. Fills each table to its insertion limit through the insert that
+/// takes the head walk, then checks the filter covers every key.
+#[test]
+#[cfg_attr(miri, ignore = "fills tens of thousands of slots")]
+fn head_vacancy_agrees_with_the_placement_walk_whenever_it_answers() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let feasible = |n: &usize, d: u32| {
+        FunnelShape::from_slots(*n, ReserveFraction::from_exponent(d).unwrap()).is_ok()
+    };
+    for (at_least, d) in [(600, 3), (6_000, 4), (60_000, 9)] {
+        let n = (at_least..2 * at_least).find(|n| feasible(n, d)).unwrap();
+        let mut table = raw_table(n, d);
+        let wide = table.shape.beta > GROUP_SIZE;
+        let inserted = table.shape.max_insertions as u64;
+        let mut answered = 0_usize;
+        for index in 0..inserted {
+            let key = index.wrapping_mul(SPREAD);
+            let probe = table.prf.prepare(key);
+            let general = table.search_vacancy(probe);
+            if let Some(head) = table.first_empty_in_head(probe) {
+                assert_eq!(Some(head), general, "n {n} d {d} index {index}");
+                answered += 1;
+            }
+            assert_eq!(map::TableBackend::insert(&mut table, key, index, key), None);
+        }
+        assert_eq!(answered == 0, wide, "n {n} d {d}");
+        assert_level_masks_cover_live(&table);
+        for index in 0..inserted {
+            let key = index.wrapping_mul(SPREAD);
+            let slot = table.find_location(&key, key);
+            assert!(slot.is_some(), "n {n} d {d} index {index}");
+        }
+    }
+}
