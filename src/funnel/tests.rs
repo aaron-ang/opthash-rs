@@ -492,6 +492,14 @@ struct DifferentialCoverage {
     overwrites: usize,
     wide_buckets: bool,
     narrow_buckets: bool,
+    /// Inserts of an unrecorded key that the head walk placed.
+    head_placements: usize,
+    /// Inserts of an unrecorded key below the budget that tombstones kept
+    /// from the head walk.
+    blocked_head_inserts: usize,
+    /// Lookups past the gate whose bin records no head level, which scan
+    /// an absent head entry.
+    absent_entry_scans: usize,
 }
 
 /// Lengths, in operations, of the stretches one differential cycle runs in
@@ -532,6 +540,19 @@ fn assert_matches_model(
 
     assert_eq!(table.entries(), model.len());
     assert!(table.entries() <= table.shape.max_insertions);
+    // The head placements left are those of a table without tombstones.
+    let head_limit = if table.tombstones == 0 {
+        table.shape.max_insertions
+    } else {
+        0
+    };
+    assert_eq!(table.head_left, head_limit.saturating_sub(model.len()));
+    let mut scans_absent_entry = |key: &HashedKey| {
+        let gate = table.membership_gate(key.hash);
+        coverage.absent_entry_scans +=
+            usize::from(gate.passes() && gate.levels & !OVERFLOW_LEVEL_BIT == 0);
+    };
+    model.keys().chain(absent).for_each(&mut scans_absent_entry);
     coverage.wide_buckets |= table.shape.beta > GROUP_SIZE;
     coverage.narrow_buckets |= table.shape.n != 0 && table.shape.beta <= GROUP_SIZE;
     let mut scan = OccupiedIndices::new();
@@ -591,6 +612,39 @@ fn assert_matches_model(
                 "{key:?}"
             );
         }
+    }
+}
+
+/// Inserts `key`, which the model held `previous` for. Where the head walk
+/// places a key the filter never recorded is read off the table before the
+/// insert runs it, and the insert must have stored the key there.
+fn insert_checking_the_head_walk(
+    table: &mut DifferentialTable,
+    key: HashedKey,
+    value: u64,
+    previous: Option<u64>,
+    coverage: &mut DifferentialCoverage,
+) {
+    use crate::map::TableBackend;
+
+    let membership = table.membership_slot(key.hash);
+    let unrecorded = !table.membership_gate_at(membership).passes();
+    let head = unrecorded
+        .then(|| table.head_vacancy(table.prf.prepare(key.hash), membership))
+        .flatten();
+    coverage.blocked_head_inserts += usize::from(
+        unrecorded && table.head_left == 0 && table.entries() < table.shape.max_insertions,
+    );
+    assert_eq!(table.insert(key, value, key.hash), previous, "{key:?}");
+    if let Some(head) = head {
+        assert_eq!(previous, None, "{key:?}");
+        assert_eq!(
+            table.find_location(&key, key.hash),
+            Some(head.slot),
+            "{key:?}"
+        );
+        assert_eq!(table.membership_gate(key.hash).levels, head.bins, "{key:?}");
+        coverage.head_placements += 1;
     }
 }
 
@@ -659,11 +713,7 @@ fn run_differential(
             );
             let previous = model.insert(key, value);
             coverage.overwrites += usize::from(previous.is_some());
-            assert_eq!(
-                table.insert(key, value, key.hash),
-                previous,
-                "step {step} insert {key:?}"
-            );
+            insert_checking_the_head_walk(&mut table, key, value, previous, &mut coverage);
         } else if step % stream.clear_every == stream.clear_every - 1 {
             table.clear();
             model.clear();
@@ -731,6 +781,9 @@ fn operation_streams_agree_with_a_model_map_and_the_ordered_walk() {
         assert!(coverage.overwrites > 0, "{coverage:?}");
         assert!(coverage.rejected_first_words, "{coverage:?}");
         assert!(!coverage.exceptional, "{coverage:?}");
+        assert!(coverage.head_placements > 0, "{coverage:?}");
+        assert!(coverage.blocked_head_inserts > 0, "{coverage:?}");
+        assert!(coverage.absent_entry_scans > 0, "{coverage:?}");
     }
 }
 
