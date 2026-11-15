@@ -300,9 +300,11 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     /// First word of the metadata tail, so the gate's address needs one load;
     /// [`NO_METADATA`] while `membership` has no words.
     metadata_words: *mut MetadataWord,
-    /// Deletes since the filter last matched the live set; see
-    /// [`membership::refresh_deletes`].
-    stale_membership: usize,
+    /// Removals the filter still tolerates, counted down from
+    /// [`membership::refresh_deletes`]; maintenance is due once it is
+    /// negative as a signed count, so the test is its sign bit. A scan's
+    /// removals may take it further down before the scan can settle.
+    deletes_left: usize,
 }
 
 // SAFETY: the table uniquely owns its arena and every entry in it, like
@@ -1105,7 +1107,7 @@ where
             probe_schedule,
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
-            stale_membership: 0,
+            deletes_left: membership::refresh_deletes(geometry.max_insertions),
         })
     }
 
@@ -1203,7 +1205,7 @@ where
         unsafe {
             reset_metadata(self.membership, self.arena.as_ptr());
         }
-        self.stale_membership = 0;
+        self.deletes_left = membership::refresh_deletes(self.max_insertions);
     }
 
     fn copy_membership_from(&mut self, source: &Self) {
@@ -1661,7 +1663,9 @@ where
     }
 
     fn epoch_snapshot(&self) -> EpochSnapshot {
-        self.epoch.snapshot(self.len)
+        let mut epoch = self.epoch;
+        epoch.note_deletes(self.stale_membership());
+        epoch.snapshot(self.len)
     }
 
     #[inline]
@@ -1801,8 +1805,8 @@ where
 
     fn remove(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
         // SAFETY: `TableBackend::Location` contract: a live location from
-        // this table names an occupied in-bounds slot.
-        let removed = unsafe { self.levels[level_idx].take(slot_idx) };
+        // this table names an occupied in-bounds slot of one of its levels.
+        let removed = unsafe { self.levels.get_unchecked_mut(level_idx).take(slot_idx) };
         self.extract_finish((level_idx, slot_idx));
         if self.maintenance_is_due() {
             self.maintain_after_deletes();
@@ -1819,16 +1823,16 @@ where
     #[inline]
     fn extract_finish(&mut self, (level_idx, slot_idx): (usize, usize)) {
         {
-            let level = &mut self.levels[level_idx];
-            // SAFETY: a live location names an in-bounds slot.
+            // SAFETY: a live location names one of this table's levels.
+            let level = unsafe { self.levels.get_unchecked_mut(level_idx) };
+            // SAFETY: and an in-bounds slot of it.
             unsafe { level.mark_tombstone(slot_idx) };
             level.len -= 1;
             level.tombstones += 1;
         }
         self.len -= 1;
         self.scheduler.note_removal(self.len);
-        self.stale_membership += 1;
-        self.epoch.note_delete();
+        self.deletes_left = self.deletes_left.wrapping_sub(1);
     }
 
     fn finish_deferred_removals(&mut self) {
@@ -1965,7 +1969,7 @@ where
             probe_schedule,
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
-            stale_membership: self.stale_membership,
+            deletes_left: self.deletes_left,
         };
         cloned.copy_membership_from(self);
         cloned
@@ -1989,7 +1993,13 @@ where
     /// since the last maintenance pay for a pass over the live entries.
     #[inline]
     fn maintenance_is_due(&self) -> bool {
-        self.stale_membership > membership::refresh_deletes(self.max_insertions)
+        self.deletes_left.cast_signed() < 0
+    }
+
+    /// Deletes since the filter last matched the live set. They are also the
+    /// deletes the epoch has not counted yet.
+    fn stale_membership(&self) -> usize {
+        membership::refresh_deletes(self.max_insertions).wrapping_sub(self.deletes_left)
     }
 
     /// Same-size cleanup when a level passed its tombstone threshold;
@@ -2029,6 +2039,7 @@ where
     #[cold]
     #[inline(never)]
     fn refresh_membership(&mut self) {
+        self.epoch.note_deletes(self.stale_membership());
         self.clear_membership();
         for level_idx in 0..self.levels.len() {
             let mut scan = OccupiedIndices::new();
@@ -2097,7 +2108,7 @@ where
                 scheduled_levels: 0,
                 probe_schedule,
                 membership,
-                stale_membership: 0,
+                deletes_left: membership::refresh_deletes(geometry.max_insertions),
             },
         );
         self.epoch.start_epoch(
@@ -2723,7 +2734,7 @@ pub(crate) struct ElasticGeneration<K, V> {
     probe_schedule: ProbeSchedule,
     membership: MembershipRegion,
     metadata_words: *mut MetadataWord,
-    stale_membership: usize,
+    deletes_left: usize,
 }
 
 impl<K, V, S, A> Rebuildable for ElasticTable<K, V, S, A>
@@ -2749,7 +2760,7 @@ where
         mem::swap(&mut self.probe_schedule, &mut other.probe_schedule);
         mem::swap(&mut self.membership, &mut other.membership);
         mem::swap(&mut self.metadata_words, &mut other.metadata_words);
-        mem::swap(&mut self.stale_membership, &mut other.stale_membership);
+        mem::swap(&mut self.deletes_left, &mut other.deletes_left);
     }
 
     fn regions(generation: &ElasticGeneration<K, V>) -> &[Level<SlotEntry<K, V>>] {

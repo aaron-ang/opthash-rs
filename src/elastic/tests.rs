@@ -852,7 +852,7 @@ fn deletes_past_the_threshold_refresh_the_membership_filter() {
             let prepared = PreparedElasticKey::new(table.hash_builder.hash_one(key));
             table.route_filter(prepared).maybe_present
         },
-        |table| table.stale_membership,
+        ElasticTable::stale_membership,
     );
 }
 

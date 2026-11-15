@@ -207,6 +207,19 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
     assert_eq!(cycles + departed.len() as u64, threshold + 1);
     assert_eq!(map.epoch().generation, 0, "no rebuild ran");
     assert_eq!(stale_membership(map.table()), 0, "refresh resets the count");
+    // The epoch still counts every delete, on either side of the refresh.
+    let epoch = map.epoch();
+    assert!(epoch.had_delete);
+    assert_eq!(
+        epoch.distinct_insertions as u64,
+        map.len() as u64 + threshold + 1
+    );
+    map.insert(churn, churn);
+    assert_eq!(map.remove(&churn), Some(churn));
+    assert_eq!(
+        map.epoch().distinct_insertions as u64,
+        map.len() as u64 + threshold + 2
+    );
 
     // Live keys are still recorded and found; departed keys mostly are not.
     for key in (0..live).filter(|key| key % 3 != 0) {
