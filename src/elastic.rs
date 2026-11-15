@@ -527,6 +527,9 @@ enum ScheduleSearch<R> {
 struct ElasticRouteFilter<'a> {
     /// `false` proves no insert ever recorded this key's route.
     maybe_present: bool,
+    /// The word's membership lane as tested, for an insert to record over
+    /// without reading the word again.
+    membership: u64,
     word: &'a MetadataWord,
 }
 
@@ -672,10 +675,11 @@ pub(crate) struct BatchScheduler {
     /// settled insert out.
     settled_limit: usize,
     /// Exclusive live-count bound of the cached batch's settled inserts: the
-    /// lower of `batch_end` and `settled_limit`, or zero once the live count
-    /// fell below `batch_start`. Every path that lowers the table's live
-    /// count reports it through [`Self::note_removal`] or re-syncs the
-    /// batch, so a live count under this bound is inside the cached batch.
+    /// lower of `batch_end` and `settled_limit`, or zero since a removal.
+    /// Every path that lowers the table's live count closes it through
+    /// [`Self::note_removal`] or re-syncs the batch, and only
+    /// [`Self::reopen`] and a re-sync raise it, so a live count under this
+    /// bound is inside the cached batch.
     settled_end: usize,
 }
 
@@ -727,13 +731,21 @@ impl BatchScheduler {
         len < self.settled_end
     }
 
-    /// Records that removals left `len` live entries: a count under the
-    /// cached batch closes the settled gate until the next re-sync.
+    /// Records a removal by closing the settled gate, whatever the live
+    /// count: one store, with no test of where the count fell.
     #[inline]
-    fn note_removal(&mut self, len: usize) {
-        if len < self.batch_start {
-            self.settled_end = 0;
+    fn note_removal(&mut self) {
+        self.settled_end = 0;
+    }
+
+    /// Reopens a gate that a removal closed while the cached batch still
+    /// covers the `len` live entries, and reports whether `len` settles.
+    #[inline]
+    fn reopen(&mut self, len: usize) -> bool {
+        if self.covers(len) {
+            self.settled_end = self.batch_end.min(self.settled_limit);
         }
+        self.settles(len)
     }
 
     /// Counts an insert into one of `level`'s tombstones. In a level past
@@ -742,11 +754,18 @@ impl BatchScheduler {
     #[cold]
     #[inline(never)]
     fn reuse_tombstone<T>(&mut self, level: &mut Level<T>) {
-        if level.needs_cleanup() {
+        // The threshold is at least half the level, a cheaper test.
+        if level.tombstones > level.capacity / 2 && level.needs_cleanup() {
             self.batch_end = 0;
             self.settled_end = 0;
         }
         level.tombstones -= 1;
+    }
+
+    /// [`Self::reopen`] on a copy: whether an insert at `len` settles.
+    #[cfg(test)]
+    fn would_settle(&self, len: usize) -> bool {
+        self.clone().reopen(len)
     }
 
     /// [`Self::target`] on a copy, for assertions through a shared borrow.
@@ -1158,8 +1177,10 @@ where
         // properly aligned `MetadataWord`s; with no words it is zero and
         // `metadata_words` addresses the one word of `NO_METADATA`.
         let word = unsafe { &*self.membership_ptr().add(word) };
+        let membership = word.membership;
         ElasticRouteFilter {
-            maybe_present: word.membership & bits == bits,
+            maybe_present: membership & bits == bits,
+            membership,
             word,
         }
     }
@@ -1189,13 +1210,29 @@ where
         membership: MembershipKey,
         summary_bit: u16,
     ) {
+        let lane = self
+            .route_filter(PreparedElasticKey { route, membership })
+            .membership;
+        self.record_membership_over(route, membership, summary_bit, lane);
+    }
+
+    /// [`Self::record_membership`] over `lane`, the membership lane of the
+    /// key's word as [`Self::route_filter`] last read it.
+    #[inline]
+    fn record_membership_over(
+        &mut self,
+        route: PreparedElasticRoute,
+        membership: MembershipKey,
+        summary_bit: u16,
+        lane: u64,
+    ) {
         let words = self.membership.words;
         if words != 0 {
             let word = MembershipKey::word(route.signature(), words);
             // SAFETY: `word < words` indexes an initialized word; `&mut self`
             // makes the borrow exclusive.
             let metadata = unsafe { &mut *self.membership_ptr().add(word) };
-            metadata.membership |= membership.bits();
+            metadata.membership = lane | membership.bits();
             metadata.level_bins[route.summary_bin()] &= !summary_bit;
         }
     }
@@ -1226,7 +1263,7 @@ where
                 self.len -= 1;
                 // Before the drop: one that panics leaves the table live
                 // with this count.
-                self.scheduler.note_removal(self.len);
+                self.scheduler.note_removal();
                 drop(entry);
             });
         }
@@ -1261,10 +1298,20 @@ where
         self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control)
     }
 
-    /// [`Self::settled_level_slot`] with the level by index.
+    /// [`Self::settled_level_slot`] with the level by index, on a copy of
+    /// the scheduler so a shared borrow can ask.
     #[cfg(test)]
     fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize, u8)> {
-        let (region, slot, control) = self.settled_level_slot(probe)?;
+        if !self.scheduler.would_settle(self.len) {
+            return None;
+        }
+        // The gate a reopening leaves is the one the copy reported.
+        let mut scheduler = self.scheduler.clone();
+        scheduler.reopen(self.len);
+        debug_assert!(scheduler.settles(self.len));
+        // SAFETY: the scheduler settles this live count once reopened, and
+        // the search reads the cached batch, which reopening leaves alone.
+        let (region, slot, control) = unsafe { self.settled_level_slot_in_batch(probe) }?;
         // SAFETY: the settled search returns one of this table's levels.
         let level = unsafe { region.as_ptr().offset_from_unsigned(self.levels.as_ptr()) };
         Some((level, slot, control))
@@ -1276,16 +1323,34 @@ where
     /// its scheduled probes. `None` leaves the insert to
     /// [`Self::insert_for_vacant_entry_prepared`]. The level comes by
     /// address, so a caller that writes the slot does not index the levels
-    /// again.
+    /// again. A gate that a removal closed inside the cached batch reopens
+    /// here.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn settled_level_slot(
+        &mut self,
+        probe: PreparedElasticProbe,
+    ) -> Option<(LevelPtr<K, V>, usize, u8)> {
+        if !self.scheduler.settles(self.len) && !self.scheduler.reopen(self.len) {
+            return None;
+        }
+        // SAFETY: the scheduler settles the live count.
+        unsafe { self.settled_level_slot_in_batch(probe) }
+    }
+
+    /// [`Self::settled_level_slot`] past its gate.
+    ///
+    /// # Safety
+    ///
+    /// The cached batch covers the live count, which is below the
+    /// scheduler's settled limit: [`BatchScheduler::settles`] holds, or
+    /// would once [`BatchScheduler::reopen`] ran.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    unsafe fn settled_level_slot_in_batch(
         &self,
         probe: PreparedElasticProbe,
     ) -> Option<(LevelPtr<K, V>, usize, u8)> {
-        if !self.scheduler.settles(self.len) {
-            return None;
-        }
         let target = self.scheduler.cached_target();
         let deepest = match target {
             BatchTarget::Bootstrap => 0,
@@ -1485,6 +1550,7 @@ where
         debug_assert!(level_idx < self.levels.len());
         // SAFETY: callers pass a level they found a free slot in.
         let level = unsafe { self.levels.as_mut_ptr().add(level_idx) };
+        let lane = self.route_filter(prepared).membership;
         // SAFETY: as above, and the slot is a free one of that level.
         unsafe {
             self.write_new_entry_at(
@@ -1495,6 +1561,7 @@ where
                 level,
                 slot_idx,
                 prev_ctrl,
+                lane,
             );
         }
         (level_idx, slot_idx)
@@ -1506,6 +1573,8 @@ where
     ///
     /// `level` is one of this table's levels, derived from their pointer,
     /// `slot_idx` is a free slot of it and `prev_ctrl` its control byte.
+    /// `lane` is the membership lane of the key's word as
+    /// [`Self::route_filter`] reads it now.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     unsafe fn write_new_entry_at(
@@ -1517,12 +1586,11 @@ where
         level: *mut Level<SlotEntry<K, V>>,
         slot_idx: usize,
         prev_ctrl: u8,
+        lane: u64,
     ) {
         // SAFETY: the caller's contract.
         let summary_bit = unsafe { (*level).summary_bit };
-        // Recorded before the level's stores, so the filter word the caller
-        // tested is not read again.
-        self.record_membership(prepared.route, prepared.membership, summary_bit);
+        self.record_membership_over(prepared.route, prepared.membership, summary_bit, lane);
         {
             // SAFETY: the caller's contract; `&mut self` borrows the levels
             // alone.
@@ -1760,6 +1828,7 @@ where
         // apart itself.
         'common: {
             let filter = self.route_filter(prepared);
+            let lane = filter.membership;
             if filter.maybe_present {
                 let walked = self.walk_schedule(
                     &key,
@@ -1795,6 +1864,7 @@ where
                         level,
                         slot,
                         control,
+                        lane,
                     );
                 }
                 return None;
@@ -1831,7 +1901,7 @@ where
             level.tombstones += 1;
         }
         self.len -= 1;
-        self.scheduler.note_removal(self.len);
+        self.scheduler.note_removal();
         self.deletes_left = self.deletes_left.wrapping_sub(1);
     }
 

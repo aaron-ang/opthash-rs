@@ -2665,7 +2665,7 @@ fn settled_inserts_match_an_ordered_map_model() {
                     continue;
                 }
                 let fresh = !model.contains_key(&key);
-                let settles = fresh && table.scheduler.settles(table.len);
+                let settles = fresh && table.scheduler.would_settle(table.len);
                 let tombstones = |table: &ElasticTable<u64, u64, FixedHashBuilder>| {
                     table
                         .levels
@@ -2733,16 +2733,19 @@ fn settled_gate_follows_the_live_count_through_a_clear_that_panicked() {
         assert!(result.is_err());
         let table = map.table();
         assert_eq!(table.len, full - 1 - panic_at - 1);
+        // Every entry the clear took closed the gate behind it.
+        assert!(!table.scheduler.settles(table.len));
         assert_eq!(
-            table.scheduler.settles(table.len),
+            table.scheduler.would_settle(table.len),
             table.scheduler.covers(table.len)
         );
 
         let follow_ups = full as u64..full as u64 + if cfg!(miri) { 20 } else { 100 };
         for key in follow_ups {
             let table = map.table();
+            assert!(!table.scheduler.settles(table.len) || table.scheduler.covers(table.len));
             assert_eq!(
-                table.scheduler.settles(table.len),
+                table.scheduler.would_settle(table.len),
                 table.scheduler.covers(table.len)
             );
             let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
@@ -2767,13 +2770,12 @@ fn settled_gate_follows_the_live_count_through_a_clear_that_panicked() {
     assert!(settled > 0);
 }
 
-/// The settled gate holds exactly for a live count inside the cached batch
-/// and under the insertion limit.
+/// An insert settles exactly for a live count inside the cached batch and
+/// under the insertion limit, and the gate is never open for another count.
 fn assert_settled_gate(table: &ElasticTable<u64, u64, FixedHashBuilder>, shifted: bool) {
-    assert_eq!(
-        table.scheduler.settles(table.len),
-        shifted && table.len < table.max_insertions && table.scheduler.covers(table.len)
-    );
+    let in_batch = shifted && table.len < table.max_insertions && table.scheduler.covers(table.len);
+    assert_eq!(table.scheduler.would_settle(table.len), in_batch);
+    assert!(in_batch || !table.scheduler.settles(table.len));
 }
 
 #[test]
@@ -2799,20 +2801,26 @@ fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
         assert_eq!(settled_inserts > table.max_insertions / 2, shifted);
         assert_eq!(settled_inserts == 0, !shifted);
 
-        // Removals walk the live count back under the cached batch, where
-        // the gate must stay shut until an insert re-syncs the batch.
+        // Every removal shuts the gate. The insert after it reopens the gate
+        // inside the cached batch and re-syncs the batch outside it.
         let full = table.max_insertions as u64;
         let mut reopened = 0;
         for key in 0..full {
             let hash = table.hash_builder.hash_one(key);
             let location = table.find_for_entry(&key, hash).ok().unwrap();
             assert_eq!(table.remove(location), (key, key));
+            assert!(!table.scheduler.settles(table.len));
             assert_settled_gate(&table, shifted);
             if key % 7 == 0 {
                 let fresh = full + key;
                 let hash = table.hash_builder.hash_one(fresh);
                 assert_eq!(table.insert(fresh, fresh, hash), None);
                 assert_settled_gate(&table, shifted);
+                // Past an insert the gate is open wherever it may be.
+                assert_eq!(
+                    table.scheduler.settles(table.len),
+                    table.scheduler.would_settle(table.len)
+                );
                 reopened += usize::from(table.scheduler.settles(table.len));
             }
         }
