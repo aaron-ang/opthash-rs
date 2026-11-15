@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::exact::reference::{ScalarElastic, ScalarElasticLimits};
 use crate::map::TableBackend;
+use crate::raw::control::CTRL_TOMBSTONE;
 use crate::test_support::{
     self, CountDrop, Deterministic, FixedElasticHashMap, FixedHashBuilder, IdentityBuildHasher,
     PanicHashKey, PanicOnFirstDrop, ToggleAllocator, fixed_hasher,
@@ -74,7 +75,7 @@ fn assert_exact_trace(n: usize, reserve_exponent: u32, identities: impl IntoIter
     );
 
     let limits = ScalarElasticLimits::new(
-        NonZeroUsize::new(ELASTIC_PROBE_BUDGET_C).unwrap(),
+        NonZeroUsize::new(ELASTIC_PROBE_BUDGET_C as usize).unwrap(),
         NonZeroU32::new(probe::RANGE_WORD_CAP).unwrap(),
         NonZeroU64::new(UNIFORM_SEARCH_CAP).unwrap(),
         NonZeroU128::new(QUERY_POSITION_CAP).unwrap(),
@@ -1600,7 +1601,7 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
         level_slots / 16,
         level_slots,
         reserve.exponent(),
-        ELASTIC_PROBE_BUDGET_C,
+        ELASTIC_PROBE_BUDGET_C as usize,
     )
     .unwrap() as u64;
     assert!(
@@ -1863,7 +1864,7 @@ fn reinsert_replaces_the_value_on_a_table_flagged_exceptional() {
         assert_eq!(table.insert(key, key, hash), None);
     }
     // The flag only widens a lookup, so raising it by hand is a valid state.
-    table.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG;
+    table.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG | WALK_UNRESOLVED_FLAG;
     assert_reinsert_replaces(&mut table, KEYS);
 }
 
@@ -2070,11 +2071,68 @@ fn levels_reduce_all_by_shift_or_all_by_the_general_reduction() {
     assert!(shifted_tables > 0 && general_tables > 0 && single_slot_levels > 0);
 }
 
+/// What the settled insert and the end of a walk read from a table instead
+/// of deriving: each level's constants, the bounds the settled limit stands
+/// for, and the flag that leaves a walk unresolved.
+fn assert_cached_state_matches<S>(table: &ElasticTable<u64, u64, S>) {
+    for (index, level) in table.levels.iter().enumerate() {
+        assert_eq!(level.summary_bit, 1 << summary_level(index));
+        assert_eq!(level.sequence_run, probe::elastic_level_run(index));
+        assert_eq!(
+            level.half_reserve as usize,
+            table.reserve_fraction.floor_half_reserved(level.capacity())
+        );
+    }
+    let shifted = table
+        .levels
+        .first()
+        .is_some_and(|level| level.index_shift() != GENERAL_REDUCTION);
+    let settled_limit = table.scheduler.settled_limit;
+    assert_eq!(
+        settled_limit,
+        if shifted { table.max_insertions } else { 0 }
+    );
+    if settled_limit != 0 {
+        assert!(table.scheduler.batch_ends.len() <= table.levels.len());
+        assert_ne!(table.membership.words, 0);
+    }
+    let exceptional = table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG != 0;
+    assert_eq!(
+        table.probe_high_water & WALK_UNRESOLVED_FLAG != 0,
+        settled_limit == 0 || exceptional
+    );
+}
+
+#[test]
+fn every_table_shape_caches_the_state_its_fast_paths_read() {
+    let slot_counts = if cfg!(miri) { 1..=40 } else { 1..=2_100 };
+    let mut settling = 0;
+    for exponent in 1..=6 {
+        let reserve = ReserveFraction::from_exponent(exponent).unwrap();
+        for slots in slot_counts.clone() {
+            let Ok(table) =
+                ElasticTable::<u64, u64, _>::try_with_slots_and_reserve_fraction_and_hasher_in(
+                    slots,
+                    reserve,
+                    fixed_hasher(),
+                    Global,
+                )
+            else {
+                continue;
+            };
+            assert_cached_state_matches(&table);
+            settling += usize::from(table.scheduler.settled_limit != 0);
+        }
+    }
+    assert!(settling > 0);
+}
+
 #[test]
 fn schedule_addresses_the_levels_of_every_table_it_serves() {
     type Table = ElasticTable<u64, u64, FixedHashBuilder>;
     fn check(table: &Table) -> bool {
         assert!(table.probe_schedule.addresses(&table.levels));
+        assert_cached_state_matches(table);
         for level in &table.levels {
             for slot in [0, level.capacity() - 1] {
                 // SAFETY: the control bytes are this table's and the slot is

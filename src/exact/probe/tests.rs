@@ -118,7 +118,7 @@ fn elastic_level_words_step_through_the_levels_sequence_indices() {
             .prepare_elastic(key)
             .sequence(ELASTIC_FOLD_MULTIPLIER);
         for level in 0..u32::try_from(ELASTIC_LEVEL_LIMIT).unwrap() {
-            let (mut word, step) = sequence.level_words(level as usize);
+            let (mut word, step) = sequence.run_words(elastic_level_run(level as usize));
             for logical in 0..512 {
                 assert_eq!(
                     word,
@@ -778,6 +778,13 @@ fn elastic_probe_budget_matches_the_ceiling_quotient_form() {
                 Ok(by_quotient(free, level, exponent, 8)),
                 "free {free} of {level}"
             );
+            if let (Ok(free), Ok(level)) = (u32::try_from(free), u32::try_from(level)) {
+                assert_eq!(
+                    elastic_level_probe_budget(free, level, exponent, 8),
+                    by_quotient(free as usize, level as usize, exponent, 8) as u64,
+                    "free {free} of {level}"
+                );
+            }
         }
     };
     let exhaustive_levels: usize = if cfg!(miri) { 70 } else { 600 };
