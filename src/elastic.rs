@@ -1062,7 +1062,7 @@ where
                 value,
                 prepared,
                 key_fingerprint,
-                placement,
+                (placement.level, placement.slot, placement.paper_probe),
                 finish,
             );
         }
@@ -1114,9 +1114,14 @@ where
         value: V,
         prepared: PreparedElasticKey,
         key_fingerprint: u8,
-        placement: ExactPlacement,
+        (level, slot, paper_probe): (usize, usize, u64),
         finish: impl FnOnce((usize, usize)) -> R,
     ) -> R {
+        let placement = ExactPlacement {
+            level,
+            slot,
+            paper_probe,
+        };
         finish(self.place_new_entry(key, value, prepared, key_fingerprint, placement))
     }
 
@@ -1795,16 +1800,12 @@ where
         target: BatchTarget,
         first_vacancy: impl Fn(usize, u64) -> Option<(usize, u64)>,
     ) -> Option<ExactPlacement> {
-        let uniform_vacancy = |level: usize| first_vacancy(level, *LEVEL_PROBE_LIMIT.get(level)?);
         // The paper's insertion cases, in order: Batch 0 fills level 0; then,
         // for the active pair, Case 2 (current nearly full) places in `next`,
         // Case 3 (next nearly full) in `current`, and Case 1 gives `current`
         // a bounded probe budget before falling back to `next`.
-        let (level, slot, paper_probe) = match target {
-            BatchTarget::Bootstrap => {
-                let (slot, paper_probe) = uniform_vacancy(0)?;
-                (0, slot, paper_probe)
-            }
+        let (mut level, mut budget, mut fallback) = match target {
+            BatchTarget::Bootstrap => (0, None, None),
             BatchTarget::LevelPair(current) => {
                 let next = current.checked_add(1)?;
                 let current_level = self.levels.get(current)?;
@@ -1815,11 +1816,9 @@ where
                 let next_low = free_next.saturating_mul(4) <= next_level.capacity();
 
                 if current_low {
-                    let (slot, paper_probe) = uniform_vacancy(next)?;
-                    (next, slot, paper_probe)
+                    (next, None, None)
                 } else if next_low {
-                    let (slot, paper_probe) = uniform_vacancy(current)?;
-                    (current, slot, paper_probe)
+                    (current, None, None)
                 } else {
                     let budget = probe::elastic_dyadic_probe_budget(
                         free_current,
@@ -1828,17 +1827,22 @@ where
                         ELASTIC_PROBE_BUDGET_C,
                     )
                     .ok()?;
-                    let budget = u64::try_from(budget)
-                        .unwrap_or(u64::MAX)
-                        .min(*LEVEL_PROBE_LIMIT.get(current)?);
-                    if let Some((slot, probe)) = first_vacancy(current, budget) {
-                        (current, slot, probe)
-                    } else {
-                        let (slot, paper_probe) = uniform_vacancy(next)?;
-                        (next, slot, paper_probe)
-                    }
+                    (
+                        current,
+                        Some(u64::try_from(budget).unwrap_or(u64::MAX)),
+                        Some(next),
+                    )
                 }
             }
+        };
+        // One search site serves every case, so the search inlines once.
+        let (slot, paper_probe) = loop {
+            let limit = *LEVEL_PROBE_LIMIT.get(level)?;
+            let budget = budget.take().map_or(limit, |budget| budget.min(limit));
+            if let Some(found) = first_vacancy(level, budget) {
+                break found;
+            }
+            level = fallback.take()?;
         };
         // Every vacancy search stops within `LEVEL_PROBE_LIMIT`, whose probes
         // all sit at positions up to `QUERY_POSITION_CAP`.
@@ -1880,7 +1884,8 @@ where
     ///
     /// `level`, when the table has it, must not be marked
     /// [`GENERAL_REDUCTION`].
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     unsafe fn first_shifted_vacancy(
         &self,
         probe: PreparedElasticProbe,
