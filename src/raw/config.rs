@@ -6,8 +6,7 @@ pub(crate) const GROUP_SIZE: usize = 8;
 pub(crate) const GROUP_SIZE: usize = 16;
 /// Align arena allocations so memset can use cache-line fast paths.
 pub(crate) const CACHE_LINE: usize = 64;
-/// First-allocation slot count when a map grows from empty.
-#[cfg(opthash_neon_group)]
+/// First-allocation slot count when a map grows from empty, the same on
+/// every target and never below one control group.
 pub(crate) const INITIAL_CAPACITY: usize = 16;
-#[cfg(not(opthash_neon_group))]
-pub(crate) const INITIAL_CAPACITY: usize = GROUP_SIZE;
+const _: () = assert!(INITIAL_CAPACITY >= GROUP_SIZE);
