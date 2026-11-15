@@ -475,8 +475,6 @@ where
 
     /// Returns a reference to the value for `key`.
     #[must_use]
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
