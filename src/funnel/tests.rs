@@ -943,28 +943,6 @@ fn lane_less_shapes_select_and_keep_an_absent_head() {
     }
 }
 
-#[test]
-#[cfg_attr(miri, ignore)]
-fn clean_and_dirty_search_modes_agree_without_tombstones() {
-    let mut table = raw_table(344, 4);
-    for key in 0..128_u64 {
-        assert!(!table.place_unique(
-            SlotEntry { key, value: key },
-            table.hash_builder.hash_one(key)
-        ));
-    }
-    assert_eq!(table.tombstones, 0);
-
-    for key in 0..256_u64 {
-        let hash = table.hash_builder.hash_one(key);
-        let fingerprint = table.prf.prepare(hash).fingerprint();
-        let probe = FunnelPrf::new(FUNNEL_PROBE_SEED).prepare(hash);
-        let clean = table.search_exact_mode::<_, true>(&key, probe, fingerprint);
-        let dirty = table.search_exact_mode::<_, false>(&key, probe, fingerprint);
-        assert_eq!(clean, dirty, "key={key}");
-    }
-}
-
 /// The placement walk must land where the exact search reports `Vacant`
 /// for an absent key, on clean epochs and with tombstones on the walk.
 #[test]
