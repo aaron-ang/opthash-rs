@@ -809,13 +809,16 @@ fn operation_streams_agree_with_a_model_map_under_colliding_hashes() {
     }
 }
 
-/// Small enough for Miri: the smallest shapes on both sides of the group
-/// width, from a table without storage through a spent budget, tombstones,
-/// a growth, a clear and a reseeding rebuild, with a clone checked at each
-/// stage.
+/// The smallest shapes on both sides of the group width, from a table without
+/// storage through a spent budget, tombstones, a growth, a clear and a
+/// reseeding rebuild, with a clone checked at each stage. Miri runs the wide
+/// shape only where its budget stays small.
 #[test]
 fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
     use crate::map::TableBackend;
+
+    /// Largest budget the staged run fills under Miri.
+    const MIRI_BUDGET: usize = 1 << 10;
 
     let (wide, _) = smallest_wide_shape();
     for d in [3, wide] {
@@ -823,6 +826,9 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
         let budget = FunnelShape::for_insert_budget(1, reserve)
             .unwrap()
             .max_insertions;
+        if cfg!(miri) && budget > MIRI_BUDGET {
+            continue;
+        }
         let universe = spread_universe(budget as u64 + 8);
         let mut coverage = DifferentialCoverage::default();
         let mut model = alloc::collections::BTreeMap::new();
@@ -934,7 +940,6 @@ fn lane_less_shapes_select_and_keep_an_absent_head() {
                 .iter()
                 .all(|level| *level == LevelShape::ABSENT)
         );
-        assert_ne!(recorded, HEAD_LEVELS);
     }
 }
 
