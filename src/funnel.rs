@@ -874,6 +874,10 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     stale_membership: usize,
     tombstones: usize,
     len: usize,
+    /// Entry count below which the head placement may run: the insertion
+    /// limit of a table without tombstones, zero with any. Kept by
+    /// [`Self::sync_head_limit`], so that placement tests one bound.
+    head_limit: usize,
     shape: FunnelShape,
 }
 
@@ -1016,6 +1020,7 @@ where
     ) -> Result<Self, TryReserveError> {
         let (arena, storage, membership) = try_allocate_storage(shape.n, &alloc)?;
         Ok(Self {
+            head_limit: shape.max_insertions,
             shape,
             storage,
             len: 0,
@@ -1917,10 +1922,25 @@ where
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn head_vacancy(&self, probe: PreparedFastFunnelProbe, bins: u16) -> Option<HeadVacancy> {
-        if self.tombstones != 0 || self.len >= self.shape.max_insertions {
+        debug_assert_eq!(self.head_limit, self.head_limit_now());
+        if self.len >= self.head_limit {
             return None;
         }
         self.first_empty_in_head(probe, bins)
+    }
+
+    fn head_limit_now(&self) -> usize {
+        if self.tombstones == 0 {
+            self.shape.max_insertions
+        } else {
+            0
+        }
+    }
+
+    /// Restores [`Self::head_limit`] after a change to the tombstone count
+    /// or the shape.
+    fn sync_head_limit(&mut self) {
+        self.head_limit = self.head_limit_now();
     }
 
     /// Stores an absent key at the vacancy [`Self::head_vacancy`] reported
@@ -2076,6 +2096,7 @@ where
         self.len += 1;
         if was_tombstone {
             self.tombstones -= 1;
+            self.sync_head_limit();
         }
         if exceptional {
             self.exceptional_placement = true;
@@ -2274,6 +2295,7 @@ where
         mem::swap(&mut self.storage, &mut other.storage);
         mem::swap(&mut self.len, &mut other.len);
         mem::swap(&mut self.tombstones, &mut other.tombstones);
+        self.sync_head_limit();
         mem::swap(&mut self.arena, &mut other.arena);
         mem::swap(
             &mut self.exceptional_placement,
@@ -2495,6 +2517,7 @@ where
         unsafe { self.storage.mark_tombstone(slot) };
         self.len -= 1;
         self.tombstones += 1;
+        self.head_limit = 0;
         self.stale_membership += 1;
         self.epoch.note_delete();
     }
@@ -2605,6 +2628,7 @@ where
                 unsafe { self.storage.set_control(slot, CTRL_TOMBSTONE) };
                 self.len -= 1;
                 self.tombstones += 1;
+                self.head_limit = 0;
                 drop(entry);
             }
         }
@@ -2615,6 +2639,7 @@ where
         self.storage.clear_all_controls();
         self.len = 0;
         self.tombstones = 0;
+        self.sync_head_limit();
         self.finish_clear();
     }
 
@@ -2634,6 +2659,7 @@ where
         cloned.storage.clone_region_from(&self.storage);
         cloned.len = self.len;
         cloned.tombstones = self.tombstones;
+        cloned.sync_head_limit();
         cloned.epoch = self.epoch;
         cloned.exceptional_placement = self.exceptional_placement;
         cloned.prf = self.prf;
