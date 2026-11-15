@@ -464,9 +464,9 @@ fn recorded_head_levels(levels: u16) -> u32 {
 }
 
 /// Level bin of a key, as the negative index [`FunnelTable::level_bin_ptr`]
-/// counts back by. The top two bits of the hash's low half: disjoint from both
-/// membership bit fields (bits 0..6 and 32..38), while the word index draws on
-/// the high half.
+/// counts back by. The top two bits of the hash's low half: disjoint from the
+/// membership bit field (bits 0..6), while the word index draws on the high
+/// half.
 #[inline]
 const fn level_bin(key_hash: u64) -> isize {
     #[allow(
@@ -2836,8 +2836,8 @@ where
     }
 
     fn remove(&mut self, slot: usize) -> (K, V) {
-        // SAFETY: a live location names an occupied in-bounds slot;
-        // `extract_finish` tombstones it so it is never read again.
+        // SAFETY: a live location names an occupied in-bounds slot; the
+        // tombstone written next keeps it from being read again.
         let entry = unsafe { self.storage.take(slot) };
         // SAFETY: a live location names an in-bounds slot.
         unsafe { self.storage.mark_tombstone(slot) };

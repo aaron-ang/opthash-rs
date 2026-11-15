@@ -15,8 +15,8 @@ use allocator_api2::alloc::Layout;
 use crate::error::TryReserveError;
 
 /// Logical slots covered by one filter word. Ten keeps the membership lane under
-/// a byte per slot while leaving words sparse enough for two or three bits per key to stay
-/// selective.
+/// a byte per slot while leaving words sparse enough for the few bits a backend
+/// sets per key to stay selective.
 pub(crate) const SLOTS_PER_WORD: usize = 10;
 
 /// Filter words needed to cover `total_slots` logical slots.
