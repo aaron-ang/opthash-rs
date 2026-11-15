@@ -347,8 +347,8 @@ fn level_bit_of(level: usize) -> u16 {
 }
 
 /// Level bin of a key. Bits 6 and 7 of the hash: disjoint from both membership
-/// bit fields (bits 0..6 and 32..38) and from the control fingerprint (bits
-/// 57..64), while the word index draws on the high half.
+/// bit fields (bits 0..6 and 32..38), while the word index draws on the high
+/// half.
 #[inline]
 const fn level_bin(key_hash: u64) -> usize {
     ((key_hash >> 6) & 3) as usize
@@ -1876,11 +1876,14 @@ where
     /// Stores an absent key at the vacancy [`Self::head_vacancy`] reported
     /// and records it in the filter. Calls nothing.
     ///
-    /// `gate` must be the filter word loaded for `membership`, with no write
-    /// to the table since it and the vacancy were read.
+    /// # Safety
+    ///
+    /// `vacancy` must come from [`Self::head_vacancy`] and `gate` from the
+    /// filter word of `membership`, itself from [`Self::membership_slot`],
+    /// with no write to the table since any of them was read.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn place_in_head(
+    unsafe fn place_in_head(
         &mut self,
         key: K,
         value: V,
@@ -1896,9 +1899,8 @@ where
         // the length and the filter word's address here, the word itself
         // by the gate.
         let len = self.len;
-        // SAFETY: a table under a non-zero insertion limit has slots, so
-        // its filter has words and `membership.index` is below their
-        // count.
+        // SAFETY: a vacancy exists only in a table with slots, so its
+        // filter has words and `membership.index` is below their count.
         let metadata = unsafe { self.membership_ptr().add(membership.index) };
         let key_fingerprint = probe.fingerprint();
         // SAFETY: the vacancy is an EMPTY lane of an ordinary bucket, and
@@ -1937,7 +1939,9 @@ where
         }
         let probe = self.prf.prepare(hash);
         if let Some(vacancy) = self.head_vacancy(probe) {
-            self.place_in_head(key, value, membership, gate, probe, vacancy);
+            // SAFETY: slot, gate and vacancy were read just above, with no
+            // write since.
+            unsafe { self.place_in_head(key, value, membership, gate, probe, vacancy) };
             return None;
         }
         if self.prepare_vacant_insert() {
@@ -2406,7 +2410,9 @@ where
         if !gate.passes() {
             let probe = self.prf.prepare(hash);
             if let Some(vacancy) = self.head_vacancy(probe) {
-                self.place_in_head(key, value, membership, gate, probe, vacancy);
+                // SAFETY: slot, gate and vacancy were read just above, with
+                // no write since.
+                unsafe { self.place_in_head(key, value, membership, gate, probe, vacancy) };
                 return None;
             }
         }

@@ -552,47 +552,57 @@ fn ordinary_level_multipliers_are_odd_and_distinct() {
     assert!(multipliers.iter().all(|multiplier| multiplier % 2 == 1));
 }
 
-/// The fingerprint tells apart the keys sharing a bucket, so it must stay
-/// spread over its values among the keys one bucket draws, for the key
-/// families an identity hasher passes through unmixed.
+/// The fingerprint tells apart the keys sharing a bucket, so two keys of one
+/// bucket must share it about once in its number of values: for a mixing
+/// hasher, for the key families an identity hasher passes through unmixed,
+/// and for bucket counts on both sides of a power of two.
 #[test]
 #[cfg_attr(
     miri,
     ignore = "counts fingerprints over hundreds of thousands of keys"
 )]
-fn fingerprints_stay_spread_within_a_bucket_for_unmixed_key_families() {
+fn fingerprints_stay_spread_within_a_bucket_for_every_key_family() {
+    use core::hash::BuildHasher;
+
     const KEYS: u64 = 1 << 17;
-    const BUCKETS: usize = 8;
     const VALUES: usize = 128;
-    const EXPECTED: u64 = KEYS / (BUCKETS * VALUES) as u64;
     type Family = (&'static str, fn(u64) -> u64);
     let oracle = FunnelPrf::new(FIXED_SEED);
-    let range = PreparedProbeRange::new(BUCKETS).unwrap();
-    let families: [Family; 3] = [
+    let families: [Family; 5] = [
+        ("mixed", |index| {
+            crate::test_support::fixed_hasher().hash_one(index)
+        }),
         ("sequential", |index| index),
         ("multiplicative", |index| {
             index.wrapping_mul(0x9E37_79B9_7F4A_7C15)
         }),
         ("shifted", |index| index << 32),
+        ("stepped", |index| index * VALUES as u64),
     ];
-    for (family, key_of) in families {
-        for level in [0, 1, 7] {
-            let multiplier = FunnelPrf::ordinary_multiplier(level).unwrap();
-            let mut counts = [[0_u64; VALUES]; BUCKETS];
-            for index in 0..KEYS {
-                let probe = oracle.prepare(key_of(index));
-                let (bucket, _) = ordinary_funnel_first_draw(probe, multiplier, range);
-                let fingerprint = probe.fingerprint();
-                assert!(crate::raw::control::is_occupied(fingerprint));
-                counts[bucket][usize::from(fingerprint) % VALUES] += 1;
-            }
-            for (bucket, counts) in counts.iter().enumerate() {
-                for (value, &count) in counts.iter().enumerate() {
-                    assert!(
-                        (EXPECTED / 2..=EXPECTED * 2).contains(&count),
-                        "{family} level {level} bucket {bucket} value {value}: {count}"
-                    );
+    for buckets in [8, 1_000, 4_096] {
+        let range = PreparedProbeRange::new(buckets).unwrap();
+        for (family, key_of) in families {
+            for level in [0, 1, 7] {
+                let multiplier = FunnelPrf::ordinary_multiplier(level).unwrap();
+                let mut counts = alloc::vec![[0_u64; VALUES]; buckets];
+                for index in 0..KEYS {
+                    let probe = oracle.prepare(key_of(index));
+                    let (bucket, _) = ordinary_funnel_first_draw(probe, multiplier, range);
+                    let fingerprint = probe.fingerprint();
+                    assert!(crate::raw::control::is_occupied(fingerprint));
+                    counts[bucket][usize::from(fingerprint) % VALUES] += 1;
                 }
+                // Pairs of keys sharing a bucket, and those of them sharing a
+                // fingerprint as well.
+                let pairs = |count: u64| count * count.saturating_sub(1) / 2;
+                let sharing_bucket: u64 =
+                    counts.iter().map(|bucket| pairs(bucket.iter().sum())).sum();
+                let sharing_both: u64 = counts.iter().flatten().copied().map(pairs).sum();
+                let even = sharing_bucket / VALUES as u64;
+                assert!(
+                    (even - even / 8..=even + even / 8).contains(&sharing_both),
+                    "{family} level {level} buckets {buckets}: {sharing_both} of {sharing_bucket}"
+                );
             }
         }
     }
