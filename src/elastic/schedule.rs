@@ -265,23 +265,25 @@ fn entry_origin<T>(levels: &[Level<T>]) -> *mut u8 {
 }
 
 impl ProbeSchedule {
-    /// The entry beside control byte `slot` of the control bytes at
-    /// `control`.
+    /// Byte offset from the entry origin of the entry beside control byte
+    /// `slot` of the control bytes at `control`.
+    #[inline]
+    pub(super) fn entry_offset<T>(control: *const u8, slot: usize) -> usize {
+        control
+            .addr()
+            .wrapping_add(slot)
+            .wrapping_mul(size_of::<T>())
+    }
+
+    /// The entry at [`Self::entry_offset`] `offset`.
     ///
     /// # Safety
     ///
-    /// That control byte is one of the levels this schedule was built for,
-    /// and `T` is their entry type.
+    /// The offset is that of a control byte of the levels this schedule was
+    /// built for, and `T` is their entry type.
     #[inline]
-    pub(super) unsafe fn entry<T>(&self, control: *const u8, slot: usize) -> *mut T {
-        self.entry_origin
-            .wrapping_add(
-                control
-                    .addr()
-                    .wrapping_add(slot)
-                    .wrapping_mul(size_of::<T>()),
-            )
-            .cast()
+    pub(super) unsafe fn entry_at<T>(&self, offset: usize) -> *mut T {
+        self.entry_origin.wrapping_add(offset).cast()
     }
 
     /// A copy of `self` with room for `route_capacity` routes, each route

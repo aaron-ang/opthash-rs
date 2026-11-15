@@ -1621,13 +1621,14 @@ where
                     prepared.route,
                     key_fingerprint,
                     filter,
-                    |_, _, entry| entry,
+                    |_, _, offset| offset,
                 );
                 match walked {
-                    ScheduleSearch::Hit(entry) => {
+                    ScheduleSearch::Hit(offset) => {
                         // SAFETY: the walk hands on an occupied slot of this
                         // table, which `&mut self` borrows alone.
-                        let slot = unsafe { &mut *entry };
+                        let slot: &mut SlotEntry<K, V> =
+                            unsafe { &mut *self.probe_schedule.entry_at(offset) };
                         return Some(mem::replace(&mut slot.value, value));
                     }
                     ScheduleSearch::Absent => {}
@@ -2261,14 +2262,21 @@ where
         Q: Equivalent<K> + ?Sized,
     {
         let key_fingerprint = key_fingerprint(route);
-        let walked =
-            self.walk_schedule(key, route, key_fingerprint, filter, |level, slot, entry| {
+        let walked = self.walk_schedule(
+            key,
+            route,
+            key_fingerprint,
+            filter,
+            |level, slot, offset| (level, slot, offset),
+        );
+        match walked {
+            ScheduleSearch::Hit((level, slot, offset)) => {
                 // SAFETY: the walk hands on an occupied slot of this table,
                 // which `&'a self` keeps from changing.
-                on_hit(level, slot, unsafe { &*entry })
-            });
-        match walked {
-            ScheduleSearch::Hit(hit) => Some(hit),
+                Some(on_hit(level, slot, unsafe {
+                    &*self.probe_schedule.entry_at(offset)
+                }))
+            }
             ScheduleSearch::Absent => None,
             ScheduleSearch::Unresolved => self.find_by_general_schedule(
                 key,
@@ -2300,7 +2308,7 @@ where
         prepared: PreparedElasticRoute,
         key_fingerprint: u8,
         filter: ElasticRouteFilter<'_>,
-        mut on_hit: impl FnMut(usize, usize, *mut SlotEntry<K, V>) -> R,
+        mut on_hit: impl FnMut(usize, usize, usize) -> R,
     ) -> ScheduleSearch<R>
     where
         Q: Equivalent<K> + ?Sized,
@@ -2313,13 +2321,13 @@ where
         // SAFETY: the route's shifted index maps into the control bytes it
         // holds.
         if unsafe { *route.control().add(h11_slot) } == key_fingerprint {
+            let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(route.control(), h11_slot);
             // SAFETY: only a level's own control bytes hold a fingerprint,
             // and one marks an occupied slot.
-            let entry: *mut SlotEntry<K, V> =
-                unsafe { self.probe_schedule.entry(route.control(), h11_slot) };
+            let entry: *mut SlotEntry<K, V> = unsafe { self.probe_schedule.entry_at(offset) };
             // SAFETY: as above, the slot holds an entry.
             if key.equivalent(unsafe { &(*entry).key }) {
-                return ScheduleSearch::Hit(on_hit(0, h11_slot, entry));
+                return ScheduleSearch::Hit(on_hit(0, h11_slot, offset));
             }
         }
 
@@ -2344,14 +2352,14 @@ where
             // it holds.
             let control = unsafe { *route.control().add(slot) };
             if control == key_fingerprint {
+                let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(route.control(), slot);
                 // SAFETY: the sentinel's control bytes match no fingerprint,
                 // so the route names a real level, and a fingerprint match
                 // means the slot is occupied.
-                let entry: *mut SlotEntry<K, V> =
-                    unsafe { self.probe_schedule.entry(route.control(), slot) };
+                let entry: *mut SlotEntry<K, V> = unsafe { self.probe_schedule.entry_at(offset) };
                 // SAFETY: as above, the slot holds an entry.
                 if key.equivalent(unsafe { &(*entry).key }) {
-                    return ScheduleSearch::Hit(on_hit(route.level() as usize, slot, entry));
+                    return ScheduleSearch::Hit(on_hit(route.level() as usize, slot, offset));
                 }
                 unlikely_path();
             } else if control == CTRL_EMPTY {
