@@ -92,13 +92,19 @@ impl ExactPlacement {
     }
 }
 
+/// One lookup probe, carrying what the walk reads from its level so a step
+/// touches the route alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
 struct PhiRoute {
-    /// Temporarily holds `phi` while a new suffix is sorted, then the
-    /// route's level.
-    level: u32,
+    level: u8,
+    /// [`Level::index_shift`] of the route's level.
+    index_shift: u8,
     /// The route's [`probe::elastic_sequence_index`].
     sequence_index: u32,
+    /// Control bytes of the route's level. Holds `phi` as a bare address
+    /// while a new suffix is sorted.
+    control: *const u8,
 }
 
 impl PhiRoute {
@@ -110,7 +116,9 @@ impl PhiRoute {
     }
 }
 
-const _: () = assert!(mem::size_of::<PhiRoute>() == 8);
+const _: () = assert!(GENERAL_REDUCTION <= u8::MAX as u32);
+const _: () = assert!(MAX_LEVELS <= u8::MAX as usize);
+const _: () = assert!(mem::size_of::<PhiRoute>() == 16);
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
@@ -1350,6 +1358,7 @@ where
         }
         let old_len = self.probe_schedule.len();
         for level in 0..self.scheduled_levels as usize {
+            let region = &self.levels[level];
             let from_probe =
                 first_paper_probe_after(level as u128 + 1, u128::from(prior_high_water));
             for_each_phi_route(level, from_probe, high_water, |paper_probe, phi| {
@@ -1360,16 +1369,22 @@ where
                         .is_ok_and(|index| index < QUERY_PROBE_LIMIT),
                     "Elastic query-probe convention exhausted"
                 );
-                let level = u32::try_from(level).expect("Elastic level count fits u32");
+                let phi = usize::try_from(phi).expect("Elastic query cap fits usize");
                 self.probe_schedule.push(PhiRoute {
-                    level: u32::try_from(phi).expect("Elastic query cap fits u32"),
-                    sequence_index: probe::elastic_sequence_index(level, logical_probe_index),
+                    level: u8::try_from(level).expect("Elastic level count fits u8"),
+                    index_shift: u8::try_from(region.index_shift)
+                        .expect("Elastic index shift fits u8"),
+                    sequence_index: probe::elastic_sequence_index(
+                        u32::try_from(level).expect("Elastic level count fits u32"),
+                        logical_probe_index,
+                    ),
+                    control: core::ptr::without_provenance(phi),
                 });
             });
         }
-        self.probe_schedule[old_len..].sort_unstable_by_key(|route| route.level);
+        self.probe_schedule[old_len..].sort_unstable_by_key(|route| route.control.addr());
         for route in &mut self.probe_schedule[old_len..] {
-            route.level = probe::elastic_sequence_coordinates(route.sequence_index).0;
+            route.control = self.levels[route.level as usize].ctrl_ptr;
         }
         self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
             | u32::try_from(high_water).expect("Elastic query cap fits u32");
@@ -1663,6 +1678,10 @@ where
 
         // Success: reclaim arena + levels so the guard's Drop no-ops.
         let (arena, levels) = guard.disarm();
+        // The copied routes still address the source's control bytes.
+        for route in &mut probe_schedule {
+            route.control = levels[route.level as usize].ctrl_ptr;
+        }
 
         let mut cloned = Self {
             levels,
@@ -2126,19 +2145,19 @@ where
             if open_levels & (1_u32 << level) == 0 {
                 continue;
             }
-            // SAFETY: schedule routes name real levels.
-            let region = unsafe { self.levels.get_unchecked(level) };
             // Level zero reducing by shift means every level of the table
             // does.
             let slot = probe::shifted_elastic_index(
                 sequence.word(route.sequence_index),
-                region.index_shift,
+                u32::from(route.index_shift),
             );
-            // SAFETY: the shifted index maps into the level's capacity.
-            let control = unsafe { region.control_at(slot) };
+            // SAFETY: the route holds its level's control base, and the
+            // shifted index maps into that level's capacity.
+            let control = unsafe { *route.control.add(slot) };
             if control == key_fingerprint {
-                // SAFETY: a fingerprint match means the slot is occupied.
-                let entry = unsafe { region.get_ref(slot) };
+                // SAFETY: schedule routes name real levels, and a
+                // fingerprint match means the slot is occupied.
+                let entry = unsafe { self.levels.get_unchecked(level).get_ref(slot) };
                 if key.equivalent(&entry.key) {
                     return ScheduleSearch::Hit(on_hit(level, slot, entry));
                 }
