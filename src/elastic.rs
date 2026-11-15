@@ -117,8 +117,77 @@ impl PhiRoute {
 }
 
 const _: () = assert!(GENERAL_REDUCTION <= u8::MAX as u32);
-const _: () = assert!(MAX_LEVELS <= u8::MAX as usize);
 const _: () = assert!(mem::size_of::<PhiRoute>() == 16);
+
+/// Control bytes the sentinel route probes: its shift leaves one index bit.
+static SENTINEL_CONTROL: [u8; 2] = [CTRL_EMPTY; 2];
+
+/// Bit of a lookup's open-level set that stands for the sentinel route,
+/// above every real level.
+const SENTINEL_LEVEL: u8 = 63;
+const _: () = assert!(SENTINEL_LEVEL as u32 == u64::BITS - 1);
+const _: () = assert!(MAX_LEVELS <= SENTINEL_LEVEL as usize);
+
+/// Lookup routes in query-position order, closed by a sentinel route so a
+/// walk needs no end test: the sentinel's level is open in every walk and
+/// its probe reads an `EMPTY` control byte, which is where a walk stops.
+struct ProbeSchedule {
+    /// The routes, then the sentinel.
+    routes: Vec<PhiRoute>,
+}
+
+impl ProbeSchedule {
+    const SENTINEL: PhiRoute = PhiRoute {
+        level: SENTINEL_LEVEL,
+        index_shift: SENTINEL_LEVEL,
+        sequence_index: 0,
+        control: SENTINEL_CONTROL.as_ptr(),
+    };
+
+    /// An empty schedule with room for the routes of `level_count` levels.
+    fn try_for_levels(level_count: usize) -> Result<Self, TryReserveError> {
+        let mut routes = Vec::new();
+        routes
+            .try_reserve_exact(PROBE_SCHEDULE_CAPACITY[level_count] + 1)
+            .map_err(|_| TryReserveError::AllocError)?;
+        routes.push(Self::SENTINEL);
+        Ok(Self { routes })
+    }
+
+    /// A copy of `self` with room for the routes of `level_count` levels.
+    fn clone_for_levels(&self, level_count: usize) -> Self {
+        let mut routes = Vec::with_capacity(PROBE_SCHEDULE_CAPACITY[level_count] + 1);
+        routes.extend_from_slice(&self.routes);
+        Self { routes }
+    }
+
+    #[inline]
+    fn routes(&self) -> &[PhiRoute] {
+        &self.routes[..self.routes.len() - 1]
+    }
+
+    fn routes_mut(&mut self) -> &mut [PhiRoute] {
+        let len = self.routes.len() - 1;
+        &mut self.routes[..len]
+    }
+
+    /// First route of a walk, which ends at the sentinel.
+    #[inline]
+    fn first(&self) -> *const PhiRoute {
+        self.routes.as_ptr()
+    }
+
+    fn clear(&mut self) {
+        self.routes.clear();
+        self.routes.push(Self::SENTINEL);
+    }
+
+    fn push(&mut self, route: PhiRoute) {
+        let sentinel = self.routes.len() - 1;
+        self.routes[sentinel] = route;
+        self.routes.push(Self::SENTINEL);
+    }
+}
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
@@ -256,7 +325,7 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     /// Probes of every scheduled level the schedule already holds: a
     /// placement within them, in a scheduled level, needs no extension.
     scheduled_probes: u32,
-    probe_schedule: Vec<PhiRoute>,
+    probe_schedule: ProbeSchedule,
     /// [`probe::ELASTIC_FOLD_MULTIPLIER`], kept in the table so the hot
     /// paths load it rather than build it.
     fold_multiplier: u64,
@@ -579,14 +648,6 @@ const fn level_route_count(level: usize) -> usize {
     count
 }
 
-fn try_probe_schedule(level_count: usize) -> Result<Vec<PhiRoute>, TryReserveError> {
-    let mut schedule = Vec::new();
-    schedule
-        .try_reserve_exact(PROBE_SCHEDULE_CAPACITY[level_count])
-        .map_err(|_| TryReserveError::AllocError)?;
-    Ok(schedule)
-}
-
 /// Schedule paper batches and allocation-epoch boundaries.
 ///
 /// The active batch is a function of the live count alone: batch `i` covers
@@ -897,7 +958,7 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let probe_schedule = try_probe_schedule(geometry.level_capacities.len())?;
+        let probe_schedule = ProbeSchedule::try_for_levels(geometry.level_capacities.len())?;
         let (arena, levels, membership) =
             try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
 
@@ -1356,7 +1417,7 @@ where
         if high_water <= u128::from(prior_high_water) {
             return;
         }
-        let old_len = self.probe_schedule.len();
+        let old_len = self.probe_schedule.routes().len();
         for level in 0..self.scheduled_levels as usize {
             let region = &self.levels[level];
             let from_probe =
@@ -1382,8 +1443,9 @@ where
                 });
             });
         }
-        self.probe_schedule[old_len..].sort_unstable_by_key(|route| route.control.addr());
-        for route in &mut self.probe_schedule[old_len..] {
+        let added = &mut self.probe_schedule.routes_mut()[old_len..];
+        added.sort_unstable_by_key(|route| route.control.addr());
+        for route in added {
             route.control = self.levels[route.level as usize].ctrl_ptr;
         }
         self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
@@ -1661,8 +1723,7 @@ where
         let scheduler = self.scheduler.clone();
         let hash_builder = self.hash_builder.clone();
         let alloc = self.alloc.clone();
-        let mut probe_schedule = Vec::with_capacity(PROBE_SCHEDULE_CAPACITY[self.levels.len()]);
-        probe_schedule.extend_from_slice(&self.probe_schedule);
+        let mut probe_schedule = self.probe_schedule.clone_for_levels(self.levels.len());
         let level_capacities = PlanBuffer::from_iter(self.levels.iter().map(ArenaSlots::capacity));
         let (arena, levels, membership) = alloc_elastic_arena(&level_capacities, &self.alloc);
 
@@ -1679,7 +1740,7 @@ where
         // Success: reclaim arena + levels so the guard's Drop no-ops.
         let (arena, levels) = guard.disarm();
         // The copied routes still address the source's control bytes.
-        for route in &mut probe_schedule {
+        for route in probe_schedule.routes_mut() {
             route.control = levels[route.level as usize].ctrl_ptr;
         }
 
@@ -1793,7 +1854,7 @@ where
         geometry: &ElasticGeometry,
         transition: EpochTransition,
     ) -> Result<(), TryReserveError> {
-        let probe_schedule = try_probe_schedule(geometry.level_capacities.len())?;
+        let probe_schedule = ProbeSchedule::try_for_levels(geometry.level_capacities.len())?;
         let (arena, levels, membership) =
             try_alloc_elastic_arena(&geometry.level_capacities, &self.alloc)?;
         let used_exceptional_placement = rebuild::rebuild(
@@ -2139,10 +2200,17 @@ where
         }
 
         let level_mask = filter.expanded_level_mask();
-        let mut open_levels = level_mask;
-        for route in &self.probe_schedule {
-            let level = route.level as usize;
-            if open_levels & (1_u32 << level) == 0 {
+        let mut open_levels = u64::from(level_mask) | (1 << SENTINEL_LEVEL);
+        let mut next = self.probe_schedule.first();
+        loop {
+            // SAFETY: the schedule ends with its sentinel, and the walk
+            // cannot pass it: the sentinel's level stays open until its own
+            // probe, which reads `EMPTY` and breaks below.
+            let route = unsafe { &*next };
+            // SAFETY: as above, `route` is at most the sentinel, the last
+            // element, so this is at most one past the end.
+            next = unsafe { next.add(1) };
+            if (open_levels >> route.level) & 1 == 0 {
                 continue;
             }
             // Level zero reducing by shift means every level of the table
@@ -2155,8 +2223,10 @@ where
             // shifted index maps into that level's capacity.
             let control = unsafe { *route.control.add(slot) };
             if control == key_fingerprint {
-                // SAFETY: schedule routes name real levels, and a
-                // fingerprint match means the slot is occupied.
+                let level = route.level as usize;
+                // SAFETY: the sentinel's control bytes match no fingerprint,
+                // so the route names a real level, and a fingerprint match
+                // means the slot is occupied.
                 let entry = unsafe { self.levels.get_unchecked(level).get_ref(slot) };
                 if key.equivalent(&entry.key) {
                     return ScheduleSearch::Hit(on_hit(level, slot, entry));
@@ -2165,8 +2235,10 @@ where
                 // A key takes its level's first free probe, and a slot never
                 // returns to `EMPTY` while its level holds entries, so the
                 // key cannot sit at a later probe of this level.
-                open_levels &= !(1_u32 << level);
-                if open_levels == 0 {
+                open_levels &= !(1 << route.level);
+                // Either no real level is left open, or this was the
+                // sentinel.
+                if open_levels <= 1 << SENTINEL_LEVEL {
                     break;
                 }
             }
@@ -2206,7 +2278,7 @@ where
             return Some(on_hit(0, h11_slot, entry));
         }
 
-        for route in &self.probe_schedule {
+        for route in self.probe_schedule.routes() {
             let level = route.level as usize;
             if level_mask & (1_u32 << level) == 0 {
                 continue;
@@ -2320,7 +2392,7 @@ pub(crate) struct ElasticGeneration<K, V> {
     probe_high_water: u32,
     scheduled_levels: u32,
     scheduled_probes: u32,
-    probe_schedule: Vec<PhiRoute>,
+    probe_schedule: ProbeSchedule,
     membership: MembershipRegion,
     metadata_words: *mut MetadataWord,
     stale_membership: usize,
