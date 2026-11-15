@@ -109,13 +109,19 @@ When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-
 
 ### Design Priorities
 
+These priorities are defaults, not limits. When a measurement disagrees with
+one, build the variant and let instruction counts and `scripts/bench.sh`
+decide; name the default it departs from in the PR.
+
 - Import types and traits, but call free functions through their owning module
   (for example, `probe::elastic_phi`). Do not flatten internal functions through
   `mod.rs`; keep crate-root re-exports limited to the curated public interface.
 - Prefer layout and locality wins before adding more metadata. Keep hot metadata contiguous — if fields are read together, store them together.
 - Cache routing state that's reused in hot paths; never recompute it per probe.
 - Preserve SIMD-friendly control-byte scans: contiguous groups, cheap bitmask iteration, early rejection before touching payloads.
-- Treat values that are constant by construction as constants. Storing them as runtime fields costs a load + mul per probe that LLVM can't fold away.
+- Keep values the compiler can fold (geometry, shifts, strides) as constants. A runtime field costs a load per probe and stops the compiler from turning a multiply or divide into a shift.
+- Measure wide constants instead of assuming. Building a 64-bit immediate can take more instructions than one load from a hot struct, and the answer differs by target.
+- Placement and probe words may change while the paper's assumptions hold: uniform, independent choices per level, the same geometry and probe order. Update the test oracle to match, and show in the PR that level occupancy and probe lengths are unchanged and that no special-array or exceptional placement appears.
 
 ### Reject
 
