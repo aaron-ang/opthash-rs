@@ -1923,12 +1923,35 @@ where
     #[inline(never)]
     fn settle_after_deletes(&mut self) {
         self.settle_counts();
-        if self.tombstones > capacity::tombstone_cleanup_threshold(self.shape.n) {
+        if self.cleanup_due() {
             self.resize_with_transition(self.shape.n, EpochTransition::TombstoneCleanup);
-        } else if self.stale_membership > membership::refresh_deletes(self.shape.max_insertions) {
+        } else {
+            self.refresh_stale_membership();
+        }
+    }
+
+    /// [`Self::settle_after_deletes`] for a lone delete, which leaves a due
+    /// cleanup to [`Self::prepare_vacant_insert`]. No lookup stops at a
+    /// tombstone and only an insert places around one, so a run of deletes
+    /// re-places no survivor that a later delete of the run removes.
+    #[cold]
+    #[inline(never)]
+    fn settle_after_delete(&mut self) {
+        self.settle_counts();
+        self.refresh_stale_membership();
+    }
+
+    fn refresh_stale_membership(&mut self) {
+        if self.stale_membership > membership::refresh_deletes(self.shape.max_insertions) {
             self.refresh_membership();
             self.settle_counts();
         }
+    }
+
+    /// Whether the settled tombstone count is past its threshold. The delete
+    /// that crosses it settles, so no uncounted delete hides a due cleanup.
+    fn cleanup_due(&self) -> bool {
+        self.tombstones > capacity::tombstone_cleanup_threshold(self.shape.n)
     }
 
     fn copy_membership_from(&mut self, source: &Self) {
@@ -2135,8 +2158,10 @@ where
         let left = if self.tombstones == 0 {
             0
         } else {
-            let cleanup =
-                capacity::tombstone_cleanup_threshold(self.shape.n).saturating_sub(self.tombstones);
+            // A due cleanup has no later delete to settle at.
+            let cleanup = capacity::tombstone_cleanup_threshold(self.shape.n)
+                .checked_sub(self.tombstones)
+                .unwrap_or(usize::MAX);
             let refresh = membership::refresh_deletes(self.shape.max_insertions)
                 .saturating_sub(self.stale_membership);
             cleanup.min(refresh)
@@ -2334,16 +2359,26 @@ where
             .map(|shape| shape.n)
     }
 
-    /// Grows the table if the next insert would exceed the insertion limit.
+    /// Grows the table if the next insert would exceed the insertion limit,
+    /// or rebuilds it at its size if lone deletes left a cleanup due.
     /// Returns `true` when a resize ran, so a search from before it is stale.
     #[inline]
     fn prepare_vacant_insert(&mut self) -> bool {
         if self.entries() >= self.shape.max_insertions {
             self.grow_for_next_insert();
             true
+        } else if self.cleanup_due() {
+            self.clean_tombstones_for_next_insert();
+            true
         } else {
             false
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn clean_tombstones_for_next_insert(&mut self) {
+        self.resize_with_transition(self.shape.n, EpochTransition::TombstoneCleanup);
     }
 
     #[cold]
@@ -2745,7 +2780,7 @@ where
         // SAFETY: a live location names an in-bounds slot.
         unsafe { self.storage.mark_tombstone(slot) };
         if self.count_delete() {
-            self.settle_after_deletes();
+            self.settle_after_delete();
         }
         (entry.key, entry.value)
     }

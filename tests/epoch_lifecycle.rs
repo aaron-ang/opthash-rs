@@ -180,6 +180,35 @@ fn tombstone_cleanup_is_an_observable_same_size_epoch_boundary() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+fn funnel_leaves_a_due_tombstone_cleanup_to_the_next_absent_insert() {
+    let mut map = FunnelHashMap::<usize, usize>::with_capacity(512);
+    let capacity = fill_to_capacity!(map);
+    let before = map.epoch();
+    let kept = capacity - 1;
+
+    for key in 0..kept {
+        assert_eq!(map.remove(&key), Some(key));
+    }
+    assert_eq!(map.epoch().generation, before.generation);
+    assert_eq!(map.get(&kept), Some(&kept));
+    assert_eq!(map.get(&0), None);
+
+    // Replacing a value places nothing, so the cleanup stays due.
+    assert_eq!(map.insert(kept, 0), Some(kept));
+    assert_eq!(map.epoch().generation, before.generation);
+
+    assert_eq!(map.insert(capacity, capacity), None);
+    let after = map.epoch();
+    assert_eq!(after.generation, before.generation + 1);
+    assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
+    assert_eq!(map.capacity(), capacity);
+    assert_eq!(map.len(), 2);
+    assert_eq!(map.get(&kept), Some(&0));
+    assert_eq!(map.get(&capacity), Some(&capacity));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
 fn bulk_removal_cleans_tombstones_after_iteration_finishes() {
     macro_rules! check {
         ($map:expr) => {{

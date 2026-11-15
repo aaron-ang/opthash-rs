@@ -621,7 +621,12 @@ fn assert_matches_model(
         .filter(|&slot| unsafe { table.storage.control_at(slot) } == CTRL_TOMBSTONE)
         .count();
     assert_eq!(table.tombstones(), tombstone_controls);
-    assert!(table.tombstones() <= capacity::tombstone_cleanup_threshold(table.shape.n));
+    // Lone deletes leave a due cleanup to the next insert of an absent key,
+    // which the stream checks; the threshold must still have settled.
+    assert_eq!(
+        table.cleanup_due(),
+        table.tombstones() > capacity::tombstone_cleanup_threshold(table.shape.n)
+    );
     assert!(table.stale_membership() <= membership::refresh_deletes(table.shape.max_insertions));
     assert!(table.settle_left >= 1);
     coverage.uncounted_deletes += usize::from(table.uncounted_deletes() != 0);
@@ -763,19 +768,20 @@ fn run_differential(
     for step in 0..stream.operations {
         // A filling stretch meets the insertion budget and growth, a mixed
         // one reuses tombstones, and a draining one removes only live keys,
-        // so tombstones pass the cleanup threshold.
+        // so tombstones pass the cleanup threshold; its few inserts draw
+        // from the whole universe, so one meets the cleanup left due.
         let (insert_below, draining) = match step % cycle {
             at if at < stream.filling => (85, false),
             at if at < stream.filling + stream.mixed => (50, false),
-            _ => (2, true),
+            _ => (3, true),
         };
         let drawn = universe[usize::try_from(next() % universe.len() as u64).unwrap()];
-        let key = if draining {
+        let roll = next() % 100;
+        let key = if draining && roll >= insert_below {
             model.range(drawn..).next().map_or(drawn, |(key, _)| *key)
         } else {
             drawn
         };
-        let roll = next() % 100;
         let slots = table.shape.n;
         let tombstones = table.tombstones();
         let prf = table.prf;
@@ -795,7 +801,15 @@ fn run_differential(
             );
             let previous = model.insert(key, value);
             coverage.overwrites += usize::from(previous.is_some());
+            let due = table.cleanup_due();
             insert_checking_the_head_walk(&mut table, key, value, previous, &mut coverage);
+            // An absent key's insert runs the cleanup its deletes left due.
+            if previous.is_none() {
+                assert!(!table.cleanup_due(), "step {step}");
+                coverage.tombstone_cleanups += usize::from(due);
+            } else {
+                assert_eq!(table.cleanup_due(), due, "step {step}");
+            }
         } else if step % stream.clear_every == stream.clear_every - 1 {
             table.clear();
             model.clear();
@@ -809,8 +823,12 @@ fn run_differential(
                 model.remove(&key).map(|value| (key, value)),
                 "step {step} remove {key:?}"
             );
-            // A remove adds a tombstone unless it triggered the cleanup.
-            coverage.tombstone_cleanups += usize::from(table.tombstones() < tombstones);
+            // A remove of a live key adds a tombstone and never rebuilds.
+            assert_eq!(
+                table.tombstones(),
+                tombstones + usize::from(removed.is_some()),
+                "step {step}"
+            );
         }
         assert!(table.entries() <= table.shape.max_insertions, "step {step}");
         // The first allocation is not a growth.
