@@ -5,7 +5,8 @@ pub(crate) const CTRL_TOMBSTONE: u8 = 0x01;
 /// Set on every occupied control byte and on neither sentinel, so a group
 /// scan tells live slots from free ones by the sign bit alone.
 pub(crate) const OCCUPIED_BIT: u8 = 0x80;
-/// Shift that pulls the 7 high bits of a 64-bit hash into bits [6:0].
+/// Shift by which [`control_fingerprint`] pulls the 7 high bits of a 64-bit
+/// hash into bits [6:0].
 const FINGERPRINT_SHIFT: u32 = 57;
 
 /// True when the control byte carries a fingerprint (slot holds a live entry).
