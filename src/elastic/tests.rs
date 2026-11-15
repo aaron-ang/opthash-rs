@@ -293,6 +293,30 @@ fn elastic_geometry_carries_capacity_and_batch_state() {
 }
 
 #[test]
+fn lookups_find_every_live_entry_after_a_clear_that_panicked() {
+    const KEYS: usize = 900;
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut map = ManuallyDrop::new(FixedElasticHashMap::<u64, PanicOnFirstDrop>::with_capacity(
+        KEYS,
+    ));
+    for key in 0..KEYS as u64 {
+        map.insert(key, PanicOnFirstDrop(drops.clone()));
+    }
+
+    let result = catch_unwind(AssertUnwindSafe(|| map.clear()));
+    assert!(result.is_err());
+    assert_eq!(map.len(), KEYS - 1);
+    let found = (0..KEYS as u64)
+        .filter(|key| map.get(key).is_some())
+        .count();
+    assert_eq!(found, map.len());
+
+    map.clear();
+    // SAFETY: `map` is not used after this drop.
+    unsafe { ManuallyDrop::drop(&mut map) };
+}
+
+#[test]
 fn clear_marks_each_slot_empty_before_dropping_its_value() {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut map = ManuallyDrop::new(FixedElasticHashMap::<u64, PanicOnFirstDrop>::with_capacity(

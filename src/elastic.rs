@@ -1018,6 +1018,11 @@ where
     }
 
     fn clear(&mut self) {
+        // Draining empties slots in slot order, so a drop that panics leaves
+        // `EMPTY` slots ahead of live entries on their probe routes. The
+        // flag keeps lookups off the walk that stops at `EMPTY` until
+        // `reset_after_clear` lifts it.
+        self.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG;
         for level in &mut self.levels {
             level.drain_reset(|entry| {
                 self.len -= 1;
@@ -2089,24 +2094,37 @@ where
         }
 
         let level_mask = filter.expanded_level_mask();
+        let mut open_levels = level_mask;
         for route in &self.probe_schedule {
             let level = route.level as usize;
-            if level_mask & (1_u32 << level) == 0 {
+            if open_levels & (1_u32 << level) == 0 {
                 continue;
             }
-            // SAFETY: schedule routes name real levels, and level zero
-            // reducing by shift means every level of the table does.
-            let slot = unsafe {
-                probe::shifted_elastic_probe_index(
-                    prepared.route.probe,
-                    route.counter_base,
-                    self.levels.get_unchecked(level).index_shift,
-                )
-            };
-            // SAFETY: the route names a real level and the shifted index maps
-            // into its capacity.
-            if let Some(entry) = unsafe { self.entry_if_match(level, slot, key_fingerprint, key) } {
-                return ScheduleSearch::Hit(on_hit(level, slot, entry));
+            // SAFETY: schedule routes name real levels.
+            let region = unsafe { self.levels.get_unchecked(level) };
+            // Level zero reducing by shift means every level of the table
+            // does.
+            let slot = probe::shifted_elastic_probe_index(
+                prepared.route.probe,
+                route.counter_base,
+                region.index_shift,
+            );
+            // SAFETY: the shifted index maps into the level's capacity.
+            let control = unsafe { region.control_at(slot) };
+            if control == key_fingerprint {
+                // SAFETY: a fingerprint match means the slot is occupied.
+                let entry = unsafe { region.get_ref(slot) };
+                if key.equivalent(&entry.key) {
+                    return ScheduleSearch::Hit(on_hit(level, slot, entry));
+                }
+            } else if control == CTRL_EMPTY {
+                // A key takes its level's first free probe, and a slot never
+                // returns to `EMPTY` while its level holds entries, so the
+                // key cannot sit at a later probe of this level.
+                open_levels &= !(1_u32 << level);
+                if open_levels == 0 {
+                    break;
+                }
             }
         }
         if self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG != 0 {
