@@ -336,13 +336,26 @@ fn lookups_find_every_live_entry_after_a_clear_that_panicked() {
         .count();
     assert_eq!(found, map.len());
 
+    // The interrupted drain reads as a run of removals: nothing is flagged
+    // exceptional, and later inserts place without a recovery.
+    assert_eq!(map.table().probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
+    let recoveries = map.epoch().placement_recoveries;
+    for key in KEYS as u64..2 * KEYS as u64 {
+        map.insert(key, PanicOnFirstDrop(drops.clone()));
+    }
+    assert_eq!(map.epoch().placement_recoveries, recoveries);
+    let found = (0..2 * KEYS as u64)
+        .filter(|key| map.get(key).is_some())
+        .count();
+    assert_eq!(found, map.len());
+
     map.clear();
     // SAFETY: `map` is not used after this drop.
     unsafe { ManuallyDrop::drop(&mut map) };
 }
 
 #[test]
-fn clear_marks_each_slot_empty_before_dropping_its_value() {
+fn clear_tombstones_each_slot_before_dropping_its_value() {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut map = ManuallyDrop::new(FixedElasticHashMap::<u64, PanicOnFirstDrop>::with_capacity(
         32,
@@ -366,8 +379,9 @@ fn clear_marks_each_slot_empty_before_dropping_its_value() {
     assert!(result.is_err());
     assert_eq!(
         map.table().levels[first_occupied.0].checked_control(first_occupied.1),
-        CTRL_EMPTY
+        CTRL_TOMBSTONE
     );
+    assert_eq!(map.table().levels[first_occupied.0].tombstones, 1);
     let live_controls = map
         .table()
         .levels
