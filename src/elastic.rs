@@ -665,14 +665,15 @@ pub(crate) struct BatchScheduler {
     batch_start: usize,
     /// `batch_ends[current_batch_index]`, or `usize::MAX` for an empty plan.
     batch_end: usize,
-    /// Live count below which [`ElasticTable::settled_slot`] can place: the
+    /// Live count below which [`ElasticTable::settled_level_slot`] can place: the
     /// table's insertion limit, or zero where [`settled_limit()`] rules a
     /// settled insert out.
     settled_limit: usize,
     /// Exclusive live-count bound of the cached batch's settled inserts: the
-    /// lower of `batch_end` and `settled_limit`, or zero once a removal took
-    /// the live count below `batch_start`. A live count under this bound is
-    /// therefore inside the cached batch.
+    /// lower of `batch_end` and `settled_limit`, or zero once the live count
+    /// fell below `batch_start`. Every path that lowers the table's live
+    /// count reports it through [`Self::note_removal`] or re-syncs the
+    /// batch, so a live count under this bound is inside the cached batch.
     settled_end: usize,
 }
 
@@ -994,11 +995,16 @@ unsafe fn reset_metadata(membership: MembershipRegion, base: *mut u8) {
         let words = unsafe { membership.ptr::<MetadataWord>(base) };
         // SAFETY: as above, nothing else borrows the words, and a metadata
         // word is two machine words, by the assertion beside the pattern.
-        let tail =
-            unsafe { core::slice::from_raw_parts_mut(words.cast::<[u64; 2]>(), membership.words) };
+        // The tail may be uninitialized, which `MaybeUninit` allows.
+        let tail = unsafe {
+            core::slice::from_raw_parts_mut(words.cast::<MaybeUninit<[u64; 2]>>(), membership.words)
+        };
         // Rebuilt from its elements: the fill then stores a value it holds
         // in registers, which is what makes the loop a wide one.
-        tail.fill([NO_METADATA_WORDS[0], NO_METADATA_WORDS[1]]);
+        tail.fill(MaybeUninit::new([
+            NO_METADATA_WORDS[0],
+            NO_METADATA_WORDS[1],
+        ]));
     }
 }
 
@@ -1203,6 +1209,9 @@ where
         for level in &mut self.levels {
             level.drain_reset(|entry| {
                 self.len -= 1;
+                // Before the drop: one that panics leaves the table live
+                // with this count.
+                self.scheduler.note_removal(self.len);
                 drop(entry);
             });
         }
@@ -1237,11 +1246,7 @@ where
         self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control)
     }
 
-    /// The slot [`Self::choose_slot_for_new_key`] gives a new key, when the
-    /// table needs no growth, the cached batch is current, its levels reduce
-    /// by shift, and the batch's first choice of level has a free slot among
-    /// its scheduled probes. `None` leaves the insert to
-    /// [`Self::insert_for_vacant_entry_prepared`].
+    /// [`Self::settled_level_slot`] with the level by index.
     #[cfg(test)]
     fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize, u8)> {
         let (region, slot, control) = self.settled_level_slot(probe)?;
@@ -1250,8 +1255,13 @@ where
         Some((level, slot, control))
     }
 
-    /// [`Self::settled_slot`] with the level by address, so a caller that
-    /// writes the slot does not index the levels again.
+    /// The slot [`Self::choose_slot_for_new_key`] gives a new key, when the
+    /// table needs no growth, the cached batch is current, its levels reduce
+    /// by shift, and the batch's first choice of level has a free slot among
+    /// its scheduled probes. `None` leaves the insert to
+    /// [`Self::insert_for_vacant_entry_prepared`]. The level comes by
+    /// address, so a caller that writes the slot does not index the levels
+    /// again.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn settled_level_slot(
@@ -2377,8 +2387,8 @@ where
         self.find_after_filter(key, prepared.route, key_fingerprint, filter, on_hit)
     }
 
-    /// The lookup of a key that passed `filter`. Out of line so the filter
-    /// test inlines alone.
+    /// The lookup of a key that passed `filter`: the schedule walk, then the
+    /// general schedule for a walk that ends unresolved.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn find_after_filter<'a, Q, R>(
@@ -2448,7 +2458,8 @@ where
     }
 
     /// Walks the candidates of a key that passed `filter` in schedule order
-    /// and hands `on_hit` the level, slot and entry that holds the key. A
+    /// and hands `on_hit` the level and slot that hold the key and the
+    /// entry's offset for [`ProbeSchedule::entry_at`]. A
     /// table that needs the general reduction has routes that probe
     /// nothing, so its walk ends unresolved.
     #[allow(clippy::inline_always)]
