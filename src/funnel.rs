@@ -21,7 +21,7 @@ use crate::exact::probe::{
 use crate::hasher::DefaultHashBuilder;
 use crate::membership::{self, MembershipKey, MembershipRegion, MetadataWord};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
-use crate::raw::bitmask::BITMASK_STRIDE;
+use crate::raw::bitmask::{BITMASK_STRIDE, BitMask};
 use crate::raw::config::GROUP_SIZE;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::raw::iter::OccupiedIndices;
@@ -58,6 +58,10 @@ enum FunnelScanMode {
     Sparse(OccupiedIndices),
 }
 
+/// Ordinary levels a lookup can name by level-bin bit, rounded up to a power
+/// of two so indexing masks instead of bounds-checking.
+const HEAD_LEVELS: usize = (OVERFLOW_LEVEL + 1).next_power_of_two();
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LevelShape {
     offset: usize,
@@ -71,6 +75,10 @@ struct FunnelShape {
     n: usize,
     max_insertions: usize,
     levels: Box<[LevelShape]>,
+    /// The levels that own a level-bin bit, copied inline so a lookup indexes
+    /// them without the pointer chase or a bounds check. Entries past the
+    /// last level have no buckets.
+    head: [LevelShape; HEAD_LEVELS],
     beta: usize,
     loglog_ceiling: usize,
     primary_offset: usize,
@@ -87,12 +95,27 @@ struct FunnelShape {
     selects: bool,
 }
 
+impl LevelShape {
+    const ABSENT: Self = Self {
+        offset: 0,
+        bucket_range: PreparedProbeRange::empty(),
+        multiplier: 0,
+    };
+}
+
 impl FunnelShape {
+    /// Shape of ordinary level `level`, which owns a level-bin bit.
+    #[inline]
+    fn head_level(&self, level: u32) -> &LevelShape {
+        &self.head[level as usize % HEAD_LEVELS]
+    }
+
     fn empty() -> Self {
         Self {
             n: 0,
             max_insertions: 0,
             levels: Box::new([]),
+            head: [LevelShape::ABSENT; HEAD_LEVELS],
             beta: 0,
             loglog_ceiling: 0,
             primary_offset: 0,
@@ -164,10 +187,15 @@ impl FunnelShape {
         }
         let loglog_ceiling =
             u8::try_from(plan.loglog_ceiling()).map_err(|_| TryReserveError::CapacityOverflow)?;
+        let mut head = [LevelShape::ABSENT; HEAD_LEVELS];
+        for (slot, level) in head.iter_mut().zip(&levels) {
+            *slot = *level;
+        }
         Ok(Self {
             n,
             max_insertions: config.max_insertions(),
             levels: levels.into_boxed_slice(),
+            head,
             beta: plan.beta(),
             loglog_ceiling: usize::from(loglog_ceiling),
             primary_offset,
@@ -1104,16 +1132,20 @@ where
         self.lookup_overflow_levels(key, probe, key_fingerprint)
     }
 
-    /// Lookup over the ordinary levels the key's bin recorded, checking only
-    /// the first fingerprint match of each bucket. `Ok` is the lookup's
+    /// Lookup over the ordinary levels the key's bin recorded, comparing the
+    /// key against each bucket's fingerprint matches. `Ok` is the lookup's
     /// answer. `Err` hands the lookup to the ordered walk: a rejected probe
-    /// word, a matching fingerprint on another key, a bucket wider than one
-    /// group, or a key that may sit in the overflow levels or outside its
-    /// funnel.
+    /// word, a bucket wider than one group, or a key that may sit in the
+    /// overflow levels or outside its funnel.
     ///
     /// A level without the fingerprint cannot hold the key, so the walk moves
     /// on without the ordered walk's `EMPTY` test, which only shortens misses
     /// the filter let through.
+    ///
+    /// Each level is scanned at the bucket its first probe word selects,
+    /// before that word is known to be accepted. A key found there is the
+    /// answer either way, so only a lookup that finds nothing tests the
+    /// words, and hands off if one was rejected.
     ///
     /// Calls nothing but the key comparison, so a caller that hands off by
     /// tail call keeps no frame.
@@ -1136,44 +1168,42 @@ where
         let probe = self.prf.prepare(key_hash);
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
-        let scan = |level: u32| -> Result<(usize, u64), ()> {
-            let level = self.shape.levels.get(level as usize).ok_or(())?;
-            let bucket =
-                probe::ordinary_funnel_first_index(probe, level.multiplier, level.bucket_range)
-                    .ok_or(())?;
+        let scan = |level: u32| -> (usize, u64) {
+            let level = self.shape.head_level(level);
+            let (bucket, _) =
+                probe::ordinary_funnel_first_draw(probe, level.multiplier, level.bucket_range);
             let start = level.offset + bucket * self.shape.beta;
-            // SAFETY: an ordinary bucket ends at or before `n`, and the control
-            // array pads `GROUP_SIZE - 1` bytes past `n`.
+            // SAFETY: a first draw is below the level's bucket count whether
+            // or not its word is accepted, an ordinary bucket ends at or
+            // before `n`, and the control array pads `GROUP_SIZE - 1` bytes
+            // past `n`. A level past the shape's last has no buckets and
+            // draws slot zero, which a shape with lanes has.
             let matches =
                 unsafe { simd::eq_mask_group(self.storage.ctrl_ptr().add(start), key_fingerprint) };
-            Ok((start, matches.0 & lanes))
+            (start, matches.0 & lanes)
         };
-        let confirm = |start: usize, matches: u64| -> Result<Option<usize>, ()> {
-            let slot = start + (matches.trailing_zeros() / BITMASK_STRIDE) as usize;
+        let holds_key = |slot: usize| -> bool {
             // SAFETY: a matched lane lies inside its bucket and carries the
             // fingerprint, so the slot is in bounds and occupied.
             let entry = unsafe { self.storage.get_ref(slot) };
-            if key.equivalent(&entry.key) {
-                Ok(Some(slot))
-            } else {
-                Err(())
-            }
+            key.equivalent(&entry.key)
         };
-        let mut ordinary = levels & !OVERFLOW_LEVEL_BIT;
-        if ordinary != 0 && self.shape.selects {
+        let recorded = levels & !OVERFLOW_LEVEL_BIT;
+        let mut pending = recorded;
+        if pending != 0 && self.shape.selects {
             // The first two recorded levels are scanned together and the
             // holder is selected, not branched on: which of them holds the key
             // is unpredictable.
-            let first = ordinary.trailing_zeros();
-            ordinary &= ordinary - 1;
-            let second = if ordinary == 0 {
+            let first = pending.trailing_zeros();
+            pending &= pending - 1;
+            let second = if pending == 0 {
                 first
             } else {
-                ordinary.trailing_zeros()
+                pending.trailing_zeros()
             };
-            ordinary &= ordinary.wrapping_sub(1);
-            let (first_start, first_matches) = scan(first)?;
-            let (second_start, second_matches) = scan(second)?;
+            pending &= pending.wrapping_sub(1);
+            let (first_start, first_matches) = scan(first);
+            let (second_start, second_matches) = scan(second);
             let in_first = first_matches != 0;
             let start = if in_first { first_start } else { second_start };
             let matches = if in_first {
@@ -1182,18 +1212,37 @@ where
                 second_matches
             };
             if matches != 0 {
-                return confirm(start, matches);
+                let slot = start + (matches.trailing_zeros() / BITMASK_STRIDE) as usize;
+                if holds_key(slot) {
+                    return Ok(Some(slot));
+                }
+                // Another key shares the fingerprint. Start over, comparing
+                // every match of every recorded level.
+                pending = recorded;
             }
         }
-        while ordinary != 0 {
-            let (start, matches) = scan(ordinary.trailing_zeros())?;
-            ordinary &= ordinary - 1;
-            if matches != 0 {
-                return confirm(start, matches);
+        while pending != 0 {
+            let (start, matches) = scan(pending.trailing_zeros());
+            pending &= pending - 1;
+            for lane in BitMask(matches) {
+                let slot = start + lane;
+                if holds_key(slot) {
+                    return Ok(Some(slot));
+                }
             }
         }
         if levels & OVERFLOW_LEVEL_BIT != 0 || self.exceptional_placement {
             return Err(());
+        }
+        let mut unchecked = recorded;
+        while unchecked != 0 {
+            let level = self.shape.head_level(unchecked.trailing_zeros());
+            unchecked &= unchecked - 1;
+            let (_, accepted) =
+                probe::ordinary_funnel_first_draw(probe, level.multiplier, level.bucket_range);
+            if !accepted {
+                return Err(());
+            }
         }
         Ok(None)
     }

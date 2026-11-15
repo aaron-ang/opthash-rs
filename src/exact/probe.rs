@@ -548,8 +548,9 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
     reduce_prepared_funnel_retries(probe, logical_probe_index, range, last_rejection_index)
 }
 
-/// The bucket an ordinary level's first random word selects, or `None` when
-/// that word is rejected and the probe needs [`ordinary_funnel_retry_index`].
+/// The bucket an ordinary level's first random word selects, and whether that
+/// word is accepted. The bucket is below the range's upper bound either way;
+/// a rejected word needs [`ordinary_funnel_retry_index`].
 ///
 /// The first word of an ordinary level is the mixed key times that level's
 /// multiplier, not a counter word: `key_out` is already a full mix of the
@@ -557,14 +558,28 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
 /// one multiply.
 #[allow(clippy::cast_possible_truncation)]
 #[inline]
+pub(crate) fn ordinary_funnel_first_draw(
+    probe: PreparedFastFunnelProbe,
+    multiplier: u64,
+    range: PreparedProbeRange,
+) -> (usize, bool) {
+    let product =
+        u128::from(probe.ordinary_first_word(multiplier)) * u128::from(range.upper as u64);
+    (
+        (product >> u64::BITS) as usize,
+        product as u64 >= range.rejection_threshold,
+    )
+}
+
+/// [`ordinary_funnel_first_draw`]'s bucket when its word is accepted.
+#[inline]
 pub(crate) fn ordinary_funnel_first_index(
     probe: PreparedFastFunnelProbe,
     multiplier: u64,
     range: PreparedProbeRange,
 ) -> Option<usize> {
-    let product =
-        u128::from(probe.ordinary_first_word(multiplier)) * u128::from(range.upper as u64);
-    (product as u64 >= range.rejection_threshold).then_some((product >> u64::BITS) as usize)
+    let (bucket, accepted) = ordinary_funnel_first_draw(probe, multiplier, range);
+    accepted.then_some(bucket)
 }
 
 /// Counter words one to [`RANGE_WORD_CAP`] of ordinary level `level`, for a
