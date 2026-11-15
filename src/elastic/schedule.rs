@@ -256,9 +256,10 @@ pub(super) struct ProbeSchedule {
 }
 
 /// Where the entry of a control byte at address zero would lie. The arena
-/// lays the levels' control bytes out back to back and their entries in the
-/// same order, so an entry's address is this plus its control byte's address
-/// times the entry size.
+/// lays the levels' control bytes and their entries out in the same order
+/// and leaves the same number of slots between two levels in both, so an
+/// entry's address is this plus its control byte's address times the entry
+/// size.
 fn entry_origin<T>(levels: &[Level<T>]) -> *mut u8 {
     let origin_of = |region: &Level<T>| {
         region

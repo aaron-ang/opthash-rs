@@ -127,11 +127,9 @@ pub(crate) struct Level<T> {
     ctrl_ptr: *mut u8,
     /// Cached `arena.as_ptr() + data_offset`, stamped at construction.
     data_ptr: *mut MaybeUninit<T>,
-    /// Exact logical slot count. Bounded by the arena layout, so the counters
-    /// fit in `u32` too.
+    /// Exact logical slot count. Bounded by the arena layout, so the
+    /// level's [`LevelCounters`] fit in `u32` too.
     capacity: u32,
-    len: u32,
-    tombstones: u32,
     /// [`probe::elastic_index_shift`] of `capacity`, or [`GENERAL_REDUCTION`]
     /// when any level of the table has no such shift. A table's levels
     /// therefore reduce all by shift or all by the general reduction, and
@@ -153,6 +151,46 @@ pub(crate) struct Level<T> {
     sequence_run: (u32, u32),
 }
 
+/// A level's live and tombstone counts, stored in the arena directly ahead of
+/// the level's control bytes so a walk that holds those reaches the counts
+/// without the descriptor.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct LevelCounters {
+    len: u32,
+    tombstones: u32,
+}
+
+impl LevelCounters {
+    /// Counts one live entry turned into a tombstone.
+    #[inline]
+    fn remove_one(&mut self) {
+        self.len -= 1;
+        self.tombstones += 1;
+    }
+}
+
+/// The counters of the level whose control bytes start at `control`.
+///
+/// # Safety
+///
+/// `control` is the control pointer of a level stamped by
+/// [`build_elastic_levels`].
+#[inline]
+unsafe fn level_counters(control: *mut u8) -> *mut LevelCounters {
+    // SAFETY: the caller's contract; the counters sit in the same arena.
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe {
+        control.sub(size_of::<LevelCounters>()).cast()
+    }
+}
+
+/// Control-section bytes the counters of `levels` levels take at most,
+/// padding included.
+const fn counter_bytes(levels: usize) -> usize {
+    levels * (size_of::<LevelCounters>() + align_of::<LevelCounters>() - 1)
+}
+
 /// [`Level::index_shift`] of every level in a table that has a level whose
 /// probes need the general range reduction.
 const GENERAL_REDUCTION: u32 = u64::BITS;
@@ -168,9 +206,10 @@ unsafe impl<T: Sync> Sync for Level<T> {}
 const _: () = assert!(mem::size_of::<Level<SlotEntry<u64, u64>>>() == 64);
 
 // SAFETY: descriptors are only stamped at offsets carved from an arena
-// allocated by `arena::layout_for` for exactly `capacity` ctrl bytes and
-// slots, whose ctrl bytes `try_allocate_with_ctrl_zeroed` starts EMPTY, and
-// are dropped or re-stamped before that arena is freed.
+// that `elastic_arena_layout` sized for every level's `capacity` ctrl bytes
+// and slots besides its counters, whose ctrl bytes
+// `try_allocate_with_ctrl_zeroed` starts EMPTY, and are dropped or
+// re-stamped before that arena is freed.
 unsafe impl<T> ArenaSlots<T> for Level<T> {
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
@@ -201,8 +240,6 @@ impl<T> Level<T> {
             ctrl_ptr,
             data_ptr,
             capacity: cap_u32,
-            len: 0,
-            tombstones: 0,
             index_shift: u16::try_from(index_shift).expect("Elastic index shift fits u16"),
             scheduled_probes: 0,
             // At most the capacity, which fits.
@@ -214,6 +251,31 @@ impl<T> Level<T> {
     }
 
     #[inline]
+    fn counters(&self) -> &LevelCounters {
+        // SAFETY: every level's control bytes follow its counters in the
+        // arena, aligned for them, and the table that owns the arena is
+        // borrowed for as long as the level.
+        unsafe { &*level_counters(self.ctrl_ptr) }
+    }
+
+    #[inline]
+    fn counters_mut(&mut self) -> &mut LevelCounters {
+        // SAFETY: as in `counters`, and `&mut self` borrows the level alone.
+        unsafe { &mut *level_counters(self.ctrl_ptr) }
+    }
+
+    /// Live entries.
+    #[inline]
+    fn len(&self) -> u32 {
+        self.counters().len
+    }
+
+    #[inline]
+    fn tombstones(&self) -> u32 {
+        self.counters().tombstones
+    }
+
+    #[inline]
     fn index_shift(&self) -> u32 {
         u32::from(self.index_shift)
     }
@@ -221,14 +283,14 @@ impl<T> Level<T> {
     /// Slots minus live entries (includes tombstones, reusable on insert).
     #[inline]
     fn free_slots(&self) -> usize {
-        (self.capacity - self.len) as usize
+        (self.capacity - self.len()) as usize
     }
 
     /// Case 2's test on the active pair's current level: at most half its
     /// reserve is left, so new keys go to the next level.
     #[inline]
     fn low(&self) -> bool {
-        self.capacity - self.len <= self.half_reserve
+        self.capacity - self.len() <= self.half_reserve
     }
 
     /// Tombstones exceed [`capacity::tombstone_cleanup_threshold`], so the
@@ -236,7 +298,7 @@ impl<T> Level<T> {
     /// or at the insert after one that reuses a tombstone of this level.
     #[inline]
     fn needs_cleanup(&self) -> bool {
-        self.tombstones as usize > capacity::tombstone_cleanup_threshold(self.capacity as usize)
+        self.tombstones() as usize > capacity::tombstone_cleanup_threshold(self.capacity as usize)
     }
 
     /// Moves every live entry out through `visit` and resets the level to
@@ -253,12 +315,11 @@ impl<T> Level<T> {
             let entry = unsafe { self.take(slot) };
             // SAFETY: `slot` is in bounds, as above.
             unsafe { self.mark_tombstone(slot) };
-            self.len -= 1;
-            self.tombstones += 1;
+            self.counters_mut().remove_one();
             visit(entry);
         }
         self.clear_all_controls();
-        self.tombstones = 0;
+        self.counters_mut().tombstones = 0;
     }
 }
 
@@ -474,8 +535,14 @@ struct ElasticArenaLayout {
     membership: MembershipRegion,
 }
 
-fn elastic_arena_layout<K, V>(total_slots: usize) -> Result<ElasticArenaLayout, TryReserveError> {
-    let (base_layout, data_base_off) = arena::layout_for::<K, V>(total_slots)?;
+fn elastic_arena_layout<K, V>(
+    total_slots: usize,
+    levels: usize,
+) -> Result<ElasticArenaLayout, TryReserveError> {
+    let ctrl_bytes = total_slots
+        .checked_add(counter_bytes(levels))
+        .ok_or(TryReserveError::CapacityOverflow)?;
+    let (base_layout, data_base_off) = arena::layout_for_extents::<K, V>(ctrl_bytes, ctrl_bytes)?;
     let (layout, membership) = MembershipRegion::extend::<MetadataWord>(base_layout, total_slots)?;
     Ok(ElasticArenaLayout {
         layout,
@@ -834,11 +901,11 @@ impl BatchScheduler {
     #[inline(never)]
     fn reuse_tombstone<T>(&mut self, level: &mut Level<T>) {
         // The threshold is at least half the level, a cheaper test.
-        if level.tombstones > level.capacity / 2 && level.needs_cleanup() {
+        if level.tombstones() > level.capacity / 2 && level.needs_cleanup() {
             self.batch_end = 0;
             self.settled_end = 0;
         }
-        level.tombstones -= 1;
+        level.counters_mut().tombstones -= 1;
     }
 
     /// [`Self::reopen`] on a copy: whether an insert into that table
@@ -1029,7 +1096,9 @@ fn build_elastic_levels<K, V>(
             Some(shift) if all_shift => shift,
             _ => GENERAL_REDUCTION,
         };
-        // SAFETY: the arena was allocated for the layout these caps sum to.
+        cursor.reserve_ctrl_header::<LevelCounters>()?;
+        // SAFETY: the arena was allocated for the layout these caps sum to,
+        // with room for every level's counters.
         let (ctrl_ptr, data_ptr) = unsafe { cursor.reserve(cap_u32)? };
         levels.push(Level::new_at(
             level,
@@ -1056,8 +1125,13 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     alloc: &A,
 ) -> Result<ElasticArenaBuild<K, V>, TryReserveError> {
     let total_ctrl = total_ctrl(level_capacities).ok_or(TryReserveError::CapacityOverflow)?;
-    let arena_layout = elastic_arena_layout::<K, V>(total_ctrl)?;
-    let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout.layout, total_ctrl, alloc)?;
+    let arena_layout = elastic_arena_layout::<K, V>(total_ctrl, level_capacities.len())?;
+    // Zeroed counters read as an empty level.
+    let arena = Arena::try_allocate_with_ctrl_zeroed(
+        arena_layout.layout,
+        total_ctrl + counter_bytes(level_capacities.len()),
+        alloc,
+    )?;
     let membership = arena_layout.membership;
     // The arena zeroes control bytes only; an empty filter must read as
     // "nothing recorded".
@@ -1181,7 +1255,7 @@ fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
 fn handle_elastic_alloc_error<K, V>(level_capacities: &[usize]) -> ! {
     let layout = total_ctrl(level_capacities)
         .and_then(|total_ctrl| {
-            elastic_arena_layout::<K, V>(total_ctrl)
+            elastic_arena_layout::<K, V>(total_ctrl, level_capacities.len())
                 .ok()
                 .map(|layout| layout.layout)
         })
@@ -1729,11 +1803,16 @@ where
             // SAFETY: callers pass a free slot found within this level.
             debug_assert_eq!(prev_ctrl, unsafe { level.control_at(slot_idx) });
             debug_assert!(control::is_free(prev_ctrl));
+            // Taken ahead of the stores, which would otherwise have the
+            // level's control pointer read again for it.
+            let counters: *mut LevelCounters = level.counters_mut();
             // SAFETY: as above; `key_fingerprint` is an occupied control byte.
             unsafe {
                 level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
             }
-            level.len += 1;
+            // SAFETY: the level's counters, which the stores above leave
+            // where they are and which `&mut self` still borrows alone.
+            unsafe { (*counters).len += 1 };
         }
         self.placed += 1;
         // A free slot that is not empty is a tombstone. Last, so the call
@@ -2031,9 +2110,9 @@ where
             prepared.route,
             key_fingerprint,
             filter,
-            |level, slot, offset, control| (level, slot, offset, control),
+            |_, slot, offset, control| (slot, offset, control),
         );
-        let (level, slot, offset, control) = match walked {
+        let (slot, offset, control) = match walked {
             ScheduleSearch::Hit(hit) => hit,
             ScheduleSearch::Absent => return None,
             ScheduleSearch::Unresolved => {
@@ -2059,10 +2138,10 @@ where
         // owns and may write, and `slot` indexes them. The sentinel's are
         // never handed on: they match no fingerprint.
         unsafe { control.cast_mut().add(slot).write(control::CTRL_TOMBSTONE) };
-        // SAFETY: the walk names one of this table's levels.
-        let level = unsafe { self.levels.get_unchecked_mut(level) };
-        level.len -= 1;
-        level.tombstones += 1;
+        // SAFETY: `control` is the control bytes of one of this table's
+        // levels, which its counters precede, and `&mut self` borrows them
+        // alone.
+        unsafe { (*level_counters(control.cast_mut())).remove_one() };
         self.scheduler.note_removal();
         if self.maintenance_is_due() {
             self.maintain_after_deletes();
@@ -2083,8 +2162,7 @@ where
             let level = unsafe { self.levels.get_unchecked_mut(level_idx) };
             // SAFETY: and an in-bounds slot of it.
             unsafe { level.mark_tombstone(slot_idx) };
-            level.len -= 1;
-            level.tombstones += 1;
+            level.counters_mut().remove_one();
         }
         self.scheduler.note_removal();
     }
@@ -2167,8 +2245,7 @@ where
     fn wipe_all(&mut self) {
         for level in &mut self.levels {
             level.clear_all_controls();
-            level.len = 0;
-            level.tombstones = 0;
+            *level.counters_mut() = LevelCounters::default();
         }
         self.placed = self.stale_membership();
         self.reset_after_clear();
@@ -2193,8 +2270,7 @@ where
 
         for (dst, src_lvl) in guard.regions_mut().iter_mut().zip(self.levels.iter()) {
             dst.clone_region_from(src_lvl);
-            dst.len = src_lvl.len;
-            dst.tombstones = src_lvl.tombstones;
+            *dst.counters_mut() = *src_lvl.counters();
             dst.scheduled_probes = src_lvl.scheduled_probes;
         }
 
@@ -2482,7 +2558,7 @@ where
                 } else {
                     // Not low, so the level has a free slot.
                     let budget = probe::elastic_level_probe_budget(
-                        current_level.capacity - current_level.len,
+                        current_level.capacity - current_level.len(),
                         current_level.capacity,
                         self.reserve_fraction.exponent(),
                         ELASTIC_PROBE_BUDGET_C,

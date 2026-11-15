@@ -145,7 +145,7 @@ impl ExactTrace {
                 table
                     .levels
                     .iter()
-                    .map(|level| level.len as usize)
+                    .map(|level| level.len() as usize)
                     .collect::<Vec<_>>(),
                 scalar.level_occupancy()
             );
@@ -185,7 +185,7 @@ impl ExactTrace {
             self.table
                 .levels
                 .iter()
-                .map(|level| level.len as usize)
+                .map(|level| level.len() as usize)
                 .collect::<Vec<_>>(),
             self.scalar.level_occupancy()
         );
@@ -212,7 +212,7 @@ fn elastic_placement_matches_the_scalar_model_with_the_current_level_low() {
                 identity += 1;
             }
             let level = &trace.table.levels[current];
-            let free = level.capacity() - level.len as usize;
+            let free = level.capacity() - level.len() as usize;
             let threshold = level.half_reserve as usize;
             // Only a threshold of two or more tells itself from its half.
             if free != threshold || threshold < 2 {
@@ -636,7 +636,7 @@ fn clear_tombstones_each_slot_before_dropping_its_value() {
         map.table().levels[first_occupied.0].checked_control(first_occupied.1),
         CTRL_TOMBSTONE
     );
-    assert_eq!(map.table().levels[first_occupied.0].tombstones, 1);
+    assert_eq!(map.table().levels[first_occupied.0].tombstones(), 1);
     let live_controls = map
         .table()
         .levels
@@ -649,7 +649,7 @@ fn clear_tombstones_each_slot_before_dropping_its_value() {
         .sum::<usize>();
     assert_eq!(map.len(), live_controls);
     assert!(map.table().levels.iter().all(|level| {
-        level.len as usize
+        level.len() as usize
             == (0..level.capacity())
                 .filter(|&slot| control::is_occupied(level.checked_control(slot)))
                 .count()
@@ -752,7 +752,7 @@ fn caught_hash_panic_during_try_resize_keeps_every_entry() {
         .sum::<usize>();
     assert_eq!(map.len(), live_controls);
     assert!(map.table().levels.iter().all(|level| {
-        level.len as usize
+        level.len() as usize
             == (0..level.capacity())
                 .filter(|&slot| control::is_occupied(level.checked_control(slot)))
                 .count()
@@ -773,11 +773,65 @@ fn caught_hash_panic_during_try_resize_keeps_every_entry() {
 }
 
 #[test]
+fn level_counters_sit_ahead_of_their_control_bytes_without_overlap() {
+    for capacity in [1, 2, 7, 56, 300, 1792, 5000] {
+        let mut table =
+            ElasticTable::<u64, u64, FixedHashBuilder>::with_capacity_and_reserve_and_hasher_in(
+                capacity,
+                ReserveFraction::DEFAULT,
+                fixed_hasher(),
+                Global,
+            );
+        let layout =
+            elastic_arena_layout::<u64, u64>(table.total_slots, table.levels.len()).unwrap();
+        let base = table.arena.as_ptr().addr();
+        let mut control_end = base;
+        let mut data_end = base + layout.data_base_off;
+        for level in &table.levels {
+            let counters = ptr::from_ref(level.counters()).addr();
+            assert!(counters >= control_end);
+            assert_eq!(counters % mem::align_of::<LevelCounters>(), 0);
+            assert_eq!(
+                counters + mem::size_of::<LevelCounters>(),
+                level.ctrl_ptr.addr()
+            );
+            control_end = level.ctrl_ptr.addr() + level.capacity();
+            assert!(level.data_ptr.addr() >= data_end);
+            data_end =
+                level.data_ptr.addr() + level.capacity() * mem::size_of::<SlotEntry<u64, u64>>();
+        }
+        assert!(control_end <= base + layout.data_base_off);
+        assert!(data_end <= base + layout.membership.offset);
+
+        // Filling every level leaves each count equal to its occupancy, so
+        // no control byte or entry was written over a counter.
+        for key in 0..capacity as u64 {
+            let hash = table.hash_key(&key);
+            table.insert(key, key, hash);
+        }
+        for level in &table.levels {
+            let occupied = (0..level.capacity())
+                // SAFETY: the slot is in bounds.
+                .filter(|&slot| control::is_occupied(unsafe { level.control_at(slot) }))
+                .count();
+            assert_eq!(level.len() as usize, occupied);
+            assert_eq!(level.tombstones(), 0);
+        }
+        for key in 0..capacity as u64 {
+            let hash = table.hash_key(&key);
+            assert!(table.find(&key, hash).is_some());
+        }
+    }
+}
+
+#[test]
 fn elastic_metadata_is_appended_without_moving_control_or_data() {
     fn assert_layout<K, V>() {
         for &slots in &[0, 1, 7, 8, 31, 256] {
-            let (base, data_offset) = arena::layout_for::<K, V>(slots).unwrap();
-            let extended = elastic_arena_layout::<K, V>(slots).unwrap();
+            let levels = if slots == 0 { 0 } else { 3 };
+            let extent = slots + counter_bytes(levels);
+            let (base, data_offset) = arena::layout_for_extents::<K, V>(extent, extent).unwrap();
+            let extended = elastic_arena_layout::<K, V>(slots, levels).unwrap();
             assert_eq!(extended.data_base_off, data_offset);
             if slots == 0 {
                 assert_eq!(extended.layout.size(), 0);
@@ -805,7 +859,9 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
             fixed_hasher(),
             Global,
         );
-    let layout = elastic_arena_layout::<OverAligned, OverAligned>(table.total_slots).unwrap();
+    let layout =
+        elastic_arena_layout::<OverAligned, OverAligned>(table.total_slots, table.levels.len())
+            .unwrap();
     assert_eq!(
         table.membership_ptr().addr(),
         // SAFETY: the membership offset lies within the arena layout.
@@ -1118,7 +1174,7 @@ fn route_summary_conservatively_records_every_live_level() {
         map.table()
             .levels
             .iter()
-            .filter(|level| level.len != 0)
+            .filter(|level| level.len() != 0)
             .count()
             > 1,
         "route summary must cover more than one occupied level"
@@ -1399,7 +1455,7 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
                             fingerprint,
                         );
                     }
-                    table.levels[level].len += 1;
+                    table.levels[level].counters_mut().len += 1;
                     table.placed += 1;
                     *next_key += 1;
                 }
@@ -1465,7 +1521,7 @@ fn direct_lookup_returns_the_compared_slot_reference() {
         );
     let mut insertion_count = 0;
     while insertion_count < table.max_insertions
-        && !table.levels.iter().skip(1).any(|level| level.len > 0)
+        && !table.levels.iter().skip(1).any(|level| level.len() > 0)
     {
         let key = insertion_count;
         table.place_unique(
@@ -1478,7 +1534,7 @@ fn direct_lookup_returns_the_compared_slot_reference() {
         insertion_count += 1;
     }
     assert!(
-        table.levels.iter().skip(1).any(|level| level.len > 0),
+        table.levels.iter().skip(1).any(|level| level.len() > 0),
         "test must exercise lookup beyond level 0"
     );
 
@@ -1678,7 +1734,11 @@ fn inserts_spill_to_deeper_levels_at_high_load() {
         map.insert(i, i);
     }
     assert!(
-        map.table().levels.iter().skip(1).any(|level| level.len > 0),
+        map.table()
+            .levels
+            .iter()
+            .skip(1)
+            .any(|level| level.len() > 0),
         "expected the exact batch schedule to populate a deeper level"
     );
     for i in 0..max {
@@ -1698,7 +1758,7 @@ fn removing_every_entry_empties_every_level() {
         map.remove(&i);
     }
     assert_eq!(map.len(), 0);
-    assert!(map.table().levels.iter().all(|level| level.len == 0));
+    assert!(map.table().levels.iter().all(|level| level.len() == 0));
 }
 
 #[test]
@@ -1718,7 +1778,13 @@ fn drop_continues_past_a_panicking_value() {
     // Fill until entries spill past level 0, so the walk resumed after the
     // panic must cross levels.
     let mut inserted = 0;
-    while !map.table().levels.iter().skip(1).any(|level| level.len > 0) {
+    while !map
+        .table()
+        .levels
+        .iter()
+        .skip(1)
+        .any(|level| level.len() > 0)
+    {
         map.insert(inserted, PanicOnFirstDrop(drops.clone()));
         inserted += 1;
     }
@@ -1833,7 +1899,7 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
                 control::OCCUPIED_BIT,
             );
         }
-        table.levels[LEVEL].len += 1;
+        table.levels[LEVEL].counters_mut().len += 1;
         table.placed += 1;
         next_key += 1;
     }
@@ -1963,12 +2029,12 @@ fn first_entry_in_a_deeper_level_reschedules_through_that_level() {
         let deepest = table
             .levels
             .iter()
-            .rposition(|level| level.len > 0)
+            .rposition(|level| level.len() > 0)
             .unwrap();
         assert!(deepest < table.scheduled_levels as usize);
         if table.scheduled_levels != scheduled_levels {
             assert_eq!(table.scheduled_levels as usize, deepest + 1);
-            assert_eq!(table.levels[deepest].len, 1);
+            assert_eq!(table.levels[deepest].len(), 1);
             scheduled_levels = table.scheduled_levels;
             reschedules += 1;
         }
@@ -2678,8 +2744,8 @@ fn assert_counters_match_controls(table: &ElasticTable<u64, u64, FixedHashBuilde
             occupied += usize::from(!control::is_free(control));
             tombstones += usize::from(control == crate::raw::control::CTRL_TOMBSTONE);
         }
-        assert_eq!(level.len as usize, occupied);
-        assert_eq!(level.tombstones as usize, tombstones);
+        assert_eq!(level.len() as usize, occupied);
+        assert_eq!(level.tombstones() as usize, tombstones);
         live += occupied;
     }
     assert_eq!(table.live(), live);
@@ -2732,11 +2798,7 @@ fn settled_inserts_match_an_ordered_map_model() {
                         .scheduler
                         .would_settle(table.placed, table.stale_membership());
                 let tombstones = |table: &ElasticTable<u64, u64, FixedHashBuilder>| {
-                    table
-                        .levels
-                        .iter()
-                        .map(|level| level.tombstones)
-                        .sum::<u32>()
+                    table.levels.iter().map(Level::tombstones).sum::<u32>()
                 };
                 let before = tombstones(&table);
                 assert_eq!(table.insert(key, step, hash), model.insert(key, step));
@@ -2969,8 +3031,8 @@ fn take_agrees_with_find_then_remove() {
 
         assert_eq!(fused.epoch_snapshot(), split.epoch_snapshot());
         for (taken, removed) in fused.levels.iter().zip(&split.levels) {
-            assert_eq!(taken.len, removed.len);
-            assert_eq!(taken.tombstones, removed.tombstones);
+            assert_eq!(taken.len(), removed.len());
+            assert_eq!(taken.tombstones(), removed.tombstones());
         }
         for key in 0..universe {
             let hash = fused.hash_builder.hash_one(key);
@@ -3029,7 +3091,7 @@ fn reusing_a_tombstone_past_the_threshold_starts_a_cleanup_inside_the_batch() {
     }
     let threshold = {
         let level = &map.table().levels[0];
-        assert_eq!(u64::from(level.len), live);
+        assert_eq!(u64::from(level.len()), live);
         capacity::tombstone_cleanup_threshold(level.capacity()) as u64
     };
     let departed = threshold + 4;
@@ -3044,13 +3106,13 @@ fn reusing_a_tombstone_past_the_threshold_starts_a_cleanup_inside_the_batch() {
     // threshold and the live count inside the batch throughout.
     let mut key = live;
     loop {
-        let tombstones = map.table().levels[0].tombstones;
+        let tombstones = map.table().levels[0].tombstones();
         map.insert(key, key);
         key += 1;
         let table = map.table();
         assert_eq!(map.epoch().generation, 0);
         assert_eq!(table.scheduler.current_batch_index, 0);
-        if table.levels[0].tombstones < tombstones {
+        if table.levels[0].tombstones() < tombstones {
             break;
         }
         assert!(key < live + 8, "no insert reused a tombstone");
@@ -3061,7 +3123,12 @@ fn reusing_a_tombstone_past_the_threshold_starts_a_cleanup_inside_the_batch() {
     let epoch = map.epoch();
     assert_eq!(epoch.generation, 1);
     assert_eq!(epoch.transition, EpochTransition::TombstoneCleanup);
-    assert!(map.table().levels.iter().all(|level| level.tombstones == 0));
+    assert!(
+        map.table()
+            .levels
+            .iter()
+            .all(|level| level.tombstones() == 0)
+    );
     for present in departed..=key {
         assert_eq!(map.get(&present), Some(&present));
     }
@@ -3133,7 +3200,7 @@ fn removing_a_full_table_leaves_no_tombstone_for_lookups() {
     // The last removal spent the countdown, so maintenance ran with it.
     let table = map.table();
     assert_eq!(table.stale_membership(), 0);
-    assert!(table.levels.iter().all(|level| level.tombstones == 0));
+    assert!(table.levels.iter().all(|level| level.tombstones() == 0));
     assert!((0..live).all(|key| {
         let prepared = PreparedElasticKey::new(table.hash_builder.hash_one(key));
         !table.route_filter(prepared).maybe_present
