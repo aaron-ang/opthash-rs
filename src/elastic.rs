@@ -97,23 +97,18 @@ struct PhiRoute {
     /// Temporarily holds `phi` while a new suffix is sorted, then the
     /// route's level.
     level: u32,
-    /// Zero-based logical probe of `level`. While the suffix is sorted its
-    /// high half carries the level.
-    logical: u32,
+    /// The route's [`probe::elastic_sequence_index`].
+    sequence_index: u32,
 }
 
 impl PhiRoute {
-    /// Bits of `logical` that hold the level while a suffix is sorted.
-    const SORT_LEVEL_SHIFT: u32 = 16;
-
     /// Packed retry-zero counter of the route, for the general reduction.
     #[inline]
     fn counter_base(self) -> u32 {
-        probe::elastic_counter_base(self.level, u64::from(self.logical))
+        let (level, logical) = probe::elastic_sequence_coordinates(self.sequence_index);
+        probe::elastic_counter_base(level, logical)
     }
 }
-
-const _: () = assert!(UNIFORM_SEARCH_CAP <= 1 << PhiRoute::SORT_LEVEL_SHIFT);
 
 const _: () = assert!(mem::size_of::<PhiRoute>() == 8);
 
@@ -1361,19 +1356,16 @@ where
                         .is_ok_and(|index| index < QUERY_PROBE_LIMIT),
                     "Elastic query-probe convention exhausted"
                 );
-                let logical =
-                    u32::try_from(logical_probe_index).expect("Elastic query probe fits u32");
                 let level = u32::try_from(level).expect("Elastic level count fits u32");
                 self.probe_schedule.push(PhiRoute {
                     level: u32::try_from(phi).expect("Elastic query cap fits u32"),
-                    logical: (level << PhiRoute::SORT_LEVEL_SHIFT) | logical,
+                    sequence_index: probe::elastic_sequence_index(level, logical_probe_index),
                 });
             });
         }
         self.probe_schedule[old_len..].sort_unstable_by_key(|route| route.level);
         for route in &mut self.probe_schedule[old_len..] {
-            route.level = route.logical >> PhiRoute::SORT_LEVEL_SHIFT;
-            route.logical &= (1 << PhiRoute::SORT_LEVEL_SHIFT) - 1;
+            route.level = probe::elastic_sequence_coordinates(route.sequence_index).0;
         }
         self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
             | u32::try_from(high_water).expect("Elastic query cap fits u32");
@@ -2115,8 +2107,7 @@ where
         if h11_shift == GENERAL_REDUCTION {
             return ScheduleSearch::Unresolved(filter.expanded_level_mask());
         }
-        let h11_slot =
-            probe::shifted_elastic_index(prepared.route.probe.probe_word(0, 0), h11_shift);
+        let h11_slot = probe::shifted_elastic_index(prepared.route.probe.probe_word(0), h11_shift);
         // SAFETY: the shifted index maps into level zero's capacity.
         if let Some(entry) = unsafe { self.entry_if_match(0, h11_slot, key_fingerprint, key) } {
             return ScheduleSearch::Hit(on_hit(0, h11_slot, entry));
@@ -2134,10 +2125,7 @@ where
             // Level zero reducing by shift means every level of the table
             // does.
             let slot = probe::shifted_elastic_index(
-                prepared
-                    .route
-                    .probe
-                    .probe_word(level, u64::from(route.logical)),
+                prepared.route.probe.probe_word(route.sequence_index),
                 region.index_shift,
             );
             // SAFETY: the shifted index maps into the level's capacity.

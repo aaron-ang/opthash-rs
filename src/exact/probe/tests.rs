@@ -93,15 +93,15 @@ fn elastic_counter_permutation_has_fixed_golden_vectors() {
     let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
     let cases = [
         (0, 0, 0, 0, 0x0000_0000, 0x0c30_dbdd_cb5c_5ccb),
-        (1, 31, 8_191, 7, 0x001f_ffff, 0x0451_a9e8_6434_f8a2),
-        (u64::MAX, 17, 383, 7, 0x0011_0bff, 0x5218_5e94_4fad_021a),
+        (1, 31, 8_191, 7, 0x001f_ffff, 0xd2ab_677c_8b49_ea94),
+        (u64::MAX, 17, 383, 7, 0x0011_0bff, 0x02e4_14ef_53a6_aa25),
         (
             0xd1b5_4a32_d192_ed03,
             7,
             7_687,
             0,
             0x0007_f038,
-            0x802e_a5ac_6975_87b1,
+            0xeef5_b0b8_ac22_ac14,
         ),
         (
             0xd1b5_4a32_d192_ed03,
@@ -117,7 +117,7 @@ fn elastic_counter_permutation_has_fixed_golden_vectors() {
             0,
             0,
             0x0001_0000,
-            0xd951_add9_e3ae_8876,
+            0x8164_c9be_3d81_144f,
         ),
     ];
     for (key, level, logical_probe, rejection, counter, word) in cases {
