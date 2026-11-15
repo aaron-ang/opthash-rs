@@ -95,6 +95,7 @@ impl ExactPlacement {
 }
 
 const _: () = assert!(GENERAL_REDUCTION <= u8::MAX as u32);
+const _: () = assert!(UNIFORM_SEARCH_CAP <= u16::MAX as u64);
 const _: () = assert!(MAX_LEVELS <= SENTINEL_LEVEL as usize);
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
@@ -114,7 +115,11 @@ pub(crate) struct Level<T> {
     /// when any level of the table has no such shift. A table's levels
     /// therefore reduce all by shift or all by the general reduction, and
     /// level zero answers which for the whole table.
-    index_shift: u32,
+    index_shift: u16,
+    /// Leading paper probes of this level the lookup schedule covers: a
+    /// placement within them needs no schedule extension. Zero for a level
+    /// the schedule holds no routes for.
+    scheduled_probes: u16,
 }
 
 /// [`Level::index_shift`] of every level in a table that has a level whose
@@ -164,8 +169,14 @@ impl<T> Level<T> {
             capacity: cap_u32,
             len: 0,
             tombstones: 0,
-            index_shift,
+            index_shift: u16::try_from(index_shift).expect("Elastic index shift fits u16"),
+            scheduled_probes: 0,
         }
+    }
+
+    #[inline]
+    fn index_shift(&self) -> u32 {
+        u32::from(self.index_shift)
     }
 
     /// Slots minus live entries (includes tombstones, reusable on insert).
@@ -234,9 +245,6 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     /// one a placement of this epoch chose. A deeper level holds no entry, so
     /// lookups have nothing to visit there.
     scheduled_levels: u32,
-    /// Probes of every scheduled level the schedule already holds: a
-    /// placement within them, in a scheduled level, needs no extension.
-    scheduled_probes: u32,
     probe_schedule: ProbeSchedule,
     /// [`probe::ELASTIC_FOLD_MULTIPLIER`], kept in the table so the hot
     /// paths load it rather than build it.
@@ -565,7 +573,7 @@ const fn level_route_count(level: usize) -> usize {
 /// `max_insertions` entries.
 fn settled_limit<T>(levels: &[Level<T>], max_insertions: usize) -> usize {
     match levels.first() {
-        Some(level) if level.index_shift != GENERAL_REDUCTION => max_insertions,
+        Some(level) if level.index_shift() != GENERAL_REDUCTION => max_insertions,
         _ => 0,
     }
 }
@@ -593,6 +601,17 @@ pub(crate) struct BatchScheduler {
     /// Live counts from `batch_start` that are inside the cached batch and
     /// below `settled_limit`.
     settled_span: usize,
+}
+
+/// One of the paper's insertion cases, resolved against a table's levels.
+struct PlacementCase<'a, K, V> {
+    /// The level to search first.
+    level: usize,
+    region: &'a Level<SlotEntry<K, V>>,
+    /// Probes of `level` the case allows, `u64::MAX` when it sets no bound.
+    budget: u64,
+    /// The level to search when the budget finds no slot.
+    fallback: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -933,7 +952,6 @@ where
             epoch: EpochState::initial(),
             probe_high_water: 0,
             scheduled_levels: 0,
-            scheduled_probes: 0,
             probe_schedule,
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
@@ -1071,7 +1089,9 @@ where
         self.scheduler.reset();
         self.probe_high_water = 0;
         self.scheduled_levels = 0;
-        self.scheduled_probes = 0;
+        for level in &mut self.levels {
+            level.scheduled_probes = 0;
+        }
         self.probe_schedule.clear();
         self.clear_membership();
         self.epoch.start(EpochTransition::Clear);
@@ -1087,9 +1107,11 @@ where
     }
 
     /// Inserts a key known to be absent and hands its location to `finish`.
-    /// The common insert chooses its slot inline: growth, a batch change, the
-    /// general range reduction, a target without a slot, and schedule growth
-    /// all leave for out-of-line paths.
+    /// The common insert searches its target level once, inline, among the
+    /// probes the lookup schedule already covers. Growth, a batch change, the
+    /// general range reduction, a search that finds no slot there, and with
+    /// it every fallback and schedule extension, leave for the out-of-line
+    /// path, which chooses the slot from the start.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn insert_absent<R>(
@@ -1100,37 +1122,20 @@ where
         key_fingerprint: u8,
         finish: impl FnOnce((usize, usize)) -> R,
     ) -> R {
-        let Some(placement) = self.settled_placement(prepared.route.probe) else {
+        let Some((level, slot)) = self.settled_slot(prepared.route.probe) else {
             return self.insert_absent_unsettled(key, value, prepared, key_fingerprint, finish);
         };
-        if placement.level >= self.scheduled_levels as usize
-            || placement.paper_probe > u64::from(self.scheduled_probes)
-        {
-            return self.place_unscheduled_entry(
-                key,
-                value,
-                prepared,
-                key_fingerprint,
-                (placement.level, placement.slot, placement.paper_probe),
-                finish,
-            );
-        }
-        finish(self.write_new_entry(
-            key,
-            value,
-            prepared,
-            key_fingerprint,
-            placement.level,
-            placement.slot,
-        ))
+        finish(self.write_new_entry(key, value, prepared, key_fingerprint, level, slot))
     }
 
-    /// The slot the active batch gives a new key, when the table needs no
-    /// growth, the cached batch is current, and its levels reduce by shift.
-    /// `None` leaves the insert to [`Self::insert_for_vacant_entry_prepared`].
+    /// The slot [`Self::choose_slot_for_new_key`] gives a new key, when the
+    /// table needs no growth, the cached batch is current, its levels reduce
+    /// by shift, and the batch's first choice of level has a free slot among
+    /// its scheduled probes. `None` leaves the insert to
+    /// [`Self::insert_for_vacant_entry_prepared`].
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn settled_placement(&self, probe: PreparedElasticProbe) -> Option<ExactPlacement> {
+    fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize)> {
         if !self.scheduler.settles(self.len) {
             return None;
         }
@@ -1140,11 +1145,14 @@ where
         // it and makes zero without a level zero. A clone copies both, and
         // a rebuild swaps both together.
         unsafe { core::hint::assert_unchecked(!self.levels.is_empty()) };
-        self.choose_slot_with(self.scheduler.cached_target(), |level, budget| {
-            // SAFETY: a settled table's level zero reduces by shift, which
-            // means every level does.
-            unsafe { self.first_shifted_vacancy(probe, level, budget) }
-        })
+        let case = self.placement_case(self.scheduler.cached_target())?;
+        // A level's scheduled probes all lie within its probe limit.
+        let budget = case.budget.min(u64::from(case.region.scheduled_probes));
+        // SAFETY: a settled table's level zero reduces by shift, which
+        // means every level does.
+        let (slot, _) =
+            unsafe { self.first_shifted_vacancy(probe, case.level, case.region, budget) }?;
+        Some((case.level, slot))
     }
 
     #[inline(never)]
@@ -1157,25 +1165,6 @@ where
         finish: impl FnOnce((usize, usize)) -> R,
     ) -> R {
         finish(self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint))
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn place_unscheduled_entry<R>(
-        &mut self,
-        key: K,
-        value: V,
-        prepared: PreparedElasticKey,
-        key_fingerprint: u8,
-        (level, slot, paper_probe): (usize, usize, u64),
-        finish: impl FnOnce((usize, usize)) -> R,
-    ) -> R {
-        let placement = ExactPlacement {
-            level,
-            slot,
-            paper_probe,
-        };
-        finish(self.place_new_entry(key, value, prepared, key_fingerprint, placement))
     }
 
     fn insert_for_vacant_entry_prepared(
@@ -1267,9 +1256,7 @@ where
         key_fingerprint: u8,
         placement: ExactPlacement,
     ) -> (usize, usize) {
-        if placement.level >= self.scheduled_levels as usize
-            || placement.paper_probe > u64::from(self.scheduled_probes)
-        {
+        if placement.paper_probe > u64::from(self.levels[placement.level].scheduled_probes) {
             self.schedule_placement(placement);
         }
         self.write_new_entry(
@@ -1357,7 +1344,9 @@ where
         self.probe_high_water &= EXCEPTIONAL_PLACEMENT_FLAG;
         self.probe_schedule.clear();
         self.scheduled_levels = u32::try_from(level + 1).expect("Elastic level count fits u32");
-        self.scheduled_probes = 0;
+        for level in &mut self.levels {
+            level.scheduled_probes = 0;
+        }
         self.extend_probe_schedule(u128::from(high_water));
     }
 
@@ -1389,10 +1378,13 @@ where
         self.probe_schedule.sort_from(old_len);
         self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
             | u32::try_from(high_water).expect("Elastic query cap fits u32");
-        // Positions grow with the level, so the deepest scheduled level
-        // holds the fewest probes.
-        let covered = first_paper_probe_after(u128::from(self.scheduled_levels), high_water) - 1;
-        self.scheduled_probes = u32::try_from(covered).expect("Elastic probe cap fits u32");
+        for (level, region) in self.levels[..self.scheduled_levels as usize]
+            .iter_mut()
+            .enumerate()
+        {
+            let covered = first_paper_probe_after(level as u128 + 1, high_water) - 1;
+            region.scheduled_probes = u16::try_from(covered).expect("Elastic probe cap fits u16");
+        }
     }
 }
 
@@ -1673,6 +1665,7 @@ where
             dst.clone_region_from(src_lvl);
             dst.len = src_lvl.len;
             dst.tombstones = src_lvl.tombstones;
+            dst.scheduled_probes = src_lvl.scheduled_probes;
         }
 
         let regions = guard.regions_mut();
@@ -1699,7 +1692,6 @@ where
             epoch: self.epoch,
             probe_high_water: self.probe_high_water,
             scheduled_levels: self.scheduled_levels,
-            scheduled_probes: self.scheduled_probes,
             probe_schedule,
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
@@ -1795,7 +1787,6 @@ where
                 arena,
                 probe_high_water: 0,
                 scheduled_levels: 0,
-                scheduled_probes: 0,
                 probe_schedule,
                 membership,
                 stale_membership: 0,
@@ -1861,22 +1852,21 @@ where
         })
     }
 
-    /// Chooses `target`'s slot for a new key. `first_vacancy(level, budget)`
-    /// yields the first free slot among `level`'s first `budget` probes and
-    /// the one-based probe that reached it.
+    /// The paper's insertion case for `target`.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn choose_slot_with(
-        &self,
-        target: BatchTarget,
-        first_vacancy: impl Fn(usize, u64) -> Option<(usize, u64)>,
-    ) -> Option<ExactPlacement> {
+    fn placement_case(&self, target: BatchTarget) -> Option<PlacementCase<'_, K, V>> {
         // The paper's insertion cases, in order: Batch 0 fills level 0; then,
         // for the active pair, Case 2 (current nearly full) places in `next`,
         // Case 3 (next nearly full) in `current`, and Case 1 gives `current`
         // a bounded probe budget before falling back to `next`.
-        let (mut level, mut budget, mut fallback) = match target {
-            BatchTarget::Bootstrap => (0, None, None),
+        Some(match target {
+            BatchTarget::Bootstrap => PlacementCase {
+                level: 0,
+                region: self.levels.first()?,
+                budget: u64::MAX,
+                fallback: None,
+            },
             BatchTarget::LevelPair(current) => {
                 let next = current.checked_add(1)?;
                 let current_level = self.levels.get(current)?;
@@ -1887,9 +1877,19 @@ where
                 let next_low = free_next.saturating_mul(4) <= next_level.capacity();
 
                 if current_low {
-                    (next, None, None)
+                    PlacementCase {
+                        level: next,
+                        region: next_level,
+                        budget: u64::MAX,
+                        fallback: None,
+                    }
                 } else if next_low {
-                    (current, None, None)
+                    PlacementCase {
+                        level: current,
+                        region: current_level,
+                        budget: u64::MAX,
+                        fallback: None,
+                    }
                 } else {
                     let budget = probe::elastic_dyadic_probe_budget(
                         free_current,
@@ -1898,22 +1898,41 @@ where
                         ELASTIC_PROBE_BUDGET_C,
                     )
                     .ok()?;
-                    (
-                        current,
-                        Some(u64::try_from(budget).unwrap_or(u64::MAX)),
-                        Some(next),
-                    )
+                    PlacementCase {
+                        level: current,
+                        region: current_level,
+                        budget: u64::try_from(budget).unwrap_or(u64::MAX),
+                        fallback: Some(next),
+                    }
                 }
             }
-        };
+        })
+    }
+
+    /// Chooses `target`'s slot for a new key. `first_vacancy(level, budget)`
+    /// yields the first free slot among `level`'s first `budget` probes and
+    /// the one-based probe that reached it.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn choose_slot_with(
+        &self,
+        target: BatchTarget,
+        first_vacancy: impl Fn(usize, u64) -> Option<(usize, u64)>,
+    ) -> Option<ExactPlacement> {
+        let PlacementCase {
+            mut level,
+            mut budget,
+            mut fallback,
+            ..
+        } = self.placement_case(target)?;
         // One search site serves every case, so the search inlines once.
         let (slot, paper_probe) = loop {
             let limit = *LEVEL_PROBE_LIMIT.get(level)?;
-            let budget = budget.take().map_or(limit, |budget| budget.min(limit));
-            if let Some(found) = first_vacancy(level, budget) {
+            if let Some(found) = first_vacancy(level, budget.min(limit)) {
                 break found;
             }
             level = fallback.take()?;
+            budget = u64::MAX;
         };
         // Every vacancy search stops within `LEVEL_PROBE_LIMIT`, whose probes
         // all sit at positions up to `QUERY_POSITION_CAP`.
@@ -1942,18 +1961,19 @@ where
         level: usize,
         budget: u64,
     ) -> Option<(usize, u64)> {
-        if self.levels.get(level)?.index_shift == GENERAL_REDUCTION {
+        let region = self.levels.get(level)?;
+        if region.index_shift() == GENERAL_REDUCTION {
             return self.first_vacancy_general(probe, level, budget);
         }
         // SAFETY: the level reduces by shift.
-        unsafe { self.first_shifted_vacancy(probe, level, budget) }
+        unsafe { self.first_shifted_vacancy(probe, level, region, budget) }
     }
 
     /// [`Self::first_vacancy`] for a level that reduces by shift.
     ///
     /// # Safety
     ///
-    /// `level`, when the table has it, must not be marked
+    /// `region` must be this table's `level`, and must not be marked
     /// [`GENERAL_REDUCTION`].
     #[allow(clippy::inline_always)]
     #[inline(always)]
@@ -1961,11 +1981,15 @@ where
         &self,
         probe: PreparedElasticProbe,
         level: usize,
+        region: &Level<SlotEntry<K, V>>,
         budget: u64,
     ) -> Option<(usize, u64)> {
-        let region = self.levels.get(level)?;
-        debug_assert_ne!(region.index_shift, GENERAL_REDUCTION);
-        let index_shift = region.index_shift;
+        debug_assert!(core::ptr::eq(region, &raw const self.levels[level]));
+        let index_shift = region.index_shift();
+        debug_assert!(index_shift < u64::BITS);
+        // SAFETY: a shift other than `GENERAL_REDUCTION` is
+        // `probe::elastic_index_shift` of the capacity, below the word width.
+        unsafe { core::hint::assert_unchecked(index_shift < u64::BITS) };
         let sequence = probe.sequence(self.fold_multiplier);
         let (mut word, word_step) = sequence.level_words(level);
         let mut remaining = budget;
@@ -2118,7 +2142,7 @@ where
         }
         // SAFETY: the filter only passes when it has words, and those are laid
         // out for a non-zero slot count, which gives the table a level zero.
-        let h11_shift = unsafe { self.levels.get_unchecked(0) }.index_shift;
+        let h11_shift = unsafe { self.levels.get_unchecked(0) }.index_shift();
         if h11_shift == GENERAL_REDUCTION {
             return ScheduleSearch::Unresolved(filter.expanded_level_mask());
         }
@@ -2323,7 +2347,6 @@ pub(crate) struct ElasticGeneration<K, V> {
     arena: Arena,
     probe_high_water: u32,
     scheduled_levels: u32,
-    scheduled_probes: u32,
     probe_schedule: ProbeSchedule,
     membership: MembershipRegion,
     metadata_words: *mut MetadataWord,
@@ -2350,7 +2373,6 @@ where
         mem::swap(&mut self.arena, &mut other.arena);
         mem::swap(&mut self.probe_high_water, &mut other.probe_high_water);
         mem::swap(&mut self.scheduled_levels, &mut other.scheduled_levels);
-        mem::swap(&mut self.scheduled_probes, &mut other.scheduled_probes);
         mem::swap(&mut self.probe_schedule, &mut other.probe_schedule);
         mem::swap(&mut self.membership, &mut other.membership);
         mem::swap(&mut self.metadata_words, &mut other.metadata_words);

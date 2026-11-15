@@ -268,7 +268,7 @@ fn query_schedule_holds_every_route_once_in_position_order() {
             assert_eq!(level, u32::from(route.level()));
             let region = &table.levels[level as usize];
             assert_eq!(route.control(), region.ctrl_ptr.cast_const());
-            assert_eq!(route.index_shift(), region.index_shift);
+            assert_eq!(route.index_shift(), region.index_shift());
             (level as usize, u128::from(logical))
         })
         .collect::<Vec<_>>();
@@ -1574,7 +1574,7 @@ fn keys_behind_another_on_their_route(
             .probe
             .sequence(table.fold_multiplier)
             .word(probe::elastic_level_run(level).0);
-        let first = probe::shifted_elastic_index(word, region.index_shift);
+        let first = probe::shifted_elastic_index(word, region.index_shift());
         if first != slot {
             assert!(control::is_occupied(region.checked_control(first)));
             // SAFETY: the slot is in bounds and occupied, checked above.
@@ -1593,7 +1593,7 @@ fn lookup_passes_a_tombstone_ahead_of_a_live_key_on_its_route() {
     for key in 0..KEYS {
         map.insert(key, key);
     }
-    assert_ne!(map.table().levels[0].index_shift, GENERAL_REDUCTION);
+    assert_ne!(map.table().levels[0].index_shift(), GENERAL_REDUCTION);
     let behind = keys_behind_another_on_their_route(&map, KEYS);
     assert!(behind.len() > 64);
 
@@ -1674,11 +1674,14 @@ fn first_entry_in_a_deeper_level_reschedules_through_that_level() {
             reschedules += 1;
         }
 
-        // Every scheduled level holds its first `scheduled_probes` probes
-        // (level zero's first is the direct slot), and the deepest holds no
-        // more than that.
-        let covered = u64::from(table.scheduled_probes);
-        for level in 0..table.scheduled_levels as usize {
+        // Every scheduled level holds exactly its first `scheduled_probes`
+        // probes (level zero's first is the direct slot), and no other
+        // level counts any.
+        for (level, region) in table.levels.iter().enumerate() {
+            if level >= table.scheduled_levels as usize {
+                assert_eq!(region.scheduled_probes, 0);
+                continue;
+            }
             let direct = u64::from(level == 0);
             let logical = scheduled_logical_probes(table, level);
             assert!(
@@ -1687,14 +1690,11 @@ fn first_entry_in_a_deeper_level_reschedules_through_that_level() {
                     .copied()
                     .eq(direct..direct + logical.len() as u64)
             );
-            assert!(direct + logical.len() as u64 >= covered);
+            assert_eq!(
+                direct + logical.len() as u64,
+                u64::from(region.scheduled_probes)
+            );
         }
-        let deepest_scheduled = table.scheduled_levels as usize - 1;
-        let direct = u64::from(deepest_scheduled == 0);
-        assert_eq!(
-            direct + scheduled_logical_probes(table, deepest_scheduled).len() as u64,
-            covered
-        );
         assert_eq!(map.get(&key), Some(&key));
     }
     assert!(reschedules >= 3);
@@ -1731,7 +1731,7 @@ fn reinsert_replaces_the_value_on_a_general_reduction_table() {
             Global,
         )
         .unwrap();
-    assert_eq!(table.levels[0].index_shift, GENERAL_REDUCTION);
+    assert_eq!(table.levels[0].index_shift(), GENERAL_REDUCTION);
     for key in 0..KEYS {
         let hash = table.hash_builder.hash_one(key);
         assert_eq!(table.insert(key, key, hash), None);
@@ -1750,7 +1750,7 @@ fn reinsert_replaces_the_value_on_a_table_flagged_exceptional() {
             Global,
         )
         .unwrap();
-    assert_ne!(table.levels[0].index_shift, GENERAL_REDUCTION);
+    assert_ne!(table.levels[0].index_shift(), GENERAL_REDUCTION);
     for key in 0..KEYS {
         let hash = table.hash_builder.hash_one(key);
         assert_eq!(table.insert(key, key, hash), None);
@@ -1776,7 +1776,7 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
                 Global,
             )
             .unwrap();
-        if table.levels[0].index_shift == GENERAL_REDUCTION {
+        if table.levels[0].index_shift() == GENERAL_REDUCTION {
             general_tables += 1;
         } else {
             shifted_tables += 1;
@@ -1827,13 +1827,50 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
 }
 
 #[test]
+fn settled_insert_slot_agrees_with_the_general_placement() {
+    const KEYS: u64 = 6_000;
+    let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(0);
+    let mut settled = 0;
+    let mut unsettled = 0;
+    for key in 0..KEYS {
+        // Removing an earlier key now and then leaves tombstones for the
+        // searches to reuse and moves the live count back across batches.
+        if key % 7 == 3 {
+            map.remove(&(key / 2));
+        }
+        let table = map.table();
+        let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
+            .route
+            .probe;
+        if let Some((level, slot)) = table.settled_slot(probe) {
+            let target = table.scheduler.target_at(table.len);
+            let general = table
+                .choose_slot_for_new_key(probe, target)
+                .expect("the settled search found a slot");
+            assert_eq!((level, slot), (general.level, general.slot));
+            assert!(general.paper_probe <= u64::from(table.levels[level].scheduled_probes));
+            settled += 1;
+        } else {
+            unsettled += 1;
+        }
+        map.insert(key, key);
+    }
+    assert!(settled > unsettled);
+    assert!(unsettled > 16);
+    for key in 0..KEYS {
+        let removed = (0..KEYS).any(|later| later % 7 == 3 && later / 2 == key && later > key);
+        assert_eq!(map.get(&key).is_some(), !removed, "{key}");
+    }
+}
+
+#[test]
 fn shifted_vacancy_search_agrees_with_the_general_one() {
     let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(1_024);
     for key in 0..900 {
         map.insert(key, key);
     }
     let table = map.table();
-    assert_ne!(table.levels[0].index_shift, GENERAL_REDUCTION);
+    assert_ne!(table.levels[0].index_shift(), GENERAL_REDUCTION);
     let mut found = 0;
     let mut missed = 0;
     for key in 0..2_000_u64 {
@@ -1842,8 +1879,10 @@ fn shifted_vacancy_search_agrees_with_the_general_one() {
             .probe;
         for level in 0..table.levels.len() {
             for budget in [0, 1, 2, 7, 64] {
-                // SAFETY: level zero reduces by shift, so every level does.
-                let shifted = unsafe { table.first_shifted_vacancy(probe, level, budget) };
+                let region = &table.levels[level];
+                // SAFETY: `region` is `level`, and level zero reduces by
+                // shift, so every level does.
+                let shifted = unsafe { table.first_shifted_vacancy(probe, level, region, budget) };
                 assert_eq!(shifted, table.first_vacancy_general(probe, level, budget));
                 if shifted.is_some() {
                     found += 1;
@@ -1885,12 +1924,12 @@ fn levels_reduce_all_by_shift_or_all_by_the_general_reduction() {
         if shifts.iter().all(Option::is_some) {
             shifted_tables += 1;
             for (level, shift) in table.levels.iter().zip(&shifts) {
-                assert_eq!(Some(level.index_shift), *shift);
+                assert_eq!(Some(level.index_shift()), *shift);
             }
         } else {
             general_tables += 1;
             for level in &table.levels {
-                assert_eq!(level.index_shift, GENERAL_REDUCTION);
+                assert_eq!(level.index_shift(), GENERAL_REDUCTION);
             }
         }
 
@@ -1920,7 +1959,12 @@ fn clone_carries_the_schedule_onto_its_own_levels() {
         let (source, copy) = (map.table(), cloned.table());
         assert!(source.scheduled_levels >= 3);
         assert_eq!(copy.scheduled_levels, source.scheduled_levels);
-        assert_eq!(copy.scheduled_probes, source.scheduled_probes);
+        assert!(
+            copy.levels
+                .iter()
+                .map(|level| level.scheduled_probes)
+                .eq(source.levels.iter().map(|level| level.scheduled_probes))
+        );
         assert_eq!(copy.probe_high_water, source.probe_high_water);
         assert_eq!(
             copy.probe_schedule.routes().len(),
@@ -2093,7 +2137,7 @@ fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
                 Global,
             )
             .unwrap();
-        assert_eq!(table.levels[0].index_shift != GENERAL_REDUCTION, shifted);
+        assert_eq!(table.levels[0].index_shift() != GENERAL_REDUCTION, shifted);
         let mut settled_inserts = 0;
         for key in 0..table.max_insertions as u64 {
             for len in [table.len.saturating_sub(1), table.len, table.len + 1] {

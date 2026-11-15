@@ -140,7 +140,7 @@ impl ProbeSchedule {
     pub(super) fn push<T>(&mut self, level: usize, region: &Level<T>, logical_probe_index: u64) {
         let route = PhiRoute {
             level: u8::try_from(level).expect("Elastic level count fits u8"),
-            index_shift: u8::try_from(region.index_shift).expect("Elastic index shift fits u8"),
+            index_shift: u8::try_from(region.index_shift()).expect("Elastic index shift fits u8"),
             sequence_index: probe::elastic_sequence_index(
                 u32::try_from(level).expect("Elastic level count fits u32"),
                 logical_probe_index,
