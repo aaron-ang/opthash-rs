@@ -2215,15 +2215,16 @@ where
         )
     }
 
-    /// Looks the key up along its schedule. The fingerprint is taken only
-    /// for a key the filter passes, so a rejected key does not derive it.
+    /// Looks the key up along its schedule. The filter is tested where the
+    /// caller is, so a key it rejects costs no call and derives no
+    /// fingerprint.
     #[inline]
     fn find_by_exact_schedule<'a, Q, R>(
         &'a self,
         key: &Q,
         prepared: PreparedElasticKey,
         key_fingerprint: impl FnOnce() -> u8,
-        mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
+        on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
     ) -> Option<R>
     where
         Q: Equivalent<K> + ?Sized,
@@ -2234,7 +2235,23 @@ where
         if !filter.maybe_present {
             return None;
         }
-        let route = prepared.route;
+        self.find_after_filter(key, prepared.route, key_fingerprint, filter, on_hit)
+    }
+
+    /// The lookup of a key that passed `filter`. Out of line so the filter
+    /// test inlines alone.
+    #[inline(never)]
+    fn find_after_filter<'a, Q, R>(
+        &'a self,
+        key: &Q,
+        route: PreparedElasticRoute,
+        key_fingerprint: impl FnOnce() -> u8,
+        filter: ElasticRouteFilter<'_>,
+        mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
+    ) -> Option<R>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
         let key_fingerprint = key_fingerprint();
         let walked =
             self.walk_schedule(key, route, key_fingerprint, filter, |level, slot, entry| {
