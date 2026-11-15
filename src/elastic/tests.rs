@@ -1553,11 +1553,11 @@ fn keys_behind_another_on_their_route(
         let hash = table.hash_builder.hash_one(key);
         let (level, slot) = table.find(&key, hash).unwrap();
         let region = &table.levels[level];
-        let (word, _) = PreparedElasticKey::new(hash)
+        let word = PreparedElasticKey::new(hash)
             .route
             .probe
             .sequence(table.fold_multiplier)
-            .level_run(level);
+            .word(probe::elastic_level_run(level).0);
         let first = probe::shifted_elastic_index(word, region.index_shift);
         if first != slot {
             assert!(control::is_occupied(region.checked_control(first)));
@@ -1904,6 +1904,47 @@ fn seeded_operation_mix_matches_std_hash_map() {
     }
     for key in 0..KEY_SPACE {
         assert_eq!(map.get(&key), model.get(&key));
+    }
+}
+
+/// Whether `level` is where the paper lets a key inserted under `target` go.
+fn target_holds(target: BatchTarget, level: usize) -> bool {
+    match target {
+        BatchTarget::Bootstrap => level == 0,
+        BatchTarget::LevelPair(current) => level == current || level == current + 1,
+    }
+}
+
+#[test]
+fn all_zero_and_all_one_hashes_place_inside_their_active_pair() {
+    for capacity in [256_usize, 2_048, 16_384] {
+        let mut map =
+            crate::ElasticHashMap::<u64, u64, IdentityBuildHasher>::with_capacity_and_hasher(
+                capacity,
+                IdentityBuildHasher,
+            );
+        let limit = map.capacity();
+        for filler in 1..limit as u64 {
+            if filler % (limit as u64 / 32) == 1 {
+                for special in [0, u64::MAX] {
+                    let mut probed = map.clone();
+                    let table = probed.table();
+                    let target = table.scheduler.target_at(table.len);
+                    probed.insert(special, 0);
+                    let table = probed.table();
+                    let (level, _) = table.find(&special, special).unwrap();
+                    assert!(
+                        target_holds(target, level),
+                        "hash {special:#x} after {} of {limit} keys: level {level}, {target:?}",
+                        filler - 1
+                    );
+                    assert_eq!(table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
+                    assert_eq!(probed.epoch().placement_recoveries, 0);
+                }
+            }
+            map.insert(filler, filler);
+        }
+        assert_eq!(map.capacity(), limit);
     }
 }
 
