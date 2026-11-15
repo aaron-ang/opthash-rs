@@ -210,7 +210,7 @@ fn compact_query_counters_cover_every_supported_geometry() {
         table
             .probe_schedule
             .iter()
-            .all(|route| route.counter_base != H11_COUNTER_BASE)
+            .all(|route| route.counter_base() != H11_COUNTER_BASE)
     );
 }
 
@@ -236,7 +236,7 @@ fn query_schedule_never_reallocates_within_an_epoch() {
 }
 
 #[test]
-fn query_schedule_caches_each_routes_level() {
+fn query_schedule_holds_every_route_once_in_position_order() {
     let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
         try_with_slots_and_reserve_fraction_and_hasher_in(
             8_193,
@@ -249,13 +249,25 @@ fn query_schedule_caches_each_routes_level() {
     table.schedule_levels_through(table.levels.len() - 1);
     table.extend_probe_schedule(QUERY_POSITION_CAP);
 
-    for route in &table.probe_schedule {
-        assert_eq!(
-            route.level,
-            probe::elastic_counter_level(route.counter_base)
-        );
-        assert!((route.level as usize) < table.levels.len());
+    let mut expected = Vec::new();
+    for level in 0..table.levels.len() {
+        for_each_phi_route(level, 1, QUERY_POSITION_CAP, |paper_probe, phi| {
+            expected.push((phi, level, paper_probe - 1));
+        });
     }
+    expected.sort_unstable();
+    let scheduled = table
+        .probe_schedule
+        .iter()
+        .map(|route| (route.level as usize, u128::from(route.logical)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        scheduled,
+        expected
+            .iter()
+            .map(|&(_, level, logical)| (level, logical))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -717,10 +729,6 @@ fn prepared_elastic_key_uses_the_exact_probe_signature() {
 #[test]
 fn elastic_controls_keep_the_public_hash_fingerprint() {
     let hash = 1_u64;
-    assert_ne!(
-        control::control_fingerprint(hash),
-        control::control_fingerprint(PreparedElasticRoute::new(hash).signature())
-    );
     let prepared = PreparedElasticKey::new(hash);
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);

@@ -29,7 +29,9 @@ use crate::raw::rebuild::{self, Rebuildable};
 type ElasticScanItem<K, V> = (*mut SlotEntry<K, V>, (usize, usize));
 
 /// Fixed construction seed shared by placement, lookup, and membership.
-const ELASTIC_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[0];
+/// Zero keeps the routing signature the key's hash itself; the probe words
+/// are keyed by their fold multiplier.
+const ELASTIC_PROBE_SEED: u64 = 0;
 /// The paper's constant `c` in the per-level probe budget
 /// `c * min(log2(1/eps)^2, log2(1/delta))`; the paper only asks that it be
 /// sufficiently large.
@@ -92,12 +94,26 @@ impl ExactPlacement {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PhiRoute {
-    /// Temporarily holds `phi` while a new suffix is sorted, then the level
-    /// `counter_base` packs, so a lookup reads it without unpacking.
+    /// Temporarily holds `phi` while a new suffix is sorted, then the
+    /// route's level.
     level: u32,
-    /// Packed retry-zero `(level, logical probe)` counter.
-    counter_base: u32,
+    /// Zero-based logical probe of `level`. While the suffix is sorted its
+    /// high half carries the level.
+    logical: u32,
 }
+
+impl PhiRoute {
+    /// Bits of `logical` that hold the level while a suffix is sorted.
+    const SORT_LEVEL_SHIFT: u32 = 16;
+
+    /// Packed retry-zero counter of the route, for the general reduction.
+    #[inline]
+    fn counter_base(self) -> u32 {
+        probe::elastic_counter_base(self.level, u64::from(self.logical))
+    }
+}
+
+const _: () = assert!(UNIFORM_SEARCH_CAP <= 1 << PhiRoute::SORT_LEVEL_SHIFT);
 
 const _: () = assert!(mem::size_of::<PhiRoute>() == 8);
 
@@ -1345,18 +1361,19 @@ where
                         .is_ok_and(|index| index < QUERY_PROBE_LIMIT),
                     "Elastic query-probe convention exhausted"
                 );
-                let counter_base =
-                    probe::try_pack_elastic_counter(level as u64, logical_probe_index, 0)
-                        .expect("Elastic query tuple fits the production counter");
+                let logical =
+                    u32::try_from(logical_probe_index).expect("Elastic query probe fits u32");
+                let level = u32::try_from(level).expect("Elastic level count fits u32");
                 self.probe_schedule.push(PhiRoute {
                     level: u32::try_from(phi).expect("Elastic query cap fits u32"),
-                    counter_base,
+                    logical: (level << PhiRoute::SORT_LEVEL_SHIFT) | logical,
                 });
             });
         }
         self.probe_schedule[old_len..].sort_unstable_by_key(|route| route.level);
         for route in &mut self.probe_schedule[old_len..] {
-            route.level = probe::elastic_counter_level(route.counter_base);
+            route.level = route.logical >> PhiRoute::SORT_LEVEL_SHIFT;
+            route.logical &= (1 << PhiRoute::SORT_LEVEL_SHIFT) - 1;
         }
         self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
             | u32::try_from(high_water).expect("Elastic query cap fits u32");
@@ -1945,21 +1962,15 @@ where
         let region = self.levels.get(level)?;
         debug_assert_ne!(region.index_shift, GENERAL_REDUCTION);
         let index_shift = region.index_shift;
-        let level = u32::try_from(level).ok()?;
-        // The counter is the loop's only induction variable; the probe
-        // number is recovered from it once, on the way out.
-        let first = probe::elastic_counter_base(level, 0);
-        let end = probe::elastic_counter_base(level, budget.min(UNIFORM_SEARCH_CAP));
-        let mut counter_base = first;
-        while counter_base != end {
-            let slot = probe::shifted_elastic_probe_index(probe, counter_base, index_shift);
+        let (mut word, distance) = probe.level_sequence(level);
+        for paper_probe in 1..=budget {
+            let slot = probe::shifted_elastic_index(word, index_shift);
             // SAFETY: the caller's shift maps the index into the level's
             // capacity.
             if control::is_free(unsafe { region.control_at(slot) }) {
-                let logical_index = probe::elastic_counter_logical(counter_base - first);
-                return Some((slot, logical_index + 1));
+                return Some((slot, paper_probe));
             }
-            counter_base += probe::ELASTIC_LOGICAL_STEP;
+            word = word.wrapping_add(distance);
         }
         None
     }
@@ -2105,7 +2116,7 @@ where
             return ScheduleSearch::Unresolved(filter.expanded_level_mask());
         }
         let h11_slot =
-            probe::shifted_elastic_probe_index(prepared.route.probe, H11_COUNTER_BASE, h11_shift);
+            probe::shifted_elastic_index(prepared.route.probe.probe_word(0, 0), h11_shift);
         // SAFETY: the shifted index maps into level zero's capacity.
         if let Some(entry) = unsafe { self.entry_if_match(0, h11_slot, key_fingerprint, key) } {
             return ScheduleSearch::Hit(on_hit(0, h11_slot, entry));
@@ -2122,9 +2133,11 @@ where
             let region = unsafe { self.levels.get_unchecked(level) };
             // Level zero reducing by shift means every level of the table
             // does.
-            let slot = probe::shifted_elastic_probe_index(
-                prepared.route.probe,
-                route.counter_base,
+            let slot = probe::shifted_elastic_index(
+                prepared
+                    .route
+                    .probe
+                    .probe_word(level, u64::from(route.logical)),
                 region.index_shift,
             );
             // SAFETY: the shifted index maps into the level's capacity.
@@ -2186,7 +2199,7 @@ where
                 continue;
             }
             let Some(slot) =
-                self.route_prepared_counter(level, prepared.route.probe, route.counter_base)
+                self.route_prepared_counter(level, prepared.route.probe, route.counter_base())
             else {
                 return self.find_by_full_scan(key, key_fingerprint, on_hit);
             };
