@@ -1891,7 +1891,7 @@ where
                     prepared.route,
                     key_fingerprint,
                     filter,
-                    |_, _, offset| offset,
+                    |_, _, offset, _| offset,
                 );
                 match walked {
                     ScheduleSearch::Hit(offset) => {
@@ -1938,6 +1938,61 @@ where
             self.maintain_after_deletes();
         }
         (removed.key, removed.value)
+    }
+
+    #[inline]
+    fn take<Q>(&mut self, key: &Q, hash: u64) -> Option<(K, V)>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let prepared = PreparedElasticKey::new(hash);
+        let filter = self.route_filter(prepared);
+        if !filter.maybe_present {
+            return None;
+        }
+        let key_fingerprint = control::control_fingerprint(hash);
+        let walked = self.walk_schedule(
+            key,
+            prepared.route,
+            key_fingerprint,
+            filter,
+            |level, slot, offset, control| (level, slot, offset, control),
+        );
+        let (level, slot, offset, control) = match walked {
+            ScheduleSearch::Hit(hit) => hit,
+            ScheduleSearch::Absent => return None,
+            ScheduleSearch::Unresolved => {
+                let location = self.find_unresolved(
+                    key,
+                    prepared.route,
+                    key_fingerprint,
+                    filter,
+                    |level, slot, _| (level, slot),
+                )?;
+                return Some(map::TableBackend::remove(self, location));
+            }
+        };
+        // SAFETY: the walk hands on an occupied slot of one of this table's
+        // levels, which `&mut self` borrows alone. The tombstone below keeps
+        // the entry from being read again.
+        let removed = unsafe {
+            self.probe_schedule
+                .entry_at::<SlotEntry<K, V>>(offset)
+                .read()
+        };
+        // SAFETY: `control` is that level's control bytes, which the table
+        // owns and may write, and `slot` indexes them. The sentinel's are
+        // never handed on: they match no fingerprint.
+        unsafe { control.cast_mut().add(slot).write(control::CTRL_TOMBSTONE) };
+        // SAFETY: the walk names one of this table's levels.
+        let level = unsafe { self.levels.get_unchecked_mut(level) };
+        level.len -= 1;
+        level.tombstones += 1;
+        self.scheduler.note_removal();
+        if self.maintenance_is_due() {
+            self.maintain_after_deletes();
+        }
+        Some((removed.key, removed.value))
     }
 
     #[inline]
@@ -2597,7 +2652,7 @@ where
             route,
             key_fingerprint,
             filter,
-            |level, slot, offset| (level, slot, offset),
+            |level, slot, offset, _| (level, slot, offset),
         );
         match walked {
             ScheduleSearch::Hit((level, slot, offset)) => {
@@ -2647,10 +2702,10 @@ where
     }
 
     /// Walks the candidates of a key that passed `filter` in schedule order
-    /// and hands `on_hit` the level and slot that hold the key and the
-    /// entry's offset for [`ProbeSchedule::entry_at`]. A
-    /// table that needs the general reduction has routes that probe
-    /// nothing, so its walk ends unresolved.
+    /// and hands `on_hit` the level and slot that hold the key, the entry's
+    /// offset for [`ProbeSchedule::entry_at`], and the level's control
+    /// bytes. A table that needs the general reduction has routes that
+    /// probe nothing, so its walk ends unresolved.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn walk_schedule<Q, R>(
@@ -2659,7 +2714,7 @@ where
         prepared: PreparedElasticRoute,
         key_fingerprint: u8,
         filter: ElasticRouteFilter<'_>,
-        mut on_hit: impl FnMut(usize, usize, usize) -> R,
+        mut on_hit: impl FnMut(usize, usize, usize, *const u8) -> R,
     ) -> ScheduleSearch<R>
     where
         Q: Equivalent<K> + ?Sized,
@@ -2678,7 +2733,7 @@ where
             let entry: *mut SlotEntry<K, V> = unsafe { self.probe_schedule.entry_at(offset) };
             // SAFETY: as above, the slot holds an entry.
             if key.equivalent(unsafe { &(*entry).key }) {
-                return ScheduleSearch::Hit(on_hit(0, h11_slot, offset));
+                return ScheduleSearch::Hit(on_hit(0, h11_slot, offset, route.control()));
             }
         }
 
@@ -2710,7 +2765,12 @@ where
                 let entry: *mut SlotEntry<K, V> = unsafe { self.probe_schedule.entry_at(offset) };
                 // SAFETY: as above, the slot holds an entry.
                 if key.equivalent(unsafe { &(*entry).key }) {
-                    return ScheduleSearch::Hit(on_hit(route.level() as usize, slot, offset));
+                    return ScheduleSearch::Hit(on_hit(
+                        route.level() as usize,
+                        slot,
+                        offset,
+                        route.control(),
+                    ));
                 }
                 unlikely_path();
             } else if control == CTRL_EMPTY {

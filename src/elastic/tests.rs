@@ -2846,6 +2846,77 @@ fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
     }
 }
 
+/// `take` against the search and the removal it fuses, on twin tables
+/// through the same operations: present, absent and departed keys, on a
+/// shape the walk resolves and on one it leaves to the general schedule,
+/// past the removals that start maintenance.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn take_agrees_with_find_then_remove() {
+    for (slots, shifted) in [(1_024, true), (1_000, false)] {
+        let build = || {
+            ElasticTable::<u64, u64, FixedHashBuilder>::
+                try_with_slots_and_reserve_fraction_and_hasher_in(
+                    slots,
+                    ReserveFraction::DEFAULT,
+                    fixed_hasher(),
+                    Global,
+                )
+                .unwrap()
+        };
+        let (mut fused, mut split) = (build(), build());
+        assert_eq!(fused.levels[0].index_shift() != GENERAL_REDUCTION, shifted);
+        let capacity = fused.max_insertions as u64;
+        let universe = capacity + capacity / 2;
+
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut maintained = false;
+        for step in 0..capacity * 12 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let key = (state >> 33) % universe;
+            let hash = fused.hash_builder.hash_one(key);
+            // Fill first, then remove more often than insert, then refill.
+            let insert = match step / (capacity * 2) {
+                0 | 3 => state >> 60 != 0,
+                _ => state >> 62 == 0,
+            };
+            if insert {
+                if fused.live() < fused.max_insertions && fused.find(&key, hash).is_none() {
+                    assert_eq!(fused.insert(key, step, hash), None);
+                    assert_eq!(split.insert(key, step, hash), None);
+                }
+            } else {
+                let before = fused.stale_membership();
+                let taken = fused.take(&key, hash);
+                let removed = split
+                    .find(&key, hash)
+                    .map(|location| split.remove(location));
+                assert_eq!(taken, removed);
+                maintained |= taken.is_some() && fused.stale_membership() <= before;
+            }
+            assert_eq!(fused.live(), split.live());
+            assert_eq!(fused.stale_membership(), split.stale_membership());
+        }
+        assert!(maintained, "removals never reached maintenance");
+
+        assert_eq!(fused.epoch_snapshot(), split.epoch_snapshot());
+        for (taken, removed) in fused.levels.iter().zip(&split.levels) {
+            assert_eq!(taken.len, removed.len);
+            assert_eq!(taken.tombstones, removed.tombstones);
+        }
+        for key in 0..universe {
+            let hash = fused.hash_builder.hash_one(key);
+            assert_eq!(fused.find(&key, hash), split.find(&key, hash));
+            assert_eq!(
+                fused.find_entry(&key, hash).map(|entry| entry.value),
+                split.find_entry(&key, hash).map(|entry| entry.value)
+            );
+        }
+    }
+}
+
 #[test]
 fn settled_gate_closes_when_the_removal_count_starts_over() {
     let mut table =

@@ -131,6 +131,18 @@ pub trait TableBackend<K, V>: Sized {
     /// update bookkeeping, and resize if needed.
     fn remove(&mut self, loc: Self::Location) -> (K, V);
 
+    /// Remove `key`'s entry, if any: [`Self::find`], then [`Self::remove`].
+    /// A backend whose search already holds what the removal needs
+    /// overrides it.
+    #[inline]
+    fn take<Q>(&mut self, key: &Q, hash: u64) -> Option<(K, V)>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let loc = self.find(key, hash)?;
+        Some(self.remove(loc))
+    }
+
     /// Mark `loc` (valid per [`Location`](TableBackend::Location)) as a tombstone
     /// without updating counters — draining iterators use it after moving the
     /// value out to avoid a double drop.
@@ -547,8 +559,8 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let loc = self.find_location(key)?;
-        Some(self.table.remove(loc))
+        let hash = self.table.hash(key);
+        self.table.take(key, hash)
     }
 
     /// Returns `N` disjoint mutable references, `None` for absent keys.
