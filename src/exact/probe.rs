@@ -310,6 +310,10 @@ impl PreparedElasticProbe {
     /// `fold_multiplier`, which must be [`ELASTIC_FOLD_MULTIPLIER`]. A table
     /// passes its stored copy so the fold reads the constant instead of
     /// building it.
+    ///
+    /// The origin and stride are the key's only probe state, so every level's
+    /// probes lie on the one sequence `origin + index * stride`
+    /// ([`ElasticProbeSequence`]).
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
     pub(crate) const fn sequence(self, fold_multiplier: u64) -> ElasticProbeSequence {
@@ -351,6 +355,11 @@ impl PreparedElasticProbe {
 
 /// One key's Elastic probe words: a double-hashing sequence every level
 /// owns a disjoint run of.
+///
+/// Every level's probes lie on one arithmetic sequence,
+/// `origin + index * stride`, so a key's probes in different levels are
+/// related: two keys whose first probes agree in two levels agree in the
+/// deeper levels as well.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ElasticProbeSequence {
     /// Word at sequence index zero, the key's level-zero first probe: both
