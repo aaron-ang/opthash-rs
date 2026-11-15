@@ -226,13 +226,13 @@ fn query_schedule_never_reallocates_within_an_epoch() {
             Global,
         )
         .unwrap();
-    let initial_ptr = table.probe_schedule.first();
+    let initial_ptr = table.probe_schedule.direct();
     let initial_capacity = table.probe_schedule.route_capacity();
 
     table.schedule_levels_through(table.levels.len() - 1);
     table.extend_probe_schedule(QUERY_POSITION_CAP);
 
-    assert_eq!(table.probe_schedule.first(), initial_ptr);
+    assert_eq!(table.probe_schedule.direct(), initial_ptr);
     assert_eq!(table.probe_schedule.route_capacity(), initial_capacity);
     assert_eq!(table.probe_schedule.routes().len(), initial_capacity);
     assert!(table.probe_schedule.ends_with_sentinel());
@@ -267,8 +267,10 @@ fn query_schedule_holds_every_route_once_in_position_order() {
             let (level, logical) = route.coordinates();
             assert_eq!(level, u32::from(route.level()));
             let region = &table.levels[level as usize];
-            assert_eq!(route.control(), region.ctrl_ptr.cast_const());
-            assert_eq!(route.index_shift(), region.index_shift());
+            assert_eq!(
+                route.control() == region.ctrl_ptr.cast_const(),
+                region.index_shift() != GENERAL_REDUCTION
+            );
             (level as usize, u128::from(logical))
         })
         .collect::<Vec<_>>();
@@ -1802,6 +1804,7 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
             let hash = table.hash_builder.hash_one(key);
             assert_eq!(table.insert(key, key, hash), None);
         }
+        assert!(table.probe_schedule.addresses(&table.levels));
         for key in 0..2 * budget {
             let hash = table.hash_builder.hash_one(key);
             let prepared = PreparedElasticKey::new(hash);
@@ -1961,6 +1964,74 @@ fn levels_reduce_all_by_shift_or_all_by_the_general_reduction() {
 }
 
 #[test]
+fn schedule_addresses_the_levels_of_every_table_it_serves() {
+    type Table = ElasticTable<u64, u64, FixedHashBuilder>;
+    fn check(table: &Table) -> bool {
+        assert!(table.probe_schedule.addresses(&table.levels));
+        table.levels[0].index_shift() == GENERAL_REDUCTION
+    }
+    let mut general_tables = 0;
+    let mut shifted_tables = 0;
+    for slots in [1, 3, 32, 1_000, 2_048, 3_000] {
+        let mut table = Table::try_with_slots_and_reserve_fraction_and_hasher_in(
+            slots,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+        let mut seen = vec![check(&table)];
+        // Twice the budget takes the table through a growth.
+        let keys = 2 * table.max_insertions as u64;
+        for key in 0..keys {
+            let hash = table.hash_builder.hash_one(key);
+            assert_eq!(table.insert(key, key, hash), None);
+            seen.push(check(&table));
+        }
+        let cloned = map::TableBackend::clone_table(&table);
+        let general = check(&cloned);
+        seen.push(general);
+        // Only routes that probe nothing fit another table's levels.
+        assert_eq!(cloned.probe_schedule.addresses(&table.levels), general);
+        for key in 0..keys + 64 {
+            let hash = table.hash_builder.hash_one(key);
+            assert_eq!(cloned.find(&key, hash).is_some(), key < keys);
+        }
+        map::TableBackend::clear(&mut table);
+        seen.push(check(&table));
+        general_tables += seen.iter().filter(|&&general| general).count();
+        shifted_tables += seen.iter().filter(|&&general| !general).count();
+    }
+    assert!(general_tables > 0 && shifted_tables > 0);
+}
+
+#[test]
+fn lookups_resolve_on_the_smallest_tables() {
+    let mut single_slot_first_levels = 0;
+    for slots in 1..=5 {
+        let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                slots,
+                ReserveFraction::DEFAULT,
+                fixed_hasher(),
+                Global,
+            )
+            .unwrap();
+        single_slot_first_levels += usize::from(table.levels[0].capacity() == 1);
+        let budget = table.max_insertions as u64;
+        for key in 0..budget {
+            let hash = table.hash_builder.hash_one(key);
+            assert_eq!(table.insert(key, key, hash), None);
+        }
+        for key in 0..64 {
+            let hash = table.hash_builder.hash_one(key);
+            assert_eq!(table.find(&key, hash).is_some(), key < budget);
+        }
+    }
+    assert!(single_slot_first_levels > 0);
+}
+
+#[test]
 fn clone_carries_the_schedule_onto_its_own_levels() {
     const KEYS: u64 = 3_000;
     let mut map: FixedElasticHashMap<u64, u64> =
@@ -2005,6 +2076,8 @@ fn clone_carries_the_schedule_onto_its_own_levels() {
             assert_ne!(ours.control(), theirs.control());
         }
         assert!(copy.probe_schedule.ends_with_sentinel());
+        assert!(copy.probe_schedule.addresses(&copy.levels));
+        assert!(!copy.probe_schedule.addresses(&source.levels));
     }
     drop(map);
     for key in 0..KEYS - 64 {
