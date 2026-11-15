@@ -701,9 +701,10 @@ pub(crate) struct BatchScheduler {
     /// the cached batch.
     settled_end: usize,
     /// Removals the table's filter still tolerates, counted down from
-    /// [`membership::refresh_deletes`]; maintenance is due once it is
-    /// negative as a signed count, so the test is its sign bit. A scan's
-    /// removals may take it further down before the scan can settle.
+    /// [`membership::refresh_deletes`] less one, so the removal that
+    /// spends the last one takes it negative as a signed count: maintenance
+    /// is due then, and the test is its sign bit. A scan's removals may take
+    /// it further down before the scan can settle.
     deletes_left: usize,
     /// Live count below which [`ElasticTable::settled_level_slot`] can place: the
     /// table's insertion limit, or zero where [`settled_limit()`] rules a
@@ -737,7 +738,7 @@ enum BatchTarget {
 }
 
 impl BatchScheduler {
-    pub(crate) fn new(batch_plan: &[usize], settled_limit: usize, deletes_left: usize) -> Self {
+    pub(crate) fn new(batch_plan: &[usize], settled_limit: usize, delete_budget: usize) -> Self {
         let mut total = 0_usize;
         let batch_ends = batch_plan
             .iter()
@@ -752,7 +753,7 @@ impl BatchScheduler {
             batch_start: 0,
             batch_end: usize::MAX,
             settled_limit,
-            deletes_left,
+            deletes_left: Self::countdown_start(delete_budget),
             settled_end: 0,
         };
         scheduler.reset();
@@ -787,11 +788,11 @@ impl BatchScheduler {
     /// placed count holds change with it, so the gate closes.
     #[inline]
     fn rearm(&mut self, budget: usize) {
-        self.deletes_left = budget;
+        self.deletes_left = Self::countdown_start(budget);
         self.close();
     }
 
-    /// Removals passed the budget the countdown started from.
+    /// Removals reached the budget the countdown started from.
     #[inline]
     fn maintenance_is_due(&self) -> bool {
         self.deletes_left.cast_signed() < 0
@@ -800,7 +801,15 @@ impl BatchScheduler {
     /// Removals counted since the countdown started from `budget`.
     #[inline]
     fn removed(&self, budget: usize) -> usize {
-        budget.wrapping_sub(self.deletes_left)
+        Self::countdown_start(budget).wrapping_sub(self.deletes_left)
+    }
+
+    /// Where a countdown of `budget` removals starts: one under the budget,
+    /// so the last of them leaves it negative. A table with no budget holds
+    /// no key to remove.
+    #[inline]
+    fn countdown_start(budget: usize) -> usize {
+        budget.wrapping_sub(1)
     }
 
     /// Reopens a closed gate while the cached batch still covers the live
@@ -2229,7 +2238,7 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
-    /// Departed keys passed [`membership::refresh_deletes`], so the deletes
+    /// Departed keys reached [`membership::refresh_deletes`], so the deletes
     /// since the last maintenance pay for a pass over the live entries.
     #[inline]
     fn maintenance_is_due(&self) -> bool {

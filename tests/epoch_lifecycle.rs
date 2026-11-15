@@ -214,7 +214,7 @@ fn removals_alone_clean_up_once_per_capacity_of_deletes() {
             "cleanup must occur before the map empties"
         );
     }
-    assert_eq!(removed + churns, capacity + 1);
+    assert_eq!(removed + churns, capacity);
     let after = map.epoch();
     assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
     assert!(!after.had_delete);

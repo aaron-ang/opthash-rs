@@ -168,16 +168,18 @@ impl Drop for PanicHashKey {
 ///
 /// `gate_passes` reports whether the backend's filter still admits `key`;
 /// `stale_membership` reads the backend's count of deletes since the last
-/// refresh.
+/// refresh; the refresh runs with delete number `refresh_at(threshold)`.
 pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
     gate_passes: impl Fn(&P, u64) -> bool,
     stale_membership: impl Fn(&P) -> usize,
+    refresh_at: impl Fn(u64) -> u64,
 ) where
     P: TableBackend<u64, u64, Hasher = FixedHashBuilder, Alloc = Global>,
 {
     let mut map: HashMap<u64, u64, P> = Deterministic::with_capacity(2_048);
     let live = map.capacity() as u64;
     let threshold = membership::refresh_deletes(map.capacity()) as u64;
+    let refresh_at = refresh_at(threshold);
     for key in 0..live {
         map.insert(key, key);
     }
@@ -202,9 +204,9 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
         if stale_membership(map.table()) == 0 {
             break;
         }
-        assert!(cycles <= threshold, "refresh never ran");
+        assert!(cycles < refresh_at, "refresh never ran");
     }
-    assert_eq!(cycles + departed.len() as u64, threshold + 1);
+    assert_eq!(cycles + departed.len() as u64, refresh_at);
     assert_eq!(map.epoch().generation, 0, "no rebuild ran");
     assert_eq!(stale_membership(map.table()), 0, "refresh resets the count");
     assert_eq!(map.len() as u64, live - departed.len() as u64);
@@ -213,13 +215,13 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
     assert!(epoch.had_delete);
     assert_eq!(
         epoch.distinct_insertions as u64,
-        map.len() as u64 + threshold + 1
+        map.len() as u64 + refresh_at
     );
     map.insert(churn, churn);
     assert_eq!(map.remove(&churn), Some(churn));
     assert_eq!(
         map.epoch().distinct_insertions as u64,
-        map.len() as u64 + threshold + 2
+        map.len() as u64 + refresh_at + 1
     );
 
     // Live keys are still recorded and found; departed keys mostly are not.

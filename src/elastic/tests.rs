@@ -911,6 +911,7 @@ fn deletes_past_the_threshold_refresh_the_membership_filter() {
             table.route_filter(prepared).maybe_present
         },
         ElasticTable::stale_membership,
+        |threshold| threshold,
     );
 }
 
@@ -3004,6 +3005,31 @@ fn settled_gate_closes_when_the_removal_count_starts_over() {
     assert_eq!(table.live() as u64, live);
     assert!(!table.scheduler.settles(table.placed));
     assert_settled_gate(&table, true);
+}
+
+#[test]
+fn removing_a_full_table_leaves_no_tombstone_for_lookups() {
+    let mut map = FixedElasticHashMap::<u64, u64>::with_capacity(1_024);
+    let live = map.capacity() as u64;
+    for key in 0..live {
+        map.insert(key, key);
+    }
+    assert_eq!(
+        membership::refresh_deletes(map.table().max_insertions) as u64,
+        live
+    );
+    for key in 0..live {
+        assert_eq!(map.remove(&key), Some(key));
+    }
+
+    // The last removal spent the countdown, so maintenance ran with it.
+    let table = map.table();
+    assert_eq!(table.stale_membership(), 0);
+    assert!(table.levels.iter().all(|level| level.tombstones == 0));
+    assert!((0..live).all(|key| {
+        let prepared = PreparedElasticKey::new(table.hash_builder.hash_one(key));
+        !table.route_filter(prepared).maybe_present
+    }));
 }
 
 #[test]
