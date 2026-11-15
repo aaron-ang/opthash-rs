@@ -261,7 +261,10 @@ fn query_schedule_holds_every_route_once_in_position_order() {
         .iter()
         .map(|route| {
             let (level, logical) = probe::elastic_sequence_coordinates(route.sequence_index);
-            assert_eq!(level, route.level);
+            assert_eq!(level, u32::from(route.level));
+            let region = &table.levels[level as usize];
+            assert_eq!(route.control, region.ctrl_ptr.cast_const());
+            assert_eq!(u32::from(route.index_shift), region.index_shift);
             (level as usize, u128::from(logical))
         })
         .collect::<Vec<_>>();
