@@ -139,3 +139,33 @@ fn build_error_display_leaves_cause_to_source() {
 
     assert!(!error.to_string().contains(&source.to_string()));
 }
+
+#[test]
+fn funnel_rejects_capacities_near_the_address_space_without_searching() {
+    let capacities = [
+        usize::MAX,
+        usize::MAX / 10 * 9,
+        usize::MAX / 10 * 7,
+        usize::MAX / 2,
+        usize::MAX / 8 * 3,
+        usize::MAX / 4,
+        usize::MAX / 16,
+    ];
+    for exponent in [3, 4, 8] {
+        let reserve = ReserveFraction::from_exponent(exponent).unwrap();
+        for capacity in capacities {
+            assert!(
+                FunnelHashMap::<u64, u64>::try_with_capacity_and_reserve(capacity, reserve)
+                    .is_err(),
+                "capacity {capacity} at exponent {exponent}"
+            );
+
+            let mut map =
+                FunnelHashMap::<u64, u64>::try_with_capacity_and_reserve(64, reserve).unwrap();
+            let before = map.capacity();
+            assert!(map.try_reserve(capacity).is_err());
+            map.shrink_to(capacity);
+            assert_eq!(map.capacity(), before);
+        }
+    }
+}

@@ -305,7 +305,7 @@ fn filter_tail(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> Vec<u64> {
 
 /// Every control byte and filter word of `table`.
 fn controls_and_filter(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> (Vec<u8>, Vec<u64>) {
-    // SAFETY: `slot < n`, the storage capacity.
+    // SAFETY: `slot < slots`, the storage capacity.
     let controls = (0..table.shape.slots)
         .map(|slot| unsafe { table.storage.control_at(slot) })
         .collect();

@@ -193,14 +193,15 @@ impl FunnelShape {
     }
 
     fn from_slots(n: usize, reserve: ReserveFraction) -> Result<Self, TryReserveError> {
+        Self::try_from_slots(n, reserve).map_err(TryReserveError::from)
+    }
+
+    fn try_from_slots(n: usize, reserve: ReserveFraction) -> Result<Self, ShapeError> {
         if n == 0 {
             return Ok(Self::empty());
         }
-        let config = PaperConfig::new(n, reserve.exponent())
-            .map_err(|_| TryReserveError::CapacityOverflow)?;
-        let plan = config
-            .funnel_plan()
-            .map_err(|_| TryReserveError::CapacityOverflow)?;
+        let config = PaperConfig::new(n, reserve.exponent()).map_err(|_| ShapeError::Infeasible)?;
+        let plan = config.funnel_plan().map_err(|_| ShapeError::Infeasible)?;
         let stride = if plan.beta() <= GROUP_SIZE {
             GROUP_SIZE
         } else {
@@ -211,41 +212,41 @@ impl FunnelShape {
         let mut levels = Vec::new();
         levels
             .try_reserve_exact(plan.alpha())
-            .map_err(|_| TryReserveError::AllocError)?;
+            .map_err(|_| ShapeError::Alloc)?;
         for (level_index, bucket_count) in plan.ordinary_bucket_counts().enumerate() {
             levels.push(LevelShape {
                 multiplier: FunnelPrf::ordinary_multiplier(level_index as u64)
-                    .ok_or(TryReserveError::CapacityOverflow)?,
+                    .ok_or(ShapeError::Infeasible)?,
                 bucket_range: PreparedProbeRange::new(bucket_count)
-                    .map_err(|_| TryReserveError::CapacityOverflow)?,
+                    .map_err(|_| ShapeError::Infeasible)?,
                 offset,
             });
             offset = offset
                 .checked_add(
                     bucket_count
                         .checked_mul(stride)
-                        .ok_or(TryReserveError::CapacityOverflow)?,
+                        .ok_or(ShapeError::Oversize)?,
                 )
-                .ok_or(TryReserveError::CapacityOverflow)?;
+                .ok_or(ShapeError::Oversize)?;
             // No overflow: at most the padded count above.
             unpadded += bucket_count * plan.beta();
         }
         let primary_offset = offset;
         let primary_len = plan.special_primary_len();
         let primary_range =
-            PreparedProbeRange::new(primary_len).map_err(|_| TryReserveError::CapacityOverflow)?;
+            PreparedProbeRange::new(primary_len).map_err(|_| ShapeError::Infeasible)?;
         let fallback_offset = primary_offset
             .checked_add(primary_len)
-            .ok_or(TryReserveError::CapacityOverflow)?;
+            .ok_or(ShapeError::Oversize)?;
         let fallback_len = plan.special_fallback_len();
         let slots = fallback_offset
             .checked_add(fallback_len)
-            .ok_or(TryReserveError::CapacityOverflow)?;
+            .ok_or(ShapeError::Oversize)?;
         if slots - (offset - unpadded) != n {
-            return Err(TryReserveError::CapacityOverflow);
+            return Err(ShapeError::Infeasible);
         }
         let loglog_ceiling =
-            u8::try_from(plan.loglog_ceiling()).map_err(|_| TryReserveError::CapacityOverflow)?;
+            u8::try_from(plan.loglog_ceiling()).map_err(|_| ShapeError::Infeasible)?;
         let bucket_lanes = bucket_lanes(plan.beta());
         let mut head = [LevelShape::ABSENT; HEAD_ENTRIES];
         if bucket_lanes != 0 {
@@ -265,7 +266,7 @@ impl FunnelShape {
             fallback_offset,
             fallback_bucket_width: plan.fallback_bucket_width(),
             fallback_bucket_range: PreparedProbeRange::new(plan.fallback_bucket_count())
-                .map_err(|_| TryReserveError::CapacityOverflow)?,
+                .map_err(|_| ShapeError::Infeasible)?,
             bucket_lanes,
             stride,
             slots,
@@ -300,12 +301,33 @@ impl FunnelShape {
 
         n = geometry::funnel_minimum_slots(d, n).ok_or(TryReserveError::CapacityOverflow)?;
         loop {
-            if let Ok(shape) = Self::from_slots(n, reserve)
-                && shape.max_insertions >= requested
-            {
-                return Ok(shape);
+            match Self::try_from_slots(n, reserve) {
+                Ok(shape) if shape.max_insertions >= requested => return Ok(shape),
+                Ok(_) | Err(ShapeError::Infeasible) => {}
+                // More slots only pad to more, and no table that large can
+                // be allocated, so a larger `n` is not worth trying.
+                Err(error) => return Err(error.into()),
             }
             n = n.checked_add(1).ok_or(TryReserveError::CapacityOverflow)?;
+        }
+    }
+}
+
+/// Why a slot count has no [`FunnelShape`].
+enum ShapeError {
+    /// The paper's geometry does not come out at exactly this many slots;
+    /// another count may.
+    Infeasible,
+    /// The padded buckets need more slots than can be counted.
+    Oversize,
+    Alloc,
+}
+
+impl From<ShapeError> for TryReserveError {
+    fn from(error: ShapeError) -> Self {
+        match error {
+            ShapeError::Infeasible | ShapeError::Oversize => Self::CapacityOverflow,
+            ShapeError::Alloc => Self::AllocError,
         }
     }
 }
@@ -336,8 +358,9 @@ const fn rarely_taken() {}
 ///
 /// # Safety
 ///
-/// `matches` must be a non-empty subset of a [`bucket_lanes`] mask, which
-/// sets one bit per lane, at `BITMASK_SLOT_BIT` of its stride.
+/// `matches` must be non-empty, with its lowest set bit at
+/// `BITMASK_SLOT_BIT` of its stride, as a group mask's is and as a subset
+/// of a [`bucket_lanes`] mask's is.
 #[inline]
 // The stride is one where a group mask holds one bit per slot.
 #[allow(clippy::modulo_one)]
@@ -1149,7 +1172,7 @@ where
 
     /// # Safety
     ///
-    /// `slot < self.shape.n`.
+    /// `slot < self.shape.slots`.
     #[inline]
     unsafe fn inspect_slot<Q>(&self, slot: usize, key_fingerprint: u8, key: &Q) -> Option<bool>
     where
@@ -1379,8 +1402,10 @@ where
         // The entry at the lowest match of a bucket starting at `start`, if
         // it holds the key.
         let holding_key = |start: usize, matches: u64| -> Option<Found<'_, K, V>> {
-            // SAFETY: every caller passes a non-empty set that `scan` masked
-            // with the shape's lanes, less the bits cleared since.
+            // SAFETY: every caller passes a non-empty set: the group mask
+            // `scan` returned, whose lowest bit is a lane's slot bit, or what
+            // is left of it once cut down to slot bits and cleared from the
+            // lowest up.
             let slot = start + unsafe { lowest_lane(matches) };
             // SAFETY: a matched lane lies inside its bucket and carries the
             // fingerprint, so the slot is in bounds and occupied.
@@ -2738,6 +2763,11 @@ where
             return;
         }
         let requested = self.entries().max(min_capacity);
+        // The insertion limit never falls as slots are added, so a shape
+        // for more than this one's limit has no fewer slots.
+        if requested > self.shape.max_insertions {
+            return;
+        }
         let Ok(shape) = FunnelShape::for_insert_budget(requested, self.reserve_fraction) else {
             panic!("capacity overflow");
         };
