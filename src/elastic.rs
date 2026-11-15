@@ -608,7 +608,7 @@ struct PlacementCase<'a, K, V> {
     /// The level to search first.
     level: usize,
     region: &'a Level<SlotEntry<K, V>>,
-    /// Probes of `level` the case allows, `u64::MAX` when it sets no bound.
+    /// Probes of `level` to search.
     budget: u64,
     /// The level to search when the budget finds no slot.
     fallback: Option<usize>,
@@ -1122,10 +1122,10 @@ where
         key_fingerprint: u8,
         finish: impl FnOnce((usize, usize)) -> R,
     ) -> R {
-        let Some((level, slot)) = self.settled_slot(prepared.route.probe) else {
+        let Some((level, slot, control)) = self.settled_slot(prepared.route.probe) else {
             return self.insert_absent_unsettled(key, value, prepared, key_fingerprint, finish);
         };
-        finish(self.write_new_entry(key, value, prepared, key_fingerprint, level, slot))
+        finish(self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control))
     }
 
     /// The slot [`Self::choose_slot_for_new_key`] gives a new key, when the
@@ -1135,7 +1135,7 @@ where
     /// [`Self::insert_for_vacant_entry_prepared`].
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize)> {
+    fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize, u8)> {
         if !self.scheduler.settles(self.len) {
             return None;
         }
@@ -1145,14 +1145,17 @@ where
         // it and makes zero without a level zero. A clone copies both, and
         // a rebuild swaps both together.
         unsafe { core::hint::assert_unchecked(!self.levels.is_empty()) };
-        let case = self.placement_case(self.scheduler.cached_target())?;
         // A level's scheduled probes all lie within its probe limit.
-        let budget = case.budget.min(u64::from(case.region.scheduled_probes));
+        let case = self.placement_case(self.scheduler.cached_target(), |region, budget| {
+            let scheduled = u64::from(region.scheduled_probes);
+            budget.map_or(scheduled, |budget| budget.min(scheduled))
+        })?;
+        let budget = case.budget;
         // SAFETY: a settled table's level zero reduces by shift, which
         // means every level does.
-        let (slot, _) =
+        let (slot, _, control) =
             unsafe { self.first_shifted_vacancy(probe, case.level, case.region, budget) }?;
-        Some((case.level, slot))
+        Some((case.level, slot, control))
     }
 
     #[inline(never)]
@@ -1259,6 +1262,8 @@ where
         if placement.paper_probe > u64::from(self.levels[placement.level].scheduled_probes) {
             self.schedule_placement(placement);
         }
+        // SAFETY: a placement names a slot of its level.
+        let prev_ctrl = unsafe { self.levels[placement.level].control_at(placement.slot) };
         self.write_new_entry(
             key,
             value,
@@ -1266,6 +1271,7 @@ where
             key_fingerprint,
             placement.level,
             placement.slot,
+            prev_ctrl,
         )
     }
 
@@ -1281,7 +1287,17 @@ where
             .first_free_slot()
             .expect("Elastic insertion limit must leave a free slot");
         self.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG;
-        self.write_new_entry(key, value, prepared, key_fingerprint, level, slot)
+        // SAFETY: the scan found `slot` within `level`.
+        let prev_ctrl = unsafe { self.levels[level].control_at(slot) };
+        self.write_new_entry(
+            key,
+            value,
+            prepared,
+            key_fingerprint,
+            level,
+            slot,
+            prev_ctrl,
+        )
     }
 
     fn first_free_slot(&self) -> Option<(usize, usize)> {
@@ -1296,6 +1312,9 @@ where
             })
     }
 
+    /// Writes a new entry into the free slot `slot_idx` of `level_idx`.
+    /// `prev_ctrl` is the control byte the caller found the slot free by.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn write_new_entry(
         &mut self,
@@ -1305,13 +1324,15 @@ where
         key_fingerprint: u8,
         level_idx: usize,
         slot_idx: usize,
+        prev_ctrl: u8,
     ) -> (usize, usize) {
         {
             debug_assert!(level_idx < self.levels.len());
             // SAFETY: callers pass a level they found a free slot in.
             let level = unsafe { self.levels.get_unchecked_mut(level_idx) };
             // SAFETY: callers pass a free slot found within this level.
-            let prev_ctrl = unsafe { level.control_at(slot_idx) };
+            debug_assert_eq!(prev_ctrl, unsafe { level.control_at(slot_idx) });
+            debug_assert!(control::is_free(prev_ctrl));
             // SAFETY: as above; `key_fingerprint` is an occupied control byte.
             unsafe {
                 level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
@@ -1883,10 +1904,17 @@ where
         })
     }
 
-    /// The paper's insertion case for `target`.
+    /// The paper's insertion case for `target`. `budget_of` turns the
+    /// case's probe bound for its level, `None` when the case sets none,
+    /// into the budget the caller searches with; resolving it per case
+    /// lets an unbounded case skip the comparison against a bound.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn placement_case(&self, target: BatchTarget) -> Option<PlacementCase<'_, K, V>> {
+    fn placement_case(
+        &self,
+        target: BatchTarget,
+        budget_of: impl Fn(&Level<SlotEntry<K, V>>, Option<u64>) -> u64,
+    ) -> Option<PlacementCase<'_, K, V>> {
         // The paper's insertion cases, in order: Batch 0 fills level 0; then,
         // for the active pair, Case 2 (current nearly full) places in `next`,
         // Case 3 (next nearly full) in `current`, and Case 1 gives `current`
@@ -1895,13 +1923,14 @@ where
             BatchTarget::Bootstrap => PlacementCase {
                 level: 0,
                 region: self.levels.first()?,
-                budget: u64::MAX,
+                budget: budget_of(self.levels.first()?, None),
                 fallback: None,
             },
             BatchTarget::LevelPair(current) => {
                 let next = current.checked_add(1)?;
-                let current_level = self.levels.get(current)?;
-                let next_level = self.levels.get(next)?;
+                let [current_level, next_level] = self.levels.get(current..=next)? else {
+                    return None;
+                };
                 let free_current = current_level.free_slots();
                 let free_next = next_level.free_slots();
                 let current_low = self.current_level_low(current_level);
@@ -1911,14 +1940,14 @@ where
                     PlacementCase {
                         level: next,
                         region: next_level,
-                        budget: u64::MAX,
+                        budget: budget_of(next_level, None),
                         fallback: None,
                     }
                 } else if next_low {
                     PlacementCase {
                         level: current,
                         region: current_level,
-                        budget: u64::MAX,
+                        budget: budget_of(current_level, None),
                         fallback: None,
                     }
                 } else {
@@ -1932,7 +1961,10 @@ where
                     PlacementCase {
                         level: current,
                         region: current_level,
-                        budget: u64::try_from(budget).unwrap_or(u64::MAX),
+                        budget: budget_of(
+                            current_level,
+                            Some(u64::try_from(budget).unwrap_or(u64::MAX)),
+                        ),
                         fallback: Some(next),
                     }
                 }
@@ -1955,7 +1987,7 @@ where
             mut budget,
             mut fallback,
             ..
-        } = self.placement_case(target)?;
+        } = self.placement_case(target, |_, budget| budget.unwrap_or(u64::MAX))?;
         // One search site serves every case, so the search inlines once.
         let (slot, paper_probe) = loop {
             let limit = *LEVEL_PROBE_LIMIT.get(level)?;
@@ -1998,6 +2030,7 @@ where
         }
         // SAFETY: the level reduces by shift.
         unsafe { self.first_shifted_vacancy(probe, level, region, budget) }
+            .map(|(slot, paper_probe, _)| (slot, paper_probe))
     }
 
     /// [`Self::first_vacancy`] for a level that reduces by shift.
@@ -2014,7 +2047,7 @@ where
         level: usize,
         region: &Level<SlotEntry<K, V>>,
         budget: u64,
-    ) -> Option<(usize, u64)> {
+    ) -> Option<(usize, u64, u8)> {
         debug_assert!(core::ptr::eq(region, &raw const self.levels[level]));
         let index_shift = region.index_shift();
         debug_assert!(index_shift < u64::BITS);
@@ -2028,8 +2061,9 @@ where
             let slot = probe::shifted_elastic_index(word, index_shift);
             // SAFETY: the caller's shift maps the index into the level's
             // capacity.
-            if control::is_free(unsafe { region.control_at(slot) }) {
-                return Some((slot, budget - remaining + 1));
+            let control = unsafe { region.control_at(slot) };
+            if control::is_free(control) {
+                return Some((slot, budget - remaining + 1, control));
             }
             word = word.wrapping_add(word_step);
             remaining -= 1;
