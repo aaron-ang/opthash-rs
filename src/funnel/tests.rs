@@ -72,7 +72,7 @@ fn vacant_paths_reuse_search_unless_growth_invalidates_it() {
             if tombstone {
                 map.insert(key(1), 0);
                 map.remove(&key(1));
-                assert_eq!(map.table().tombstones, 1);
+                assert_eq!(map.table().tombstones(), 1);
             }
             comparisons.store(0, Ordering::Relaxed);
             VACANCY_WALKS.with(|walks| walks.set(0));
@@ -86,9 +86,10 @@ fn vacant_paths_reuse_search_unless_growth_invalidates_it() {
             let walks = VACANCY_WALKS.with(Cell::get);
             let label = format!("{path:?} full={full} tombstone={tombstone}");
             if full {
-                // Rebuild places each old key; the new key needs its own fresh walk.
+                // Rebuild places each old key from the head walk; the new key
+                // needs its own fresh walk.
                 assert!(comparisons.load(Ordering::Relaxed) > 0, "{label}");
-                assert_eq!(walks, capacity + 1, "{label}");
+                assert_eq!(walks, 1, "{label}");
                 assert!(map.capacity() > capacity, "{label}");
             } else {
                 assert_eq!(comparisons.load(Ordering::Relaxed), 1, "{label}");
@@ -112,7 +113,7 @@ fn entry_search_checks_exceptional_hits_before_reusing_vacancy() {
     let key = 42;
     let fingerprint = table.prf.prepare(key).fingerprint();
     let exact = table.search_exact_for_insert(&key, key, fingerprint);
-    let slot = table.shape.n - 1;
+    let slot = table.shape.slots - 1;
     assert_ne!(exact, SearchResult::Vacant(slot));
     table.place_new_entry(
         table.vacancy_at(slot),
@@ -177,9 +178,10 @@ fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement(
     // rehashes them, so the walk after it finds a vacancy in the funnel.
     assert_eq!(
         VACANCY_WALKS.with(Cell::get),
-        old_len + 1,
-        "one walk per survivor, then one for the new key"
+        1,
+        "the head walk places each survivor; the new key walks afresh"
     );
+    assert_eq!(table.entries(), old_len + 1);
     assert_ne!(table.prf, old_seed);
     assert!(!table.exceptional_placement);
     assert_eq!(
@@ -203,6 +205,10 @@ fn smallest_wide_shape() -> (u32, FunnelShape) {
 }
 
 fn raw_table(n: usize, d: u32) -> FunnelTable<u64, u64, IdentityBuildHasher> {
+    raw_table_of(n, d)
+}
+
+fn raw_table_of<V>(n: usize, d: u32) -> FunnelTable<u64, V, IdentityBuildHasher> {
     let reserve = ReserveFraction::from_exponent(d).unwrap();
     FunnelTable::try_from_shape(
         FunnelShape::from_slots(n, reserve).unwrap(),
@@ -296,7 +302,7 @@ fn refresh_membership_rebuilds_the_recorded_filter() {
 }
 
 /// Every word of `table`'s filter tail, level bins and membership alike.
-fn filter_tail(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> Vec<u64> {
+fn filter_tail<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> Vec<u64> {
     let words = table.membership.region.words;
     // SAFETY: the tail holds `words` words of level bins below its base and
     // as many membership words from it on, all initialized.
@@ -304,9 +310,9 @@ fn filter_tail(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> Vec<u64> {
 }
 
 /// Every control byte and filter word of `table`.
-fn controls_and_filter(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> (Vec<u8>, Vec<u64>) {
-    // SAFETY: `slot < n`, the storage capacity.
-    let controls = (0..table.shape.n)
+fn controls_and_filter<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> (Vec<u8>, Vec<u64>) {
+    // SAFETY: `slot < slots`, the storage capacity.
+    let controls = (0..table.shape.slots)
         .map(|slot| unsafe { table.storage.control_at(slot) })
         .collect();
     (controls, filter_tail(table))
@@ -369,6 +375,112 @@ fn frameless_insert_places_and_records_like_the_placement_walk() {
     }
 }
 
+/// A rebuild places each survivor where the placement walk would, in slot
+/// order, and records it the same way.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn rebuild_places_and_records_like_the_placement_walk() {
+    let (wide, wide_shape) = smallest_wide_shape();
+    for (n, d) in [
+        (344, 4),
+        (4096, 3),
+        (1 << 14, 3),
+        (wide_shape.n, wide),
+        (21_856, 10),
+    ] {
+        let rebuilt = assert_rebuild_matches_placement_walk(n, d, |index| index);
+        assert!(!rebuild_prefetches(&rebuilt), "n {n} d {d}");
+    }
+}
+
+/// [`rebuild_places_and_records_like_the_placement_walk`] over a table large
+/// enough for the rebuild to hash ahead of its placements. Wide values reach
+/// that size in few slots.
+#[test]
+fn prefetching_rebuild_places_and_records_like_the_placement_walk() {
+    const BUDGET: usize = 300;
+    type WideValue = [u64; 2047];
+    let narrow = ReserveFraction::from_exponent(3).unwrap();
+    let n = FunnelShape::for_insert_budget(BUDGET, narrow).unwrap().n;
+    let rebuilt =
+        assert_rebuild_matches_placement_walk(n, 3, |index| -> WideValue { [index; 2047] });
+    assert!(rebuilt.shape.beta <= GROUP_SIZE, "no head placement");
+    assert!(rebuild_prefetches(&rebuilt));
+
+    if cfg!(miri) {
+        return;
+    }
+    let (wide, _) = smallest_wide_shape();
+    let reserve = ReserveFraction::from_exponent(wide).unwrap();
+    let n = FunnelShape::for_insert_budget(BUDGET, reserve).unwrap().n;
+    let rebuilt =
+        assert_rebuild_matches_placement_walk(n, wide, |index| -> WideValue { [index; 2047] });
+    assert!(rebuilt.shape.beta > GROUP_SIZE);
+    assert!(rebuild_prefetches(&rebuilt));
+}
+
+/// Whether a rebuild out of `table` hashes ahead of its placements.
+fn rebuild_prefetches<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> bool {
+    table.shape.slots * size_of::<SlotEntry<u64, V>>() >= rebuild::PREFETCH_MIN_BYTES
+}
+
+/// Fills a table of `n` slots, tombstones a third of it, rebuilds it at the
+/// same size and compares it with a table the survivors were inserted into
+/// through the placement walk. Returns the rebuilt table.
+fn assert_rebuild_matches_placement_walk<V>(
+    n: usize,
+    d: u32,
+    value_of: impl Fn(u64) -> V,
+) -> FunnelTable<u64, V, IdentityBuildHasher>
+where
+    V: Copy + PartialEq + core::fmt::Debug,
+{
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut rebuilt = raw_table_of::<V>(n, d);
+    let budget = rebuilt.shape.max_insertions as u64;
+    let key_of = |index: u64| {
+        let key = index.wrapping_mul(SPREAD);
+        (key ^ (key >> 32)).wrapping_mul(SPREAD)
+    };
+    for index in 0..budget {
+        let key = key_of(index);
+        assert!(map::TableBackend::insert(&mut rebuilt, key, value_of(index), key).is_none());
+    }
+    // Tombstones, so the rebuild has slots to reclaim.
+    for index in (0..budget).step_by(3) {
+        let key = key_of(index);
+        let slot = rebuilt.find_location(&key, key).unwrap();
+        map::TableBackend::remove(&mut rebuilt, slot);
+    }
+    let mut survivors = Vec::new();
+    let mut scan = OccupiedIndices::new();
+    while let Some(slot) = scan.step(&rebuilt.storage) {
+        // SAFETY: `step` yields occupied in-bounds slots.
+        let entry = unsafe { rebuilt.storage.get_ref(slot) };
+        survivors.push((entry.key, entry.value));
+    }
+    rebuilt.resize_with_transition(n, EpochTransition::ExplicitResize);
+
+    let mut walked = raw_table_of::<V>(n, d);
+    for &(key, value) in &survivors {
+        walked.insert_for_vacant_entry(key, value, key);
+    }
+    assert_eq!(rebuilt.entries(), survivors.len(), "n {n} d {d}");
+    assert_eq!(rebuilt.head_left, walked.head_left, "n {n} d {d}");
+    assert_eq!(rebuilt.tombstones(), 0);
+    assert!(
+        controls_and_filter(&rebuilt) == controls_and_filter(&walked),
+        "n {n} d {d}"
+    );
+    for &(key, value) in &survivors {
+        assert_eq!(
+            map::TableBackend::find_entry(&rebuilt, &key, key).map(|entry| entry.value),
+            Some(value)
+        );
+    }
+    rebuilt
+}
+
 /// With tombstones the frameless insert stands aside: the placement walk
 /// takes a tombstone ahead of the first EMPTY lane.
 #[test]
@@ -392,12 +504,12 @@ fn insert_reuses_tombstones_like_the_placement_walk() {
                 map::TableBackend::remove(table, slot);
             }
         }
-        assert_eq!(inline.tombstones, removed.clone().count());
+        assert_eq!(inline.tombstones(), removed.clone().count());
         let mut reused_unrecorded = 0;
         for index in (budget..).take(removed.count()) {
             let key = index.wrapping_mul(SPREAD);
             let unrecorded = !inline.membership_gate(key).passes();
-            let tombstones = walked.tombstones;
+            let tombstones = walked.tombstones();
             assert_eq!(
                 map::TableBackend::insert(&mut inline, key, index, key),
                 None
@@ -408,10 +520,10 @@ fn insert_reuses_tombstones_like_the_placement_walk() {
                 Some(slot),
                 "n {n} d {d} index {index}"
             );
-            reused_unrecorded += usize::from(unrecorded && walked.tombstones < tombstones);
+            reused_unrecorded += usize::from(unrecorded && walked.tombstones() < tombstones);
         }
         assert_ne!(reused_unrecorded, 0, "n {n} d {d}");
-        assert_eq!(inline.tombstones, walked.tombstones);
+        assert_eq!(inline.tombstones(), walked.tombstones());
         assert_eq!(controls_and_filter(&inline), controls_and_filter(&walked));
     }
 }
@@ -433,7 +545,7 @@ fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
         // The first lane of an untouched level-zero bucket the probe does
         // not select.
         let (_, slot) = (0..buckets)
-            .map(|bucket| (bucket, level.offset + bucket * table.shape.beta))
+            .map(|bucket| (bucket, level.offset + bucket * table.shape.stride))
             .find(|&(bucket, slot)| {
                 // SAFETY: a level-zero bucket starts inside the storage.
                 own != Some(bucket) && control::is_free(unsafe { table.storage.control_at(slot) })
@@ -500,6 +612,8 @@ struct DifferentialCoverage {
     /// Lookups past the gate whose bin records no head level, which scan
     /// an absent head entry.
     absent_entry_scans: usize,
+    /// Checks of a table holding deletes its counters had yet to see.
+    uncounted_deletes: usize,
 }
 
 /// Lengths, in operations, of the stretches one differential cycle runs in
@@ -541,12 +655,28 @@ fn assert_matches_model(
     assert_eq!(table.entries(), model.len());
     assert!(table.entries() <= table.shape.max_insertions);
     // The head placements left are those of a table without tombstones.
-    let head_limit = if table.tombstones == 0 {
+    let head_limit = if table.tombstones() == 0 {
         table.shape.max_insertions
     } else {
         0
     };
     assert_eq!(table.head_left, head_limit.saturating_sub(model.len()));
+    // The delete counts are exact with the uncounted deletes added, and no
+    // delete ran past a threshold it had to settle at.
+    // SAFETY: `slot < slots`, the storage capacity.
+    let tombstone_controls = (0..table.shape.slots)
+        .filter(|&slot| unsafe { table.storage.control_at(slot) } == CTRL_TOMBSTONE)
+        .count();
+    assert_eq!(table.tombstones(), tombstone_controls);
+    // Lone deletes leave a due cleanup to the next insert of an absent key,
+    // which the stream checks; the threshold must still have settled.
+    assert_eq!(
+        table.cleanup_due(),
+        table.tombstones() > capacity::tombstone_cleanup_threshold(table.shape.n)
+    );
+    assert!(table.stale_membership() <= membership::refresh_deletes(table.shape.max_insertions));
+    assert!(table.settle_left >= 1);
+    coverage.uncounted_deletes += usize::from(table.uncounted_deletes() != 0);
     let mut scans_absent_entry = |key: &HashedKey| {
         let gate = table.membership_gate(key.hash);
         coverage.absent_entry_scans +=
@@ -574,6 +704,17 @@ fn assert_matches_model(
         .levels
         .get(OVERFLOW_LEVEL)
         .map_or(table.shape.primary_offset, |level| level.offset);
+    if table.shape.beta < GROUP_SIZE {
+        for slot in 0..table.shape.primary_offset {
+            // SAFETY: `slot` is below the storage capacity.
+            let control = unsafe { table.storage.control_at(slot) };
+            assert_eq!(
+                control == CTRL_PADDING,
+                slot % GROUP_SIZE >= table.shape.beta,
+                "slot {slot} holds {control:#x}"
+            );
+        }
+    }
     for (key, value) in model {
         let slot = table
             .find_location(key, key.hash)
@@ -592,6 +733,10 @@ fn assert_matches_model(
             table.membership_gate(key.hash).levels & table.level_bit(slot),
             0,
             "{key:?} lost its level bit"
+        );
+        assert!(
+            slot >= table.shape.primary_offset || slot % table.shape.stride < table.shape.beta,
+            "{key:?} sits in a padding lane"
         );
         coverage.overflow_entries |= slot >= overflow_start;
         if let Some(level) = table.shape.levels.first() {
@@ -681,21 +826,22 @@ fn run_differential(
     for step in 0..stream.operations {
         // A filling stretch meets the insertion budget and growth, a mixed
         // one reuses tombstones, and a draining one removes only live keys,
-        // so tombstones pass the cleanup threshold.
+        // so tombstones pass the cleanup threshold; its few inserts draw
+        // from the whole universe, so one meets the cleanup left due.
         let (insert_below, draining) = match step % cycle {
             at if at < stream.filling => (85, false),
             at if at < stream.filling + stream.mixed => (50, false),
-            _ => (2, true),
+            _ => (3, true),
         };
         let drawn = universe[usize::try_from(next() % universe.len() as u64).unwrap()];
-        let key = if draining {
+        let roll = next() % 100;
+        let key = if draining && roll >= insert_below {
             model.range(drawn..).next().map_or(drawn, |(key, _)| *key)
         } else {
             drawn
         };
-        let roll = next() % 100;
         let slots = table.shape.n;
-        let tombstones = table.tombstones;
+        let tombstones = table.tombstones();
         let prf = table.prf;
         if roll < 2 {
             assert_eq!(
@@ -713,7 +859,15 @@ fn run_differential(
             );
             let previous = model.insert(key, value);
             coverage.overwrites += usize::from(previous.is_some());
+            let due = table.cleanup_due();
             insert_checking_the_head_walk(&mut table, key, value, previous, &mut coverage);
+            // An absent key's insert runs the cleanup its deletes left due.
+            if previous.is_none() {
+                assert!(!table.cleanup_due(), "step {step}");
+                coverage.tombstone_cleanups += usize::from(due);
+            } else {
+                assert_eq!(table.cleanup_due(), due, "step {step}");
+            }
         } else if step % stream.clear_every == stream.clear_every - 1 {
             table.clear();
             model.clear();
@@ -727,8 +881,12 @@ fn run_differential(
                 model.remove(&key).map(|value| (key, value)),
                 "step {step} remove {key:?}"
             );
-            // A remove adds a tombstone unless it triggered the cleanup.
-            coverage.tombstone_cleanups += usize::from(table.tombstones < tombstones);
+            // A remove of a live key adds a tombstone and never rebuilds.
+            assert_eq!(
+                table.tombstones(),
+                tombstones + usize::from(removed.is_some()),
+                "step {step}"
+            );
         }
         assert!(table.entries() <= table.shape.max_insertions, "step {step}");
         // The first allocation is not a growth.
@@ -784,6 +942,7 @@ fn operation_streams_agree_with_a_model_map_and_the_ordered_walk() {
         assert!(coverage.head_placements > 0, "{coverage:?}");
         assert!(coverage.blocked_head_inserts > 0, "{coverage:?}");
         assert!(coverage.absent_entry_scans > 0, "{coverage:?}");
+        assert!(coverage.uncounted_deletes > 0, "{coverage:?}");
     }
 }
 
@@ -897,7 +1056,7 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
             model.insert(*key, key.id);
         }
         assert_eq!(table.shape.max_insertions, budget, "d {d}");
-        assert_eq!((table.entries(), table.tombstones), (budget, 0), "d {d}");
+        assert_eq!((table.entries(), table.tombstones()), (budget, 0), "d {d}");
         check(&table, &model);
 
         // Tombstones on the walks, then inserts that reuse some of them.
@@ -906,7 +1065,7 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
             assert_eq!(table.remove(location), (*key, key.id), "d {d}");
             model.remove(key);
         }
-        assert_ne!(table.tombstones, 0, "d {d}");
+        assert_ne!(table.tombstones(), 0, "d {d}");
         check(&table, &model);
         for key in universe[..budget].iter().step_by(6) {
             assert_eq!(
@@ -997,16 +1156,15 @@ fn recorded_head_yields_the_entry_of_every_recorded_level_shallowest_first() {
     assert_eq!(level_bit_of(usize::MAX), OVERFLOW_LEVEL_BIT);
 }
 
-/// A shape without lanes matches nothing in a first-match scan, and it keeps
-/// an all-absent head, which ends the insert's head walk at once. A shape
-/// with lanes copies its levels into the head.
+/// An empty shape and one with buckets wider than a group keep an all-absent
+/// head, which ends the insert's head walk at once and matches nothing in a
+/// first-match scan. Any other shape copies its levels into the head.
 #[test]
 fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     let (wide, smallest_wide) = smallest_wide_shape();
     let wide_reserve = ReserveFraction::from_exponent(wide).unwrap();
     let large_wide = FunnelShape::for_insert_budget(1 << 19, wide_reserve).unwrap();
     for shape in [FunnelShape::empty(), smallest_wide, large_wide] {
-        assert_eq!(shape.bucket_lanes, 0, "n {}", shape.n);
         assert_eq!(
             shape.head,
             [LevelShape::ABSENT; HEAD_ENTRIES],
@@ -1018,7 +1176,7 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     let narrow_reserve = ReserveFraction::from_exponent(3).unwrap();
     for budget in [1, 1 << 19] {
         let shape = FunnelShape::for_insert_budget(budget, narrow_reserve).unwrap();
-        assert_eq!(shape.bucket_lanes.count_ones() as usize, shape.beta);
+        assert!(shape.beta <= GROUP_SIZE);
         let recorded = shape.levels.len().min(OVERFLOW_LEVEL);
         assert_eq!(shape.head[..recorded], shape.levels[..recorded]);
         assert!(
@@ -1065,7 +1223,7 @@ fn vacancy_walk_matches_exact_search_for_absent_keys() {
         let slot = table.find_location(&key, hash).unwrap();
         map::TableBackend::remove(&mut table, slot);
     }
-    assert!(table.tombstones > 0);
+    assert!(table.tombstones() > 0);
     check(&table, "tombstoned table");
 }
 
@@ -1110,7 +1268,7 @@ fn lookup_walk_matches_exact_search_hits() {
         let slot = table.find_location(&key, hash).unwrap();
         map::TableBackend::remove(&mut table, slot);
     }
-    assert!(table.tombstones > 0);
+    assert!(table.tombstones() > 0);
     check(&table, "tombstoned table");
 }
 
@@ -1125,7 +1283,7 @@ fn deletes_past_the_threshold_refresh_the_membership_filter() {
                 .membership_gate(table.hash_builder.hash_one(key))
                 .passes()
         },
-        |table| table.stale_membership,
+        FunnelTable::stale_membership,
     );
 }
 
@@ -1207,7 +1365,7 @@ fn decompose_scalar_location(shape: &FunnelShape, location: ScalarFunnelLocation
         } => {
             assert!(bucket < shape.levels[level].bucket_range.upper());
             assert!(slot_in_bucket < shape.beta);
-            shape.levels[level].offset + bucket * shape.beta + slot_in_bucket
+            shape.levels[level].offset + bucket * shape.stride + slot_in_bucket
         }
         ScalarFunnelLocation::SpecialPrimary { slot, .. } => {
             assert!(slot < shape.primary_range.upper());
@@ -1252,7 +1410,13 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
                 None
             );
             let actual = table.find_location(&identity, identity).unwrap();
-            assert_eq!(actual, expected.global_slot(), "n={n} key={identity}");
+            // The oracle numbers its slots without the padding lanes, so the
+            // two are compared by level, bucket and lane.
+            assert_eq!(
+                actual,
+                decompose_scalar_location(&table.shape, expected),
+                "n={n} key={identity}"
+            );
             locations.push((
                 identity,
                 actual,
@@ -1264,7 +1428,6 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
         assert_eq!(scalar.locations().count(), locations.len());
         for (expected, identity) in scalar.locations() {
             let global_slot = locations[usize::try_from(identity).unwrap()].1;
-            assert_eq!(expected.global_slot(), global_slot, "n={n} key={identity}");
             assert_eq!(
                 decompose_scalar_location(&table.shape, expected),
                 global_slot,
@@ -1368,7 +1531,7 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
             0,
             level.bucket_range.upper(),
         );
-        let start = level.offset + bucket * table.shape.beta;
+        let start = level.offset + bucket * table.shape.stride;
         for lane in 0..table.shape.beta {
             occupy(
                 &mut table,
@@ -1576,7 +1739,7 @@ fn level_bits_follow_slot_levels_into_the_special_arrays() {
     for slot in [
         table.shape.primary_offset,
         table.shape.fallback_offset,
-        table.shape.n - 1,
+        table.shape.slots - 1,
     ] {
         assert_eq!(
             table.level_bit(slot),
@@ -1674,7 +1837,14 @@ fn exact_geometry_sums_to_n() {
             + table.shape.fallback_bucket_range.upper() * table.shape.fallback_bucket_width,
         table.shape.n
     );
-    assert_eq!(table.storage.capacity(), table.shape.n);
+    let padding = table
+        .shape
+        .levels
+        .iter()
+        .map(|level| level.bucket_range.upper() * (table.shape.stride - table.shape.beta))
+        .sum::<usize>();
+    assert_eq!(table.storage.capacity(), table.shape.n + padding);
+    assert_eq!(table.shape.slots, table.shape.n + padding);
 }
 
 #[test]
@@ -1692,10 +1862,10 @@ fn tombstones_never_hide_survivors_and_are_reused() {
             assert!(table.find_location(&key, key).is_some(), "lost key {key}");
         }
     }
-    let tombstones = table.tombstones;
+    let tombstones = table.tombstones();
     let replacement = table.insert_for_vacant_entry(10_000, 1, 7);
     assert_eq!(replacement, removed);
-    assert_eq!(table.tombstones, tombstones - 1);
+    assert_eq!(table.tombstones(), tombstones - 1);
     assert_eq!(table.entries(), 200);
 }
 
@@ -1712,12 +1882,12 @@ fn tombstone_before_a_duplicate_does_not_hide_the_duplicate() {
         Some(2)
     );
     assert_eq!(table.entries(), 1);
-    assert_eq!(table.tombstones, 1);
+    assert_eq!(table.tombstones(), 1);
     assert_eq!(table.find_location(&200, 42), Some(second));
 
     let reused = table.insert_for_vacant_entry(300, 3, 42);
     assert_eq!(reused, first);
-    assert_eq!(table.tombstones, 0);
+    assert_eq!(table.tombstones(), 0);
 }
 
 #[test]
@@ -1737,7 +1907,7 @@ fn clear_tombstones_each_slot_before_dropping_its_value() {
     for key in 0..3 {
         table.insert_for_vacant_entry(key, PanicOnFirstDrop(drops.clone()), key);
     }
-    let first_occupied = (0..table.shape.n)
+    let first_occupied = (0..table.shape.slots)
         .find(|&slot| control::is_occupied(table.storage.checked_control(slot)))
         .unwrap();
 
@@ -1751,7 +1921,7 @@ fn clear_tombstones_each_slot_before_dropping_its_value() {
     );
     assert_eq!(
         table.entries(),
-        (0..table.shape.n)
+        (0..table.shape.slots)
             .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
     );
@@ -1831,7 +2001,7 @@ fn panicking_hasher_during_resize_keeps_every_entry() {
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert_eq!(
         table.entries(),
-        (0..table.shape.n)
+        (0..table.shape.slots)
             .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
     );
@@ -1865,12 +2035,173 @@ fn panicking_hasher_during_resize_keeps_every_entry() {
     );
     assert_eq!(
         table.entries(),
-        (0..table.shape.n)
+        (0..table.shape.slots)
             .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
             .count()
     );
     drop(table);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
+}
+
+/// Deletes the counts have yet to see when a resize starts are settled as the
+/// new generation goes in, and must come back out with it when a panicking
+/// hasher rolls the resize back.
+#[test]
+fn panicking_hasher_during_resize_rolls_back_uncounted_deletes() {
+    const INSERTED: u64 = 9;
+    const REMOVED: u64 = 4;
+    let armed = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let reserve = ReserveFraction::from_exponent(3).unwrap();
+    let shape = FunnelShape::from_slots(144, reserve).unwrap();
+    let mut table = FunnelTable::<PanicHashKey, u64, IdentityBuildHasher>::try_from_shape(
+        shape,
+        reserve,
+        IdentityBuildHasher,
+        Global,
+    )
+    .unwrap();
+    let key_of = |id: u64| PanicHashKey {
+        id,
+        armed: armed.clone(),
+        drops: drops.clone(),
+    };
+    for id in 0..INSERTED {
+        assert_eq!(
+            map::TableBackend::insert(&mut table, key_of(id), id, id),
+            None
+        );
+    }
+    for id in 0..REMOVED {
+        let slot = table.find_location(&key_of(id), id).unwrap();
+        map::TableBackend::remove(&mut table, slot);
+    }
+    assert_ne!(table.uncounted_deletes(), 0, "the deletes were settled");
+    let before = map::TableBackend::epoch_snapshot(&table);
+    assert_eq!(before.distinct_insertions as u64, INSERTED);
+    assert!(before.had_delete);
+    let next_shape = FunnelShape::for_insert_budget(256, reserve).unwrap();
+
+    armed.store(true, Ordering::SeqCst);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        map::TableBackend::try_resize(&mut table, next_shape.n).unwrap();
+    }));
+    armed.store(false, Ordering::SeqCst);
+    assert!(result.is_err());
+
+    assert_eq!(table.shape.n, 144);
+    assert_eq!(table.entries() as u64, INSERTED - REMOVED);
+    assert_eq!(table.tombstones() as u64, REMOVED);
+    assert_eq!(table.stale_membership() as u64, REMOVED);
+    assert_eq!(map::TableBackend::epoch_snapshot(&table), before);
+    assert_eq!(
+        table.head_left,
+        table.head_limit().saturating_sub(table.entries())
+    );
+    for id in 0..INSERTED {
+        assert_eq!(
+            map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
+            (id >= REMOVED).then_some(id)
+        );
+    }
+
+    // The counts still drive placement and the next resize.
+    for id in 0..REMOVED {
+        assert_eq!(
+            map::TableBackend::insert(&mut table, key_of(id), id, id),
+            None
+        );
+    }
+    assert_eq!(table.entries() as u64, INSERTED);
+    map::TableBackend::try_resize(&mut table, next_shape.n).unwrap();
+    assert_eq!(table.entries() as u64, INSERTED);
+    assert_eq!(table.tombstones(), 0);
+    for id in 0..INSERTED {
+        assert_eq!(
+            map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
+            Some(id)
+        );
+    }
+}
+
+/// A filter refresh hashes every live key. A hasher that panics part way
+/// through must leave the filter recording every live key.
+#[test]
+fn panicking_hasher_during_filter_refresh_keeps_every_key_recorded() {
+    const LIVE: u64 = 12;
+    const CHURN: u64 = LIVE;
+    let armed = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let reserve = ReserveFraction::from_exponent(3).unwrap();
+    let shape = FunnelShape::from_slots(144, reserve).unwrap();
+    let mut table = FunnelTable::<PanicHashKey, u64, IdentityBuildHasher>::try_from_shape(
+        shape,
+        reserve,
+        IdentityBuildHasher,
+        Global,
+    )
+    .unwrap();
+    let key_of = |id: u64| PanicHashKey {
+        id,
+        armed: armed.clone(),
+        drops: drops.clone(),
+    };
+    for id in 0..LIVE {
+        assert_eq!(
+            map::TableBackend::insert(&mut table, key_of(id), id, id),
+            None
+        );
+    }
+
+    // Cycling one key re-takes its tombstone, so only the stale-filter count
+    // grows and the delete that passes its threshold refreshes the filter.
+    let threshold = membership::refresh_deletes(table.shape.max_insertions);
+    for cycle in 0..=threshold {
+        assert_eq!(
+            map::TableBackend::insert(&mut table, key_of(CHURN), CHURN, CHURN),
+            None
+        );
+        let slot = table.find_location(&key_of(CHURN), CHURN).unwrap();
+        if cycle < threshold {
+            map::TableBackend::remove(&mut table, slot);
+            assert_eq!(table.stale_membership(), cycle + 1);
+            continue;
+        }
+        armed.store(true, Ordering::SeqCst);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            map::TableBackend::remove(&mut table, slot);
+        }));
+        armed.store(false, Ordering::SeqCst);
+        assert!(result.is_err(), "the refresh hashed no key");
+    }
+
+    assert_eq!(table.entries() as u64, LIVE);
+    for id in 0..LIVE {
+        assert!(table.membership_gate(id).passes(), "key {id} unrecorded");
+        assert_eq!(
+            map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
+            Some(id)
+        );
+    }
+    assert_eq!(
+        map::TableBackend::find_entry(&table, &key_of(CHURN), CHURN).map(|entry| entry.value),
+        None
+    );
+
+    // The refresh is still owed, and runs at the next settling delete.
+    assert_eq!(
+        map::TableBackend::insert(&mut table, key_of(CHURN), CHURN, CHURN),
+        None
+    );
+    let slot = table.find_location(&key_of(CHURN), CHURN).unwrap();
+    map::TableBackend::remove(&mut table, slot);
+    assert_eq!(table.stale_membership(), 0);
+    for id in 0..LIVE {
+        assert_eq!(
+            map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
+            Some(id)
+        );
+    }
 }
 
 #[test]
@@ -2270,9 +2601,12 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 if found.is_some() || table.unmatched_is_absent(probe, gate.levels) {
                     assert_eq!(found, walk, "n {n} d {d} index {index}");
                     // A bucket wider than a group is never scanned here:
-                    // only a key no level recorded is answered.
+                    // only a key no level recorded is answered, or one the
+                    // scan of an absent entry meets in the first group.
                     assert!(
-                        !wide || gate.levels & !OVERFLOW_LEVEL_BIT == 0,
+                        !wide
+                            || gate.levels & !OVERFLOW_LEVEL_BIT == 0
+                            || found.is_some_and(|slot| slot < GROUP_SIZE),
                         "n {n} d {d} index {index}"
                     );
                     answered += 1;

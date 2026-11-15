@@ -40,7 +40,7 @@ const PREFETCH_DISTANCE: usize = 16;
 
 /// Smallest old-generation slot footprint that rebuilds with prefetching.
 /// Below it the tables stay cache-resident, so hashing ahead only adds work.
-const PREFETCH_MIN_BYTES: usize = 1 << 22;
+pub(crate) const PREFETCH_MIN_BYTES: usize = 1 << 22;
 
 /// Moves every entry of `table` into `next` and installs it. Each key is
 /// hashed in place before its entry is copied, so a panicking hasher
