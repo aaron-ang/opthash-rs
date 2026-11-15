@@ -64,30 +64,25 @@ enum FunnelScanMode {
 /// instead of bounds-checking.
 const HEAD_LEVELS: usize = (OVERFLOW_LEVEL + 1).next_power_of_two();
 
+// Declaration order is layout order: a draw reads the multiplier with the
+// bucket count, and a tested draw the threshold with the offset.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LevelShape {
-    offset: usize,
-    bucket_range: PreparedProbeRange,
     /// See [`FunnelPrf::ordinary_multiplier`].
     multiplier: u64,
+    bucket_range: PreparedProbeRange,
+    offset: usize,
 }
 
+// Declaration order is layout order, so the words every operation reads sit
+// at small offsets and pair up, and the large head array comes last.
+#[repr(C)]
 #[derive(Clone, Debug)]
 struct FunnelShape {
-    n: usize,
     max_insertions: usize,
-    levels: Box<[LevelShape]>,
-    /// The levels that own a level-bin bit, copied inline so the hot paths
-    /// index them without the pointer chase or a bounds check. Every other
-    /// entry, the last one always among them, is [`LevelShape::ABSENT`].
-    head: [LevelShape; HEAD_LEVELS],
+    n: usize,
     beta: usize,
-    loglog_ceiling: usize,
-    primary_offset: usize,
-    primary_range: PreparedProbeRange,
-    fallback_offset: usize,
-    fallback_bucket_width: usize,
-    fallback_bucket_range: PreparedProbeRange,
     /// One bit per lane of a bucket, selecting its lanes from a group's
     /// fingerprint matches. Zero when a bucket is wider than one group, or
     /// the shape is empty: such a table answers no lookup from first matches.
@@ -95,14 +90,25 @@ struct FunnelShape {
     /// Whether lookups select between the first two recorded levels; see
     /// [`SELECT_MAX_SLOTS`].
     selects: bool,
+    levels: Box<[LevelShape]>,
+    loglog_ceiling: usize,
+    primary_offset: usize,
+    primary_range: PreparedProbeRange,
+    fallback_offset: usize,
+    fallback_bucket_width: usize,
+    fallback_bucket_range: PreparedProbeRange,
+    /// The levels that own a level-bin bit, copied inline so the hot paths
+    /// index them without the pointer chase or a bounds check. Every other
+    /// entry, the last one always among them, is [`LevelShape::ABSENT`].
+    head: [LevelShape; HEAD_LEVELS],
 }
 
 impl LevelShape {
     /// A level with no buckets, which rejects every probe word.
     const ABSENT: Self = Self {
-        offset: 0,
-        bucket_range: PreparedProbeRange::rejecting(),
         multiplier: 0,
+        bucket_range: PreparedProbeRange::rejecting(),
+        offset: 0,
     };
 }
 
@@ -159,11 +165,11 @@ impl FunnelShape {
             .map_err(|_| TryReserveError::AllocError)?;
         for (level_index, bucket_count) in plan.ordinary_bucket_counts().enumerate() {
             levels.push(LevelShape {
-                offset,
-                bucket_range: PreparedProbeRange::new(bucket_count)
-                    .map_err(|_| TryReserveError::CapacityOverflow)?,
                 multiplier: FunnelPrf::ordinary_multiplier(level_index as u64)
                     .ok_or(TryReserveError::CapacityOverflow)?,
+                bucket_range: PreparedProbeRange::new(bucket_count)
+                    .map_err(|_| TryReserveError::CapacityOverflow)?,
+                offset,
             });
             offset = offset
                 .checked_add(
@@ -761,17 +767,11 @@ unsafe fn first_free_in_bucket(ctrl_ptr: *const u8, start: usize, length: usize)
 /// Paper-exact Funnel hashing within each table epoch. Deletion, growth, and
 /// exceptional collision recovery are built-in dynamic-map behavior beyond
 /// the paper's fixed-size insertion model.
+// Declaration order is layout order; see [`FunnelShape`], which comes last
+// for its head array.
+#[repr(C)]
 pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
-    shape: FunnelShape,
     storage: FlatStorage<SlotEntry<K, V>>,
-    len: usize,
-    tombstones: usize,
-    reserve_fraction: ReserveFraction,
-    hash_builder: S,
-    alloc: A,
-    arena: Arena,
-    epoch: EpochState,
-    exceptional_placement: bool,
     /// Seeds every probe sequence. Starts at [`FUNNEL_PROBE_SEED`]; a
     /// placement-recovery rebuild advances it, because survivors of slot-order
     /// deletes are skewed toward the buckets the old seed left full.
@@ -779,9 +779,18 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// Cached location of the membership filter tail. Lookups load one word
     /// from it before probing; see [`crate::membership`].
     membership: FilterTail,
+    hash_builder: S,
+    reserve_fraction: ReserveFraction,
+    alloc: A,
+    arena: Arena,
+    epoch: EpochState,
+    exceptional_placement: bool,
     /// Deletes since the filter last matched the live set; see
     /// [`membership::refresh_deletes`].
     stale_membership: usize,
+    tombstones: usize,
+    len: usize,
+    shape: FunnelShape,
 }
 
 // SAFETY: the table uniquely owns its arena and every `K`/`V` in it; no
