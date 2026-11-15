@@ -26,7 +26,7 @@ use crate::raw::rebuild::{self, Rebuildable};
 
 mod schedule;
 
-use schedule::{ProbeSchedule, ProbeScheduleRoom, SENTINEL_LEVEL};
+use schedule::{ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -181,7 +181,7 @@ impl<T> Level<T> {
     /// Slots minus live entries (includes tombstones, reusable on insert).
     #[inline]
     fn free_slots(&self) -> usize {
-        self.capacity.saturating_sub(self.len) as usize
+        (self.capacity - self.len) as usize
     }
 
     /// Tombstones exceed [`capacity::tombstone_cleanup_threshold`], so the
@@ -448,35 +448,49 @@ impl PreparedElasticKey {
 const _: () = assert!(mem::size_of::<PreparedElasticRoute>() == 8);
 const _: () = assert!(mem::size_of::<PreparedElasticKey>() == 16);
 
-/// Outcome of [`ElasticTable::search_schedule`].
+/// Outcome of [`ElasticTable::walk_schedule`].
 enum ScheduleSearch<R> {
     Hit(R),
     Absent,
-    /// The walk could not decide; carries the key's widened level mask for
-    /// [`ElasticTable::find_by_general_schedule`].
-    Unresolved(u32),
+    /// The walk could not decide: the key is where
+    /// [`ElasticTable::find_by_general_schedule`] finds it, or absent.
+    Unresolved,
 }
 
-/// Both metadata answers for one prepared key, read from one word.
+/// The metadata word of one prepared key and its membership answer.
 #[derive(Clone, Copy)]
-struct ElasticRouteFilter {
+struct ElasticRouteFilter<'a> {
     /// `false` proves no insert ever recorded this key's route.
     maybe_present: bool,
-    /// Summary bits of the levels this route bin has occupied. Bit `i` covers
-    /// level `i` for `i < ROUTE_SUMMARY_LEVELS - 1`; the last bit is saturating
-    /// and covers every deeper level.
-    level_mask: u32,
+    word: &'a MetadataWord,
 }
 
-impl ElasticRouteFilter {
-    /// Widens the saturating last summary bit over every level index it stands
-    /// for, so a lookup tests `1 << level` directly instead of clamping the
-    /// level on each schedule step.
+impl ElasticRouteFilter<'_> {
+    /// Summary bits of the levels `route`'s bin has occupied. Bit `i` covers
+    /// level `i` for `i < ROUTE_SUMMARY_LEVELS - 1`; the last bit is
+    /// saturating and covers every deeper level. Read apart from the
+    /// membership answer, so a lookup that ends before it narrows its levels
+    /// does not load them.
     #[inline]
-    const fn expanded_level_mask(self) -> u32 {
-        let saturated = (self.level_mask >> (ROUTE_SUMMARY_LEVELS - 1)) & 1;
-        self.level_mask | (0_u32.wrapping_sub(saturated) << (ROUTE_SUMMARY_LEVELS - 1))
+    fn level_mask(self, route: PreparedElasticRoute) -> u16 {
+        self.word.level_bins[route.summary_bin()]
     }
+
+    /// [`Self::level_mask`] widened by [`expand_level_mask`].
+    #[inline]
+    fn expanded_level_mask(self, route: PreparedElasticRoute) -> u64 {
+        expand_level_mask(self.level_mask(route))
+    }
+}
+
+/// Widens the saturating last summary bit over every level index it stands
+/// for, so a lookup tests `1 << level` directly instead of clamping the
+/// level on each schedule step. The last bit is the summary's sign bit, so
+/// sign extension is the widening.
+#[inline]
+const fn expand_level_mask(level_mask: u16) -> u64 {
+    const { assert!(ROUTE_SUMMARY_LEVELS == u16::BITS as usize) };
+    (level_mask.cast_signed() as i64).cast_unsigned()
 }
 
 /// Maps a level index onto its route-summary bit. Levels past the summary's
@@ -619,6 +633,13 @@ impl BatchScheduler {
     #[inline]
     fn settles(&self, len: usize) -> bool {
         len.wrapping_sub(self.batch_start) < self.settled_span
+    }
+
+    /// No live count settles: the table's levels do not all reduce by
+    /// shift, or it takes no insertion.
+    #[inline]
+    fn never_settles(&self) -> bool {
+        self.settled_limit == 0
     }
 
     /// [`Self::target`] on a copy, for assertions through a shared borrow.
@@ -963,29 +984,24 @@ where
         self.metadata_words
     }
 
-    /// Reads the membership scalar and selected route-summary bin directly:
-    /// `maybe_present == false` proves the key was never recorded, and
-    /// `level_mask` narrows the candidate levels. The two field loads avoid
-    /// copying the whole metadata word for dynamic bin extraction.
+    /// Tests the membership scalar of the key's metadata word:
+    /// `maybe_present == false` proves the key was never recorded. The
+    /// word's summary bins narrow the candidate levels.
     #[inline]
-    fn route_filter(&self, prepared: PreparedElasticKey) -> ElasticRouteFilter {
+    fn route_filter(&self, prepared: PreparedElasticKey) -> ElasticRouteFilter<'_> {
         // Zero words reduce every signature to word zero, which is then
         // `NO_METADATA`: no bit is set there, so the filter rejects the key.
         let word = MembershipKey::word(prepared.route.signature(), self.membership.words);
-        let summary_bin = prepared.route.summary_bin();
         let bits = prepared.membership.bits();
         debug_assert!(bits != 0);
         // SAFETY: `word` is a multiply-high reduction below the word count,
         // and the cached region covers exactly that many initialized,
         // properly aligned `MetadataWord`s; with no words it is zero and
         // `metadata_words` addresses the one word of `NO_METADATA`.
-        let (membership, route_bin) = unsafe {
-            let metadata = self.membership_ptr().add(word);
-            ((*metadata).membership, (*metadata).level_bins[summary_bin])
-        };
+        let word = unsafe { &*self.membership_ptr().add(word) };
         ElasticRouteFilter {
-            maybe_present: membership & bits == bits,
-            level_mask: u32::from(route_bin),
+            maybe_present: word.membership & bits == bits,
+            word,
         }
     }
 
@@ -1075,29 +1091,10 @@ where
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
-        self.insert_absent(key, value, prepared, key_fingerprint, |location| location)
-    }
-
-    /// Inserts a key known to be absent and hands its location to `finish`.
-    /// The common insert searches its target level once, inline, among the
-    /// probes the lookup schedule already covers. Growth, a batch change, the
-    /// general range reduction, a search that finds no slot there, and with
-    /// it every fallback and schedule extension, leave for the out-of-line
-    /// path, which chooses the slot from the start.
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
-    fn insert_absent<R>(
-        &mut self,
-        key: K,
-        value: V,
-        prepared: PreparedElasticKey,
-        key_fingerprint: u8,
-        finish: impl FnOnce((usize, usize)) -> R,
-    ) -> R {
         let Some((level, slot, control)) = self.settled_slot(prepared.route.probe) else {
-            return self.insert_absent_unsettled(key, value, prepared, key_fingerprint, finish);
+            return self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
         };
-        finish(self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control))
+        self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control)
     }
 
     /// The slot [`Self::choose_slot_for_new_key`] gives a new key, when the
@@ -1130,18 +1127,6 @@ where
         Some((case.level, slot, control))
     }
 
-    #[inline(never)]
-    fn insert_absent_unsettled<R>(
-        &mut self,
-        key: K,
-        value: V,
-        prepared: PreparedElasticKey,
-        key_fingerprint: u8,
-        finish: impl FnOnce((usize, usize)) -> R,
-    ) -> R {
-        finish(self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint))
-    }
-
     fn insert_for_vacant_entry_prepared(
         &mut self,
         key: K,
@@ -1165,26 +1150,31 @@ where
         self.place_after_target_failure(key, value, prepared, key_fingerprint, target)
     }
 
-    /// [`map::TableBackend::insert`] for a key
-    /// [`Self::search_schedule`] left unresolved.
+    /// [`map::TableBackend::insert`] off its common path: a key the walk
+    /// left unresolved, or an absent key without a settled slot. It tells
+    /// the two apart itself, so its callers pass the same arguments and
+    /// share one call.
     #[inline(never)]
-    fn insert_unresolved(
+    fn insert_slow(
         &mut self,
         key: K,
         value: V,
         prepared: PreparedElasticKey,
         key_fingerprint: u8,
-        level_mask: u32,
     ) -> Option<V> {
-        let found = self.find_by_general_schedule(
-            &key,
-            prepared,
-            key_fingerprint,
-            level_mask,
-            |level, slot, _| (level, slot),
-        );
-        if let Some(location) = found {
-            return Some(map::TableBackend::replace_value(self, location, value));
+        let filter = self.route_filter(prepared);
+        if filter.maybe_present && self.walk_ends_unresolved() {
+            let level_mask = filter.expanded_level_mask(prepared.route);
+            let found = self.find_by_general_schedule(
+                &key,
+                prepared.route,
+                key_fingerprint,
+                level_mask,
+                |level, slot, _| (level, slot),
+            );
+            if let Some(location) = found {
+                return Some(map::TableBackend::replace_value(self, location, value));
+            }
         }
         self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
         None
@@ -1470,10 +1460,11 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_slot_indices_prepared(
+        self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            control::control_fingerprint(hash),
+            || control::control_fingerprint(hash),
+            |level, slot, _entry| (level, slot),
         )
     }
 
@@ -1482,10 +1473,11 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_entry_prepared(
+        self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            control::control_fingerprint(hash),
+            || control::control_fingerprint(hash),
+            |_level, _slot, entry| entry,
         )
     }
 
@@ -1498,7 +1490,7 @@ where
         self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            control::control_fingerprint(hash),
+            || control::control_fingerprint(hash),
             |_level, _slot, entry| &entry.value,
         )
     }
@@ -1523,20 +1515,35 @@ where
     {
         let prepared = PreparedElasticKey::new(hash);
         let key_fingerprint = control::control_fingerprint(hash);
-        // The search applies the filter from the metadata word it already
-        // reads, so this path pays no separate pre-check load.
-        let search = self.search_schedule(&key, prepared, key_fingerprint, |level, slot, _| {
-            (level, slot)
-        });
-        match search {
-            ScheduleSearch::Hit(location) => Some(self.replace_value(location, value)),
-            ScheduleSearch::Absent => {
-                self.insert_absent(key, value, prepared, key_fingerprint, |_| None)
+        // Every way off the common path meets in one call, which tells them
+        // apart itself.
+        'common: {
+            let filter = self.route_filter(prepared);
+            if filter.maybe_present {
+                let walked = self.walk_schedule(
+                    &key,
+                    prepared.route,
+                    key_fingerprint,
+                    filter,
+                    |_, _, entry| entry,
+                );
+                match walked {
+                    ScheduleSearch::Hit(entry) => {
+                        // SAFETY: the walk hands on an occupied slot of this
+                        // table, which `&mut self` borrows alone.
+                        let slot = unsafe { &mut *entry };
+                        return Some(mem::replace(&mut slot.value, value));
+                    }
+                    ScheduleSearch::Absent => {}
+                    ScheduleSearch::Unresolved => break 'common,
+                }
             }
-            ScheduleSearch::Unresolved(level_mask) => {
-                self.insert_unresolved(key, value, prepared, key_fingerprint, level_mask)
+            if let Some((level, slot, control)) = self.settled_slot(prepared.route.probe) {
+                self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control);
+                return None;
             }
         }
+        self.insert_slow(key, value, prepared, key_fingerprint)
     }
 
     fn remove(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
@@ -2088,7 +2095,7 @@ where
         .map(|probe| probe.index)
     }
 
-    #[inline]
+    #[cfg(test)]
     fn find_slot_indices_prepared<Q>(
         &self,
         key: &Q,
@@ -2098,12 +2105,15 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.find_by_exact_schedule(key, prepared, key_fingerprint, |level, slot, _entry| {
-            (level, slot)
-        })
+        self.find_by_exact_schedule(
+            key,
+            prepared,
+            || key_fingerprint,
+            |level, slot, _entry| (level, slot),
+        )
     }
 
-    #[inline]
+    #[cfg(test)]
     fn find_entry_prepared<'a, Q>(
         &'a self,
         key: &Q,
@@ -2113,43 +2123,24 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.find_by_exact_schedule(key, prepared, key_fingerprint, |_level, _slot, entry| entry)
+        self.find_by_exact_schedule(
+            key,
+            prepared,
+            || key_fingerprint,
+            |_level, _slot, entry| entry,
+        )
     }
 
+    /// Looks the key up along its schedule. The fingerprint is taken only
+    /// for a key the filter passes, so a rejected key does not derive it.
     #[inline]
     fn find_by_exact_schedule<'a, Q, R>(
         &'a self,
         key: &Q,
         prepared: PreparedElasticKey,
-        key_fingerprint: u8,
+        key_fingerprint: impl FnOnce() -> u8,
         mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
     ) -> Option<R>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        match self.search_schedule(key, prepared, key_fingerprint, &mut on_hit) {
-            ScheduleSearch::Hit(hit) => Some(hit),
-            ScheduleSearch::Absent => None,
-            ScheduleSearch::Unresolved(level_mask) => {
-                self.find_by_general_schedule(key, prepared, key_fingerprint, level_mask, on_hit)
-            }
-        }
-    }
-
-    /// Walks the key's candidates in schedule order. A table that needs the
-    /// general reduction has routes that probe nothing, so its walk ends
-    /// unresolved. It calls nothing but the key comparison, so a caller that
-    /// hands [`ScheduleSearch::Unresolved`] on in tail position keeps no
-    /// stack frame.
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
-    fn search_schedule<'a, Q, R>(
-        &'a self,
-        key: &Q,
-        prepared: PreparedElasticKey,
-        key_fingerprint: u8,
-        mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
-    ) -> ScheduleSearch<R>
     where
         Q: Equivalent<K> + ?Sized,
     {
@@ -2157,37 +2148,82 @@ where
         // candidates nor the exceptional full scan can hold it.
         let filter = self.route_filter(prepared);
         if !filter.maybe_present {
-            return ScheduleSearch::Absent;
+            return None;
         }
-        let sequence = prepared.route.probe.sequence(self.fold_multiplier);
+        let route = prepared.route;
+        let key_fingerprint = key_fingerprint();
+        let walked =
+            self.walk_schedule(key, route, key_fingerprint, filter, |level, slot, entry| {
+                // SAFETY: the walk hands on an occupied slot of this table,
+                // which `&'a self` keeps from changing.
+                on_hit(level, slot, unsafe { &*entry })
+            });
+        match walked {
+            ScheduleSearch::Hit(hit) => Some(hit),
+            ScheduleSearch::Absent => None,
+            ScheduleSearch::Unresolved => self.find_by_general_schedule(
+                key,
+                route,
+                key_fingerprint,
+                filter.expanded_level_mask(route),
+                on_hit,
+            ),
+        }
+    }
+
+    /// Whether a walk that finds no key leaves it unresolved: a table that
+    /// needs the general reduction has routes that probe nothing, and one
+    /// that placed a key exceptionally holds it off the schedule.
+    #[inline]
+    fn walk_ends_unresolved(&self) -> bool {
+        self.scheduler.never_settles() || self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG != 0
+    }
+
+    /// Walks the candidates of a key that passed `filter` in schedule order
+    /// and hands `on_hit` the level, slot and entry that holds the key. A
+    /// table that needs the general reduction has routes that probe
+    /// nothing, so its walk ends unresolved.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn walk_schedule<Q, R>(
+        &self,
+        key: &Q,
+        prepared: PreparedElasticRoute,
+        key_fingerprint: u8,
+        filter: ElasticRouteFilter<'_>,
+        mut on_hit: impl FnMut(usize, usize, *mut SlotEntry<K, V>) -> R,
+    ) -> ScheduleSearch<R>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let sequence = prepared.probe.sequence(self.fold_multiplier);
         let direct = self.probe_schedule.direct();
-        // SAFETY: the schedule starts with its direct route and ends with
-        // its sentinel, so the route after the direct one is in bounds.
-        let (direct, mut next) = unsafe { (&*direct, direct.add(1)) };
-        let h11_slot = probe::shifted_elastic_index(sequence.word(0), direct.index_shift());
+        // SAFETY: the schedule starts with its direct route.
+        let route = unsafe { &*direct };
+        let h11_slot = probe::shifted_elastic_index(sequence.word(0), route.direct_index_shift());
         // SAFETY: the route's shifted index maps into the control bytes it
         // holds.
-        if unsafe { *direct.control().add(h11_slot) } == key_fingerprint {
-            // SAFETY: only level zero's own control bytes hold a
-            // fingerprint, so the table has that level and the slot is one
-            // of its occupied ones.
-            let entry = unsafe { self.levels.get_unchecked(0).get_ref(h11_slot) };
-            if key.equivalent(&entry.key) {
+        if unsafe { *route.control().add(h11_slot) } == key_fingerprint {
+            // SAFETY: only a level's own control bytes hold a fingerprint,
+            // and one marks an occupied slot.
+            let entry: *mut SlotEntry<K, V> =
+                unsafe { self.probe_schedule.entry(route.control(), h11_slot) };
+            // SAFETY: as above, the slot holds an entry.
+            if key.equivalent(unsafe { &(*entry).key }) {
                 return ScheduleSearch::Hit(on_hit(0, h11_slot, entry));
             }
         }
 
-        let level_mask = filter.expanded_level_mask();
-        let mut open_levels = u64::from(level_mask) | (1 << SENTINEL_LEVEL);
+        let mut open_levels = filter.expanded_level_mask(prepared) | SENTINEL_BIT;
+        let mut next = direct;
         loop {
             // SAFETY: the schedule ends with its sentinel, and the walk
             // cannot pass it: the sentinel's level stays open until its own
-            // probe, which reads `EMPTY` and breaks below.
-            let route = unsafe { &*next };
-            // SAFETY: as above, `route` is at most the sentinel, the last
-            // element, so this is at most one past the end.
+            // probe, which reads `EMPTY` and ends the walk below.
             next = unsafe { next.add(1) };
-            if (open_levels >> route.level()) & 1 == 0 {
+            // SAFETY: as above, `next` is at most the sentinel.
+            let route = unsafe { &*next };
+            if !route.is_open(open_levels) {
                 continue;
             }
             // The route holds a shift whichever reduction its level needs.
@@ -2199,13 +2235,14 @@ where
             // it holds.
             let control = unsafe { *route.control().add(slot) };
             if control == key_fingerprint {
-                let level = route.level() as usize;
                 // SAFETY: the sentinel's control bytes match no fingerprint,
                 // so the route names a real level, and a fingerprint match
                 // means the slot is occupied.
-                let entry = unsafe { self.levels.get_unchecked(level).get_ref(slot) };
-                if key.equivalent(&entry.key) {
-                    return ScheduleSearch::Hit(on_hit(level, slot, entry));
+                let entry: *mut SlotEntry<K, V> =
+                    unsafe { self.probe_schedule.entry(route.control(), slot) };
+                // SAFETY: as above, the slot holds an entry.
+                if key.equivalent(unsafe { &(*entry).key }) {
+                    return ScheduleSearch::Hit(on_hit(route.level() as usize, slot, entry));
                 }
             } else if control == CTRL_EMPTY {
                 // A key takes its level's first free probe, and a slot
@@ -2213,44 +2250,39 @@ where
                 // removal leaves a tombstone, and so does a `clear` until its
                 // last entry is out, even one a panicking drop interrupts. So
                 // the key cannot sit at a later probe of this level.
-                open_levels &= !(1 << route.level());
+                open_levels = route.close(open_levels);
                 // Either no real level is left open, or this was the
                 // sentinel.
-                if open_levels <= 1 << SENTINEL_LEVEL {
+                if open_levels <= SENTINEL_BIT {
                     break;
                 }
             }
         }
-        // A table that needs the general reduction walked routes that probe
-        // nothing.
-        // SAFETY: the filter only passes when it has words, and those are laid
-        // out for a non-zero slot count, which gives the table a level zero.
-        let general = unsafe { self.levels.get_unchecked(0) }.index_shift() == GENERAL_REDUCTION;
-        if general || self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG != 0 {
-            ScheduleSearch::Unresolved(level_mask)
+        if self.walk_ends_unresolved() {
+            ScheduleSearch::Unresolved
         } else {
             ScheduleSearch::Absent
         }
     }
 
     /// The schedule walk from the first candidate, for a key that passed the
-    /// filter and that [`Self::search_schedule`] left unresolved: the table
+    /// filter and that [`Self::walk_schedule`] left unresolved: the table
     /// needs the general range reduction or placed an entry outside its
     /// probe routes.
     #[inline(never)]
     fn find_by_general_schedule<'a, Q, R>(
         &'a self,
         key: &Q,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
-        level_mask: u32,
+        level_mask: u64,
         mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
     ) -> Option<R>
     where
         Q: Equivalent<K> + ?Sized,
     {
         let Some(h11_slot) = Self::route_prepared_counter_for_upper(
-            prepared.route.probe,
+            prepared.probe,
             H11_COUNTER_BASE,
             self.levels[0].capacity(),
         ) else {
@@ -2263,11 +2295,11 @@ where
 
         for route in self.probe_schedule.routes() {
             let level = route.level() as usize;
-            if level_mask & (1_u32 << level) == 0 {
+            if level_mask & (1_u64 << level) == 0 {
                 continue;
             }
             let Some(slot) =
-                self.route_prepared_counter(level, prepared.route.probe, route.counter_base())
+                self.route_prepared_counter(level, prepared.probe, route.counter_base())
             else {
                 return self.find_by_full_scan(key, key_fingerprint, on_hit);
             };
