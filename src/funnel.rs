@@ -3,6 +3,7 @@ use core::fmt;
 use core::hash::{BuildHasher, Hash};
 use core::marker::PhantomData;
 use core::mem::{self, MaybeUninit};
+use core::num::NonZeroUsize;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -664,11 +665,35 @@ trait FoundPart<'a, K, V> {
 struct FoundSlot;
 
 impl<'a, K, V> FoundPart<'a, K, V> for FoundSlot {
-    type Part = usize;
+    type Part = SlotWord;
 
     #[inline]
-    fn of(found: Found<'a, K, V>) -> usize {
-        found.slot
+    fn of(found: Found<'a, K, V>) -> SlotWord {
+        SlotWord::new(found.slot)
+    }
+}
+
+/// A slot index with the word's top bit set, so that a lookup's
+/// `Option<SlotWord>` is one word, zero for `None`. An allocation holds fewer
+/// than `isize::MAX` slots, so an index never has that bit of its own.
+#[derive(Clone, Copy)]
+struct SlotWord(NonZeroUsize);
+
+impl SlotWord {
+    const TAG: NonZeroUsize = match NonZeroUsize::new(1 << (usize::BITS - 1)) {
+        Some(tag) => tag,
+        None => unreachable!(),
+    };
+
+    #[inline]
+    fn new(slot: usize) -> Self {
+        debug_assert_eq!(slot & Self::TAG.get(), 0);
+        Self(Self::TAG | slot)
+    }
+
+    #[inline]
+    fn slot(self) -> usize {
+        self.0.get() & !Self::TAG.get()
     }
 }
 
@@ -1993,6 +2018,7 @@ where
         Q: Equivalent<K> + ?Sized,
     {
         self.find_live::<Q, FoundSlot>(key, key_hash)
+            .map(SlotWord::slot)
     }
 
     /// Out of line so a filter-rejected miss pays for no probe preparation.
@@ -2246,8 +2272,8 @@ where
         let gate = self.membership_gate_at(membership);
         if gate.passes() {
             let found = self.find_after_gate::<K, FoundSlot>(&key, hash, gate.levels.into());
-            if let Some(slot) = found {
-                return Some(map::TableBackend::replace_value(self, slot, value));
+            if let Some(found) = found {
+                return Some(map::TableBackend::replace_value(self, found.slot(), value));
             }
             let probe = self.prf.prepare(hash);
             if let Some(vacancy) = self.head_vacancy(probe, membership) {
