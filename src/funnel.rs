@@ -1286,6 +1286,7 @@ where
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
         let scan = |level: u32| -> (usize, u64) {
+            debug_assert_ne!(lanes, 0);
             let level = self.shape.head_level(level);
             let (bucket, _) =
                 probe::ordinary_funnel_first_draw(probe, level.multiplier, level.bucket_range);

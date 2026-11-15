@@ -602,7 +602,8 @@ fn assert_matches_model(
 }
 
 /// Runs a fixed pseudo-random insert, overwrite, remove, lookup and clear
-/// stream against a model map, starting from a table with no storage.
+/// stream against a model map, starting from a table with no storage, and
+/// checks a clone of the final table against the model too.
 fn run_differential(
     d: u32,
     universe: &[HashedKey],
@@ -696,6 +697,7 @@ fn run_differential(
         }
     }
     assert_matches_model(&table, &model, universe, &mut coverage);
+    assert_matches_model(&table.clone_table(), &model, universe, &mut coverage);
     coverage
 }
 
@@ -783,16 +785,151 @@ fn operation_streams_agree_with_a_model_map_under_colliding_hashes() {
             hash: (id % 3 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
         })
         .collect();
-    let coverage = run_differential(
-        3,
-        &universe,
-        DifferentialStream::SMALL,
-        0xD1B5_4A32_D192_ED03,
-    );
-    assert!(coverage.overflow_entries, "{coverage:?}");
-    assert!(coverage.reseeds > 0, "{coverage:?}");
-    assert!(coverage.exceptional, "{coverage:?}");
-    assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
+    // Buckets narrower and wider than one control group.
+    let (wide, _) = smallest_wide_shape();
+    for d in [3, wide] {
+        let coverage = run_differential(
+            d,
+            &universe,
+            DifferentialStream::SMALL,
+            0xD1B5_4A32_D192_ED03,
+        );
+        assert_eq!(coverage.wide_buckets, d == wide, "{coverage:?}");
+        assert_eq!(coverage.narrow_buckets, d != wide, "{coverage:?}");
+        assert!(coverage.overflow_entries, "{coverage:?}");
+        assert!(coverage.reseeds > 0, "{coverage:?}");
+        assert!(coverage.exceptional, "{coverage:?}");
+        assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
+    }
+}
+
+/// Small enough for Miri: the smallest shapes on both sides of the group
+/// width, from a table without storage through a spent budget, tombstones,
+/// a growth, a clear and a reseeding rebuild, with a clone checked at each
+/// stage.
+#[test]
+fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
+    use crate::map::TableBackend;
+
+    let (wide, _) = smallest_wide_shape();
+    for d in [3, wide] {
+        let reserve = ReserveFraction::from_exponent(d).unwrap();
+        let budget = FunnelShape::for_insert_budget(1, reserve)
+            .unwrap()
+            .max_insertions;
+        let universe = spread_universe(budget as u64 + 8);
+        let mut coverage = DifferentialCoverage::default();
+        let mut model = alloc::collections::BTreeMap::new();
+        let mut table = DifferentialTable::with_capacity_and_reserve_and_hasher_in(
+            0,
+            reserve,
+            IdentityBuildHasher,
+            Global,
+        );
+        let mut check =
+            |table: &DifferentialTable, model: &alloc::collections::BTreeMap<HashedKey, u64>| {
+                assert_matches_model(table, model, &universe, &mut coverage);
+                assert_matches_model(&table.clone_table(), model, &universe, &mut coverage);
+            };
+        check(&table, &model);
+
+        // The smallest shape, filled to its budget without a tombstone.
+        for key in &universe[..budget] {
+            assert_eq!(table.insert(*key, key.id, key.hash), None, "d {d} {key:?}");
+            model.insert(*key, key.id);
+        }
+        assert_eq!(table.shape.max_insertions, budget, "d {d}");
+        assert_eq!((table.len, table.tombstones), (budget, 0), "d {d}");
+        check(&table, &model);
+
+        // Tombstones on the walks, then inserts that reuse some of them.
+        for key in universe[..budget].iter().step_by(3) {
+            let location = table.find(key, key.hash).unwrap();
+            assert_eq!(table.remove(location), (*key, key.id), "d {d}");
+            model.remove(key);
+        }
+        assert_ne!(table.tombstones, 0, "d {d}");
+        check(&table, &model);
+        for key in universe[..budget].iter().step_by(6) {
+            assert_eq!(
+                table.insert(*key, key.id + 1, key.hash),
+                None,
+                "d {d} {key:?}"
+            );
+            model.insert(*key, key.id + 1);
+        }
+        check(&table, &model);
+
+        // Inserts past the budget grow the table.
+        let slots = table.shape.n;
+        for key in &universe {
+            assert_eq!(
+                table.insert(*key, key.id + 2, key.hash),
+                model.insert(*key, key.id + 2),
+                "d {d} {key:?}"
+            );
+        }
+        assert!(table.shape.n > slots, "d {d}");
+        check(&table, &model);
+
+        table.clear();
+        model.clear();
+        check(&table, &model);
+
+        // Keys sharing one hash overfill its probe path, which a rebuild
+        // answers with a new seed.
+        let prf = table.prf;
+        let mut id = 1 << 32;
+        while table.prf == prf {
+            let key = HashedKey {
+                id,
+                hash: 0x9E37_79B9_7F4A_7C15,
+            };
+            assert_eq!(table.insert(key, id, key.hash), None, "d {d} {key:?}");
+            model.insert(key, id);
+            id += 1;
+            assert!(model.len() <= table.shape.max_insertions, "d {d}");
+        }
+        assert!(table.exceptional_placement, "d {d}");
+        check(&table, &model);
+    }
+}
+
+/// A shape without lanes selects, so no lookup scans its buckets for first
+/// matches, and it keeps an all-absent head, which ends the insert's head
+/// walk at once. A shape with lanes copies its levels into the head.
+#[test]
+fn lane_less_shapes_select_and_keep_an_absent_head() {
+    let (wide, smallest_wide) = smallest_wide_shape();
+    let wide_reserve = ReserveFraction::from_exponent(wide).unwrap();
+    let past_select_limit =
+        FunnelShape::for_insert_budget(2 * SELECT_MAX_SLOTS, wide_reserve).unwrap();
+    assert!(past_select_limit.n > SELECT_MAX_SLOTS);
+    for shape in [FunnelShape::empty(), smallest_wide, past_select_limit] {
+        assert_eq!(shape.bucket_lanes, 0, "n {}", shape.n);
+        assert!(shape.selects, "n {}", shape.n);
+        assert_eq!(
+            shape.head,
+            [LevelShape::ABSENT; HEAD_LEVELS],
+            "n {}",
+            shape.n
+        );
+    }
+
+    let narrow_reserve = ReserveFraction::from_exponent(3).unwrap();
+    for (budget, selects) in [(1, true), (2 * SELECT_MAX_SLOTS, false)] {
+        let shape = FunnelShape::for_insert_budget(budget, narrow_reserve).unwrap();
+        assert_eq!(shape.bucket_lanes.count_ones() as usize, shape.beta);
+        assert_eq!(shape.selects, selects, "n {}", shape.n);
+        let recorded = shape.levels.len().min(OVERFLOW_LEVEL);
+        assert_eq!(shape.head[..recorded], shape.levels[..recorded]);
+        assert!(
+            shape.head[recorded..]
+                .iter()
+                .all(|level| *level == LevelShape::ABSENT)
+        );
+        assert_ne!(recorded, HEAD_LEVELS);
+    }
 }
 
 #[test]
@@ -2053,10 +2190,13 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                     Err(()) => handed_off += 1,
                 }
             }
+            // A wide table still answers the lookups with no level to scan,
+            // which spread keys leave it.
+            if !(wide && shared_fingerprint) {
+                assert_ne!(answered, 0, "n {n} d {d}");
+            }
             if wide {
                 assert_ne!(handed_off, 0, "n {n} d {d}");
-            } else {
-                assert_ne!(answered, 0, "n {n} d {d}");
             }
         }
     }
