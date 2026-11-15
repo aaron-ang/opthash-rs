@@ -1214,6 +1214,9 @@ where
         if !self.scheduler.settles(self.len) {
             return None;
         }
+        // SAFETY: the settled limit is zero for a table without a level
+        // zero, so a settled table has one.
+        unsafe { core::hint::assert_unchecked(!self.levels.is_empty()) };
         self.choose_slot_with(self.scheduler.cached_target(), |level, budget| {
             // SAFETY: a settled table's level zero reduces by shift, which
             // means every level does.
@@ -2050,14 +2053,16 @@ where
         debug_assert_ne!(region.index_shift, GENERAL_REDUCTION);
         let index_shift = region.index_shift;
         let (mut word, distance) = probe.sequence(self.fold_multiplier).level_run(level);
-        for paper_probe in 1..=budget {
+        let mut remaining = budget;
+        while remaining != 0 {
             let slot = probe::shifted_elastic_index(word, index_shift);
             // SAFETY: the caller's shift maps the index into the level's
             // capacity.
             if control::is_free(unsafe { region.control_at(slot) }) {
-                return Some((slot, paper_probe));
+                return Some((slot, budget - remaining + 1));
             }
             word = word.wrapping_add(distance);
+            remaining -= 1;
         }
         None
     }
