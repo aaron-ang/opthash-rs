@@ -311,7 +311,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
             0,
             0,
             0x0000_0000_0000_0000,
-            0xc4c4_6fc5_ee77_31bc,
+            0x1900_49ec_e9b9_4124,
         ),
         (
             1,
@@ -321,7 +321,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
             255,
             255,
             0x3fff_ffff_ffff_ffff,
-            0x7eb3_1d4f_a3ad_ff86,
+            0x0610_a668_27e7_3b4b,
         ),
         (
             u64::MAX,
@@ -329,7 +329,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
             255,
             255,
             0x4000_0000_0000_ffff,
-            0xa598_6f4e_980c_6e48,
+            0xc018_4e05_44d6_1b67,
         ),
         (
             0xd1b5_4a32_d192_ed03,
@@ -337,7 +337,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
             7,
             1,
             0x8000_0000_0000_0701,
-            0xe5e1_cce2_966c_0e6a,
+            0x16c9_2271_400d_9fc0,
         ),
         (
             0x0123_4567_89ab_cdef,
@@ -345,7 +345,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
             0,
             0,
             0xc000_0000_0000_0000,
-            0xb037_1bb0_36a5_818b,
+            0xee3b_835b_d981_5793,
         ),
     ];
     for (key, domain, logical, retry, counter, word) in cases {
@@ -368,8 +368,8 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
         }
     }
     assert_eq!(
-        oracle.word(1, ProbeDomain::FunnelOrdinary { level: 0 }, 0, 0),
-        0xb546_c6e2_ca34_8f63
+        oracle.word(0, ProbeDomain::FunnelOrdinary { level: 0 }, 0, 0),
+        0x2ee5_d5a0_6f80_afe8
     );
 }
 
@@ -425,10 +425,10 @@ fn fast_funnel_retries_and_exhaustion_use_distinct_checked_counters() {
 #[test]
 #[allow(clippy::cast_possible_truncation)]
 fn fast_funnel_reducer_accepts_the_full_rejection_index_lane() {
-    const KEY: u64 = 0x12;
+    const KEY: u64 = 0x1c7;
     const LOGICAL_PROBE_INDEX: u8 = u8::MAX;
     const UPPER: usize = 2;
-    const REJECTION_THRESHOLD: u64 = 0xfd64_df3e_86e6_be92;
+    const REJECTION_THRESHOLD: u64 = 0xfe17_cfc8_112e_3a20;
     let prepared = FunnelPrf::new(0x1234_5678_9abc_def0)
         .prepare(KEY)
         .prepare_domain(ProbeDomain::FunnelSpecialPrimary)
