@@ -209,6 +209,7 @@ fn compact_query_counters_cover_every_supported_geometry() {
     assert!(
         table
             .probe_schedule
+            .routes()
             .iter()
             .all(|route| route.counter_base() != H11_COUNTER_BASE)
     );
@@ -224,15 +225,19 @@ fn query_schedule_never_reallocates_within_an_epoch() {
             Global,
         )
         .unwrap();
-    let initial_ptr = table.probe_schedule.as_ptr();
-    let initial_capacity = table.probe_schedule.capacity();
+    let initial_ptr = table.probe_schedule.first();
+    let initial_capacity = table.probe_schedule.routes.capacity();
 
     table.schedule_levels_through(table.levels.len() - 1);
     table.extend_probe_schedule(QUERY_POSITION_CAP);
 
-    assert_eq!(table.probe_schedule.as_ptr(), initial_ptr);
-    assert_eq!(table.probe_schedule.capacity(), initial_capacity);
-    assert_eq!(table.probe_schedule.len(), initial_capacity);
+    assert_eq!(table.probe_schedule.first(), initial_ptr);
+    assert_eq!(table.probe_schedule.routes.capacity(), initial_capacity);
+    assert_eq!(table.probe_schedule.routes.len(), initial_capacity);
+    assert_eq!(
+        table.probe_schedule.routes.last(),
+        Some(&ProbeSchedule::SENTINEL)
+    );
 }
 
 #[test]
@@ -258,6 +263,7 @@ fn query_schedule_holds_every_route_once_in_position_order() {
     expected.sort_unstable();
     let scheduled = table
         .probe_schedule
+        .routes()
         .iter()
         .map(|route| {
             let (level, logical) = probe::elastic_sequence_coordinates(route.sequence_index);
