@@ -73,9 +73,19 @@ const _: () = {
 struct ExactPlacement {
     level: usize,
     slot: usize,
+    /// One-based probe of `level` that reached the slot.
+    paper_probe: u64,
+}
+
+impl ExactPlacement {
     /// Paper position of the chosen slot, `elastic_phi(level + 1, probe)`;
     /// the lookup schedule is extended to cover it.
-    phi: u128,
+    fn phi(self) -> u128 {
+        let paper_level = u32::try_from(self.level + 1).expect("Elastic level count fits u32");
+        probe::elastic_phi_bounded(paper_level, self.paper_probe)
+            .map(u128::from)
+            .expect("bounded Elastic query coordinate")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +232,9 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     /// one a placement of this epoch chose. A deeper level holds no entry, so
     /// lookups have nothing to visit there.
     scheduled_levels: u32,
+    /// Probes of every scheduled level the schedule already holds: a
+    /// placement within them, in a scheduled level, needs no extension.
+    scheduled_probes: u32,
     probe_schedule: Vec<PhiRoute>,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
@@ -853,6 +866,7 @@ where
             epoch: EpochState::initial(),
             probe_high_water: 0,
             scheduled_levels: 0,
+            scheduled_probes: 0,
             probe_schedule,
             membership,
             stale_membership: 0,
@@ -993,6 +1007,7 @@ where
         self.scheduler.reset();
         self.probe_high_water = 0;
         self.scheduled_levels = 0;
+        self.scheduled_probes = 0;
         self.probe_schedule.clear();
         self.clear_membership();
         self.epoch.start(EpochTransition::Clear);
@@ -1070,10 +1085,11 @@ where
         key_fingerprint: u8,
         placement: ExactPlacement,
     ) -> (usize, usize) {
-        if placement.level >= self.scheduled_levels as usize {
-            self.schedule_levels_through(placement.level);
+        if placement.level >= self.scheduled_levels as usize
+            || placement.paper_probe > u64::from(self.scheduled_probes)
+        {
+            self.schedule_placement(placement);
         }
-        self.extend_probe_schedule(placement.phi);
         self.write_new_entry(
             key,
             value,
@@ -1139,15 +1155,25 @@ where
         (level_idx, slot_idx)
     }
 
-    /// Rebuilds the schedule to hold the routes of every level up to `level`,
-    /// the first placement of this epoch past the levels scheduled so far.
+    /// Extends the schedule to cover a placement outside the scheduled levels
+    /// or past the probes every scheduled level already holds.
     #[cold]
     #[inline(never)]
+    fn schedule_placement(&mut self, placement: ExactPlacement) {
+        if placement.level >= self.scheduled_levels as usize {
+            self.schedule_levels_through(placement.level);
+        }
+        self.extend_probe_schedule(placement.phi());
+    }
+
+    /// Rebuilds the schedule to hold the routes of every level up to `level`,
+    /// the first placement of this epoch past the levels scheduled so far.
     fn schedule_levels_through(&mut self, level: usize) {
         let high_water = self.probe_high_water & !EXCEPTIONAL_PLACEMENT_FLAG;
         self.probe_high_water &= EXCEPTIONAL_PLACEMENT_FLAG;
         self.probe_schedule.clear();
         self.scheduled_levels = u32::try_from(level + 1).expect("Elastic level count fits u32");
+        self.scheduled_probes = 0;
         self.extend_probe_schedule(u128::from(high_water));
     }
 
@@ -1187,6 +1213,10 @@ where
         }
         self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
             | u32::try_from(high_water).expect("Elastic query cap fits u32");
+        // Positions grow with the level, so the deepest scheduled level
+        // holds the fewest probes.
+        let covered = first_paper_probe_after(u128::from(self.scheduled_levels), high_water) - 1;
+        self.scheduled_probes = u32::try_from(covered).expect("Elastic probe cap fits u32");
     }
 }
 
@@ -1466,6 +1496,7 @@ where
             epoch: self.epoch,
             probe_high_water: self.probe_high_water,
             scheduled_levels: self.scheduled_levels,
+            scheduled_probes: self.scheduled_probes,
             probe_schedule,
             membership,
             stale_membership: self.stale_membership,
@@ -1574,6 +1605,7 @@ where
                 arena,
                 probe_high_water: 0,
                 scheduled_levels: 0,
+                scheduled_probes: 0,
                 probe_schedule,
                 membership,
                 stale_membership: 0,
@@ -1671,10 +1703,7 @@ where
                     let budget = u64::try_from(budget)
                         .unwrap_or(u64::MAX)
                         .min(LEVEL_PROBE_LIMIT[current]);
-                    if let Some((slot, probe)) = (0..budget).find_map(|logical_index| {
-                        self.vacancy(current, probe, logical_index)
-                            .map(|slot| (slot, logical_index + 1))
-                    }) {
+                    if let Some((slot, probe)) = self.first_vacancy(probe, current, budget) {
                         (current, slot, probe)
                     } else {
                         let (slot, paper_probe) = self.uniform_vacancy(probe, next)?;
@@ -1683,12 +1712,13 @@ where
                 }
             }
         };
-        let paper_level = u32::try_from(level.checked_add(1)?).ok()?;
-        let phi = u128::from(probe::elastic_phi_bounded(paper_level, paper_probe)?);
-        if phi > QUERY_POSITION_CAP {
-            return None;
-        }
-        Some(ExactPlacement { level, slot, phi })
+        // Every vacancy search stops within `LEVEL_PROBE_LIMIT`, whose probes
+        // all sit at positions up to `QUERY_POSITION_CAP`.
+        Some(ExactPlacement {
+            level,
+            slot,
+            paper_probe,
+        })
     }
 
     /// Case 2's test: the active pair's current level has at most half its
@@ -1701,13 +1731,52 @@ where
                 .floor_half_reserved(current_level.capacity())
     }
 
+    #[inline]
     fn uniform_vacancy(&self, probe: PreparedElasticProbe, level: usize) -> Option<(usize, u64)> {
-        for logical_index in 0..LEVEL_PROBE_LIMIT[level] {
-            if let Some(slot) = self.vacancy(level, probe, logical_index) {
+        self.first_vacancy(probe, level, LEVEL_PROBE_LIMIT[level])
+    }
+
+    /// The first free slot among `level`'s first `budget` probes, in probe
+    /// order, with the one-based probe that reached it.
+    #[inline]
+    fn first_vacancy(
+        &self,
+        probe: PreparedElasticProbe,
+        level: usize,
+        budget: u64,
+    ) -> Option<(usize, u64)> {
+        let region = self.levels.get(level)?;
+        if region.index_shift == GENERAL_REDUCTION {
+            return self.first_vacancy_general(probe, level, budget);
+        }
+        let level = u32::try_from(level).ok()?;
+        for logical_index in 0..budget {
+            let slot = probe::shifted_elastic_probe_index(
+                probe,
+                probe::elastic_counter_base(level, logical_index),
+                region.index_shift,
+            );
+            // SAFETY: the shifted index maps into the level's capacity.
+            if control::is_free(unsafe { region.control_at(slot) }) {
                 return Some((slot, logical_index + 1));
             }
         }
         None
+    }
+
+    /// [`Self::first_vacancy`] for a table whose levels need the general
+    /// range reduction.
+    #[inline(never)]
+    fn first_vacancy_general(
+        &self,
+        probe: PreparedElasticProbe,
+        level: usize,
+        budget: u64,
+    ) -> Option<(usize, u64)> {
+        (0..budget).find_map(|logical_index| {
+            self.vacancy(level, probe, logical_index)
+                .map(|slot| (slot, logical_index + 1))
+        })
     }
 
     fn vacancy(
@@ -1994,6 +2063,7 @@ pub(crate) struct ElasticGeneration<K, V> {
     arena: Arena,
     probe_high_water: u32,
     scheduled_levels: u32,
+    scheduled_probes: u32,
     probe_schedule: Vec<PhiRoute>,
     membership: MembershipRegion,
     stale_membership: usize,
@@ -2019,6 +2089,7 @@ where
         mem::swap(&mut self.arena, &mut other.arena);
         mem::swap(&mut self.probe_high_water, &mut other.probe_high_water);
         mem::swap(&mut self.scheduled_levels, &mut other.scheduled_levels);
+        mem::swap(&mut self.scheduled_probes, &mut other.scheduled_probes);
         mem::swap(&mut self.probe_schedule, &mut other.probe_schedule);
         mem::swap(&mut self.membership, &mut other.membership);
         mem::swap(&mut self.stale_membership, &mut other.stale_membership);

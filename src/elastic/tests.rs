@@ -100,9 +100,9 @@ fn assert_exact_trace(n: usize, reserve_exponent: u32, identities: impl IntoIter
         assert_eq!(placement.level, expected.location.level);
         assert_eq!(placement.slot, expected.location.slot_in_level);
         assert_eq!(global_slot, expected.location.global_slot);
-        assert_eq!(placement.phi, expected.phi);
+        assert_eq!(placement.phi(), expected.phi);
         assert_eq!(
-            placement.phi,
+            placement.phi(),
             probe::elastic_phi(
                 expected.location.level as u128 + 1,
                 u128::from(expected.paper_probe)
@@ -139,10 +139,10 @@ fn assert_exact_trace(n: usize, reserve_exponent: u32, identities: impl IntoIter
         let query = scalar.query(identity);
         assert_eq!(query.global_slot, global_slot);
         assert!(
-            query.found_position <= placement.phi,
+            query.found_position <= placement.phi(),
             "lookup order visits phi={} no later than placement phi={}",
             query.found_position,
-            placement.phi
+            placement.phi()
         );
     }
 }
