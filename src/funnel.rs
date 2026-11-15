@@ -40,7 +40,7 @@ const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
 const FUNNEL_RESEED_STEP: u64 = probe::WYHASH_DEFAULT_SECRET[0];
 /// Bits each key sets in its membership-filter word. A lookup whose bits are
 /// not all set skips the probe walk, since the key cannot be present.
-const MEMBERSHIP_BITS: usize = 2;
+const MEMBERSHIP_BITS: usize = 1;
 
 /// Pointerless scan progress through Funnel's flat storage.
 #[derive(Clone, Debug)]
