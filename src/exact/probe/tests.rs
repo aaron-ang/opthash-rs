@@ -780,7 +780,8 @@ fn elastic_probe_budget_matches_the_ceiling_quotient_form() {
             );
         }
     };
-    for level in 1..=600_usize {
+    let exhaustive_levels: usize = if cfg!(miri) { 70 } else { 600 };
+    for level in 1..=exhaustive_levels {
         for free in 1..=level {
             check(free, level);
         }

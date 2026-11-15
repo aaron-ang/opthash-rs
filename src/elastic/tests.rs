@@ -1749,6 +1749,10 @@ fn a_table_without_metadata_words_rejects_every_lookup() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "checks the whole schedule after each of thousands of inserts"
+)]
 fn first_entry_in_a_deeper_level_reschedules_through_that_level() {
     const KEYS: u64 = 3_000;
     let mut map: FixedElasticHashMap<u64, u64> =
@@ -1864,7 +1868,12 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
     let mut walked_misses = 0;
     let mut shifted_tables = 0;
     let mut general_tables = 0;
-    for slots in [32, 128, 1_000, 2_048, 3_000, 8_192] {
+    let (slot_counts, floor): (&[usize], _) = if cfg!(miri) {
+        (&[32, 100, 256, 300], 100)
+    } else {
+        (&[32, 128, 1_000, 2_048, 3_000, 8_192], 1_000)
+    };
+    for &slots in slot_counts {
         let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
             try_with_slots_and_reserve_fraction_and_hasher_in(
                 slots,
@@ -1920,13 +1929,13 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
             }
         }
     }
-    assert!(hits > 1_000 && filtered_misses > 1_000 && walked_misses > 0);
+    assert!(hits > floor && filtered_misses > floor && walked_misses > 0);
     assert!(shifted_tables > 0 && general_tables > 0);
 }
 
 #[test]
 fn settled_insert_slot_agrees_with_the_general_placement() {
-    const KEYS: u64 = 6_000;
+    const KEYS: u64 = if cfg!(miri) { 600 } else { 6_000 };
     let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(0);
     let mut settled = 0;
     let mut unsettled = 0;
@@ -1973,7 +1982,8 @@ fn shifted_vacancy_search_agrees_with_the_general_one() {
     assert_ne!(table.levels[0].index_shift(), GENERAL_REDUCTION);
     let mut found = 0;
     let mut missed = 0;
-    for key in 0..2_000_u64 {
+    let keys = if cfg!(miri) { 300_u64 } else { 2_000 };
+    for key in 0..keys {
         let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
             .route
             .probe;
@@ -2008,6 +2018,9 @@ fn levels_reduce_all_by_shift_or_all_by_the_general_reduction() {
     for slots in [
         1, 2, 3, 4, 7, 8, 16, 31, 64, 100, 1_000, 1_024, 4_096, 5_000, 65_536,
     ] {
+        if cfg!(miri) && slots > 100 {
+            continue;
+        }
         let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
             try_with_slots_and_reserve_fraction_and_hasher_in(
                 slots,
@@ -2060,7 +2073,12 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
     }
     let mut general_tables = 0;
     let mut shifted_tables = 0;
-    for slots in [1, 3, 32, 1_000, 2_048, 3_000] {
+    let slot_counts: &[usize] = if cfg!(miri) {
+        &[1, 3, 32, 48]
+    } else {
+        &[1, 3, 32, 1_000, 2_048, 3_000]
+    };
+    for &slots in slot_counts {
         let mut table = Table::try_with_slots_and_reserve_fraction_and_hasher_in(
             slots,
             ReserveFraction::DEFAULT,
@@ -2091,6 +2109,67 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
         shifted_tables += seen.iter().filter(|&&general| !general).count();
     }
     assert!(general_tables > 0 && shifted_tables > 0);
+}
+
+/// Small enough to run under Miri, and reaches the lookup's direct route,
+/// the sentinel's control bytes, the static empty filter word and the
+/// settled insert on every table shape.
+#[test]
+fn lookup_and_insert_paths_hold_on_every_small_table_shape() {
+    type Table = ElasticTable<u64, u64, FixedHashBuilder>;
+    fn assert_holds(table: &Table, present: impl Fn(u64) -> bool, keys: u64) {
+        assert!(table.probe_schedule.addresses(&table.levels));
+        for key in 0..keys + 8 {
+            let hash = table.hash_builder.hash_one(key);
+            assert_eq!(table.find_value(&key, hash), present(key).then_some(&key));
+        }
+    }
+    let mut settled = 0;
+    let mut general_tables = 0;
+    let mut shifted_tables = 0;
+    for slots in [0, 1, 2, 3, 5, 16, 24, 64] {
+        let mut table = Table::try_with_slots_and_reserve_fraction_and_hasher_in(
+            slots,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+        assert_holds(&table, |_| false, 0);
+        // Twice the budget takes the table through a growth.
+        let keys = 2 * table.max_insertions.max(8) as u64;
+        for key in 0..keys {
+            match table.levels.first().map(Level::index_shift) {
+                Some(GENERAL_REDUCTION) => general_tables += 1,
+                Some(_) => shifted_tables += 1,
+                None => {}
+            }
+            let hash = table.hash_builder.hash_one(key);
+            let probe = PreparedElasticKey::new(hash).route.probe;
+            settled += usize::from(table.settled_slot(probe).is_some());
+            assert_eq!(table.insert(key, key, hash), None);
+            assert_eq!(table.insert(key, key, hash), Some(key));
+        }
+        assert_holds(&table, |key| key < keys, keys);
+
+        let cloned = map::TableBackend::clone_table(&table);
+        for key in (0..keys).step_by(2) {
+            let hash = table.hash_builder.hash_one(key);
+            let location = table.find(&key, hash).unwrap();
+            assert_eq!(table.remove(location), (key, key));
+        }
+        assert_holds(&table, |key| key < keys && key % 2 == 1, keys);
+        assert_holds(&cloned, |key| key < keys, keys);
+
+        map::TableBackend::clear(&mut table);
+        assert_holds(&table, |_| false, keys);
+        for key in 0..4 {
+            let hash = table.hash_builder.hash_one(key);
+            assert_eq!(table.insert(key, key, hash), None);
+        }
+        assert_holds(&table, |key| key < 4, keys);
+    }
+    assert!(settled > 0 && general_tables > 0 && shifted_tables > 0);
 }
 
 #[test]
@@ -2182,7 +2261,8 @@ fn clone_carries_the_schedule_onto_its_own_levels() {
 
 #[test]
 fn seeded_operation_mix_matches_an_ordered_map_model() {
-    const KEY_SPACE: u64 = 3_000;
+    const KEY_SPACE: u64 = if cfg!(miri) { 200 } else { 3_000 };
+    const STEPS: u64 = if cfg!(miri) { 4_000 } else { 200_000 };
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
     let mut next = move || {
         state ^= state << 13;
@@ -2192,7 +2272,7 @@ fn seeded_operation_mix_matches_an_ordered_map_model() {
     };
     let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(16);
     let mut model = alloc::collections::BTreeMap::<u64, u64>::new();
-    for step in 0..200_000_u64 {
+    for step in 0..STEPS {
         let roll = next() % 10_000;
         let key = next() % KEY_SPACE;
         match roll {
@@ -2239,7 +2319,12 @@ fn target_holds(target: BatchTarget, level: usize) -> bool {
 
 #[test]
 fn all_zero_and_all_one_hashes_place_inside_their_active_pair() {
-    for capacity in [256_usize, 2_048, 16_384] {
+    let capacities: &[usize] = if cfg!(miri) {
+        &[256]
+    } else {
+        &[256, 2_048, 16_384]
+    };
+    for &capacity in capacities {
         let mut map =
             crate::ElasticHashMap::<u64, u64, IdentityBuildHasher>::with_capacity_and_hasher(
                 capacity,
@@ -2273,7 +2358,12 @@ fn all_zero_and_all_one_hashes_place_inside_their_active_pair() {
 #[test]
 fn the_fold_multiplier_as_a_hash_stays_findable_and_unflagged() {
     const KEY: u64 = probe::ELASTIC_FOLD_MULTIPLIER;
-    for capacity in [16_usize, 256, 2_048] {
+    let capacities: &[usize] = if cfg!(miri) {
+        &[16, 64]
+    } else {
+        &[16, 256, 2_048]
+    };
+    for &capacity in capacities {
         let mut map =
             crate::ElasticHashMap::<u64, u64, IdentityBuildHasher>::with_capacity_and_hasher(
                 capacity,
