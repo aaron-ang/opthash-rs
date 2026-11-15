@@ -236,7 +236,7 @@ fn query_schedule_never_reallocates_within_an_epoch() {
 }
 
 #[test]
-fn query_schedule_caches_each_routes_exact_level_bound() {
+fn query_schedule_caches_each_routes_level() {
     let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
         try_with_slots_and_reserve_fraction_and_hasher_in(
             8_193,
@@ -251,9 +251,10 @@ fn query_schedule_caches_each_routes_exact_level_bound() {
 
     for route in &table.probe_schedule {
         assert_eq!(
-            route.range_upper as usize,
-            table.levels[route.level()].capacity()
+            route.level,
+            probe::elastic_counter_level(route.counter_base)
         );
+        assert!((route.level as usize) < table.levels.len());
     }
 }
 

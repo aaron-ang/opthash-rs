@@ -80,21 +80,14 @@ struct ExactPlacement {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PhiRoute {
-    /// Temporarily holds `phi` while a new suffix is sorted, then the exact
-    /// level bound used by every lookup in the epoch.
-    range_upper: u32,
+    /// Temporarily holds `phi` while a new suffix is sorted, then the level
+    /// `counter_base` packs, so a lookup reads it without unpacking.
+    level: u32,
     /// Packed retry-zero `(level, logical probe)` counter.
     counter_base: u32,
 }
 
 const _: () = assert!(mem::size_of::<PhiRoute>() == 8);
-
-impl PhiRoute {
-    #[inline]
-    const fn level(self) -> usize {
-        probe::elastic_counter_level(self.counter_base) as usize
-    }
-}
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
@@ -109,12 +102,15 @@ pub(crate) struct Level<T> {
     capacity: u32,
     len: u32,
     tombstones: u32,
-    /// [`probe::elastic_index_shift`] of `capacity`, or [`GENERAL_REDUCTION`].
+    /// [`probe::elastic_index_shift`] of `capacity`, or [`GENERAL_REDUCTION`]
+    /// when any level of the table has no such shift. A table's levels
+    /// therefore reduce all by shift or all by the general reduction, and
+    /// level zero answers which for the whole table.
     index_shift: u32,
 }
 
-/// [`Level::index_shift`] of a level whose probes need the general range
-/// reduction.
+/// [`Level::index_shift`] of every level in a table that has a level whose
+/// probes need the general range reduction.
 const GENERAL_REDUCTION: u32 = u64::BITS;
 
 // SAFETY: the raw pointers address slots this descriptor's table owns
@@ -148,17 +144,19 @@ unsafe impl<T> ArenaSlots<T> for Level<T> {
 impl<T> Level<T> {
     /// Stamps a fresh descriptor at the given arena ptrs.
     /// Caller advances the offset cursor.
-    fn new_at(cap_u32: u32, ctrl_ptr: *mut u8, data_ptr: *mut MaybeUninit<T>) -> Self {
+    fn new_at(
+        cap_u32: u32,
+        index_shift: u32,
+        ctrl_ptr: *mut u8,
+        data_ptr: *mut MaybeUninit<T>,
+    ) -> Self {
         Self {
             ctrl_ptr,
             data_ptr,
             capacity: cap_u32,
             len: 0,
             tombstones: 0,
-            index_shift: match probe::elastic_index_shift(cap_u32 as usize) {
-                Some(shift) => shift,
-                None => GENERAL_REDUCTION,
-            },
+            index_shift,
         }
     }
 
@@ -748,11 +746,18 @@ fn build_elastic_levels<K, V>(
     levels
         .try_reserve_exact(level_capacities.len())
         .map_err(|_| TryReserveError::AllocError)?;
+    let all_shift = level_capacities
+        .iter()
+        .all(|&cap| probe::elastic_index_shift(cap).is_some());
     for &cap in level_capacities {
         let cap_u32 = u32::try_from(cap).map_err(|_| TryReserveError::CapacityOverflow)?;
+        let index_shift = match probe::elastic_index_shift(cap) {
+            Some(shift) if all_shift => shift,
+            _ => GENERAL_REDUCTION,
+        };
         // SAFETY: the arena was allocated for the layout these caps sum to.
         let (ctrl_ptr, data_ptr) = unsafe { cursor.reserve(cap_u32)? };
-        levels.push(Level::new_at(cap_u32, ctrl_ptr, data_ptr));
+        levels.push(Level::new_at(cap_u32, index_shift, ctrl_ptr, data_ptr));
     }
     Ok(levels.into_boxed_slice())
 }
@@ -1171,14 +1176,14 @@ where
                     probe::try_pack_elastic_counter(level as u64, logical_probe_index, 0)
                         .expect("Elastic query tuple fits the production counter");
                 self.probe_schedule.push(PhiRoute {
-                    range_upper: u32::try_from(phi).expect("Elastic query cap fits u32"),
+                    level: u32::try_from(phi).expect("Elastic query cap fits u32"),
                     counter_base,
                 });
             });
         }
-        self.probe_schedule[old_len..].sort_unstable_by_key(|route| route.range_upper);
+        self.probe_schedule[old_len..].sort_unstable_by_key(|route| route.level);
         for route in &mut self.probe_schedule[old_len..] {
-            route.range_upper = self.levels[route.level()].capacity;
+            route.level = probe::elastic_counter_level(route.counter_base);
         }
         self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
             | u32::try_from(high_water).expect("Elastic query cap fits u32");
@@ -1802,7 +1807,6 @@ where
         if !filter.maybe_present {
             return None;
         }
-        let level_mask = filter.expanded_level_mask();
         // SAFETY: the filter only passes when it has words, and those are laid
         // out for a non-zero slot count, which gives the table a level zero.
         let h11_shift = unsafe { self.levels.get_unchecked(0) }.index_shift;
@@ -1811,7 +1815,7 @@ where
                 key,
                 prepared,
                 key_fingerprint,
-                level_mask,
+                filter.expanded_level_mask(),
                 on_hit,
             );
         }
@@ -1822,27 +1826,21 @@ where
             return Some(on_hit(0, h11_slot, entry));
         }
 
+        let level_mask = filter.expanded_level_mask();
         for route in &self.probe_schedule {
-            let level = route.level();
+            let level = route.level as usize;
             if level_mask & (1_u32 << level) == 0 {
                 continue;
             }
-            // SAFETY: schedule routes name real levels.
-            let index_shift = unsafe { self.levels.get_unchecked(level) }.index_shift;
-            if index_shift == GENERAL_REDUCTION {
-                return self.find_by_general_schedule(
-                    key,
-                    prepared,
-                    key_fingerprint,
-                    level_mask,
-                    on_hit,
-                );
-            }
-            let slot = probe::shifted_elastic_probe_index(
-                prepared.route.probe,
-                route.counter_base,
-                index_shift,
-            );
+            // SAFETY: schedule routes name real levels, and level zero
+            // reducing by shift means every level of the table does.
+            let slot = unsafe {
+                probe::shifted_elastic_probe_index(
+                    prepared.route.probe,
+                    route.counter_base,
+                    self.levels.get_unchecked(level).index_shift,
+                )
+            };
             // SAFETY: the route names a real level and the shifted index maps
             // into its capacity.
             if let Some(entry) = unsafe { self.entry_if_match(level, slot, key_fingerprint, key) } {
@@ -1884,20 +1882,17 @@ where
         }
 
         for route in &self.probe_schedule {
-            let level = route.level();
+            let level = route.level as usize;
             if level_mask & (1_u32 << level) == 0 {
                 continue;
             }
-            let upper = route.range_upper as usize;
-            let Some(slot) = Self::route_prepared_counter_for_upper(
-                prepared.route.probe,
-                route.counter_base,
-                upper,
-            ) else {
+            let Some(slot) =
+                self.route_prepared_counter(level, prepared.route.probe, route.counter_base)
+            else {
                 return self.find_by_full_scan(key, key_fingerprint, on_hit);
             };
-            // SAFETY: schedule routes name real levels and map below
-            // `range_upper`, which is within that level's capacity.
+            // SAFETY: schedule routes name real levels and the counter route
+            // maps into that level's capacity.
             if let Some(entry) = unsafe { self.entry_if_match(level, slot, key_fingerprint, key) } {
                 return Some(on_hit(level, slot, entry));
             }
