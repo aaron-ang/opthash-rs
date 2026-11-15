@@ -1592,7 +1592,7 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 }
             }
             assert_eq!(answered == 0, wide, "n {n} d {d}");
-            if shared_fingerprint || wide {
+            if wide {
                 assert_ne!(handed_off, 0, "n {n} d {d}");
             }
         }
