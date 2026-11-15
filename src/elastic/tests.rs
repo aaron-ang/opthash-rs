@@ -2051,8 +2051,8 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
                 let walked = table.find_by_general_schedule(
                     &key,
                     prepared.route,
-                    fingerprint,
                     filter.expanded_level_mask(prepared.route),
+                    fingerprint,
                     |level, slot, _| (level, slot),
                 );
                 assert_eq!(scheduled, walked);

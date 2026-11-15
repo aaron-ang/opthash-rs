@@ -465,6 +465,13 @@ impl PreparedElasticRoute {
         self.probe.routing_signature()
     }
 
+    /// The hash [`Self::new`] took, so a callee handed the route needs no
+    /// second copy of it.
+    #[inline]
+    const fn key_hash(self) -> u64 {
+        self.signature() ^ ELASTIC_PROBE_SEED
+    }
+
     #[inline]
     fn summary_bin(self) -> usize {
         (self.signature() & 3) as usize
@@ -490,6 +497,11 @@ impl PreparedElasticKey {
 
 const _: () = assert!(mem::size_of::<PreparedElasticRoute>() == 8);
 const _: () = assert!(mem::size_of::<PreparedElasticKey>() == 16);
+
+/// Marks the path that reaches it as the unlikely one of its branch.
+#[cold]
+#[inline]
+const fn unlikely_path() {}
 
 /// Outcome of [`ElasticTable::walk_schedule`].
 enum ScheduleSearch<R> {
@@ -1249,8 +1261,8 @@ where
             let found = self.find_by_general_schedule(
                 &key,
                 prepared.route,
-                key_fingerprint,
                 level_mask,
+                key_fingerprint,
                 |level, slot, _| (level, slot),
             );
             if let Some(location) = found {
@@ -1546,7 +1558,7 @@ where
         self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            || control::control_fingerprint(hash),
+            |route| control::control_fingerprint(route.key_hash()),
             |level, slot, _entry| (level, slot),
         )
     }
@@ -1559,7 +1571,7 @@ where
         self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            || control::control_fingerprint(hash),
+            |route| control::control_fingerprint(route.key_hash()),
             |_level, _slot, entry| entry,
         )
     }
@@ -1573,9 +1585,10 @@ where
         self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            || control::control_fingerprint(hash),
-            |_level, _slot, entry| &entry.value,
+            |route| control::control_fingerprint(route.key_hash()),
+            |_level, _slot, entry| entry,
         )
+        .map(|entry| &entry.value)
     }
 
     #[inline]
@@ -2187,7 +2200,7 @@ where
         self.find_by_exact_schedule(
             key,
             prepared,
-            || key_fingerprint,
+            |_| key_fingerprint,
             |level, slot, _entry| (level, slot),
         )
     }
@@ -2205,7 +2218,7 @@ where
         self.find_by_exact_schedule(
             key,
             prepared,
-            || key_fingerprint,
+            |_| key_fingerprint,
             |_level, _slot, entry| entry,
         )
     }
@@ -2218,7 +2231,7 @@ where
         &'a self,
         key: &Q,
         prepared: PreparedElasticKey,
-        key_fingerprint: impl FnOnce() -> u8,
+        key_fingerprint: impl FnOnce(PreparedElasticRoute) -> u8,
         on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
     ) -> Option<R>
     where
@@ -2240,14 +2253,14 @@ where
         &'a self,
         key: &Q,
         route: PreparedElasticRoute,
-        key_fingerprint: impl FnOnce() -> u8,
+        key_fingerprint: impl FnOnce(PreparedElasticRoute) -> u8,
         filter: ElasticRouteFilter<'_>,
         mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
     ) -> Option<R>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let key_fingerprint = key_fingerprint();
+        let key_fingerprint = key_fingerprint(route);
         let walked =
             self.walk_schedule(key, route, key_fingerprint, filter, |level, slot, entry| {
                 // SAFETY: the walk hands on an occupied slot of this table,
@@ -2260,8 +2273,8 @@ where
             ScheduleSearch::Unresolved => self.find_by_general_schedule(
                 key,
                 route,
-                key_fingerprint,
                 filter.expanded_level_mask(route),
+                key_fingerprint,
                 on_hit,
             ),
         }
@@ -2340,6 +2353,7 @@ where
                 if key.equivalent(unsafe { &(*entry).key }) {
                     return ScheduleSearch::Hit(on_hit(route.level() as usize, slot, entry));
                 }
+                unlikely_path();
             } else if control == CTRL_EMPTY {
                 // A key takes its level's first free probe, and a slot
                 // returns to `EMPTY` only when its whole level is reset: a
@@ -2370,8 +2384,8 @@ where
         &'a self,
         key: &Q,
         prepared: PreparedElasticRoute,
-        key_fingerprint: u8,
         level_mask: u64,
+        key_fingerprint: u8,
         mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
     ) -> Option<R>
     where
