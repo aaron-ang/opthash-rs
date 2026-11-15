@@ -19,21 +19,27 @@ use crate::map;
 use crate::membership::{self, MembershipKey, MembershipRegion, MetadataWord};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::INITIAL_CAPACITY;
-use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
+use crate::raw::control::{self, CTRL_EMPTY};
 use crate::raw::iter::OccupiedIndices;
 use crate::raw::prefetch;
 use crate::raw::rebuild::{self, Rebuildable};
+
+mod schedule;
+
+use schedule::{ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
 type ElasticScanItem<K, V> = (*mut SlotEntry<K, V>, (usize, usize));
 
 /// Fixed construction seed shared by placement, lookup, and membership.
-const ELASTIC_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[0];
+/// Zero keeps the routing signature the key's hash itself; the probe words
+/// are keyed by their fold multiplier.
+const ELASTIC_PROBE_SEED: u64 = 0;
 /// The paper's constant `c` in the per-level probe budget
 /// `c * min(log2(1/eps)^2, log2(1/delta))`; the paper only asks that it be
 /// sufficiently large.
-const ELASTIC_PROBE_BUDGET_C: usize = 8;
+const ELASTIC_PROBE_BUDGET_C: u32 = 8;
 /// Most probe indices any level's search visits. The paper's fallback search
 /// is unbounded; this caps it so the lookup schedule stays finite.
 const UNIFORM_SEARCH_CAP: u64 = 4_096;
@@ -41,10 +47,27 @@ const UNIFORM_SEARCH_CAP: u64 = 4_096;
 /// covers every position up to it, so a vacancy past it counts as a failed
 /// probe.
 const QUERY_POSITION_CAP: u128 = 1_000_000;
-/// Top bit of `probe_high_water`, set once this epoch placed an entry outside
+/// Bit of `probe_high_water` set once this epoch placed an entry outside
 /// its probe routes; lookups that miss the schedule then fall back to a full
 /// scan.
-const EXCEPTIONAL_PLACEMENT_FLAG: u32 = 1 << 31;
+const EXCEPTIONAL_PLACEMENT_FLAG: u32 = 1 << 30;
+/// Top bit of `probe_high_water`: a walk that finds no key leaves it
+/// unresolved. Set with [`EXCEPTIONAL_PLACEMENT_FLAG`], and for its whole
+/// life on a table that never settles, whose routes probe nothing.
+const WALK_UNRESOLVED_FLAG: u32 = 1 << 31;
+/// The bits of `probe_high_water` that are not the high-water mark.
+const HIGH_WATER_FLAGS: u32 = EXCEPTIONAL_PLACEMENT_FLAG | WALK_UNRESOLVED_FLAG;
+const _: () = assert!(QUERY_POSITION_CAP < EXCEPTIONAL_PLACEMENT_FLAG as u128);
+
+/// `probe_high_water` of a table that has placed nothing, under a scheduler
+/// with `settled_limit`.
+const fn empty_high_water(settled_limit: usize) -> u32 {
+    if settled_limit == 0 {
+        WALK_UNRESOLVED_FLAG
+    } else {
+        0
+    }
+}
 /// Bound on a level's probe index within `QUERY_POSITION_CAP`. Level one
 /// reaches the most probes before its positions pass the cap.
 const QUERY_PROBE_LIMIT: usize = 384;
@@ -58,47 +81,43 @@ const ROUTE_SUMMARY_LEVELS: usize = u16::BITS as usize;
 /// positive walks every level's full schedule, so a third bit rejects enough
 /// extra misses to outweigh its cost.
 const MEMBERSHIP_BITS: usize = 3;
-/// Counter base of level zero's first probe, which lookups route ahead of
-/// the schedule.
+/// Counter base of level zero's first probe, the schedule's direct route.
 const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
 const _: () = assert!(u32::BITS as u64 <= probe::ELASTIC_LEVEL_LIMIT);
 const _: () = assert!(UNIFORM_SEARCH_CAP <= probe::ELASTIC_LOGICAL_LIMIT);
 const _: () = {
-    let max_case1_logical_probes = ELASTIC_PROBE_BUDGET_C * (u32::BITS as usize - 1).pow(2);
-    assert!(max_case1_logical_probes as u64 <= probe::ELASTIC_LOGICAL_LIMIT);
+    let max_case1_logical_probes = ELASTIC_PROBE_BUDGET_C as u64 * (u32::BITS as u64 - 1).pow(2);
+    assert!(max_case1_logical_probes <= probe::ELASTIC_LOGICAL_LIMIT);
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExactPlacement {
     level: usize,
     slot: usize,
+    /// One-based probe of `level` that reached the slot.
+    paper_probe: u64,
+}
+
+impl ExactPlacement {
     /// Paper position of the chosen slot, `elastic_phi(level + 1, probe)`;
     /// the lookup schedule is extended to cover it.
-    phi: u128,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PhiRoute {
-    /// Temporarily holds `phi` while a new suffix is sorted, then the exact
-    /// level bound used by every lookup in the epoch.
-    range_upper: u32,
-    /// Packed retry-zero `(level, logical probe)` counter.
-    counter_base: u32,
-}
-
-const _: () = assert!(mem::size_of::<PhiRoute>() == 8);
-
-impl PhiRoute {
-    #[inline]
-    const fn level(self) -> usize {
-        probe::elastic_counter_level(self.counter_base) as usize
+    fn phi(self) -> u128 {
+        let paper_level = u32::try_from(self.level + 1).expect("Elastic level count fits u32");
+        probe::elastic_phi_bounded(paper_level, self.paper_probe)
+            .map(u128::from)
+            .expect("bounded Elastic query coordinate")
     }
 }
+
+const _: () = assert!(GENERAL_REDUCTION <= u8::MAX as u32);
+const _: () = assert!(UNIFORM_SEARCH_CAP <= u16::MAX as u64);
+const _: () = assert!(MAX_LEVELS <= SENTINEL_LEVEL as usize);
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
 /// into the map-level arena; owns no allocation. The actual ctrl bytes and
 /// [`SlotEntry`] data live contiguously in [`ElasticTable::arena`].
+#[repr(align(64))]
 pub(crate) struct Level<T> {
     /// Cached `arena.as_ptr() + ctrl_offset`, stamped at construction.
     ctrl_ptr: *mut u8,
@@ -109,7 +128,28 @@ pub(crate) struct Level<T> {
     capacity: u32,
     len: u32,
     tombstones: u32,
+    /// [`probe::elastic_index_shift`] of `capacity`, or [`GENERAL_REDUCTION`]
+    /// when any level of the table has no such shift. A table's levels
+    /// therefore reduce all by shift or all by the general reduction, and
+    /// level zero answers which for the whole table.
+    index_shift: u16,
+    /// Leading paper probes of this level the lookup schedule covers: a
+    /// placement within them needs no schedule extension. Zero for a level
+    /// the schedule holds no routes for.
+    scheduled_probes: u16,
+    /// Case 2's threshold: half the reserve of `capacity`
+    /// ([`ReserveFraction::floor_half_reserved`]).
+    half_reserve: u32,
+    /// This level's bit in a route summary: `1 << summary_level(level)`.
+    summary_bit: u16,
+    /// [`probe::elastic_level_run`] of this level, beside the fields a
+    /// vacancy search reads with it.
+    sequence_run: (u32, u32),
 }
+
+/// [`Level::index_shift`] of every level in a table that has a level whose
+/// probes need the general range reduction.
+const GENERAL_REDUCTION: u32 = u64::BITS;
 
 // SAFETY: the raw pointers address slots this descriptor's table owns
 // exclusively, like `Box<[T]>`; no shared interior state outlives the borrow.
@@ -117,8 +157,9 @@ unsafe impl<T: Send> Send for Level<T> {}
 // SAFETY: as above; `&Level` only permits reads of `T` through the pointers.
 unsafe impl<T: Sync> Sync for Level<T> {}
 
-// `Level` is read on every lookup — keep it within one 64-byte cache line.
-const _: () = assert!(mem::size_of::<Level<SlotEntry<u64, u64>>>() <= 64);
+// A level fills one cache line, so an insert reads its whole descriptor from
+// one line and indexes the levels by shift.
+const _: () = assert!(mem::size_of::<Level<SlotEntry<u64, u64>>>() == 64);
 
 // SAFETY: descriptors are only stamped at offsets carved from an arena
 // allocated by `arena::layout_for` for exactly `capacity` ctrl bytes and
@@ -142,20 +183,46 @@ unsafe impl<T> ArenaSlots<T> for Level<T> {
 impl<T> Level<T> {
     /// Stamps a fresh descriptor at the given arena ptrs.
     /// Caller advances the offset cursor.
-    fn new_at(cap_u32: u32, ctrl_ptr: *mut u8, data_ptr: *mut MaybeUninit<T>) -> Self {
+    fn new_at(
+        level: usize,
+        cap_u32: u32,
+        reserve_fraction: ReserveFraction,
+        index_shift: u32,
+        ctrl_ptr: *mut u8,
+        data_ptr: *mut MaybeUninit<T>,
+    ) -> Self {
         Self {
             ctrl_ptr,
             data_ptr,
             capacity: cap_u32,
             len: 0,
             tombstones: 0,
+            index_shift: u16::try_from(index_shift).expect("Elastic index shift fits u16"),
+            scheduled_probes: 0,
+            // At most the capacity, which fits.
+            #[allow(clippy::cast_possible_truncation)]
+            half_reserve: reserve_fraction.floor_half_reserved(cap_u32 as usize) as u32,
+            summary_bit: 1 << summary_level(level),
+            sequence_run: probe::elastic_level_run(level),
         }
+    }
+
+    #[inline]
+    fn index_shift(&self) -> u32 {
+        u32::from(self.index_shift)
     }
 
     /// Slots minus live entries (includes tombstones, reusable on insert).
     #[inline]
     fn free_slots(&self) -> usize {
-        self.capacity.saturating_sub(self.len) as usize
+        (self.capacity - self.len) as usize
+    }
+
+    /// Case 2's test on the active pair's current level: at most half its
+    /// reserve is left, so new keys go to the next level.
+    #[inline]
+    fn low(&self) -> bool {
+        self.capacity - self.len <= self.half_reserve
     }
 
     /// Tombstones exceed [`capacity::tombstone_cleanup_threshold`], so the
@@ -166,19 +233,21 @@ impl<T> Level<T> {
     }
 
     /// Moves every live entry out through `visit` and resets the level to
-    /// empty. Each slot's control and `len` are updated before `visit` runs,
-    /// and tombstones are wiped only after the last entry, so a panic inside
-    /// `visit` leaves the level consistent: the entries not yet visited stay
-    /// live and counted, and the moved ones are `EMPTY`.
+    /// empty. Each moved slot becomes a counted tombstone before `visit`
+    /// runs, and controls return to `EMPTY` only after the last entry, so a
+    /// panic inside `visit` leaves the level as a run of removals would: the
+    /// entries not yet visited stay live and counted, and no `EMPTY` slot
+    /// appears ahead of one on its probe route.
     fn drain_reset(&mut self, mut visit: impl FnMut(T)) {
         let mut scan = OccupiedIndices::new();
         while let Some(slot) = scan.step(self) {
             // SAFETY: `step` yields occupied in-bounds slots; the value is
-            // moved out before the slot is marked empty.
+            // moved out before the slot is marked.
             let entry = unsafe { self.take(slot) };
             // SAFETY: `slot` is in bounds, as above.
-            unsafe { self.set_control(slot, CTRL_EMPTY) };
+            unsafe { self.mark_tombstone(slot) };
             self.len -= 1;
+            self.tombstones += 1;
             visit(entry);
         }
         self.clear_all_controls();
@@ -200,26 +269,41 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     levels: LevelSlice<K, V>,
     len: usize,
     total_slots: usize,
+    /// Fixed for the allocation. The scheduler's settled limit is taken from
+    /// it once, when the two are built ([`settled_limit`]).
     max_insertions: usize,
     reserve_fraction: ReserveFraction,
     /// Schedule batch progression and epoch boundaries.
     scheduler: BatchScheduler,
     hash_builder: S,
     alloc: A,
-    /// [`ctrl_L0|ctrl_L1|...`][pad][`slots_L0|slots_L1|...`].
+    /// `ctrl_L0|ctrl_L1|...`, padding, then `slots_L0|slots_L1|...`.
     arena: Arena,
     epoch: EpochState,
     probe_high_water: u32,
-    probe_schedule: Vec<PhiRoute>,
+    /// Levels the schedule holds routes for: every level up to the deepest
+    /// one a placement of this epoch chose. A deeper level holds no entry, so
+    /// lookups have nothing to visit there.
+    scheduled_levels: u32,
+    probe_schedule: ProbeSchedule,
+    /// [`probe::ELASTIC_FOLD_MULTIPLIER`], kept in the table so the hot
+    /// paths load it rather than build it.
+    fold_multiplier: u64,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
+    /// First word of the metadata tail, so the gate's address needs one load;
+    /// [`NO_METADATA`] while `membership` has no words.
+    metadata_words: *mut MetadataWord,
     /// Deletes since the filter last matched the live set; see
     /// [`membership::refresh_deletes`].
     stale_membership: usize,
 }
 
 // SAFETY: the table uniquely owns its arena and every entry in it, like
-// `Box<[SlotEntry<K, V>]>`; the raw pointers are never shared with another table.
+// `Box<[SlotEntry<K, V>]>`. Its raw pointers address that arena, except the
+// schedule's sentinel route, which addresses an immutable static, and the
+// schedule's entry origin, which is an address to offset from and is never
+// read: it lies outside the arena, and is null without levels.
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
     for ElasticTable<K, V, S, A>
 {
@@ -407,26 +491,54 @@ impl PreparedElasticKey {
 const _: () = assert!(mem::size_of::<PreparedElasticRoute>() == 8);
 const _: () = assert!(mem::size_of::<PreparedElasticKey>() == 16);
 
-/// Both metadata answers for one prepared key, read from one word.
-#[derive(Clone, Copy)]
-struct ElasticRouteFilter {
-    /// `false` proves no insert ever recorded this key's route.
-    maybe_present: bool,
-    /// Summary bits of the levels this route bin has occupied. Bit `i` covers
-    /// level `i` for `i < ROUTE_SUMMARY_LEVELS - 1`; the last bit is saturating
-    /// and covers every deeper level.
-    level_mask: u32,
+/// Outcome of [`ElasticTable::walk_schedule`].
+enum ScheduleSearch<R> {
+    Hit(R),
+    Absent,
+    /// The walk could not decide: the key is where
+    /// [`ElasticTable::find_by_general_schedule`] finds it, or absent.
+    Unresolved,
 }
 
-impl ElasticRouteFilter {
-    /// Widens the saturating last summary bit over every level index it stands
-    /// for, so a lookup tests `1 << level` directly instead of clamping the
-    /// level on each schedule step.
+/// The metadata word of one prepared key and its membership answer.
+#[derive(Clone, Copy)]
+struct ElasticRouteFilter<'a> {
+    /// `false` proves no insert ever recorded this key's route.
+    maybe_present: bool,
+    word: &'a MetadataWord,
+}
+
+impl ElasticRouteFilter<'_> {
+    /// Summary bits of the levels `route`'s bin has occupied. Bit `i` covers
+    /// level `i` for `i < ROUTE_SUMMARY_LEVELS - 1`; the last bit is
+    /// saturating and covers every deeper level. Read apart from the
+    /// membership answer, so a lookup that ends before it narrows its levels
+    /// does not load them.
     #[inline]
-    const fn expanded_level_mask(self) -> u32 {
-        let saturated = (self.level_mask >> (ROUTE_SUMMARY_LEVELS - 1)) & 1;
-        self.level_mask | (0_u32.wrapping_sub(saturated) << (ROUTE_SUMMARY_LEVELS - 1))
+    fn level_mask(self, route: PreparedElasticRoute) -> u16 {
+        self.word.level_bins[route.summary_bin()]
     }
+
+    /// [`Self::level_mask`] widened by [`expand_level_mask`].
+    #[inline]
+    fn expanded_level_mask(self, route: PreparedElasticRoute) -> u64 {
+        expand_level_mask(self.level_mask(route))
+    }
+}
+
+/// Widens the saturating last summary bit over every level index it stands
+/// for, so a lookup tests `1 << level` directly instead of clamping the
+/// level on each schedule step.
+///
+/// The last bit is the summary's sign bit, yet the widening is arithmetic on
+/// the zero-extended bin and not a sign extension: the shorter form hands
+/// the walk its open levels sooner, and the lookup benchmarks run slower
+/// with it.
+#[inline]
+const fn expand_level_mask(level_mask: u16) -> u64 {
+    let mask = level_mask as u64;
+    let saturated = mask >> (ROUTE_SUMMARY_LEVELS - 1);
+    mask | (saturated.wrapping_neg() << (ROUTE_SUMMARY_LEVELS - 1))
 }
 
 /// Maps a level index onto its route-summary bit. Levels past the summary's
@@ -438,35 +550,6 @@ const fn summary_level(level: usize) -> usize {
         level
     } else {
         ROUTE_SUMMARY_LEVELS - 1
-    }
-}
-
-/// Walks `level`'s probes in paper order from `from_probe`, visiting each
-/// `(paper_probe, phi)` with `phi <= position_cap` inside the uniform search
-/// cap. Level 0's first probe is skipped: the H11 fast path covers it, so no
-/// route is ever scheduled for it.
-#[allow(clippy::inline_always)]
-#[inline(always)]
-fn for_each_phi_route(
-    level: usize,
-    from_probe: u128,
-    position_cap: u128,
-    mut visit: impl FnMut(u128, u128),
-) {
-    let paper_level = level as u128 + 1;
-    let mut paper_probe = if level == 0 && from_probe == 1 {
-        2
-    } else {
-        from_probe
-    };
-    while paper_probe <= u128::from(UNIFORM_SEARCH_CAP) {
-        let phi =
-            probe::elastic_phi(paper_level, paper_probe).expect("bounded Elastic query coordinate");
-        if phi > position_cap {
-            break;
-        }
-        visit(paper_probe, phi);
-        paper_probe += 1;
     }
 }
 
@@ -499,8 +582,9 @@ const LEVEL_PROBE_LIMIT: [u64; MAX_LEVELS] = {
     limits
 };
 
-/// Routes [`for_each_phi_route`] visits for `level` from its first probe up to
-/// `QUERY_POSITION_CAP`, within `UNIFORM_SEARCH_CAP` probes.
+/// Routes a full schedule holds for `level`: its probes at positions up to
+/// `QUERY_POSITION_CAP`, within `UNIFORM_SEARCH_CAP` probes, less level
+/// zero's first, which is the direct slot.
 const fn level_route_count(level: usize) -> usize {
     let paper_level = level as u128 + 1;
     let mut paper_probe = if level == 0 { 2 } else { 1 };
@@ -518,12 +602,26 @@ const fn level_route_count(level: usize) -> usize {
     count
 }
 
-fn try_probe_schedule(level_count: usize) -> Result<Vec<PhiRoute>, TryReserveError> {
-    let mut schedule = Vec::new();
-    schedule
-        .try_reserve_exact(PROBE_SCHEDULE_CAPACITY[level_count])
-        .map_err(|_| TryReserveError::AllocError)?;
-    Ok(schedule)
+/// [`BatchScheduler`]'s settled limit for a table of `levels` that takes
+/// `max_insertions` entries over `batches` batches and records its keys in
+/// `membership`: zero unless level zero reduces by shift, every batch's
+/// level pair lies inside `levels`, and the filter has a word to record in.
+fn settled_limit<T>(
+    levels: &[Level<T>],
+    batches: usize,
+    membership: MembershipRegion,
+    max_insertions: usize,
+) -> usize {
+    match levels.first() {
+        Some(level)
+            if level.index_shift() != GENERAL_REDUCTION
+                && batches <= levels.len()
+                && membership.words != 0 =>
+        {
+            max_insertions
+        }
+        _ => 0,
+    }
 }
 
 /// Schedule paper batches and allocation-epoch boundaries.
@@ -542,6 +640,24 @@ pub(crate) struct BatchScheduler {
     batch_start: usize,
     /// `batch_ends[current_batch_index]`, or `usize::MAX` for an empty plan.
     batch_end: usize,
+    /// Live count below which [`ElasticTable::settled_slot`] can place: the
+    /// table's insertion limit, or zero where [`settled_limit()`] rules a
+    /// settled insert out.
+    settled_limit: usize,
+    /// Live counts from `batch_start` that are inside the cached batch and
+    /// below `settled_limit`.
+    settled_span: usize,
+}
+
+/// One of the paper's insertion cases, resolved against a table's levels.
+struct PlacementCase<'a, K, V> {
+    /// The level to search first.
+    level: usize,
+    region: &'a Level<SlotEntry<K, V>>,
+    /// Probes of `level` to search.
+    budget: u64,
+    /// The level to search when the budget finds no slot.
+    fallback: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -551,7 +667,7 @@ enum BatchTarget {
 }
 
 impl BatchScheduler {
-    pub(crate) fn new(batch_plan: &[usize]) -> Self {
+    pub(crate) fn new(batch_plan: &[usize], settled_limit: usize) -> Self {
         let mut total = 0_usize;
         let batch_ends = batch_plan
             .iter()
@@ -565,9 +681,19 @@ impl BatchScheduler {
             current_batch_index: 0,
             batch_start: 0,
             batch_end: usize::MAX,
+            settled_limit,
+            settled_span: settled_limit,
         };
         scheduler.reset();
         scheduler
+    }
+
+    /// The cached batch is current for `len` live entries and `len` is below
+    /// the settled limit, in one compare: a `len` under `batch_start` wraps
+    /// past any span.
+    #[inline]
+    fn settles(&self, len: usize) -> bool {
+        len.wrapping_sub(self.batch_start) < self.settled_span
     }
 
     /// [`Self::target`] on a copy, for assertions through a shared borrow.
@@ -581,10 +707,16 @@ impl BatchScheduler {
     /// `len` has left its window; the common case is two compares.
     #[inline]
     fn target(&mut self, len: usize) -> BatchTarget {
-        if len >= self.batch_end || len < self.batch_start {
+        if !self.covers(len) {
             self.sync(len);
         }
         self.cached_target()
+    }
+
+    /// The cached batch is the one a table holding `len` live entries is in.
+    #[inline]
+    fn covers(&self, len: usize) -> bool {
+        len < self.batch_end && len >= self.batch_start
     }
 
     /// The target of the cached batch, which may trail `len` until the next
@@ -612,6 +744,10 @@ impl BatchScheduler {
         self.current_batch_index = index;
         self.batch_start = if index == 0 { 0 } else { ends[index - 1] };
         self.batch_end = ends[index];
+        self.settled_span = self
+            .batch_end
+            .min(self.settled_limit)
+            .saturating_sub(self.batch_start);
     }
 
     /// Reset batch progress after resize or clear.
@@ -728,17 +864,32 @@ fn build_elastic_levels<K, V>(
     arena_base: *mut u8,
     data_base_off: usize,
     level_capacities: &[usize],
+    reserve_fraction: ReserveFraction,
 ) -> Result<LevelSlice<K, V>, TryReserveError> {
     let mut cursor = arena::LayoutCursor::<SlotEntry<K, V>>::new(arena_base, data_base_off)?;
     let mut levels: Vec<Level<SlotEntry<K, V>>> = Vec::new();
     levels
         .try_reserve_exact(level_capacities.len())
         .map_err(|_| TryReserveError::AllocError)?;
-    for &cap in level_capacities {
+    let all_shift = level_capacities
+        .iter()
+        .all(|&cap| probe::elastic_index_shift(cap).is_some());
+    for (level, &cap) in level_capacities.iter().enumerate() {
         let cap_u32 = u32::try_from(cap).map_err(|_| TryReserveError::CapacityOverflow)?;
+        let index_shift = match probe::elastic_index_shift(cap) {
+            Some(shift) if all_shift => shift,
+            _ => GENERAL_REDUCTION,
+        };
         // SAFETY: the arena was allocated for the layout these caps sum to.
         let (ctrl_ptr, data_ptr) = unsafe { cursor.reserve(cap_u32)? };
-        levels.push(Level::new_at(cap_u32, ctrl_ptr, data_ptr));
+        levels.push(Level::new_at(
+            level,
+            cap_u32,
+            reserve_fraction,
+            index_shift,
+            ctrl_ptr,
+            data_ptr,
+        ));
     }
     Ok(levels.into_boxed_slice())
 }
@@ -752,6 +903,7 @@ fn total_ctrl(level_capacities: &[usize]) -> Option<usize> {
 #[allow(clippy::cast_ptr_alignment)]
 fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     level_capacities: &[usize],
+    reserve_fraction: ReserveFraction,
     alloc: &A,
 ) -> Result<ElasticArenaBuild<K, V>, TryReserveError> {
     let total_ctrl = total_ctrl(level_capacities).ok_or(TryReserveError::CapacityOverflow)?;
@@ -764,8 +916,12 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     unsafe { membership.clear::<MetadataWord>(arena.as_ptr()) };
 
     // `Arena` has no `Drop`: deallocate explicitly if level construction fails.
-    match build_elastic_levels::<K, V>(arena.as_ptr(), arena_layout.data_base_off, level_capacities)
-    {
+    match build_elastic_levels::<K, V>(
+        arena.as_ptr(),
+        arena_layout.data_base_off,
+        level_capacities,
+        reserve_fraction,
+    ) {
         Ok(levels) => Ok((arena, levels, membership)),
         Err(e) => {
             arena.deallocate(alloc);
@@ -774,11 +930,29 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     }
 }
 
+/// The word a table without a metadata tail reads: it records no key, so
+/// the filter rejects every lookup without testing for the missing tail.
+static NO_METADATA: MetadataWord = MetadataWord {
+    level_bins: [0; 4],
+    membership: 0,
+};
+
+/// First metadata word of `membership`'s tail inside `arena`, or
+/// [`NO_METADATA`] when it has none. Only a tail with words is written to.
+fn metadata_words(arena: &Arena, membership: MembershipRegion) -> *mut MetadataWord {
+    if membership.words == 0 {
+        return (&raw const NO_METADATA).cast_mut();
+    }
+    // SAFETY: `membership` was laid out together with `arena`.
+    unsafe { membership.ptr::<MetadataWord>(arena.as_ptr()) }
+}
+
 fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
     level_capacities: &[usize],
+    reserve_fraction: ReserveFraction,
     alloc: &A,
 ) -> ElasticArenaBuild<K, V> {
-    try_alloc_elastic_arena(level_capacities, alloc)
+    try_alloc_elastic_arena(level_capacities, reserve_fraction, alloc)
         .unwrap_or_else(|_| handle_elastic_alloc_error::<K, V>(level_capacities))
 }
 
@@ -817,23 +991,35 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let probe_schedule = try_probe_schedule(geometry.level_capacities.len())?;
+        let schedule_room = ProbeScheduleRoom::try_with_capacity(
+            PROBE_SCHEDULE_CAPACITY[geometry.level_capacities.len()],
+        )?;
         let (arena, levels, membership) =
-            try_alloc_elastic_arena(&geometry.level_capacities, &alloc)?;
+            try_alloc_elastic_arena(&geometry.level_capacities, reserve_fraction, &alloc)?;
 
+        let settled_limit = settled_limit(
+            &levels,
+            geometry.batch_plan.len,
+            membership,
+            geometry.max_insertions,
+        );
+        let probe_schedule = schedule_room.schedule(&levels);
         Ok(Self {
             levels,
             len: 0,
             total_slots: geometry.total_slots,
             max_insertions: geometry.max_insertions,
             reserve_fraction,
-            scheduler: BatchScheduler::new(&geometry.batch_plan),
+            scheduler: BatchScheduler::new(&geometry.batch_plan, settled_limit),
             hash_builder,
             alloc,
+            metadata_words: metadata_words(&arena, membership),
             arena,
             epoch: EpochState::initial(),
-            probe_high_water: 0,
+            probe_high_water: empty_high_water(settled_limit),
+            scheduled_levels: 0,
             probe_schedule,
+            fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
             stale_membership: 0,
         })
@@ -868,36 +1054,27 @@ where
 
     #[inline]
     fn membership_ptr(&self) -> *mut MetadataWord {
-        // SAFETY: `self.membership` was laid out together with `self.arena`.
-        unsafe { self.membership.ptr::<MetadataWord>(self.arena.as_ptr()) }
+        self.metadata_words
     }
 
-    /// Reads the membership scalar and selected route-summary bin directly:
-    /// `maybe_present == false` proves the key was never recorded, and
-    /// `level_mask` narrows the candidate levels. The two field loads avoid
-    /// copying the whole metadata word for dynamic bin extraction.
+    /// Tests the membership scalar of the key's metadata word:
+    /// `maybe_present == false` proves the key was never recorded. The
+    /// word's summary bins narrow the candidate levels.
     #[inline]
-    fn route_filter(&self, prepared: PreparedElasticKey) -> ElasticRouteFilter {
-        let words = self.membership.words;
-        if words == 0 {
-            return ElasticRouteFilter {
-                maybe_present: false,
-                level_mask: 0,
-            };
-        }
-        let word = MembershipKey::word(prepared.route.signature(), words);
-        let summary_bin = prepared.route.summary_bin();
+    fn route_filter(&self, prepared: PreparedElasticKey) -> ElasticRouteFilter<'_> {
+        // Zero words reduce every signature to word zero, which is then
+        // `NO_METADATA`: no bit is set there, so the filter rejects the key.
+        let word = MembershipKey::word(prepared.route.signature(), self.membership.words);
         let bits = prepared.membership.bits();
-        // SAFETY: `word` is a multiply-high reduction below `words`, and the
-        // cached region covers exactly that many initialized, properly aligned
-        // `MetadataWord`s.
-        let (membership, route_bin) = unsafe {
-            let metadata = self.membership_ptr().add(word);
-            ((*metadata).membership, (*metadata).level_bins[summary_bin])
-        };
+        debug_assert!(bits != 0);
+        // SAFETY: `word` is a multiply-high reduction below the word count,
+        // and the cached region covers exactly that many initialized,
+        // properly aligned `MetadataWord`s; with no words it is zero and
+        // `metadata_words` addresses the one word of `NO_METADATA`.
+        let word = unsafe { &*self.membership_ptr().add(word) };
         ElasticRouteFilter {
-            maybe_present: membership & bits == bits,
-            level_mask: u32::from(route_bin),
+            maybe_present: word.membership & bits == bits,
+            word,
         }
     }
 
@@ -924,7 +1101,7 @@ where
         &mut self,
         route: PreparedElasticRoute,
         membership: MembershipKey,
-        level: usize,
+        summary_bit: u16,
     ) {
         let words = self.membership.words;
         if words != 0 {
@@ -933,7 +1110,7 @@ where
             // makes the borrow exclusive.
             let metadata = unsafe { &mut *self.membership_ptr().add(word) };
             metadata.membership |= membership.bits();
-            metadata.level_bins[route.summary_bin()] |= 1_u16 << summary_level(level);
+            metadata.level_bins[route.summary_bin()] |= summary_bit;
         }
     }
 
@@ -971,7 +1148,11 @@ where
     /// Resets placement, lookup, and filter state once every level is empty.
     fn reset_after_clear(&mut self) {
         self.scheduler.reset();
-        self.probe_high_water = 0;
+        self.probe_high_water = empty_high_water(self.scheduler.settled_limit);
+        self.scheduled_levels = 0;
+        for level in &mut self.levels {
+            level.scheduled_probes = 0;
+        }
         self.probe_schedule.clear();
         self.clear_membership();
         self.epoch.start(EpochTransition::Clear);
@@ -979,10 +1160,57 @@ where
 
     /// Post-lookup insert for a key known to be absent. Returns the chosen
     /// slot so the caller can borrow into it without re-probing.
+    #[inline]
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let prepared = PreparedElasticKey::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
-        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint)
+        let Some((level, slot, control)) = self.settled_slot(prepared.route.probe) else {
+            return self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
+        };
+        self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control)
+    }
+
+    /// The slot [`Self::choose_slot_for_new_key`] gives a new key, when the
+    /// table needs no growth, the cached batch is current, its levels reduce
+    /// by shift, and the batch's first choice of level has a free slot among
+    /// its scheduled probes. `None` leaves the insert to
+    /// [`Self::insert_for_vacant_entry_prepared`].
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize, u8)> {
+        if !self.scheduler.settles(self.len) {
+            return None;
+        }
+        let target = self.scheduler.cached_target();
+        let deepest = match target {
+            BatchTarget::Bootstrap => 0,
+            BatchTarget::LevelPair(current) => current + 1,
+        };
+        debug_assert!(deepest < self.levels.len());
+        debug_assert!(self.membership.words != 0);
+        // SAFETY: the scheduler settles only below the limit it was built
+        // with, which `settled_limit` derives from the levels and the
+        // filter built beside it: zero without a level zero, with a batch
+        // whose level pair reaches past the levels, or without a filter
+        // word. The cached batch is one of the scheduler's own, so its
+        // target's levels exist. A clone takes the scheduler and builds
+        // levels and a filter of the same capacities, and a rebuild swaps
+        // all three together.
+        unsafe {
+            core::hint::assert_unchecked(deepest < self.levels.len());
+            core::hint::assert_unchecked(self.membership.words != 0);
+        }
+        // A level's scheduled probes all lie within its probe limit.
+        let case = self.placement_case(target, |region, budget| {
+            let scheduled = u64::from(region.scheduled_probes);
+            budget.map_or(scheduled, |budget| budget.min(scheduled))
+        })?;
+        let budget = case.budget;
+        // SAFETY: a settled table's level zero reduces by shift, which
+        // means every level does.
+        let (slot, _, control) =
+            unsafe { self.first_shifted_vacancy(probe, case.level, case.region, budget) }?;
+        Some((case.level, slot, control))
     }
 
     fn insert_for_vacant_entry_prepared(
@@ -1006,6 +1234,36 @@ where
             return self.place_new_entry(key, value, prepared, key_fingerprint, placement);
         }
         self.place_after_target_failure(key, value, prepared, key_fingerprint, target)
+    }
+
+    /// [`map::TableBackend::insert`] off its common path: a key the walk
+    /// left unresolved, or an absent key without a settled slot. It tells
+    /// the two apart itself, so its callers pass the same arguments and
+    /// share one call.
+    #[inline(never)]
+    fn insert_slow(
+        &mut self,
+        key: K,
+        value: V,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
+    ) -> Option<V> {
+        let filter = self.route_filter(prepared);
+        if filter.maybe_present && self.walk_ends_unresolved() {
+            let level_mask = filter.expanded_level_mask(prepared.route);
+            let found = self.find_by_general_schedule(
+                &key,
+                prepared.route,
+                key_fingerprint,
+                level_mask,
+                |level, slot, _| (level, slot),
+            );
+            if let Some(location) = found {
+                return Some(map::TableBackend::replace_value(self, location, value));
+            }
+        }
+        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
+        None
     }
 
     /// Places a key whose active batch target has no slot: another target,
@@ -1049,7 +1307,11 @@ where
         key_fingerprint: u8,
         placement: ExactPlacement,
     ) -> (usize, usize) {
-        self.extend_probe_schedule(placement.phi);
+        if placement.paper_probe > u64::from(self.levels[placement.level].scheduled_probes) {
+            self.schedule_placement(placement);
+        }
+        // SAFETY: a placement names a slot of its level.
+        let prev_ctrl = unsafe { self.levels[placement.level].control_at(placement.slot) };
         self.write_new_entry(
             key,
             value,
@@ -1057,6 +1319,7 @@ where
             key_fingerprint,
             placement.level,
             placement.slot,
+            prev_ctrl,
         )
     }
 
@@ -1071,8 +1334,18 @@ where
         let (level, slot) = self
             .first_free_slot()
             .expect("Elastic insertion limit must leave a free slot");
-        self.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG;
-        self.write_new_entry(key, value, prepared, key_fingerprint, level, slot)
+        self.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG | WALK_UNRESOLVED_FLAG;
+        // SAFETY: the scan found `slot` within `level`.
+        let prev_ctrl = unsafe { self.levels[level].control_at(slot) };
+        self.write_new_entry(
+            key,
+            value,
+            prepared,
+            key_fingerprint,
+            level,
+            slot,
+            prev_ctrl,
+        )
     }
 
     fn first_free_slot(&self) -> Option<(usize, usize)> {
@@ -1087,6 +1360,9 @@ where
             })
     }
 
+    /// Writes a new entry into the free slot `slot_idx` of `level_idx`.
+    /// `prev_ctrl` is the control byte the caller found the slot free by.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn write_new_entry(
         &mut self,
@@ -1096,23 +1372,53 @@ where
         key_fingerprint: u8,
         level_idx: usize,
         slot_idx: usize,
+        prev_ctrl: u8,
     ) -> (usize, usize) {
-        {
-            let level = &mut self.levels[level_idx];
+        let summary_bit = {
+            debug_assert!(level_idx < self.levels.len());
+            // SAFETY: callers pass a level they found a free slot in.
+            let level = unsafe { self.levels.get_unchecked_mut(level_idx) };
             // SAFETY: callers pass a free slot found within this level.
-            let prev_ctrl = unsafe { level.control_at(slot_idx) };
+            debug_assert_eq!(prev_ctrl, unsafe { level.control_at(slot_idx) });
+            debug_assert!(control::is_free(prev_ctrl));
             // SAFETY: as above; `key_fingerprint` is an occupied control byte.
             unsafe {
                 level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
             }
             level.len += 1;
-            if prev_ctrl == CTRL_TOMBSTONE {
+            // A free slot that is not empty is a tombstone.
+            if prev_ctrl != CTRL_EMPTY {
                 level.tombstones -= 1;
             }
-        }
-        self.record_membership(prepared.route, prepared.membership, level_idx);
+            level.summary_bit
+        };
+        self.record_membership(prepared.route, prepared.membership, summary_bit);
         self.len += 1;
         (level_idx, slot_idx)
+    }
+
+    /// Extends the schedule to cover a placement outside the scheduled levels
+    /// or past the probes its own level already holds.
+    #[cold]
+    #[inline(never)]
+    fn schedule_placement(&mut self, placement: ExactPlacement) {
+        if placement.level >= self.scheduled_levels as usize {
+            self.schedule_levels_through(placement.level);
+        }
+        self.extend_probe_schedule(placement.phi());
+    }
+
+    /// Rebuilds the schedule to hold the routes of every level up to `level`,
+    /// the first placement of this epoch past the levels scheduled so far.
+    fn schedule_levels_through(&mut self, level: usize) {
+        let high_water = self.probe_high_water & !HIGH_WATER_FLAGS;
+        self.probe_high_water &= HIGH_WATER_FLAGS;
+        self.probe_schedule.clear();
+        self.scheduled_levels = u32::try_from(level + 1).expect("Elastic level count fits u32");
+        for level in &mut self.levels {
+            level.scheduled_probes = 0;
+        }
+        self.extend_probe_schedule(u128::from(high_water));
     }
 
     fn extend_probe_schedule(&mut self, high_water: u128) {
@@ -1120,36 +1426,48 @@ where
             high_water <= QUERY_POSITION_CAP,
             "Elastic query-position convention exhausted"
         );
-        let prior_high_water = self.probe_high_water & !EXCEPTIONAL_PLACEMENT_FLAG;
+        let prior_high_water = self.probe_high_water & !HIGH_WATER_FLAGS;
         if high_water <= u128::from(prior_high_water) {
             return;
         }
-        let old_len = self.probe_schedule.len();
-        for level in 0..self.levels.len() {
-            let from_probe =
-                first_paper_probe_after(level as u128 + 1, u128::from(prior_high_water));
-            for_each_phi_route(level, from_probe, high_water, |paper_probe, phi| {
-                let logical_probe_index =
-                    u64::try_from(paper_probe - 1).expect("Elastic probe cap fits u64");
+        // A level's positions grow with its probe, so each level offers its
+        // next unscheduled probe and the lowest position among them is the
+        // next route in position order.
+        let position = |level: usize, paper_probe: u64| {
+            if paper_probe > UNIFORM_SEARCH_CAP {
+                return None;
+            }
+            let phi = probe::elastic_phi(level as u128 + 1, u128::from(paper_probe))
+                .expect("bounded Elastic query coordinate");
+            (phi <= high_water).then_some(phi)
+        };
+        let levels = &mut self.levels[..self.scheduled_levels as usize];
+        let mut next = [None; MAX_LEVELS];
+        for (level, region) in levels.iter().enumerate() {
+            next[level] = position(level, u64::from(region.scheduled_probes) + 1);
+        }
+        while let Some((level, _)) = next[..levels.len()]
+            .iter()
+            .enumerate()
+            .filter_map(|(level, phi)| phi.map(|phi| (level, phi)))
+            .min_by_key(|&(_, phi)| phi)
+        {
+            let logical_probe_index = u64::from(levels[level].scheduled_probes);
+            // Level zero's first probe is the direct slot, which every
+            // lookup reads before it walks the schedule.
+            if level != 0 || logical_probe_index != 0 {
                 assert!(
                     usize::try_from(logical_probe_index)
                         .is_ok_and(|index| index < QUERY_PROBE_LIMIT),
                     "Elastic query-probe convention exhausted"
                 );
-                let counter_base =
-                    probe::try_pack_elastic_counter(level as u64, logical_probe_index, 0)
-                        .expect("Elastic query tuple fits the production counter");
-                self.probe_schedule.push(PhiRoute {
-                    range_upper: u32::try_from(phi).expect("Elastic query cap fits u32"),
-                    counter_base,
-                });
-            });
+                self.probe_schedule.push(levels, level, logical_probe_index);
+            }
+            let region = &mut levels[level];
+            region.scheduled_probes += 1;
+            next[level] = position(level, u64::from(region.scheduled_probes) + 1);
         }
-        self.probe_schedule[old_len..].sort_unstable_by_key(|route| route.range_upper);
-        for route in &mut self.probe_schedule[old_len..] {
-            route.range_upper = self.levels[route.level()].capacity;
-        }
-        self.probe_high_water = (self.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG)
+        self.probe_high_water = (self.probe_high_water & HIGH_WATER_FLAGS)
             | u32::try_from(high_water).expect("Elastic query cap fits u32");
     }
 }
@@ -1230,10 +1548,11 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_slot_indices_prepared(
+        self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            control::control_fingerprint(hash),
+            || control::control_fingerprint(hash),
+            |level, slot, _entry| (level, slot),
         )
     }
 
@@ -1242,10 +1561,25 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_entry_prepared(
+        self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            control::control_fingerprint(hash),
+            || control::control_fingerprint(hash),
+            |_level, _slot, entry| entry,
+        )
+    }
+
+    #[inline]
+    fn find_value<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+        K: 'a,
+    {
+        self.find_by_exact_schedule(
+            key,
+            PreparedElasticKey::new(hash),
+            || control::control_fingerprint(hash),
+            |_level, _slot, entry| &entry.value,
         )
     }
 
@@ -1269,13 +1603,35 @@ where
     {
         let prepared = PreparedElasticKey::new(hash);
         let key_fingerprint = control::control_fingerprint(hash);
-        // `find_slot_indices_prepared` applies the same filter from the metadata
-        // word it already reads, so this path pays no separate pre-check load.
-        if let Some(location) = self.find_slot_indices_prepared(&key, prepared, key_fingerprint) {
-            return Some(self.replace_value(location, value));
+        // Every way off the common path meets in one call, which tells them
+        // apart itself.
+        'common: {
+            let filter = self.route_filter(prepared);
+            if filter.maybe_present {
+                let walked = self.walk_schedule(
+                    &key,
+                    prepared.route,
+                    key_fingerprint,
+                    filter,
+                    |_, _, entry| entry,
+                );
+                match walked {
+                    ScheduleSearch::Hit(entry) => {
+                        // SAFETY: the walk hands on an occupied slot of this
+                        // table, which `&mut self` borrows alone.
+                        let slot = unsafe { &mut *entry };
+                        return Some(mem::replace(&mut slot.value, value));
+                    }
+                    ScheduleSearch::Absent => {}
+                    ScheduleSearch::Unresolved => break 'common,
+                }
+            }
+            if let Some((level, slot, control)) = self.settled_slot(prepared.route.probe) {
+                self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control);
+                return None;
+            }
         }
-        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
-        None
+        self.insert_slow(key, value, prepared, key_fingerprint)
     }
 
     fn remove(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
@@ -1399,10 +1755,9 @@ where
         let scheduler = self.scheduler.clone();
         let hash_builder = self.hash_builder.clone();
         let alloc = self.alloc.clone();
-        let mut probe_schedule = Vec::with_capacity(PROBE_SCHEDULE_CAPACITY[self.levels.len()]);
-        probe_schedule.extend_from_slice(&self.probe_schedule);
         let level_capacities = PlanBuffer::from_iter(self.levels.iter().map(ArenaSlots::capacity));
-        let (arena, levels, membership) = alloc_elastic_arena(&level_capacities, &self.alloc);
+        let (arena, levels, membership) =
+            alloc_elastic_arena(&level_capacities, self.reserve_fraction, &self.alloc);
 
         // If a user `K::clone` / `V::clone` panics, the guard drops the
         // already-cloned values and frees the arena; see `ArenaDropGuard`.
@@ -1412,7 +1767,13 @@ where
             dst.clone_region_from(src_lvl);
             dst.len = src_lvl.len;
             dst.tombstones = src_lvl.tombstones;
+            dst.scheduled_probes = src_lvl.scheduled_probes;
         }
+
+        let regions = guard.regions_mut();
+        let probe_schedule = self
+            .probe_schedule
+            .clone_onto(PROBE_SCHEDULE_CAPACITY[regions.len()], regions);
 
         // Success: reclaim arena + levels so the guard's Drop no-ops.
         let (arena, levels) = guard.disarm();
@@ -1426,10 +1787,13 @@ where
             scheduler,
             hash_builder,
             alloc,
+            metadata_words: metadata_words(&arena, membership),
             arena,
             epoch: self.epoch,
             probe_high_water: self.probe_high_water,
+            scheduled_levels: self.scheduled_levels,
             probe_schedule,
+            fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
             stale_membership: self.stale_membership,
         };
@@ -1477,7 +1841,8 @@ where
                     self.hash_builder.hash_one(&entry.key)
                 };
                 let prepared = PreparedElasticKey::new(hash);
-                self.record_membership(prepared.route, prepared.membership, level_idx);
+                let summary_bit = self.levels[level_idx].summary_bit;
+                self.record_membership(prepared.route, prepared.membership, summary_bit);
             }
         }
     }
@@ -1505,9 +1870,21 @@ where
         geometry: &ElasticGeometry,
         transition: EpochTransition,
     ) -> Result<(), TryReserveError> {
-        let probe_schedule = try_probe_schedule(geometry.level_capacities.len())?;
-        let (arena, levels, membership) =
-            try_alloc_elastic_arena(&geometry.level_capacities, &self.alloc)?;
+        let schedule_room = ProbeScheduleRoom::try_with_capacity(
+            PROBE_SCHEDULE_CAPACITY[geometry.level_capacities.len()],
+        )?;
+        let (arena, levels, membership) = try_alloc_elastic_arena(
+            &geometry.level_capacities,
+            self.reserve_fraction,
+            &self.alloc,
+        )?;
+        let settled_limit = settled_limit(
+            &levels,
+            geometry.batch_plan.len,
+            membership,
+            geometry.max_insertions,
+        );
+        let probe_schedule = schedule_room.schedule(&levels);
         let used_exceptional_placement = rebuild::rebuild(
             self,
             ElasticGeneration {
@@ -1515,9 +1892,11 @@ where
                 len: 0,
                 total_slots: geometry.total_slots,
                 max_insertions: geometry.max_insertions,
-                scheduler: BatchScheduler::new(&geometry.batch_plan),
+                scheduler: BatchScheduler::new(&geometry.batch_plan, settled_limit),
+                metadata_words: metadata_words(&arena, membership),
                 arena,
-                probe_high_water: 0,
+                probe_high_water: empty_high_water(settled_limit),
+                scheduled_levels: 0,
                 probe_schedule,
                 membership,
                 stale_membership: 0,
@@ -1554,7 +1933,8 @@ where
     /// Retries placement on every other batch target, shallowest first.
     /// Batches follow the live count, so after deletes the active pair can be
     /// one that earlier batches filled while other levels have room again.
-    /// Insert-only traces never fail their active pair, so they never get here.
+    /// A trace without deletes gets here only when a key's probes in its
+    /// active pair all land on occupied slots.
     fn choose_slot_on_other_targets(
         &self,
         probe: PreparedElasticProbe,
@@ -1577,81 +1957,177 @@ where
         probe: PreparedElasticProbe,
         target: BatchTarget,
     ) -> Option<ExactPlacement> {
-        if self.levels.is_empty() {
-            return None;
-        }
+        self.choose_slot_with(target, |level, budget| {
+            self.first_vacancy(probe, level, budget)
+        })
+    }
+
+    /// The paper's insertion case for `target`. `budget_of` turns the
+    /// case's probe bound for its level, `None` when the case sets none,
+    /// into the budget the caller searches with; resolving it per case
+    /// lets an unbounded case skip the comparison against a bound.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn placement_case(
+        &self,
+        target: BatchTarget,
+        budget_of: impl Fn(&Level<SlotEntry<K, V>>, Option<u64>) -> u64,
+    ) -> Option<PlacementCase<'_, K, V>> {
         // The paper's insertion cases, in order: Batch 0 fills level 0; then,
         // for the active pair, Case 2 (current nearly full) places in `next`,
         // Case 3 (next nearly full) in `current`, and Case 1 gives `current`
         // a bounded probe budget before falling back to `next`.
-        let (level, slot, paper_probe) = match target {
-            BatchTarget::Bootstrap => {
-                let (slot, paper_probe) = self.uniform_vacancy(probe, 0)?;
-                (0, slot, paper_probe)
-            }
+        Some(match target {
+            BatchTarget::Bootstrap => PlacementCase {
+                level: 0,
+                region: self.levels.first()?,
+                budget: budget_of(self.levels.first()?, None),
+                fallback: None,
+            },
             BatchTarget::LevelPair(current) => {
                 let next = current.checked_add(1)?;
-                let current_level = self.levels.get(current)?;
-                let next_level = self.levels.get(next)?;
-                let free_current = current_level.free_slots();
+                let [current_level, next_level] = self.levels.get(current..=next)? else {
+                    return None;
+                };
                 let free_next = next_level.free_slots();
-                let current_low = self.current_level_low(current_level);
+                let current_low = current_level.low();
                 let next_low = free_next.saturating_mul(4) <= next_level.capacity();
 
                 if current_low {
-                    let (slot, paper_probe) = self.uniform_vacancy(probe, next)?;
-                    (next, slot, paper_probe)
+                    PlacementCase {
+                        level: next,
+                        region: next_level,
+                        budget: budget_of(next_level, None),
+                        fallback: None,
+                    }
                 } else if next_low {
-                    let (slot, paper_probe) = self.uniform_vacancy(probe, current)?;
-                    (current, slot, paper_probe)
+                    PlacementCase {
+                        level: current,
+                        region: current_level,
+                        budget: budget_of(current_level, None),
+                        fallback: None,
+                    }
                 } else {
-                    let budget = probe::elastic_dyadic_probe_budget(
-                        free_current,
-                        current_level.capacity(),
+                    // Not low, so the level has a free slot.
+                    let budget = probe::elastic_level_probe_budget(
+                        current_level.capacity - current_level.len,
+                        current_level.capacity,
                         self.reserve_fraction.exponent(),
                         ELASTIC_PROBE_BUDGET_C,
-                    )
-                    .ok()?;
-                    let budget = u64::try_from(budget)
-                        .unwrap_or(u64::MAX)
-                        .min(LEVEL_PROBE_LIMIT[current]);
-                    if let Some((slot, probe)) = (0..budget).find_map(|logical_index| {
-                        self.vacancy(current, probe, logical_index)
-                            .map(|slot| (slot, logical_index + 1))
-                    }) {
-                        (current, slot, probe)
-                    } else {
-                        let (slot, paper_probe) = self.uniform_vacancy(probe, next)?;
-                        (next, slot, paper_probe)
+                    );
+                    PlacementCase {
+                        level: current,
+                        region: current_level,
+                        budget: budget_of(current_level, Some(budget)),
+                        fallback: Some(next),
                     }
                 }
             }
-        };
-        let paper_level = u32::try_from(level.checked_add(1)?).ok()?;
-        let phi = u128::from(probe::elastic_phi_bounded(paper_level, paper_probe)?);
-        if phi > QUERY_POSITION_CAP {
-            return None;
-        }
-        Some(ExactPlacement { level, slot, phi })
+        })
     }
 
-    /// Case 2's test: the active pair's current level has at most half its
-    /// reserve left, so new keys go to the next level.
-    #[inline]
-    fn current_level_low(&self, current_level: &Level<SlotEntry<K, V>>) -> bool {
-        current_level.free_slots()
-            <= self
-                .reserve_fraction
-                .floor_half_reserved(current_level.capacity())
-    }
-
-    fn uniform_vacancy(&self, probe: PreparedElasticProbe, level: usize) -> Option<(usize, u64)> {
-        for logical_index in 0..LEVEL_PROBE_LIMIT[level] {
-            if let Some(slot) = self.vacancy(level, probe, logical_index) {
-                return Some((slot, logical_index + 1));
+    /// Chooses `target`'s slot for a new key. `first_vacancy(level, budget)`
+    /// yields the first free slot among `level`'s first `budget` probes and
+    /// the one-based probe that reached it.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn choose_slot_with(
+        &self,
+        target: BatchTarget,
+        first_vacancy: impl Fn(usize, u64) -> Option<(usize, u64)>,
+    ) -> Option<ExactPlacement> {
+        let PlacementCase {
+            mut level,
+            mut budget,
+            mut fallback,
+            ..
+        } = self.placement_case(target, |_, budget| budget.unwrap_or(u64::MAX))?;
+        // One search site serves every case, so the search inlines once.
+        let (slot, paper_probe) = loop {
+            let limit = *LEVEL_PROBE_LIMIT.get(level)?;
+            if let Some(found) = first_vacancy(level, budget.min(limit)) {
+                break found;
             }
+            level = fallback.take()?;
+            budget = u64::MAX;
+        };
+        // Every vacancy search stops within `LEVEL_PROBE_LIMIT`, whose probes
+        // all sit at positions up to `QUERY_POSITION_CAP`.
+        Some(ExactPlacement {
+            level,
+            slot,
+            paper_probe,
+        })
+    }
+
+    /// The first free slot among `level`'s first `budget` probes, in probe
+    /// order, with the one-based probe that reached it.
+    fn first_vacancy(
+        &self,
+        probe: PreparedElasticProbe,
+        level: usize,
+        budget: u64,
+    ) -> Option<(usize, u64)> {
+        let region = self.levels.get(level)?;
+        if region.index_shift() == GENERAL_REDUCTION {
+            return self.first_vacancy_general(probe, level, budget);
+        }
+        // SAFETY: the level reduces by shift.
+        unsafe { self.first_shifted_vacancy(probe, level, region, budget) }
+            .map(|(slot, paper_probe, _)| (slot, paper_probe))
+    }
+
+    /// [`Self::first_vacancy`] for a level that reduces by shift.
+    ///
+    /// # Safety
+    ///
+    /// `region` must be this table's `level`, and must not be marked
+    /// [`GENERAL_REDUCTION`].
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    unsafe fn first_shifted_vacancy(
+        &self,
+        probe: PreparedElasticProbe,
+        level: usize,
+        region: &Level<SlotEntry<K, V>>,
+        budget: u64,
+    ) -> Option<(usize, u64, u8)> {
+        debug_assert!(core::ptr::eq(region, &raw const self.levels[level]));
+        let index_shift = region.index_shift();
+        debug_assert!(index_shift < u64::BITS);
+        // SAFETY: a shift other than `GENERAL_REDUCTION` is
+        // `probe::elastic_index_shift` of the capacity, below the word width.
+        unsafe { core::hint::assert_unchecked(index_shift < u64::BITS) };
+        let sequence = probe.sequence(self.fold_multiplier);
+        let (mut word, word_step) = sequence.run_words(region.sequence_run);
+        let mut remaining = budget;
+        while remaining != 0 {
+            let slot = probe::shifted_elastic_index(word, index_shift);
+            // SAFETY: the caller's shift maps the index into the level's
+            // capacity.
+            let control = unsafe { region.control_at(slot) };
+            if control::is_free(control) {
+                return Some((slot, budget - remaining + 1, control));
+            }
+            word = word.wrapping_add(word_step);
+            remaining -= 1;
         }
         None
+    }
+
+    /// [`Self::first_vacancy`] for a table whose levels need the general
+    /// range reduction.
+    #[inline(never)]
+    fn first_vacancy_general(
+        &self,
+        probe: PreparedElasticProbe,
+        level: usize,
+        budget: u64,
+    ) -> Option<(usize, u64)> {
+        (0..budget).find_map(|logical_index| {
+            self.vacancy(level, probe, logical_index)
+                .map(|slot| (slot, logical_index + 1))
+        })
     }
 
     fn vacancy(
@@ -1703,7 +2179,7 @@ where
         .map(|probe| probe.index)
     }
 
-    #[inline]
+    #[cfg(test)]
     fn find_slot_indices_prepared<Q>(
         &self,
         key: &Q,
@@ -1713,12 +2189,15 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.find_by_exact_schedule(key, prepared, key_fingerprint, |level, slot, _entry| {
-            (level, slot)
-        })
+        self.find_by_exact_schedule(
+            key,
+            prepared,
+            || key_fingerprint,
+            |level, slot, _entry| (level, slot),
+        )
     }
 
-    #[inline]
+    #[cfg(test)]
     fn find_entry_prepared<'a, Q>(
         &'a self,
         key: &Q,
@@ -1728,58 +2207,188 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        self.find_by_exact_schedule(key, prepared, key_fingerprint, |_level, _slot, entry| entry)
+        self.find_by_exact_schedule(
+            key,
+            prepared,
+            || key_fingerprint,
+            |_level, _slot, entry| entry,
+        )
     }
 
+    /// Looks the key up along its schedule. The fingerprint is taken only
+    /// for a key the filter passes, so a rejected key does not derive it.
+    #[inline]
     fn find_by_exact_schedule<'a, Q, R>(
         &'a self,
         key: &Q,
         prepared: PreparedElasticKey,
-        key_fingerprint: u8,
+        key_fingerprint: impl FnOnce() -> u8,
         mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
     ) -> Option<R>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        if self.len == 0 || self.levels.is_empty() {
+        // A key the filter never recorded was never inserted, so neither the
+        // candidates nor the exceptional full scan can hold it.
+        let filter = self.route_filter(prepared);
+        if !filter.maybe_present {
             return None;
         }
+        let route = prepared.route;
+        let key_fingerprint = key_fingerprint();
+        let walked =
+            self.walk_schedule(key, route, key_fingerprint, filter, |level, slot, entry| {
+                // SAFETY: the walk hands on an occupied slot of this table,
+                // which `&'a self` keeps from changing.
+                on_hit(level, slot, unsafe { &*entry })
+            });
+        match walked {
+            ScheduleSearch::Hit(hit) => Some(hit),
+            ScheduleSearch::Absent => None,
+            ScheduleSearch::Unresolved => self.find_by_general_schedule(
+                key,
+                route,
+                key_fingerprint,
+                filter.expanded_level_mask(route),
+                on_hit,
+            ),
+        }
+    }
+
+    /// Whether a walk that finds no key leaves it unresolved: a table that
+    /// needs the general reduction has routes that probe nothing, and one
+    /// that placed a key exceptionally holds it off the schedule.
+    #[inline]
+    fn walk_ends_unresolved(&self) -> bool {
+        self.probe_high_water & WALK_UNRESOLVED_FLAG != 0
+    }
+
+    /// Walks the candidates of a key that passed `filter` in schedule order
+    /// and hands `on_hit` the level, slot and entry that holds the key. A
+    /// table that needs the general reduction has routes that probe
+    /// nothing, so its walk ends unresolved.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn walk_schedule<Q, R>(
+        &self,
+        key: &Q,
+        prepared: PreparedElasticRoute,
+        key_fingerprint: u8,
+        filter: ElasticRouteFilter<'_>,
+        mut on_hit: impl FnMut(usize, usize, *mut SlotEntry<K, V>) -> R,
+    ) -> ScheduleSearch<R>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let sequence = prepared.probe.sequence(self.fold_multiplier);
+        let direct = self.probe_schedule.direct();
+        // SAFETY: the schedule starts with its direct route.
+        let route = unsafe { &*direct };
+        let h11_slot = probe::shifted_elastic_index(sequence.word(0), route.direct_index_shift());
+        // SAFETY: the route's shifted index maps into the control bytes it
+        // holds.
+        if unsafe { *route.control().add(h11_slot) } == key_fingerprint {
+            // SAFETY: only a level's own control bytes hold a fingerprint,
+            // and one marks an occupied slot.
+            let entry: *mut SlotEntry<K, V> =
+                unsafe { self.probe_schedule.entry(route.control(), h11_slot) };
+            // SAFETY: as above, the slot holds an entry.
+            if key.equivalent(unsafe { &(*entry).key }) {
+                return ScheduleSearch::Hit(on_hit(0, h11_slot, entry));
+            }
+        }
+
+        let mut open_levels = filter.expanded_level_mask(prepared) | SENTINEL_BIT;
+        let mut next = direct;
+        loop {
+            // SAFETY: the schedule ends with its sentinel, and the walk
+            // cannot pass it: the sentinel's level stays open until its own
+            // probe, which reads `EMPTY` and ends the walk below.
+            next = unsafe { next.add(1) };
+            // SAFETY: as above, `next` is at most the sentinel.
+            let route = unsafe { &*next };
+            if !route.is_open(open_levels) {
+                continue;
+            }
+            // The route holds a shift whichever reduction its level needs.
+            let slot = probe::shifted_elastic_index(
+                sequence.word(route.sequence_index()),
+                route.index_shift(),
+            );
+            // SAFETY: the route's shifted index maps into the control bytes
+            // it holds.
+            let control = unsafe { *route.control().add(slot) };
+            if control == key_fingerprint {
+                // SAFETY: the sentinel's control bytes match no fingerprint,
+                // so the route names a real level, and a fingerprint match
+                // means the slot is occupied.
+                let entry: *mut SlotEntry<K, V> =
+                    unsafe { self.probe_schedule.entry(route.control(), slot) };
+                // SAFETY: as above, the slot holds an entry.
+                if key.equivalent(unsafe { &(*entry).key }) {
+                    return ScheduleSearch::Hit(on_hit(route.level() as usize, slot, entry));
+                }
+            } else if control == CTRL_EMPTY {
+                // A key takes its level's first free probe, and a slot
+                // returns to `EMPTY` only when its whole level is reset: a
+                // removal leaves a tombstone, and so does a `clear` until its
+                // last entry is out, even one a panicking drop interrupts. So
+                // the key cannot sit at a later probe of this level.
+                open_levels = route.close(open_levels);
+                // Either no real level is left open, or this was the
+                // sentinel.
+                if open_levels <= SENTINEL_BIT {
+                    break;
+                }
+            }
+        }
+        if self.walk_ends_unresolved() {
+            ScheduleSearch::Unresolved
+        } else {
+            ScheduleSearch::Absent
+        }
+    }
+
+    /// The schedule walk from the first candidate, for a key that passed the
+    /// filter and that [`Self::walk_schedule`] left unresolved: the table
+    /// needs the general range reduction or placed an entry outside its
+    /// probe routes.
+    #[inline(never)]
+    fn find_by_general_schedule<'a, Q, R>(
+        &'a self,
+        key: &Q,
+        prepared: PreparedElasticRoute,
+        key_fingerprint: u8,
+        level_mask: u64,
+        mut on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
+    ) -> Option<R>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
         let Some(h11_slot) = Self::route_prepared_counter_for_upper(
-            prepared.route.probe,
+            prepared.probe,
             H11_COUNTER_BASE,
             self.levels[0].capacity(),
         ) else {
             return self.find_by_full_scan(key, key_fingerprint, on_hit);
         };
-        // The metadata load is issued while the level-zero control byte is still
-        // in flight: neither depends on the other.
-        let filter = self.route_filter(prepared);
         // SAFETY: the counter route maps into level zero's capacity.
         if let Some(entry) = unsafe { self.entry_if_match(0, h11_slot, key_fingerprint, key) } {
             return Some(on_hit(0, h11_slot, entry));
         }
-        // A key the filter never recorded was never inserted, so neither the
-        // remaining candidates nor the exceptional full scan can hold it.
-        if !filter.maybe_present {
-            return None;
-        }
 
-        let level_mask = filter.expanded_level_mask();
-        for route in &self.probe_schedule {
-            let level = route.level();
-            if level_mask & (1_u32 << level) == 0 {
+        for route in self.probe_schedule.routes() {
+            let level = route.level() as usize;
+            if level_mask & (1_u64 << level) == 0 {
                 continue;
             }
-            let upper = route.range_upper as usize;
-            let Some(slot) = Self::route_prepared_counter_for_upper(
-                prepared.route.probe,
-                route.counter_base,
-                upper,
-            ) else {
+            let Some(slot) =
+                self.route_prepared_counter(level, prepared.probe, route.counter_base())
+            else {
                 return self.find_by_full_scan(key, key_fingerprint, on_hit);
             };
-            // SAFETY: schedule routes name real levels and map below
-            // `range_upper`, which is within that level's capacity.
+            // SAFETY: schedule routes name real levels and the counter route
+            // maps into that level's capacity.
             if let Some(entry) = unsafe { self.entry_if_match(level, slot, key_fingerprint, key) } {
                 return Some(on_hit(level, slot, entry));
             }
@@ -1841,22 +2450,6 @@ where
     }
 }
 
-fn first_paper_probe_after(paper_level: u128, position: u128) -> u128 {
-    let mut lower = 1_u128;
-    let mut upper = u128::from(UNIFORM_SEARCH_CAP) + 1;
-    while lower < upper {
-        let middle = lower + (upper - lower) / 2;
-        let phi =
-            probe::elastic_phi(paper_level, middle).expect("bounded Elastic query coordinate");
-        if phi <= position {
-            lower = middle + 1;
-        } else {
-            upper = middle;
-        }
-    }
-    lower
-}
-
 #[cfg(test)]
 impl<K, V, S, A> ElasticTable<K, V, S, A>
 where
@@ -1880,8 +2473,10 @@ pub(crate) struct ElasticGeneration<K, V> {
     scheduler: BatchScheduler,
     arena: Arena,
     probe_high_water: u32,
-    probe_schedule: Vec<PhiRoute>,
+    scheduled_levels: u32,
+    probe_schedule: ProbeSchedule,
     membership: MembershipRegion,
+    metadata_words: *mut MetadataWord,
     stale_membership: usize,
 }
 
@@ -1904,8 +2499,10 @@ where
         mem::swap(&mut self.scheduler, &mut other.scheduler);
         mem::swap(&mut self.arena, &mut other.arena);
         mem::swap(&mut self.probe_high_water, &mut other.probe_high_water);
+        mem::swap(&mut self.scheduled_levels, &mut other.scheduled_levels);
         mem::swap(&mut self.probe_schedule, &mut other.probe_schedule);
         mem::swap(&mut self.membership, &mut other.membership);
+        mem::swap(&mut self.metadata_words, &mut other.metadata_words);
         mem::swap(&mut self.stale_membership, &mut other.stale_membership);
     }
 
@@ -1937,7 +2534,7 @@ where
                 let Some(current_level) = self.levels.get(current) else {
                     return;
                 };
-                if self.current_level_low(current_level) {
+                if current_level.low() {
                     current + 1
                 } else {
                     current

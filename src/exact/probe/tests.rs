@@ -89,19 +89,107 @@ fn prepared_power_of_two_reduction_is_bit_identical_to_generic_reduction() {
 }
 
 #[test]
+fn elastic_level_runs_never_share_or_wrap_a_sequence_index() {
+    let last_probe = ELASTIC_LOGICAL_LIMIT - 1;
+    let levels = u32::try_from(ELASTIC_LEVEL_LIMIT).unwrap();
+    assert_eq!(elastic_level_run(0).0, 0);
+    let mut steps = alloc::collections::BTreeSet::new();
+    for level in 0..levels {
+        let (first, step) = elastic_level_run(level as usize);
+        // The level sits in the bits no step reaches, so two levels' runs
+        // are disjoint, and a positive step keeps one level's probes apart.
+        assert_eq!(first % levels, level);
+        assert_eq!(step % levels, 0);
+        assert_eq!((step / levels) % 2, 1);
+        assert!(steps.insert(step), "two levels share a step");
+        assert!(u32::try_from(u64::from(first) + last_probe * u64::from(step)).is_ok());
+        for logical in [0, 1, 2, 63, 64, 4_095, 4_096, last_probe] {
+            let index = elastic_sequence_index(level, logical);
+            assert_eq!(elastic_sequence_coordinates(index), (level, logical));
+        }
+    }
+}
+
+#[test]
+fn elastic_level_words_step_through_the_levels_sequence_indices() {
+    let oracle = CounterPrf::new(FIXED_SEED);
+    for key in [0, 1, u64::MAX, FIXED_SEED, ELASTIC_FOLD_MULTIPLIER] {
+        let sequence = oracle
+            .prepare_elastic(key)
+            .sequence(ELASTIC_FOLD_MULTIPLIER);
+        for level in 0..u32::try_from(ELASTIC_LEVEL_LIMIT).unwrap() {
+            let (mut word, step) = sequence.run_words(elastic_level_run(level as usize));
+            for logical in 0..512 {
+                assert_eq!(
+                    word,
+                    sequence.word(elastic_sequence_index(level, logical)),
+                    "key {key:#x} level {level} probe {logical}"
+                );
+                assert_eq!(
+                    word,
+                    oracle.specified_word(key, u64::from(level), logical, 0)
+                );
+                word = word.wrapping_add(step);
+            }
+        }
+    }
+}
+
+/// Distinct slots among a key's first 64 probes of a level of 1024 slots.
+fn distinct_slots(oracle: CounterPrf, key: u64, level: u64) -> usize {
+    let prepared = oracle.prepare_elastic(key);
+    let domain = ProbeDomain::ElasticOrdinary { level };
+    (0..64)
+        .map(|logical| prepared.word(0, domain, logical, 0) >> (u64::BITS - 10))
+        .collect::<alloc::collections::BTreeSet<_>>()
+        .len()
+}
+
+#[test]
+fn all_zero_and_all_one_signatures_probe_many_slots() {
+    // The construction's seed leaves the signature equal to the hash, which
+    // an identity hasher makes the key.
+    let oracle = CounterPrf::new(0);
+    for key in [0, u64::MAX] {
+        for level in 0..ELASTIC_LEVEL_LIMIT {
+            assert!(
+                distinct_slots(oracle, key, level) >= 48,
+                "key {key:#x} level {level}"
+            );
+        }
+    }
+}
+
+#[test]
 fn elastic_counter_permutation_has_fixed_golden_vectors() {
     let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
     let cases = [
-        (0, 0, 0, 0, 0x0000_0000, 0xa672_f2f4_5fc9_0bed),
-        (1, 31, 8_191, 7, 0x001f_ffff, 0x728c_b5c3_2967_b861),
-        (u64::MAX, 17, 383, 7, 0x0011_0bff, 0x3472_0d88_ba17_9868),
+        (0, 0, 0, 0, 0x0000_0000, 0x03dc_8f3b_0012_13da),
+        (1, 31, 8_191, 7, 0x001f_ffff, 0x077e_7748_26d1_cae4),
+        (u64::MAX, 17, 383, 7, 0x0011_0bff, 0xd466_8029_2118_daf5),
         (
             0xd1b5_4a32_d192_ed03,
             7,
             7_687,
             0,
             0x0007_f038,
-            0x8778_e64f_a636_f5ca,
+            0xe8be_5676_db52_3aea,
+        ),
+        (
+            0xd1b5_4a32_d192_ed03,
+            0,
+            1,
+            0,
+            0x0000_0008,
+            0xf8b9_ef2e_58a2_6c67,
+        ),
+        (
+            0xd1b5_4a32_d192_ed03,
+            1,
+            0,
+            0,
+            0x0001_0000,
+            0xf987_7ac4_310b_9b4c,
         ),
     ];
     for (key, level, logical_probe, rejection, counter, word) in cases {
@@ -178,13 +266,18 @@ fn assert_awkward_ranges_have_no_large_skew(sample: impl Fn(u64, usize) -> usize
 fn elastic_fixed_seed_distribution_smoke() {
     let oracle = CounterPrf::new(FIXED_SEED);
     let word = |key, level| oracle.word(key, ProbeDomain::ElasticOrdinary { level }, 3, 0);
+    // Consecutive probes of a level are a multiple of the level count apart
+    // in the sequence, so their words share the lowest bits. A slot index is
+    // drawn from the top of the word; the high half is what must differ.
+    let high_half = |word: u64| word >> u32::BITS;
     let mut cross_probe_equal_bits = 0_u64;
     assert_fixed_seed_word_distribution(word, |key| {
         let next_probe = oracle.word(key, ProbeDomain::ElasticOrdinary { level: 7 }, 4, 0);
-        cross_probe_equal_bits += u64::from((!(word(key, 7) ^ next_probe)).count_ones());
+        let differing = high_half(word(key, 7) ^ next_probe).count_ones();
+        cross_probe_equal_bits += u64::from(u32::BITS - differing);
     });
     assert!(
-        (DISTRIBUTION_SAMPLES * 30..=DISTRIBUTION_SAMPLES * 34).contains(&cross_probe_equal_bits)
+        (DISTRIBUTION_SAMPLES * 15..=DISTRIBUTION_SAMPLES * 17).contains(&cross_probe_equal_bits)
     );
 }
 
@@ -669,4 +762,60 @@ fn certain_first_index_agrees_with_the_exact_draw_whenever_it_answers() {
         );
         assert_eq!(none, None);
     }
+}
+
+#[test]
+fn elastic_probe_budget_matches_the_ceiling_quotient_form() {
+    let by_quotient = |free: usize, level: usize, exponent: u32, c: usize| {
+        let ratio_ceiling = level.div_ceil(free);
+        let log_ceiling = (usize::BITS - (ratio_ceiling - 1).leading_zeros()) as usize;
+        c * (log_ceiling * log_ceiling).min(exponent as usize)
+    };
+    let check = |free: usize, level: usize| {
+        for exponent in [1, 3, 4, 64, u32::MAX] {
+            for c in [8_u32, 3] {
+                let expected = by_quotient(free, level, exponent, c as usize);
+                assert_eq!(
+                    elastic_dyadic_probe_budget(free, level, exponent, c as usize),
+                    Ok(expected),
+                    "free {free} of {level}"
+                );
+                if let (Ok(free), Ok(level)) = (u32::try_from(free), u32::try_from(level)) {
+                    assert_eq!(
+                        elastic_level_probe_budget(free, level, exponent, c),
+                        expected as u64,
+                        "free {free} of {level}"
+                    );
+                }
+            }
+        }
+    };
+    let exhaustive_levels: usize = if cfg!(miri) { 70 } else { 600 };
+    for level in 1..=exhaustive_levels {
+        for free in 1..=level {
+            check(free, level);
+        }
+    }
+    for shift in [15, 31, usize::BITS - 2, usize::BITS - 1] {
+        let power = 1_usize << shift;
+        // `u32::MAX` is the widest level the `u32` form takes.
+        for level in [power - 1, power, power + 1, u32::MAX as usize, usize::MAX] {
+            for free in [
+                1,
+                2,
+                3,
+                level / 3,
+                level / 2,
+                level / 2 + 1,
+                level - 1,
+                level,
+            ] {
+                check(free, level);
+            }
+        }
+    }
+
+    assert!(elastic_dyadic_probe_budget(0, 8, 3, 8).is_err());
+    assert!(elastic_dyadic_probe_budget(9, 8, 3, 8).is_err());
+    assert!(elastic_dyadic_probe_budget(1, 8, 3, 0).is_err());
 }
