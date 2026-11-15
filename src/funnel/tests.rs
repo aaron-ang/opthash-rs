@@ -1531,42 +1531,31 @@ fn large_reserve_exponent_sizes_without_scanning_every_slot_count() {
     assert!(crate::FunnelHashMap::<u64, u64>::try_with_capacity_and_reserve(1, reserve).is_err());
 }
 
-/// Only tables inside `SELECT_MIN_SLOTS..=SELECT_MAX_SLOTS` select between
-/// the first two recorded levels. This one lies past the band, so every
-/// lookup branches on each recorded level in turn.
-#[test]
-#[cfg_attr(miri, ignore = "fills a table past a million slots")]
-fn lookups_in_a_table_past_the_select_limit_find_every_key() {
-    let mut map: FunnelHashMap<u64, u64, test_support::FixedHashBuilder> =
-        test_support::Deterministic::with_capacity(SELECT_MAX_SLOTS);
-    assert!(map.table().shape.n > SELECT_MAX_SLOTS);
-    let keys = 0..map.capacity() as u64;
-    for key in keys.clone() {
-        assert_eq!(map.insert(key, !key), None);
-    }
-    for key in keys.clone() {
-        assert_eq!(map.get(&key), Some(&!key));
-    }
-    for absent in keys.end..keys.end + 100_000 {
-        assert_eq!(map.get(&absent), None);
-    }
-}
-
 /// Whatever the first-match lookup answers itself, the ordered walk answers
-/// the same; every other lookup is handed to that walk. Covers tables below
-/// and inside the select band, shared fingerprints, deletes, absent keys, and
-/// a bucket wider than one group.
+/// the same; every other lookup is handed to that walk. Covers table sizes on
+/// both sides of the select limit, shared fingerprints, deletes, absent keys,
+/// and a bucket wider than one group.
 #[test]
-#[cfg_attr(miri, ignore = "walks tens of thousands of lookups twice")]
+#[cfg_attr(miri, ignore = "walks hundreds of thousands of lookups twice")]
 fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
     const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
     const FINGERPRINT_LANE: u64 = 0x7F << 57;
-    let shapes = [(600, 3), (6_000, 3), (6_000, 4), (60_000, 9)];
-    for (at_least, d) in shapes {
-        let reserve = ReserveFraction::from_exponent(d).unwrap();
-        let n = (at_least..2 * at_least)
-            .find(|&n| FunnelShape::from_slots(n, reserve).is_ok())
-            .unwrap();
+    let feasible = |n: &usize, d: u32| {
+        FunnelShape::from_slots(*n, ReserveFraction::from_exponent(d).unwrap()).is_ok()
+    };
+    let mut shapes: Vec<(usize, u32)> = [(600, 3), (6_000, 3), (6_000, 4), (60_000, 9)]
+        .into_iter()
+        .map(|(at_least, d)| {
+            let n = (at_least..2 * at_least).find(|n| feasible(n, d));
+            (n.unwrap(), d)
+        })
+        .collect();
+    // The last table that selects between two levels and the first that
+    // branches on each.
+    let selecting = (1..=SELECT_MAX_SLOTS).rev().find(|n| feasible(n, 3));
+    let branching = (SELECT_MAX_SLOTS + 1..2 * SELECT_MAX_SLOTS).find(|n| feasible(n, 3));
+    shapes.extend([(selecting.unwrap(), 3), (branching.unwrap(), 3)]);
+    for (n, d) in shapes {
         for shared_fingerprint in [false, true] {
             let key_of = |index: u64| {
                 let key = index.wrapping_mul(SPREAD);
