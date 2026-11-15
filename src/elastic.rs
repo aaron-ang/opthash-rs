@@ -1435,7 +1435,12 @@ where
         slot_idx: usize,
         prev_ctrl: u8,
     ) {
-        let summary_bit = {
+        // SAFETY: the caller's contract.
+        let summary_bit = unsafe { (*level).summary_bit };
+        // Recorded before the level's stores, so the filter word the caller
+        // tested is not read again.
+        self.record_membership(prepared.route, prepared.membership, summary_bit);
+        {
             // SAFETY: the caller's contract; `&mut self` borrows the levels
             // alone.
             let level = unsafe { &mut *level };
@@ -1451,9 +1456,7 @@ where
             if prev_ctrl != CTRL_EMPTY {
                 level.tombstones -= 1;
             }
-            level.summary_bit
         };
-        self.record_membership(prepared.route, prepared.membership, summary_bit);
         self.len += 1;
     }
 
