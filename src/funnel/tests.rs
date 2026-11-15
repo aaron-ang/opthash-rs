@@ -700,12 +700,17 @@ fn run_differential(
 }
 
 fn spread_universe(len: u64) -> Vec<HashedKey> {
-    // Identity zero hashes to zero, whose first word a level rejects unless
-    // its bucket count is a power of two.
+    // The first key's word is rejected by a level unless its bucket count
+    // is a power of two.
+    let rejected = FunnelPrf::new(FUNNEL_PROBE_SEED).zero_word_hash();
     (0..len)
         .map(|id| HashedKey {
             id,
-            hash: id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            hash: if id == 0 {
+                rejected
+            } else {
+                id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            },
         })
         .collect()
 }
