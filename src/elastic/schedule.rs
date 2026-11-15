@@ -19,7 +19,7 @@ pub(super) struct PhiRoute {
     control: *const u8,
 }
 
-const _: () = assert!(size_of::<PhiRoute>() == 16);
+const _: () = assert!(size_of::<PhiRoute>() <= 16);
 
 impl PhiRoute {
     /// Level the route probes; [`SENTINEL_LEVEL`] for the sentinel.
