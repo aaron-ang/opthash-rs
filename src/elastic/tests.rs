@@ -361,6 +361,10 @@ fn query_schedule_holds_every_route_once_in_position_order() {
         .map(|route| {
             let (level, logical) = route.coordinates();
             assert_eq!(level, u32::from(route.level()));
+            // The route opens and closes its own level's bit and no other.
+            let bit = 1_u64 << level;
+            assert!(route.is_open(bit) && !route.is_open(!bit));
+            assert_eq!(route.close(u64::MAX), !bit);
             let region = &table.levels[level as usize];
             assert_eq!(
                 route.control() == region.ctrl_ptr.cast_const(),
@@ -793,19 +797,15 @@ fn route_summary_saturates_deep_levels_into_the_last_bit() {
 
     // Expansion is the inverse view: the saturating bit covers every level
     // index at or past it, and a clear bit widens to nothing.
-    let filter = |level_mask| ElasticRouteFilter {
-        maybe_present: true,
-        level_mask,
-    };
-    assert_eq!(filter(0).expanded_level_mask(), 0);
-    assert_eq!(filter(0b101).expanded_level_mask(), 0b101);
+    assert_eq!(expand_level_mask(0), 0);
+    assert_eq!(expand_level_mask(0b101), 0b101);
     assert_eq!(
-        filter(1 << (ROUTE_SUMMARY_LEVELS - 1)).expanded_level_mask(),
-        u32::MAX << (ROUTE_SUMMARY_LEVELS - 1)
+        expand_level_mask(1 << (ROUTE_SUMMARY_LEVELS - 1)),
+        u64::MAX << (ROUTE_SUMMARY_LEVELS - 1)
     );
     let level_limit = usize::try_from(probe::ELASTIC_LEVEL_LIMIT).unwrap();
     for level in 0..level_limit {
-        let recorded = filter(1 << summary_level(level)).expanded_level_mask();
+        let recorded = expand_level_mask(1 << summary_level(level));
         assert_ne!(recorded & (1 << level), 0, "level {level} lost its bit");
     }
 }
@@ -827,8 +827,11 @@ fn route_summary_still_narrows_shallow_levels_on_wide_geometries() {
     }
     for key in 0..key_count {
         let prepared = PreparedElasticKey::new(key);
-        let mask = map.table().route_filter(prepared).level_mask;
-        assert!(mask != 0 && u16::try_from(mask).is_ok(), "mask {mask:#x}");
+        let mask = map
+            .table()
+            .route_filter(prepared)
+            .level_mask(prepared.route);
+        assert!(mask != 0, "key {key} has no level recorded");
         assert!(
             mask.count_ones() < u32::try_from(ROUTE_SUMMARY_LEVELS).unwrap(),
             "key {key} mask {mask:#x} must exclude at least one level"
@@ -920,7 +923,10 @@ fn route_summary_conservatively_records_every_live_level() {
         let level_index = level_index.unwrap();
         let prepared = PreparedElasticKey::new(key);
         assert_ne!(
-            map.table().route_filter(prepared).level_mask & (1_u32 << summary_level(level_index)),
+            map.table()
+                .route_filter(prepared)
+                .level_mask(prepared.route)
+                & (1 << summary_level(level_index)),
             0,
             "key {key} at level {level_index}"
         );
@@ -1742,7 +1748,7 @@ fn a_table_without_metadata_words_rejects_every_lookup() {
         let prepared = PreparedElasticKey::new(map.table().hash_builder.hash_one(key));
         let filter = map.table().route_filter(prepared);
         assert!(!filter.maybe_present);
-        assert_eq!(filter.level_mask, 0);
+        assert_eq!(filter.level_mask(prepared.route), 0);
         assert_eq!(map.get(&key), None);
         assert!(!map.contains_key(&key));
         assert_eq!(map.remove(&key), None);
@@ -1922,9 +1928,9 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
             if filter.maybe_present {
                 let walked = table.find_by_general_schedule(
                     &key,
-                    prepared,
+                    prepared.route,
                     fingerprint,
-                    filter.expanded_level_mask(),
+                    filter.expanded_level_mask(prepared.route),
                     |level, slot, _| (level, slot),
                 );
                 assert_eq!(scheduled, walked);
@@ -2076,6 +2082,21 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
     type Table = ElasticTable<u64, u64, FixedHashBuilder>;
     fn check(table: &Table) -> bool {
         assert!(table.probe_schedule.addresses(&table.levels));
+        for level in &table.levels {
+            for slot in [0, level.capacity() - 1] {
+                // SAFETY: the control bytes are this table's and the slot is
+                // in bounds; neither pointer is read.
+                let (scheduled, direct) = unsafe {
+                    (
+                        table
+                            .probe_schedule
+                            .entry::<SlotEntry<u64, u64>>(level.ctrl_ptr, slot),
+                        level.slot_ptr(slot),
+                    )
+                };
+                assert_eq!(scheduled, direct);
+            }
+        }
         table.levels[0].index_shift() == GENERAL_REDUCTION
     }
     let mut general_tables = 0;
@@ -2104,8 +2125,8 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
         let cloned = map::TableBackend::clone_table(&table);
         let general = check(&cloned);
         seen.push(general);
-        // Only routes that probe nothing fit another table's levels.
-        assert_eq!(cloned.probe_schedule.addresses(&table.levels), general);
+        // A clone's schedule addresses its own levels, not its source's.
+        assert!(!cloned.probe_schedule.addresses(&table.levels));
         for key in 0..keys + 64 {
             let hash = table.hash_builder.hash_one(key);
             assert_eq!(cloned.find(&key, hash).is_some(), key < keys);
