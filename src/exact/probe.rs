@@ -72,6 +72,9 @@ pub(crate) struct FunnelPrf {
     /// The seed plus [`DOMAIN_KIND_LANE`], so preparing a probe is one add
     /// ahead of the mix.
     lane_seed: u64,
+    /// [`MIX`], held beside the seed so a probe loads the multipliers instead
+    /// of building each from immediates.
+    mix: [u64; 2],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +155,7 @@ impl FunnelPrf {
     pub(crate) const fn new(seed: u64) -> Self {
         Self {
             lane_seed: seed.wrapping_add(DOMAIN_KIND_LANE),
+            mix: MIX,
         }
     }
 
@@ -160,6 +164,7 @@ impl FunnelPrf {
     pub(crate) const fn reseeded(self, step: u64) -> Self {
         Self {
             lane_seed: self.lane_seed.wrapping_add(step),
+            mix: self.mix,
         }
     }
 
@@ -168,7 +173,7 @@ impl FunnelPrf {
         let keyed = key_hash.wrapping_add(self.lane_seed);
         PreparedFastFunnelProbe {
             keyed,
-            key_out: mix64(keyed),
+            key_out: mix64_with(keyed, self.mix),
         }
     }
 
@@ -923,9 +928,17 @@ pub(crate) const fn elastic_dyadic_probe_budget(
     Ok(budget)
 }
 
-const fn mix64(mut value: u64) -> u64 {
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+/// The two multipliers of [`mix64`].
+const MIX: [u64; 2] = [0xbf58_476d_1ce4_e5b9, 0x94d0_49bb_1331_11eb];
+
+const fn mix64(value: u64) -> u64 {
+    mix64_with(value, MIX)
+}
+
+#[inline]
+const fn mix64_with(mut value: u64, mix: [u64; 2]) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(mix[0]);
+    value = (value ^ (value >> 27)).wrapping_mul(mix[1]);
     value ^ (value >> 31)
 }
 
