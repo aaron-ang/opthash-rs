@@ -2113,8 +2113,11 @@ where
     /// Counts one delete. `true` once the counters need settling.
     #[inline]
     fn count_delete(&mut self) -> bool {
-        self.settle_left = self.settle_left.wrapping_sub(1);
-        self.settle_left.cast_signed() <= 0
+        // Never below zero: every caller settles at zero, which leaves at
+        // least one.
+        debug_assert_ne!(self.settle_left, 0);
+        self.settle_left -= 1;
+        self.settle_left == 0
     }
 
     /// Sets the entry count, and with it [`Self::head_left`]. Also restores
