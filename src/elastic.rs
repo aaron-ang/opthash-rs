@@ -243,8 +243,8 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     fold_multiplier: u64,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
-    /// First word of the metadata tail, so the gate's address needs one load.
-    /// Dangling while `membership` has no words.
+    /// First word of the metadata tail, so the gate's address needs one load;
+    /// [`NO_METADATA`] while `membership` has no words.
     metadata_words: *mut MetadataWord,
     /// Deletes since the filter last matched the live set; see
     /// [`membership::refresh_deletes`].
@@ -852,8 +852,19 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     }
 }
 
-/// First metadata word of `membership`'s tail inside `arena`.
+/// The word a table without a metadata tail reads: it records no key, so
+/// the filter rejects every lookup without testing for the missing tail.
+static NO_METADATA: MetadataWord = MetadataWord {
+    level_bins: [0; 4],
+    membership: 0,
+};
+
+/// First metadata word of `membership`'s tail inside `arena`, or
+/// [`NO_METADATA`] when it has none. Only a tail with words is written to.
 fn metadata_words(arena: &Arena, membership: MembershipRegion) -> *mut MetadataWord {
+    if membership.words == 0 {
+        return (&raw const NO_METADATA).cast_mut();
+    }
     // SAFETY: `membership` was laid out together with `arena`.
     unsafe { membership.ptr::<MetadataWord>(arena.as_ptr()) }
 }
@@ -968,19 +979,16 @@ where
     /// copying the whole metadata word for dynamic bin extraction.
     #[inline]
     fn route_filter(&self, prepared: PreparedElasticKey) -> ElasticRouteFilter {
-        let words = self.membership.words;
-        if words == 0 {
-            return ElasticRouteFilter {
-                maybe_present: false,
-                level_mask: 0,
-            };
-        }
-        let word = MembershipKey::word(prepared.route.signature(), words);
+        // Zero words reduce every signature to word zero, which is then
+        // `NO_METADATA`: no bit is set there, so the filter rejects the key.
+        let word = MembershipKey::word(prepared.route.signature(), self.membership.words);
         let summary_bin = prepared.route.summary_bin();
         let bits = prepared.membership.bits();
-        // SAFETY: `word` is a multiply-high reduction below `words`, and the
-        // cached region covers exactly that many initialized, properly aligned
-        // `MetadataWord`s.
+        debug_assert!(bits != 0);
+        // SAFETY: `word` is a multiply-high reduction below the word count,
+        // and the cached region covers exactly that many initialized,
+        // properly aligned `MetadataWord`s; with no words it is zero and
+        // `metadata_words` addresses the one word of `NO_METADATA`.
         let (membership, route_bin) = unsafe {
             let metadata = self.membership_ptr().add(word);
             ((*metadata).membership, (*metadata).level_bins[summary_bin])

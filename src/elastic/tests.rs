@@ -1638,6 +1638,27 @@ fn scheduled_logical_probes<K, V, S, A: Allocator + Clone>(
 }
 
 #[test]
+fn a_table_without_metadata_words_rejects_every_lookup() {
+    let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(0);
+    assert_eq!(map.table().membership.words, 0);
+    for key in 0..1_000_u64 {
+        let prepared = PreparedElasticKey::new(map.table().hash_builder.hash_one(key));
+        let filter = map.table().route_filter(prepared);
+        assert!(!filter.maybe_present);
+        assert_eq!(filter.level_mask, 0);
+        assert_eq!(map.get(&key), None);
+        assert!(!map.contains_key(&key));
+        assert_eq!(map.remove(&key), None);
+    }
+
+    // The first insert grows into a table with words of its own.
+    assert_eq!(map.insert(7, 70), None);
+    assert_ne!(map.table().membership.words, 0);
+    assert_eq!(map.get(&7), Some(&70));
+    assert_eq!(map.get(&8), None);
+}
+
+#[test]
 fn first_entry_in_a_deeper_level_reschedules_through_that_level() {
     const KEYS: u64 = 3_000;
     let mut map: FixedElasticHashMap<u64, u64> =
