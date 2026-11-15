@@ -153,6 +153,8 @@ impl<'a> Iterator for RecordedHead<'a> {
         debug_assert!((distance as usize) < OVERFLOW_LEVEL);
         // SAFETY: a pending bit stands for a level below `OVERFLOW_LEVEL`,
         // whose entry the head holds, at the bit's distance from `entry`.
+        // The distances stepped so far add up to the index of the level last
+        // yielded, so the steps never leave the head.
         self.entry = unsafe { self.entry.add(distance as usize) };
         // The yielded level's bit moves to the top and is cleared, so the
         // rest keep their distances from its entry.
