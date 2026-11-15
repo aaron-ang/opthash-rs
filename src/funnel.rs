@@ -1611,8 +1611,8 @@ where
         }
     }
 
-    /// Loads this key's filter word without testing it, so a lookup can run the
-    /// probe's mix chain while the load is in flight.
+    /// Loads this key's filter word without testing it, so a lookup can
+    /// prepare the probe while the load is in flight.
     #[inline]
     fn membership_gate(&self, key_hash: u64) -> MembershipGate {
         self.membership_gate_at(self.membership_slot(key_hash))

@@ -177,7 +177,7 @@ impl FunnelPrf {
         }
     }
 
-    /// Odd multiplier that turns a key's mixed word into its first random
+    /// Odd multiplier that turns a key's folded word into its first random
     /// word in ordinary level `level`.
     pub(crate) const fn ordinary_multiplier(level: u64) -> Option<u64> {
         match Self::ordinary_counter_base(level) {
@@ -565,7 +565,7 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
 /// word is accepted. The bucket is below the range's upper bound either way;
 /// a rejected word needs [`ordinary_funnel_retry_index`].
 ///
-/// The first word of an ordinary level is the mixed key times that level's
+/// The first word of an ordinary level is the folded key times that level's
 /// multiplier, not a counter word: `key_out` already folds every bit of the
 /// key, and a distinct odd multiplier per level decorrelates the levels with
 /// one multiply.
