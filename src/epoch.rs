@@ -65,6 +65,15 @@ impl EpochState {
         self.lifecycle |= HAD_DELETE_MASK;
     }
 
+    /// [`Self::note_delete`] for `count` deletes at once.
+    #[inline]
+    pub(crate) fn note_deletes(&mut self, count: usize) {
+        if count != 0 {
+            self.deletions = self.deletions.saturating_add(count);
+            self.lifecycle |= HAD_DELETE_MASK;
+        }
+    }
+
     pub(crate) fn start(&mut self, transition: EpochTransition) {
         let generation = self.generation().saturating_add(1);
         self.lifecycle = (self.lifecycle & RECOVERY_MASK)
