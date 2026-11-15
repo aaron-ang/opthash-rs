@@ -3,7 +3,7 @@ use std::hash::{BuildHasher, Hasher};
 use opthash::{EpochTransition, ReserveFraction};
 
 mod support;
-use support::{Deterministic, ElasticHashMap, ElasticHashSet, FunnelHashMap};
+use support::{Deterministic, ElasticHashMap, ElasticHashSet, FunnelHashMap, FunnelHashSet};
 
 #[derive(Clone, Copy, Default)]
 struct ConstantBuildHasher;
@@ -205,6 +205,69 @@ fn funnel_leaves_a_due_tombstone_cleanup_to_the_next_absent_insert() {
     assert_eq!(map.len(), 2);
     assert_eq!(map.get(&kept), Some(&0));
     assert_eq!(map.get(&capacity), Some(&capacity));
+}
+
+/// Drains a full map to one key, which leaves a tombstone cleanup due, runs
+/// `$insert` to add one absent key, and asserts that insert ran the cleanup.
+macro_rules! assert_absent_insert_runs_a_due_cleanup {
+    ($map:expr, |$m:ident, $key:ident| $insert:expr) => {{
+        let mut map = $map;
+        let capacity = fill_to_capacity!(map);
+        let before = map.epoch();
+        let kept = capacity - 1;
+        for key in 0..kept {
+            assert!(map.remove(&key).is_some());
+        }
+        assert_eq!(map.epoch().generation, before.generation);
+
+        {
+            let $m = &mut map;
+            let $key = capacity;
+            $insert;
+        }
+        let after = map.epoch();
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
+        assert_eq!(map.capacity(), capacity);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key(&kept));
+        assert!(map.contains_key(&capacity));
+    }};
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn funnel_runs_a_due_tombstone_cleanup_on_every_absent_insert_path() {
+    assert_absent_insert_runs_a_due_cleanup!(
+        FunnelHashMap::<usize, usize>::with_capacity(512),
+        |map, key| {
+            assert_eq!(*map.entry(key).or_insert(key), key);
+        }
+    );
+    assert_absent_insert_runs_a_due_cleanup!(
+        FunnelHashMap::<usize, usize>::with_capacity(512),
+        |map, key| {
+            assert_eq!(map.try_insert(key, key).ok(), Some(&mut { key }));
+        }
+    );
+
+    let mut set = FunnelHashSet::<usize>::with_capacity(512);
+    let capacity = set.capacity();
+    for key in 0..capacity {
+        assert!(set.insert(key));
+    }
+    let before = set.epoch();
+    let kept = capacity - 1;
+    for key in 0..kept {
+        assert!(set.remove(&key));
+    }
+    assert_eq!(set.epoch().generation, before.generation);
+    assert_eq!(*set.get_or_insert(capacity), capacity);
+    let after = set.epoch();
+    assert_eq!(after.generation, before.generation + 1);
+    assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
+    assert_eq!(set.len(), 2);
+    assert!(set.contains(&kept) && set.contains(&capacity));
 }
 
 /// Removed keys stay counted as distinct insertions of their epoch, and a

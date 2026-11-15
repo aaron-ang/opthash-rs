@@ -205,6 +205,10 @@ fn smallest_wide_shape() -> (u32, FunnelShape) {
 }
 
 fn raw_table(n: usize, d: u32) -> FunnelTable<u64, u64, IdentityBuildHasher> {
+    raw_table_of(n, d)
+}
+
+fn raw_table_of<V>(n: usize, d: u32) -> FunnelTable<u64, V, IdentityBuildHasher> {
     let reserve = ReserveFraction::from_exponent(d).unwrap();
     FunnelTable::try_from_shape(
         FunnelShape::from_slots(n, reserve).unwrap(),
@@ -298,7 +302,7 @@ fn refresh_membership_rebuilds_the_recorded_filter() {
 }
 
 /// Every word of `table`'s filter tail, level bins and membership alike.
-fn filter_tail(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> Vec<u64> {
+fn filter_tail<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> Vec<u64> {
     let words = table.membership.region.words;
     // SAFETY: the tail holds `words` words of level bins below its base and
     // as many membership words from it on, all initialized.
@@ -306,7 +310,7 @@ fn filter_tail(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> Vec<u64> {
 }
 
 /// Every control byte and filter word of `table`.
-fn controls_and_filter(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> (Vec<u8>, Vec<u64>) {
+fn controls_and_filter<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> (Vec<u8>, Vec<u64>) {
     // SAFETY: `slot < slots`, the storage capacity.
     let controls = (0..table.shape.slots)
         .map(|slot| unsafe { table.storage.control_at(slot) })
@@ -376,7 +380,6 @@ fn frameless_insert_places_and_records_like_the_placement_walk() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn rebuild_places_and_records_like_the_placement_walk() {
-    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
     let (wide, wide_shape) = smallest_wide_shape();
     for (n, d) in [
         (344, 4),
@@ -385,53 +388,97 @@ fn rebuild_places_and_records_like_the_placement_walk() {
         (wide_shape.n, wide),
         (21_856, 10),
     ] {
-        let mut rebuilt = raw_table(n, d);
-        let budget = rebuilt.shape.max_insertions as u64;
-        let key_of = |index: u64| {
-            let key = index.wrapping_mul(SPREAD);
-            (key ^ (key >> 32)).wrapping_mul(SPREAD)
-        };
-        for index in 0..budget {
-            let key = key_of(index);
-            assert_eq!(
-                map::TableBackend::insert(&mut rebuilt, key, index, key),
-                None
-            );
-        }
-        // Tombstones, so the rebuild has slots to reclaim.
-        for index in (0..budget).step_by(3) {
-            let key = key_of(index);
-            let slot = rebuilt.find_location(&key, key).unwrap();
-            map::TableBackend::remove(&mut rebuilt, slot);
-        }
-        let mut survivors = Vec::new();
-        let mut scan = OccupiedIndices::new();
-        while let Some(slot) = scan.step(&rebuilt.storage) {
-            // SAFETY: `step` yields occupied in-bounds slots.
-            let entry = unsafe { rebuilt.storage.get_ref(slot) };
-            survivors.push((entry.key, entry.value));
-        }
-        rebuilt.resize_with_transition(n, EpochTransition::ExplicitResize);
-
-        let mut walked = raw_table(n, d);
-        for &(key, value) in &survivors {
-            walked.insert_for_vacant_entry(key, value, key);
-        }
-        assert_eq!(rebuilt.entries(), survivors.len(), "n {n} d {d}");
-        assert_eq!(rebuilt.head_left, walked.head_left, "n {n} d {d}");
-        assert_eq!(rebuilt.tombstones(), 0);
-        assert_eq!(
-            controls_and_filter(&rebuilt),
-            controls_and_filter(&walked),
-            "n {n} d {d}"
-        );
-        for &(key, value) in &survivors {
-            assert_eq!(
-                map::TableBackend::find_entry(&rebuilt, &key, key).map(|entry| entry.value),
-                Some(value)
-            );
-        }
+        let rebuilt = assert_rebuild_matches_placement_walk(n, d, |index| index);
+        assert!(!rebuild_prefetches(&rebuilt), "n {n} d {d}");
     }
+}
+
+/// [`rebuild_places_and_records_like_the_placement_walk`] over a table large
+/// enough for the rebuild to hash ahead of its placements. Wide values reach
+/// that size in few slots.
+#[test]
+fn prefetching_rebuild_places_and_records_like_the_placement_walk() {
+    const BUDGET: usize = 300;
+    type WideValue = [u64; 2047];
+    let narrow = ReserveFraction::from_exponent(3).unwrap();
+    let n = FunnelShape::for_insert_budget(BUDGET, narrow).unwrap().n;
+    let rebuilt =
+        assert_rebuild_matches_placement_walk(n, 3, |index| -> WideValue { [index; 2047] });
+    assert!(rebuilt.shape.beta <= GROUP_SIZE, "no head placement");
+    assert!(rebuild_prefetches(&rebuilt));
+
+    if cfg!(miri) {
+        return;
+    }
+    let (wide, _) = smallest_wide_shape();
+    let reserve = ReserveFraction::from_exponent(wide).unwrap();
+    let n = FunnelShape::for_insert_budget(BUDGET, reserve).unwrap().n;
+    let rebuilt =
+        assert_rebuild_matches_placement_walk(n, wide, |index| -> WideValue { [index; 2047] });
+    assert!(rebuilt.shape.beta > GROUP_SIZE);
+    assert!(rebuild_prefetches(&rebuilt));
+}
+
+/// Whether a rebuild out of `table` hashes ahead of its placements.
+fn rebuild_prefetches<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> bool {
+    table.shape.slots * size_of::<SlotEntry<u64, V>>() >= rebuild::PREFETCH_MIN_BYTES
+}
+
+/// Fills a table of `n` slots, tombstones a third of it, rebuilds it at the
+/// same size and compares it with a table the survivors were inserted into
+/// through the placement walk. Returns the rebuilt table.
+fn assert_rebuild_matches_placement_walk<V>(
+    n: usize,
+    d: u32,
+    value_of: impl Fn(u64) -> V,
+) -> FunnelTable<u64, V, IdentityBuildHasher>
+where
+    V: Copy + PartialEq + core::fmt::Debug,
+{
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut rebuilt = raw_table_of::<V>(n, d);
+    let budget = rebuilt.shape.max_insertions as u64;
+    let key_of = |index: u64| {
+        let key = index.wrapping_mul(SPREAD);
+        (key ^ (key >> 32)).wrapping_mul(SPREAD)
+    };
+    for index in 0..budget {
+        let key = key_of(index);
+        assert!(map::TableBackend::insert(&mut rebuilt, key, value_of(index), key).is_none());
+    }
+    // Tombstones, so the rebuild has slots to reclaim.
+    for index in (0..budget).step_by(3) {
+        let key = key_of(index);
+        let slot = rebuilt.find_location(&key, key).unwrap();
+        map::TableBackend::remove(&mut rebuilt, slot);
+    }
+    let mut survivors = Vec::new();
+    let mut scan = OccupiedIndices::new();
+    while let Some(slot) = scan.step(&rebuilt.storage) {
+        // SAFETY: `step` yields occupied in-bounds slots.
+        let entry = unsafe { rebuilt.storage.get_ref(slot) };
+        survivors.push((entry.key, entry.value));
+    }
+    rebuilt.resize_with_transition(n, EpochTransition::ExplicitResize);
+
+    let mut walked = raw_table_of::<V>(n, d);
+    for &(key, value) in &survivors {
+        walked.insert_for_vacant_entry(key, value, key);
+    }
+    assert_eq!(rebuilt.entries(), survivors.len(), "n {n} d {d}");
+    assert_eq!(rebuilt.head_left, walked.head_left, "n {n} d {d}");
+    assert_eq!(rebuilt.tombstones(), 0);
+    assert!(
+        controls_and_filter(&rebuilt) == controls_and_filter(&walked),
+        "n {n} d {d}"
+    );
+    for &(key, value) in &survivors {
+        assert_eq!(
+            map::TableBackend::find_entry(&rebuilt, &key, key).map(|entry| entry.value),
+            Some(value)
+        );
+    }
+    rebuilt
 }
 
 /// With tombstones the frameless insert stands aside: the placement walk
