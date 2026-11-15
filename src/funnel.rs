@@ -78,6 +78,13 @@ struct FunnelShape {
     fallback_offset: usize,
     fallback_bucket_width: usize,
     fallback_bucket_range: PreparedProbeRange,
+    /// Mask over one bucket's lanes of a group's fingerprint matches. Zero
+    /// when a bucket is wider than one group, or the shape is empty: such a
+    /// table answers no lookup from first matches.
+    bucket_lanes: u64,
+    /// Whether lookups select between the first two recorded levels; see
+    /// [`SELECT_MAX_SLOTS`].
+    selects: bool,
 }
 
 impl FunnelShape {
@@ -93,6 +100,8 @@ impl FunnelShape {
             fallback_offset: 0,
             fallback_bucket_width: 0,
             fallback_bucket_range: PreparedProbeRange::empty(),
+            bucket_lanes: 0,
+            selects: false,
         }
     }
 
@@ -167,6 +176,8 @@ impl FunnelShape {
             fallback_bucket_width: plan.fallback_bucket_width(),
             fallback_bucket_range: PreparedProbeRange::new(plan.fallback_bucket_count())
                 .map_err(|_| TryReserveError::CapacityOverflow)?,
+            bucket_lanes: bucket_lanes(plan.beta()),
+            selects: n <= SELECT_MAX_SLOTS,
         })
     }
 
@@ -206,6 +217,16 @@ impl FunnelShape {
             n = n.checked_add(1).ok_or(TryReserveError::CapacityOverflow)?;
         }
     }
+}
+
+/// See [`FunnelShape::bucket_lanes`].
+fn bucket_lanes(beta: usize) -> u64 {
+    if beta == 0 || beta > GROUP_SIZE {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let lane_bits = beta as u32 * BITMASK_STRIDE;
+    u64::MAX >> (u64::BITS - lane_bits)
 }
 
 pub(crate) struct FlatStorage<T> {
@@ -1108,12 +1129,10 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        // An empty shape has no lanes to mask and never reaches a lookup.
-        if self.shape.beta.wrapping_sub(1) >= GROUP_SIZE {
+        let lanes = self.shape.bucket_lanes;
+        if lanes == 0 {
             return Err(());
         }
-        #[allow(clippy::cast_possible_truncation)]
-        let lanes = u64::MAX >> (u64::BITS - self.shape.beta as u32 * BITMASK_STRIDE);
         let probe = FunnelPrf::new(self.probe_seed).prepare(key_hash);
         // Fingerprint matches of the key's bucket in one level, with the
         // bucket's first slot.
@@ -1141,7 +1160,7 @@ where
             }
         };
         let mut ordinary = levels & !OVERFLOW_LEVEL_BIT;
-        if ordinary != 0 && self.shape.n <= SELECT_MAX_SLOTS {
+        if ordinary != 0 && self.shape.selects {
             // The first two recorded levels are scanned together and the
             // holder is selected, not branched on: which of them holds the key
             // is unpredictable.
