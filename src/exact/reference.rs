@@ -286,6 +286,23 @@ impl<O: ProbeOracle> ScalarElastic<O> {
         panic!("scalar Elastic query failed to find its promised identity")
     }
 
+    /// Frees the slot holding `identity`.
+    pub(crate) fn remove(&mut self, identity: u64) {
+        let global_slot = self
+            .slots
+            .iter()
+            .position(|&slot| slot == Some(identity))
+            .expect("scalar Elastic removal of an absent identity");
+        let level = self
+            .offsets
+            .iter()
+            .rposition(|&offset| offset <= global_slot)
+            .expect("level zero starts at slot zero");
+        self.slots[global_slot] = None;
+        self.occupancy[level] -= 1;
+        self.len -= 1;
+    }
+
     pub(crate) fn level_occupancy(&self) -> &[usize] {
         &self.occupancy
     }

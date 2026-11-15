@@ -301,7 +301,9 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
 
 // SAFETY: the table uniquely owns its arena and every entry in it, like
 // `Box<[SlotEntry<K, V>]>`. Its raw pointers address that arena, except the
-// schedule's sentinel route, which addresses an immutable static.
+// schedule's sentinel route, which addresses an immutable static, and the
+// schedule's entry origin, which is an address to offset from and is never
+// read: it lies outside the arena, and is null without levels.
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
     for ElasticTable<K, V, S, A>
 {
@@ -634,8 +636,8 @@ pub(crate) struct BatchScheduler {
     /// `batch_ends[current_batch_index]`, or `usize::MAX` for an empty plan.
     batch_end: usize,
     /// Live count below which [`ElasticTable::settled_slot`] can place: the
-    /// table's insertion limit, or zero when its levels do not all reduce by
-    /// shift.
+    /// table's insertion limit, or zero where [`settled_limit()`] rules a
+    /// settled insert out.
     settled_limit: usize,
     /// Live counts from `batch_start` that are inside the cached batch and
     /// below `settled_limit`.
@@ -1186,8 +1188,9 @@ where
         // filter built beside it: zero without a level zero, with a batch
         // whose level pair reaches past the levels, or without a filter
         // word. The cached batch is one of the scheduler's own, so its
-        // target's levels exist. A clone copies all three, and a rebuild
-        // swaps all three together.
+        // target's levels exist. A clone takes the scheduler and builds
+        // levels and a filter of the same capacities, and a rebuild swaps
+        // all three together.
         unsafe {
             core::hint::assert_unchecked(deepest < self.levels.len());
             core::hint::assert_unchecked(self.membership.words != 0);

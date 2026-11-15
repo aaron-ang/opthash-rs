@@ -773,17 +773,20 @@ fn elastic_probe_budget_matches_the_ceiling_quotient_form() {
     };
     let check = |free: usize, level: usize| {
         for exponent in [1, 3, 4, 64, u32::MAX] {
-            assert_eq!(
-                elastic_dyadic_probe_budget(free, level, exponent, 8),
-                Ok(by_quotient(free, level, exponent, 8)),
-                "free {free} of {level}"
-            );
-            if let (Ok(free), Ok(level)) = (u32::try_from(free), u32::try_from(level)) {
+            for c in [8_u32, 3] {
+                let expected = by_quotient(free, level, exponent, c as usize);
                 assert_eq!(
-                    elastic_level_probe_budget(free, level, exponent, 8),
-                    by_quotient(free as usize, level as usize, exponent, 8) as u64,
+                    elastic_dyadic_probe_budget(free, level, exponent, c as usize),
+                    Ok(expected),
                     "free {free} of {level}"
                 );
+                if let (Ok(free), Ok(level)) = (u32::try_from(free), u32::try_from(level)) {
+                    assert_eq!(
+                        elastic_level_probe_budget(free, level, exponent, c),
+                        expected as u64,
+                        "free {free} of {level}"
+                    );
+                }
             }
         }
     };
@@ -795,7 +798,8 @@ fn elastic_probe_budget_matches_the_ceiling_quotient_form() {
     }
     for shift in [15, 31, usize::BITS - 2, usize::BITS - 1] {
         let power = 1_usize << shift;
-        for level in [power - 1, power, power + 1, usize::MAX] {
+        // `u32::MAX` is the widest level the `u32` form takes.
+        for level in [power - 1, power, power + 1, u32::MAX as usize, usize::MAX] {
             for free in [
                 1,
                 2,

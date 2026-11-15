@@ -44,11 +44,25 @@ struct Zst;
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct OverAligned(u64);
 
+/// A table and the scalar paper model, stepped together.
+struct ExactTrace {
+    table: ElasticTable<u64, u64, IdentityBuildHasher>,
+    scalar: ScalarElastic<CounterPrf>,
+}
+
 fn assert_exact_trace(n: usize, reserve_exponent: u32, identities: impl IntoIterator<Item = u64>) {
-    let reserve = ReserveFraction::from_exponent(reserve_exponent).unwrap();
-    let config = PaperConfig::new(n, reserve_exponent).unwrap();
-    let plan = config.elastic_plan();
-    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+    let mut trace = ExactTrace::new(n, reserve_exponent);
+    for identity in identities {
+        trace.insert(identity);
+    }
+}
+
+impl ExactTrace {
+    fn new(n: usize, reserve_exponent: u32) -> Self {
+        let reserve = ReserveFraction::from_exponent(reserve_exponent).unwrap();
+        let config = PaperConfig::new(n, reserve_exponent).unwrap();
+        let plan = config.elastic_plan();
+        let table = ElasticTable::<u64, u64, IdentityBuildHasher>::
         try_with_slots_and_reserve_fraction_and_hasher_in(
             n,
             reserve,
@@ -56,97 +70,211 @@ fn assert_exact_trace(n: usize, reserve_exponent: u32, identities: impl IntoIter
             Global,
         )
         .unwrap();
-    assert_eq!(
-        table
-            .levels
-            .iter()
-            .map(ArenaSlots::capacity)
-            .collect::<Vec<_>>(),
-        plan.level_lengths().collect::<Vec<_>>()
-    );
-    assert_eq!(
-        table.scheduler.batch_ends.as_ref(),
-        plan.batch_quotas()
-            .scan(0_usize, |total, quota| {
-                *total += quota;
-                Some(*total)
-            })
-            .collect::<Vec<_>>()
-    );
-
-    let limits = ScalarElasticLimits::new(
-        NonZeroUsize::new(ELASTIC_PROBE_BUDGET_C as usize).unwrap(),
-        NonZeroU32::new(probe::RANGE_WORD_CAP).unwrap(),
-        NonZeroU64::new(UNIFORM_SEARCH_CAP).unwrap(),
-        NonZeroU128::new(QUERY_POSITION_CAP).unwrap(),
-    );
-    let mut scalar = ScalarElastic::new(config, CounterPrf::new(ELASTIC_PROBE_SEED), limits);
-
-    for identity in identities {
-        let prepared = PreparedElasticKey::new(identity);
-        assert_eq!(table.hash_builder.hash_one(identity), identity);
-        assert!(table.len < table.max_insertions);
-        let target = table.scheduler.target(table.len);
-        let placement = table
-            .choose_slot_for_new_key(prepared.route.probe, target)
-            .unwrap();
-        let expected = scalar.insert(identity);
-        let global_slot = table.levels[..placement.level]
-            .iter()
-            .map(ArenaSlots::capacity)
-            .sum::<usize>()
-            + placement.slot;
-
-        // The oracle's case label is not carried by the table; its
-        // observable outcome (level, slot, and paper position) is.
-        assert_eq!(placement.level, expected.location.level);
-        assert_eq!(placement.slot, expected.location.slot_in_level);
-        assert_eq!(global_slot, expected.location.global_slot);
-        assert_eq!(placement.phi(), expected.phi);
-        assert_eq!(
-            placement.phi(),
-            probe::elastic_phi(
-                expected.location.level as u128 + 1,
-                u128::from(expected.paper_probe)
-            )
-            .unwrap()
-        );
-
-        assert_eq!(
-            table.place_new_entry(
-                identity,
-                identity,
-                prepared,
-                control::control_fingerprint(identity),
-                placement,
-            ),
-            (placement.level, placement.slot)
-        );
         assert_eq!(
             table
                 .levels
                 .iter()
-                .map(|level| level.len as usize)
+                .map(ArenaSlots::capacity)
                 .collect::<Vec<_>>(),
-            scalar.level_occupancy()
+            plan.level_lengths().collect::<Vec<_>>()
         );
         assert_eq!(
-            table.find_slot_indices_prepared(
-                &identity,
-                prepared,
-                control::control_fingerprint(identity),
-            ),
-            Some((placement.level, placement.slot))
+            table.scheduler.batch_ends.as_ref(),
+            plan.batch_quotas()
+                .scan(0_usize, |total, quota| {
+                    *total += quota;
+                    Some(*total)
+                })
+                .collect::<Vec<_>>()
         );
-        let query = scalar.query(identity);
-        assert_eq!(query.global_slot, global_slot);
-        assert!(
-            query.found_position <= placement.phi(),
-            "lookup order visits phi={} no later than placement phi={}",
-            query.found_position,
-            placement.phi()
+
+        let limits = ScalarElasticLimits::new(
+            NonZeroUsize::new(ELASTIC_PROBE_BUDGET_C as usize).unwrap(),
+            NonZeroU32::new(probe::RANGE_WORD_CAP).unwrap(),
+            NonZeroU64::new(UNIFORM_SEARCH_CAP).unwrap(),
+            NonZeroU128::new(QUERY_POSITION_CAP).unwrap(),
+        );
+        let scalar = ScalarElastic::new(config, CounterPrf::new(ELASTIC_PROBE_SEED), limits);
+        Self { table, scalar }
+    }
+
+    /// Inserts `identity` into both and returns the level it went to.
+    fn insert(&mut self, identity: u64) -> usize {
+        let Self { table, scalar } = self;
+        {
+            let prepared = PreparedElasticKey::new(identity);
+            assert_eq!(table.hash_builder.hash_one(identity), identity);
+            assert!(table.len < table.max_insertions);
+            let target = table.scheduler.target(table.len);
+            let placement = table
+                .choose_slot_for_new_key(prepared.route.probe, target)
+                .unwrap();
+            let expected = scalar.insert(identity);
+            let global_slot = table.levels[..placement.level]
+                .iter()
+                .map(ArenaSlots::capacity)
+                .sum::<usize>()
+                + placement.slot;
+
+            // The oracle's case label is not carried by the table; its
+            // observable outcome (level, slot, and paper position) is.
+            assert_eq!(placement.level, expected.location.level);
+            assert_eq!(placement.slot, expected.location.slot_in_level);
+            assert_eq!(global_slot, expected.location.global_slot);
+            assert_eq!(placement.phi(), expected.phi);
+            assert_eq!(
+                placement.phi(),
+                probe::elastic_phi(
+                    expected.location.level as u128 + 1,
+                    u128::from(expected.paper_probe)
+                )
+                .unwrap()
+            );
+
+            assert_eq!(
+                table.place_new_entry(
+                    identity,
+                    identity,
+                    prepared,
+                    control::control_fingerprint(identity),
+                    placement,
+                ),
+                (placement.level, placement.slot)
+            );
+            assert_eq!(
+                table
+                    .levels
+                    .iter()
+                    .map(|level| level.len as usize)
+                    .collect::<Vec<_>>(),
+                scalar.level_occupancy()
+            );
+            assert_eq!(
+                table.find_slot_indices_prepared(
+                    &identity,
+                    prepared,
+                    control::control_fingerprint(identity),
+                ),
+                Some((placement.level, placement.slot))
+            );
+            let query = scalar.query(identity);
+            assert_eq!(query.global_slot, global_slot);
+            assert!(
+                query.found_position <= placement.phi(),
+                "lookup order visits phi={} no later than placement phi={}",
+                query.found_position,
+                placement.phi()
+            );
+            placement.level
+        }
+    }
+
+    /// Removes `identity` from both.
+    fn remove(&mut self, identity: u64) {
+        let prepared = PreparedElasticKey::new(identity);
+        let location = self
+            .table
+            .find_slot_indices_prepared(&identity, prepared, control::control_fingerprint(identity))
+            .unwrap();
+        assert_eq!(
+            map::TableBackend::remove(&mut self.table, location),
+            (identity, identity)
+        );
+        self.scalar.remove(identity);
+        assert_eq!(
+            self.table
+                .levels
+                .iter()
+                .map(|level| level.len as usize)
+                .collect::<Vec<_>>(),
+            self.scalar.level_occupancy()
         );
     }
+}
+
+/// An insert-only trace ends each batch as its current level turns low, so
+/// it never places with that level low. Filling a batch and then removing
+/// a key of the next level leaves the table inside the batch with the
+/// current level exactly at its threshold and the next level above its
+/// own.
+#[test]
+fn elastic_placement_matches_the_scalar_model_with_the_current_level_low() {
+    let mut low_placements = 0;
+    for &(n, reserve_exponent) in &[(64, 1), (128, 2)] {
+        let mut trace = ExactTrace::new(n, reserve_exponent);
+        let batch_ends = trace.table.scheduler.batch_ends.clone();
+        let mut identity = 0;
+        let mut level_of = Vec::new();
+        for batch in 1..batch_ends.len() {
+            let current = batch - 1;
+            while trace.table.len < batch_ends[batch] {
+                level_of.push((identity, trace.insert(identity)));
+                identity += 1;
+            }
+            let level = &trace.table.levels[current];
+            let free = level.capacity() - level.len as usize;
+            let threshold = level.half_reserve as usize;
+            // Only a threshold of two or more tells itself from its half.
+            if free != threshold || threshold < 2 {
+                continue;
+            }
+            let other = level_of
+                .iter()
+                .position(|&(_, level)| level == batch)
+                .unwrap();
+            trace.remove(level_of.swap_remove(other).0);
+            assert_eq!(
+                trace.table.scheduler.target_at(trace.table.len),
+                BatchTarget::LevelPair(current)
+            );
+            let placed = trace.insert(identity);
+            assert_eq!(placed, batch);
+            level_of.push((identity, placed));
+            identity += 1;
+            low_placements += 1;
+        }
+    }
+    assert!(low_placements > 0);
+}
+
+#[test]
+fn settled_limit_is_zero_without_the_bounds_a_settled_insert_assumes() {
+    type Table = ElasticTable<u64, u64, FixedHashBuilder>;
+    let table = |slots| {
+        Table::try_with_slots_and_reserve_fraction_and_hasher_in(
+            slots,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap()
+    };
+    let shifted = table(32);
+    let levels = &shifted.levels;
+    assert_ne!(levels[0].index_shift(), GENERAL_REDUCTION);
+    assert_ne!(shifted.membership.words, 0);
+    assert_eq!(
+        settled_limit(levels, levels.len(), shifted.membership, 7),
+        7
+    );
+    // A batch past the last level pair.
+    assert_eq!(
+        settled_limit(levels, levels.len() + 1, shifted.membership, 7),
+        0
+    );
+    // No filter word to record in.
+    assert_eq!(
+        settled_limit(levels, levels.len(), MembershipRegion::EMPTY, 7),
+        0
+    );
+    // No level zero.
+    assert_eq!(settled_limit(&levels[..0], 0, shifted.membership, 7), 0);
+    let general = table(3);
+    assert_eq!(general.levels[0].index_shift(), GENERAL_REDUCTION);
+    assert_eq!(
+        settled_limit(&general.levels, general.levels.len(), general.membership, 7),
+        0
+    );
 }
 
 #[test]
