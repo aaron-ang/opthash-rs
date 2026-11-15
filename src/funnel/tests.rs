@@ -1523,3 +1523,78 @@ fn large_reserve_exponent_sizes_without_scanning_every_slot_count() {
     assert!(FunnelShape::from_slots(shape.n - 1, reserve).is_err());
     assert!(crate::FunnelHashMap::<u64, u64>::try_with_capacity_and_reserve(1, reserve).is_err());
 }
+
+/// Whatever the first-match lookup answers itself, the ordered walk answers
+/// the same; every other lookup is handed to that walk. Covers table sizes on
+/// both sides of the select limit, shared fingerprints, deletes, absent keys,
+/// and a bucket wider than one group.
+#[test]
+#[cfg_attr(miri, ignore = "walks hundreds of thousands of lookups twice")]
+fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    const FINGERPRINT_LANE: u64 = 0x7F << 57;
+    let feasible = |n: &usize, d: u32| {
+        FunnelShape::from_slots(*n, ReserveFraction::from_exponent(d).unwrap()).is_ok()
+    };
+    let mut shapes: Vec<(usize, u32)> = [(600, 3), (6_000, 3), (6_000, 4), (60_000, 9)]
+        .into_iter()
+        .map(|(at_least, d)| {
+            let n = (at_least..2 * at_least).find(|n| feasible(n, d));
+            (n.unwrap(), d)
+        })
+        .collect();
+    // The last table that selects between two levels and the first that
+    // branches on each.
+    let selecting = (1..=SELECT_MAX_SLOTS).rev().find(|n| feasible(n, 3));
+    let branching = (SELECT_MAX_SLOTS + 1..2 * SELECT_MAX_SLOTS).find(|n| feasible(n, 3));
+    shapes.extend([(selecting.unwrap(), 3), (branching.unwrap(), 3)]);
+    for (n, d) in shapes {
+        for shared_fingerprint in [false, true] {
+            let key_of = |index: u64| {
+                let key = index.wrapping_mul(SPREAD);
+                if shared_fingerprint {
+                    (key & !FINGERPRINT_LANE) | (0x2A << 57)
+                } else {
+                    key
+                }
+            };
+            let mut table = raw_table(n, d);
+            let inserted = table.shape.max_insertions as u64;
+            for index in 0..inserted {
+                let key = key_of(index);
+                assert_eq!(map::TableBackend::insert(&mut table, key, index, key), None);
+            }
+            for index in (0..inserted).step_by(3) {
+                let key = key_of(index);
+                let slot = table
+                    .find_location(&key, key, control::control_fingerprint(key))
+                    .unwrap();
+                map::TableBackend::remove(&mut table, slot);
+            }
+            let wide = table.shape.beta > GROUP_SIZE;
+            let (mut answered, mut handed_off) = (0_usize, 0_usize);
+            for index in 0..2 * inserted {
+                let key = key_of(index);
+                let fingerprint = control::control_fingerprint(key);
+                let gate = table.membership_gate(key);
+                if !gate.passes() {
+                    continue;
+                }
+                let walk = table.find_location_by_walk(&key, key, fingerprint, gate.levels);
+                let live = index < inserted && index % 3 != 0;
+                assert_eq!(walk.is_some(), live, "n {n} d {d} index {index}");
+                match table.lookup_first_matches(&key, key, fingerprint, gate.levels) {
+                    Ok(found) => {
+                        assert_eq!(found, walk, "n {n} d {d} index {index}");
+                        answered += 1;
+                    }
+                    Err(()) => handed_off += 1,
+                }
+            }
+            assert_eq!(answered == 0, wide, "n {n} d {d}");
+            if shared_fingerprint || wide {
+                assert_ne!(handed_off, 0, "n {n} d {d}");
+            }
+        }
+    }
+}

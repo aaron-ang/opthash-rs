@@ -487,16 +487,28 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
         });
     };
 
-    let upper_word = range.upper as u64;
-    let product =
-        u128::from(probe.word_from_indices(logical_probe_index, 0)) * u128::from(upper_word);
-    if product as u64 >= range.rejection_threshold {
+    if let Some(index) = first_word_funnel_probe_index(probe, logical_probe_index, range) {
         return Ok(ProbeIndex {
-            index: (product >> u64::BITS) as usize,
+            index,
             random_word_count: 1,
         });
     }
     reduce_prepared_funnel_retries(probe, logical_probe_index, range, last_rejection_index)
+}
+
+/// The index the first random word selects, or `None` when that word is
+/// rejected and the probe needs the retry path of
+/// [`unbiased_prepared_funnel_probe_index_in_range`].
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+pub(crate) fn first_word_funnel_probe_index(
+    probe: &PreparedFastFunnelDomainProbe,
+    logical_probe_index: u8,
+    range: PreparedProbeRange,
+) -> Option<usize> {
+    let product = u128::from(probe.word_from_indices(logical_probe_index, 0))
+        * u128::from(range.upper as u64);
+    (product as u64 >= range.rejection_threshold).then_some((product >> u64::BITS) as usize)
 }
 
 #[cold]
