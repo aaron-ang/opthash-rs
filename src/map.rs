@@ -99,6 +99,18 @@ pub trait TableBackend<K, V>: Sized {
     where
         Q: Hash + Equivalent<K> + ?Sized;
 
+    /// Find and borrow the value for `key` by precomputed hash. A backend
+    /// whose lookup ends in a call overrides this to project the value
+    /// inside the lookup, which keeps that call in tail position.
+    #[inline]
+    fn find_value<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+        K: 'a,
+    {
+        self.find_entry(key, hash).map(|entry| &entry.value)
+    }
+
     // -- Insert / remove --
 
     /// Find an entry, preserving reusable insertion state on absence.
@@ -465,7 +477,8 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.lookup_entry(key).map(|entry| &entry.value)
+        let hash = self.table.hash(key);
+        self.table.find_value(key, hash)
     }
 
     /// Returns the stored `(key, value)` pair for `key`.

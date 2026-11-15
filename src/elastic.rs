@@ -1458,6 +1458,20 @@ where
     }
 
     #[inline]
+    fn find_value<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+        K: 'a,
+    {
+        self.find_by_exact_schedule(
+            key,
+            PreparedElasticKey::new(hash),
+            control::control_fingerprint(hash),
+            |_level, _slot, entry| &entry.value,
+        )
+    }
+
+    #[inline]
     fn find_for_entry<Q>(&self, key: &Q, hash: u64) -> Result<Self::Location, u64>
     where
         Q: Hash + Equivalent<K> + ?Sized,
