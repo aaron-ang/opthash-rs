@@ -37,13 +37,11 @@ const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
 /// through `mix64` before routing, so any odd step draws a fresh mapping.
 const FUNNEL_RESEED_STEP: u64 = probe::WYHASH_DEFAULT_SECRET[0];
 /// Largest table whose lookups select between the first two recorded levels
-/// instead of branching on the first. While the control bytes stay in cache a
-/// mispredicted level costs more than a second scan; past this size the scan
-/// is a cache miss, and speculating on the first level is cheaper.
-const SELECT_MAX_SLOTS: usize = 1 << 20;
-/// Smallest table that selects. A table below it holds so few keys that
-/// the level branch is learned, and the second scan is pure cost.
-const SELECT_MIN_SLOTS: usize = 1 << 10;
+/// instead of branching on the first. The second scan is a few instructions
+/// while the control bytes, one per slot, stay in a core's private cache; past
+/// that it is one more cache miss per lookup. The bound is a size such caches
+/// commonly hold, not a measured crossover.
+const SELECT_MAX_SLOTS: usize = 1 << 18;
 /// Bits each key sets in its membership-filter word. A lookup whose bits are
 /// not all set skips the probe walk, since the key cannot be present.
 const MEMBERSHIP_BITS: usize = 2;
@@ -1132,7 +1130,7 @@ where
             }
         };
         let mut ordinary = levels & !OVERFLOW_LEVEL_BIT;
-        if ordinary != 0 && (SELECT_MIN_SLOTS..=SELECT_MAX_SLOTS).contains(&self.shape.n) {
+        if ordinary != 0 && self.shape.n <= SELECT_MAX_SLOTS {
             // The first two recorded levels are scanned together and the
             // holder is selected, not branched on: which of them holds the key
             // is unpredictable.
