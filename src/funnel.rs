@@ -33,8 +33,9 @@ use crate::{macros, map};
 /// Initial probe seed; each placement-recovery rebuild advances it by
 /// [`FUNNEL_RESEED_STEP`].
 const FUNNEL_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[3];
-/// Added to the probe seed by each placement-recovery rebuild. The seed passes
-/// through `mix64` before routing, so any odd step draws a fresh mapping.
+/// Added to the probe seed by each placement-recovery rebuild. The seed is
+/// added to the key hash ahead of the fold, so a reseed translates every hash
+/// by this step.
 const FUNNEL_RESEED_STEP: u64 = probe::WYHASH_DEFAULT_SECRET[0];
 /// Largest table whose lookups select between the first two recorded levels
 /// instead of branching on the first. The second scan is a few instructions
