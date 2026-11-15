@@ -204,6 +204,7 @@ fn compact_query_counters_cover_every_supported_geometry() {
             Global,
         )
         .unwrap();
+    table.schedule_levels_through(table.levels.len() - 1);
     table.extend_probe_schedule(QUERY_POSITION_CAP);
     assert!(
         table
@@ -226,6 +227,7 @@ fn query_schedule_never_reallocates_within_an_epoch() {
     let initial_ptr = table.probe_schedule.as_ptr();
     let initial_capacity = table.probe_schedule.capacity();
 
+    table.schedule_levels_through(table.levels.len() - 1);
     table.extend_probe_schedule(QUERY_POSITION_CAP);
 
     assert_eq!(table.probe_schedule.as_ptr(), initial_ptr);
@@ -244,6 +246,7 @@ fn query_schedule_caches_each_routes_exact_level_bound() {
         )
         .unwrap();
 
+    table.schedule_levels_through(table.levels.len() - 1);
     table.extend_probe_schedule(QUERY_POSITION_CAP);
 
     for route in &table.probe_schedule {

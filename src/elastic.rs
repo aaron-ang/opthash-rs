@@ -220,6 +220,10 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     arena: Arena,
     epoch: EpochState,
     probe_high_water: u32,
+    /// Levels the schedule holds routes for: every level up to the deepest
+    /// one a placement of this epoch chose. A deeper level holds no entry, so
+    /// lookups have nothing to visit there.
+    scheduled_levels: u32,
     probe_schedule: Vec<PhiRoute>,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
@@ -843,6 +847,7 @@ where
             arena,
             epoch: EpochState::initial(),
             probe_high_water: 0,
+            scheduled_levels: 0,
             probe_schedule,
             membership,
             stale_membership: 0,
@@ -982,6 +987,7 @@ where
     fn reset_after_clear(&mut self) {
         self.scheduler.reset();
         self.probe_high_water = 0;
+        self.scheduled_levels = 0;
         self.probe_schedule.clear();
         self.clear_membership();
         self.epoch.start(EpochTransition::Clear);
@@ -1059,6 +1065,9 @@ where
         key_fingerprint: u8,
         placement: ExactPlacement,
     ) -> (usize, usize) {
+        if placement.level >= self.scheduled_levels as usize {
+            self.schedule_levels_through(placement.level);
+        }
         self.extend_probe_schedule(placement.phi);
         self.write_new_entry(
             key,
@@ -1125,6 +1134,18 @@ where
         (level_idx, slot_idx)
     }
 
+    /// Rebuilds the schedule to hold the routes of every level up to `level`,
+    /// the first placement of this epoch past the levels scheduled so far.
+    #[cold]
+    #[inline(never)]
+    fn schedule_levels_through(&mut self, level: usize) {
+        let high_water = self.probe_high_water & !EXCEPTIONAL_PLACEMENT_FLAG;
+        self.probe_high_water &= EXCEPTIONAL_PLACEMENT_FLAG;
+        self.probe_schedule.clear();
+        self.scheduled_levels = u32::try_from(level + 1).expect("Elastic level count fits u32");
+        self.extend_probe_schedule(u128::from(high_water));
+    }
+
     fn extend_probe_schedule(&mut self, high_water: u128) {
         assert!(
             high_water <= QUERY_POSITION_CAP,
@@ -1135,7 +1156,7 @@ where
             return;
         }
         let old_len = self.probe_schedule.len();
-        for level in 0..self.levels.len() {
+        for level in 0..self.scheduled_levels as usize {
             let from_probe =
                 first_paper_probe_after(level as u128 + 1, u128::from(prior_high_water));
             for_each_phi_route(level, from_probe, high_water, |paper_probe, phi| {
@@ -1439,6 +1460,7 @@ where
             arena,
             epoch: self.epoch,
             probe_high_water: self.probe_high_water,
+            scheduled_levels: self.scheduled_levels,
             probe_schedule,
             membership,
             stale_membership: self.stale_membership,
@@ -1546,6 +1568,7 @@ where
                 scheduler: BatchScheduler::new(&geometry.batch_plan),
                 arena,
                 probe_high_water: 0,
+                scheduled_levels: 0,
                 probe_schedule,
                 membership,
                 stale_membership: 0,
@@ -1975,6 +1998,7 @@ pub(crate) struct ElasticGeneration<K, V> {
     scheduler: BatchScheduler,
     arena: Arena,
     probe_high_water: u32,
+    scheduled_levels: u32,
     probe_schedule: Vec<PhiRoute>,
     membership: MembershipRegion,
     stale_membership: usize,
@@ -1999,6 +2023,7 @@ where
         mem::swap(&mut self.scheduler, &mut other.scheduler);
         mem::swap(&mut self.arena, &mut other.arena);
         mem::swap(&mut self.probe_high_water, &mut other.probe_high_water);
+        mem::swap(&mut self.scheduled_levels, &mut other.scheduled_levels);
         mem::swap(&mut self.probe_schedule, &mut other.probe_schedule);
         mem::swap(&mut self.membership, &mut other.membership);
         mem::swap(&mut self.stale_membership, &mut other.stale_membership);
