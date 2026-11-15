@@ -315,41 +315,67 @@ fn elastic_geometry_carries_capacity_and_batch_state() {
     }
 }
 
+/// Panics in the drop that finds `drops` at `panic_at`.
+struct PanicOnNthDrop {
+    drops: Arc<AtomicUsize>,
+    panic_at: usize,
+}
+
+impl Drop for PanicOnNthDrop {
+    fn drop(&mut self) {
+        assert_ne!(
+            self.drops.fetch_add(1, Ordering::Relaxed),
+            self.panic_at,
+            "intentional drop panic"
+        );
+    }
+}
+
 #[test]
 fn lookups_find_every_live_entry_after_a_clear_that_panicked() {
     const KEYS: usize = 900;
-    let drops = Arc::new(AtomicUsize::new(0));
-    let mut map = ManuallyDrop::new(FixedElasticHashMap::<u64, PanicOnFirstDrop>::with_capacity(
-        KEYS,
-    ));
-    for key in 0..KEYS as u64 {
-        map.insert(key, PanicOnFirstDrop(drops.clone()));
+    for panic_at in [0, 1, KEYS / 2, KEYS - 2, KEYS - 1] {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let value = || PanicOnNthDrop {
+            drops: drops.clone(),
+            panic_at,
+        };
+        let mut map = ManuallyDrop::new(FixedElasticHashMap::<u64, PanicOnNthDrop>::with_capacity(
+            KEYS,
+        ));
+        for key in 0..KEYS as u64 {
+            map.insert(key, value());
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| map.clear()));
+        assert!(result.is_err());
+        // The drain stopped at the panicking drop, which left the map too.
+        assert_eq!(map.len(), KEYS - panic_at - 1);
+        let found = (0..KEYS as u64)
+            .filter(|key| map.get(key).is_some())
+            .count();
+        assert_eq!(found, map.len());
+
+        // The interrupted drain reads as a run of removals: nothing is
+        // flagged exceptional, and later inserts place without a recovery.
+        assert_eq!(map.table().probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
+        let recoveries = map.epoch().placement_recoveries;
+        let live = map.len();
+        for key in KEYS as u64..2 * KEYS as u64 {
+            map.insert(key, value());
+        }
+        assert_eq!(map.epoch().placement_recoveries, recoveries);
+        assert_eq!(map.len(), live + KEYS);
+        let found = (0..2 * KEYS as u64)
+            .filter(|key| map.get(key).is_some())
+            .count();
+        assert_eq!(found, map.len());
+
+        map.clear();
+        assert!(map.is_empty());
+        // SAFETY: `map` is not used after this drop.
+        unsafe { ManuallyDrop::drop(&mut map) };
     }
-
-    let result = catch_unwind(AssertUnwindSafe(|| map.clear()));
-    assert!(result.is_err());
-    assert_eq!(map.len(), KEYS - 1);
-    let found = (0..KEYS as u64)
-        .filter(|key| map.get(key).is_some())
-        .count();
-    assert_eq!(found, map.len());
-
-    // The interrupted drain reads as a run of removals: nothing is flagged
-    // exceptional, and later inserts place without a recovery.
-    assert_eq!(map.table().probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
-    let recoveries = map.epoch().placement_recoveries;
-    for key in KEYS as u64..2 * KEYS as u64 {
-        map.insert(key, PanicOnFirstDrop(drops.clone()));
-    }
-    assert_eq!(map.epoch().placement_recoveries, recoveries);
-    let found = (0..2 * KEYS as u64)
-        .filter(|key| map.get(key).is_some())
-        .count();
-    assert_eq!(found, map.len());
-
-    map.clear();
-    // SAFETY: `map` is not used after this drop.
-    unsafe { ManuallyDrop::drop(&mut map) };
 }
 
 #[test]
@@ -1538,8 +1564,8 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
     assert_eq!(placement.level, LEVEL + 1);
 }
 
-/// Every key of a full map whose level-`level` route starts at a slot other
-/// than its own, with the key that holds that first slot.
+/// For every key below `keys` that sits past the first probe of its level:
+/// the key holding that first slot, the key itself, the level, and the slot.
 fn keys_behind_another_on_their_route(
     map: &FixedElasticHashMap<u64, u64>,
     keys: u64,
@@ -1856,7 +1882,7 @@ fn clone_carries_the_schedule_onto_its_own_levels() {
 }
 
 #[test]
-fn seeded_operation_mix_matches_std_hash_map() {
+fn seeded_operation_mix_matches_an_ordered_map_model() {
     const KEY_SPACE: u64 = 3_000;
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
     let mut next = move || {
@@ -1866,7 +1892,7 @@ fn seeded_operation_mix_matches_std_hash_map() {
         state
     };
     let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(16);
-    let mut model = std::collections::HashMap::<u64, u64>::new();
+    let mut model = alloc::collections::BTreeMap::<u64, u64>::new();
     for step in 0..200_000_u64 {
         let roll = next() % 10_000;
         let key = next() % KEY_SPACE;
@@ -1881,9 +1907,8 @@ fn seeded_operation_mix_matches_std_hash_map() {
             }
             9_988..9_992 => {
                 let mut drained = map.drain().collect::<Vec<_>>();
-                let mut expected = model.drain().collect::<Vec<_>>();
+                let expected = mem::take(&mut model).into_iter().collect::<Vec<_>>();
                 drained.sort_unstable();
-                expected.sort_unstable();
                 assert_eq!(drained, expected);
             }
             9_992..9_995 => {
