@@ -424,6 +424,31 @@ struct MembershipSlot {
     bin: isize,
 }
 
+use level_bin::WideLevelBin;
+
+mod level_bin {
+    /// A level bin at register width, as its load left it. Built only from a
+    /// bin, so no bit at or above `u16::BITS` is ever set: the first-match
+    /// walk steps the head by the positions of these bits and relies on that
+    /// bound.
+    #[derive(Clone, Copy)]
+    pub(super) struct WideLevelBin(u32);
+
+    impl WideLevelBin {
+        #[inline]
+        pub(super) fn get(self) -> u32 {
+            self.0
+        }
+    }
+
+    impl From<u16> for WideLevelBin {
+        #[inline]
+        fn from(levels: u16) -> Self {
+            Self(u32::from(levels))
+        }
+    }
+}
+
 /// A loaded filter word paired with the key's bits, split from the test so the
 /// load can be issued before the work that hides its latency. An absent tail
 /// yields a gate that never passes, matching an empty table. It omits the
@@ -1303,7 +1328,7 @@ where
         &self,
         key: &Q,
         probe: PreparedFastFunnelProbe,
-        levels: u32,
+        levels: WideLevelBin,
     ) -> Option<Found<'_, K, V>>
     where
         Q: Equivalent<K> + ?Sized,
@@ -1339,7 +1364,6 @@ where
         };
         // A passed gate means a recorded key, so the table has slots.
         debug_assert_ne!(self.shape.n, 0);
-        debug_assert!(u16::try_from(levels).is_ok());
         // The bin is walked as it is, in the low half of the word: its
         // leading zeros are `BIN_LEAD` more than the index of the shallowest
         // level, so the walk starts that many entries ahead of the head. Two
@@ -1348,7 +1372,7 @@ where
         // past the last recorded one would, and an empty set, which the walk
         // tests for after a scan and not before one, has a whole word of
         // leading zeros.
-        let mut pending = levels;
+        let mut pending = levels.get();
         let mut entry = self.shape.head.as_ptr().wrapping_sub(BIN_LEAD);
         loop {
             let distance = pending.leading_zeros();
@@ -1358,9 +1382,10 @@ where
             // shifts by its whole width, which wraps to none.
             pending = pending.wrapping_shl(distance) & !SHALLOWEST_LEVEL;
             // SAFETY: the distances stepped so far add up to `BIN_LEAD` plus
-            // the index of a set bit, which is below `u16::BITS`, or to
-            // `u32::BITS` for an empty set. Either way the entry is one of
-            // the head's `HEAD_ENTRIES`, which outlive the borrow of `self`.
+            // the index of a set bit, which a `WideLevelBin` keeps below
+            // `u16::BITS`, or to `u32::BITS` for an empty set. Either way the
+            // entry is one of the head's `HEAD_ENTRIES`, which outlive the
+            // borrow of `self`.
             let (start, mut matches) = scan(unsafe { &*entry });
             while matches != 0 {
                 if let Some(found) = holding_key(start, matches) {
@@ -1870,7 +1895,7 @@ where
         if !gate.passes() {
             return None;
         }
-        self.find_after_gate::<Q, P>(key, key_hash, u32::from(gate.levels))
+        self.find_after_gate::<Q, P>(key, key_hash, gate.levels.into())
     }
 
     #[inline]
@@ -1887,12 +1912,16 @@ where
     /// Takes the level bin at register width, as the gate's load left it, so
     /// the walk does not widen it again.
     #[inline(never)]
-    fn find_after_gate<'a, Q, P>(&'a self, key: &Q, key_hash: u64, levels: u32) -> Option<P::Part>
+    fn find_after_gate<'a, Q, P>(
+        &'a self,
+        key: &Q,
+        key_hash: u64,
+        levels: WideLevelBin,
+    ) -> Option<P::Part>
     where
         Q: Equivalent<K> + ?Sized,
         P: FoundPart<'a, K, V>,
     {
-        debug_assert!(u16::try_from(levels).is_ok());
         let probe = self.prf.prepare(key_hash);
         match self.first_match(key, probe, levels) {
             Some(found) => Some(P::of(found)),
@@ -2075,7 +2104,7 @@ where
         let mut membership = self.membership_slot(hash);
         let gate = self.membership_gate_at(membership);
         if gate.passes() {
-            let found = self.find_after_gate::<K, FoundSlot>(&key, hash, u32::from(gate.levels));
+            let found = self.find_after_gate::<K, FoundSlot>(&key, hash, gate.levels.into());
             if let Some(slot) = found {
                 return Some(map::TableBackend::replace_value(self, slot, value));
             }

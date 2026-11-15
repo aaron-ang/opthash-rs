@@ -2254,13 +2254,13 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 );
                 let probe = table.prf.prepare(key);
                 let found = table
-                    .first_match(&key, probe, u32::from(gate.levels))
+                    .first_match(&key, probe, gate.levels.into())
                     .map(|found| found.slot);
                 // An empty bin and the overflow bit each scan an absent head
                 // entry, which finds nothing but the key itself.
                 for absent in [0, OVERFLOW_LEVEL_BIT] {
                     let at_absent = table
-                        .first_match(&key, probe, u32::from(absent))
+                        .first_match(&key, probe, absent.into())
                         .map(|found| found.slot);
                     assert!(
                         at_absent.is_none() || at_absent == walk,
