@@ -72,9 +72,9 @@ pub(crate) struct FunnelPrf {
     /// The seed plus [`DOMAIN_KIND_LANE`], so preparing a probe is one add
     /// ahead of the mix.
     lane_seed: u64,
-    /// [`MIX`], held beside the seed so a probe loads the multipliers instead
-    /// of building each from immediates.
-    mix: [u64; 2],
+    /// [`KEY_FOLD`], held beside the seed so a probe loads the multiplier
+    /// instead of building it from immediates.
+    fold: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,7 +155,7 @@ impl FunnelPrf {
     pub(crate) const fn new(seed: u64) -> Self {
         Self {
             lane_seed: seed.wrapping_add(DOMAIN_KIND_LANE),
-            mix: MIX,
+            fold: KEY_FOLD,
         }
     }
 
@@ -164,7 +164,7 @@ impl FunnelPrf {
     pub(crate) const fn reseeded(self, step: u64) -> Self {
         Self {
             lane_seed: self.lane_seed.wrapping_add(step),
-            mix: self.mix,
+            fold: self.fold,
         }
     }
 
@@ -173,7 +173,7 @@ impl FunnelPrf {
         let keyed = key_hash.wrapping_add(self.lane_seed);
         PreparedFastFunnelProbe {
             keyed,
-            key_out: mix64_with(keyed, self.mix),
+            key_out: folded_multiply(keyed, self.fold),
         }
     }
 
@@ -566,7 +566,7 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
 /// a rejected word needs [`ordinary_funnel_retry_index`].
 ///
 /// The first word of an ordinary level is the mixed key times that level's
-/// multiplier, not a counter word: `key_out` is already a full mix of the
+/// multiplier, not a counter word: `key_out` already folds every bit of the
 /// key, and a distinct odd multiplier per level decorrelates the levels with
 /// one multiply.
 #[allow(clippy::cast_possible_truncation)]
@@ -928,18 +928,22 @@ pub(crate) const fn elastic_dyadic_probe_budget(
     Ok(budget)
 }
 
-/// The two multipliers of [`mix64`].
-const MIX: [u64; 2] = [0xbf58_476d_1ce4_e5b9, 0x94d0_49bb_1331_11eb];
+/// Multiplier of the per-key fold in [`FunnelPrf::prepare`].
+const KEY_FOLD: u64 = 0xbf58_476d_1ce4_e5b9;
 
-const fn mix64(value: u64) -> u64 {
-    mix64_with(value, MIX)
+const fn mix64(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
+/// Both halves of the 128-bit product combined by XOR, so every bit of
+/// `value` reaches the high bits the range reduction reads.
+#[allow(clippy::cast_possible_truncation)]
 #[inline]
-const fn mix64_with(mut value: u64, mix: [u64; 2]) -> u64 {
-    value = (value ^ (value >> 30)).wrapping_mul(mix[0]);
-    value = (value ^ (value >> 27)).wrapping_mul(mix[1]);
-    value ^ (value >> 31)
+const fn folded_multiply(value: u64, multiplier: u64) -> u64 {
+    let product = value as u128 * multiplier as u128;
+    (product as u64) ^ ((product >> u64::BITS) as u64)
 }
 
 const fn append_bit(prefix: u128, bit: u128) -> Option<u128> {
