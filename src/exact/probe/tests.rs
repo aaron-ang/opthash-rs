@@ -571,22 +571,25 @@ fn ordinary_level_multipliers_are_odd_and_distinct() {
 }
 
 /// The fingerprint tells apart the keys sharing a bucket, so two keys of one
-/// bucket must share it about once in its number of values: for a mixing
-/// hasher, for the key families an identity hasher passes through unmixed,
-/// and for bucket counts on both sides of a power of two.
-#[test]
-#[cfg_attr(
-    miri,
-    ignore = "counts fingerprints over hundreds of thousands of keys"
-)]
-fn fingerprints_stay_spread_within_a_bucket_for_every_key_family() {
+/// bucket must share it about once in its number of values, in every level a
+/// shape can have.
+///
+/// A family that does not know the seed stays within an eighth of that rate
+/// in each level: a mixing hasher, and the key families an identity hasher
+/// passes through unmixed. A family built around the seed, whose folded
+/// words are small multiples of a power of two, lines up with single levels;
+/// it stays within an eighth over the levels of a walk taken together, and
+/// in no level does it lose more than one bit of the fingerprint.
+fn assert_fingerprints_stay_spread_within_a_bucket(buckets: usize) {
     use core::hash::BuildHasher;
-
     const KEYS: u64 = 1 << 17;
     const VALUES: usize = 128;
+    // One past the last level of the plan with the largest reserve exponent.
+    const LEVELS: u64 = 4 * (u64::BITS as u64 - 1) + 10;
     type Family = (&'static str, fn(u64) -> u64);
     let oracle = FunnelPrf::new(FIXED_SEED);
-    let families: [Family; 5] = [
+    let zero = oracle.zero_word_hash();
+    let seedless: [Family; 6] = [
         ("mixed", |index| {
             crate::test_support::fixed_hasher().hash_one(index)
         }),
@@ -596,33 +599,85 @@ fn fingerprints_stay_spread_within_a_bucket_for_every_key_family() {
         }),
         ("shifted", |index| index << 32),
         ("stepped", |index| index * VALUES as u64),
+        ("thousands", |index| index * 1_000),
     ];
-    for buckets in [8, 1_000, 4_096] {
-        for (family, key_of) in families {
-            for level in [0, 1, 7] {
+    let seedless = seedless.map(|(family, key_of)| {
+        let probes = (0..KEYS).map(|index| oracle.prepare(key_of(index)));
+        (family, false, probes.collect::<alloc::vec::Vec<_>>())
+    });
+    let seed_centred = [0_u32, 7, 18, 19, 20, 21].map(|shift| {
+        let probes = (0..KEYS).map(|index| oracle.prepare((index << shift).wrapping_add(zero)));
+        ("seed-centred", true, probes.collect::<alloc::vec::Vec<_>>())
+    });
+    for (_, _, probes) in seedless.iter().chain(&seed_centred) {
+        for probe in probes {
+            assert!(crate::raw::control::is_occupied(probe.fingerprint()));
+        }
+    }
+    // Pairs of keys sharing a bucket, and those of them sharing a
+    // fingerprint as well.
+    let pairs = |count: u64| count * count.saturating_sub(1) / 2;
+    {
+        let mut counts = alloc::vec![[0_u64; VALUES]; buckets];
+        for (family, centred, probes) in seedless.iter().chain(&seed_centred) {
+            let (mut walk_bucket, mut walk_both) = (0, 0);
+            for level in 0..LEVELS {
                 let multiplier = FunnelPrf::ordinary_multiplier(level).unwrap();
-                let mut counts = alloc::vec![[0_u64; VALUES]; buckets];
-                for index in 0..KEYS {
-                    let probe = oracle.prepare(key_of(index));
+                counts.fill([0; VALUES]);
+                for &probe in probes {
                     let bucket = ordinary_funnel_bucket(probe, multiplier, buckets);
-                    let fingerprint = probe.fingerprint();
-                    assert!(crate::raw::control::is_occupied(fingerprint));
-                    counts[bucket][usize::from(fingerprint) % VALUES] += 1;
+                    counts[bucket][usize::from(probe.fingerprint()) % VALUES] += 1;
                 }
-                // Pairs of keys sharing a bucket, and those of them sharing a
-                // fingerprint as well.
-                let pairs = |count: u64| count * count.saturating_sub(1) / 2;
                 let sharing_bucket: u64 =
                     counts.iter().map(|bucket| pairs(bucket.iter().sum())).sum();
                 let sharing_both: u64 = counts.iter().flatten().copied().map(pairs).sum();
                 let even = sharing_bucket / VALUES as u64;
+                let allowed = if *centred {
+                    0..=2 * even
+                } else {
+                    even - even / 8..=even + even / 8
+                };
                 assert!(
-                    (even - even / 8..=even + even / 8).contains(&sharing_both),
+                    allowed.contains(&sharing_both),
                     "{family} level {level} buckets {buckets}: {sharing_both} of {sharing_bucket}"
                 );
+                walk_bucket += sharing_bucket;
+                walk_both += sharing_both;
             }
+            let even = walk_bucket / VALUES as u64;
+            assert!(
+                (even - even / 8..=even + even / 8).contains(&walk_both),
+                "{family} buckets {buckets}: {walk_both} of {walk_bucket}"
+            );
         }
     }
+}
+
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "counts fingerprints over hundreds of thousands of keys"
+)]
+fn fingerprints_stay_spread_within_a_bucket_of_few() {
+    assert_fingerprints_stay_spread_within_a_bucket(8);
+}
+
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "counts fingerprints over hundreds of thousands of keys"
+)]
+fn fingerprints_stay_spread_within_a_bucket_of_a_ragged_count() {
+    assert_fingerprints_stay_spread_within_a_bucket(1_000);
+}
+
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "counts fingerprints over hundreds of thousands of keys"
+)]
+fn fingerprints_stay_spread_within_a_bucket_of_a_power_of_two() {
+    assert_fingerprints_stay_spread_within_a_bucket(4_096);
 }
 
 /// The ordinary draw gives each bucket one run of consecutive words, the
