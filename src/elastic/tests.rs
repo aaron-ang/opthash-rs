@@ -2262,13 +2262,26 @@ fn shifted_vacancy_search_agrees_with_the_general_one() {
                 let region = &table.levels[level];
                 // SAFETY: `region` is `level`, and level zero reduces by
                 // shift, so every level does.
-                let shifted = unsafe { table.first_shifted_vacancy(probe, level, region, budget) }
-                    .map(|(slot, paper_probe, control)| {
-                        // SAFETY: the search returns a slot of `region`.
-                        assert_eq!(control, unsafe { region.control_at(slot) });
-                        (slot, paper_probe)
-                    });
+                let shifted = unsafe { table.first_shifted_vacancy(probe, level, region, budget) };
                 assert_eq!(shifted, table.first_vacancy_general(probe, level, budget));
+                if let Ok(budget @ 1..) = u16::try_from(budget) {
+                    // SAFETY: as above, and the budget is not zero.
+                    let settled = unsafe {
+                        first_settled_vacancy(
+                            probe.sequence(table.fold_multiplier),
+                            ptr::from_ref(region).cast_mut(),
+                            settled_word(region.summary_bit(), budget),
+                        )
+                    }
+                    .map(|found| {
+                        assert!(ptr::eq(found.level, region));
+                        assert_eq!(found.summary_bit, region.summary_bit());
+                        // SAFETY: the search returns a slot of `region`.
+                        assert_eq!(found.control, unsafe { region.control_at(found.slot) });
+                        found.slot
+                    });
+                    assert_eq!(settled, shifted.map(|(slot, _)| slot));
+                }
                 if shifted.is_some() {
                     found += 1;
                 } else {
@@ -2339,7 +2352,7 @@ fn levels_reduce_all_by_shift_or_all_by_the_general_reduction() {
 /// for, and the flag that leaves a walk unresolved.
 fn assert_cached_state_matches<S>(table: &ElasticTable<u64, u64, S>) {
     for (index, level) in table.levels.iter().enumerate() {
-        assert_eq!(level.summary_bit, 2 << summary_level(index));
+        assert_eq!(level.summary_bit(), 2 << summary_level(index));
         assert_eq!(level.sequence_run, probe::elastic_level_run(index));
         assert_eq!(
             level.half_reserve as usize,
@@ -2966,12 +2979,12 @@ fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
                 let hash = table.hash_builder.hash_one(fresh);
                 assert_eq!(table.insert(fresh, fresh, hash), None);
                 assert_settled_gate(&table, shifted);
-                // Past an insert the gate is open wherever it may be.
-                assert_eq!(
-                    table.scheduler.settles(table.placed),
-                    table
-                        .scheduler
-                        .would_settle(table.placed, table.stale_membership())
+                // Past an insert the gate is open only where it may be.
+                assert!(
+                    !table.scheduler.settles(table.placed)
+                        || table
+                            .scheduler
+                            .would_settle(table.placed, table.stale_membership())
                 );
                 reopened += usize::from(table.scheduler.settles(table.placed));
             }
@@ -3285,4 +3298,95 @@ fn schedule_lookup_agrees_past_the_summary_width() {
     }
     assert!(saturated_hits > 0 && hits_past_the_summary > 0);
     assert!(deep_walked_misses > 0 && shallow_walked_misses > 0 && filtered_misses > 0);
+}
+
+/// A settled insert against the general one, on twin tables through the
+/// same inserts and removals, with an ordered map as the model: the plan
+/// the gate opens on, through every case and budget the fill of a batch's
+/// levels walks it through and every removal that closes it, puts each key
+/// in the slot the paper's insertion case chooses afresh.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn settled_plan_places_every_key_where_the_general_insert_does() {
+    use alloc::collections::BTreeMap;
+
+    for slots in [1_024, 1 << 15] {
+        let build = || {
+            ElasticTable::<u64, u64, FixedHashBuilder>::
+                try_with_slots_and_reserve_fraction_and_hasher_in(
+                    slots,
+                    ReserveFraction::DEFAULT,
+                    fixed_hasher(),
+                    Global,
+                )
+                .unwrap()
+        };
+        let (mut settled, mut general) = (build(), build());
+        assert_ne!(settled.levels[0].index_shift(), GENERAL_REDUCTION);
+        let mut model = BTreeMap::new();
+        let capacity = settled.max_insertions as u64;
+        let universe = capacity + capacity / 2;
+
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let (mut through_gate, mut inserts) = (0_u64, 0_u64);
+        for step in 0..capacity * 8 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let key = (state >> 33) % universe;
+            let hash = settled.hash_builder.hash_one(key);
+            // Fill, thin out, refill, then churn.
+            let insert = match step / (capacity * 2) {
+                0 | 2 => state >> 60 != 0,
+                1 => state >> 62 == 0,
+                _ => state >> 63 == 0,
+            };
+            if insert {
+                if settled.live() == settled.max_insertions && !model.contains_key(&key) {
+                    continue;
+                }
+                let absent = !model.contains_key(&key);
+                through_gate += u64::from(absent && settled.scheduler.settles(settled.placed));
+                inserts += u64::from(absent);
+                let previous = model.insert(key, step);
+                assert_eq!(settled.insert(key, step, hash), previous);
+                if let Some(location) = general.find(&key, hash) {
+                    assert_eq!(Some(general.replace_value(location, step)), previous);
+                } else {
+                    let prepared = PreparedElasticKey::new(hash);
+                    general.insert_for_vacant_entry_prepared(
+                        key,
+                        step,
+                        prepared,
+                        control::control_fingerprint_low(hash),
+                    );
+                }
+            } else {
+                let removed = model.remove(&key);
+                assert_eq!(settled.take(&key, hash).map(|(_, value)| value), removed);
+                assert_eq!(general.take(&key, hash).map(|(_, value)| value), removed);
+            }
+            assert_eq!(settled.find(&key, hash), general.find(&key, hash));
+            assert_eq!(settled.live(), model.len());
+        }
+        assert!(
+            through_gate > inserts / 2,
+            "{through_gate} of {inserts} inserts found the gate open"
+        );
+
+        assert_eq!(settled.epoch_snapshot(), general.epoch_snapshot());
+        for (ours, theirs) in settled.levels.iter().zip(&general.levels) {
+            assert_eq!(ours.len(), theirs.len());
+            assert_eq!(ours.tombstones(), theirs.tombstones());
+            assert_eq!(ours.scheduled_probes, theirs.scheduled_probes);
+        }
+        for key in 0..universe {
+            let hash = settled.hash_builder.hash_one(key);
+            assert_eq!(settled.find(&key, hash), general.find(&key, hash));
+            assert_eq!(
+                settled.find_entry(&key, hash).map(|entry| entry.value),
+                model.get(&key).copied()
+            );
+        }
+    }
 }
