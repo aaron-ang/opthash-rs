@@ -2454,7 +2454,10 @@ where
     fn schedule_levels_through(&mut self, level: usize) {
         let high_water = self.probe_high_water & !HIGH_WATER_FLAGS;
         self.probe_high_water &= HIGH_WATER_FLAGS;
-        self.probe_schedule.clear();
+        // The levels scheduled before and after are scheduled again, to the
+        // same position.
+        self.probe_schedule
+            .rewind(self.scheduled_levels as usize, level + 1);
         self.scheduled_levels = u32::try_from(level + 1).expect("Elastic level count fits u32");
         for level in &mut self.levels {
             level.scheduled_probes = 0;
@@ -2883,7 +2886,9 @@ where
         }
 
         let regions = guard.regions_mut();
-        let probe_schedule = self.probe_schedule.clone_onto(regions);
+        let probe_schedule = self
+            .probe_schedule
+            .clone_onto(regions, self.scheduled_levels as usize);
 
         // Success: reclaim arena + levels so the guard's Drop no-ops.
         let (arena, levels) = guard.disarm();

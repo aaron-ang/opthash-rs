@@ -415,12 +415,15 @@ impl ProbeScheduleRoom {
         book.push(ScheduleBook {
             starts: [WalkStart::at_list(slots.as_ptr().cast()); WALK_STARTS],
             run_len: [0; MAX_LEVELS],
-            group_runs: group_runs(level_count),
-            group_len: [0; GROUPS],
+            group_next: [0; GROUPS],
+            group_end: GROUP_RUNS[level_count].map(GroupRun::end),
             pushed: 0,
+            reach: 0,
             levels: level_count,
             whole_runs: named_levels(level_count),
-            grouped: false,
+            open_groups: 0,
+            grouped_pushed: 0,
+            grouped_held: 0,
             whole_groups: 0,
         });
         let book: Box<[ScheduleBook; 1]> = book
@@ -458,22 +461,32 @@ struct ScheduleBook {
     starts: [WalkStart; WALK_STARTS],
     /// Routes each level's run holds while it is whole.
     run_len: [u16; MAX_LEVELS],
-    /// [`group_run`] of each group, which a push reads.
-    group_runs: [GroupRun; GROUPS],
-    /// Routes each group's run holds while it is whole.
-    group_len: [u16; GROUPS],
+    /// The slot each group's run takes its next route in while it is whole.
+    group_next: [u16; GROUPS],
+    /// [`GroupRun::end`] of each group, which a push reads.
+    group_end: [u16; GROUPS],
     pushed: usize,
+    /// The routes the schedule holds once a push has work besides writing
+    /// its route: the lead of the whole run the pushed routes reach first,
+    /// or one route more than the schedule has room for.
+    reach: usize,
     levels: usize,
     /// [`whole_runs`] of `pushed`.
     whole_runs: usize,
-    /// Whether the groups' runs were written since the routes were last
-    /// dropped: they are at the first push of a level past the first two,
-    /// which no walk of a group's levels has a route to skip before.
-    grouped: bool,
-    /// The groups whose runs are whole, a bit each: once `grouped`, those
-    /// of [`fitted_groups`] that the pushed routes and their sentinel end
-    /// at the lead of or before it, and that had a slot for every route
-    /// their levels pushed.
+    /// [`GROUPED_LEVELS`] while a group's run is whole, and no level
+    /// otherwise: the levels whose routes a push also gives to groups.
+    open_groups: usize,
+    /// Routes of the grouped levels among the pushed ones, counted while a
+    /// group's run is whole.
+    grouped_pushed: u16,
+    /// Routes of the grouped levels the whole groups' runs were given, in
+    /// the order they were pushed. It runs ahead of `grouped_pushed` while
+    /// routes dropped by [`ProbeSchedule::rewind`] are pushed again.
+    grouped_held: u16,
+    /// The groups whose runs are whole, a bit each: those of
+    /// [`FITTED_GROUPS`] that the pushed routes and their sentinel end at
+    /// the lead of or before it, and that had a slot for every route their
+    /// levels pushed.
     whole_groups: u8,
 }
 
@@ -529,7 +542,7 @@ const fn named_levels(levels: usize) -> usize {
 
 /// Levels whose routes the schedule also holds together: one run per set of
 /// two or more of them, a group, for the summary that leaves that set open.
-const GROUPED_LEVELS: usize = 3;
+pub(super) const GROUPED_LEVELS: usize = 3;
 const GROUPS: usize = (1 << GROUPED_LEVELS) - 1 - GROUPED_LEVELS;
 
 /// Each group's levels, bit `i` for level `i`, in the order the groups'
@@ -549,6 +562,7 @@ const _: () = {
         group += 1;
     }
     assert!(GROUPED_LEVELS <= named_levels(MAX_LEVELS) && GROUPS <= u8::BITS as usize);
+    assert!(GROUP_LEVELS[0].count_ones() as usize == GROUPED_LEVELS);
 };
 
 /// The groups each grouped level is in, a bit each.
@@ -593,8 +607,14 @@ struct GroupRun {
 }
 
 impl GroupRun {
-    fn lead(self) -> usize {
-        usize::from(self.lead)
+    const fn lead(self) -> usize {
+        self.lead as usize
+    }
+
+    /// The slot after the run's last: the sentinel of a run that is full,
+    /// and the lead of the run that follows.
+    const fn end(self) -> u16 {
+        self.lead + 1 + self.capacity
     }
 }
 
@@ -628,7 +648,7 @@ const fn group_run(levels: usize, group: usize) -> GroupRun {
         let capacity = group_routes(other) * room / every;
         lead -= capacity + 1;
         if other == group {
-            assert!(lead <= u16::MAX as usize);
+            assert!(lead + 1 + capacity <= u16::MAX as usize);
             #[allow(clippy::cast_possible_truncation)]
             return GroupRun {
                 lead: lead as u16,
@@ -638,33 +658,41 @@ const fn group_run(levels: usize, group: usize) -> GroupRun {
     }
 }
 
-/// [`group_run`] of every group of the schedule of `levels` levels.
-const fn group_runs(levels: usize) -> [GroupRun; GROUPS] {
-    let mut runs = [GroupRun {
+/// [`group_run`] of every group, by the schedule's level count.
+const GROUP_RUNS: [[GroupRun; GROUPS]; MAX_LEVELS + 1] = {
+    let mut runs = [[GroupRun {
         lead: 0,
         capacity: 0,
-    }; GROUPS];
-    let mut group = 0;
-    while group < GROUPS {
-        runs[group] = group_run(levels, group);
-        group += 1;
+    }; GROUPS]; MAX_LEVELS + 1];
+    let mut levels = 0;
+    while levels <= MAX_LEVELS {
+        let mut group = 0;
+        while group < GROUPS {
+            runs[levels][group] = group_run(levels, group);
+            group += 1;
+        }
+        levels += 1;
     }
     runs
-}
+};
 
-/// The groups of the schedule of `levels` levels whose runs have a slot for
-/// a route, a bit each.
-const fn fitted_groups(levels: usize) -> u8 {
-    let mut fitted = 0;
-    let mut group = 0;
-    while group < GROUPS {
-        if group_run(levels, group).capacity != 0 {
-            fitted |= 1 << group;
+/// The groups whose runs have a slot for a route, a bit each, by the
+/// schedule's level count.
+const FITTED_GROUPS: [u8; MAX_LEVELS + 1] = {
+    let mut fitted = [0; MAX_LEVELS + 1];
+    let mut levels = 0;
+    while levels <= MAX_LEVELS {
+        let mut group = 0;
+        while group < GROUPS {
+            if GROUP_RUNS[levels][group].capacity != 0 {
+                fitted[levels] |= 1 << group;
+            }
+            group += 1;
         }
-        group += 1;
+        levels += 1;
     }
     fitted
-}
+};
 
 /// The summary that leaves `group`'s levels open and no other.
 const fn group_summary(group: usize) -> SummaryBin {
@@ -893,10 +921,11 @@ impl ProbeSchedule {
             .wrapping_add(slot)
     }
 
-    /// A copy of `self` for `levels`, each route addressing its level
-    /// there.
-    pub(super) fn clone_onto<T>(&self, levels: &[Level<T>]) -> Self {
+    /// A copy of `self`, which holds routes of the first `scheduled` levels,
+    /// for `levels`: each route addresses its level there.
+    pub(super) fn clone_onto<T>(&self, levels: &[Level<T>], scheduled: usize) -> Self {
         let mut copy = ProbeScheduleRoom::for_levels(levels.len()).schedule(levels);
+        copy.rewind(0, scheduled);
         for route in self.routes() {
             let (level, logical_probe_index) = route.coordinates();
             copy.push(levels, level as usize, logical_probe_index);
@@ -951,10 +980,10 @@ impl ProbeSchedule {
                 book.starts[entry(summary)] = WalkStart::at_run(lead);
             }
         }
-        for group in 0..GROUPS {
+        for (group, run) in GROUP_RUNS[book.levels].iter().enumerate() {
             if book.whole_groups >> group & 1 != 0 {
                 // SAFETY: a fitted group's lead is a slot of the schedule.
-                let lead = unsafe { first.add(book.group_runs[group].lead()) };
+                let lead = unsafe { first.add(run.lead()) };
                 book.starts[entry(group_summary(group))] = WalkStart::at_list(lead);
             }
         }
@@ -962,9 +991,22 @@ impl ProbeSchedule {
 
     /// Drops the pushed routes.
     pub(super) fn clear(&mut self) {
+        self.rewind(0, 0);
+    }
+
+    /// Drops the pushed routes ahead of pushing those of the first `after`
+    /// levels, where the first `before` levels were pushed: the routes of
+    /// the levels in both are pushed again, in the same order and every
+    /// one of them. A group's run holds no route of another level, so where
+    /// every grouped level is in both the groups' runs keep their routes
+    /// and are not written again. The groups have runs from the first push
+    /// on once every grouped level is pushed, and none before: a walk of a
+    /// group's levels has no route to skip until then.
+    pub(super) fn rewind(&mut self, before: usize, after: usize) {
         let book = &mut *self.book;
-        // Every run is whole again, and empty: a sentinel follows its lead.
-        // So does one follow the direct route, and one is the last slot.
+        // Every level's run is whole again, and empty: a sentinel follows
+        // its lead. So does one follow the direct route, and one is the
+        // last slot.
         let runs = named_levels(book.levels);
         self.slots[1].write(SENTINEL);
         for level in 0..runs {
@@ -975,12 +1017,46 @@ impl ProbeSchedule {
             .expect("a schedule has slots")
             .write(SENTINEL);
         book.run_len = [0; MAX_LEVELS];
-        book.group_len = [0; GROUPS];
         book.pushed = 0;
-        book.grouped = false;
-        if (book.whole_runs, book.whole_groups) != (runs, 0) {
+        book.grouped_pushed = 0;
+        let mut groups = book.whole_groups;
+        if before.min(after) < GROUPED_LEVELS {
+            groups = if after < GROUPED_LEVELS {
+                0
+            } else {
+                FITTED_GROUPS[book.levels]
+            };
+            book.grouped_held = 0;
+            for (group, run) in GROUP_RUNS[book.levels].iter().enumerate() {
+                if groups >> group & 1 != 0 {
+                    book.group_next[group] = run.lead + 1;
+                    self.slots[run.lead() + 1].write(SENTINEL);
+                }
+            }
+        }
+        self.set_whole(runs, groups);
+    }
+
+    /// Makes the first `runs` levels' runs and the runs of `groups` the
+    /// ones a walk may start at. Nothing walks the schedule while it is
+    /// borrowed to change, so the starts may follow the writes that end a
+    /// run.
+    fn set_whole(&mut self, runs: usize, groups: u8) {
+        let book = &mut *self.book;
+        // The groups' runs lie ahead of the levels', the first group's
+        // first, and a deeper level's ahead of a shallower one's.
+        let lead = if groups != 0 {
+            GROUP_RUNS[book.levels][groups.trailing_zeros() as usize].lead()
+        } else if runs != 0 {
+            run_lead(book.levels, runs - 1)
+        } else {
+            usize::MAX
+        };
+        book.reach = lead.min(PROBE_SCHEDULE_CAPACITY[book.levels] + 1);
+        book.open_groups = if groups == 0 { 0 } else { GROUPED_LEVELS };
+        if (book.whole_runs, book.whole_groups) != (runs, groups) {
             book.whole_runs = runs;
-            book.whole_groups = 0;
+            book.whole_groups = groups;
             self.fill_starts();
         }
     }
@@ -990,15 +1066,15 @@ impl ProbeSchedule {
     /// prefix of it. The caller appends routes in query-position order,
     /// which is each level's probe order.
     pub(super) fn push<T>(&mut self, levels: &[Level<T>], level: usize, logical_probe_index: u64) {
-        let book = &mut *self.book;
-        assert!(
-            book.pushed < PROBE_SCHEDULE_CAPACITY[book.levels],
-            "probe schedule outgrew its room"
-        );
+        if self.book.pushed + 1 >= self.book.reach {
+            // No walk may start at a run the routes are about to overwrite.
+            self.leave_reached_runs();
+        }
         let route = PhiRoute::new(level, &levels[level], logical_probe_index);
-        let whole_runs = whole_runs(book.levels, book.pushed + 1, book.whole_runs);
+        let book = &mut *self.book;
+        let in_run = level < book.whole_runs;
         let run_len = usize::from(book.run_len[level]);
-        if level < whole_runs {
+        if in_run {
             assert!(
                 run_len < run_capacity(level),
                 "probe schedule outgrew its room"
@@ -1011,16 +1087,10 @@ impl ProbeSchedule {
                 "probe schedule pushed out of order"
             );
         }
-        if whole_runs != book.whole_runs {
-            // No walk may start at a run the routes are about to overwrite.
-            book.whole_runs = whole_runs;
-            self.fill_starts();
-        }
-        let book = &mut *self.book;
         book.pushed += 1;
         self.slots[book.pushed].write(route);
         self.slots[book.pushed + 1].write(SENTINEL);
-        if level < whole_runs {
+        if in_run {
             let run = run_lead(book.levels, level) + 1 + run_len;
             self.slots[run].write(route);
             // The lead of the run after this one, or the last slot, when
@@ -1028,81 +1098,74 @@ impl ProbeSchedule {
             self.slots[run + 1].write(SENTINEL);
             book.run_len[level] += 1;
         }
-        if book.whole_groups != 0 || (!book.grouped && level + 1 >= GROUPED_LEVELS) {
-            self.push_to_groups(route);
+        if level < book.open_groups {
+            book.grouped_pushed += 1;
+            if book.grouped_pushed > book.grouped_held {
+                book.grouped_held = book.grouped_pushed;
+                self.append_to_groups(route, level);
+            } else {
+                // The first group has every grouped level, so its run holds
+                // the routes in the order `grouped_pushed` counts them.
+                debug_assert!(
+                    book.whole_groups & 1 == 0 || {
+                        let held =
+                            GROUP_RUNS[book.levels][0].lead() + usize::from(book.grouped_pushed);
+                        // SAFETY: a whole run holds a route in each slot up to
+                        // its next, which the routes it was given reach.
+                        unsafe { self.slots[held].assume_init() == route }
+                    }
+                );
+            }
         }
     }
 
-    /// Brings the groups' runs up to `route`, the route just pushed: writes
-    /// them from the first pushed route on when they were not written yet,
-    /// and appends `route` otherwise. A run stops being whole when the
-    /// pushed routes and their sentinel pass its lead, or when it has no
-    /// slot for a route.
+    /// Stops walks from starting at the runs the routes and their sentinel
+    /// reach with one more pushed, which they do in the runs' order.
     #[cold]
-    fn push_to_groups(&mut self, route: PhiRoute) {
-        let book = &mut *self.book;
-        let was_whole = book.whole_groups;
-        if book.grouped {
-            self.append_to_groups(route);
-        } else {
-            book.grouped = true;
-            // A run the pushed routes have reached is never written, and
-            // one that takes no route still ends in a sentinel.
-            let mut fitted = fitted_groups(book.levels);
-            while fitted != 0 {
-                let group = fitted.trailing_zeros() as usize;
-                fitted &= fitted - 1;
-                let lead = book.group_runs[group].lead();
-                if lead > book.pushed {
-                    self.slots[lead + 1].write(SENTINEL);
-                    book.whole_groups |= 1 << group;
-                }
-            }
-            for pushed in 1..=book.pushed {
-                // SAFETY: the slots of the pushed routes hold routes.
-                let route = unsafe { self.slots[pushed].assume_init() };
-                self.append_to_groups(route);
-            }
-        }
-        // The pushed routes reach the groups' runs in the groups' order.
-        let book = &mut *self.book;
-        while book.whole_groups != 0 {
-            let first = book.whole_groups.trailing_zeros() as usize;
-            if book.group_runs[first].lead() > book.pushed {
+    fn leave_reached_runs(&mut self) {
+        let book = &*self.book;
+        assert!(
+            book.pushed < PROBE_SCHEDULE_CAPACITY[book.levels],
+            "probe schedule outgrew its room"
+        );
+        let pushed = book.pushed + 1;
+        let mut groups = book.whole_groups;
+        while groups != 0 {
+            let first = groups.trailing_zeros() as usize;
+            if GROUP_RUNS[book.levels][first].lead() > pushed {
                 break;
             }
-            book.whole_groups &= book.whole_groups - 1;
+            groups &= groups - 1;
         }
-        if book.whole_groups != was_whole {
-            // Nothing walks the schedule while it is borrowed to push, so
-            // the starts may follow the writes.
-            self.fill_starts();
-        }
+        let runs = whole_runs(book.levels, pushed, book.whole_runs);
+        self.set_whole(runs, groups);
     }
 
-    /// Appends `route` to the run of each whole group its level is in, or
-    /// drops the group where the run is full.
-    fn append_to_groups(&mut self, route: PhiRoute) {
+    /// Appends `route`, of grouped level `level`, to the run of each whole
+    /// group the level is in, or stops walks from starting at a run that
+    /// has no slot for it.
+    fn append_to_groups(&mut self, route: PhiRoute, level: usize) {
         let book = &mut *self.book;
-        let level = usize::from(route.level());
-        if level >= GROUPED_LEVELS {
-            return;
-        }
-        let mut groups = book.whole_groups & LEVEL_GROUPS[level];
-        while groups != 0 {
-            let group = groups.trailing_zeros() as usize;
-            groups &= groups - 1;
-            let run = book.group_runs[group];
-            if book.group_len[group] == run.capacity {
-                book.whole_groups &= !(1 << group);
+        let mut whole = book.whole_groups;
+        let groups = whole & LEVEL_GROUPS[level];
+        for group in 0..GROUPS {
+            if groups >> group & 1 == 0 {
                 continue;
             }
-            let slot = run.lead() + 1 + usize::from(book.group_len[group]);
-            self.slots[slot].write(route);
+            let slot = book.group_next[group];
+            if slot == book.group_end[group] {
+                whole &= !(1 << group);
+                continue;
+            }
+            self.slots[usize::from(slot)].write(route);
             // The lead of the group after this one, or of the last named
             // level, when the run is full.
-            self.slots[slot + 1].write(SENTINEL);
-            book.group_len[group] += 1;
+            self.slots[usize::from(slot) + 1].write(SENTINEL);
+            book.group_next[group] = slot + 1;
+        }
+        if whole != book.whole_groups {
+            let runs = book.whole_runs;
+            self.set_whole(runs, whole);
         }
     }
 
@@ -1141,8 +1204,9 @@ impl ProbeSchedule {
         let direct = self.direct();
         let book = &mut *self.book;
         book.whole_runs = 0;
-        book.grouped = true;
         book.whole_groups = 0;
+        book.open_groups = 0;
+        book.reach = PROBE_SCHEDULE_CAPACITY[book.levels] + 1;
         book.starts = [WalkStart::at_list(direct); WALK_STARTS];
     }
 
@@ -1181,14 +1245,13 @@ impl ProbeSchedule {
             && self.ends_with_sentinel()
             && slot(self.slots.len() - 1) == SENTINEL
             && book.whole_runs == whole_runs(book.levels, book.pushed, named_levels(book.levels))
-            && book.whole_groups & !fitted_groups(book.levels) == 0
-            && (book.grouped || book.whole_groups == 0)
+            && book.whole_groups & !FITTED_GROUPS[book.levels] == 0
             && (0..GROUPS)
                 .filter(|group| book.whole_groups >> group & 1 != 0)
                 .all(|group| {
-                    let run = group_run(book.levels, group);
+                    let run = GROUP_RUNS[book.levels][group];
                     let (lead, capacity) = (run.lead(), usize::from(run.capacity));
-                    let len = usize::from(book.group_len[group]);
+                    let len = usize::from(book.group_next[group]) - lead - 1;
                     let pushed = || {
                         self.routes()
                             .iter()
@@ -1219,7 +1282,7 @@ impl ProbeSchedule {
                 let level = (0..book.whole_runs)
                     .find(|&level| lone_level_summary(book.levels, level) == Some(summary));
                 let start = if let Some(group) = group {
-                    WalkStart::at_list(slot(book.group_runs[group].lead()))
+                    WalkStart::at_list(slot(GROUP_RUNS[book.levels][group].lead()))
                 } else if let Some(level) = level {
                     WalkStart::at_run(slot(run_lead(book.levels, level)))
                 } else if summary == NO_LEVELS_OCCUPIED {
@@ -1249,7 +1312,7 @@ impl ProbeSchedule {
     pub(super) fn whole_groups(&self) -> (u32, u32) {
         (
             self.book.whole_groups.count_ones(),
-            fitted_groups(self.book.levels).count_ones(),
+            FITTED_GROUPS[self.book.levels].count_ones(),
         )
     }
 

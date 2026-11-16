@@ -2666,6 +2666,16 @@ fn clone_carries_the_schedule_onto_its_own_levels() {
         assert!(copy.probe_schedule.ends_with_sentinel());
         assert!(copy.probe_schedule.addresses(&copy.levels));
         assert!(!copy.probe_schedule.addresses(&source.levels));
+        // The copy's walks start where the source's do.
+        assert_ne!(source.probe_schedule.whole_groups().0, 0);
+        assert_eq!(
+            copy.probe_schedule.whole_groups(),
+            source.probe_schedule.whole_groups()
+        );
+        assert_eq!(
+            copy.probe_schedule.whole_runs(),
+            source.probe_schedule.whole_runs()
+        );
     }
     drop(map);
     for key in 0..KEYS - 64 {
@@ -3290,6 +3300,28 @@ fn schedule_push_past_its_room_panics_instead_of_moving_the_routes() {
 }
 
 #[test]
+#[should_panic(expected = "probe schedule outgrew its room")]
+fn schedule_push_past_every_route_panics_where_no_run_is_whole() {
+    let mut table =
+        ElasticTable::<u64, u64, FixedHashBuilder>::try_with_slots_and_reserve_fraction_and_hasher_in(
+            1_024,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+    let last = table.levels.len() - 1;
+    table.schedule_levels_through(last);
+    table.extend_probe_schedule(QUERY_POSITION_CAP);
+    assert_eq!(
+        table.probe_schedule.routes().len(),
+        table.probe_schedule.route_capacity()
+    );
+    assert_eq!(table.probe_schedule.whole_runs(), 0);
+    table.probe_schedule.push(&table.levels, last, 0);
+}
+
+#[test]
 fn removing_a_full_table_leaves_no_tombstone_for_lookups() {
     let mut map = FixedElasticHashMap::<u64, u64>::with_capacity(1_024);
     let live = map.capacity() as u64;
@@ -3844,6 +3876,31 @@ fn settled_plan_stays_readable_past_a_leaked_drain() {
 /// pushed routes take the runs' slots one level after another, and again
 /// after the schedule is dropped and rebuilt.
 #[test]
+fn rebuild_leaves_a_group_run_that_stopped_being_whole_as_it_is() {
+    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            1 << 8,
+            ReserveFraction::DEFAULT,
+            IdentityBuildHasher,
+            Global,
+        )
+        .unwrap();
+    let fitted = table.probe_schedule.whole_groups().1;
+    assert_ne!(fitted, 0);
+    // Every route of the grouped levels is more than the groups' runs
+    // have slots for.
+    table.schedule_levels_through(schedule::GROUPED_LEVELS);
+    table.extend_probe_schedule(QUERY_POSITION_CAP);
+    let whole = table.probe_schedule.whole_groups().0;
+    assert!(whole < fitted);
+    assert!(table.probe_schedule.addresses(&table.levels));
+    // The rebuild that brings the other levels in keeps the groups' runs.
+    table.schedule_levels_through(table.levels.len() - 1);
+    assert!(table.probe_schedule.whole_groups().0 <= whole);
+    assert!(table.probe_schedule.addresses(&table.levels));
+}
+
+#[test]
 #[cfg_attr(miri, ignore)]
 fn every_walk_start_leads_to_the_routes_its_summary_leaves_open() {
     for slots in [16, 64, 1_024, 1 << 15] {
@@ -3901,16 +3958,34 @@ fn every_walk_start_leads_to_the_routes_its_summary_leaves_open() {
         let fitted = table.probe_schedule.whole_groups().1;
         // Only a table with levels past the named ones has room for groups.
         assert_eq!(fitted != 0, named < level_count, "{slots} slots");
-        for _ in 0..2 {
+        for staged in [false, true] {
             let mut whole_groups_seen = alloc::vec![false; fitted as usize + 1];
-            // Rebuilt up to no position at all, the schedule is empty.
+            // Cleared, the schedule is empty and every run whole.
             table.probe_high_water &= HIGH_WATER_FLAGS;
-            table.schedule_levels_through(level_count - 1);
+            table.scheduled_levels = 0;
+            table.probe_schedule.clear();
             assert_eq!(table.probe_schedule.routes(), []);
             assert_eq!(table.probe_schedule.whole_runs(), named);
-            // The groups' runs are written once a third level has a route.
             assert_eq!(table.probe_schedule.whole_groups(), (0, fitted));
             let mut high_water = 0_u128;
+            if staged {
+                // Levels come into the schedule as placements reach them,
+                // and the routes pushed so far are pushed again with the
+                // new level's among them: first among the grouped levels'
+                // own, which the groups have no runs for, then with those
+                // all there.
+                for (through, to, grouped) in
+                    [(1, 40, 0), (schedule::GROUPED_LEVELS - 1, 120, fitted)]
+                {
+                    table.schedule_levels_through(through.min(level_count - 1));
+                    assert_eq!(assert_starts(&table), grouped);
+                    table.extend_probe_schedule(to);
+                    assert_starts(&table);
+                    high_water = to;
+                }
+            }
+            table.schedule_levels_through(level_count - 1);
+            assert_eq!(assert_starts(&table), fitted);
             while high_water < QUERY_POSITION_CAP {
                 high_water = (high_water + high_water / 4 + 1).min(QUERY_POSITION_CAP);
                 table.extend_probe_schedule(high_water);
