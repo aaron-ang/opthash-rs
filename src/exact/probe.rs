@@ -225,6 +225,13 @@ impl FunnelPrf {
         self.lane_seed.wrapping_neg()
     }
 
+    /// The factor from one ordinary level's multiplier to the next level's,
+    /// which a walk over consecutive levels applies to its running word.
+    #[inline]
+    pub(crate) const fn level_step(self) -> u64 {
+        self.fold
+    }
+
     #[inline]
     pub(crate) fn prepare(self, key_hash: u64) -> PreparedFastFunnelProbe {
         let keyed = key_hash.wrapping_add(self.lane_seed);
@@ -235,16 +242,25 @@ impl FunnelPrf {
     }
 
     /// Odd multiplier that turns a key's folded word into its first random
-    /// word in ordinary level `level`.
+    /// word in ordinary level `level`: [`KEY_FOLD`] raised to one more than
+    /// the level, so each level's word is the level before's times
+    /// [`Self::level_step`] and the first level's is not the folded word the
+    /// fingerprint is cut from.
     pub(crate) const fn ordinary_multiplier(level: u64) -> Option<u64> {
-        match Self::ordinary_counter_base(level) {
-            Some(counter_base) => Some(mix64(counter_base ^ INITIAL_LANE) | 1),
-            None => None,
+        if try_pack_funnel_counter(ProbeDomain::FunnelOrdinary { level }, 0, 0).is_none() {
+            return None;
         }
-    }
-
-    pub(crate) const fn ordinary_counter_base(level: u64) -> Option<u64> {
-        try_pack_funnel_counter(ProbeDomain::FunnelOrdinary { level }, 0, 0)
+        let mut multiplier = KEY_FOLD;
+        let mut square = KEY_FOLD;
+        let mut exponent = level;
+        while exponent != 0 {
+            if exponent & 1 == 1 {
+                multiplier = multiplier.wrapping_mul(square);
+            }
+            square = square.wrapping_mul(square);
+            exponent >>= 1;
+        }
+        Some(multiplier)
     }
 }
 
@@ -507,7 +523,7 @@ impl PreparedFastFunnelProbe {
     }
 
     #[inline]
-    const fn ordinary_first_word(self, multiplier: u64) -> u64 {
+    pub(crate) const fn ordinary_first_word(self, multiplier: u64) -> u64 {
         self.key_out.wrapping_mul(multiplier)
     }
 
@@ -843,17 +859,22 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
 /// The random word of an ordinary level is the folded key times that level's
 /// multiplier, not a counter word: `key_out` already folds every bit of the
 /// key, and a distinct odd multiplier per level decorrelates the levels with
-/// one multiply. The key whose folded word is zero draws bucket zero in
-/// every level.
-#[allow(clippy::cast_possible_truncation)]
+/// one multiply. The multipliers are successive powers of one constant. The
+/// key whose folded word is zero draws bucket zero in every level.
 #[inline]
 pub(crate) fn ordinary_funnel_bucket(
     probe: PreparedFastFunnelProbe,
     multiplier: u64,
     buckets: usize,
 ) -> usize {
-    let product = u128::from(probe.ordinary_first_word(multiplier)) * u128::from(buckets as u64);
-    (product >> u64::BITS) as usize
+    ordinary_bucket_of_word(probe.ordinary_first_word(multiplier), buckets)
+}
+
+/// [`ordinary_funnel_bucket`] of a level's random word.
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+pub(crate) const fn ordinary_bucket_of_word(word: u64, buckets: usize) -> usize {
+    ((word as u128 * buckets as u128) >> u64::BITS) as usize
 }
 
 #[cold]
