@@ -2277,7 +2277,9 @@ fn shifted_vacancy_search_agrees_with_the_general_one() {
                         assert!(ptr::eq(found.level, region));
                         assert_eq!(found.summary_bit, region.summary_bit());
                         // SAFETY: the search returns a slot of `region`.
-                        assert_eq!(found.control, unsafe { region.control_at(found.slot) });
+                        assert_eq!(found.control, unsafe {
+                            i32::from(region.control_at(found.slot).cast_signed())
+                        });
                         found.slot
                     });
                     assert_eq!(settled, shifted.map(|(slot, _)| slot));
@@ -3419,6 +3421,7 @@ fn settled_plan_places_every_key_where_the_general_insert_does() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
     const BLOCK: usize = 64;
     type Table = ElasticTable<u64, u64, FixedHashBuilder>;
@@ -3511,6 +3514,7 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn settled_fallback_bound_holds_where_its_level_recrosses_a_quarter_free() {
     type Table = ElasticTable<u64, u64, FixedHashBuilder>;
 
@@ -3565,8 +3569,7 @@ fn settled_fallback_bound_holds_where_its_level_recrosses_a_quarter_free() {
     let mut live_keys: Vec<u64> = (0..next_key).collect();
     let base_live = settled.live();
     let mut crossed_open = 0;
-    let rounds = if cfg!(miri) { 40 } else { 4_000 };
-    for _ in 0..rounds {
+    for _ in 0..4_000 {
         let mut removed = 0_usize;
         live_keys.retain(|&key| {
             let hash = hash_of(key);
@@ -3598,7 +3601,7 @@ fn settled_fallback_bound_holds_where_its_level_recrosses_a_quarter_free() {
             BatchTarget::LevelPair(1)
         );
     }
-    assert!(cfg!(miri) || crossed_open > 4, "{crossed_open} crossings");
+    assert!(crossed_open > 4, "{crossed_open} crossings");
 }
 
 #[test]
@@ -3686,4 +3689,16 @@ fn route_step_and_reach_read_what_each_route_holds() {
     assert_eq!(step.close(0), SENTINEL_BIT);
     // SAFETY: the sentinel is a route of the schedule.
     assert_eq!(unsafe { (*route).level() }, SENTINEL_LEVEL);
+}
+
+#[test]
+fn signed_control_sign_extends_every_byte() {
+    let bytes: Vec<u8> = (0..=u8::MAX).collect();
+    for (slot, &byte) in bytes.iter().enumerate() {
+        // SAFETY: `slot` indexes `bytes`.
+        let signed = unsafe { signed_control(bytes.as_ptr(), slot) };
+        assert_eq!(signed, i32::from(byte.cast_signed()));
+        assert_eq!(signed >= 0, control::is_free(byte));
+        assert_eq!(signed.to_le_bytes()[0], byte);
+    }
 }
