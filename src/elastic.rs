@@ -3462,54 +3462,114 @@ where
         }
 
         let summary = filter.summary();
-        let mut closed_levels = schedule::closed_levels(summary);
-        let mut route = self.probe_schedule.walk_start(summary);
-        loop {
-            // SAFETY: a sentinel closes the routes after a walk start, and
-            // the walk cannot pass it: the sentinel's level stays open until
-            // its own probe, which reads `EMPTY` and ends the walk below. So
-            // `route` is ahead of that sentinel here.
-            let step = unsafe { PhiRoute::step(&mut route) };
-            if step.is_closed(closed_levels) {
-                continue;
-            }
-            // SAFETY: as above, `route` is at most the sentinel.
-            let (index_shift, level_control) = unsafe { PhiRoute::reach(route) };
-            // The route holds a shift whichever reduction its level needs.
-            let slot = probe::masked_shift_elastic_index(
-                sequence.word_at(step.sequence_index()),
-                index_shift,
-            );
-            // SAFETY: the route's shifted index maps into the control bytes
-            // it holds.
-            let control = unsafe { *level_control.add(slot) };
-            if control == key_fingerprint {
-                let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
-                let entry: *mut SlotEntry<K, V> = ProbeSchedule::entry_at(entry_origin, offset);
-                // SAFETY: the sentinel's control bytes match no fingerprint,
-                // so the route names a real level, and a fingerprint match
-                // means the slot is occupied and holds an entry.
-                if key.equivalent(unsafe { &(*entry).key }) {
-                    // SAFETY: as above.
-                    let level = unsafe { (*route).level() };
-                    let entry = EntryAt {
-                        entry_origin,
-                        offset,
-                    };
-                    return ScheduleSearch::Hit(on_hit(level as usize, slot, entry, level_control));
-                }
-                unlikely_path();
-            } else if control == CTRL_EMPTY {
-                // A key takes its level's first free probe, and a slot
-                // returns to `EMPTY` only when its whole level is reset: a
-                // removal leaves a tombstone, and so does a `clear` until its
-                // last entry is out, even one a panicking drop interrupts. So
-                // the key cannot sit at a later probe of this level.
-                closed_levels = step.close(closed_levels);
-                // Either this was the sentinel, or no real level is left
-                // open.
-                if closed_levels & SENTINEL_BIT != 0 || closed_levels == !SENTINEL_BIT {
+        match self.probe_schedule.walk_start(summary).run() {
+            Ok(mut run) => loop {
+                // SAFETY: a sentinel closes the run, and the walk cannot
+                // pass it: its probe reads `EMPTY` and ends the walk below.
+                // So the walk is ahead of that sentinel here.
+                let sequence_index = unsafe { run.step() };
+                let route = run.route();
+                // SAFETY: the walk has stepped, so `route` is a route of the
+                // schedule, at most the sentinel.
+                let (index_shift, level_control) = unsafe { PhiRoute::reach(route) };
+                let slot = probe::masked_shift_elastic_index(
+                    sequence.word_at(sequence_index),
+                    index_shift,
+                );
+                // SAFETY: the route's shifted index maps into the control
+                // bytes it holds.
+                let control = unsafe { *level_control.add(slot) };
+                if control == key_fingerprint {
+                    let offset =
+                        ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
+                    let entry: *mut SlotEntry<K, V> = ProbeSchedule::entry_at(entry_origin, offset);
+                    // SAFETY: the sentinel's control bytes match no
+                    // fingerprint, so the route names a real level, and a
+                    // fingerprint match means the slot is occupied and
+                    // holds an entry.
+                    if key.equivalent(unsafe { &(*entry).key }) {
+                        // SAFETY: as above.
+                        let level = unsafe { (*route).level() };
+                        let entry = EntryAt {
+                            entry_origin,
+                            offset,
+                        };
+                        return ScheduleSearch::Hit(on_hit(
+                            level as usize,
+                            slot,
+                            entry,
+                            level_control,
+                        ));
+                    }
+                    unlikely_path();
+                } else if control == CTRL_EMPTY {
+                    // The run's level has no later probe to hold the key,
+                    // as below, and the walk has no other level to visit.
                     break;
+                }
+            },
+            Err(direct) => {
+                let mut closed_levels = schedule::closed_levels(summary);
+                let mut route = direct;
+                loop {
+                    // SAFETY: a sentinel closes the routes after the direct
+                    // route, and the walk cannot pass it: the sentinel's
+                    // level stays open until its own probe, which reads
+                    // `EMPTY` and ends the walk below. So `route` is ahead
+                    // of that sentinel here.
+                    let step = unsafe { PhiRoute::step(&mut route) };
+                    if step.is_closed(closed_levels) {
+                        continue;
+                    }
+                    // SAFETY: as above, `route` is at most the sentinel.
+                    let (index_shift, level_control) = unsafe { PhiRoute::reach(route) };
+                    // The route holds a shift whichever reduction its level
+                    // needs.
+                    let slot = probe::masked_shift_elastic_index(
+                        sequence.word_at(step.sequence_index()),
+                        index_shift,
+                    );
+                    // SAFETY: the route's shifted index maps into the
+                    // control bytes it holds.
+                    let control = unsafe { *level_control.add(slot) };
+                    if control == key_fingerprint {
+                        let offset =
+                            ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
+                        let entry: *mut SlotEntry<K, V> =
+                            ProbeSchedule::entry_at(entry_origin, offset);
+                        // SAFETY: the sentinel's control bytes match no
+                        // fingerprint, so the route names a real level, and
+                        // a fingerprint match means the slot is occupied and
+                        // holds an entry.
+                        if key.equivalent(unsafe { &(*entry).key }) {
+                            // SAFETY: as above.
+                            let level = unsafe { (*route).level() };
+                            let entry = EntryAt {
+                                entry_origin,
+                                offset,
+                            };
+                            return ScheduleSearch::Hit(on_hit(
+                                level as usize,
+                                slot,
+                                entry,
+                                level_control,
+                            ));
+                        }
+                        unlikely_path();
+                    } else if control == CTRL_EMPTY {
+                        // A key takes its level's first free probe, and a
+                        // slot returns to `EMPTY` only when its whole level
+                        // is reset: a removal leaves a tombstone, and so
+                        // does a `clear` until its last entry is out, even
+                        // one a panicking drop interrupts. So the key cannot
+                        // sit at a later probe of this level.
+                        closed_levels = step.close(closed_levels);
+                        // Either this was the sentinel, or no real level is
+                        // left open.
+                        if closed_levels & SENTINEL_BIT != 0 || closed_levels == !SENTINEL_BIT {
+                            break;
+                        }
+                    }
                 }
             }
         }

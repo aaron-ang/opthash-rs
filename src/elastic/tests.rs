@@ -3740,6 +3740,57 @@ fn every_walk_start_leads_to_the_routes_its_summary_leaves_open() {
     }
 }
 
+#[test]
+fn run_walk_steps_over_its_level_routes_and_stops_at_a_sentinel() {
+    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            8_193,
+            ReserveFraction::DEFAULT,
+            IdentityBuildHasher,
+            Global,
+        )
+        .unwrap();
+    let level_count = table.levels.len();
+    table.schedule_levels_through(level_count - 1);
+    table.extend_probe_schedule(1_024);
+    let schedule = &table.probe_schedule;
+    assert!(schedule.whole_runs() >= ROUTE_SUMMARY_LEVELS);
+
+    let walk = |summary: SummaryBin, level: Option<usize>| {
+        let mut run = schedule.walk_start(summary).run().unwrap();
+        let held = schedule
+            .routes()
+            .iter()
+            .filter(|route| Some(usize::from(route.level())) == level);
+        let mut steps = 0;
+        for held in held {
+            // SAFETY: the walk is ahead of the run's sentinel, which follows
+            // every route of the level.
+            let sequence_index = unsafe { run.step() };
+            assert_eq!(sequence_index, held.as_step().sequence_index());
+            // SAFETY: the walk has stepped onto a route of the schedule.
+            assert_eq!(unsafe { *run.route() }, *held);
+            steps += 1;
+        }
+        // SAFETY: as above; the level's last route is ahead of the sentinel.
+        assert_eq!(unsafe { run.step() }, 0);
+        // SAFETY: the sentinel is a route of the schedule.
+        assert_eq!(unsafe { (*run.route()).level() }, SENTINEL_LEVEL);
+        steps
+    };
+    assert_eq!(walk(NO_LEVELS_OCCUPIED, None), 0);
+    for level in 0..ROUTE_SUMMARY_LEVELS - 1 {
+        assert_ne!(walk(NO_LEVELS_OCCUPIED & !(2 << level), Some(level)), 0);
+    }
+    // Two open levels are no run's.
+    assert!(
+        schedule
+            .walk_start(NO_LEVELS_OCCUPIED & !0b110)
+            .run()
+            .is_err()
+    );
+}
+
 type ComparesCountedMap = ElasticHashMap<ComparesCounted, u64, FixedHashBuilder>;
 
 /// Clears the count of key compares and returns what it was.
@@ -3774,12 +3825,8 @@ fn assert_twin_lookups_agree(
         let summary = started
             .route_filter(PreparedElasticRoute::new(hash))
             .summary();
-        assert_eq!(
-            direct.probe_schedule.walk_start(summary),
-            direct.probe_schedule.direct()
-        );
-        let at_direct =
-            started.probe_schedule.walk_start(summary) == started.probe_schedule.direct();
+        assert!(direct.probe_schedule.walk_start(summary).run().is_err());
+        let at_direct = started.probe_schedule.walk_start(summary).run().is_err();
         from_runs += u64::from(!at_direct);
         from_direct += u64::from(at_direct);
     }

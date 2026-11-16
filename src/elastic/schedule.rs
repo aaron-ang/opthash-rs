@@ -20,8 +20,11 @@ use crate::raw::control::CTRL_EMPTY;
 /// `repr(C)` keeps the two words a step tests and multiplies adjacent, and
 /// the two a probe reduces and reads through adjacent, so each pair comes in
 /// one load.
+///
+/// Its alignment leaves the low bits of a route's address clear, which a
+/// [`WalkStart`] marks a run's lead in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(C)]
+#[repr(C, align(32))]
 pub(super) struct PhiRoute {
     /// The level's bit of a closed-level set, alone, so a step tests it
     /// against the set and closes the level with it as they are.
@@ -216,6 +219,88 @@ const _: () = assert!(
         && core::mem::offset_of!(PhiRoute, sequence_index) == size_of::<u64>()
 );
 
+/// Where a walk steps on from: the direct route, for a walk over the routes
+/// in query-position order, or the lead of a run, for a walk that has that
+/// run's level alone to visit or no level at all.
+///
+/// It is the address of the word the walk's step reads in the route after:
+/// a route's first word, or, for a run's lead, its sequence index, which no
+/// route's own address is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(super) struct WalkStart(*const u8);
+
+/// Offset in a route of the one word a walk of a run steps on.
+const RUN_STEP_WORD: usize = core::mem::offset_of!(PhiRoute, sequence_index);
+const _: () = assert!(RUN_STEP_WORD.is_power_of_two() && RUN_STEP_WORD < align_of::<PhiRoute>());
+
+impl WalkStart {
+    fn at_direct(direct: *const PhiRoute) -> Self {
+        Self(direct.cast())
+    }
+
+    fn at_run(lead: *const PhiRoute) -> Self {
+        Self(lead.cast::<u8>().wrapping_add(RUN_STEP_WORD))
+    }
+
+    /// The start as a run's lead, or as the direct route.
+    #[inline]
+    pub(super) fn run(self) -> Result<RunWalk, *const PhiRoute> {
+        if self.0.addr() & RUN_STEP_WORD == 0 {
+            Err(self.0.cast())
+        } else {
+            Ok(RunWalk(self.0.cast()))
+        }
+    }
+}
+
+/// A walk of one run: the sequence index of the route it is at, which starts
+/// as the run's lead.
+#[derive(Clone, Copy)]
+pub(super) struct RunWalk(*const u64);
+
+impl RunWalk {
+    /// Steps to the route after and reads its sequence index, the one word
+    /// a step takes where no other level is left to skip. On 64-bit
+    /// `AArch64` the step and the read are one pre-indexed load.
+    ///
+    /// # Safety
+    ///
+    /// The walk is ahead of the sentinel that closes its run.
+    #[inline]
+    pub(super) unsafe fn step(&mut self) -> u64 {
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64", not(miri)))]
+        {
+            const _: () = assert!(size_of::<PhiRoute>() == 32);
+            let sequence_index: u64;
+            // SAFETY: the caller's contract: the next route holds the word,
+            // which the load only reads.
+            unsafe {
+                core::arch::asm!(
+                    "ldr {sequence_index}, [{at}, #32]!",
+                    at = inout(reg) self.0,
+                    sequence_index = lateout(reg) sequence_index,
+                    options(pure, readonly, nostack, preserves_flags),
+                );
+            }
+            sequence_index
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_pointer_width = "64", not(miri))))]
+        {
+            // SAFETY: the caller's contract.
+            self.0 = unsafe { self.0.byte_add(size_of::<PhiRoute>()) };
+            // SAFETY: as above.
+            unsafe { *self.0 }
+        }
+    }
+
+    /// The route the walk is at, once it has stepped.
+    #[inline]
+    pub(super) fn route(self) -> *const PhiRoute {
+        self.0.wrapping_byte_sub(RUN_STEP_WORD).cast()
+    }
+}
+
 /// What a walk's step reads of a route.
 #[derive(Clone, Copy)]
 pub(super) struct RouteStep {
@@ -323,7 +408,7 @@ impl ProbeScheduleRoom {
         slots.resize_with(slot_count(level_count), MaybeUninit::uninit);
         slots[0].write(direct);
         book.push(ScheduleBook {
-            starts: [slots.as_ptr().cast(); WALK_STARTS],
+            starts: [WalkStart::at_direct(slots.as_ptr().cast()); WALK_STARTS],
             run_len: [0; MAX_LEVELS],
             pushed: 0,
             levels: level_count,
@@ -335,7 +420,7 @@ impl ProbeScheduleRoom {
             direct_control: direct.control(),
             entry_origin: entry_origin(levels),
             // SAFETY: the table holds `WALK_STARTS` entries.
-            starts: unsafe { book.as_ptr().cast::<*const PhiRoute>().add(WALK_STARTS / 2) },
+            starts: unsafe { book.as_ptr().cast::<WalkStart>().add(WALK_STARTS / 2) },
             slots,
             book,
         };
@@ -355,7 +440,7 @@ struct ScheduleBook {
     /// the summaries that are negative as signed bytes first. The slots
     /// never move, so an entry changes only when a run stops being whole or
     /// becomes whole again.
-    starts: [*const PhiRoute; WALK_STARTS],
+    starts: [WalkStart; WALK_STARTS],
     /// Routes each level's run holds while it is whole.
     run_len: [u16; MAX_LEVELS],
     pushed: usize,
@@ -445,7 +530,7 @@ pub(super) struct ProbeSchedule {
     /// See [`entry_origin`].
     entry_origin: *mut u8,
     /// The entry of the book's walk starts for summary zero.
-    starts: *const *const PhiRoute,
+    starts: *const WalkStart,
     /// Every slot of the schedule. The slots never move and their count
     /// never changes: [`Self::push`] and [`Self::clear`] only write them.
     ///
@@ -558,13 +643,13 @@ impl ProbeSchedule {
         unsafe { &*(ptr::from_ref(pushed) as *const [PhiRoute]) }
     }
 
-    /// The route a walk under `summary` steps on from. Every route after it
-    /// up to and including a sentinel, whose level is [`SENTINEL_LEVEL`],
-    /// may be read. Between the two lie, in query-position order, the pushed
+    /// Where a walk under `summary` steps on from. Every route after it up
+    /// to and including a sentinel, whose level is [`SENTINEL_LEVEL`], may
+    /// be read. Between the two lie, in query-position order, the pushed
     /// routes of every level `summary` leaves open, and none but pushed
-    /// routes.
+    /// routes; after a run's lead, no other route at all.
     #[inline]
-    pub(super) fn walk_start(&self, summary: SummaryBin) -> *const PhiRoute {
+    pub(super) fn walk_start(&self, summary: SummaryBin) -> WalkStart {
         // SAFETY: `starts` has an entry at every signed byte's distance.
         unsafe { *self.starts.offset(isize::from(summary.cast_signed())) }
     }
@@ -580,13 +665,14 @@ impl ProbeSchedule {
         let slots = self.slots.len();
         let book = &mut self.book[0];
         let entry = |summary: SummaryBin| (WALK_STARTS / 2 + usize::from(summary)) % WALK_STARTS;
-        book.starts = [first; WALK_STARTS];
+        book.starts = [WalkStart::at_direct(first); WALK_STARTS];
         // SAFETY: a schedule has the direct route's slot and two more.
-        book.starts[entry(NO_LEVELS_OCCUPIED)] = unsafe { first.add(slots - 2) };
+        book.starts[entry(NO_LEVELS_OCCUPIED)] = WalkStart::at_run(unsafe { first.add(slots - 2) });
         for level in 0..book.whole_runs {
             if let Some(summary) = lone_level_summary(book.levels, level) {
                 // SAFETY: a run's lead is a slot of the schedule.
-                book.starts[entry(summary)] = unsafe { first.add(run_lead(book.levels, level)) };
+                let lead = unsafe { first.add(run_lead(book.levels, level)) };
+                book.starts[entry(summary)] = WalkStart::at_run(lead);
             }
         }
         book.starts_name_runs = true;
@@ -668,7 +754,10 @@ impl ProbeSchedule {
     /// The routes a walk under `summary` steps over before its sentinel.
     #[cfg(test)]
     pub(super) fn walk_routes(&self, summary: SummaryBin) -> Vec<PhiRoute> {
-        let mut route = self.walk_start(summary);
+        let mut route = match self.walk_start(summary).run() {
+            Ok(run) => run.route(),
+            Err(direct) => direct,
+        };
         let mut routes = Vec::new();
         loop {
             // SAFETY: a sentinel follows every walk start, and the walk
@@ -691,7 +780,7 @@ impl ProbeSchedule {
         let book = &mut self.book[0];
         book.whole_runs = 0;
         book.starts_name_runs = true;
-        book.starts = [direct; WALK_STARTS];
+        book.starts = [WalkStart::at_direct(direct); WALK_STARTS];
     }
 
     /// Whether every route is the one its level in `levels` gives, every
@@ -731,13 +820,16 @@ impl ProbeSchedule {
                     && slot(first + len) == SENTINEL
             })
             && (SummaryBin::MIN..=SummaryBin::MAX).all(|summary| {
-                let start = self.walk_start(summary);
-                start == self.direct()
-                    || book.starts_name_runs
-                        && (start == self.slots[self.slots.len() - 2].as_ptr()
-                            || (0..book.whole_runs).any(|level| {
-                                start == self.slots[run_lead(book.levels, level)].as_ptr()
-                            }))
+                match self.walk_start(summary).run() {
+                    Err(direct) => direct == self.direct(),
+                    Ok(run) => {
+                        book.starts_name_runs
+                            && (run.route() == self.slots[self.slots.len() - 2].as_ptr()
+                                || (0..book.whole_runs).any(|level| {
+                                    run.route() == self.slots[run_lead(book.levels, level)].as_ptr()
+                                }))
+                    }
+                }
             })
             && (book.starts_name_runs || book.pushed == 0)
     }
