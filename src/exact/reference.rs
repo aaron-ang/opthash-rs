@@ -442,7 +442,7 @@ impl<O: ProbeOracle> ScalarFunnel<O> {
     ) -> Result<(ScalarFunnelSearch, u128), RangeReductionError> {
         let mut logical_probes = 0_u128;
         for (level, &(offset, bucket_count)) in self.levels.iter().enumerate() {
-            // An ordinary level reduces one word, with no rejection test.
+            // An ordinary level reduces one word.
             let word = self.oracle.word(
                 identity,
                 ProbeDomain::FunnelOrdinary {

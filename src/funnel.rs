@@ -140,7 +140,8 @@ impl<T> HeadLevel<T> {
     ///
     /// # Safety
     ///
-    /// `bucket` is below the level's bucket count.
+    /// `bucket` is below the level's bucket count, or zero for an entry
+    /// that is no level.
     #[inline]
     unsafe fn entries(&self, bucket: usize) -> *mut [MaybeUninit<T>; GROUP_SIZE] {
         // SAFETY: the caller keeps the bucket inside the level.
