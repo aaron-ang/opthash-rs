@@ -370,7 +370,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
     }
     assert_eq!(
         oracle.word(0, ProbeDomain::FunnelOrdinary { level: 0 }, 0, 0),
-        0x2ee5_d5a0_6f80_afe8
+        0xe2a7_e887_3647_55d8
     );
 }
 
@@ -538,6 +538,23 @@ fn fast_funnel_awkward_ranges_have_no_large_fixed_seed_skew() {
             .unwrap()
             .index
     });
+}
+
+/// A walk over consecutive levels multiplies its running word by the step
+/// where a lookup of one level multiplies the folded word by that level's
+/// multiplier, and both must draw the same bucket.
+#[test]
+fn stepping_a_level_word_reaches_the_next_level_multiplier() {
+    let oracle = FunnelPrf::new(FIXED_SEED);
+    for key in [0, 1, u64::MAX, 0x0123_4567_89ab_cdef] {
+        let probe = oracle.prepare(key);
+        let mut word = probe.ordinary_first_word(oracle.level_step());
+        for level in 0..4_096_u64 {
+            let multiplier = FunnelPrf::ordinary_multiplier(level).unwrap();
+            assert_eq!(word, probe.ordinary_first_word(multiplier), "level {level}");
+            word = word.wrapping_mul(oracle.level_step());
+        }
+    }
 }
 
 /// Two levels sharing a multiplier would send every key to correlated

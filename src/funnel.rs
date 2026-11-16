@@ -1830,7 +1830,12 @@ where
         &self,
         probe: PreparedFastFunnelProbe,
     ) -> Option<HeadVacancy<SlotEntry<K, V>>> {
-        (0..OVERFLOW_LEVEL).find_map(|index| self.first_empty_in_head_level(probe, index))
+        let mut word = probe.ordinary_first_word(self.prf.level_step());
+        (0..OVERFLOW_LEVEL).find_map(|index| {
+            let vacancy = self.first_empty_in_head_level(word, index);
+            word = word.wrapping_mul(self.prf.level_step());
+            vacancy
+        })
     }
 
     /// The duplicate search and [`Self::first_empty_in_head`] in one walk,
@@ -1936,16 +1941,18 @@ where
     }
 
     /// One step of [`Self::first_empty_in_head`]: the first EMPTY lane of the
-    /// key's bucket in head entry `index`, if it has one.
+    /// key's bucket in head entry `index`, if it has one. `word` is the key's
+    /// random word in that level, which the caller steps from the level
+    /// before by [`FunnelPrf::level_step`].
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn first_empty_in_head_level(
         &self,
-        probe: PreparedFastFunnelProbe,
+        word: u64,
         index: usize,
     ) -> Option<HeadVacancy<SlotEntry<K, V>>> {
         let level = &self.head[index];
-        let bucket = probe::ordinary_funnel_bucket(probe, level.multiplier, level.buckets);
+        let bucket = probe::ordinary_bucket_of_word(word, level.buckets);
         // The placement runs in a table without tombstones, so a free lane
         // of the bucket is an EMPTY one. Every head entry it walks is a
         // level: a shape with a head has more levels than the walk.
@@ -2486,13 +2493,18 @@ where
         // SAFETY: head placements are left only in a table with slots, so
         // its filter has units and `membership.index` is below their count.
         let recorded = unsafe { self.membership_ptr().add(membership.index) };
+        let level_step = self.prf.level_step();
+        let mut word = probe.ordinary_first_word(level_step);
         // One copy of the step per level, each with a constant index: the
         // walk then keeps no index and checks no bound.
         macro_rules! walk {
             ($($index:literal)*) => {
                 const { assert!([$($index),*].len() == OVERFLOW_LEVEL) };
                 $(
-                    if let Some(vacancy) = self.first_empty_in_head_level(probe, $index) {
+                    if $index != 0 {
+                        word = word.wrapping_mul(level_step);
+                    }
+                    if let Some(vacancy) = self.first_empty_in_head_level(word, $index) {
                         let entry = vacancy.entry.cast::<SlotEntry<K, V>>();
                         // SAFETY: the vacancy is an EMPTY lane read just
                         // above, so its entry is writable and holds
