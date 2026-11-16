@@ -495,16 +495,19 @@ const FIXED_ROUTES: usize = 2;
 
 /// Slots of the schedule of `levels` levels: room for the direct route and
 /// every route in query-position order with the sentinel that closes them,
-/// and one more slot per level and one over, so that the room also holds a
-/// sentinel after each level's run and a last slot no route is written to.
+/// and one more slot per level and one over. The runs share that room: a
+/// level's share holds its run where it has one ([`named_levels`]), the
+/// groups' runs lie in the other levels' shares ([`group_run`]), and the
+/// last slot is one no route is written to.
 const fn slot_count(levels: usize) -> usize {
     PROBE_SCHEDULE_CAPACITY[levels] + FIXED_ROUTES + levels + 1
 }
 
-/// The slot ahead of `level`'s run in the schedule of `levels` levels. The
-/// runs lie at the end of the room, the first level's last: a run fills the
-/// slots after its lead up to the lead of the level before it, or up to the
-/// last slot, and that slot is the sentinel of a run that is full.
+/// The slot ahead of `level`'s share of the schedule of `levels` levels,
+/// which holds the level's run where it has one. The shares lie at the end
+/// of the room, the first level's last: a run fills the slots after its
+/// lead up to the lead of the level before it, or up to the last slot, and
+/// that slot is the sentinel of a run that is full.
 const fn run_lead(levels: usize, level: usize) -> usize {
     slot_count(levels) - 1 - (PROBE_SCHEDULE_CAPACITY[level + 1] + level + 1)
 }
@@ -615,13 +618,13 @@ impl GroupRun {
     }
 }
 
-/// `group`'s run in the schedule of `levels` levels. The groups' runs lie where the runs of
-/// the levels past [`named_levels`] would, which no walk starts at, the last
-/// group's against the lead of the last named level. That room is shared
-/// out in proportion to the routes a full schedule holds: the routes in
-/// query-position order get their share at its front, and each group the
-/// same fraction of its levels' full runs. A table whose levels are all
-/// named has no such room and no groups.
+/// `group`'s run in the schedule of `levels` levels. The groups' runs lie
+/// where the runs of the levels past [`named_levels`] would, which no walk
+/// starts at, the last group's against the lead of the last named level.
+/// That room is shared out in proportion to the routes a full schedule
+/// holds: the routes in query-position order get their share at its front,
+/// and each group the same fraction of its levels' full runs. A table whose
+/// levels are all named has no such room and no groups.
 const fn group_run(levels: usize, group: usize) -> GroupRun {
     let named = named_levels(levels);
     if named == levels || named < GROUPED_LEVELS {
