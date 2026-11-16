@@ -2879,7 +2879,7 @@ where
         let direct = self.probe_schedule.direct();
         // SAFETY: the schedule starts with its direct route.
         let route = unsafe { &*direct };
-        let h11_slot = probe::shifted_elastic_index(sequence.word(0), route.direct_index_shift());
+        let h11_slot = probe::masked_shift_elastic_index(sequence.word(0), route.index_shift());
         // SAFETY: the route's shifted index maps into the control bytes it
         // holds.
         if unsafe { *route.control().add(h11_slot) } == key_fingerprint {
@@ -2894,38 +2894,41 @@ where
         }
 
         let mut closed_levels = filter.closed_levels(prepared);
-        let mut next = direct;
+        let mut route = direct;
         loop {
             // SAFETY: the schedule ends with its sentinel, and the walk
             // cannot pass it: the sentinel's level stays open until its own
-            // probe, which reads `EMPTY` and ends the walk below.
-            next = unsafe { next.add(1) };
-            // SAFETY: as above, `next` is at most the sentinel.
-            let route = unsafe { PhiRoute::load(next) };
-            if route.is_closed(closed_levels) {
+            // probe, which reads `EMPTY` and ends the walk below. So `route`
+            // is ahead of the sentinel here.
+            let step = unsafe { PhiRoute::step(&mut route) };
+            if step.is_closed(closed_levels) {
                 continue;
             }
+            // SAFETY: as above, `route` is at most the sentinel.
+            let (index_shift, level_control) = unsafe { PhiRoute::reach(route) };
             // The route holds a shift whichever reduction its level needs.
-            let slot = probe::shifted_elastic_index(
-                sequence.word(route.sequence_index()),
-                route.index_shift(),
+            let slot = probe::masked_shift_elastic_index(
+                sequence.word_at(step.sequence_index()),
+                index_shift,
             );
             // SAFETY: the route's shifted index maps into the control bytes
             // it holds.
-            let control = unsafe { *route.control().add(slot) };
+            let control = unsafe { *level_control.add(slot) };
             if control == key_fingerprint {
-                let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(route.control(), slot);
+                let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
                 // SAFETY: the sentinel's control bytes match no fingerprint,
                 // so the route names a real level, and a fingerprint match
                 // means the slot is occupied.
                 let entry: *mut SlotEntry<K, V> = unsafe { self.probe_schedule.entry_at(offset) };
                 // SAFETY: as above, the slot holds an entry.
                 if key.equivalent(unsafe { &(*entry).key }) {
+                    // SAFETY: as above.
+                    let level = unsafe { (*route).level() };
                     return ScheduleSearch::Hit(on_hit(
-                        route.level() as usize,
+                        level as usize,
                         slot,
                         offset,
-                        route.control(),
+                        level_control,
                     ));
                 }
                 unlikely_path();
@@ -2935,7 +2938,7 @@ where
                 // removal leaves a tombstone, and so does a `clear` until its
                 // last entry is out, even one a panicking drop interrupts. So
                 // the key cannot sit at a later probe of this level.
-                closed_levels = route.close(closed_levels);
+                closed_levels = step.close(closed_levels);
                 // Either this was the sentinel, or no real level is left
                 // open.
                 if closed_levels & SENTINEL_BIT != 0 || closed_levels == !SENTINEL_BIT {

@@ -493,8 +493,10 @@ fn query_schedule_holds_every_route_once_in_position_order() {
             // The route tests and closes its own level's bit, one above the
             // level, and no other.
             let bit = 2_u64 << level;
-            assert!(route.is_closed(bit) && !route.is_closed(!bit));
-            assert_eq!(route.close(0), bit);
+            let step = route.as_step();
+            assert!(step.is_closed(bit) && !step.is_closed(!bit));
+            assert_eq!(step.close(0), bit);
+            assert_eq!(step.sequence_index(), route.sequence_index());
             let region = &table.levels[level as usize];
             assert_eq!(
                 route.control() == region.ctrl_ptr.cast_const(),
