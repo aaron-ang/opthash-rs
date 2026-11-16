@@ -2417,7 +2417,8 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
                 // in bounds; neither pointer is read.
                 let (scheduled, direct) = unsafe {
                     (
-                        table.probe_schedule.entry_at::<SlotEntry<u64, u64>>(
+                        ProbeSchedule::entry_at::<SlotEntry<u64, u64>>(
+                            table.probe_schedule.direct_reach().2,
                             ProbeSchedule::entry_offset::<SlotEntry<u64, u64>>(
                                 level.ctrl_ptr,
                                 slot,

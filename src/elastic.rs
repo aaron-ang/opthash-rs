@@ -779,6 +779,22 @@ const _: () = assert!(mem::size_of::<PreparedElasticKey>() == 16);
 #[inline]
 const fn unlikely_path() {}
 
+/// The entry a walk found, as the two addends of its address: the walk has
+/// both in hand, and a caller that adds them reads neither from the table
+/// again.
+#[derive(Clone, Copy)]
+struct EntryAt {
+    entry_origin: *mut u8,
+    offset: usize,
+}
+
+impl EntryAt {
+    #[inline]
+    fn get<T>(self) -> *mut T {
+        ProbeSchedule::entry_at(self.entry_origin, self.offset)
+    }
+}
+
 /// Outcome of [`ElasticTable::walk_schedule`].
 enum ScheduleSearch<R> {
     Hit(R),
@@ -2544,14 +2560,13 @@ where
                     prepared.route,
                     key_fingerprint,
                     filter,
-                    |_, _, offset, _| offset,
+                    |_, _, entry, _| entry,
                 );
                 match walked {
-                    ScheduleSearch::Hit(offset) => {
+                    ScheduleSearch::Hit(entry) => {
                         // SAFETY: the walk hands on an occupied slot of this
                         // table, which `&mut self` borrows alone.
-                        let slot: &mut SlotEntry<K, V> =
-                            unsafe { &mut *self.probe_schedule.entry_at(offset) };
+                        let slot: &mut SlotEntry<K, V> = unsafe { &mut *entry.get() };
                         return Some(mem::replace(&mut slot.value, value));
                     }
                     ScheduleSearch::Absent => {}
@@ -2606,9 +2621,9 @@ where
             prepared.route,
             key_fingerprint,
             filter,
-            |_, slot, offset, control| (slot, offset, control),
+            |_, slot, entry, control| (slot, entry, control),
         );
-        let (slot, offset, control) = match walked {
+        let (slot, entry, control) = match walked {
             ScheduleSearch::Hit(hit) => hit,
             ScheduleSearch::Absent => return None,
             ScheduleSearch::Unresolved => {
@@ -2625,11 +2640,7 @@ where
         // SAFETY: the walk hands on an occupied slot of one of this table's
         // levels, which `&mut self` borrows alone. The tombstone below keeps
         // the entry from being read again.
-        let removed = unsafe {
-            self.probe_schedule
-                .entry_at::<SlotEntry<K, V>>(offset)
-                .read()
-        };
+        let removed = unsafe { entry.get::<SlotEntry<K, V>>().read() };
         // SAFETY: `control` is that level's control bytes, which the table
         // owns and may write, and `slot` indexes them. The sentinel's are
         // never handed on: they match no fingerprint.
@@ -3306,15 +3317,13 @@ where
             route,
             key_fingerprint,
             filter,
-            |level, slot, offset, _| (level, slot, offset),
+            |level, slot, entry, _| (level, slot, entry),
         );
         match walked {
-            ScheduleSearch::Hit((level, slot, offset)) => {
+            ScheduleSearch::Hit((level, slot, entry)) => {
                 // SAFETY: the walk hands on an occupied slot of this table,
                 // which `&'a self` keeps from changing.
-                Some(on_hit(level, slot, unsafe {
-                    &*self.probe_schedule.entry_at(offset)
-                }))
+                Some(on_hit(level, slot, unsafe { &*entry.get() }))
             }
             ScheduleSearch::Absent => None,
             ScheduleSearch::Unresolved => {
@@ -3356,9 +3365,8 @@ where
     }
 
     /// Walks the candidates of a key that passed `filter` in schedule order
-    /// and hands `on_hit` the level and slot that hold the key, the entry's
-    /// offset for [`ProbeSchedule::entry_at`], and the level's control
-    /// bytes. A table that needs the general reduction has routes that
+    /// and hands `on_hit` the level and slot that hold the key, the entry,
+    /// and the level's control bytes. A table that needs the general reduction has routes that
     /// probe nothing, so its walk ends unresolved.
     #[allow(clippy::inline_always)]
     #[inline(always)]
@@ -3368,31 +3376,32 @@ where
         prepared: PreparedElasticRoute,
         key_fingerprint: u8,
         filter: ElasticRouteFilter<'_>,
-        mut on_hit: impl FnMut(usize, usize, usize, *const u8) -> R,
+        mut on_hit: impl FnMut(usize, usize, EntryAt, *const u8) -> R,
     ) -> ScheduleSearch<R>
     where
         Q: Equivalent<K> + ?Sized,
     {
         let sequence = prepared.probe.sequence(self.fold_multiplier);
-        let direct = self.probe_schedule.direct();
-        // SAFETY: the schedule starts with its direct route.
-        let route = unsafe { &*direct };
-        let h11_slot = probe::masked_shift_elastic_index(sequence.word(0), route.index_shift());
-        // SAFETY: the route's shifted index maps into the control bytes it
-        // holds.
-        if unsafe { *route.control().add(h11_slot) } == key_fingerprint {
-            let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(route.control(), h11_slot);
+        let (index_shift, direct_control, entry_origin) = self.probe_schedule.direct_reach();
+        let h11_slot = probe::masked_shift_elastic_index(sequence.word(0), index_shift);
+        // SAFETY: the direct route's shifted index maps into the control
+        // bytes it holds.
+        if unsafe { *direct_control.add(h11_slot) } == key_fingerprint {
+            let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(direct_control, h11_slot);
+            let entry: *mut SlotEntry<K, V> = ProbeSchedule::entry_at(entry_origin, offset);
             // SAFETY: only a level's own control bytes hold a fingerprint,
-            // and one marks an occupied slot.
-            let entry: *mut SlotEntry<K, V> = unsafe { self.probe_schedule.entry_at(offset) };
-            // SAFETY: as above, the slot holds an entry.
+            // and one marks an occupied slot, so the slot holds an entry.
             if key.equivalent(unsafe { &(*entry).key }) {
-                return ScheduleSearch::Hit(on_hit(0, h11_slot, offset, route.control()));
+                let entry = EntryAt {
+                    entry_origin,
+                    offset,
+                };
+                return ScheduleSearch::Hit(on_hit(0, h11_slot, entry, direct_control));
             }
         }
 
         let mut closed_levels = filter.closed_levels(prepared);
-        let mut route = direct;
+        let mut route = self.probe_schedule.direct();
         loop {
             // SAFETY: the schedule ends with its sentinel, and the walk
             // cannot pass it: the sentinel's level stays open until its own
@@ -3414,20 +3423,18 @@ where
             let control = unsafe { *level_control.add(slot) };
             if control == key_fingerprint {
                 let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
+                let entry: *mut SlotEntry<K, V> = ProbeSchedule::entry_at(entry_origin, offset);
                 // SAFETY: the sentinel's control bytes match no fingerprint,
                 // so the route names a real level, and a fingerprint match
-                // means the slot is occupied.
-                let entry: *mut SlotEntry<K, V> = unsafe { self.probe_schedule.entry_at(offset) };
-                // SAFETY: as above, the slot holds an entry.
+                // means the slot is occupied and holds an entry.
                 if key.equivalent(unsafe { &(*entry).key }) {
                     // SAFETY: as above.
                     let level = unsafe { (*route).level() };
-                    return ScheduleSearch::Hit(on_hit(
-                        level as usize,
-                        slot,
+                    let entry = EntryAt {
+                        entry_origin,
                         offset,
-                        level_control,
-                    ));
+                    };
+                    return ScheduleSearch::Hit(on_hit(level as usize, slot, entry, level_control));
                 }
                 unlikely_path();
             } else if control == CTRL_EMPTY {

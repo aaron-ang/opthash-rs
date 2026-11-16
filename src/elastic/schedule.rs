@@ -173,7 +173,7 @@ impl PhiRoute {
     /// Shift that reduces a probe word to a slot of the route's level. Only
     /// its low six bits are the shift: a caller shifts by it with a wrapping
     /// shift, which reads no others.
-    #[inline]
+    #[cfg(test)]
     #[allow(clippy::cast_possible_truncation)]
     pub(super) fn index_shift(&self) -> u32 {
         self.reduction as u32
@@ -301,16 +301,22 @@ const FIXED_ROUTES: usize = 2;
 /// each take that slice, and a route holds only what [`PhiRoute::new`]
 /// derives from one of its levels.
 ///
-/// `repr(C)` keeps the two addresses a lookup starts from adjacent, so one
-/// load brings both.
+/// `repr(C)` keeps the words a direct probe reads adjacent and ahead of the
+/// address only a walk needs, so a lookup the direct probe answers never
+/// loads a route.
 #[repr(C)]
 pub(super) struct ProbeSchedule {
+    /// The direct route's [`PhiRoute::index_shift`] word and control bytes,
+    /// held beside the entry origin. [`Self::assemble`] alone writes them,
+    /// from the route it puts first.
+    direct_reduction: u64,
+    direct_control: *const u8,
+    /// See [`entry_origin`].
+    entry_origin: *mut u8,
     /// `routes.as_ptr()`. The routes never move: [`Self::clear`] only
     /// shortens them, and [`Self::push`] writes into room they already
     /// hold or panics.
     direct: *const PhiRoute,
-    /// See [`entry_origin`].
-    entry_origin: *mut u8,
     /// The direct route, the pushed routes, then the sentinel. No method
     /// leaves the first or the last off, so a walk from [`Self::direct`]
     /// always reaches the sentinel.
@@ -335,17 +341,57 @@ fn entry_origin<T>(levels: &[Level<T>]) -> *mut u8 {
 }
 
 const _: () = assert!(
-    core::mem::offset_of!(ProbeSchedule, entry_origin)
-        == core::mem::offset_of!(ProbeSchedule, direct) + size_of::<*const PhiRoute>()
+    core::mem::offset_of!(ProbeSchedule, direct_reduction) == 0
+        && core::mem::offset_of!(ProbeSchedule, entry_origin)
+            == core::mem::offset_of!(ProbeSchedule, direct_control) + size_of::<*const u8>()
 );
 
 impl ProbeSchedule {
     fn assemble(routes: Vec<PhiRoute>, entry_origin: *mut u8) -> Self {
+        let direct = &routes[0];
         Self {
-            direct: routes.as_ptr(),
+            direct_reduction: direct.reduction,
+            direct_control: direct.control(),
             entry_origin,
+            direct: routes.as_ptr(),
             routes,
         }
+    }
+
+    /// [`PhiRoute::index_shift`] and [`PhiRoute::control`] of the direct
+    /// route, without reading the route, and the origin [`Self::entry_at`]
+    /// adds to. Where two pointers fill one wide load and the target is
+    /// little-endian, that load brings the control bytes and the origin, so
+    /// a caller that needs the origin on every path does not load it once
+    /// per path.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    pub(super) fn direct_reach(&self) -> (u32, *const u8, *mut u8) {
+        #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+        {
+            // SAFETY: `repr(C)` puts the origin right after the control
+            // pointer, asserted above, so the read covers exactly those two
+            // initialized fields. The pointer comes from `self` whole, so it
+            // may read both.
+            let both = unsafe {
+                core::ptr::from_ref(self)
+                    .cast::<u8>()
+                    .add(core::mem::offset_of!(Self, direct_control))
+                    .cast::<u128>()
+                    .read_unaligned()
+            };
+            (
+                self.direct_reduction as u32,
+                self.direct_control.with_addr(both as usize),
+                self.entry_origin.with_addr((both >> u64::BITS) as usize),
+            )
+        }
+        #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
+        (
+            self.direct_reduction as u32,
+            self.direct_control,
+            self.entry_origin,
+        )
     }
 
     /// Byte offset from the entry origin of the entry beside control byte
@@ -358,15 +404,13 @@ impl ProbeSchedule {
             .wrapping_mul(size_of::<T>())
     }
 
-    /// The entry at [`Self::entry_offset`] `offset`.
-    ///
-    /// # Safety
-    ///
-    /// The offset is that of a control byte of the levels this schedule was
-    /// built for, and `T` is their entry type.
+    /// The entry at [`Self::entry_offset`] `offset` from `entry_origin`, the
+    /// origin [`Self::direct_reach`] gives. It is an entry of the levels the
+    /// schedule was built for when the offset is that of one of their
+    /// control bytes and `T` is their entry type.
     #[inline]
-    pub(super) unsafe fn entry_at<T>(&self, offset: usize) -> *mut T {
-        self.entry_origin.wrapping_add(offset).cast()
+    pub(super) fn entry_at<T>(entry_origin: *mut u8, offset: usize) -> *mut T {
+        entry_origin.wrapping_add(offset).cast()
     }
 
     /// A copy of `self` with room for `route_capacity` routes, each route
@@ -389,9 +433,10 @@ impl ProbeSchedule {
         &self.routes[1..self.routes.len() - 1]
     }
 
-    /// The direct route, which every lookup probes first. Every route from
-    /// it up to and including the sentinel, whose level is
-    /// [`SENTINEL_LEVEL`], may be read.
+    /// The direct route, which every lookup probes first through
+    /// [`Self::direct_reach`] and a walk steps on from. Every route from it
+    /// up to and including the sentinel, whose level is [`SENTINEL_LEVEL`],
+    /// may be read.
     #[inline]
     pub(super) fn direct(&self) -> *const PhiRoute {
         debug_assert_eq!(self.direct, self.routes.as_ptr());
@@ -423,6 +468,12 @@ impl ProbeSchedule {
     pub(super) fn addresses<T>(&self, levels: &[Level<T>]) -> bool {
         self.direct == self.routes.as_ptr()
             && self.routes[0] == PhiRoute::direct(levels)
+            && self.direct_reach()
+                == (
+                    self.routes[0].index_shift(),
+                    self.routes[0].control(),
+                    self.entry_origin,
+                )
             && self.entry_origin == entry_origin(levels)
             && self.routes().iter().all(|route| {
                 let (level, logical_probe_index) = route.coordinates();
