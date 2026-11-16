@@ -536,19 +536,17 @@ fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
     const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut table = raw_table(4096, 3);
     let level = table.shape.levels[0];
-    let buckets = level.bucket_range.upper();
-    let mut accepted_elsewhere = 0;
     for index in 1..=32_u64 {
         let key = index.wrapping_mul(SPREAD);
         let probe = table.prf.prepare(key);
-        let own = probe::ordinary_funnel_first_index(probe, level.multiplier, level.bucket_range);
+        let own = probe::ordinary_funnel_bucket(probe, level.multiplier, level.buckets);
         // The first lane of an untouched level-zero bucket the probe does
         // not select.
-        let (_, slot) = (0..buckets)
+        let (_, slot) = (0..level.buckets)
             .map(|bucket| (bucket, level.offset + bucket * table.shape.stride))
             .find(|&(bucket, slot)| {
                 // SAFETY: a level-zero bucket starts inside the storage.
-                own != Some(bucket) && control::is_free(unsafe { table.storage.control_at(slot) })
+                own != bucket && control::is_free(unsafe { table.storage.control_at(slot) })
             })
             .unwrap();
         let vacancy = table.vacancy_at(slot);
@@ -561,10 +559,8 @@ fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
             table.prf.prepare(key).fingerprint(),
             true,
         );
-        accepted_elsewhere += usize::from(own.is_some());
     }
     assert!(table.exceptional_placement);
-    assert_ne!(accepted_elsewhere, 0);
     for index in 1..=32_u64 {
         let key = index.wrapping_mul(SPREAD);
         assert_eq!(table.membership_gate(key).levels & OVERFLOW_LEVEL_BIT, 0);
@@ -600,7 +596,8 @@ struct DifferentialCoverage {
     reseeds: usize,
     exceptional: bool,
     overflow_entries: bool,
-    rejected_first_words: bool,
+    /// A live key whose folded word is zero.
+    zero_word_keys: bool,
     overwrites: usize,
     wide_buckets: bool,
     narrow_buckets: bool,
@@ -656,7 +653,7 @@ fn assert_matches_model(
     assert!(table.entries() <= table.shape.max_insertions);
     // The head placements left are those of a table without tombstones.
     let head_limit = if table.tombstones() == 0 {
-        table.shape.max_insertions
+        table.shape.head_insertions()
     } else {
         0
     };
@@ -739,14 +736,7 @@ fn assert_matches_model(
             "{key:?} sits in a padding lane"
         );
         coverage.overflow_entries |= slot >= overflow_start;
-        if let Some(level) = table.shape.levels.first() {
-            coverage.rejected_first_words |= probe::ordinary_funnel_first_index(
-                table.prf.prepare(key.hash),
-                level.multiplier,
-                level.bucket_range,
-            )
-            .is_none();
-        }
+        coverage.zero_word_keys |= key.hash == table.prf.zero_word_hash();
     }
     for key in absent {
         if !model.contains_key(key) {
@@ -903,14 +893,14 @@ fn run_differential(
 }
 
 fn spread_universe(len: u64) -> Vec<HashedKey> {
-    // The first key's word is rejected by a level unless its bucket count
-    // is a power of two.
-    let rejected = FunnelPrf::new(FUNNEL_PROBE_SEED).zero_word_hash();
+    // The first key's folded word is zero until a reseed, so it draws
+    // bucket zero in every level.
+    let zero_word = FunnelPrf::new(FUNNEL_PROBE_SEED).zero_word_hash();
     (0..len)
         .map(|id| HashedKey {
             id,
             hash: if id == 0 {
-                rejected
+                zero_word
             } else {
                 id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             },
@@ -937,7 +927,7 @@ fn operation_streams_agree_with_a_model_map_and_the_ordered_walk() {
         assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
         assert!(coverage.clears > 0, "{coverage:?}");
         assert!(coverage.overwrites > 0, "{coverage:?}");
-        assert!(coverage.rejected_first_words, "{coverage:?}");
+        assert!(coverage.zero_word_keys, "{coverage:?}");
         assert!(!coverage.exceptional, "{coverage:?}");
         assert!(coverage.head_placements > 0, "{coverage:?}");
         assert!(coverage.blocked_head_inserts > 0, "{coverage:?}");
@@ -1112,53 +1102,16 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
     }
 }
 
-/// Every set of recorded levels yields its head entries in level order, and
-/// the overflow bit yields none.
 #[test]
-fn recorded_head_yields_the_entry_of_every_recorded_level_shallowest_first() {
-    let shape = FunnelShape::for_insert_budget(1 << 12, ReserveFraction::from_exponent(3).unwrap())
-        .unwrap();
-    let yielded = |levels: u16| -> Vec<*const LevelShape> {
-        RecordedHead::new(&shape, levels)
-            .map(core::ptr::from_ref)
-            .collect()
-    };
-    let entries = |levels: &[usize]| -> Vec<*const LevelShape> {
-        levels
-            .iter()
-            .map(|&level| core::ptr::from_ref(&shape.head[level]))
-            .collect()
-    };
-    assert_eq!(yielded(0), []);
-    assert_eq!(yielded(OVERFLOW_LEVEL_BIT), []);
-    assert_eq!(
-        yielded(u16::MAX),
-        entries(&(0..OVERFLOW_LEVEL).collect::<Vec<_>>())
-    );
-    for shallow in 0..OVERFLOW_LEVEL {
-        assert_eq!(
-            yielded(level_bit_of(shallow)),
-            entries(&[shallow]),
-            "level {shallow}"
-        );
-        for deep in shallow + 1..OVERFLOW_LEVEL {
-            for overflow in [0, OVERFLOW_LEVEL_BIT] {
-                assert_eq!(
-                    yielded(level_bit_of(shallow) | level_bit_of(deep) | overflow),
-                    entries(&[shallow, deep]),
-                    "levels {shallow} and {deep}"
-                );
-            }
-        }
-    }
+fn levels_past_the_head_share_the_overflow_bit() {
     // A deeper level shares the overflow bit, which names no head entry.
     assert_eq!(level_bit_of(OVERFLOW_LEVEL), OVERFLOW_LEVEL_BIT);
     assert_eq!(level_bit_of(usize::MAX), OVERFLOW_LEVEL_BIT);
 }
 
 /// An empty shape and one with buckets wider than a group keep an all-absent
-/// head, which ends the insert's head walk at once and matches nothing in a
-/// first-match scan. Any other shape copies its levels into the head.
+/// head, which no insert walks and which matches nothing in a first-match
+/// scan. Any other shape copies its levels into the head.
 #[test]
 fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     let (wide, smallest_wide) = smallest_wide_shape();
@@ -1167,10 +1120,12 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     for shape in [FunnelShape::empty(), smallest_wide, large_wide] {
         assert_eq!(
             shape.head,
-            [LevelShape::ABSENT; HEAD_ENTRIES],
+            [LevelShape::absent(shape.slots); HEAD_ENTRIES],
             "n {}",
             shape.n
         );
+        assert!(!shape.has_head());
+        assert_eq!(shape.head_insertions(), 0);
     }
 
     let narrow_reserve = ReserveFraction::from_exponent(3).unwrap();
@@ -1182,8 +1137,9 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
         assert!(
             shape.head[recorded..]
                 .iter()
-                .all(|level| *level == LevelShape::ABSENT)
+                .all(|level| *level == LevelShape::absent(shape.slots))
         );
+        assert_eq!(shape.head_insertions(), shape.max_insertions);
     }
 }
 
@@ -1363,7 +1319,7 @@ fn decompose_scalar_location(shape: &FunnelShape, location: ScalarFunnelLocation
             slot_in_bucket,
             ..
         } => {
-            assert!(bucket < shape.levels[level].bucket_range.upper());
+            assert!(bucket < shape.levels[level].buckets);
             assert!(slot_in_bucket < shape.beta);
             shape.levels[level].offset + bucket * shape.stride + slot_in_bucket
         }
@@ -1529,7 +1485,7 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
                 level: level_index as u64,
             },
             0,
-            level.bucket_range.upper(),
+            level.buckets,
         );
         let start = level.offset + bucket * table.shape.stride;
         for lane in 0..table.shape.beta {
@@ -1829,7 +1785,7 @@ fn exact_geometry_sums_to_n() {
         .shape
         .levels
         .iter()
-        .map(|level| level.bucket_range.upper() * table.shape.beta)
+        .map(|level| level.buckets * table.shape.beta)
         .sum::<usize>();
     assert_eq!(
         ordinary_slots
@@ -1841,7 +1797,7 @@ fn exact_geometry_sums_to_n() {
         .shape
         .levels
         .iter()
-        .map(|level| level.bucket_range.upper() * (table.shape.stride - table.shape.beta))
+        .map(|level| level.buckets * (table.shape.stride - table.shape.beta))
         .sum::<usize>();
     assert_eq!(table.storage.capacity(), table.shape.n + padding);
     assert_eq!(table.shape.slots, table.shape.n + padding);
@@ -2588,39 +2544,26 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                     .first_match(&key, probe, gate.levels.into())
                     .map(|found| found.slot);
                 // An empty bin and the overflow bit each scan an absent head
-                // entry, which finds nothing but the key itself.
+                // entry, which finds nothing.
                 for absent in [0, OVERFLOW_LEVEL_BIT] {
                     let at_absent = table
                         .first_match(&key, probe, absent.into())
                         .map(|found| found.slot);
-                    assert!(
-                        at_absent.is_none() || at_absent == walk,
-                        "n {n} d {d} index {index}"
-                    );
+                    assert_eq!(at_absent, None, "n {n} d {d} index {index}");
                 }
-                if found.is_some() || table.unmatched_is_absent(probe, gate.levels) {
+                if found.is_some() || table.unmatched_is_absent(gate.levels) {
                     assert_eq!(found, walk, "n {n} d {d} index {index}");
-                    // A bucket wider than a group is never scanned here:
-                    // only a key no level recorded is answered, or one the
-                    // scan of an absent entry meets in the first group.
-                    assert!(
-                        !wide
-                            || gate.levels & !OVERFLOW_LEVEL_BIT == 0
-                            || found.is_some_and(|slot| slot < GROUP_SIZE),
-                        "n {n} d {d} index {index}"
-                    );
+                    // A bucket wider than a group is never scanned here.
+                    assert!(!wide, "n {n} d {d} index {index}");
                     answered += 1;
                 } else {
                     handed_off += 1;
                 }
             }
-            // A wide table still answers the lookups with no level to scan,
-            // which spread keys leave it.
-            if !(wide && shared_fingerprint) {
-                assert_ne!(answered, 0, "n {n} d {d}");
-            }
             if wide {
                 assert_ne!(handed_off, 0, "n {n} d {d}");
+            } else {
+                assert_ne!(answered, 0, "n {n} d {d}");
             }
         }
     }
