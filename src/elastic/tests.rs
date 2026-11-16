@@ -2478,11 +2478,9 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
                 let (scheduled, direct) = unsafe {
                     (
                         ProbeSchedule::entry_at::<SlotEntry<u64, u64>>(
-                            table.probe_schedule.direct_reach().2,
-                            ProbeSchedule::entry_offset::<SlotEntry<u64, u64>>(
-                                level.ctrl_ptr,
-                                slot,
-                            ),
+                            table.probe_schedule.entry_origin(),
+                            level.ctrl_ptr,
+                            slot,
                         ),
                         level.slot_ptr(slot),
                     )

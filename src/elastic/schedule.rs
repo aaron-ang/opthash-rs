@@ -423,6 +423,9 @@ impl ProbeScheduleRoom {
         let mut schedule = ProbeSchedule {
             direct_reduction: direct.reduction,
             direct_control: direct.control(),
+            direct_entries: levels
+                .first()
+                .map_or(ptr::null_mut(), |level| level.data_ptr.cast()),
             entry_origin: entry_origin(levels),
             book: OwnedBook::new(book),
             slots,
@@ -523,10 +526,12 @@ const fn lone_level_summary(levels: usize, level: usize) -> Option<SummaryBin> {
 #[repr(C)]
 pub(super) struct ProbeSchedule {
     /// The direct route's [`PhiRoute::index_shift`] word and control bytes,
-    /// held beside the entry origin. [`ProbeScheduleRoom::schedule`] alone
-    /// writes them, from the route it puts first.
+    /// held beside its level's entries. [`ProbeScheduleRoom::schedule`]
+    /// alone writes them, from the route it puts first.
     direct_reduction: u64,
     direct_control: *const u8,
+    /// The entries of level zero, or null for a table without levels.
+    direct_entries: *mut u8,
     /// See [`entry_origin`].
     entry_origin: *mut u8,
     book: OwnedBook,
@@ -607,23 +612,24 @@ fn entry_origin<T>(levels: &[Level<T>]) -> *mut u8 {
 
 const _: () = assert!(
     core::mem::offset_of!(ProbeSchedule, direct_reduction) == 0
-        && core::mem::offset_of!(ProbeSchedule, entry_origin)
+        && core::mem::offset_of!(ProbeSchedule, direct_entries)
             == core::mem::offset_of!(ProbeSchedule, direct_control) + size_of::<*const u8>()
+        && core::mem::offset_of!(ProbeSchedule, book)
+            == core::mem::offset_of!(ProbeSchedule, entry_origin) + size_of::<*const u8>()
+        && size_of::<OwnedBook>() == size_of::<*const u8>()
 );
 
 impl ProbeSchedule {
     /// [`PhiRoute::index_shift`] and [`PhiRoute::control`] of the direct
-    /// route, without reading the route, and the origin [`Self::entry_at`]
-    /// adds to. Where two pointers fill one wide load and the target is
-    /// little-endian, that load brings the control bytes and the origin, so
-    /// a caller that needs the origin on every path does not load it once
-    /// per path.
+    /// route, without reading the route, and the entries of its level.
+    /// Where two pointers fill one wide load and the target is
+    /// little-endian, that load brings both pointers.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub(super) fn direct_reach(&self) -> (u32, *const u8, *mut u8) {
         #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
         {
-            // SAFETY: `repr(C)` puts the origin right after the control
+            // SAFETY: `repr(C)` puts the entries right after the control
             // pointer, asserted above, so the read covers exactly those two
             // initialized fields. The pointer comes from `self` whole, so it
             // may read both.
@@ -637,34 +643,65 @@ impl ProbeSchedule {
             (
                 self.direct_reduction as u32,
                 self.direct_control.with_addr(both as usize),
-                self.entry_origin.with_addr((both >> u64::BITS) as usize),
+                self.direct_entries.with_addr((both >> u64::BITS) as usize),
             )
         }
         #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
         (
             self.direct_reduction as u32,
             self.direct_control,
-            self.entry_origin,
+            self.direct_entries,
         )
     }
 
-    /// Byte offset from the entry origin of the entry beside control byte
-    /// `slot` of the control bytes at `control`.
+    /// What a walk past the direct route reads of the schedule: the entry
+    /// origin [`Self::entry_at`] adds to, and where a walk under `summary`
+    /// steps on from, as [`Self::walk_start`] gives it. Where two pointers
+    /// fill one wide load and the target is little-endian, that load brings
+    /// the origin and the address of the walk starts.
     #[inline]
-    pub(super) fn entry_offset<T>(control: *const u8, slot: usize) -> usize {
-        control
-            .addr()
-            .wrapping_add(slot)
-            .wrapping_mul(size_of::<T>())
+    #[allow(clippy::cast_possible_truncation)]
+    pub(super) fn walk_reach(&self, summary: SummaryBin) -> (*mut u8, WalkStart) {
+        #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+        let (entry_origin, zero_start) = {
+            // SAFETY: `repr(C)` puts the book, one pointer, right after the
+            // origin, asserted above, so the read covers exactly those two
+            // initialized fields. The pointer comes from `self` whole, so it
+            // may read both.
+            let both = unsafe {
+                core::ptr::from_ref(self)
+                    .cast::<u8>()
+                    .add(core::mem::offset_of!(Self, entry_origin))
+                    .cast::<u128>()
+                    .read_unaligned()
+            };
+            (
+                self.entry_origin.with_addr(both as usize),
+                self.book
+                    .zero_start
+                    .as_ptr()
+                    .with_addr((both >> u64::BITS) as usize),
+            )
+        };
+        #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
+        let (entry_origin, zero_start) = (self.entry_origin, self.book.zero_start.as_ptr());
+        // SAFETY: `starts` has an entry at every signed byte's distance.
+        let start = unsafe { *zero_start.offset(isize::from(summary.cast_signed())) };
+        (entry_origin, start)
     }
 
-    /// The entry at [`Self::entry_offset`] `offset` from `entry_origin`, the
-    /// origin [`Self::direct_reach`] gives. It is an entry of the levels the
-    /// schedule was built for when the offset is that of one of their
-    /// control bytes and `T` is their entry type.
+    /// The entry beside control byte `slot` of the control bytes at
+    /// `control`, by `entry_origin`, the origin [`Self::walk_reach`] gives:
+    /// the level's entries first, then the slot's among them. It is an
+    /// entry of the levels the schedule was built for when `control` is the
+    /// control bytes of one of them, `slot` one of its slots and `T` their
+    /// entry type.
     #[inline]
-    pub(super) fn entry_at<T>(entry_origin: *mut u8, offset: usize) -> *mut T {
-        entry_origin.wrapping_add(offset).cast()
+    pub(super) fn entry_at<T>(entry_origin: *mut u8, control: *const u8, slot: usize) -> *mut T {
+        entry_origin
+            .wrapping_add(control.addr().wrapping_mul(size_of::<T>()))
+            .cast::<T>()
+            .wrapping_add(slot)
     }
 
     /// A copy of `self` for `levels`, each route addressing its level
@@ -692,16 +729,14 @@ impl ProbeSchedule {
     /// be read. Between the two lie, in query-position order, the pushed
     /// routes of every level `summary` leaves open, and none but pushed
     /// routes; after a run's lead, no other route at all.
-    #[inline]
+    #[cfg(test)]
     pub(super) fn walk_start(&self, summary: SummaryBin) -> WalkStart {
-        // SAFETY: `starts` has an entry at every signed byte's distance.
-        unsafe {
-            *self
-                .book
-                .zero_start
-                .as_ptr()
-                .offset(isize::from(summary.cast_signed()))
-        }
+        self.walk_reach(summary).1
+    }
+
+    #[cfg(test)]
+    pub(super) fn entry_origin(&self) -> *mut u8 {
+        self.entry_origin
     }
 
     /// Points every walk start at a slot the walk may step on from: for
@@ -848,8 +883,14 @@ impl ProbeSchedule {
         book.levels == levels.len()
             && self.slots.len() == slot_count(book.levels)
             && slot(0) == PhiRoute::direct(levels)
-            && self.direct_reach() == (slot(0).index_shift(), slot(0).control(), self.entry_origin)
+            && self.direct_reach().0 == slot(0).index_shift()
+            && self.direct_reach().1 == slot(0).control()
+            && self.direct_reach().2
+                == levels
+                    .first()
+                    .map_or(ptr::null_mut(), |level| level.data_ptr.cast())
             && self.entry_origin == entry_origin(levels)
+            && self.walk_reach(0).0 == self.entry_origin
             && self.routes().iter().all(|route| {
                 let (level, logical_probe_index) = route.coordinates();
                 let level = level as usize;

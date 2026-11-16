@@ -860,19 +860,20 @@ const _: () = assert!(mem::size_of::<PreparedElasticRoute>() == 8);
 #[inline]
 const fn unlikely_path() {}
 
-/// The entry a walk found, as the two addends of its address: the walk has
-/// both in hand, and a caller that adds them reads neither from the table
-/// again.
-#[derive(Clone, Copy)]
-struct EntryAt {
-    entry_origin: *mut u8,
-    offset: usize,
-}
-
-impl EntryAt {
-    #[inline]
-    fn get<T>(self) -> *mut T {
-        ProbeSchedule::entry_at(self.entry_origin, self.offset)
+/// The key of the entry a walk found at `entry`, read as an address that is
+/// not zero, so a caller that hands the entry on tests it for nothing.
+///
+/// # Safety
+///
+/// `entry` is an occupied slot of a live level, and nothing writes its key
+/// while the borrow lasts.
+#[inline]
+unsafe fn found_key<'k, K, V>(entry: *mut SlotEntry<K, V>) -> &'k K {
+    // SAFETY: a slot of an allocation is not at address zero, and the
+    // caller's contract covers the read.
+    unsafe {
+        core::hint::assert_unchecked(!entry.is_null());
+        &(*entry).key
     }
 }
 
@@ -2665,7 +2666,7 @@ where
                     ScheduleSearch::Hit(entry) => {
                         // SAFETY: the walk hands on an occupied slot of this
                         // table, which `&mut self` borrows alone.
-                        let slot: &mut SlotEntry<K, V> = unsafe { &mut *entry.get() };
+                        let slot: &mut SlotEntry<K, V> = unsafe { &mut *entry };
                         return Some(mem::replace(&mut slot.value, value));
                     }
                     ScheduleSearch::Absent => {}
@@ -2739,7 +2740,7 @@ where
         // SAFETY: the walk hands on an occupied slot of one of this table's
         // levels, which `&mut self` borrows alone. The tombstone below keeps
         // the entry from being read again.
-        let removed = unsafe { entry.get::<SlotEntry<K, V>>().read() };
+        let removed = unsafe { entry.read() };
         // SAFETY: `control` is that level's control bytes, which the table
         // owns and may write, and `slot` indexes them. The sentinel's are
         // never handed on: they match no fingerprint.
@@ -3440,7 +3441,7 @@ where
             ScheduleSearch::Hit((level, slot, entry)) => {
                 // SAFETY: the walk hands on an occupied slot of this table,
                 // which `&'a self` keeps from changing.
-                Some(on_hit(level, slot, unsafe { &*entry.get() }))
+                Some(on_hit(level, slot, unsafe { &*entry }))
             }
             ScheduleSearch::Absent => None,
             ScheduleSearch::Unresolved => {
@@ -3493,32 +3494,31 @@ where
         prepared: PreparedElasticRoute,
         key_fingerprint: u8,
         filter: ElasticRouteFilter<'_>,
-        mut on_hit: impl FnMut(usize, usize, EntryAt, *const u8) -> R,
+        mut on_hit: impl FnMut(usize, usize, *mut SlotEntry<K, V>, *const u8) -> R,
     ) -> ScheduleSearch<R>
     where
         Q: Equivalent<K> + ?Sized,
     {
         let sequence = prepared.probe.sequence(self.fold_multiplier);
-        let (index_shift, direct_control, entry_origin) = self.probe_schedule.direct_reach();
+        let (index_shift, direct_control, direct_entries) = self.probe_schedule.direct_reach();
         let h11_slot = probe::masked_shift_elastic_index(sequence.word(0), index_shift);
         // SAFETY: the direct route's shifted index maps into the control
         // bytes it holds.
         if unsafe { *direct_control.add(h11_slot) } == key_fingerprint {
-            let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(direct_control, h11_slot);
-            let entry: *mut SlotEntry<K, V> = ProbeSchedule::entry_at(entry_origin, offset);
+            let entry = direct_entries
+                .cast::<SlotEntry<K, V>>()
+                .wrapping_add(h11_slot);
             // SAFETY: only a level's own control bytes hold a fingerprint,
-            // and one marks an occupied slot, so the slot holds an entry.
-            if key.equivalent(unsafe { &(*entry).key }) {
-                let entry = EntryAt {
-                    entry_origin,
-                    offset,
-                };
+            // and one marks an occupied slot, so the slot holds an entry,
+            // level zero's at the slot's index.
+            if key.equivalent(unsafe { found_key(entry) }) {
                 return ScheduleSearch::Hit(on_hit(0, h11_slot, entry, direct_control));
             }
         }
 
         let summary = filter.summary();
-        match self.probe_schedule.walk_start(summary).run() {
+        let (entry_origin, start) = self.probe_schedule.walk_reach(summary);
+        match start.run() {
             Ok(mut run) => loop {
                 // SAFETY: a sentinel closes the run, and the walk cannot
                 // pass it: its probe reads `EMPTY` and ends the walk below.
@@ -3536,20 +3536,15 @@ where
                 // bytes it holds.
                 let control = unsafe { *level_control.add(slot) };
                 if control == key_fingerprint {
-                    let offset =
-                        ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
-                    let entry: *mut SlotEntry<K, V> = ProbeSchedule::entry_at(entry_origin, offset);
+                    let entry: *mut SlotEntry<K, V> =
+                        ProbeSchedule::entry_at(entry_origin, level_control, slot);
                     // SAFETY: the sentinel's control bytes match no
                     // fingerprint, so the route names a real level, and a
                     // fingerprint match means the slot is occupied and
                     // holds an entry.
-                    if key.equivalent(unsafe { &(*entry).key }) {
+                    if key.equivalent(unsafe { found_key(entry) }) {
                         // SAFETY: as above.
                         let level = unsafe { (*route).level() };
-                        let entry = EntryAt {
-                            entry_origin,
-                            offset,
-                        };
                         return ScheduleSearch::Hit(on_hit(
                             level as usize,
                             slot,
@@ -3589,21 +3584,15 @@ where
                     // control bytes it holds.
                     let control = unsafe { *level_control.add(slot) };
                     if control == key_fingerprint {
-                        let offset =
-                            ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
                         let entry: *mut SlotEntry<K, V> =
-                            ProbeSchedule::entry_at(entry_origin, offset);
+                            ProbeSchedule::entry_at(entry_origin, level_control, slot);
                         // SAFETY: the sentinel's control bytes match no
                         // fingerprint, so the route names a real level, and
                         // a fingerprint match means the slot is occupied and
                         // holds an entry.
-                        if key.equivalent(unsafe { &(*entry).key }) {
+                        if key.equivalent(unsafe { found_key(entry) }) {
                             // SAFETY: as above.
                             let level = unsafe { (*route).level() };
-                            let entry = EntryAt {
-                                entry_origin,
-                                offset,
-                            };
                             return ScheduleSearch::Hit(on_hit(
                                 level as usize,
                                 slot,
