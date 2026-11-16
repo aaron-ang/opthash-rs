@@ -1802,7 +1802,8 @@ where
         if self.uncounted.pending(self.placed) != 0 {
             // SAFETY: an insert goes uncounted only into the settled level
             // of an open gate, which `reopen_settled` set to one of the
-            // levels, and the levels are replaced only after this call.
+            // levels. A generation swap moves the uncounted inserts with
+            // their levels and leaves the pointer on them.
             let counters = unsafe { (*self.settled_level).counters_mut() };
             self.uncounted.count_into(self.placed, &mut counters.len);
         }
@@ -3779,9 +3780,12 @@ where
     type Generation = ElasticGeneration<K, V>;
 
     fn swap_generation(&mut self, other: &mut ElasticGeneration<K, V>) {
-        self.count_settled();
         mem::swap(&mut self.levels, &mut other.levels);
         mem::swap(&mut self.placed, &mut other.placed);
+        // The uncounted inserts go with the levels they went into, and
+        // `settled_level` stays on those: a rebuild places by the general
+        // insert, which sets no settled level, so levels put back find it
+        // where they left it.
         mem::swap(&mut self.uncounted, &mut other.uncounted);
         mem::swap(&mut self.total_slots, &mut other.total_slots);
         mem::swap(&mut self.max_insertions, &mut other.max_insertions);

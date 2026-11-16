@@ -778,6 +778,56 @@ fn caught_hash_panic_during_try_resize_keeps_every_entry() {
     assert_eq!(drops.load(Ordering::SeqCst), 17);
 }
 
+/// A rebuild that unwinds part way puts back levels whose settled inserts
+/// stood uncounted when it began, and they still count.
+#[test]
+fn caught_hash_panic_during_a_rebuild_keeps_uncounted_settled_inserts() {
+    let panic = Arc::new(AtomicBool::new(false));
+    let never = Arc::new(AtomicBool::new(false));
+    let key_drops = Arc::new(AtomicUsize::new(0));
+    // Half the keys unwind, so the rebuild places some before it does.
+    let key = |id: u64| PanicHashKey {
+        id,
+        armed: if id.is_multiple_of(2) {
+            never.clone()
+        } else {
+            panic.clone()
+        },
+        drops: key_drops.clone(),
+    };
+    let mut map = FixedElasticHashMap::<PanicHashKey, u64>::with_capacity(32);
+    for id in 0..16_u64 {
+        map.insert(key(id), id);
+    }
+    let live_matches_controls = |map: &FixedElasticHashMap<PanicHashKey, u64>| {
+        let table = map.table();
+        table.levels.iter().all(|level| {
+            table.live_in(level) as usize
+                == (0..level.capacity())
+                    .filter(|&slot| control::is_occupied(level.checked_control(slot)))
+                    .count()
+        })
+    };
+    assert_ne!(map.table().uncounted.pending(map.table().placed), 0);
+    assert!(live_matches_controls(&map));
+
+    panic.store(true, Ordering::SeqCst);
+    let result = catch_unwind(AssertUnwindSafe(|| map.try_reserve(4_096)));
+    assert!(result.is_err());
+    panic.store(false, Ordering::SeqCst);
+
+    assert_eq!(map.len(), 16);
+    assert_ne!(map.table().uncounted.pending(map.table().placed), 0);
+    assert!(live_matches_controls(&map));
+    for id in 16..24_u64 {
+        map.insert(key(id), id);
+    }
+    assert!(live_matches_controls(&map));
+    for id in 0..24_u64 {
+        assert_eq!(map.get(&key(id)), Some(&id));
+    }
+}
+
 #[test]
 fn level_counters_sit_ahead_of_their_control_bytes_without_overlap() {
     for capacity in [1, 2, 7, 56, 300, 1792, 5000] {
