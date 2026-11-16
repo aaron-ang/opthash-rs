@@ -2595,6 +2595,106 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
     }
 }
 
+/// The walk that searches and places a recorded key at once answers as the
+/// lookup and the head placement do apart: a key it reports present is where
+/// the lookup finds it, and a vacancy it reports is the head walk's, for a
+/// key the lookup does not find. It settles nothing in a table with
+/// tombstones, and inserts through it agree with a model map.
+#[test]
+#[cfg_attr(miri, ignore = "fills tens of thousands of slots")]
+fn recorded_key_search_agrees_with_the_lookup_and_the_head_walk() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let feasible = |n: &usize, d: u32| {
+        FunnelShape::from_slots(*n, ReserveFraction::from_exponent(d).unwrap()).is_ok()
+    };
+    // (present, vacant, unsettled) over every recorded key below `keys`.
+    let census = |table: &FunnelTable<u64, u64, IdentityBuildHasher>, keys: u64| {
+        let (mut present, mut vacant, mut unsettled) = (0_usize, 0_usize, 0_usize);
+        // The inserted sequence, then a scrambled one whose keys the filter
+        // records by chance.
+        let scrambled = |index: u64| {
+            let word = index.wrapping_mul(SPREAD);
+            (word ^ (word >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        };
+        let sequence = (0..keys)
+            .map(|index| index.wrapping_mul(SPREAD))
+            .chain((0..keys).map(scrambled));
+        for (index, key) in sequence.enumerate() {
+            let gate = table.membership_gate(key);
+            if !gate.passes() {
+                continue;
+            }
+            let probe = table.prf.prepare(key);
+            let location = table.find_location(&key, key);
+            match table.search_head(&key, probe, gate.levels()) {
+                HeadSearch::Present(lane) => {
+                    assert_eq!(Some(table.slot_of(lane)), location, "index {index}");
+                    present += 1;
+                }
+                HeadSearch::Vacant(vacancy) => {
+                    assert_eq!(location, None, "index {index}");
+                    let head = table.head_vacancy(probe).unwrap();
+                    assert_eq!(vacancy.lane, head.lane, "index {index}");
+                    assert_eq!(vacancy.entry, head.entry, "index {index}");
+                    assert_eq!(vacancy.level_bit, head.level_bit, "index {index}");
+                    vacant += 1;
+                }
+                HeadSearch::Unsettled => unsettled += 1,
+            }
+        }
+        (present, vacant, unsettled)
+    };
+    for (at_least, d) in [(600, 3), (6_000, 4), (60_000, 9)] {
+        let n = (at_least..2 * at_least).find(|n| feasible(n, d)).unwrap();
+        let mut table = raw_table(n, d);
+        let wide = !table.shape.has_head();
+        let mut model = alloc::collections::BTreeMap::new();
+        let limit = table.shape.max_insertions as u64;
+        let keys = 2 * limit;
+        let (mut present, mut vacant) = (0, 0);
+        // Odd indices first, so the even ones are absent keys the filter
+        // partly records by the time they are inserted.
+        for parity in [1, 0] {
+            for index in (1..limit - 1).filter(|index| index % 2 == parity) {
+                let key = index.wrapping_mul(SPREAD);
+                assert_eq!(
+                    map::TableBackend::insert(&mut table, key, index, key),
+                    model.insert(key, index),
+                    "n {n} d {d} index {index}"
+                );
+            }
+            let (now_present, now_vacant, unsettled) = census(&table, keys);
+            present += now_present;
+            vacant += now_vacant;
+            assert!(!wide || now_present + now_vacant == 0, "n {n} d {d}");
+            assert!(wide || unsettled < now_present, "n {n} d {d}");
+        }
+        assert_eq!(wide, present == 0, "n {n} d {d}");
+        assert_eq!(wide, vacant == 0, "n {n} d {d}");
+        // Every key again: a present one is replaced, never placed twice.
+        for index in 1..limit - 1 {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(
+                map::TableBackend::insert(&mut table, key, !index, key),
+                model.insert(key, !index),
+                "n {n} d {d} index {index}"
+            );
+        }
+        assert_eq!(table.entries(), model.len());
+        for index in 0..keys {
+            let key = index.wrapping_mul(SPREAD);
+            let found = table.find_entry_ref(&key, key).map(|entry| entry.value);
+            assert_eq!(found, model.get(&key).copied(), "n {n} d {d} index {index}");
+        }
+        // A tombstone takes the head placement away, and the walk with it.
+        let key = SPREAD;
+        assert!(map::TableBackend::remove_key(&mut table, &key, key).is_some());
+        assert_eq!(table.head_left, 0);
+        let (present, vacant, _) = census(&table, keys);
+        assert_eq!((present, vacant), (0, 0), "n {n} d {d}");
+    }
+}
+
 /// Removal by key takes each entry a model map holds and nothing else,
 /// whichever lookup path finds it: the first-match scan, the ordered walk a
 /// wide bucket hands the lookup to, and both again over the tombstones

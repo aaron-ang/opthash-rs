@@ -799,6 +799,16 @@ impl<'a, K: 'a, V: 'a> FoundPart<'a, K, V> for FoundEntry {
     }
 }
 
+/// What one placement walk settles for a key the filter recorded.
+enum HeadSearch<T> {
+    /// The key's control byte.
+    Present(NonNull<u8>),
+    /// The key is absent, and this is where it goes.
+    Vacant(HeadVacancy<T>),
+    /// Neither: the lookup and the general placement decide.
+    Unsettled,
+}
+
 /// A known-absent search, retained only while the entry borrows its map.
 #[derive(Debug)]
 pub struct FunnelVacant {
@@ -1785,6 +1795,108 @@ where
         None
     }
 
+    /// The duplicate search and [`Self::first_empty_in_head`] in one walk,
+    /// for a key the filter recorded with level bin `levels`.
+    ///
+    /// The walk visits the key's bucket in each head level in placement
+    /// order, compares the key against the fingerprint matches of every
+    /// level its bin recorded, and stops at the first EMPTY lane. Reaching
+    /// that lane without a match means the key is absent: the head placement
+    /// runs only in a table without tombstones, where every bucket a placed
+    /// key passed over is still full, so the walk meets a present key's
+    /// level before any EMPTY lane. A key in a level the head does not hold,
+    /// or outside its funnel, passed over every head bucket, so the walk
+    /// leaves it unsettled.
+    #[inline]
+    fn search_head<Q>(
+        &self,
+        key: &Q,
+        probe: PreparedFastFunnelProbe,
+        levels: u16,
+    ) -> HeadSearch<SlotEntry<K, V>>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        if self.head_left == 0 {
+            return HeadSearch::Unsettled;
+        }
+        // One copy of the step per level, as in `first_empty_in_head`.
+        macro_rules! walk {
+            ($($index:literal)*) => {
+                const { assert!([$($index),*].len() == OVERFLOW_LEVEL) };
+                $(
+                    if let Some(settled) = self.search_head_level(key, probe, $index, levels) {
+                        return settled;
+                    }
+                )*
+            };
+        }
+        walk!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14);
+        HeadSearch::Unsettled
+    }
+
+    /// One step of [`Self::search_head`], in head entry `index`. `None`
+    /// moves the walk on to the next level.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn search_head_level<Q>(
+        &self,
+        key: &Q,
+        probe: PreparedFastFunnelProbe,
+        index: usize,
+        levels: u16,
+    ) -> Option<HeadSearch<SlotEntry<K, V>>>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let level = &self.head[index];
+        let bucket = probe::ordinary_funnel_bucket(probe, level.multiplier, level.buckets);
+        // SAFETY: a draw is below the level's bucket count, or zero for an
+        // entry that is no level.
+        let (group, entries) = unsafe {
+            (
+                level.group(bucket).cast::<u8>(),
+                level.entries(bucket).cast::<MaybeUninit<SlotEntry<K, V>>>(),
+            )
+        };
+        let level_bit = level_bit_of(index);
+        if levels & level_bit != 0 {
+            // SAFETY: as in `first_empty_in_head_level`, the group is
+            // readable and is the whole bucket.
+            let mut matches = unsafe { simd::eq_mask_group(group, probe.fingerprint()) }.0;
+            while matches != 0 {
+                // SAFETY: the set is a group mask or a subset of
+                // `GROUP_LANES`, and not empty.
+                let lane = unsafe { lowest_lane(matches) };
+                // SAFETY: a lane carrying a fingerprint is an occupied slot
+                // of the bucket.
+                let stored = unsafe { &(*entries.add(lane)).assume_init_ref().key };
+                if key.equivalent(stored) {
+                    // SAFETY: the lane is inside the bucket's group.
+                    return Some(HeadSearch::Present(unsafe {
+                        NonNull::new_unchecked(group.add(lane))
+                    }));
+                }
+                matches &= GROUP_LANES;
+                matches &= matches - 1;
+            }
+        }
+        // SAFETY: as above. Neither the padding lanes nor the group past the
+        // slots are EMPTY.
+        let empty = unsafe { simd::eq_mask_group(group, CTRL_EMPTY) }.0;
+        (empty != 0).then(|| {
+            let lane = (empty.trailing_zeros() / BITMASK_STRIDE) as usize;
+            // SAFETY: an EMPTY lane of the bucket is a slot of the level.
+            HeadSearch::Vacant(unsafe {
+                HeadVacancy {
+                    lane: group.add(lane),
+                    entry: entries.add(lane),
+                    level_bit,
+                }
+            })
+        })
+    }
+
     /// One step of [`Self::first_empty_in_head`]: the first EMPTY lane of the
     /// key's bucket in head entry `index`, if it has one.
     #[allow(clippy::inline_always)]
@@ -2361,17 +2473,24 @@ where
         let mut membership = self.membership_slot(hash);
         let gate = self.membership_gate_at(membership);
         if gate.passes() {
-            let found = self.find_after_gate::<K, FoundLane>(&key, hash, gate.levels().into());
+            let probe = self.prf.prepare(hash);
+            let found = match self.search_head(&key, probe, gate.levels()) {
+                HeadSearch::Present(lane) => Some(lane),
+                HeadSearch::Vacant(vacancy) => {
+                    // SAFETY: slot, gate and vacancy were read just above,
+                    // with no write since.
+                    unsafe {
+                        self.place_in_head(key, value, membership, gate.unit, probe, &vacancy);
+                    }
+                    return None;
+                }
+                HeadSearch::Unsettled => {
+                    self.find_after_gate::<K, FoundLane>(&key, hash, gate.levels().into())
+                }
+            };
             if let Some(lane) = found {
                 let slot = self.slot_of(lane);
                 return Some(map::TableBackend::replace_value(self, slot, value));
-            }
-            let probe = self.prf.prepare(hash);
-            if let Some(vacancy) = self.head_vacancy(probe) {
-                // SAFETY: slot, gate and vacancy were read just above, with
-                // no write since.
-                unsafe { self.place_in_head(key, value, membership, gate.unit, probe, &vacancy) };
-                return None;
             }
         }
         if self.prepare_vacant_insert() {
