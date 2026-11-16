@@ -2637,8 +2637,19 @@ fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
 #[test]
 fn a_group_mask_walked_from_the_top_visits_its_lanes_in_reverse() {
     const FP: u8 = 0x80 | 7;
-    // One bit of `chosen` per lane.
-    for chosen in 0..1_u32 << GROUP_SIZE {
+    // One bit of `chosen` per lane. Miri takes the sets of eight lanes, and
+    // repeats each in the upper half of a wider group.
+    let sets = if cfg!(miri) {
+        1 << u8::BITS
+    } else {
+        1_u32 << GROUP_SIZE
+    };
+    for set in 0..sets {
+        let chosen = if cfg!(miri) {
+            set | set << u8::BITS
+        } else {
+            set
+        };
         let controls: [u8; GROUP_SIZE] = core::array::from_fn(|lane| {
             if chosen >> lane & 1 == 1 {
                 FP
@@ -3001,8 +3012,8 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                     "n {n} d {d} index {index}"
                 );
                 let found = scan.ok();
-                // An empty bin and the overflow bit each scan an absent head
-                // entry, which finds nothing.
+                // An empty bin scans an entry that is no level and the
+                // overflow bit an absent one; neither finds anything.
                 for absent in [0, OVERFLOW_LEVEL_BIT] {
                     let at_absent = table
                         .first_match(&key, probe, unit_wide_levels(unit_of(0, absent)))
