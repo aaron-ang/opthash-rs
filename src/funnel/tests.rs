@@ -1143,6 +1143,46 @@ fn assert_head_addresses_storage<K, V, S>(table: &FunnelTable<K, V, S>) {
     assert_eq!(table.head_lanes, table.shape.head_lanes());
 }
 
+/// The head placement walks the levels that own a level-bin bit without
+/// asking whether each exists, so every shape must have them all, and each
+/// head entry the walk reads must address groups of the storage.
+#[test]
+#[cfg_attr(miri, ignore = "builds a table for each of thousands of shapes")]
+fn every_shape_has_the_levels_the_head_placement_walks() {
+    for d in geometry::MIN_FUNNEL_RESERVE_EXPONENT..=8 {
+        let reserve = ReserveFraction::from_exponent(d).unwrap();
+        let levels = 4 * d as usize + 10;
+        assert!(levels >= geometry::MIN_FUNNEL_LEVELS);
+        let mut shapes = 0;
+        for n in (2..4_000).chain((1 << 16)..(1 << 16) + 200) {
+            let Ok(shape) = FunnelShape::from_slots(n, reserve) else {
+                continue;
+            };
+            shapes += 1;
+            assert_eq!(shape.levels.len(), levels, "d={d} n={n}");
+            if !shape.has_head() {
+                continue;
+            }
+            let table = raw_table(n, d);
+            let controls = table.storage.ctrl_ptr() as usize;
+            for (index, level) in table.head[..OVERFLOW_LEVEL].iter().enumerate() {
+                assert_ne!(level.buckets, 0, "d={d} n={n} entry {index}");
+                let first = level.ctrl as usize;
+                let end = first + level.buckets * GROUP_SIZE;
+                assert!(
+                    controls <= first && end <= controls + table.shape.primary_offset,
+                    "d={d} n={n} entry {index}"
+                );
+            }
+        }
+        assert_ne!(shapes, 0, "d={d}");
+    }
+    // Below the smallest exponent no plan exists, so no shape with fewer
+    // levels does.
+    let below = ReserveFraction::from_exponent(geometry::MIN_FUNNEL_RESERVE_EXPONENT - 1).unwrap();
+    assert!((2..4_000).all(|n| FunnelShape::from_slots(n, below).is_err()));
+}
+
 /// Every path that gives a table another storage gives it that storage's
 /// head: growth, shrinking, the empty shape, and a clone. A clear keeps
 /// both. Lookups, inserts and removals read and write through the head after

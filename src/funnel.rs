@@ -303,6 +303,10 @@ impl FunnelShape {
             // No overflow: at most the padded count above.
             unpadded += bucket_count * plan.beta();
         }
+        // The head placement walks its levels unchecked.
+        if levels.len() <= OVERFLOW_LEVEL {
+            return Err(ShapeError::Infeasible);
+        }
         let primary_offset = offset;
         let primary_len = plan.special_primary_len();
         let primary_range =
@@ -344,7 +348,7 @@ impl FunnelShape {
             return Ok(Self::empty());
         }
         let d = reserve.exponent();
-        if !(3..usize::BITS).contains(&d) {
+        if !(geometry::MIN_FUNNEL_RESERVE_EXPONENT..usize::BITS).contains(&d) {
             return Err(TryReserveError::CapacityOverflow);
         }
         let mut n = capacity::exact_capacity_for(requested, reserve)
@@ -502,6 +506,10 @@ impl<T> arena::RegionSet for FlatStorage<T> {
 /// level zero the highest, so the leading zeros of a bin count up to its
 /// shallowest recorded level.
 const OVERFLOW_LEVEL: usize = u16::BITS as usize - 1;
+// Every plan has a level for each bit above the shared one, so a walk over
+// those levels meets no absent head entry; `FunnelShape::try_from_slots`
+// holds each shape to it.
+const _: () = assert!(geometry::MIN_FUNNEL_LEVELS > OVERFLOW_LEVEL);
 const OVERFLOW_LEVEL_BIT: u16 = 1;
 
 /// Level-bin bit of ordinary level `level`.
@@ -1955,7 +1963,8 @@ where
         let bucket = probe::ordinary_bucket_of_word(word, level.buckets);
         // The placement runs in a table without tombstones, so a free lane
         // of the bucket is an EMPTY one. Every head entry it walks is a
-        // level: a shape with a head has more levels than the walk.
+        // level: `FunnelShape::try_from_slots` builds no shape with fewer
+        // levels than the walk.
         debug_assert!(self.tombstones == 0 && index < self.shape.levels.len());
         // SAFETY: an ordinary bucket is one group, which ends at or before
         // `slots`.
