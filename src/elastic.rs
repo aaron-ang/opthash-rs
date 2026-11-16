@@ -3781,6 +3781,13 @@ where
         // insert, which sets no settled level, so levels put back find it
         // where they left it.
         mem::swap(&mut self.uncounted, &mut other.uncounted);
+        debug_assert!(
+            self.uncounted.pending(self.placed) == 0
+                || self
+                    .levels
+                    .as_ptr_range()
+                    .contains(&self.settled_level.cast_const())
+        );
         mem::swap(&mut self.total_slots, &mut other.total_slots);
         mem::swap(&mut self.max_insertions, &mut other.max_insertions);
         mem::swap(&mut self.scheduler, &mut other.scheduler);
@@ -3839,7 +3846,9 @@ where
     }
 
     /// Skips the existence and capacity checks in `insert`: the new
-    /// generation starts all-EMPTY, so neither can succeed.
+    /// generation starts all-EMPTY, so neither can succeed. Never sets
+    /// `settled_level` ([`Self::reopen_settled`]), which
+    /// [`Self::swap_generation`] leaves on the levels a rollback puts back.
     #[inline]
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let prepared = PreparedElasticRoute::new(key_hash);
