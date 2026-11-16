@@ -136,7 +136,7 @@ impl ExactTrace {
                     identity,
                     identity,
                     prepared,
-                    control::control_fingerprint(identity),
+                    control::control_fingerprint_low(identity),
                     placement,
                 ),
                 (placement.level, placement.slot)
@@ -153,7 +153,7 @@ impl ExactTrace {
                 table.find_slot_indices_prepared(
                     &identity,
                     prepared,
-                    control::control_fingerprint(identity),
+                    control::control_fingerprint_low(identity),
                 ),
                 Some((placement.level, placement.slot))
             );
@@ -174,7 +174,11 @@ impl ExactTrace {
         let prepared = PreparedElasticKey::new(identity);
         let location = self
             .table
-            .find_slot_indices_prepared(&identity, prepared, control::control_fingerprint(identity))
+            .find_slot_indices_prepared(
+                &identity,
+                prepared,
+                control::control_fingerprint_low(identity),
+            )
             .unwrap();
         assert_eq!(
             map::TableBackend::remove(&mut self.table, location),
@@ -1127,12 +1131,12 @@ fn elastic_controls_keep_the_public_hash_fingerprint() {
     map.insert(hash, 7);
     let location = map
         .table()
-        .find_slot_indices_prepared(&hash, prepared, control::control_fingerprint(hash))
+        .find_slot_indices_prepared(&hash, prepared, control::control_fingerprint_low(hash))
         .unwrap();
 
     assert_eq!(
         map.table().levels[location.0].checked_control(location.1),
-        control::control_fingerprint(hash)
+        control::control_fingerprint_low(hash)
     );
 }
 
@@ -1429,7 +1433,7 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
             Global,
         )
         .unwrap();
-    let fingerprint = control::control_fingerprint(0);
+    let fingerprint = control::control_fingerprint_low(0);
     let prepared = PreparedElasticKey::new(0);
     let mut next_key = 0_u64;
 
@@ -1543,7 +1547,7 @@ fn direct_lookup_returns_the_compared_slot_reference() {
     for key in 0..insertion_count {
         let hash = table.hash_builder.hash_one(key);
         let prepared = PreparedElasticKey::new(hash);
-        let fingerprint = control::control_fingerprint(hash);
+        let fingerprint = control::control_fingerprint_low(hash);
         let location = table
             .find_slot_indices_prepared(&key, prepared, fingerprint)
             .expect("inserted key must have a location");
@@ -1558,7 +1562,7 @@ fn direct_lookup_returns_the_compared_slot_reference() {
     let missing = usize::MAX;
     let hash = table.hash_builder.hash_one(missing);
     let prepared = PreparedElasticKey::new(hash);
-    let fingerprint = control::control_fingerprint(hash);
+    let fingerprint = control::control_fingerprint_low(hash);
     assert!(
         table
             .find_entry_prepared(&missing, prepared, fingerprint)
@@ -1579,7 +1583,7 @@ fn delete_below_cleanup_threshold_preserves_survivor_locations() {
                 .find_slot_indices_prepared(
                     &key,
                     PreparedElasticKey::new(hash),
-                    control::control_fingerprint(hash),
+                    control::control_fingerprint_low(hash),
                 )
                 .unwrap()
         })
@@ -1594,7 +1598,7 @@ fn delete_below_cleanup_threshold_preserves_survivor_locations() {
                 .find_slot_indices_prepared(
                     &key,
                     PreparedElasticKey::new(hash),
-                    control::control_fingerprint(hash),
+                    control::control_fingerprint_low(hash),
                 )
                 .unwrap()
         })
@@ -2171,7 +2175,7 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
         for key in 0..2 * budget {
             let hash = table.hash_builder.hash_one(key);
             let prepared = PreparedElasticKey::new(hash);
-            let fingerprint = control::control_fingerprint(hash);
+            let fingerprint = control::control_fingerprint_low(hash);
             let scheduled = table.find_slot_indices_prepared(&key, prepared, fingerprint);
             let scanned =
                 table.find_by_full_scan(&key, fingerprint, |level, slot, _| (level, slot));
@@ -3243,7 +3247,7 @@ fn schedule_lookup_agrees_past_the_summary_width() {
     for key in 0..2 * budget {
         let hash = table.hash_builder.hash_one(key);
         let prepared = PreparedElasticKey::new(hash);
-        let fingerprint = control::control_fingerprint(hash);
+        let fingerprint = control::control_fingerprint_low(hash);
         let scheduled = table.find_slot_indices_prepared(&key, prepared, fingerprint);
         assert_eq!(scheduled.is_some(), key < budget, "key {key}");
         let filter = table.route_filter(prepared);

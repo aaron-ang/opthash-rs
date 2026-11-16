@@ -1494,7 +1494,7 @@ where
     #[inline]
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let prepared = PreparedElasticKey::new(key_hash);
-        let key_fingerprint = control::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint_low(key_hash);
         let Some((region, slot, control)) = self.settled_level_slot(prepared.route.probe) else {
             return self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
         };
@@ -1979,7 +1979,7 @@ where
         self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            |route| control::control_fingerprint(route.key_hash()),
+            |route| control::control_fingerprint_low(route.key_hash()),
             |level, slot, _entry| (level, slot),
         )
     }
@@ -1992,7 +1992,7 @@ where
         self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            |route| control::control_fingerprint(route.key_hash()),
+            |route| control::control_fingerprint_low(route.key_hash()),
             |_level, _slot, entry| entry,
         )
     }
@@ -2007,7 +2007,7 @@ where
         self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            |route| control::control_fingerprint(route.key_hash()),
+            |route| control::control_fingerprint_low(route.key_hash()),
             |_level, _slot, entry| entry,
         )
         .map(|entry| &entry.value)
@@ -2033,7 +2033,7 @@ where
         K: Hash + Eq,
     {
         let prepared = PreparedElasticKey::new(hash);
-        let key_fingerprint = control::control_fingerprint(hash);
+        let key_fingerprint = control::control_fingerprint_low(hash);
         // Every way off the common path meets in one call, which tells them
         // apart itself.
         'common: {
@@ -2104,7 +2104,7 @@ where
         if !filter.maybe_present {
             return None;
         }
-        let key_fingerprint = control::control_fingerprint(hash);
+        let key_fingerprint = control::control_fingerprint_low(hash);
         let walked = self.walk_schedule(
             key,
             prepared.route,
@@ -3156,7 +3156,7 @@ where
     #[inline]
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let prepared = PreparedElasticKey::new(key_hash);
-        let key_fingerprint = control::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint_low(key_hash);
         let target = self.scheduler.target(self.live());
         if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             self.place_new_entry(entry.key, entry.value, prepared, key_fingerprint, placement);
