@@ -1143,6 +1143,209 @@ fn assert_head_addresses_storage<K, V, S>(table: &FunnelTable<K, V, S>) {
     assert_eq!(table.head_lanes, table.shape.head_lanes());
 }
 
+/// The head placement takes every free lane of a bucket for an EMPTY one,
+/// so it must be closed whenever a lane of the table is a tombstone. Every
+/// operation that writes or clears tombstones keeps that, and absent keys
+/// are placed both ways along the stream.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn head_placement_is_closed_while_any_lane_is_a_tombstone() {
+    use alloc::collections::BTreeMap;
+
+    type Map = FunnelHashMap<u64, u64, crate::test_support::FixedHashBuilder>;
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    fn tombstone_lanes(map: &Map) -> usize {
+        let table = map.table();
+        (0..table.shape.slots)
+            // SAFETY: `slot < slots`, the storage capacity.
+            .filter(|&slot| unsafe { table.storage.control_at(slot) } == CTRL_TOMBSTONE)
+            .count()
+    }
+    fn check(map: &Map, model: &BTreeMap<u64, u64>) {
+        let table = map.table();
+        let tombstones = tombstone_lanes(map);
+        assert!(table.head_left == 0 || tombstones == 0);
+        assert_eq!(table.tombstones(), tombstones);
+        assert_eq!(map.len(), model.len());
+        for (key, value) in model {
+            assert_eq!(map.get(key), Some(value), "key {key}");
+        }
+    }
+    // The scan of every lane after each single step, where it is cheap.
+    fn check_step(map: &Map, model: &BTreeMap<u64, u64>) {
+        if !cfg!(miri) {
+            check(map, model);
+        }
+    }
+    // Inserts `count` absent keys, checking each placement: one through the
+    // head lands in a table without a tombstone lane.
+    struct Stream {
+        next: u64,
+        through_head: usize,
+        around_tombstones: usize,
+    }
+    impl Stream {
+        fn insert(&mut self, map: &mut Map, model: &mut BTreeMap<u64, u64>, count: usize) {
+            for _ in 0..count {
+                let key = self.next.wrapping_mul(SPREAD);
+                self.next += 1;
+                let (open, tombstones) = (map.table().head_left, map.table().tombstones());
+                let slots = map.table().shape.slots;
+                assert_eq!(map.insert(key, self.next), None);
+                model.insert(key, self.next);
+                if map.table().shape.slots == slots {
+                    if open == 0 {
+                        self.around_tombstones += usize::from(tombstones != 0);
+                    } else {
+                        assert_eq!(tombstones, 0);
+                        assert_eq!(map.table().head_left, open - 1);
+                        self.through_head += 1;
+                    }
+                }
+                check_step(map, model);
+            }
+        }
+    }
+
+    let mut map: Map = FunnelHashMap::with_capacity_and_hasher(256, test_support::fixed_hasher());
+    let mut model = BTreeMap::new();
+    let mut stream = Stream {
+        next: 0,
+        through_head: 0,
+        around_tombstones: 0,
+    };
+    stream.insert(&mut map, &mut model, 150);
+
+    // Removals, then inserts among their tombstones.
+    let removed: Vec<u64> = model.keys().copied().step_by(3).collect();
+    for key in removed {
+        assert_eq!(map.remove(&key), model.remove(&key));
+        check_step(&map, &model);
+    }
+    check(&map, &model);
+    stream.insert(&mut map, &mut model, 20);
+
+    map.retain(|key, _| key % 5 != 0);
+    model.retain(|key, _| key % 5 != 0);
+    check(&map, &model);
+    stream.insert(&mut map, &mut model, 20);
+
+    // An extraction run to its end, and one dropped part way.
+    for extracted in map.extract_if(|key, _| key % 7 == 0).collect::<Vec<_>>() {
+        assert_eq!(model.remove(&extracted.0), Some(extracted.1));
+    }
+    check(&map, &model);
+    stream.insert(&mut map, &mut model, 20);
+    for extracted in map
+        .extract_if(|key, _| key % 2 == 0)
+        .take(9)
+        .collect::<Vec<_>>()
+    {
+        assert_eq!(model.remove(&extracted.0), Some(extracted.1));
+    }
+    check(&map, &model);
+    stream.insert(&mut map, &mut model, 20);
+
+    // A clone carries the tombstones and the closed head with them.
+    let mut clone = map.clone();
+    let mut clone_model = model.clone();
+    check(&clone, &clone_model);
+    let mut clone_stream = Stream {
+        next: 1 << 40,
+        through_head: 0,
+        around_tombstones: 0,
+    };
+    clone_stream.insert(&mut clone, &mut clone_model, 20);
+
+    // A rebuild leaves no tombstone, and the head opens again.
+    assert_ne!(tombstone_lanes(&map), 0);
+    map.shrink_to_fit();
+    check(&map, &model);
+    assert_eq!(tombstone_lanes(&map), 0);
+    assert_eq!(
+        map.table().head_left,
+        map.table().shape.head_insertions() - map.len()
+    );
+    stream.insert(&mut map, &mut model, 20);
+
+    // A drain run to its end, a clear, and a clear after removals.
+    for drained in map.drain().collect::<Vec<_>>() {
+        assert_eq!(model.remove(&drained.0), Some(drained.1));
+    }
+    check(&map, &model);
+    stream.insert(&mut map, &mut model, 40);
+    map.clear();
+    model.clear();
+    check(&map, &model);
+    stream.insert(&mut map, &mut model, 40);
+    let removed: Vec<u64> = model.keys().copied().step_by(2).collect();
+    for key in removed {
+        assert_eq!(map.remove(&key), model.remove(&key));
+    }
+    map.clear();
+    model.clear();
+    check(&map, &model);
+    assert_ne!(map.table().head_left, 0);
+
+    // Churn through tombstone cleanups and growth.
+    stream.insert(&mut map, &mut model, 100);
+    for _ in 0..if cfg!(miri) { 200 } else { 3_000 } {
+        let key = *model.keys().next().unwrap();
+        assert_eq!(map.remove(&key), model.remove(&key));
+        check_step(&map, &model);
+        stream.insert(&mut map, &mut model, 1);
+    }
+    stream.insert(&mut map, &mut model, 400);
+    check(&map, &model);
+    check(&clone, &clone_model);
+    assert_ne!(stream.through_head, 0);
+    assert_ne!(stream.around_tombstones, 0);
+    assert_ne!(clone_stream.around_tombstones, 0);
+}
+
+/// The head placement copies an absent key and its value into the table,
+/// and the insert then gives both up without dropping them: each drops
+/// once, with the table.
+#[test]
+fn head_placement_takes_key_and_value_without_dropping_either() {
+    // Counted in a static, not behind a pointer the key or value owns, so
+    // a second drop is a wrong count and not a use after free.
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Tracked {
+        id: u64,
+    }
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    impl PartialEq for Tracked {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+    impl Eq for Tracked {}
+    impl Hash for Tracked {
+        fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+            self.id.hash(state);
+        }
+    }
+
+    const ENTRIES: usize = 100;
+    let tracked = |id| Tracked { id };
+    let mut map = FunnelHashMap::with_capacity_and_hasher(128, test_support::fixed_hasher());
+    let open = map.table().head_left;
+    for id in 0..ENTRIES as u64 {
+        assert!(map.insert(tracked(id), tracked(id)).is_none());
+    }
+    // Every insert went through the head.
+    assert_eq!(map.table().head_left, open - ENTRIES);
+    assert_eq!(DROPS.load(Ordering::Relaxed), 0);
+    drop(map);
+    assert_eq!(DROPS.load(Ordering::Relaxed), 2 * ENTRIES);
+}
+
 /// The head placement walks the levels that own a level-bin bit without
 /// asking whether each exists, so every shape must have them all, and each
 /// head entry the walk reads must address groups of the storage.
