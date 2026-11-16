@@ -102,12 +102,12 @@ impl ExactTrace {
     fn insert(&mut self, identity: u64) -> usize {
         let Self { table, scalar } = self;
         {
-            let prepared = PreparedElasticKey::new(identity);
+            let prepared = PreparedElasticRoute::new(identity);
             assert_eq!(table.hash_builder.hash_one(identity), identity);
             assert!(table.live() < table.max_insertions);
             let target = table.scheduler.target(table.live());
             let placement = table
-                .choose_slot_for_new_key(prepared.route.probe, target)
+                .choose_slot_for_new_key(prepared.probe, target)
                 .unwrap();
             let expected = scalar.insert(identity);
             let global_slot = table.levels[..placement.level]
@@ -171,7 +171,7 @@ impl ExactTrace {
 
     /// Removes `identity` from both.
     fn remove(&mut self, identity: u64) {
-        let prepared = PreparedElasticKey::new(identity);
+        let prepared = PreparedElasticRoute::new(identity);
         let location = self
             .table
             .find_slot_indices_prepared(
@@ -846,7 +846,7 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
                 assert_eq!(extended.membership.offset, base.size());
                 assert_eq!(
                     extended.membership.words,
-                    slots.div_ceil(membership::SLOTS_PER_WORD)
+                    slots.div_ceil(FILTER_SLOTS_PER_WORD)
                 );
                 assert!(extended.layout.size() > base.size());
             }
@@ -856,7 +856,7 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
     assert_layout::<u64, u64>();
     assert_layout::<Zst, Zst>();
     assert_layout::<OverAligned, OverAligned>();
-    assert!(mem::size_of::<MetadataWord>() <= 2 * membership::SLOTS_PER_WORD);
+    assert!(10 * mem::size_of::<TailWord>() <= 16 * FILTER_SLOTS_PER_WORD);
 
     let table =
         ElasticTable::<OverAligned, OverAligned, FixedHashBuilder>::with_capacity_and_reserve_and_hasher_in(
@@ -874,14 +874,14 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
         unsafe { table.arena.as_ptr().add(layout.membership.offset) }.addr()
     );
     assert_eq!(
-        table.membership_ptr().addr() % mem::align_of::<MetadataWord>(),
+        table.membership_ptr().addr() % mem::align_of::<TailWord>(),
         0
     );
     for word in 0..table.membership.words {
         // SAFETY: `word < words` indexes an initialized metadata word.
         let metadata = unsafe { *table.membership_ptr().add(word) };
         assert_eq!(metadata.membership, 0);
-        assert_eq!(metadata.level_bins, [NO_LEVELS_OCCUPIED; 4]);
+        assert_eq!(metadata.level_bins, [NO_LEVELS_OCCUPIED; SUMMARY_BINS]);
     }
     assert_eq!(
         table.levels[0].data_ptr().addr() % mem::align_of::<OverAligned>(),
@@ -969,7 +969,7 @@ fn deletes_past_the_threshold_refresh_the_membership_filter() {
         ElasticTable<u64, u64, FixedHashBuilder>,
     >(
         |table, key| {
-            let prepared = PreparedElasticKey::new(table.hash_builder.hash_one(key));
+            let prepared = PreparedElasticRoute::new(table.hash_builder.hash_one(key));
             table.route_filter(prepared).maybe_present
         },
         ElasticTable::stale_membership,
@@ -993,33 +993,49 @@ fn duplicate_insert_does_not_advance_the_paper_schedule() {
     assert_eq!(map.get(&7), Some(&13));
 }
 
-/// Independent restatement of the filter's bit pattern, kept here so a
-/// change to the shared derivation has to be deliberate.
-fn membership_bits_from_signature(signature: u64) -> u64 {
-    let first = signature & 63;
-    let second = (signature >> 32) & 63;
-    let third = (signature >> 16) & 63;
-    (1_u64 << first) | (1_u64 << second) | (1_u64 << third)
+/// Independent restatement of a key's place in a tail of `words` words, as
+/// its word, its membership bits and its summary bin, kept here so a change
+/// to the derivation has to be deliberate.
+fn metadata_place_from_signature(signature: u64, words: usize) -> (usize, u64, usize) {
+    let lane_bits = u128::from(u64::BITS);
+    let fraction = lane_bits.pow(u32::try_from(MEMBERSHIP_BITS).unwrap());
+    let reduction =
+        (u128::from(signature) * u128::try_from(words).unwrap() * fraction) >> u64::BITS;
+    let mut bits = 0;
+    let mut field = reduction % fraction;
+    let mut top_field = 0;
+    for _ in 0..MEMBERSHIP_BITS {
+        top_field = field % lane_bits;
+        bits |= 1_u64 << top_field;
+        field /= lane_bits;
+    }
+    let bin = top_field / (lane_bits / u128::try_from(SUMMARY_BINS).unwrap());
+    (
+        usize::try_from(reduction / fraction).unwrap(),
+        bits,
+        usize::try_from(bin).unwrap(),
+    )
 }
 
 fn membership_maybe_contains_prepared<K, V, S, A>(
     table: &ElasticTable<K, V, S, A>,
-    prepared: PreparedElasticKey,
+    prepared: PreparedElasticRoute,
 ) -> bool
 where
     K: Eq + Hash,
     S: BuildHasher,
     A: Allocator + Clone,
 {
-    table.membership_maybe_contains(prepared.route, prepared.membership)
+    table.route_filter(prepared).maybe_present
 }
 
 #[test]
 fn compact_prepared_elastic_state_is_register_sized() {
     assert_eq!(mem::size_of::<PreparedElasticRoute>(), 8);
-    assert_eq!(mem::align_of::<PreparedElasticRoute>(), 8);
-    assert_eq!(mem::size_of::<PreparedElasticKey>(), 16);
-    assert_eq!(mem::align_of::<PreparedElasticKey>(), 8);
+    assert_eq!(
+        mem::align_of::<PreparedElasticRoute>(),
+        mem::align_of::<u64>()
+    );
 }
 
 #[test]
@@ -1070,11 +1086,8 @@ fn route_summary_still_narrows_shallow_levels_on_wide_geometries() {
         map.insert(key, key);
     }
     for key in 0..key_count {
-        let prepared = PreparedElasticKey::new(key);
-        let mask = map
-            .table()
-            .route_filter(prepared)
-            .level_mask(prepared.route);
+        let prepared = PreparedElasticRoute::new(key);
+        let mask = map.table().route_filter(prepared).level_mask();
         assert!(mask != 0, "key {key} has no level recorded");
         assert!(
             mask.count_ones() < u32::try_from(ROUTE_SUMMARY_LEVELS).unwrap(),
@@ -1095,36 +1108,24 @@ fn prepared_route_keeps_the_geometry_independent_signature() {
 }
 
 #[test]
-fn compact_membership_matches_the_existing_signature_formula() {
-    for hash in (0..16_384_u64).map(|value| value.rotate_left(19)) {
-        let prepared = PreparedElasticKey::new(hash);
-        let signature = prepared.route.signature();
-        let expected = membership_bits_from_signature(signature);
-        assert_eq!(prepared.membership.bits(), expected);
-        for words in [1_usize, 3, 17, 257] {
-            let product = u128::from(signature) * u128::try_from(words).unwrap();
+fn metadata_place_matches_its_restatement() {
+    for hash in (0..16_384_u64).map(|value| value.rotate_left(19) ^ value.rotate_left(51)) {
+        let signature = PreparedElasticRoute::new(hash).signature();
+        for words in [1_usize, 3, 17, 257, 65_537] {
+            let place = MetadataPlace::new(signature, MetadataPlace::scale(words));
             assert_eq!(
-                MembershipKey::word(signature, words),
-                usize::try_from(product >> 64).unwrap(),
+                (place.word(), place.bits(), place.summary_bin()),
+                metadata_place_from_signature(signature, words),
+                "signature {signature:#x} over {words} words"
             );
         }
     }
 }
 
 #[test]
-fn prepared_elastic_key_uses_the_exact_probe_signature() {
-    let hash = 0xd1b5_4a32_d192_ed03;
-    let prepared = PreparedElasticKey::new(hash);
-    assert_eq!(
-        prepared.route.signature(),
-        prepared.route.probe.routing_signature()
-    );
-}
-
-#[test]
 fn elastic_controls_keep_the_public_hash_fingerprint() {
     let hash = 1_u64;
-    let prepared = PreparedElasticKey::new(hash);
+    let prepared = PreparedElasticRoute::new(hash);
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
 
@@ -1165,12 +1166,9 @@ fn route_summary_conservatively_records_every_live_level() {
     }
     for (key, level_index) in (0..key_count).zip(key_levels) {
         let level_index = level_index.unwrap();
-        let prepared = PreparedElasticKey::new(key);
+        let prepared = PreparedElasticRoute::new(key);
         assert_ne!(
-            map.table()
-                .route_filter(prepared)
-                .level_mask(prepared.route)
-                & (1 << summary_level(level_index)),
+            map.table().route_filter(prepared).level_mask() & (1 << summary_level(level_index)),
             0,
             "key {key} at level {level_index}"
         );
@@ -1197,20 +1195,19 @@ fn route_summary_conservatively_records_every_live_level() {
     }
 
     map.clear();
-    assert!(map.table().levels.len() <= ROUTE_SUMMARY_LEVELS);
     for word in 0..map.table().membership.words {
         assert_eq!(
             // SAFETY: `word < words` indexes an initialized metadata word.
             unsafe { (*map.table().membership_ptr().add(word)).level_bins },
-            [NO_LEVELS_OCCUPIED; 4]
+            [NO_LEVELS_OCCUPIED; SUMMARY_BINS]
         );
     }
 }
 
 #[test]
-fn prepared_elastic_key_remains_geometry_independent_across_growth() {
+fn prepared_route_remains_geometry_independent_across_growth() {
     let hash = 0x9e37_79b9_7f4a_7c15;
-    let prepared = PreparedElasticKey::new(hash);
+    let prepared = PreparedElasticRoute::new(hash);
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(1, IdentityBuildHasher);
     map.insert(hash, 7);
@@ -1224,7 +1221,7 @@ fn membership_filter_never_forgets_live_or_deleted_hashes() {
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
     let inserted_hash = map.table().hash_builder.hash_one(7_u64);
-    let prepared = PreparedElasticKey::new(inserted_hash);
+    let prepared = PreparedElasticRoute::new(inserted_hash);
     assert!(!membership_maybe_contains_prepared(map.table(), prepared));
 
     assert_eq!(map.insert(7, 11), None);
@@ -1254,7 +1251,7 @@ fn blocked_membership_never_forgets_inserted_hashes() {
     for key in 0..key_count {
         assert!(membership_maybe_contains_prepared(
             map.table(),
-            PreparedElasticKey::new(key)
+            PreparedElasticRoute::new(key)
         ));
     }
 }
@@ -1262,7 +1259,7 @@ fn blocked_membership_never_forgets_inserted_hashes() {
 #[test]
 fn prepared_membership_remains_valid_across_growth() {
     let key = 0xD1B5_4A32_D192_ED03_u64;
-    let prepared = PreparedElasticKey::new(key);
+    let prepared = PreparedElasticRoute::new(key);
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(1, IdentityBuildHasher);
 
@@ -1289,7 +1286,7 @@ fn membership_filter_resets_and_rebuilds_at_table_boundaries() {
         let hash = cloned.table().hash_builder.hash_one(key);
         assert!(membership_maybe_contains_prepared(
             cloned.table(),
-            PreparedElasticKey::new(hash),
+            PreparedElasticRoute::new(hash),
         ));
         assert_eq!(cloned.get(&key), Some(&(key ^ 0x55)));
     }
@@ -1299,7 +1296,7 @@ fn membership_filter_resets_and_rebuilds_at_table_boundaries() {
         let hash = cloned.table().hash_builder.hash_one(key);
         assert!(!membership_maybe_contains_prepared(
             cloned.table(),
-            PreparedElasticKey::new(hash),
+            PreparedElasticRoute::new(hash),
         ));
     }
 
@@ -1311,7 +1308,7 @@ fn membership_filter_resets_and_rebuilds_at_table_boundaries() {
         let hash = cloned.table().hash_builder.hash_one(key);
         assert!(membership_maybe_contains_prepared(
             cloned.table(),
-            PreparedElasticKey::new(hash),
+            PreparedElasticRoute::new(hash),
         ));
         assert_eq!(cloned.get(&key), Some(&key));
     }
@@ -1330,7 +1327,7 @@ fn all_vacant_entry_apis_record_membership() {
         let hash = map.table().hash_builder.hash_one(key);
         assert!(membership_maybe_contains_prepared(
             map.table(),
-            PreparedElasticKey::new(hash)
+            PreparedElasticRoute::new(hash)
         ));
         assert!(map.contains_key(&key));
     }
@@ -1348,7 +1345,7 @@ fn drain_and_failed_reserve_preserve_membership_invariants() {
         let hash = map.table().hash_builder.hash_one(key);
         assert!(membership_maybe_contains_prepared(
             map.table(),
-            PreparedElasticKey::new(hash)
+            PreparedElasticRoute::new(hash)
         ));
         assert_eq!(map.get(&key), Some(&key));
     }
@@ -1359,7 +1356,7 @@ fn drain_and_failed_reserve_preserve_membership_invariants() {
         let hash = map.table().hash_builder.hash_one(key);
         assert!(!membership_maybe_contains_prepared(
             map.table(),
-            PreparedElasticKey::new(hash)
+            PreparedElasticRoute::new(hash)
         ));
     }
 }
@@ -1398,7 +1395,7 @@ fn allocator_failure_does_not_publish_or_forget_membership() {
         let hash = map.table().hash_builder.hash_one(key);
         assert!(membership_maybe_contains_prepared(
             map.table(),
-            PreparedElasticKey::new(hash)
+            PreparedElasticRoute::new(hash)
         ));
         assert_eq!(map.get(&key), Some(&(key ^ 0x5a)));
     }
@@ -1434,7 +1431,7 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
         )
         .unwrap();
     let fingerprint = control::control_fingerprint_low(0);
-    let prepared = PreparedElasticKey::new(0);
+    let prepared = PreparedElasticRoute::new(0);
     let mut next_key = 0_u64;
 
     // Occupy every slot the shared hash can reach in every level, so no batch
@@ -1472,12 +1469,12 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
     assert!(table.live() < table.max_insertions);
     assert!(
         table
-            .choose_slot_for_new_key(prepared.route.probe, BatchTarget::Bootstrap)
+            .choose_slot_for_new_key(prepared.probe, BatchTarget::Bootstrap)
             .is_none()
     );
     assert!(
         table
-            .choose_slot_on_other_targets(prepared.route.probe, BatchTarget::Bootstrap)
+            .choose_slot_on_other_targets(prepared.probe, BatchTarget::Bootstrap)
             .is_none()
     );
 
@@ -1546,7 +1543,7 @@ fn direct_lookup_returns_the_compared_slot_reference() {
 
     for key in 0..insertion_count {
         let hash = table.hash_builder.hash_one(key);
-        let prepared = PreparedElasticKey::new(hash);
+        let prepared = PreparedElasticRoute::new(hash);
         let fingerprint = control::control_fingerprint_low(hash);
         let location = table
             .find_slot_indices_prepared(&key, prepared, fingerprint)
@@ -1561,7 +1558,7 @@ fn direct_lookup_returns_the_compared_slot_reference() {
 
     let missing = usize::MAX;
     let hash = table.hash_builder.hash_one(missing);
-    let prepared = PreparedElasticKey::new(hash);
+    let prepared = PreparedElasticRoute::new(hash);
     let fingerprint = control::control_fingerprint_low(hash);
     assert!(
         table
@@ -1582,7 +1579,7 @@ fn delete_below_cleanup_threshold_preserves_survivor_locations() {
             map.table()
                 .find_slot_indices_prepared(
                     &key,
-                    PreparedElasticKey::new(hash),
+                    PreparedElasticRoute::new(hash),
                     control::control_fingerprint_low(hash),
                 )
                 .unwrap()
@@ -1597,7 +1594,7 @@ fn delete_below_cleanup_threshold_preserves_survivor_locations() {
             map.table()
                 .find_slot_indices_prepared(
                     &key,
-                    PreparedElasticKey::new(hash),
+                    PreparedElasticRoute::new(hash),
                     control::control_fingerprint_low(hash),
                 )
                 .unwrap()
@@ -1917,9 +1914,9 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
         "every reachable probe must be occupied"
     );
 
-    let prepared = PreparedElasticKey::new(key_hash);
+    let prepared = PreparedElasticRoute::new(key_hash);
     let placement = table
-        .choose_slot_for_new_key(prepared.route.probe, BatchTarget::LevelPair(LEVEL))
+        .choose_slot_for_new_key(prepared.probe, BatchTarget::LevelPair(LEVEL))
         .expect("Case 1 falls through to the next level");
     assert_eq!(placement.level, LEVEL + 1);
 }
@@ -1936,8 +1933,7 @@ fn keys_behind_another_on_their_route(
         let hash = table.hash_builder.hash_one(key);
         let (level, slot) = table.find(&key, hash).unwrap();
         let region = &table.levels[level];
-        let word = PreparedElasticKey::new(hash)
-            .route
+        let word = PreparedElasticRoute::new(hash)
             .probe
             .sequence(table.fold_multiplier)
             .word(probe::elastic_level_run(level).0);
@@ -2002,10 +1998,10 @@ fn a_table_without_metadata_words_rejects_every_lookup() {
     let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(0);
     assert_eq!(map.table().membership.words, 0);
     for key in 0..1_000_u64 {
-        let prepared = PreparedElasticKey::new(map.table().hash_builder.hash_one(key));
+        let prepared = PreparedElasticRoute::new(map.table().hash_builder.hash_one(key));
         let filter = map.table().route_filter(prepared);
         assert!(!filter.maybe_present);
-        assert_eq!(filter.level_mask(prepared.route), 0);
+        assert_eq!(filter.level_mask(), 0);
         assert_eq!(map.get(&key), None);
         assert!(!map.contains_key(&key));
         assert_eq!(map.remove(&key), None);
@@ -2174,7 +2170,7 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
         assert!(table.probe_schedule.addresses(&table.levels));
         for key in 0..2 * budget {
             let hash = table.hash_builder.hash_one(key);
-            let prepared = PreparedElasticKey::new(hash);
+            let prepared = PreparedElasticRoute::new(hash);
             let fingerprint = control::control_fingerprint_low(hash);
             let scheduled = table.find_slot_indices_prepared(&key, prepared, fingerprint);
             let scanned =
@@ -2185,8 +2181,8 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
             if filter.maybe_present {
                 let walked = table.find_by_general_schedule(
                     &key,
-                    prepared.route,
-                    filter.expanded_level_mask(prepared.route),
+                    prepared,
+                    filter.expanded_level_mask(),
                     fingerprint,
                     |level, slot, _| (level, slot),
                 );
@@ -2216,9 +2212,7 @@ fn settled_insert_slot_agrees_with_the_general_placement() {
             map.remove(&(key / 2));
         }
         let table = map.table();
-        let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
-            .route
-            .probe;
+        let probe = PreparedElasticRoute::new(table.hash_builder.hash_one(key)).probe;
         if let Some((level, slot, control)) = table.settled_slot(probe) {
             // SAFETY: the settled search returns a slot of `level`.
             assert_eq!(control, unsafe { table.levels[level].control_at(slot) });
@@ -2254,9 +2248,7 @@ fn shifted_vacancy_search_agrees_with_the_general_one() {
     let mut missed = 0;
     let keys = if cfg!(miri) { 300_u64 } else { 2_000 };
     for key in 0..keys {
-        let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
-            .route
-            .probe;
+        let probe = PreparedElasticRoute::new(table.hash_builder.hash_one(key)).probe;
         for level in 0..table.levels.len() {
             for budget in [0, 1, 2, 7, 64] {
                 let region = &table.levels[level];
@@ -2507,7 +2499,7 @@ fn lookup_and_insert_paths_hold_on_every_small_table_shape() {
                 None => {}
             }
             let hash = table.hash_builder.hash_one(key);
-            let probe = PreparedElasticKey::new(hash).route.probe;
+            let probe = PreparedElasticRoute::new(hash).probe;
             settled += usize::from(table.settled_slot(probe).is_some());
             assert_eq!(table.insert(key, key, hash), None);
             assert_eq!(table.insert(key, key, hash), Some(key));
@@ -2829,7 +2821,7 @@ fn settled_inserts_match_an_ordered_map_model() {
                     reused += usize::from(tombstones(&table) < before);
                     assert!(membership_maybe_contains_prepared(
                         &table,
-                        PreparedElasticKey::new(hash)
+                        PreparedElasticRoute::new(hash)
                     ));
                 }
             } else if roll < 85 {
@@ -2901,9 +2893,7 @@ fn settled_gate_follows_the_live_count_through_a_clear_that_panicked() {
                     .would_settle(table.placed, table.stale_membership()),
                 table.scheduler.covers(table.live())
             );
-            let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
-                .route
-                .probe;
+            let probe = PreparedElasticRoute::new(table.hash_builder.hash_one(key)).probe;
             let general = table
                 .choose_slot_for_new_key(probe, table.scheduler.target_at(table.live()))
                 .map(|placement| (placement.level, placement.slot));
@@ -3244,7 +3234,7 @@ fn removing_a_full_table_leaves_no_tombstone_for_lookups() {
     assert_eq!(table.stale_membership(), 0);
     assert!(table.levels.iter().all(|level| level.tombstones() == 0));
     assert!((0..live).all(|key| {
-        let prepared = PreparedElasticKey::new(table.hash_builder.hash_one(key));
+        let prepared = PreparedElasticRoute::new(table.hash_builder.hash_one(key));
         !table.route_filter(prepared).maybe_present
     }));
 }
@@ -3253,7 +3243,9 @@ fn removing_a_full_table_leaves_no_tombstone_for_lookups() {
 #[cfg_attr(miri, ignore)]
 fn schedule_lookup_agrees_past_the_summary_width() {
     const SAMPLE_STRIDE: u64 = 4_099;
-    const DEEP_MISS_STRIDE: u64 = 61;
+    const ABSENT_STRIDE: usize = 16;
+    const SCATTER: u64 = 0x9E37_79B9_7F4A_7C15;
+    const ABSENT: u64 = 1 << 63;
     // A thin reserve lets the fill reach the levels that share the
     // summary's last bit, and the ones past it.
     let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
@@ -3280,19 +3272,29 @@ fn schedule_lookup_agrees_past_the_summary_width() {
     let mut deep_walked_misses = 0;
     let mut shallow_walked_misses = 0;
     let mut filtered_misses = 0;
-    for key in 0..2 * budget {
+    // A walk for an absent key the filter passes is the slow case, so the
+    // absent keys are a sample.
+    for index in (0..budget).chain((budget..2 * budget).step_by(ABSENT_STRIDE)) {
+        // The absent keys are scattered: a run of consecutive ones folds
+        // to places that interleave with the present run's, and then the
+        // filter rejects nearly all of them.
+        let key = if index < budget {
+            index
+        } else {
+            index.wrapping_mul(SCATTER) | ABSENT
+        };
         let hash = table.hash_builder.hash_one(key);
-        let prepared = PreparedElasticKey::new(hash);
+        let prepared = PreparedElasticRoute::new(hash);
         let fingerprint = control::control_fingerprint_low(hash);
         let scheduled = table.find_slot_indices_prepared(&key, prepared, fingerprint);
-        assert_eq!(scheduled.is_some(), key < budget, "key {key}");
+        assert_eq!(scheduled.is_some(), index < budget, "key {key}");
         let filter = table.route_filter(prepared);
-        let mask = filter.expanded_level_mask(prepared.route);
+        let mask = filter.expanded_level_mask();
         let deep_open = filter.maybe_present && mask >> saturated != 0;
         if filter.maybe_present {
             let walked = table.find_by_general_schedule(
                 &key,
-                prepared.route,
+                prepared,
                 mask,
                 fingerprint,
                 |level, slot, _| (level, slot),
@@ -3311,16 +3313,19 @@ fn schedule_lookup_agrees_past_the_summary_width() {
         } else {
             filtered_misses += 1;
         }
-        // The scan reads every slot, so it runs on the deep hits and a
-        // sample of the rest.
-        if deep_hit || key % SAMPLE_STRIDE == 0 || (deep_open && key % DEEP_MISS_STRIDE == 0) {
+        // The scan reads every slot, so it runs on the deep hits, the deep
+        // walked misses and a sample of the rest.
+        if deep_hit || deep_open || index % SAMPLE_STRIDE == 0 {
             let scanned =
                 table.find_by_full_scan(&key, fingerprint, |level, slot, _| (level, slot));
             assert_eq!(scheduled, scanned, "key {key}");
         }
     }
     assert!(saturated_hits > 0 && hits_past_the_summary > 0);
-    assert!(deep_walked_misses > 0 && shallow_walked_misses > 0 && filtered_misses > 0);
+    assert!(
+        deep_walked_misses > 0 && shallow_walked_misses > 0 && filtered_misses > 0,
+        "{deep_walked_misses} {shallow_walked_misses} {filtered_misses} {saturated_hits} {hits_past_the_summary}"
+    );
 }
 
 /// A settled insert against the general one, on twin tables through the
@@ -3376,7 +3381,7 @@ fn settled_plan_places_every_key_where_the_general_insert_does() {
                 if let Some(location) = general.find(&key, hash) {
                     assert_eq!(Some(general.replace_value(location, step)), previous);
                 } else {
-                    let prepared = PreparedElasticKey::new(hash);
+                    let prepared = PreparedElasticRoute::new(hash);
                     general.insert_for_vacant_entry_prepared(
                         key,
                         step,
@@ -3444,7 +3449,7 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
         general.insert_for_vacant_entry_prepared(
             key,
             key,
-            PreparedElasticKey::new(hash),
+            PreparedElasticRoute::new(hash),
             control::control_fingerprint_low(hash),
         );
         assert_eq!(settled.find(&key, hash), general.find(&key, hash));
@@ -3536,7 +3541,7 @@ fn settled_fallback_bound_holds_where_its_level_recrosses_a_quarter_free() {
         general.insert_for_vacant_entry_prepared(
             key,
             key,
-            PreparedElasticKey::new(hash),
+            PreparedElasticRoute::new(hash),
             control::control_fingerprint_low(hash),
         );
         assert_eq!(
@@ -3701,5 +3706,210 @@ fn signed_control_sign_extends_every_byte() {
         assert_eq!(signed, i32::from(byte.cast_signed()));
         assert_eq!(signed >= 0, control::is_free(byte));
         assert_eq!(signed.to_le_bytes()[0], byte);
+    }
+}
+
+/// Splitmix64 of `index`: keys with no structure in any bit.
+fn scattered(index: u64) -> u64 {
+    let mut word = index.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    word = (word ^ (word >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    word = (word ^ (word >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    word ^ (word >> 31)
+}
+
+/// A hasher with nothing in its low bits leaves the filter as selective as
+/// one that fills them: a key's place comes from the top of its hash.
+///
+/// Two bounds hold for every family. A key passes only if its first bit is
+/// set, and the keys of a full table set at most [`MEMBERSHIP_BITS`] bits
+/// each, so the passes of uniformly placed absent keys are a count whose
+/// mean is at most that share of the sample. And the passes of a family
+/// without low bits and of the family with them are two such counts. A
+/// count of independent passes has a variance of at most its mean, so six
+/// deviations allow the square of an excess thirty-six times the mean, and
+/// the square of a difference of two counts twice that. The families share
+/// their high bits, so their counts sit closer than counts of independent
+/// samples would; the bound asks for no more than it can derive.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn the_filter_keeps_its_rate_for_hashes_without_low_bits() {
+    const CAPACITY: u64 = 28_672;
+    const SAMPLE: u64 = 4 * CAPACITY;
+    let passes = |low_bits: u32| {
+        let key_at = |index: u64| scattered(index) & !((1 << low_bits) - 1);
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(
+                usize::try_from(CAPACITY).unwrap(),
+                IdentityBuildHasher,
+            );
+        for index in 0..CAPACITY {
+            assert_eq!(map.insert(key_at(index), index), None);
+        }
+        let table = map.table();
+        let lane_bits = u64::try_from(table.membership.words).unwrap() * u64::from(u64::BITS);
+        let mean =
+            (SAMPLE * CAPACITY * u64::try_from(MEMBERSHIP_BITS).unwrap()).div_ceil(lane_bits);
+        let mut passes = 0_u64;
+        for index in CAPACITY..CAPACITY + SAMPLE {
+            let key = key_at(index);
+            assert!(!map.contains_key(&key));
+            let filter = table.route_filter(PreparedElasticRoute::new(key));
+            passes += u64::from(filter.maybe_present);
+        }
+        let excess = passes.saturating_sub(mean);
+        assert!(
+            excess * excess <= 36 * mean,
+            "{passes} of {SAMPLE} keys without their low {low_bits} bits pass, over a mean of {mean}"
+        );
+        passes
+    };
+    let uniform = passes(0);
+    for low_bits in [3, 6, 7] {
+        let difference = passes(low_bits).abs_diff(uniform);
+        assert!(
+            difference * difference <= 72 * uniform,
+            "keys without their low {low_bits} bits pass {difference} apart from {uniform}"
+        );
+    }
+}
+
+std::thread_local! {
+    /// Key compares [`ComparesCounted`] made on this thread.
+    static KEY_COMPARES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// A key that counts its compares and hashes as the `u64` it holds. It
+/// carries its control fingerprint, so a compare with a key of another
+/// fingerprint, which the control byte should have ruled out, fails.
+#[derive(Clone, Copy, Debug)]
+struct ComparesCounted {
+    key: u64,
+    fingerprint: u8,
+}
+
+impl ComparesCounted {
+    fn new(key: u64, hasher: &impl BuildHasher) -> Self {
+        let unmarked = Self {
+            key,
+            fingerprint: 0,
+        };
+        Self {
+            key,
+            fingerprint: control::control_fingerprint_low(hasher.hash_one(unmarked)),
+        }
+    }
+}
+
+impl PartialEq for ComparesCounted {
+    fn eq(&self, other: &Self) -> bool {
+        assert_eq!(self.fingerprint, other.fingerprint);
+        KEY_COMPARES.with(|compares| compares.set(compares.get() + 1));
+        self.key == other.key
+    }
+}
+
+impl Eq for ComparesCounted {}
+
+impl Hash for ComparesCounted {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.key);
+    }
+}
+
+/// Fills a table with the first keys of a family and looks up those and as
+/// many more, absent ones, asserting that the compares against other keys
+/// stay within what the family's own fingerprints explain.
+///
+/// A lookup probes each scheduled route at most once, and a probed slot
+/// holds another key of the family, which shares the fingerprint with the
+/// family's collision probability: the pairs of keys with equal
+/// fingerprints, over all pairs. So the mean of the compares of as many
+/// lookups as keys is at most the routes times the equal pairs over the
+/// keys, and six deviations of a count with that mean allow the square of
+/// an excess thirty-six times it. The routes overstate the probes a lookup
+/// makes, so the bound catches compares that multiply past the family's
+/// collisions, not a rate above the expected one.
+fn assert_compares_within_fingerprint_collisions<S: BuildHasher + Clone>(
+    family: &str,
+    hasher: &S,
+    distinct_fingerprints: usize,
+    key_at: impl Fn(u64) -> u64,
+) {
+    const CAPACITY: u64 = 28_672;
+    let mut map: ElasticHashMap<ComparesCounted, u64, S> = ElasticHashMap::with_capacity_and_hasher(
+        usize::try_from(CAPACITY).unwrap(),
+        hasher.clone(),
+    );
+    let mut fingerprints = [0_u64; 1 << u8::BITS];
+    for index in 0..CAPACITY {
+        let key = ComparesCounted::new(key_at(index), hasher);
+        fingerprints[usize::from(key.fingerprint)] += 1;
+        assert_eq!(map.insert(key, index), None);
+    }
+    assert!(
+        fingerprints.iter().filter(|&&keys| keys != 0).count() >= distinct_fingerprints,
+        "{family}: fewer than {distinct_fingerprints} fingerprints"
+    );
+    let equal_pairs: u64 = fingerprints.iter().map(|keys| keys * keys).sum();
+    let routes = u64::try_from(map.table().probe_schedule.routes().len()).unwrap() + 1;
+    let mean = (routes * equal_pairs).div_ceil(CAPACITY);
+    let within = |compares: u64, lookups: &str| {
+        let excess = compares.saturating_sub(mean);
+        assert!(
+            excess * excess <= 36 * mean,
+            "{family}: {compares} compares against other keys on {lookups}, over a mean of {mean}"
+        );
+    };
+
+    KEY_COMPARES.with(|compares| compares.set(0));
+    for index in 0..CAPACITY {
+        assert_eq!(
+            map.get(&ComparesCounted::new(key_at(index), hasher)),
+            Some(&index)
+        );
+    }
+    within(KEY_COMPARES.with(core::cell::Cell::get) - CAPACITY, "hits");
+
+    KEY_COMPARES.with(|compares| compares.set(0));
+    for index in CAPACITY..2 * CAPACITY {
+        assert_eq!(map.get(&ComparesCounted::new(key_at(index), hasher)), None);
+    }
+    within(KEY_COMPARES.with(core::cell::Cell::get), "misses");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn compares_against_other_keys_stay_within_fingerprint_collisions() {
+    let fingerprints = 1_usize << (u8::BITS - 1);
+    assert_compares_within_fingerprint_collisions(
+        "hashed, consecutive",
+        &fixed_hasher(),
+        fingerprints,
+        |index| index,
+    );
+    let identity = |family: &str, distinct_fingerprints: usize, key_at: &dyn Fn(u64) -> u64| {
+        assert_compares_within_fingerprint_collisions(
+            family,
+            &IdentityBuildHasher,
+            distinct_fingerprints,
+            key_at,
+        );
+    };
+    identity("consecutive", fingerprints, &|index| index);
+    identity("odd multiples", fingerprints, &|index| {
+        index.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    });
+    // A step with three low zero bits leaves the fingerprint four.
+    identity("thousands", fingerprints >> 3, &|index| index * 1_000);
+    for shift in [6_u32, 7, 16, 32, 48] {
+        let distinct = fingerprints >> shift.min(u8::BITS - 1);
+        identity("shifted", distinct, &|index| (index + 1) << shift);
+    }
+    for low_bits in [3_u32, 6, 7] {
+        identity(
+            "scattered, no low bits",
+            fingerprints >> low_bits,
+            &|index| scattered(index) & !((1 << low_bits) - 1),
+        );
     }
 }

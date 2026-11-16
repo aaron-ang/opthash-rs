@@ -544,7 +544,8 @@ fn funnel_layout<K, V>(n: usize) -> Result<FunnelLayout, TryReserveError> {
             .ok_or(TryReserveError::CapacityOverflow)?
     };
     let (base_layout, data_offset) = arena::layout_for_extents::<K, V>(control_bytes, n)?;
-    let (layout, membership) = MembershipRegion::extend::<MetadataWord>(base_layout, n)?;
+    let (layout, membership) =
+        MembershipRegion::extend::<MetadataWord>(base_layout, n, membership::SLOTS_PER_WORD)?;
     Ok(FunnelLayout {
         layout,
         data_offset,
