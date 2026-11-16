@@ -625,12 +625,12 @@ struct FilterTail {
 /// The filter unit an empty table's gate reads: nothing recorded.
 static NO_FILTER_UNIT: u32 = 0;
 
-/// Filter units of a table of `n` entries: four for every five. A key sets
+/// Filter units of a table of `n` entries: eight for every five. A key sets
 /// one membership bit, so the share of absent keys a gate lets through is
 /// the share of bits set, which falls only with more bits per entry; fewer
 /// entries per level bin also leave a lookup fewer levels to scan.
 fn filter_units(n: usize) -> Result<usize, TryReserveError> {
-    Ok(n.checked_mul(4)
+    Ok(n.checked_mul(8)
         .ok_or(TryReserveError::CapacityOverflow)?
         .div_ceil(5))
 }
