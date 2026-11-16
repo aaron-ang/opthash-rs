@@ -549,7 +549,8 @@ const _: () = {
 
 // SAFETY: the table uniquely owns its arena and every entry in it, like
 // `Box<[SlotEntry<K, V>]>`. Its raw pointers address that arena, except:
-// `ProbeSchedule::direct`, which addresses the routes the schedule owns;
+// the schedule's walk starts, which address the routes the schedule owns
+// and the table of them it owns;
 // `settled_level` and `settled_fallback`, which address the table's own
 // levels and are read only through an exclusive borrow of the table;
 // the schedule's sentinel route and, in a table without a metadata tail,
@@ -916,14 +917,13 @@ impl ElasticRouteFilter<'_> {
         !self.word.level_bins[self.read.place.summary_bin()] >> 1
     }
 
-    /// The stored summary as a schedule walk's closed-level set: bit zero,
-    /// the sentinel's, is clear, and bit `i + 1` is set for a level `i` the
-    /// bin never occupied. The stored word keeps unoccupied levels set and
-    /// its last bit is its sign, so sign extension alone gives every deeper
-    /// level its own bit and leaves the sentinel open.
+    /// The stored summary of the bin, which keeps the levels the bin never
+    /// occupied set. A schedule walk starts from it
+    /// ([`ProbeSchedule::walk_start`]) and closes its levels
+    /// ([`schedule::closed_levels`]).
     #[inline]
-    fn closed_levels(self) -> u64 {
-        i64::from(self.word.level_bins[self.read.place.summary_bin()].cast_signed()).cast_unsigned()
+    fn summary(self) -> SummaryBin {
+        self.word.level_bins[self.read.place.summary_bin()]
     }
 
     /// [`Self::level_mask`] widened by [`expand_level_mask`].
@@ -1641,9 +1641,7 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let schedule_room = ProbeScheduleRoom::try_with_capacity(
-            PROBE_SCHEDULE_CAPACITY[geometry.level_capacities.len()],
-        )?;
+        let schedule_room = ProbeScheduleRoom::try_for_levels(geometry.level_capacities.len())?;
         let (arena, levels, membership) =
             try_alloc_elastic_arena(&geometry.level_capacities, reserve_fraction, &alloc)?;
 
@@ -2847,9 +2845,7 @@ where
         }
 
         let regions = guard.regions_mut();
-        let probe_schedule = self
-            .probe_schedule
-            .clone_onto(PROBE_SCHEDULE_CAPACITY[regions.len()], regions);
+        let probe_schedule = self.probe_schedule.clone_onto(regions);
 
         // Success: reclaim arena + levels so the guard's Drop no-ops.
         let (arena, levels) = guard.disarm();
@@ -2991,9 +2987,7 @@ where
         geometry: &ElasticGeometry,
         transition: EpochTransition,
     ) -> Result<(), TryReserveError> {
-        let schedule_room = ProbeScheduleRoom::try_with_capacity(
-            PROBE_SCHEDULE_CAPACITY[geometry.level_capacities.len()],
-        )?;
+        let schedule_room = ProbeScheduleRoom::try_for_levels(geometry.level_capacities.len())?;
         let (arena, levels, membership) = try_alloc_elastic_arena(
             &geometry.level_capacities,
             self.reserve_fraction,
@@ -3467,13 +3461,14 @@ where
             }
         }
 
-        let mut closed_levels = filter.closed_levels();
-        let mut route = self.probe_schedule.direct();
+        let summary = filter.summary();
+        let mut closed_levels = schedule::closed_levels(summary);
+        let mut route = self.probe_schedule.walk_start(summary);
         loop {
-            // SAFETY: the schedule ends with its sentinel, and the walk
-            // cannot pass it: the sentinel's level stays open until its own
-            // probe, which reads `EMPTY` and ends the walk below. So `route`
-            // is ahead of the sentinel here.
+            // SAFETY: a sentinel closes the routes after a walk start, and
+            // the walk cannot pass it: the sentinel's level stays open until
+            // its own probe, which reads `EMPTY` and ends the walk below. So
+            // `route` is ahead of that sentinel here.
             let step = unsafe { PhiRoute::step(&mut route) };
             if step.is_closed(closed_levels) {
                 continue;

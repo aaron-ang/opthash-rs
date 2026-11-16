@@ -1,9 +1,15 @@
 //! The lookup schedule: one route per `(level, probe)` pair a lookup may
-//! visit, in query-position order.
+//! visit, in query-position order, and each level's routes again as a run of
+//! their own for a lookup that has one level left to visit.
 
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
+use core::ptr;
 
-use super::{GENERAL_REDUCTION, Level};
+use super::{
+    GENERAL_REDUCTION, Level, MAX_LEVELS, NO_LEVELS_OCCUPIED, PROBE_SCHEDULE_CAPACITY, SummaryBin,
+    summary_level,
+};
 use crate::error::TryReserveError;
 use crate::exact::probe;
 use crate::raw::control::CTRL_EMPTY;
@@ -77,8 +83,8 @@ impl PhiRoute {
     ///
     /// # Safety
     ///
-    /// `route` addresses a route of a [`ProbeSchedule`] ahead of its
-    /// sentinel.
+    /// `route` addresses a route of a [`ProbeSchedule`] ahead of the
+    /// sentinel that closes its list.
     #[inline]
     pub(super) unsafe fn step(route: &mut *const Self) -> RouteStep {
         #[cfg(all(target_arch = "aarch64", target_pointer_width = "64", not(miri)))]
@@ -262,39 +268,164 @@ const SENTINEL: PhiRoute = PhiRoute {
 };
 const _: () = assert!(SENTINEL_BIT == 1 << level_bit(SENTINEL_LEVEL));
 
+/// A stored route summary as a walk's closed-level set: bit zero, the
+/// sentinel's, is clear, and bit `i + 1` is set for a level `i` the summary
+/// rules out. The summary keeps the levels it rules out set and its last bit
+/// is its sign, so sign extension alone gives every deeper level its own bit
+/// and leaves the sentinel open.
+#[inline]
+pub(super) const fn closed_levels(summary: SummaryBin) -> u64 {
+    (summary.cast_signed() as i64).cast_unsigned()
+}
+
 /// Storage reserved for a [`ProbeSchedule`], taken before the levels it
 /// will address exist.
 pub(super) struct ProbeScheduleRoom {
-    routes: Vec<PhiRoute>,
+    slots: Vec<MaybeUninit<PhiRoute>>,
+    book: Vec<ScheduleBook>,
+    levels: usize,
 }
 
 impl ProbeScheduleRoom {
-    /// Room for `route_capacity` routes.
-    pub(super) fn try_with_capacity(route_capacity: usize) -> Result<Self, TryReserveError> {
-        let mut routes = Vec::new();
-        routes
-            .try_reserve_exact(route_capacity + FIXED_ROUTES)
+    /// Room for the full schedule of `levels` levels.
+    pub(super) fn try_for_levels(levels: usize) -> Result<Self, TryReserveError> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(slot_count(levels))
             .map_err(|_| TryReserveError::AllocError)?;
-        Ok(Self { routes })
+        let mut book = Vec::new();
+        book.try_reserve_exact(1)
+            .map_err(|_| TryReserveError::AllocError)?;
+        Ok(Self {
+            slots,
+            book,
+            levels,
+        })
     }
 
-    /// The empty schedule of `levels`.
+    fn for_levels(levels: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(slot_count(levels)),
+            book: Vec::with_capacity(1),
+            levels,
+        }
+    }
+
+    /// The empty schedule of `levels`, the levels the room was taken for.
     pub(super) fn schedule<T>(self, levels: &[Level<T>]) -> ProbeSchedule {
-        let mut routes = self.routes;
-        routes.push(PhiRoute::direct(levels));
-        routes.push(SENTINEL);
-        ProbeSchedule::assemble(routes, entry_origin(levels))
+        assert_eq!(levels.len(), self.levels);
+        let Self {
+            mut slots,
+            mut book,
+            levels: level_count,
+        } = self;
+        let direct = PhiRoute::direct(levels);
+        slots.resize_with(slot_count(level_count), MaybeUninit::uninit);
+        slots[0].write(direct);
+        book.push(ScheduleBook {
+            starts: [slots.as_ptr().cast(); WALK_STARTS],
+            run_len: [0; MAX_LEVELS],
+            pushed: 0,
+            levels: level_count,
+            whole_runs: level_count,
+            starts_name_runs: false,
+        });
+        let mut schedule = ProbeSchedule {
+            direct_reduction: direct.reduction,
+            direct_control: direct.control(),
+            entry_origin: entry_origin(levels),
+            // SAFETY: the table holds `WALK_STARTS` entries.
+            starts: unsafe { book.as_ptr().cast::<*const PhiRoute>().add(WALK_STARTS / 2) },
+            slots,
+            book,
+        };
+        schedule.clear();
+        schedule
     }
 }
 
-/// Routes a schedule holds besides the ones pushed: the direct route and the
-/// sentinel.
+/// Entries of a schedule's table of walk starts: one per summary value.
+const WALK_STARTS: usize = 1 << SummaryBin::BITS;
+
+/// What a schedule keeps besides its slots, which only building it reads
+/// past the walk starts.
+#[repr(C)]
+struct ScheduleBook {
+    /// For each summary value, the slot a walk under it steps on from, with
+    /// the summaries that are negative as signed bytes first. The slots
+    /// never move, so an entry changes only when a run stops being whole or
+    /// becomes whole again.
+    starts: [*const PhiRoute; WALK_STARTS],
+    /// Routes each level's run holds while it is whole.
+    run_len: [u16; MAX_LEVELS],
+    pushed: usize,
+    levels: usize,
+    /// [`whole_runs`] of `pushed`.
+    whole_runs: usize,
+    /// Whether `starts` holds the slots the summaries name. Until the first
+    /// route is pushed every entry is the direct route instead, which the
+    /// sentinel follows as it does the lead of each run.
+    starts_name_runs: bool,
+}
+
+const _: () = assert!(core::mem::offset_of!(ScheduleBook, starts) == 0);
+
+/// Routes a schedule holds in query-position order besides the ones pushed:
+/// the direct route and the sentinel.
 const FIXED_ROUTES: usize = 2;
+
+/// Slots of the schedule of `levels` levels: room for the direct route and
+/// every route in query-position order with the sentinel that closes them,
+/// and one more slot per level and one over, so that the room also holds a
+/// sentinel after each level's run and a last slot no route is written to.
+const fn slot_count(levels: usize) -> usize {
+    PROBE_SCHEDULE_CAPACITY[levels] + FIXED_ROUTES + levels + 1
+}
+
+/// The slot ahead of `level`'s run in the schedule of `levels` levels. The
+/// runs lie at the end of the room, the first level's last: a run fills the
+/// slots after its lead up to the lead of the level before it, or up to the
+/// last slot, and that slot is the sentinel of a run that is full.
+const fn run_lead(levels: usize, level: usize) -> usize {
+    slot_count(levels) - 1 - (PROBE_SCHEDULE_CAPACITY[level + 1] + level + 1)
+}
+
+/// Routes `level`'s run has slots for: the level's share of the schedule.
+const fn run_capacity(level: usize) -> usize {
+    PROBE_SCHEDULE_CAPACITY[level + 1] - PROBE_SCHEDULE_CAPACITY[level]
+}
+
+/// Levels whose runs stay whole in the schedule of `levels` levels once it
+/// holds `pushed` routes, of the first `whole` that were. The runs share
+/// the room of the routes in query-position order, which grow from its
+/// front and reach the deepest level's slots first. A run is whole while
+/// those routes and their sentinel end at its lead or before it.
+const fn whole_runs(levels: usize, pushed: usize, mut whole: usize) -> usize {
+    while whole > 0 && run_lead(levels, whole - 1) < pushed + 1 {
+        whole -= 1;
+    }
+    whole
+}
+
+/// The summary that leaves `level` alone open in a table of `levels`
+/// levels, if one does: a level past the summary's width shares its bit
+/// with every other such level.
+const fn lone_level_summary(levels: usize, level: usize) -> Option<SummaryBin> {
+    let bit = summary_level(level);
+    let shared = bit != level || (summary_level(level + 1) == bit && levels > level + 1);
+    if shared {
+        None
+    } else {
+        #[allow(clippy::cast_possible_truncation)]
+        Some(NO_LEVELS_OCCUPIED & !(1 << level_bit(bit as u8)))
+    }
+}
 
 /// The direct route, then the lookup routes in query-position order, closed
 /// by a sentinel route so a walk needs no end test: the sentinel's level is
 /// open in every walk and its probe reads an `EMPTY` control byte, which is
-/// where a walk stops.
+/// where a walk stops. Each level's routes are held again in probe order as
+/// a run closed by its own sentinel, while the room has slots for it.
 ///
 /// Every route addresses a level of the slice its schedule was built for:
 /// [`ProbeScheduleRoom::schedule`], [`Self::clone_onto`] and [`Self::push`]
@@ -307,20 +438,25 @@ const FIXED_ROUTES: usize = 2;
 #[repr(C)]
 pub(super) struct ProbeSchedule {
     /// The direct route's [`PhiRoute::index_shift`] word and control bytes,
-    /// held beside the entry origin. [`Self::assemble`] alone writes them,
-    /// from the route it puts first.
+    /// held beside the entry origin. [`ProbeScheduleRoom::schedule`] alone
+    /// writes them, from the route it puts first.
     direct_reduction: u64,
     direct_control: *const u8,
     /// See [`entry_origin`].
     entry_origin: *mut u8,
-    /// `routes.as_ptr()`. The routes never move: [`Self::clear`] only
-    /// shortens them, and [`Self::push`] writes into room they already
-    /// hold or panics.
-    direct: *const PhiRoute,
-    /// The direct route, the pushed routes, then the sentinel. No method
-    /// leaves the first or the last off, so a walk from [`Self::direct`]
-    /// always reaches the sentinel.
-    routes: Vec<PhiRoute>,
+    /// The entry of the book's walk starts for summary zero.
+    starts: *const *const PhiRoute,
+    /// Every slot of the schedule. The slots never move and their count
+    /// never changes: [`Self::push`] and [`Self::clear`] only write them.
+    ///
+    /// These hold a route or the sentinel, and no others are read: the
+    /// direct route; the pushed routes after it and the sentinel after
+    /// them; after the lead ([`run_lead`]) of each whole run, the routes
+    /// its level pushed and the sentinel after them; and the last slot,
+    /// a sentinel.
+    slots: Vec<MaybeUninit<PhiRoute>>,
+    /// One book, at an address that never changes.
+    book: Vec<ScheduleBook>,
 }
 
 /// Where the entry of a control byte at address zero would lie. The arena
@@ -347,17 +483,6 @@ const _: () = assert!(
 );
 
 impl ProbeSchedule {
-    fn assemble(routes: Vec<PhiRoute>, entry_origin: *mut u8) -> Self {
-        let direct = &routes[0];
-        Self {
-            direct_reduction: direct.reduction,
-            direct_control: direct.control(),
-            entry_origin,
-            direct: routes.as_ptr(),
-            routes,
-        }
-    }
-
     /// [`PhiRoute::index_shift`] and [`PhiRoute::control`] of the direct
     /// route, without reading the route, and the origin [`Self::entry_at`]
     /// adds to. Where two pointers fill one wide load and the target is
@@ -413,82 +538,224 @@ impl ProbeSchedule {
         entry_origin.wrapping_add(offset).cast()
     }
 
-    /// A copy of `self` with room for `route_capacity` routes, each route
-    /// addressing its level in `levels`.
-    pub(super) fn clone_onto<T>(&self, route_capacity: usize, levels: &[Level<T>]) -> Self {
-        let mut routes = Vec::with_capacity(route_capacity + FIXED_ROUTES);
-        routes.push(PhiRoute::direct(levels));
-        routes.extend(self.routes().iter().map(|route| {
+    /// A copy of `self` for `levels`, each route addressing its level
+    /// there.
+    pub(super) fn clone_onto<T>(&self, levels: &[Level<T>]) -> Self {
+        let mut copy = ProbeScheduleRoom::for_levels(levels.len()).schedule(levels);
+        for route in self.routes() {
             let (level, logical_probe_index) = route.coordinates();
-            let level = level as usize;
-            PhiRoute::new(level, &levels[level], logical_probe_index)
-        }));
-        routes.push(SENTINEL);
-        Self::assemble(routes, entry_origin(levels))
+            copy.push(levels, level as usize, logical_probe_index);
+        }
+        copy
     }
 
     /// The pushed routes, in query-position order.
     #[inline]
     pub(super) fn routes(&self) -> &[PhiRoute] {
-        &self.routes[1..self.routes.len() - 1]
+        let pushed = &self.slots[1..=self.book[0].pushed];
+        // SAFETY: the slots of the pushed routes hold routes, and a slot
+        // that holds a route is laid out as one.
+        unsafe { &*(ptr::from_ref(pushed) as *const [PhiRoute]) }
     }
 
-    /// The direct route, which every lookup probes first through
-    /// [`Self::direct_reach`] and a walk steps on from. Every route from it
-    /// up to and including the sentinel, whose level is [`SENTINEL_LEVEL`],
-    /// may be read.
+    /// The route a walk under `summary` steps on from. Every route after it
+    /// up to and including a sentinel, whose level is [`SENTINEL_LEVEL`],
+    /// may be read. Between the two lie, in query-position order, the pushed
+    /// routes of every level `summary` leaves open, and none but pushed
+    /// routes.
     #[inline]
-    pub(super) fn direct(&self) -> *const PhiRoute {
-        debug_assert_eq!(self.direct, self.routes.as_ptr());
-        self.direct
+    pub(super) fn walk_start(&self, summary: SummaryBin) -> *const PhiRoute {
+        // SAFETY: `starts` has an entry at every signed byte's distance.
+        unsafe { *self.starts.offset(isize::from(summary.cast_signed())) }
+    }
+
+    /// Points every walk start at a slot the walk may step on from: for
+    /// the summary that leaves one level open, the lead of that level's run
+    /// while it is whole; for the one that leaves none, the slot ahead of
+    /// the last, a sentinel; for the others, the direct route. Either way
+    /// the walk probes what it would from the direct route, where every
+    /// route of a level the summary closes is a step it skips.
+    fn fill_starts(&mut self) {
+        let first = self.slots.as_ptr().cast::<PhiRoute>();
+        let slots = self.slots.len();
+        let book = &mut self.book[0];
+        let entry = |summary: SummaryBin| (WALK_STARTS / 2 + usize::from(summary)) % WALK_STARTS;
+        book.starts = [first; WALK_STARTS];
+        // SAFETY: a schedule has the direct route's slot and two more.
+        book.starts[entry(NO_LEVELS_OCCUPIED)] = unsafe { first.add(slots - 2) };
+        for level in 0..book.whole_runs {
+            if let Some(summary) = lone_level_summary(book.levels, level) {
+                // SAFETY: a run's lead is a slot of the schedule.
+                book.starts[entry(summary)] = unsafe { first.add(run_lead(book.levels, level)) };
+            }
+        }
+        book.starts_name_runs = true;
     }
 
     /// Drops the pushed routes.
     pub(super) fn clear(&mut self) {
-        self.routes.truncate(1);
-        self.routes.push(SENTINEL);
+        let book = &mut self.book[0];
+        // Every run is whole again, and empty: a sentinel follows its lead.
+        // So does one follow the direct route, and one is the last slot.
+        self.slots[1].write(SENTINEL);
+        for level in 0..book.levels {
+            self.slots[run_lead(book.levels, level) + 1].write(SENTINEL);
+        }
+        self.slots
+            .last_mut()
+            .expect("a schedule has slots")
+            .write(SENTINEL);
+        book.run_len = [0; MAX_LEVELS];
+        book.pushed = 0;
+        if book.whole_runs != book.levels {
+            book.whole_runs = book.levels;
+            self.fill_starts();
+        }
     }
 
     /// Appends the route of logical probe `logical_probe_index` of level
     /// `level` of `levels`, the slice this schedule was built for or a
-    /// prefix of it. The caller appends routes in query-position order.
+    /// prefix of it. The caller appends routes in query-position order,
+    /// which is each level's probe order.
     pub(super) fn push<T>(&mut self, levels: &[Level<T>], level: usize, logical_probe_index: u64) {
-        let sentinel = self.routes.len() - 1;
-        // Growing would move the routes away from `direct`.
+        let book = &mut self.book[0];
         assert!(
-            self.routes.len() < self.routes.capacity(),
+            book.pushed < PROBE_SCHEDULE_CAPACITY[book.levels],
             "probe schedule outgrew its room"
         );
-        self.routes[sentinel] = PhiRoute::new(level, &levels[level], logical_probe_index);
-        self.routes.push(SENTINEL);
+        let route = PhiRoute::new(level, &levels[level], logical_probe_index);
+        let whole_runs = whole_runs(book.levels, book.pushed + 1, book.whole_runs);
+        let run_len = usize::from(book.run_len[level]);
+        if level < whole_runs {
+            assert!(
+                run_len < run_capacity(level),
+                "probe schedule outgrew its room"
+            );
+            // Level zero's first probe is the direct route, which no run
+            // holds. A run with a gap would not be its level's routes.
+            assert!(
+                usize::try_from(logical_probe_index)
+                    .is_ok_and(|probe| probe == run_len + usize::from(level == 0)),
+                "probe schedule pushed out of order"
+            );
+        }
+        if whole_runs != book.whole_runs || !book.starts_name_runs {
+            // No walk may start at a run the routes are about to overwrite.
+            book.whole_runs = whole_runs;
+            self.fill_starts();
+        }
+        let book = &mut self.book[0];
+        book.pushed += 1;
+        self.slots[book.pushed].write(route);
+        self.slots[book.pushed + 1].write(SENTINEL);
+        if level < whole_runs {
+            let run = run_lead(book.levels, level) + 1 + run_len;
+            self.slots[run].write(route);
+            // The lead of the run after this one, or the last slot, when
+            // the run is full.
+            self.slots[run + 1].write(SENTINEL);
+            book.run_len[level] += 1;
+        }
     }
 
-    /// Whether every route is the one its level in `levels` gives.
+    /// The direct route, which a walk under a summary that names no run
+    /// steps on from.
+    #[cfg(test)]
+    pub(super) fn direct(&self) -> *const PhiRoute {
+        self.slots.as_ptr().cast()
+    }
+
+    /// The routes a walk under `summary` steps over before its sentinel.
+    #[cfg(test)]
+    pub(super) fn walk_routes(&self, summary: SummaryBin) -> Vec<PhiRoute> {
+        let mut route = self.walk_start(summary);
+        let mut routes = Vec::new();
+        loop {
+            // SAFETY: a sentinel follows every walk start, and the walk
+            // stops at it.
+            route = unsafe { route.add(1) };
+            // SAFETY: as above.
+            let held = unsafe { *route };
+            if held == SENTINEL {
+                return routes;
+            }
+            routes.push(held);
+        }
+    }
+
+    /// Starts every walk at the direct route, as a schedule without runs
+    /// would, until its routes are dropped.
+    #[cfg(test)]
+    pub(super) fn start_walks_at_the_direct_route(&mut self) {
+        let direct = self.direct();
+        let book = &mut self.book[0];
+        book.whole_runs = 0;
+        book.starts_name_runs = true;
+        book.starts = [direct; WALK_STARTS];
+    }
+
+    /// Whether every route is the one its level in `levels` gives, every
+    /// whole run holds its level's pushed routes in order, and every walk
+    /// start is the direct route, the lead of a whole run, or the slot
+    /// ahead of the last.
     #[cfg(test)]
     pub(super) fn addresses<T>(&self, levels: &[Level<T>]) -> bool {
-        self.direct == self.routes.as_ptr()
-            && self.routes[0] == PhiRoute::direct(levels)
-            && self.direct_reach()
-                == (
-                    self.routes[0].index_shift(),
-                    self.routes[0].control(),
-                    self.entry_origin,
-                )
+        let book = &self.book[0];
+        let pushed_of = |level: usize| {
+            self.routes()
+                .iter()
+                .filter(move |route| usize::from(route.level()) == level)
+        };
+        // SAFETY: only called on slots the schedule's invariant initializes.
+        let slot = |slot: usize| unsafe { self.slots[slot].assume_init() };
+        book.levels == levels.len()
+            && self.slots.len() == slot_count(book.levels)
+            && slot(0) == PhiRoute::direct(levels)
+            && self.direct_reach() == (slot(0).index_shift(), slot(0).control(), self.entry_origin)
             && self.entry_origin == entry_origin(levels)
             && self.routes().iter().all(|route| {
                 let (level, logical_probe_index) = route.coordinates();
                 let level = level as usize;
                 *route == PhiRoute::new(level, &levels[level], logical_probe_index)
             })
+            && self.ends_with_sentinel()
+            && slot(self.slots.len() - 1) == SENTINEL
+            && book.whole_runs == whole_runs(book.levels, book.pushed, book.levels)
+            && (0..book.whole_runs).all(|level| {
+                let first = run_lead(book.levels, level) + 1;
+                let len = usize::from(book.run_len[level]);
+                len == pushed_of(level).count()
+                    && (first..first + len)
+                        .zip(pushed_of(level))
+                        .all(|(run, pushed)| slot(run) == *pushed)
+                    && slot(first + len) == SENTINEL
+            })
+            && (SummaryBin::MIN..=SummaryBin::MAX).all(|summary| {
+                let start = self.walk_start(summary);
+                start == self.direct()
+                    || book.starts_name_runs
+                        && (start == self.slots[self.slots.len() - 2].as_ptr()
+                            || (0..book.whole_runs).any(|level| {
+                                start == self.slots[run_lead(book.levels, level)].as_ptr()
+                            }))
+            })
+            && (book.starts_name_runs || book.pushed == 0)
+    }
+
+    /// Levels whose runs a walk may start at.
+    #[cfg(test)]
+    pub(super) fn whole_runs(&self) -> usize {
+        self.book[0].whole_runs
     }
 
     #[cfg(test)]
     pub(super) fn route_capacity(&self) -> usize {
-        self.routes.capacity() - FIXED_ROUTES
+        PROBE_SCHEDULE_CAPACITY[self.book[0].levels]
     }
 
     #[cfg(test)]
     pub(super) fn ends_with_sentinel(&self) -> bool {
-        self.routes.last() == Some(&SENTINEL)
+        // SAFETY: a sentinel follows the pushed routes.
+        unsafe { self.slots[self.book[0].pushed + 1].assume_init() == SENTINEL }
     }
 }

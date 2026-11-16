@@ -3205,13 +3205,15 @@ fn schedule_push_past_its_room_panics_instead_of_moving_the_routes() {
             Global,
         )
         .unwrap();
-    let mut schedule = ProbeScheduleRoom::try_with_capacity(1)
+    let mut schedule = ProbeScheduleRoom::try_for_levels(table.levels.len())
         .unwrap()
         .schedule(&table.levels);
-    assert_eq!(schedule.route_capacity(), 1);
-    schedule.push(&table.levels, 0, 1);
+    for logical_probe_index in 1..LEVEL_PROBE_LIMIT[0] {
+        schedule.push(&table.levels, 0, logical_probe_index);
+    }
     assert!(schedule.addresses(&table.levels));
-    schedule.push(&table.levels, 0, 2);
+    // One past the last probe level zero's run has a slot for.
+    schedule.push(&table.levels, 0, LEVEL_PROBE_LIMIT[0]);
 }
 
 #[test]
@@ -3657,6 +3659,220 @@ fn settled_plan_stays_readable_past_a_leaked_drain() {
     for key in (0..20).chain(100..110) {
         assert_eq!(map.get(&key).is_some(), key != taken, "{key}");
     }
+}
+
+/// Model check of the walk starts: under every summary value, the routes
+/// between a walk's start and its sentinel that the summary leaves open are
+/// the pushed routes it leaves open, in the same order. The walk skips the
+/// others and closes levels by what it probes, so it probes the same slots
+/// from either start. Checked through a schedule's whole growth, where the
+/// pushed routes take the runs' slots one level after another, and again
+/// after the schedule is dropped and rebuilt.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn every_walk_start_leads_to_the_routes_its_summary_leaves_open() {
+    for slots in [16, 64, 1_024, 1 << 15] {
+        let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                slots,
+                ReserveFraction::DEFAULT,
+                IdentityBuildHasher,
+                Global,
+            )
+            .unwrap();
+        let level_count = table.levels.len();
+        let assert_starts = |table: &ElasticTable<u64, u64, IdentityBuildHasher>| {
+            let schedule = &table.probe_schedule;
+            assert!(schedule.addresses(&table.levels));
+            for summary in SummaryBin::MIN..=SummaryBin::MAX {
+                let closed = schedule::closed_levels(summary);
+                let open = |route: &&PhiRoute| !route.as_step().is_closed(closed);
+                let walked = schedule.walk_routes(summary);
+                assert!(
+                    walked
+                        .iter()
+                        .filter(open)
+                        .eq(schedule.routes().iter().filter(open)),
+                    "{slots} slots, summary {summary:#010b}"
+                );
+                // A summary that leaves at most one level open, and that a
+                // level whose run is whole, has no route to skip.
+                let open_levels = (0..level_count)
+                    .filter(|&level| closed & (2 << level) == 0)
+                    .collect::<Vec<_>>();
+                let stored = summary & !NO_LEVELS_OCCUPIED == 0
+                    && (level_count..ROUTE_SUMMARY_LEVELS).all(|level| summary & (2 << level) != 0);
+                if stored
+                    && (open_levels.is_empty()
+                        || open_levels.len() == 1 && open_levels[0] < schedule.whole_runs())
+                {
+                    assert_eq!(walked.iter().filter(open).count(), walked.len());
+                }
+            }
+        };
+
+        let mut whole_runs_seen = alloc::vec![false; level_count + 1];
+        for _ in 0..2 {
+            // Rebuilt up to no position at all, the schedule is empty.
+            table.probe_high_water &= HIGH_WATER_FLAGS;
+            table.schedule_levels_through(level_count - 1);
+            assert_eq!(table.probe_schedule.routes(), []);
+            assert_eq!(table.probe_schedule.whole_runs(), level_count);
+            let mut high_water = 0_u128;
+            while high_water < QUERY_POSITION_CAP {
+                high_water = (high_water + high_water / 4 + 1).min(QUERY_POSITION_CAP);
+                table.extend_probe_schedule(high_water);
+                assert_starts(&table);
+                whole_runs_seen[table.probe_schedule.whole_runs()] = true;
+            }
+            assert_eq!(
+                table.probe_schedule.routes().len(),
+                table.probe_schedule.route_capacity()
+            );
+        }
+        // The full schedule leaves no run whole, and takes them over its
+        // growth, not at once.
+        let seen = whole_runs_seen.iter().filter(|&&seen| seen).count();
+        assert!(
+            whole_runs_seen[0] && seen >= 3.min(level_count + 1),
+            "{slots} slots"
+        );
+    }
+}
+
+type ComparesCountedMap = ElasticHashMap<ComparesCounted, u64, FixedHashBuilder>;
+
+/// Clears the count of key compares and returns what it was.
+fn take_key_compares() -> u64 {
+    KEY_COMPARES.with(|compares| compares.replace(0))
+}
+
+/// Looks every key below `universe` up in both maps and asserts that they
+/// find it in the same slot after the same key compares, and hold what
+/// `model` does. Returns how many of the walks `started` would make start
+/// at a run and how many at the direct route.
+fn assert_twin_lookups_agree(
+    started: &ComparesCountedMap,
+    direct: &ComparesCountedMap,
+    model: &alloc::collections::BTreeMap<u64, u64>,
+    universe: u64,
+) -> (u64, u64) {
+    let (started, direct) = (started.table(), direct.table());
+    let (mut from_runs, mut from_direct) = (0, 0);
+    for key in 0..universe {
+        let counted = ComparesCounted::new(key, &started.hash_builder);
+        let hash = started.hash_builder.hash_one(counted);
+        take_key_compares();
+        let found = started.find(&counted, hash);
+        let ours = take_key_compares();
+        assert_eq!(found, direct.find(&counted, hash));
+        assert_eq!(ours, take_key_compares(), "key {key}");
+        assert_eq!(
+            started.find_entry(&counted, hash).map(|entry| entry.value),
+            model.get(&key).copied()
+        );
+        let summary = started
+            .route_filter(PreparedElasticRoute::new(hash))
+            .summary();
+        assert_eq!(
+            direct.probe_schedule.walk_start(summary),
+            direct.probe_schedule.direct()
+        );
+        let at_direct =
+            started.probe_schedule.walk_start(summary) == started.probe_schedule.direct();
+        from_runs += u64::from(!at_direct);
+        from_direct += u64::from(at_direct);
+    }
+    (from_runs, from_direct)
+}
+
+/// Twin maps take the same inserts and removals, with an ordered map as the
+/// model: one starts each walk where its summary says, the other starts
+/// every walk at the direct route. Through fills, removals that leave
+/// tombstones, the rebuilds they bring and growth, both find every key in
+/// the same slot after the same key compares, and neither finds an absent
+/// one.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn walks_from_their_starts_probe_what_walks_from_the_direct_route_do() {
+    let start_at_direct = |map: &mut ComparesCountedMap| {
+        map.table_mut()
+            .probe_schedule
+            .start_walks_at_the_direct_route();
+    };
+    let mut cleanups = 0_u64;
+    for capacity in [48, 900, 28_672] {
+        let build = || ComparesCountedMap::with_capacity_and_hasher(capacity, fixed_hasher());
+        let (mut started, mut direct) = (build(), build());
+        let mut model = alloc::collections::BTreeMap::new();
+        let universe = started.capacity() as u64;
+
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let (mut from_runs, mut from_direct) = (0_u64, 0_u64);
+        let mut tombstones = 0_u64;
+        for step in 0..universe * 8 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let key = (state >> 33) % universe;
+            let counted = ComparesCounted::new(key, started.hasher());
+            // Fill, thin out, refill, then churn.
+            let insert = match step / (universe * 2) {
+                0 | 2 => state >> 60 != 0,
+                1 => state >> 62 == 0,
+                _ => state >> 63 == 0,
+            };
+            let generation = started.epoch().generation;
+            take_key_compares();
+            let ours = if insert {
+                let previous = model.insert(key, step);
+                assert_eq!(started.insert(counted, step), previous);
+                let ours = take_key_compares();
+                assert_eq!(direct.insert(counted, step), previous);
+                ours
+            } else {
+                let removed = model.remove(&key);
+                assert_eq!(started.remove(&counted), removed);
+                let ours = take_key_compares();
+                assert_eq!(direct.remove(&counted), removed);
+                ours
+            };
+            assert_eq!(ours, take_key_compares(), "step {step}");
+            start_at_direct(&mut direct);
+            assert_eq!(started.len(), model.len());
+            assert_eq!(started.epoch(), direct.epoch());
+            let epoch = started.epoch();
+            cleanups += u64::from(
+                epoch.generation != generation
+                    && epoch.transition == EpochTransition::TombstoneCleanup,
+            );
+            let levels = &started.table().levels;
+            tombstones += u64::from(levels.iter().any(|level| level.tombstones() != 0));
+            if (step + 1) % universe == 0 {
+                let (runs, direct) = assert_twin_lookups_agree(&started, &direct, &model, universe);
+                from_runs += runs;
+                from_direct += direct;
+            }
+        }
+        assert_eq!(started.capacity() as u64, universe);
+        assert!(tombstones > universe, "{capacity}");
+        assert!(
+            from_runs > universe && from_direct > universe / 8,
+            "{capacity}: {from_runs} walks from runs, {from_direct} from the direct route"
+        );
+
+        // Then past the capacity, into a grown table.
+        for key in universe..2 * universe {
+            let counted = ComparesCounted::new(key, started.hasher());
+            model.insert(key, key);
+            assert_eq!(started.insert(counted, key), None);
+            assert_eq!(direct.insert(counted, key), None);
+            start_at_direct(&mut direct);
+        }
+        assert!(started.capacity() as u64 > universe);
+        assert_twin_lookups_agree(&started, &direct, &model, 2 * universe);
+    }
+    assert_ne!(cleanups, 0);
 }
 
 #[test]
