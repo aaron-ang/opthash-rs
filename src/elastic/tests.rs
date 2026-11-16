@@ -3876,6 +3876,45 @@ fn settled_plan_stays_readable_past_a_leaked_drain() {
 /// pushed routes take the runs' slots one level after another, and again
 /// after the schedule is dropped and rebuilt.
 #[test]
+fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
+    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            1 << 8,
+            ReserveFraction::DEFAULT,
+            IdentityBuildHasher,
+            Global,
+        )
+        .unwrap();
+    let level_count = table.levels.len();
+    let fitted = table.probe_schedule.whole_groups().1;
+    assert_ne!(fitted, 0);
+    assert!(level_count > schedule::GROUPED_LEVELS + 1);
+    // A rebuild that first brings a grouped level in writes the groups'
+    // runs from their start.
+    for through in 0..schedule::GROUPED_LEVELS {
+        table.schedule_levels_through(through);
+        table.extend_probe_schedule(40 * (through as u128 + 1));
+        assert!(table.probe_schedule.addresses(&table.levels));
+        if through + 1 < schedule::GROUPED_LEVELS {
+            assert_eq!(table.probe_schedule.group_appends(), 0);
+        }
+    }
+    assert_eq!(table.probe_schedule.whole_groups().0, fitted);
+    assert_ne!(table.probe_schedule.group_appends(), 0);
+    for through in schedule::GROUPED_LEVELS..level_count {
+        let held = table.probe_schedule.group_appends();
+        // One that brings a deeper level in pushes the same routes of the
+        // grouped levels, which the runs hold.
+        table.schedule_levels_through(through);
+        assert_eq!(table.probe_schedule.group_appends(), held);
+        assert!(table.probe_schedule.addresses(&table.levels));
+        // Only the routes past them are written.
+        table.extend_probe_schedule(40 * (through as u128 + 1));
+        assert!(table.probe_schedule.addresses(&table.levels));
+    }
+}
+
+#[test]
 fn rebuild_leaves_a_group_run_that_stopped_being_whole_as_it_is() {
     let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
         try_with_slots_and_reserve_fraction_and_hasher_in(

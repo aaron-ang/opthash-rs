@@ -425,6 +425,8 @@ impl ProbeScheduleRoom {
             grouped_held: 0,
             whole_groups: 0,
             allocated: book.capacity(),
+            #[cfg(test)]
+            group_appends: 0,
         });
         let mut schedule = ProbeSchedule {
             direct_reduction: direct.reduction,
@@ -485,6 +487,9 @@ struct ScheduleBook {
     whole_groups: u8,
     /// Books the allocation has room for, which freeing it takes.
     allocated: usize,
+    /// Routes written to groups' runs since the schedule was made.
+    #[cfg(test)]
+    group_appends: usize,
 }
 
 const _: () = assert!(core::mem::offset_of!(ScheduleBook, starts) == 0);
@@ -1165,6 +1170,10 @@ impl ProbeSchedule {
             // level, when the run is full.
             self.slots[usize::from(slot) + 1].write(SENTINEL);
             book.group_next[group] = slot + 1;
+            #[cfg(test)]
+            {
+                book.group_appends += 1;
+            }
         }
         if whole != book.whole_groups {
             let runs = book.whole_runs;
@@ -1307,6 +1316,11 @@ impl ProbeSchedule {
     #[cfg(test)]
     pub(super) fn named_levels(&self) -> usize {
         named_levels(self.book.levels)
+    }
+
+    #[cfg(test)]
+    pub(super) fn group_appends(&self) -> usize {
+        self.book.group_appends
     }
 
     /// Groups whose runs a walk may start at, of how many the schedule has
