@@ -1874,7 +1874,7 @@ where
                 if key.equivalent(stored) {
                     // SAFETY: the lane is inside the bucket's group.
                     return Some(HeadSearch::Present(unsafe {
-                        NonNull::new_unchecked(group.add(lane))
+                        NonNull::new_unchecked(level.ctrl.add(bucket * GROUP_SIZE + lane))
                     }));
                 }
                 matches &= GROUP_LANES;
@@ -1889,7 +1889,7 @@ where
             // SAFETY: an EMPTY lane of the bucket is a slot of the level.
             HeadSearch::Vacant(unsafe {
                 HeadVacancy {
-                    lane: group.add(lane),
+                    lane: level.ctrl.add(bucket * GROUP_SIZE + lane),
                     entry: entries.add(lane),
                     level_bit,
                 }
@@ -1917,7 +1917,9 @@ where
             let lane = (empty.trailing_zeros() / BITMASK_STRIDE) as usize;
             HeadVacancy {
                 // SAFETY: an EMPTY lane of the bucket is a slot of the level.
-                lane: unsafe { level.group(bucket).cast::<u8>().add(lane) },
+                // Addressed from the level, not from the group just read,
+                // which leaves that read its scaled bucket index.
+                lane: unsafe { level.ctrl.add(bucket * GROUP_SIZE + lane) },
                 // SAFETY: as above, and the set is non-empty.
                 entry: unsafe {
                     level
