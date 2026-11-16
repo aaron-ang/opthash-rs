@@ -458,8 +458,14 @@ impl ElasticProbeSequence {
     #[allow(clippy::cast_lossless)]
     #[inline]
     pub(crate) const fn word(self, sequence_index: u32) -> u64 {
+        self.word_at(sequence_index as u64)
+    }
+
+    /// [`Self::word`] for a sequence index already as wide as the word.
+    #[inline]
+    pub(crate) const fn word_at(self, sequence_index: u64) -> u64 {
         self.origin
-            .wrapping_add((sequence_index as u64).wrapping_mul(self.stride))
+            .wrapping_add(sequence_index.wrapping_mul(self.stride))
     }
 
     /// First random word of the first logical probe of the level whose
@@ -786,6 +792,14 @@ pub(crate) const fn elastic_index_shift(upper: usize) -> Option<u32> {
 pub(crate) const fn shifted_elastic_index(word: u64, index_shift: u32) -> usize {
     debug_assert!(index_shift < u64::BITS);
     (word >> index_shift) as usize
+}
+
+/// [`shifted_elastic_index`] by the low six bits of `index_shift`, for a
+/// caller whose shift shares its word with other fields above them.
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+pub(crate) const fn masked_shift_elastic_index(word: u64, index_shift: u32) -> usize {
+    word.wrapping_shr(index_shift) as usize
 }
 
 #[allow(clippy::cast_possible_truncation)]

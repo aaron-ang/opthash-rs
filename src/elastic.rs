@@ -1,7 +1,7 @@
 use core::fmt;
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
-use core::ptr::NonNull;
+use core::ptr;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -20,7 +20,7 @@ use crate::map;
 use crate::membership::{self, MembershipKey, MembershipRegion, MetadataWord};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::INITIAL_CAPACITY;
-use crate::raw::control::{self, CTRL_EMPTY};
+use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::raw::iter::OccupiedIndices;
 use crate::raw::prefetch;
 use crate::raw::rebuild::{self, Rebuildable};
@@ -130,11 +130,8 @@ pub(crate) struct Level<T> {
     /// Exact logical slot count. Bounded by the arena layout, so the
     /// level's [`LevelCounters`] fit in `u32` too.
     capacity: u32,
-    /// [`probe::elastic_index_shift`] of `capacity`, or [`GENERAL_REDUCTION`]
-    /// when any level of the table has no such shift. A table's levels
-    /// therefore reduce all by shift or all by the general reduction, and
-    /// level zero answers which for the whole table.
-    index_shift: u16,
+    /// The words a settled insert's search reads of this level.
+    search: LevelSearch,
     /// Leading paper probes of this level the lookup schedule covers: a
     /// placement within them needs no schedule extension. Zero for a level
     /// the schedule holds no routes for.
@@ -142,13 +139,46 @@ pub(crate) struct Level<T> {
     /// Case 2's threshold: half the reserve of `capacity`
     /// ([`ReserveFraction::floor_half_reserved`]).
     half_reserve: u32,
-    /// This level's bit in a stored route summary, one above its
-    /// [`summary_level`]: clear once the level holds a key of the summary's
-    /// bin.
-    summary_bit: u16,
     /// [`probe::elastic_level_run`] of this level, beside the fields a
     /// vacancy search reads with it.
     sequence_run: (u32, u32),
+}
+
+/// What a settled insert's search reads of a level besides its pointers and
+/// its run of the probe sequence. `repr(C)` keeps the two words adjacent, so
+/// one paired load brings both.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LevelSearch {
+    /// [`probe::elastic_index_shift`] of the level's capacity, or
+    /// [`GENERAL_REDUCTION`] when any level of the table has no such shift.
+    /// A table's levels therefore reduce all by shift or all by the general
+    /// reduction, and level zero answers which for the whole table.
+    index_shift: u32,
+    /// A [`settled_word`].
+    settled: u32,
+}
+
+/// The countdown of a settled search over `budget` probes, which is not
+/// zero, of a level whose bit in a stored route summary is `summary_bit`:
+/// the bit in the low half and one under the budget above it. Each probe
+/// that finds no free slot takes [`SETTLED_PROBE`] off, and the one that
+/// spends the budget borrows, so the search needs no separate count; the
+/// low half keeps the summary bit throughout.
+#[inline]
+const fn settled_word(summary_bit: u16, budget: u16) -> u32 {
+    debug_assert!(budget != 0);
+    summary_bit as u32 | ((budget - 1) as u32) << u16::BITS
+}
+
+/// One probe of a [`settled_word`]'s budget.
+const SETTLED_PROBE: u32 = 1 << u16::BITS;
+
+/// The summary bit of a [`settled_word`], at any point of its countdown.
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+const fn settled_summary_bit(settled: u32) -> u16 {
+    settled as u16
 }
 
 /// A level's live and tombstone counts, stored in the arena directly ahead of
@@ -183,6 +213,11 @@ unsafe fn level_counters(control: *mut u8) -> *mut LevelCounters {
     unsafe {
         control.sub(size_of::<LevelCounters>()).cast()
     }
+}
+
+/// A level's bit in a stored route summary.
+const fn summary_bit(level: usize) -> u16 {
+    2 << summary_level(level)
 }
 
 /// Control-section bytes the counters of `levels` levels take at most,
@@ -240,12 +275,14 @@ impl<T> Level<T> {
             ctrl_ptr,
             data_ptr,
             capacity: cap_u32,
-            index_shift: u16::try_from(index_shift).expect("Elastic index shift fits u16"),
+            search: LevelSearch {
+                index_shift,
+                settled: settled_word(summary_bit(level), 1),
+            },
             scheduled_probes: 0,
             // At most the capacity, which fits.
             #[allow(clippy::cast_possible_truncation)]
             half_reserve: reserve_fraction.floor_half_reserved(cap_u32 as usize) as u32,
-            summary_bit: 2 << summary_level(level),
             sequence_run: probe::elastic_level_run(level),
         }
     }
@@ -277,7 +314,15 @@ impl<T> Level<T> {
 
     #[inline]
     fn index_shift(&self) -> u32 {
-        u32::from(self.index_shift)
+        self.search.index_shift
+    }
+
+    /// This level's bit in a stored route summary, one above its
+    /// [`summary_level`]: clear once the level holds a key of the summary's
+    /// bin.
+    #[inline]
+    fn summary_bit(&self) -> u16 {
+        settled_summary_bit(self.search.settled)
     }
 
     /// Slots minus live entries (includes tombstones, reusable on insert).
@@ -336,17 +381,27 @@ impl<T> Level<T> {
 ///
 /// `repr(C)` fixes the field order, which puts words an operation reads or
 /// writes together next to each other so one paired access covers both: the
-/// fold multiplier and the schedule's direct route, the filter's word count
-/// and its first word, the placed count and the settled bound, the cached
-/// batch and the levels.
+/// settled level and the fold multiplier, the fold multiplier and the
+/// schedule's direct route, the filter's word count and its first word, the
+/// placed count and the settled bound.
 #[repr(C)]
 pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     /// `ctrl_L0|ctrl_L1|...`, padding, then `slots_L0|slots_L1|...`.
     arena: Arena,
+    /// The level a settled insert searches, with that level's settled
+    /// budget, while the scheduler's gate is open; [`Self::reopen_settled`]
+    /// sets both as it opens the gate. Not read while the gate is closed.
+    /// It is [`Levels::level_ptr`] of the level, so borrows of the levels
+    /// leave it good to read through.
+    settled_level: *mut Level<SlotEntry<K, V>>,
     /// [`probe::ELASTIC_FOLD_MULTIPLIER`], kept in the table so the hot
     /// paths load it rather than build it.
     fold_multiplier: u64,
     probe_schedule: ProbeSchedule,
+    /// The level a settled insert searches after `settled_level`, with its
+    /// own settled budget, or null where the plan has no such level. Set
+    /// and read as `settled_level` is.
+    settled_fallback: *mut Level<SlotEntry<K, V>>,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
     /// First word of the metadata tail, so the gate's address needs one load;
@@ -378,23 +433,22 @@ const _: () = {
     type Table = ElasticTable<(), ()>;
     let word = size_of::<usize>();
     assert!(
-        mem::offset_of!(Table, probe_schedule)
-            == mem::offset_of!(Table, fold_multiplier) + size_of::<u64>()
+        mem::offset_of!(Table, fold_multiplier) == mem::offset_of!(Table, settled_level) + word
+            && mem::offset_of!(Table, probe_schedule)
+                == mem::offset_of!(Table, fold_multiplier) + size_of::<u64>()
             && mem::offset_of!(Table, metadata_words)
                 == mem::offset_of!(Table, membership) + size_of::<MembershipRegion>()
             && mem::offset_of!(Table, scheduler) == mem::offset_of!(Table, placed) + word
             && mem::offset_of!(BatchScheduler, settled_end) == 0
             && mem::offset_of!(BatchScheduler, deletes_left) == word
-            && mem::offset_of!(BatchScheduler, current_batch_index) + word
-                == size_of::<BatchScheduler>()
-            && mem::offset_of!(Table, levels)
-                == mem::offset_of!(Table, scheduler) + size_of::<BatchScheduler>()
     );
 };
 
 // SAFETY: the table uniquely owns its arena and every entry in it, like
 // `Box<[SlotEntry<K, V>]>`. Its raw pointers address that arena, except:
 // `ProbeSchedule::direct`, which addresses the routes the schedule owns;
+// `settled_level` and `settled_fallback`, which address the table's own
+// levels and are read only through an exclusive borrow of the table;
 // the schedule's sentinel route and, in a table without a metadata tail,
 // `metadata_words`, which address the immutable statics `SENTINEL_CONTROL`
 // and `NO_METADATA` and are only read; and the schedule's entry origin,
@@ -411,7 +465,46 @@ unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
 {
 }
 
-type LevelPtr<K, V> = NonNull<Level<SlotEntry<K, V>>>;
+/// A free slot of a level, with the level's words a write of it reads.
+struct SettledSlot<K, V> {
+    level: *mut Level<SlotEntry<K, V>>,
+    control_bytes: *mut u8,
+    data: *mut MaybeUninit<SlotEntry<K, V>>,
+    /// [`Level::summary_bit`] of `level`.
+    summary_bit: u16,
+    slot: usize,
+    /// The slot's control byte, sign-extended.
+    control: i32,
+}
+
+/// Control byte `slot` of the bytes at `control`, sign-extended, so an
+/// occupied byte is negative. On 64-bit `AArch64` the load is opaque to the
+/// compiler, which then tests the bits of the register as it is.
+///
+/// # Safety
+///
+/// `slot` is in bounds of the control bytes at `control`.
+#[inline]
+unsafe fn signed_control(control: *const u8, slot: usize) -> i32 {
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64", not(miri)))]
+    {
+        let byte: i32;
+        // SAFETY: the caller's contract; the load only reads.
+        unsafe {
+            core::arch::asm!(
+                "ldrsb {byte:w}, [{control}, {slot}]",
+                control = in(reg) control,
+                slot = in(reg) slot,
+                byte = lateout(reg) byte,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+        byte
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_pointer_width = "64", not(miri))))]
+    // SAFETY: the caller's contract.
+    i32::from(unsafe { control.add(slot).read() }.cast_signed())
+}
 
 impl<K, V, S, A: Allocator + Clone> fmt::Debug for ElasticTable<K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -525,7 +618,86 @@ macros::declare_backend_aliases! {
 }
 
 /// Boxed slice of levels for one `(K, V)` parameterization.
-type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
+type LevelSlice<K, V> = Levels<SlotEntry<K, V>>;
+
+/// A boxed slice of levels held by its raw pointer.
+///
+/// Every borrow of the levels is taken from that pointer and
+/// [`Self::level_ptr`] is that pointer offset, so a level's address stays
+/// good to read through for as long as the slice is owned here, whatever
+/// borrows of the levels come and go in between.
+struct Levels<T> {
+    first: ptr::NonNull<Level<T>>,
+    len: usize,
+}
+
+impl<T> Levels<T> {
+    /// Level `index`, addressed from the pointer the slice is held by.
+    #[inline]
+    fn level_ptr(&self, index: usize) -> *mut Level<T> {
+        assert!(index < self.len);
+        // SAFETY: `index` is in bounds of the slice at `first`.
+        unsafe { self.first.as_ptr().add(index) }
+    }
+}
+
+impl<T> From<Box<[Level<T>]>> for Levels<T> {
+    fn from(levels: Box<[Level<T>]>) -> Self {
+        let len = levels.len();
+        let first = ptr::NonNull::from(Box::leak(levels)).cast();
+        Self { first, len }
+    }
+}
+
+impl<T> Drop for Levels<T> {
+    fn drop(&mut self) {
+        let levels = ptr::slice_from_raw_parts_mut(self.first.as_ptr(), self.len);
+        // SAFETY: `from` took these levels out of a box of this length.
+        drop(unsafe { Box::from_raw(levels) });
+    }
+}
+
+impl<T> core::ops::Deref for Levels<T> {
+    type Target = [Level<T>];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `first` addresses `len` levels this owns, which nothing
+        // writes while `self` is borrowed shared.
+        unsafe { core::slice::from_raw_parts(self.first.as_ptr(), self.len) }
+    }
+}
+
+impl<T> core::ops::DerefMut for Levels<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as in `deref`, and `self` is borrowed alone.
+        unsafe { core::slice::from_raw_parts_mut(self.first.as_ptr(), self.len) }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Levels<T> {
+    type Item = &'a Level<T>;
+    type IntoIter = core::slice::Iter<'a, Level<T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut Levels<T> {
+    type Item = &'a mut Level<T>;
+    type IntoIter = core::slice::IterMut<'a, Level<T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+// SAFETY: this owns its levels as the box it was made from does.
+unsafe impl<T> Send for Levels<T> where Box<[Level<T>]>: Send {}
+// SAFETY: as above.
+unsafe impl<T> Sync for Levels<T> where Box<[Level<T>]>: Sync {}
 /// A fresh arena, its level descriptors, and the metadata tail they share.
 type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>, MembershipRegion);
 
@@ -757,19 +929,22 @@ fn settled_limit<T>(
 ///
 /// It also counts removals, in the word next to the gate a removal closes:
 /// `repr(C)` keeps the two adjacent, so a removal writes both together. It
-/// also keeps the gate first and the cached batch's index last, next to the
-/// table fields an insert reads with them.
+/// also keeps the gate first, next to the placed count an insert reads with
+/// it.
 #[derive(Clone)]
 #[repr(C)]
 pub(crate) struct BatchScheduler {
     /// Exclusive bound of the cached batch's settled inserts, on the table's
     /// placed count: the lower of `batch_end` and `settled_limit` plus the
-    /// removals the placed count still holds, or zero since a removal or a
-    /// re-sync. Every path that lowers the table's live count or changes
-    /// those removals closes it through [`Self::note_removal`] or
-    /// [`Self::close`], or re-syncs the batch, and only [`Self::reopen`]
-    /// raises it, so a placed count under this bound is a live count inside
-    /// the cached batch.
+    /// removals the placed count still holds, or less where the
+    /// [`SettledPlan`] it opened on ends sooner, or zero since a removal or
+    /// a re-sync. Every path that lowers the table's live count or changes
+    /// those removals, and every insert that is not a settled one, closes it
+    /// through [`Self::note_removal`] or [`Self::close`], or re-syncs the
+    /// batch, and only the table raises it, to a plan's end and no further
+    /// than [`Self::reopened_end`], so a placed count under this bound is a
+    /// live count inside the cached batch that only settled inserts reached
+    /// since the gate opened.
     settled_end: usize,
     /// Removals the table's filter still tolerates, counted down from
     /// [`membership::refresh_deletes`] less one, so the removal that
@@ -789,6 +964,75 @@ pub(crate) struct BatchScheduler {
     /// which the batch ends. Zero-quota batches repeat the previous end.
     batch_ends: Box<[usize]>,
     current_batch_index: usize,
+}
+
+/// The level and probe budget the paper's insertion case gives a table's next
+/// new key, and how long they stay its choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SettledPlan {
+    level: usize,
+    /// Probes of `level` to search, none past its scheduled ones. Not zero.
+    budget: u16,
+    /// Probes of the level after `level` to search when those find no free
+    /// slot, none past its scheduled ones and not zero: `Some` where the
+    /// insertion case falls back to that level and `budget` is the whole of
+    /// the case's own, so the search of `level` it ends is the case's.
+    fallback: Option<u16>,
+    /// Exclusive bound on the placed count of the inserts the plan holds
+    /// for, while each of them is a settled one.
+    end: usize,
+}
+
+/// The first free slot among the probes `settled` counts of `level`, in
+/// probe order.
+///
+/// # Safety
+///
+/// `level` is a level of a table that is not marked
+/// [`GENERAL_REDUCTION`], and `settled` is a [`settled_word`] of it.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+unsafe fn first_settled_vacancy<K, V>(
+    sequence: probe::ElasticProbeSequence,
+    level: *mut Level<SlotEntry<K, V>>,
+    settled: u32,
+) -> Option<SettledSlot<K, V>> {
+    // SAFETY: the caller's contract.
+    let (index_shift, control, data, run) = unsafe {
+        (
+            (*level).search.index_shift,
+            (*level).ctrl_ptr,
+            (*level).data_ptr,
+            (*level).sequence_run,
+        )
+    };
+    debug_assert!(index_shift < u64::BITS);
+    // SAFETY: a shift other than `GENERAL_REDUCTION` is
+    // `probe::elastic_index_shift` of the capacity, below the word width.
+    unsafe { core::hint::assert_unchecked(index_shift < u64::BITS) };
+    let (mut word, word_step) = sequence.run_words(run);
+    let mut countdown = settled;
+    loop {
+        let slot = probe::shifted_elastic_index(word, index_shift);
+        // SAFETY: the level's shift maps the index into its capacity.
+        let byte = unsafe { signed_control(control, slot) };
+        if byte >= 0 {
+            return Some(SettledSlot {
+                level,
+                control_bytes: control,
+                data,
+                summary_bit: settled_summary_bit(countdown),
+                slot,
+                control: byte,
+            });
+        }
+        word = word.wrapping_add(word_step);
+        let spent;
+        (countdown, spent) = countdown.overflowing_sub(SETTLED_PROBE);
+        if spent {
+            return None;
+        }
+    }
 }
 
 /// One of the paper's insertion cases, resolved against a table's levels.
@@ -886,12 +1130,20 @@ impl BatchScheduler {
     /// Reopens a closed gate while the cached batch still covers the live
     /// entries of a table at `placed`, `removed` of which have left, and
     /// reports whether that table settles.
-    #[inline]
+    #[cfg(test)]
     fn reopen(&mut self, placed: usize, removed: usize) -> bool {
-        if self.covers(placed - removed) {
-            self.settled_end = self.batch_end.min(self.settled_limit) + removed;
+        if let Some(end) = self.reopened_end(placed, removed) {
+            self.settled_end = end;
         }
         self.settles(placed)
+    }
+
+    /// The highest bound the gate may reopen to: `None` while the cached
+    /// batch does not cover the live entries.
+    #[inline]
+    fn reopened_end(&self, placed: usize, removed: usize) -> Option<usize> {
+        self.covers(placed - removed)
+            .then(|| self.batch_end.min(self.settled_limit) + removed)
     }
 
     /// Counts an insert into one of `level`'s tombstones. In a level past
@@ -1109,7 +1361,7 @@ fn build_elastic_levels<K, V>(
             data_ptr,
         ));
     }
-    Ok(levels.into_boxed_slice())
+    Ok(levels.into_boxed_slice().into())
 }
 
 fn total_ctrl(level_capacities: &[usize]) -> Option<usize> {
@@ -1316,6 +1568,8 @@ where
             probe_high_water: empty_high_water(settled_limit),
             scheduled_levels: 0,
             probe_schedule,
+            settled_level: ptr::null_mut(),
+            settled_fallback: ptr::null_mut(),
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
         })
@@ -1494,98 +1748,305 @@ where
     #[inline]
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let prepared = PreparedElasticKey::new(key_hash);
-        let key_fingerprint = control::control_fingerprint(key_hash);
-        let Some((region, slot, control)) = self.settled_level_slot(prepared.route.probe) else {
-            return self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
-        };
-        // SAFETY: the settled search returns one of this table's levels.
-        let level = unsafe { region.as_ptr().offset_from_unsigned(self.levels.as_ptr()) };
-        self.write_new_entry(key, value, prepared, key_fingerprint, level, slot, control)
+        let key_fingerprint = control::control_fingerprint_low(key_hash);
+        self.insert_absent(key, value, prepared, key_fingerprint)
     }
 
-    /// [`Self::settled_level_slot`] with the level by index, on a copy of
-    /// the scheduler so a shared borrow can ask.
+    /// [`Self::insert_for_vacant_entry`] of a prepared key: a settled
+    /// insert, reopening the gate for it where it may open, or else the
+    /// general one.
+    fn insert_absent(
+        &mut self,
+        key: K,
+        value: V,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
+    ) -> (usize, usize) {
+        if self.scheduler.settles(self.placed) || self.reopen_settled() {
+            // SAFETY: the gate is open.
+            let found = unsafe {
+                self.settled_level_slot(prepared.route.probe)
+                    .or_else(|| self.settled_fallback_slot(prepared.route.probe))
+            };
+            if let Some(found) = found {
+                // SAFETY: the settled search returns one of this table's levels.
+                let level = unsafe { found.level.offset_from_unsigned(self.levels.as_ptr()) };
+                let slot = found.slot;
+                let lane = self.route_filter(prepared).membership;
+                // SAFETY: the settled search returns a free slot of that
+                // level with the level's words.
+                unsafe {
+                    self.write_new_entry_at(key, value, prepared, key_fingerprint, found, lane);
+                }
+                return (level, slot);
+            }
+        }
+        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint)
+    }
+
+    /// [`Self::settled_level_slot`] with the level by index, for a table
+    /// whose gate is closed too: the slot a settled insert would write once
+    /// the gate reopened.
     #[cfg(test)]
     fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize, u8)> {
-        // The gate a reopening leaves is the one the copy reports.
-        let mut scheduler = self.scheduler.clone();
-        if !scheduler.reopen(self.placed, self.stale_membership()) {
-            return None;
-        }
-        // SAFETY: the scheduler settles this live count once reopened, and
-        // the search reads the cached batch, which reopening leaves alone.
-        let (region, slot, control) = unsafe { self.settled_level_slot_in_batch(probe) }?;
-        // SAFETY: the settled search returns one of this table's levels.
-        let level = unsafe { region.as_ptr().offset_from_unsigned(self.levels.as_ptr()) };
-        Some((level, slot, control))
+        let plan = self.settled_plan()?;
+        let searches = [
+            Some((plan.level, plan.budget)),
+            plan.fallback.map(|budget| (plan.level + 1, budget)),
+        ];
+        searches.into_iter().flatten().find_map(|(index, budget)| {
+            let level = &self.levels[index];
+            // SAFETY: a plan's levels are those of a table that settles,
+            // whose levels reduce by shift.
+            let found = unsafe {
+                first_settled_vacancy(
+                    probe.sequence(self.fold_multiplier),
+                    ptr::from_ref(level).cast_mut(),
+                    settled_word(level.summary_bit(), budget),
+                )
+            }?;
+            Some((index, found.slot, found.control.to_le_bytes()[0]))
+        })
     }
 
-    /// The slot [`Self::choose_slot_for_new_key`] gives a new key, when the
-    /// table needs no growth, the cached batch is current, its levels reduce
-    /// by shift, and the batch's first choice of level has a free slot among
-    /// its scheduled probes. `None` leaves the insert to
-    /// [`Self::insert_for_vacant_entry_prepared`]. The level comes by
-    /// address, so a caller that writes the slot does not index the levels
-    /// again. A gate that a removal closed inside the cached batch reopens
-    /// here.
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
-    fn settled_level_slot(
-        &mut self,
-        probe: PreparedElasticProbe,
-    ) -> Option<(LevelPtr<K, V>, usize, u8)> {
-        if !self.scheduler.settles(self.placed)
-            && !self.scheduler.reopen(self.placed, self.stale_membership())
-        {
-            return None;
-        }
-        // SAFETY: the scheduler settles the live count.
-        unsafe { self.settled_level_slot_in_batch(probe) }
+    /// The plan the settled gate opens on, when the cached batch covers the
+    /// live count, that count is below the settled limit, and the paper's
+    /// insertion case for the batch has a scheduled probe to search.
+    ///
+    /// The case and its budget follow the fill of the batch's levels, which
+    /// a settled insert raises in one of the plan's levels. The plan ends
+    /// where that fill changes either: where the level a budgeted case
+    /// searches comes down to half its reserve or to a free fraction with
+    /// another budget, or where the level it falls back to comes down to a
+    /// quarter free. Counting every insert against both levels ends it no
+    /// later.
+    fn settled_plan(&self) -> Option<SettledPlan> {
+        let end = self
+            .scheduler
+            .reopened_end(self.placed, self.stale_membership())?;
+        let target = self.scheduler.cached_target();
+        let (case, budget, fallback) = self.settled_case(target)?;
+        let holds_for = match target {
+            // The level a case searches without a bound stays the case's
+            // while the other level of its pair keeps its fill.
+            BatchTarget::LevelPair(current) if case.level == current => {
+                let region = case.region;
+                let free = region.capacity - region.len();
+                let paper_budget = |free: u32| {
+                    probe::elastic_level_probe_budget(
+                        free,
+                        region.capacity,
+                        self.reserve_fraction.exponent(),
+                        ELASTIC_PROBE_BUDGET_C,
+                    )
+                };
+                // Not low, so above half the reserve.
+                let until_low = free - region.half_reserve;
+                if case.fallback.is_none() {
+                    until_low
+                } else {
+                    // The budget only grows as the level fills, so the
+                    // inserts that keep it are a prefix.
+                    let (mut keeps, mut changes) = (1, until_low + 1);
+                    while changes - keeps > 1 {
+                        let middle = keeps + (changes - keeps) / 2;
+                        if paper_budget(free - (middle - 1)) == paper_budget(free) {
+                            keeps = middle;
+                        } else {
+                            changes = middle;
+                        }
+                    }
+                    keeps
+                }
+            }
+            _ => u32::MAX,
+        };
+        let holds_for = if fallback.is_some() {
+            let next = &self.levels[case.level + 1];
+            // Not a quarter free or less, the case's test of this level.
+            holds_for.min(next.capacity - next.len() - next.capacity / 4)
+        } else {
+            holds_for
+        };
+        let end = end.min(self.placed.saturating_add(holds_for as usize));
+        (self.placed < end).then_some(SettledPlan {
+            level: case.level,
+            budget,
+            fallback,
+            end,
+        })
     }
 
-    /// [`Self::settled_level_slot`] past its gate.
+    /// The paper's insertion case for `target` with the budget a settled
+    /// search gives it, the case's own within the level's scheduled probes,
+    /// and [`SettledPlan::fallback`]: `None` for a table whose levels do
+    /// not reduce by shift, and where no probe is left to search.
+    #[inline]
+    fn settled_case(
+        &self,
+        target: BatchTarget,
+    ) -> Option<(PlacementCase<'_, K, V>, u16, Option<u16>)> {
+        let case = self.placement_case(target, |_, budget| budget.unwrap_or(u64::MAX))?;
+        if case.region.index_shift() == GENERAL_REDUCTION {
+            return None;
+        }
+        let budget = case.region.scheduled_probes;
+        let budget = u16::try_from(case.budget).map_or(budget, |own| own.min(budget));
+        if budget == 0 {
+            return None;
+        }
+        let fallback = case.fallback.and_then(|next| {
+            // What the general search gives the case's level.
+            let own = case.budget.min(*LEVEL_PROBE_LIMIT.get(case.level)?);
+            let scheduled = self.levels.get(next)?.scheduled_probes;
+            (u64::from(budget) == own && scheduled != 0).then_some(scheduled)
+        });
+        Some((case, budget, fallback))
+    }
+
+    /// What an open gate holds of a plan with these searches: each level
+    /// and its [`settled_word`], the fallback's null and zero without one.
+    fn plan_words(
+        &self,
+        level: usize,
+        budget: u16,
+        fallback: Option<u16>,
+    ) -> [(*const Level<SlotEntry<K, V>>, u32); 2] {
+        let words = |index: usize, budget| {
+            let level = &self.levels[index];
+            (
+                ptr::from_ref(level),
+                settled_word(level.summary_bit(), budget),
+            )
+        };
+        [
+            words(level, budget),
+            fallback.map_or((ptr::null(), 0), |budget| words(level + 1, budget)),
+        ]
+    }
+
+    /// [`Self::plan_words`] of the plan the gate last opened on.
     ///
     /// # Safety
     ///
-    /// The cached batch covers the live count, which is below the
-    /// scheduler's settled limit: [`BatchScheduler::settles`] holds, or
-    /// would once [`BatchScheduler::reopen`] ran.
+    /// The gate opened since the levels were last replaced.
+    unsafe fn open_words(&self) -> [(*const Level<SlotEntry<K, V>>, u32); 2] {
+        let (level, fallback) = (self.settled_level, self.settled_fallback);
+        // SAFETY: the caller's contract: the gate's levels are levels.
+        unsafe {
+            [
+                (level.cast_const(), (*level).search.settled),
+                if fallback.is_null() {
+                    (ptr::null(), 0)
+                } else {
+                    (fallback.cast_const(), (*fallback).search.settled)
+                },
+            ]
+        }
+    }
+
+    /// Reopens the gate a general insert closed, which stood open to `end`
+    /// before it: on the plan it stood open on while the insertion case
+    /// still names that plan's levels and budgets, and on a fresh plan
+    /// otherwise.
+    ///
+    /// The insert raised the placed count and one level's fill by one, which
+    /// the plan's bound counts against each of its levels.
+    fn keep_settled(&mut self, end: usize) {
+        let removed = self.stale_membership();
+        if self.placed < end && self.scheduler.covers(self.placed - removed) {
+            let kept = self
+                .settled_case(self.scheduler.cached_target())
+                .is_some_and(|(case, budget, fallback)| {
+                    // SAFETY: the gate stood open before the insert, which
+                    // took `place_new_entry` and so kept the levels.
+                    self.plan_words(case.level, budget, fallback) == unsafe { self.open_words() }
+                });
+            if kept {
+                self.scheduler.settled_end = end;
+                return;
+            }
+        }
+        self.reopen_settled();
+    }
+
+    /// Opens the settled gate on [`Self::settled_plan`], and reports whether
+    /// there is one.
+    #[cold]
+    #[inline(never)]
+    fn reopen_settled(&mut self) -> bool {
+        let Some(plan) = self.settled_plan() else {
+            return false;
+        };
+        let [(_, word), (_, fallback_word)] =
+            self.plan_words(plan.level, plan.budget, plan.fallback);
+        self.levels[plan.level].search.settled = word;
+        self.settled_level = self.levels.level_ptr(plan.level);
+        self.settled_fallback = if plan.fallback.is_some() {
+            self.levels[plan.level + 1].search.settled = fallback_word;
+            self.levels.level_ptr(plan.level + 1)
+        } else {
+            ptr::null_mut()
+        };
+        self.scheduler.settled_end = plan.end;
+        true
+    }
+
+    /// The level and free slot [`Self::choose_slot_for_new_key`] gives a
+    /// new key, with the level's words a write needs, when the plan the
+    /// settled gate opened on finds a free slot among its probes. `None`
+    /// leaves the insert to [`Self::insert_for_vacant_entry_prepared`].
+    ///
+    /// # Safety
+    ///
+    /// The settled gate is open: [`BatchScheduler::settles`] holds.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    unsafe fn settled_level_slot_in_batch(
-        &self,
-        probe: PreparedElasticProbe,
-    ) -> Option<(LevelPtr<K, V>, usize, u8)> {
-        let target = self.scheduler.cached_target();
-        let deepest = match target {
-            BatchTarget::Bootstrap => 0,
-            BatchTarget::LevelPair(current) => current + 1,
-        };
-        debug_assert!(deepest < self.levels.len());
+    unsafe fn settled_level_slot(&self, probe: PreparedElasticProbe) -> Option<SettledSlot<K, V>> {
+        debug_assert!(self.scheduler.settles(self.placed));
+        debug_assert_eq!(
+            self.settled_plan()
+                .map(|plan| self.plan_words(plan.level, plan.budget, plan.fallback)),
+            // SAFETY: the gate is open.
+            Some(unsafe { self.open_words() }),
+            "the open gate's plan is the table's"
+        );
         debug_assert!(self.membership.words != 0);
         // SAFETY: the scheduler settles only below the limit it was built
         // with, which `settled_limit` derives from the levels and the
-        // filter built beside it: zero without a level zero, with a batch
-        // whose level pair reaches past the levels, or without a filter
-        // word. The cached batch is one of the scheduler's own, so its
-        // target's levels exist. A clone takes the scheduler and builds
-        // levels and a filter of the same capacities, and a rebuild swaps
-        // all three together.
-        unsafe {
-            core::hint::assert_unchecked(deepest < self.levels.len());
-            core::hint::assert_unchecked(self.membership.words != 0);
+        // filter built beside it: zero without a filter word. A clone takes
+        // the scheduler and builds a filter of the same capacity, and a
+        // rebuild swaps both together.
+        unsafe { core::hint::assert_unchecked(self.membership.words != 0) };
+        let sequence = probe.sequence(self.fold_multiplier);
+        let level = self.settled_level;
+        // SAFETY: the gate is open, so `settled_level` and a
+        // `settled_fallback` that is not null are the levels of the plan it
+        // opened on, with that plan's countdowns: every path that replaces
+        // the levels, changes a level's fill other than by a settled
+        // insert, or changes a level's scheduled probes closes the gate. A
+        // plan's levels reduce by shift.
+        unsafe { first_settled_vacancy(sequence, level, (*level).search.settled) }
+    }
+
+    /// The first free slot `probe` reaches in the settled plan's fallback
+    /// level, for a key [`Self::settled_level_slot`] found no slot for;
+    /// `None` without such a level too.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::settled_level_slot`].
+    unsafe fn settled_fallback_slot(
+        &self,
+        probe: PreparedElasticProbe,
+    ) -> Option<SettledSlot<K, V>> {
+        let fallback = self.settled_fallback;
+        if fallback.is_null() {
+            return None;
         }
-        // A level's scheduled probes all lie within its probe limit.
-        let case = self.placement_case(target, |region, budget| {
-            let scheduled = u64::from(region.scheduled_probes);
-            budget.map_or(scheduled, |budget| budget.min(scheduled))
-        })?;
-        let budget = case.budget;
-        // SAFETY: a settled table's level zero reduces by shift, which
-        // means every level does.
-        let (slot, _, control) =
-            unsafe { self.first_shifted_vacancy(probe, case.level, case.region, budget) }?;
-        Some((NonNull::from(case.region), slot, control))
+        let sequence = probe.sequence(self.fold_multiplier);
+        // SAFETY: as in `settled_level_slot`.
+        unsafe { first_settled_vacancy(sequence, fallback, (*fallback).search.settled) }
     }
 
     fn insert_for_vacant_entry_prepared(
@@ -1608,10 +2069,19 @@ where
             self.enter_batch();
         }
         let target = self.scheduler.cached_target();
+        // The write closes the gate; the next insert finds it open again
+        // where it may be.
         if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
-            return self.place_new_entry(key, value, prepared, key_fingerprint, placement);
+            let open_to = self.scheduler.settled_end;
+            let location = self.place_new_entry(key, value, prepared, key_fingerprint, placement);
+            self.keep_settled(open_to);
+            location
+        } else {
+            let location =
+                self.place_after_target_failure(key, value, prepared, key_fingerprint, target);
+            self.reopen_settled();
+            location
         }
-        self.place_after_target_failure(key, value, prepared, key_fingerprint, target)
     }
 
     /// [`map::TableBackend::insert`] off its common path: a key the walk
@@ -1640,8 +2110,34 @@ where
                 return Some(map::TableBackend::replace_value(self, location, value));
             }
         }
-        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
+        self.insert_absent(key, value, prepared, key_fingerprint);
         None
+    }
+
+    /// [`map::TableBackend::insert`] of an absent key the open gate's
+    /// [`Self::settled_level_slot`] found no slot for: into the plan's
+    /// fallback level, or else the general insert.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::settled_level_slot`].
+    #[inline(never)]
+    unsafe fn insert_unsettled(
+        &mut self,
+        key: K,
+        value: V,
+        prepared: PreparedElasticKey,
+        key_fingerprint: u8,
+    ) {
+        // SAFETY: the caller's contract.
+        if let Some(found) = unsafe { self.settled_fallback_slot(prepared.route.probe) } {
+            let lane = self.route_filter(prepared).membership;
+            // SAFETY: the settled search returns one of this table's levels
+            // with its words, and a free slot of it with its control byte.
+            unsafe { self.write_new_entry_at(key, value, prepared, key_fingerprint, found, lane) };
+            return;
+        }
+        self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
     }
 
     /// Places a key whose active batch target has no slot: another target,
@@ -1753,34 +2249,37 @@ where
         prev_ctrl: u8,
     ) -> (usize, usize) {
         debug_assert!(level_idx < self.levels.len());
-        // SAFETY: callers pass a level they found a free slot in.
-        let level = unsafe { self.levels.as_mut_ptr().add(level_idx) };
+        let level = self.levels.level_ptr(level_idx);
         let lane = self.route_filter(prepared).membership;
-        // SAFETY: as above, and the slot is a free one of that level.
-        unsafe {
-            self.write_new_entry_at(
-                key,
-                value,
-                prepared,
-                key_fingerprint,
+        // SAFETY: `level_ptr` checked the index, so the pointer is to a level.
+        let found = unsafe {
+            SettledSlot {
                 level,
-                slot_idx,
-                prev_ctrl,
-                lane,
-            );
-        }
+                control_bytes: (*level).ctrl_ptr,
+                data: (*level).data_ptr,
+                summary_bit: (*level).summary_bit(),
+                slot: slot_idx,
+                control: i32::from(prev_ctrl.cast_signed()),
+            }
+        };
+        // SAFETY: callers pass a free slot of the level they found it in.
+        unsafe { self.write_new_entry_at(key, value, prepared, key_fingerprint, found, lane) };
+        // Not a settled insert: it may change the fill or the scheduled
+        // probes the settled plan was made for.
+        self.scheduler.close();
         (level_idx, slot_idx)
     }
 
-    /// [`Self::write_new_entry`] for a level by address.
+    /// [`Self::write_new_entry`] for a level by address, which leaves the
+    /// settled gate as it is.
     ///
     /// # Safety
     ///
-    /// `level` is one of this table's levels, derived from their pointer,
-    /// `slot_idx` is a free slot of it and `prev_ctrl` its control byte.
-    /// `lane` is the membership lane of the key's word as
-    /// [`Self::route_filter`] reads it now.
-    #[allow(clippy::too_many_arguments)]
+    /// `found` names one of this table's levels, derived from their
+    /// pointer, with that level's pointers and summary bit, a free slot of
+    /// it and the slot's control byte. `lane` is the membership lane of the
+    /// key's word as [`Self::route_filter`] reads it now.
+    #[allow(clippy::needless_pass_by_value)]
     #[inline]
     unsafe fn write_new_entry_at(
         &mut self,
@@ -1788,37 +2287,37 @@ where
         value: V,
         prepared: PreparedElasticKey,
         key_fingerprint: u8,
-        level: *mut Level<SlotEntry<K, V>>,
-        slot_idx: usize,
-        prev_ctrl: u8,
+        found: SettledSlot<K, V>,
         lane: u64,
     ) {
-        // SAFETY: the caller's contract.
-        let summary_bit = unsafe { (*level).summary_bit };
+        let SettledSlot {
+            level,
+            control_bytes,
+            data,
+            summary_bit,
+            slot,
+            control,
+        } = found;
         self.record_membership_over(prepared.route, prepared.membership, summary_bit, lane);
-        {
-            // SAFETY: the caller's contract; `&mut self` borrows the levels
-            // alone.
-            let level = unsafe { &mut *level };
-            // SAFETY: callers pass a free slot found within this level.
-            debug_assert_eq!(prev_ctrl, unsafe { level.control_at(slot_idx) });
-            debug_assert!(control::is_free(prev_ctrl));
-            // Taken ahead of the stores, which would otherwise have the
-            // level's control pointer read again for it.
-            let counters: *mut LevelCounters = level.counters_mut();
-            // SAFETY: as above; `key_fingerprint` is an occupied control byte.
-            unsafe {
-                level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
-            }
-            // SAFETY: the level's counters, which the stores above leave
-            // where they are and which `&mut self` still borrows alone.
-            unsafe { (*counters).len += 1 };
+        debug_assert!(control >= 0);
+        // SAFETY: the caller's contract: the slot is a free one of the
+        // level these pointers are of, whose counters sit ahead of its
+        // control bytes, and `&mut self` borrows the arena alone.
+        // `key_fingerprint` is an occupied control byte.
+        unsafe {
+            debug_assert_eq!(control, signed_control(control_bytes, slot));
+            data.add(slot)
+                .write(MaybeUninit::new(SlotEntry { key, value }));
+            control_bytes.add(slot).write(key_fingerprint);
+            (*level_counters(control_bytes)).len += 1;
         }
         self.placed += 1;
-        // A free slot that is not empty is a tombstone. Last, so the call
-        // sits after every store of the common path.
-        if prev_ctrl != CTRL_EMPTY {
-            // SAFETY: the caller's contract, as above.
+        // A free slot that is not empty is a tombstone, which differs from
+        // an empty one in this bit. Last, so the call sits after every
+        // store of the common path.
+        const { assert!(CTRL_EMPTY & CTRL_TOMBSTONE == 0) };
+        if control & i32::from(CTRL_TOMBSTONE) != 0 {
+            // SAFETY: the caller's contract.
             self.scheduler.reuse_tombstone(unsafe { &mut *level });
         }
     }
@@ -1979,7 +2478,7 @@ where
         self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            |route| control::control_fingerprint(route.key_hash()),
+            |route| control::control_fingerprint_low(route.key_hash()),
             |level, slot, _entry| (level, slot),
         )
     }
@@ -1992,7 +2491,7 @@ where
         self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            |route| control::control_fingerprint(route.key_hash()),
+            |route| control::control_fingerprint_low(route.key_hash()),
             |_level, _slot, entry| entry,
         )
     }
@@ -2007,7 +2506,7 @@ where
         self.find_by_exact_schedule(
             key,
             PreparedElasticKey::new(hash),
-            |route| control::control_fingerprint(route.key_hash()),
+            |route| control::control_fingerprint_low(route.key_hash()),
             |_level, _slot, entry| entry,
         )
         .map(|entry| &entry.value)
@@ -2033,7 +2532,7 @@ where
         K: Hash + Eq,
     {
         let prepared = PreparedElasticKey::new(hash);
-        let key_fingerprint = control::control_fingerprint(hash);
+        let key_fingerprint = control::control_fingerprint_low(hash);
         // Every way off the common path meets in one call, which tells them
         // apart itself.
         'common: {
@@ -2059,23 +2558,20 @@ where
                     ScheduleSearch::Unresolved => break 'common,
                 }
             }
-            if let Some((region, slot, control)) = self.settled_level_slot(prepared.route.probe) {
-                // The search borrowed the level shared; the write takes it
-                // again through the levels' own pointer.
-                let level = self.levels.as_mut_ptr().with_addr(region.addr().get());
+            // A closed gate leaves the insert to the call below, which
+            // reopens it where it may open.
+            if self.scheduler.settles(self.placed) {
+                // SAFETY: the gate is open.
+                let Some(found) = (unsafe { self.settled_level_slot(prepared.route.probe) }) else {
+                    // SAFETY: the gate is open.
+                    unsafe { self.insert_unsettled(key, value, prepared, key_fingerprint) };
+                    return None;
+                };
                 // SAFETY: the settled search returns one of this table's
-                // levels and a free slot of it with its control byte.
+                // levels with its words, and a free slot of it with its
+                // control byte.
                 unsafe {
-                    self.write_new_entry_at(
-                        key,
-                        value,
-                        prepared,
-                        key_fingerprint,
-                        level,
-                        slot,
-                        control,
-                        lane,
-                    );
+                    self.write_new_entry_at(key, value, prepared, key_fingerprint, found, lane);
                 }
                 return None;
             }
@@ -2104,7 +2600,7 @@ where
         if !filter.maybe_present {
             return None;
         }
-        let key_fingerprint = control::control_fingerprint(hash);
+        let key_fingerprint = control::control_fingerprint_low(hash);
         let walked = self.walk_schedule(
             key,
             prepared.route,
@@ -2297,9 +2793,13 @@ where
             probe_high_water: self.probe_high_water,
             scheduled_levels: self.scheduled_levels,
             probe_schedule,
+            settled_level: ptr::null_mut(),
+            settled_fallback: ptr::null_mut(),
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
         };
+        // The copied gate is open on the source's settled level.
+        cloned.scheduler.close();
         cloned.copy_membership_from(self);
         cloned
     }
@@ -2362,7 +2862,6 @@ where
             self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
         }
         self.scheduler.sync(self.live());
-        self.scheduler.reopen(self.placed, self.stale_membership());
     }
 
     /// Re-record the filter from the live entries, dropping the bits departed
@@ -2385,7 +2884,7 @@ where
                     table.hash_builder.hash_one(&entry.key)
                 };
                 let prepared = PreparedElasticKey::new(hash);
-                let summary_bit = table.levels[level_idx].summary_bit;
+                let summary_bit = table.levels[level_idx].summary_bit();
                 table.record_membership(prepared.route, prepared.membership, summary_bit);
             }
         }
@@ -2622,7 +3121,6 @@ where
         }
         // SAFETY: the level reduces by shift.
         unsafe { self.first_shifted_vacancy(probe, level, region, budget) }
-            .map(|(slot, paper_probe, _)| (slot, paper_probe))
     }
 
     /// [`Self::first_vacancy`] for a level that reduces by shift.
@@ -2639,7 +3137,7 @@ where
         level: usize,
         region: &Level<SlotEntry<K, V>>,
         budget: u64,
-    ) -> Option<(usize, u64, u8)> {
+    ) -> Option<(usize, u64)> {
         debug_assert!(core::ptr::eq(region, &raw const self.levels[level]));
         let index_shift = region.index_shift();
         debug_assert!(index_shift < u64::BITS);
@@ -2655,7 +3153,7 @@ where
             // capacity.
             let control = unsafe { region.control_at(slot) };
             if control::is_free(control) {
-                return Some((slot, budget - remaining + 1, control));
+                return Some((slot, budget - remaining + 1));
             }
             word = word.wrapping_add(word_step);
             remaining -= 1;
@@ -2879,7 +3377,7 @@ where
         let direct = self.probe_schedule.direct();
         // SAFETY: the schedule starts with its direct route.
         let route = unsafe { &*direct };
-        let h11_slot = probe::shifted_elastic_index(sequence.word(0), route.direct_index_shift());
+        let h11_slot = probe::masked_shift_elastic_index(sequence.word(0), route.index_shift());
         // SAFETY: the route's shifted index maps into the control bytes it
         // holds.
         if unsafe { *route.control().add(h11_slot) } == key_fingerprint {
@@ -2894,38 +3392,41 @@ where
         }
 
         let mut closed_levels = filter.closed_levels(prepared);
-        let mut next = direct;
+        let mut route = direct;
         loop {
             // SAFETY: the schedule ends with its sentinel, and the walk
             // cannot pass it: the sentinel's level stays open until its own
-            // probe, which reads `EMPTY` and ends the walk below.
-            next = unsafe { next.add(1) };
-            // SAFETY: as above, `next` is at most the sentinel.
-            let route = unsafe { PhiRoute::load(next) };
-            if route.is_closed(closed_levels) {
+            // probe, which reads `EMPTY` and ends the walk below. So `route`
+            // is ahead of the sentinel here.
+            let step = unsafe { PhiRoute::step(&mut route) };
+            if step.is_closed(closed_levels) {
                 continue;
             }
+            // SAFETY: as above, `route` is at most the sentinel.
+            let (index_shift, level_control) = unsafe { PhiRoute::reach(route) };
             // The route holds a shift whichever reduction its level needs.
-            let slot = probe::shifted_elastic_index(
-                sequence.word(route.sequence_index()),
-                route.index_shift(),
+            let slot = probe::masked_shift_elastic_index(
+                sequence.word_at(step.sequence_index()),
+                index_shift,
             );
             // SAFETY: the route's shifted index maps into the control bytes
             // it holds.
-            let control = unsafe { *route.control().add(slot) };
+            let control = unsafe { *level_control.add(slot) };
             if control == key_fingerprint {
-                let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(route.control(), slot);
+                let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
                 // SAFETY: the sentinel's control bytes match no fingerprint,
                 // so the route names a real level, and a fingerprint match
                 // means the slot is occupied.
                 let entry: *mut SlotEntry<K, V> = unsafe { self.probe_schedule.entry_at(offset) };
                 // SAFETY: as above, the slot holds an entry.
                 if key.equivalent(unsafe { &(*entry).key }) {
+                    // SAFETY: as above.
+                    let level = unsafe { (*route).level() };
                     return ScheduleSearch::Hit(on_hit(
-                        route.level() as usize,
+                        level as usize,
                         slot,
                         offset,
-                        route.control(),
+                        level_control,
                     ));
                 }
                 unlikely_path();
@@ -2935,7 +3436,7 @@ where
                 // removal leaves a tombstone, and so does a `clear` until its
                 // last entry is out, even one a panicking drop interrupts. So
                 // the key cannot sit at a later probe of this level.
-                closed_levels = route.close(closed_levels);
+                closed_levels = step.close(closed_levels);
                 // Either this was the sentinel, or no real level is left
                 // open.
                 if closed_levels & SENTINEL_BIT != 0 || closed_levels == !SENTINEL_BIT {
@@ -3097,6 +3598,9 @@ where
         mem::swap(&mut self.total_slots, &mut other.total_slots);
         mem::swap(&mut self.max_insertions, &mut other.max_insertions);
         mem::swap(&mut self.scheduler, &mut other.scheduler);
+        // An open gate goes with the settled level of the levels it left.
+        self.scheduler.close();
+        other.scheduler.close();
         mem::swap(&mut self.arena, &mut other.arena);
         mem::swap(&mut self.probe_high_water, &mut other.probe_high_water);
         mem::swap(&mut self.scheduled_levels, &mut other.scheduled_levels);
@@ -3153,7 +3657,7 @@ where
     #[inline]
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let prepared = PreparedElasticKey::new(key_hash);
-        let key_fingerprint = control::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint_low(key_hash);
         let target = self.scheduler.target(self.live());
         if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
             self.place_new_entry(entry.key, entry.value, prepared, key_fingerprint, placement);

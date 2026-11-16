@@ -10,31 +10,30 @@ use crate::raw::control::CTRL_EMPTY;
 
 /// One lookup probe, carrying what the walk reads from its level so a step
 /// touches the route alone.
+///
+/// `repr(C)` keeps the two words a step tests and multiplies adjacent, and
+/// the two a probe reduces and reads through adjacent, so each pair comes in
+/// one load.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub(super) struct PhiRoute {
-    /// The distance of the level's bit of a closed-level set below the top
-    /// bit in the low byte, the index shift in the next, the level in the
-    /// third and the sequence index in the high half, so one load brings
-    /// them all. The first two byte fields are below the word width: used
-    /// as a shift amount, the word itself moves the level's bit to the top,
-    /// and the top bit down to the level's.
-    packed: u64,
+    /// The level's bit of a closed-level set, alone, so a step tests it
+    /// against the set and closes the level with it as they are.
+    level_bit: u64,
+    /// [`probe::elastic_sequence_index`] of the probe, as wide as the
+    /// multiply that takes it.
+    sequence_index: u64,
+    /// The index shift in the low byte and the level in the next. The shift
+    /// is below the word width, so the word itself is the shift amount.
+    reduction: u64,
     control: *const u8,
 }
 
-const _: () = assert!(size_of::<PhiRoute>() <= 16);
+const LEVEL_BIT: u32 = u8::BITS;
 
-const INDEX_SHIFT_BIT: u32 = u8::BITS;
-const LEVEL_BIT: u32 = 2 * u8::BITS;
-const SEQUENCE_INDEX_BIT: u32 = u32::BITS;
-
-const fn pack(level: u8, index_shift: u8, sequence_index: u32) -> u64 {
+const fn reduction(level: u8, index_shift: u8) -> u64 {
     assert!(level <= SENTINEL_LEVEL && (index_shift as u32) < u64::BITS);
-    (TOP_LEVEL_BIT - level_bit(level)) as u64
-        | (index_shift as u64) << INDEX_SHIFT_BIT
-        | (level as u64) << LEVEL_BIT
-        | (sequence_index as u64) << SEQUENCE_INDEX_BIT
+    index_shift as u64 | (level as u64) << LEVEL_BIT
 }
 
 impl PhiRoute {
@@ -51,109 +50,139 @@ impl PhiRoute {
                 region.ctrl_ptr.cast_const(),
             )
         };
+        let level = u8::try_from(level).expect("Elastic level count fits u8");
         Self {
-            packed: pack(
-                u8::try_from(level).expect("Elastic level count fits u8"),
-                index_shift,
-                probe::elastic_sequence_index(
-                    u32::try_from(level).expect("Elastic level count fits u32"),
-                    logical_probe_index,
-                ),
-            ),
+            level_bit: 1 << level_bit(level),
+            sequence_index: u64::from(probe::elastic_sequence_index(
+                u32::from(level),
+                logical_probe_index,
+            )),
+            reduction: reduction(level, index_shift),
             control,
         }
     }
 
     /// The direct route: level zero's first probe, or the sentinel's control
-    /// bytes for a table without levels. No walk steps onto it, so its word
-    /// is its index shift alone, ready to shift by.
+    /// bytes for a table without levels. No walk steps onto it.
     fn direct<T>(levels: &[Level<T>]) -> Self {
         let Some(region) = levels.first() else {
-            return Self {
-                packed: u64::from(SENTINEL_LEVEL),
-                control: SENTINEL.control,
-            };
+            return SENTINEL;
         };
-        let route = Self::new(0, region, 0);
-        Self {
-            packed: u64::from(route.index_shift()),
-            control: route.control,
+        Self::new(0, region, 0)
+    }
+
+    /// Steps `route` to the route after it and reads the two words a walk's
+    /// step takes there: the level's bit and the sequence index. On 64-bit
+    /// `AArch64` the step and both reads are one pre-indexed pair load.
+    ///
+    /// # Safety
+    ///
+    /// `route` addresses a route of a [`ProbeSchedule`] ahead of its
+    /// sentinel.
+    #[inline]
+    pub(super) unsafe fn step(route: &mut *const Self) -> RouteStep {
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64", not(miri)))]
+        {
+            const _: () = assert!(size_of::<PhiRoute>() == 32);
+            let level_bit: u64;
+            let sequence_index: u64;
+            // SAFETY: the caller's contract: the next route holds both
+            // words, which the load only reads.
+            unsafe {
+                core::arch::asm!(
+                    "ldp {level_bit}, {sequence_index}, [{route}, #32]!",
+                    route = inout(reg) *route,
+                    level_bit = lateout(reg) level_bit,
+                    sequence_index = lateout(reg) sequence_index,
+                    options(pure, readonly, nostack, preserves_flags),
+                );
+            }
+            RouteStep {
+                level_bit,
+                sequence_index,
+            }
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_pointer_width = "64", not(miri))))]
+        {
+            // SAFETY: the caller's contract.
+            *route = unsafe { route.add(1) };
+            // SAFETY: as above.
+            unsafe { (**route).as_step() }
         }
     }
 
-    /// The route at `route`. Where the target has a load as wide as the
-    /// route, the packed word comes out of one such load and the pointer is
-    /// read as a pointer beside it: the two reads fold into the wide one, and
-    /// a walk that skips the route keeps no second pointer to it.
+    /// What [`Self::step`] reads of this route.
+    #[cfg(any(
+        test,
+        not(all(target_arch = "aarch64", target_pointer_width = "64", not(miri)))
+    ))]
+    pub(super) fn as_step(&self) -> RouteStep {
+        RouteStep {
+            level_bit: self.level_bit,
+            sequence_index: self.sequence_index,
+        }
+    }
+
+    /// The two words a walk's probe reads at `route`: the index shift, as
+    /// [`Self::index_shift`] gives it, and the level's control bytes. Where
+    /// a pointer is as wide as the reduction and the target is little-endian,
+    /// so that one wide load splits into the two in order, it reads them
+    /// together.
     ///
     /// # Safety
     ///
     /// `route` addresses a route of a [`ProbeSchedule`].
     #[inline]
-    pub(super) unsafe fn load(route: *const Self) -> Self {
+    #[allow(clippy::cast_possible_truncation)]
+    pub(super) unsafe fn reach(route: *const Self) -> (u32, *const u8) {
         #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
         {
             const _: () = assert!(
-                size_of::<PhiRoute>() == size_of::<u128>()
-                    && core::mem::offset_of!(PhiRoute, packed) == 0
+                size_of::<*const u8>() == size_of::<u64>()
+                    && core::mem::offset_of!(PhiRoute, control)
+                        == core::mem::offset_of!(PhiRoute, reduction) + size_of::<u64>()
+                    && size_of::<PhiRoute>()
+                        == core::mem::offset_of!(PhiRoute, control) + size_of::<u64>()
             );
-            // SAFETY: the route is sixteen initialized bytes, by the
-            // caller's contract and the layout asserted above.
-            let both = unsafe { route.cast::<u128>().read_unaligned() };
-            #[allow(clippy::cast_possible_truncation)]
-            Self {
-                packed: both as u64,
-                // SAFETY: the caller's contract.
-                control: unsafe { (*route).control },
-            }
+            // SAFETY: the caller's contract; the reduction and the control
+            // pointer are the route's last two words, with no padding
+            // between or after them.
+            let both = unsafe {
+                (&raw const (*route).reduction)
+                    .cast::<u128>()
+                    .read_unaligned()
+            };
+            // SAFETY: the caller's contract.
+            let control = unsafe { (*route).control }.with_addr((both >> u64::BITS) as usize);
+            (both as u32, control)
         }
         #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
         // SAFETY: the caller's contract.
         unsafe {
-            *route
+            ((*route).reduction as u32, (*route).control)
         }
-    }
-
-    /// [`Self::index_shift`] of the direct route.
-    #[inline]
-    #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn direct_index_shift(&self) -> u32 {
-        self.packed as u32
     }
 
     /// Level the route probes; [`SENTINEL_LEVEL`] for the sentinel.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub(super) fn level(&self) -> u8 {
-        (self.packed >> LEVEL_BIT) as u8
+        (self.reduction >> LEVEL_BIT) as u8
     }
 
-    /// Whether `closed_levels` holds the route's level.
-    #[inline]
-    #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn is_closed(&self, closed_levels: u64) -> bool {
-        closed_levels.wrapping_shl(self.packed as u32) >> TOP_LEVEL_BIT != 0
-    }
-
-    /// `closed_levels` with the route's level.
-    #[inline]
-    #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn close(&self, closed_levels: u64) -> u64 {
-        closed_levels | (1_u64 << TOP_LEVEL_BIT).wrapping_shr(self.packed as u32)
-    }
-
-    /// Shift that reduces a probe word to a slot of the route's level.
+    /// Shift that reduces a probe word to a slot of the route's level. Only
+    /// its low six bits are the shift: a caller shifts by it with a wrapping
+    /// shift, which reads no others.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub(super) fn index_shift(&self) -> u32 {
-        u32::from((self.packed >> INDEX_SHIFT_BIT) as u8)
+        self.reduction as u32
     }
 
     /// The route's [`probe::elastic_sequence_index`].
-    #[inline]
-    #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn sequence_index(&self) -> u32 {
-        (self.packed >> SEQUENCE_INDEX_BIT) as u32
+    #[cfg(test)]
+    pub(super) fn sequence_index(&self) -> u64 {
+        self.sequence_index
     }
 
     /// Control bytes of the route's level.
@@ -163,8 +192,9 @@ impl PhiRoute {
     }
 
     /// `(level, logical probe)` the route stands for.
+    #[allow(clippy::cast_possible_truncation)]
     pub(super) fn coordinates(&self) -> (u32, u64) {
-        probe::elastic_sequence_coordinates(self.sequence_index())
+        probe::elastic_sequence_coordinates(self.sequence_index as u32)
     }
 
     /// Packed retry-zero counter of the route, for the general reduction.
@@ -175,15 +205,44 @@ impl PhiRoute {
     }
 }
 
+const _: () = assert!(
+    core::mem::offset_of!(PhiRoute, level_bit) == 0
+        && core::mem::offset_of!(PhiRoute, sequence_index) == size_of::<u64>()
+);
+
+/// What a walk's step reads of a route.
+#[derive(Clone, Copy)]
+pub(super) struct RouteStep {
+    level_bit: u64,
+    sequence_index: u64,
+}
+
+impl RouteStep {
+    /// Whether `closed_levels` holds the route's level.
+    #[inline]
+    pub(super) fn is_closed(self, closed_levels: u64) -> bool {
+        closed_levels & self.level_bit != 0
+    }
+
+    /// `closed_levels` with the route's level.
+    #[inline]
+    pub(super) fn close(self, closed_levels: u64) -> u64 {
+        closed_levels | self.level_bit
+    }
+
+    /// The route's [`probe::elastic_sequence_index`].
+    #[inline]
+    pub(super) fn sequence_index(self) -> u64 {
+        self.sequence_index
+    }
+}
+
 /// Control bytes the sentinel route probes: its shift leaves one index bit.
 static SENTINEL_CONTROL: [u8; 2] = [CTRL_EMPTY; 2];
 
 /// Level of the sentinel route, above every real level.
 pub(super) const SENTINEL_LEVEL: u8 = 63;
 const _: () = assert!(SENTINEL_LEVEL as u32 == u64::BITS - 1);
-
-/// Top bit position of a lookup's closed-level set.
-const TOP_LEVEL_BIT: u8 = 63;
 
 /// The sentinel's bit of a closed-level set, the lowest: a stored route
 /// summary keeps it clear, so a walk always stops at the sentinel.
@@ -192,13 +251,16 @@ pub(super) const SENTINEL_BIT: u64 = 1;
 /// Bit position of `level` in a closed-level set: one above the level for a
 /// real level, the lowest for the sentinel.
 const fn level_bit(level: u8) -> u8 {
-    level.wrapping_add(1) & TOP_LEVEL_BIT
+    level.wrapping_add(1) & SENTINEL_LEVEL
 }
 
 const SENTINEL: PhiRoute = PhiRoute {
-    packed: pack(SENTINEL_LEVEL, SENTINEL_LEVEL, 0),
+    level_bit: SENTINEL_BIT,
+    sequence_index: 0,
+    reduction: reduction(SENTINEL_LEVEL, SENTINEL_LEVEL),
     control: SENTINEL_CONTROL.as_ptr(),
 };
+const _: () = assert!(SENTINEL_BIT == 1 << level_bit(SENTINEL_LEVEL));
 
 /// Storage reserved for a [`ProbeSchedule`], taken before the levels it
 /// will address exist.
