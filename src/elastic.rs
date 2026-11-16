@@ -1788,8 +1788,11 @@ where
     #[inline]
     fn live_in(&self, level: &Level<SlotEntry<K, V>>) -> u32 {
         let settled = ptr::eq(level, self.settled_level);
-        self.uncounted
-            .live(self.placed, level.counters().len, settled)
+        let live = self
+            .uncounted
+            .live(self.placed, level.counters().len, settled);
+        debug_assert!(live <= level.capacity, "a live count fell below zero");
+        live
     }
 
     /// Moves the settled inserts into `settled_level`'s stored live count,
