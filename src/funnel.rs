@@ -167,9 +167,10 @@ impl<T> HeadLevel<T> {
     /// `slot` is below the level's slot count.
     #[inline]
     unsafe fn entry(&self, slot: usize) -> *mut MaybeUninit<T> {
-        // SAFETY: the caller keeps the slot inside the level, whose first
-        // bucket's last lane is `GROUP_SIZE - 1` slots in.
-        unsafe { self.last.add(slot).sub(GROUP_SIZE - 1) }
+        // SAFETY: the first bucket's last lane is `GROUP_SIZE - 1` slots
+        // into the level, so stepping back that far reaches the level's
+        // first slot, and the caller keeps `slot` inside the level.
+        unsafe { self.last.sub(GROUP_SIZE - 1).add(slot) }
     }
 }
 
@@ -641,13 +642,6 @@ mod level_bin {
             self.0
         }
     }
-
-    impl From<u16> for WideLevelBin {
-        #[inline]
-        fn from(levels: u16) -> Self {
-            Self(u64::from(levels) << super::LEVEL_BIN_SHIFT)
-        }
-    }
 }
 
 /// A loaded filter unit paired with the key's bit, split from the test so the
@@ -877,9 +871,9 @@ impl<K, V> Clone for Found<'_, K, V> {
 
 impl<K, V> Copy for Found<'_, K, V> {}
 
-/// The part of a [`Found`] a lookup's caller wants. The out-of-line lookup is
-/// instantiated per projection, so each returns one word and the hand-off to
-/// the ordered walk stays a tail call.
+/// The part of a [`Found`] a lookup's caller wants. A lookup is instantiated
+/// per projection, so each builds that part alone, and the ordered walk it
+/// hands off to returns one word.
 trait FoundPart<'a, K, V> {
     type Part;
 

@@ -1110,7 +1110,7 @@ fn levels_past_the_head_share_the_overflow_bit() {
 #[test]
 fn a_wide_bin_leads_with_the_index_of_its_shallowest_level() {
     let lead = |levels: u16| {
-        let wide = WideLevelBin::from(levels).get();
+        let wide = unit_wide_levels(unit_of(0, levels)).get();
         let unit = unit_of(u32::MAX, levels);
         // The unit's membership bits lie under its bin, so a bin that is
         // not empty leads the unit as it leads the bin alone.
@@ -2632,16 +2632,15 @@ fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
 
 /// The first-match lookup walks a group mask from its highest lane down.
 /// For every set of matching lanes, that walk visits the lanes the mask's
-/// own iterator yields, in reverse, and each lane's depth scales to the
-/// distance of its control and of its entry from the group's last.
+/// own iterator yields, in reverse, and each lane's depth is a whole number
+/// of lanes below the group's last.
 #[test]
 fn a_group_mask_walked_from_the_top_visits_its_lanes_in_reverse() {
     const FP: u8 = 0x80 | 7;
-    // One bit of `chosen` per lane; a group of more lanes than that many
-    // bits repeats the pattern.
-    for chosen in 0..=u8::MAX {
+    // One bit of `chosen` per lane.
+    for chosen in 0..1_u32 << GROUP_SIZE {
         let controls: [u8; GROUP_SIZE] = core::array::from_fn(|lane| {
-            if chosen >> (lane % 8) & 1 == 1 {
+            if chosen >> lane & 1 == 1 {
                 FP
             } else {
                 CTRL_EMPTY
@@ -2986,16 +2985,19 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 );
                 let probe = table.prf.prepare(key);
                 // The walk takes the unit as the gate loaded it, and reads
-                // the same bin from it as from the bin alone.
+                // the same bin from it as from the bin alone: the same slot,
+                // or the same head entry scanned last.
                 let scan = table
                     .first_match(&key, probe, gate.wide_levels())
                     .map(|found| table.slot_of(found.lane));
                 assert_eq!(
                     table
-                        .first_match(&key, probe, gate.levels().into())
+                        .first_match(&key, probe, unit_wide_levels(unit_of(0, gate.levels())))
                         .map(|found| table.slot_of(found.lane))
-                        .ok(),
-                    scan.as_ref().ok().copied(),
+                        .map_err(core::ptr::from_ref),
+                    scan.as_ref()
+                        .copied()
+                        .map_err(|last| core::ptr::from_ref(*last)),
                     "n {n} d {d} index {index}"
                 );
                 let found = scan.ok();
@@ -3003,7 +3005,7 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 // entry, which finds nothing.
                 for absent in [0, OVERFLOW_LEVEL_BIT] {
                     let at_absent = table
-                        .first_match(&key, probe, absent.into())
+                        .first_match(&key, probe, unit_wide_levels(unit_of(0, absent)))
                         .map(|found| table.slot_of(found.lane))
                         .ok();
                     assert_eq!(at_absent, None, "n {n} d {d} index {index}");
