@@ -1138,7 +1138,7 @@ fn assert_head_addresses_storage<K, V, S>(table: &FunnelTable<K, V, S>) {
         assert_eq!(head.multiplier, derived.multiplier, "entry {index}");
         assert_eq!(head.buckets, derived.buckets, "entry {index}");
         assert_eq!(head.ctrl, derived.ctrl, "entry {index}");
-        assert_eq!(head.data, derived.data, "entry {index}");
+        assert_eq!(head.last, derived.last, "entry {index}");
     }
     assert_eq!(table.head_lanes, table.shape.head_lanes());
 }
@@ -1514,7 +1514,8 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
             );
             // SAFETY: a level starts inside the storage.
             let data = unsafe { table.storage.slot_ptr(level.offset) };
-            assert_eq!(head.data.cast(), data);
+            // SAFETY: slot zero of a level is inside it.
+            assert_eq!(unsafe { head.entry(0) }.cast(), data);
         }
         assert!(
             table.head[recorded..OVERFLOW_LEVEL]
@@ -2607,6 +2608,44 @@ fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
     drop(table);
     assert_eq!(allocations.load(Ordering::SeqCst), 1);
     assert_eq!(deallocations.load(Ordering::SeqCst), 1);
+}
+
+/// The first-match lookup walks a group mask from its highest lane down.
+/// For every set of matching lanes, that walk visits the lanes the mask's
+/// own iterator yields, in reverse, and each lane's depth scales to the
+/// distance of its control and of its entry from the group's last.
+#[test]
+fn a_group_mask_walked_from_the_top_visits_its_lanes_in_reverse() {
+    const FP: u8 = 0x80 | 7;
+    // One bit of `chosen` per lane; a group of more lanes than that many
+    // bits repeats the pattern.
+    for chosen in 0..=u8::MAX {
+        let controls: [u8; GROUP_SIZE] = core::array::from_fn(|lane| {
+            if chosen >> (lane % 8) & 1 == 1 {
+                FP
+            } else {
+                CTRL_EMPTY
+            }
+        });
+        // SAFETY: `controls` is one whole group.
+        let mask = unsafe { simd::eq_mask_group(controls.as_ptr(), FP) };
+        let mut ascending: Vec<usize> = mask.clone().collect();
+        ascending.reverse();
+        let mut descending = Vec::new();
+        let mut matches = mask.0;
+        while matches != 0 {
+            // SAFETY: `matches` is a group mask less whole lanes, and not
+            // empty.
+            let depth = unsafe { highest_lane_depth(matches) };
+            assert_eq!(depth % BITMASK_STRIDE, 0, "{controls:02x?}");
+            descending.push(GROUP_SIZE - 1 - (depth / BITMASK_STRIDE) as usize);
+            // SAFETY: as above.
+            let rest = unsafe { below_highest_lane(matches) };
+            assert!(rest < matches, "{controls:02x?}");
+            matches = rest;
+        }
+        assert_eq!(descending, ascending, "{controls:02x?}");
+    }
 }
 
 #[test]
