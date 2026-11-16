@@ -3,6 +3,7 @@ use core::fmt;
 use core::hash::{BuildHasher, Hash};
 use core::iter::FusedIterator;
 use core::marker::PhantomData;
+use core::mem;
 use core::ops::Index;
 
 use allocator_api2::alloc::{Allocator, Global};
@@ -119,10 +120,16 @@ pub trait TableBackend<K, V>: Sized {
     /// update bookkeeping, and resize if needed.
     fn remove(&mut self, loc: Self::Location) -> (K, V);
 
-    /// Mark `loc` (valid per [`Location`](TableBackend::Location)) as a tombstone
-    /// without updating counters — draining iterators use it after moving the
-    /// value out to avoid a double drop.
-    fn tombstone_slot(&mut self, loc: Self::Location);
+    /// Move the next entry `scan` reaches out of the table and mark its slot
+    /// a tombstone without updating counters, which leaves the table fit only
+    /// for dropping. [`IntoIter`] uses it on a table it owns, so the table's
+    /// `Drop` skips the slot.
+    ///
+    /// # Safety
+    ///
+    /// `scan` came from [`scan`](TableBackend::scan) on this table and has
+    /// stepped only this table, which has seen no insertion or resize since.
+    unsafe fn take_next(&mut self, scan: &mut Self::Scan) -> Option<SlotEntry<K, V>>;
 
     /// Mark a moved-out `loc` (valid per [`Location`](TableBackend::Location)) as
     /// a tombstone and update counters without resizing.
@@ -145,6 +152,71 @@ pub trait TableBackend<K, V>: Sized {
     /// Yield each occupied slot exactly once per traversal, with distinct
     /// pointers: `IterMut`/`Drain` lift each to a `&mut`, so a repeat aliases (UB).
     fn scan_next(&self, scan: &mut Self::Scan) -> Option<(*mut SlotEntry<K, V>, Self::Location)>;
+
+    // -- Drain: detach the storage, move entries out, put it back empty --
+
+    /// The entries and their allocation, apart from the hash builder and the
+    /// allocator. Dropping it frees nothing; only
+    /// [`restore_storage`](TableBackend::restore_storage) gives the allocation
+    /// back to a table. The default owns no allocation.
+    type Storage: Default;
+
+    /// Detach the storage and start a `Clear` epoch, leaving a valid empty
+    /// table that owns no allocation. A [`Scan`](TableBackend::Scan) created
+    /// just before, and the locations it yields, carry over to the storage.
+    fn take_storage(&mut self) -> Self::Storage;
+
+    /// [`scan_next`](TableBackend::scan_next) over detached storage.
+    fn storage_scan_next(
+        storage: &Self::Storage,
+        scan: &mut Self::Scan,
+    ) -> Option<(*mut SlotEntry<K, V>, Self::Location)>;
+
+    /// [`take_next`](TableBackend::take_next) over detached storage, so
+    /// [`drop_storage_values`](TableBackend::drop_storage_values) skips the
+    /// slot.
+    ///
+    /// # Safety
+    ///
+    /// `scan` carried over to `storage` per
+    /// [`take_storage`](TableBackend::take_storage) and has stepped only it.
+    unsafe fn storage_take_next(
+        storage: &mut Self::Storage,
+        scan: &mut Self::Scan,
+    ) -> Option<SlotEntry<K, V>>;
+
+    /// Folds the entries [`storage_take_next`](TableBackend::storage_take_next)
+    /// would yield from here on, leaving `scan` exhausted. A backend
+    /// overrides it where one pass beats repeated single steps.
+    ///
+    /// # Safety
+    ///
+    /// As for [`storage_take_next`](TableBackend::storage_take_next).
+    #[inline]
+    unsafe fn storage_take_fold<B>(
+        storage: &mut Self::Storage,
+        scan: &mut Self::Scan,
+        init: B,
+        mut f: impl FnMut(B, (K, V)) -> B,
+    ) -> B {
+        let mut acc = init;
+        // SAFETY: the caller's contract is this call's.
+        while let Some(entry) = unsafe { Self::storage_take_next(storage, scan) } {
+            acc = f(acc, (entry.key, entry.value));
+        }
+        acc
+    }
+
+    /// Drop every entry still in `storage`. Like dropping a slice, a panicking
+    /// `Drop` does not stop the walk; a second panic aborts.
+    fn drop_storage_values(storage: &mut Self::Storage);
+
+    /// Put back the storage [`take_storage`](TableBackend::take_storage)
+    /// detached from this table, reset to empty with its allocation kept. No
+    /// entry is dropped, so the caller must have moved out or dropped them
+    /// all. `storage` receives the empty storage the table held meanwhile.
+    /// Runs no user code and cannot panic.
+    fn restore_storage(&mut self, storage: &mut Self::Storage);
 
     // -- Lifecycle: construct, resize, clean up, clone --
 
@@ -225,9 +297,6 @@ pub trait TableBackend<K, V>: Sized {
 
     /// Drop all entries while retaining the allocation.
     fn clear(&mut self);
-
-    /// Clear control bytes and counters after [`Drain::drop`] moves out values.
-    fn wipe_all(&mut self);
 
     /// Clone storage, hash builder, allocator, and entries.
     fn clone_table(&self) -> Self
@@ -1167,15 +1236,23 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
         }
     }
 
-    /// Draining iterator that empties the map.
+    /// Clears the map, returning every entry as an iterator. Keeps the
+    /// allocated memory for reuse.
+    ///
+    /// The map is empty as soon as this returns. Dropping the iterator drops
+    /// the entries it has not yielded and gives the allocation back to the
+    /// map. Leaking the iterator (for example with
+    /// [`mem::forget`](core::mem::forget)) leaks those entries and the
+    /// allocation, and leaves the map empty and usable.
     pub fn drain(&mut self) -> Drain<'_, K, V, P> {
         let scan = self.table.scan();
         let remaining = self.table.len();
+        let storage = self.table.take_storage();
         Drain {
-            table: TableBorrow::new(&mut self.table),
+            table: &mut self.table,
+            storage,
             scan,
             remaining,
-            _marker: PhantomData,
         }
     }
 
@@ -1377,12 +1454,11 @@ pub struct IntoIter<K, V, P: TableBackend<K, V>> {
 impl<K, V, P: TableBackend<K, V>> Iterator for IntoIter<K, V, P> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
-        let (ptr, loc) = self.table.scan_next(&mut self.scan)?;
+        // SAFETY: `scan` was made from `table` when this iterator took
+        // ownership of it, and nothing else steps the scan or touches the
+        // table.
+        let entry = unsafe { self.table.take_next(&mut self.scan) }?;
         self.remaining -= 1;
-        // SAFETY: `ptr` is a live slot; read the entry out, then tombstone so
-        // the consumed table's `Drop` won't re-drop the moved-out slot.
-        let entry = unsafe { core::ptr::read(ptr) };
-        self.table.tombstone_slot(loc);
         Some((entry.key, entry.value))
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1411,40 +1487,73 @@ where
     }
 }
 
-/// Draining iterator; empties the map on consumption or drop.
+/// Draining iterator over owned `(K, V)`. Owns the storage it took from the
+/// map, which stays empty until the iterator is dropped and hands the
+/// allocation back.
 pub struct Drain<'a, K, V, P: TableBackend<K, V>> {
-    table: TableBorrow<'a, P>,
+    table: &'a mut P,
+    storage: P::Storage,
     scan: P::Scan,
     remaining: usize,
-    _marker: PhantomData<(K, V)>,
 }
 
 impl<K, V, P: TableBackend<K, V>> Iterator for Drain<'_, K, V, P> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
-        // SAFETY: `table` points to the borrowed map for the drain's lifetime.
-        let (ptr, loc) = unsafe { (*self.table.as_ptr()).scan_next(&mut self.scan) }?;
+        // SAFETY: `drain` made `scan` just before detaching `storage`, and
+        // both are private to this iterator.
+        let entry = unsafe { P::storage_take_next(&mut self.storage, &mut self.scan) }?;
         self.remaining -= 1;
-        // SAFETY: live slot; read the entry out and mark a tombstone (counters
-        // are reset wholesale by `wipe_all` on drop).
-        let entry = unsafe { core::ptr::read(ptr) };
-        // SAFETY: `table` is exclusively borrowed; `loc` is still valid since no
-        // structural mutation ran after `scan_next`.
-        unsafe { (*self.table.as_ptr()).tombstone_slot(loc) };
         Some((entry.key, entry.value))
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.remaining, Some(self.remaining))
     }
+    fn fold<B, F>(mut self, init: B, f: F) -> B
+    where
+        F: FnMut(B, (K, V)) -> B,
+    {
+        // SAFETY: as in `next`.
+        let acc = unsafe { P::storage_take_fold(&mut self.storage, &mut self.scan, init, f) };
+        // Reached only when `f` did not unwind, so no value is left to drop.
+        self.remaining = 0;
+        acc
+    }
 }
 
 impl<K, V, P: TableBackend<K, V>> Drop for Drain<'_, K, V, P> {
     fn drop(&mut self) {
-        // Drain any unyielded entries so values run their `Drop`, then wipe.
-        for _ in &mut *self {}
-        // SAFETY: `table` points to the exclusively borrowed map for the drain's
-        // lifetime.
-        unsafe { (*self.table.as_ptr()).wipe_all() };
+        /// Puts the storage back when dropped, so the map regains its
+        /// allocation even if a value's `Drop` unwinds.
+        struct Restore<'a, K, V, P: TableBackend<K, V>> {
+            table: &'a mut P,
+            storage: &'a mut P::Storage,
+        }
+
+        impl<K, V, P: TableBackend<K, V>> Drop for Restore<'_, K, V, P> {
+            fn drop(&mut self) {
+                // Moved to a slot of its own first: a pointer into the
+                // `Drain` would expose every field to the call and keep the
+                // scan state in memory throughout the caller's loop.
+                let mut storage = mem::take(self.storage);
+                restore(self.table, &mut storage);
+            }
+        }
+
+        /// Out of line so the drop glue stays small enough to inline into
+        /// the caller's loop.
+        #[inline(never)]
+        fn restore<K, V, P: TableBackend<K, V>>(table: &mut P, storage: &mut P::Storage) {
+            table.restore_storage(storage);
+        }
+
+        let restore = Restore {
+            table: &mut *self.table,
+            storage: &mut self.storage,
+        };
+        if self.remaining != 0 {
+            P::drop_storage_values(restore.storage);
+        }
     }
 }
 
@@ -1464,11 +1573,15 @@ where
     P::Scan: Clone,
 {
     /// Shared view of the entries not yet moved out.
-    pub(crate) fn view(&self) -> Iter<'_, K, V, P> {
-        // SAFETY: `table` points to the exclusively borrowed map; the cloned
-        // scan visits only slots not yet moved out.
-        let table = unsafe { &*self.table.as_ptr() };
-        Iter::remaining(table, &self.scan, self.remaining)
+    pub(crate) fn view(&self) -> impl Iterator<Item = (&K, &V)> {
+        let mut scan = self.scan.clone();
+        core::iter::from_fn(move || {
+            let (ptr, _loc) = P::storage_scan_next(&self.storage, &mut scan)?;
+            // SAFETY: `ptr` is a live slot of the storage `&self` borrows; the
+            // cloned scan visits only slots not yet moved out.
+            let slot = unsafe { &*ptr };
+            Some((&slot.key, &slot.value))
+        })
     }
 }
 

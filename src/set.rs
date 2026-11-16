@@ -46,7 +46,8 @@ macro_rules! forward_constructors {
 /// Declare a [`HashSet`] iterator that wraps map-level iterators.
 ///
 /// Emits the struct, its `Iterator` impl from the given `next` and
-/// `size_hint` bodies, and `FusedIterator`. `bounds [..]` lists extra
+/// `size_hint` bodies, and `FusedIterator`. An `@fold(self, init, f)` body
+/// overrides `Iterator::fold`. `bounds [..]` lists extra
 /// `where` clauses shared by every `Iterator`-dependent impl. Trailing flags
 /// add `exact_size` (`len` forwards to the first field), `clone` (fieldwise,
 /// requiring `P::Scan: Clone`), and either `debug_list` (prints the
@@ -60,6 +61,7 @@ macro_rules! set_iter {
         type Item = $item:ty;
         fn next(&mut $this:ident) $next:block
         fn size_hint(&$this_ref:ident) $size_hint:block
+        $(@fold($fold_this:ident, $init:ident, $f:ident) $fold:block)?
         $($flag:ident)*
     ) => {
         $(#[$attr])*
@@ -75,6 +77,12 @@ macro_rules! set_iter {
             type Item = $item;
             fn next(&mut $this) -> Option<$item> $next
             fn size_hint(&$this_ref) -> (usize, Option<usize>) $size_hint
+            $(
+                fn fold<B, F>($fold_this, $init: B, mut $f: F) -> B
+                where
+                    F: FnMut(B, $item) -> B,
+                $fold
+            )?
         }
 
         impl<$($lt,)? T, P> FusedIterator for $name<$($lt,)? T, P>
@@ -430,7 +438,12 @@ where
         }
     }
 
-    /// Draining iterator. Removes and yields every value.
+    /// Clears the set, returning every value as an iterator. Keeps the
+    /// allocated memory for reuse.
+    ///
+    /// The set is empty as soon as this returns. Dropping the iterator drops
+    /// the values it has not yielded; leaking it leaks them and the
+    /// allocation, and leaves the set empty and usable.
     pub fn drain(&mut self) -> Drain<'_, T, P> {
         Drain {
             inner: self.map.drain(),
@@ -857,6 +870,9 @@ set_iter! {
     }
     fn size_hint(&self) {
         self.inner.size_hint()
+    }
+    @fold(self, init, f) {
+        self.inner.fold(init, |acc, (value, ())| f(acc, value))
     }
     exact_size debug_view
 }

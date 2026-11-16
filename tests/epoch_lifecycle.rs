@@ -267,6 +267,30 @@ fn extract_drop_after_a_caught_predicate_panic_finishes_cleanup() {
 }
 
 #[test]
+fn drain_starts_one_clear_epoch_and_returns_the_allocation() {
+    macro_rules! check {
+        ($map:expr) => {{
+            let mut map = $map;
+            fill_identity!(map, 0..32);
+            assert_eq!(map.remove(&0), Some(0));
+            let capacity = map.capacity();
+            let before = map.epoch();
+
+            assert_eq!(map.drain().take(4).count(), 4);
+            let after = map.epoch();
+            assert_eq!(map.capacity(), capacity);
+            assert_eq!(after.generation, before.generation + 1);
+            assert_eq!(after.transition, EpochTransition::Clear);
+            assert_eq!(after.distinct_insertions, 0);
+            assert!(!after.had_delete);
+        }};
+    }
+
+    check!(ElasticHashMap::<usize, usize>::with_capacity(64));
+    check!(FunnelHashMap::<usize, usize>::with_capacity(64));
+}
+
+#[test]
 fn clear_starts_a_fresh_epoch_in_the_same_allocation() {
     let mut map = FunnelHashMap::<usize, usize>::with_capacity(64);
     map.insert(1, 1);
