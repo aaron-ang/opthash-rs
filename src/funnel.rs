@@ -1797,28 +1797,13 @@ where
     /// [`Self::search_vacancy`] for a table without tombstones, over the levels
     /// that own a level-bin bit: the first EMPTY lane of the walk, which is
     /// then its first free slot. `None` hands the insert to the general walk:
-    /// no vacancy in those levels. An absent head entry has none, so the
-    /// walk passes over it.
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
+    /// no vacancy in those levels.
+    #[inline]
     fn first_empty_in_head(
         &self,
         probe: PreparedFastFunnelProbe,
     ) -> Option<HeadVacancy<SlotEntry<K, V>>> {
-        // One copy of the step per level, each with a constant index: the
-        // walk then keeps no index and checks no bound.
-        macro_rules! walk {
-            ($($index:literal)*) => {
-                const { assert!([$($index),*].len() == OVERFLOW_LEVEL) };
-                $(
-                    if let Some(vacancy) = self.first_empty_in_head_level(probe, $index) {
-                        return Some(vacancy);
-                    }
-                )*
-            };
-        }
-        walk!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14);
-        None
+        (0..OVERFLOW_LEVEL).find_map(|index| self.first_empty_in_head_level(probe, index))
     }
 
     /// The duplicate search and [`Self::first_empty_in_head`] in one walk,
@@ -1846,7 +1831,7 @@ where
         if self.head_left == 0 {
             return HeadSearch::Unsettled;
         }
-        // One copy of the step per level, as in `first_empty_in_head`.
+        // One copy of the step per level, as in `place_through_head`.
         macro_rules! walk {
             ($($index:literal)*) => {
                 const { assert!([$($index),*].len() == OVERFLOW_LEVEL) };
@@ -1944,18 +1929,15 @@ where
             unsafe { simd::free_lanes_group(level.group(bucket).cast(), self.head_lanes) }.0;
         (empty != 0).then(|| {
             let lane = (empty.trailing_zeros() / BITMASK_STRIDE) as usize;
+            // One slot index for both addresses.
+            let slot = bucket * GROUP_SIZE + lane;
             HeadVacancy {
                 // SAFETY: an EMPTY lane of the bucket is a slot of the level.
                 // Addressed from the level, not from the group just read,
                 // which leaves that read its scaled bucket index.
-                lane: unsafe { level.ctrl.add(bucket * GROUP_SIZE + lane) },
-                // SAFETY: as above, and the set is non-empty.
-                entry: unsafe {
-                    level
-                        .entries(bucket)
-                        .byte_add(lowest_entry_offset::<SlotEntry<K, V>>(empty))
-                        .cast::<MaybeUninit<_>>()
-                },
+                lane: unsafe { level.ctrl.add(slot) },
+                // SAFETY: as above.
+                entry: unsafe { level.data.add(slot) },
                 level_bit: level_bit_of(index),
             }
         })
@@ -2440,20 +2422,121 @@ where
         self.set_entries(self.entries());
     }
 
-    /// Stores an absent key at the vacancy [`Self::head_vacancy`] reported
-    /// and records it in the filter. Calls nothing.
+    /// [`Self::head_vacancy`] and [`Self::place_in_head`] in one walk: moves
+    /// an absent key and its value to the first EMPTY lane and records the
+    /// key in the filter. `false` when the head has no placement left or no
+    /// vacancy for the key, which then stays where it is. Calls nothing.
+    ///
+    /// The placement is written out once per level, after that level's
+    /// scan: each copy then records its own level bit as a constant. The
+    /// pair comes by reference so that those copies keep none of their own
+    /// on the stack.
     ///
     /// # Safety
     ///
     /// `unit` must be the filter unit of `membership`, itself from
-    /// [`Self::membership_slot`], and `vacancy` from [`Self::head_vacancy`],
-    /// with no write to the table since any of them was read.
+    /// [`Self::membership_slot`], with no write to the table since either
+    /// was read. After `true` the caller must forget `key` and `value`:
+    /// the table owns them.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    unsafe fn place_through_head(
+        &mut self,
+        key: &K,
+        value: &V,
+        membership: MembershipSlot,
+        unit: u64,
+        probe: PreparedFastFunnelProbe,
+    ) -> bool {
+        debug_assert_eq!(
+            self.head_left,
+            self.head_limit().saturating_sub(self.entries())
+        );
+        let head_left = self.head_left;
+        if head_left == 0 {
+            return false;
+        }
+        // SAFETY: head placements are left only in a table with slots, so
+        // its filter has units and `membership.index` is below their count.
+        let recorded = unsafe { self.membership_ptr().add(membership.index) };
+        // One copy of the step per level, each with a constant index: the
+        // walk then keeps no index and checks no bound.
+        macro_rules! walk {
+            ($($index:literal)*) => {
+                const { assert!([$($index),*].len() == OVERFLOW_LEVEL) };
+                $(
+                    if let Some(vacancy) = self.first_empty_in_head_level(probe, $index) {
+                        let entry = vacancy.entry.cast::<SlotEntry<K, V>>();
+                        // SAFETY: the vacancy is an EMPTY lane read just
+                        // above, so its entry is writable and holds
+                        // nothing; the caller gives up the pair. The
+                        // caller vouches for the rest.
+                        unsafe {
+                            (&raw mut (*entry).key).copy_from_nonoverlapping(key, 1);
+                            (&raw mut (*entry).value).copy_from_nonoverlapping(value, 1);
+                            self.record_in_head(
+                                head_left, recorded, membership, unit, probe, &vacancy,
+                            );
+                        }
+                        return true;
+                    }
+                )*
+            };
+        }
+        walk!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14);
+        false
+    }
+
+    /// Stores an absent key at `vacancy` and records it in the filter.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::record_in_head`].
     #[allow(clippy::inline_always)]
     #[inline(always)]
     unsafe fn place_in_head(
         &mut self,
         key: K,
         value: V,
+        membership: MembershipSlot,
+        unit: u64,
+        probe: PreparedFastFunnelProbe,
+        vacancy: &HeadVacancy<SlotEntry<K, V>>,
+    ) {
+        let head_left = self.head_left;
+        // SAFETY: a vacancy exists only in a table with slots, so its
+        // filter has units and `membership.index` is below their count.
+        let recorded = unsafe { self.membership_ptr().add(membership.index) };
+        // SAFETY: the vacancy is an EMPTY lane of an ordinary bucket, and
+        // the caller vouches for the rest.
+        unsafe {
+            vacancy
+                .entry
+                .write(MaybeUninit::new(SlotEntry { key, value }));
+            self.record_in_head(head_left, recorded, membership, unit, probe, vacancy);
+        }
+    }
+
+    /// Makes the entry just written at `vacancy` a live one: records its key
+    /// in the filter, counts it, and writes its control.
+    ///
+    /// # Safety
+    ///
+    /// `unit` must be the filter unit of `membership`, itself from
+    /// [`Self::membership_slot`], `recorded` that unit's address, `head_left`
+    /// the table's, and `vacancy` from [`Self::first_empty_in_head_level`]
+    /// or [`Self::search_head`], with no write to the table since any of
+    /// them was read but the entry's own.
+    ///
+    /// Every table word the placement needs comes as an argument, read
+    /// before the entry's store, which could otherwise force each to be
+    /// loaded again.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    unsafe fn record_in_head(
+        &mut self,
+        head_left: usize,
+        recorded: *mut u64,
         membership: MembershipSlot,
         unit: u64,
         probe: PreparedFastFunnelProbe,
@@ -2466,29 +2549,18 @@ where
             assert_eq!(vacancy.level_bit, self.level_bit(slot));
             // SAFETY: a vacancy is a slot of the storage.
             assert_eq!(vacancy.entry.cast(), unsafe { self.storage.slot_ptr(slot) });
+            // SAFETY: a vacancy's control is readable.
+            assert_eq!(unsafe { *vacancy.lane }, CTRL_EMPTY);
         }
-        // Every table word this insert needs is read before its first
-        // store, which could otherwise force each to be loaded again:
-        // the length and the filter unit's address here, the unit itself
-        // by the gate.
-        let head_left = self.head_left;
-        // SAFETY: a vacancy exists only in a table with slots, so its
-        // filter has units and `membership.index` is below their count.
-        let recorded = unsafe { self.membership_ptr().add(membership.index) };
-        let key_fingerprint = probe.fingerprint();
-        // SAFETY: the vacancy is an EMPTY lane of an ordinary bucket, whose
-        // entry is written before the occupied control that names it.
-        unsafe {
-            debug_assert_eq!(*vacancy.lane, CTRL_EMPTY);
-            vacancy
-                .entry
-                .write(MaybeUninit::new(SlotEntry { key, value }));
-            *vacancy.lane = key_fingerprint;
-        }
-        // SAFETY: `recorded` is this key's filter unit, as above, and
-        // `&mut self` makes the access exclusive.
+        debug_assert_eq!(head_left, self.head_left);
+        // SAFETY: `recorded` is this key's filter unit, and `&mut self`
+        // makes the access exclusive.
         unsafe { *recorded = unit | unit_of(membership.bits, vacancy.level_bit) };
         self.head_left = head_left - 1;
+        // SAFETY: the vacancy is a lane of the storage. Its control is the
+        // last store: after the entry it names, and where the per-level
+        // copies of this placement share no more than their ends.
+        unsafe { *vacancy.lane = probe.fingerprint() };
     }
 
     /// The whole insert: duplicate search behind the filter gate, growth, then
@@ -3033,10 +3105,12 @@ where
         let unit = unsafe { *self.membership_ptr().add(membership.index) };
         if !unit_records(unit, membership.bits) {
             let probe = self.prf.prepare(hash);
-            if let Some(vacancy) = self.head_vacancy(probe) {
-                // SAFETY: slot, unit and vacancy were read just above, with
-                // no write since.
-                unsafe { self.place_in_head(key, value, membership, unit, probe, &vacancy) };
+            // SAFETY: slot and unit were read just above, with no write
+            // since.
+            if unsafe { self.place_through_head(&key, &value, membership, unit, probe) } {
+                // The table took both.
+                mem::forget(key);
+                mem::forget(value);
                 return None;
             }
         }
