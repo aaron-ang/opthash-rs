@@ -194,6 +194,39 @@ mod sse2 {
         // SAFETY: caller guarantees 16 readable bytes.
         BitMask(u64::from(unsafe { occupied_bits(ptr) }))
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE, OCCUPIED_BIT};
+
+        /// One slot bit per lane of a group.
+        const ALL_LANES: u64 = 0xFFFF;
+
+        #[test]
+        fn free_lanes_are_the_free_lanes_among_the_asked_ones() {
+            for low in (0..=u8::MAX).step_by(if cfg!(miri) { 15 } else { 1 }) {
+                for high in [CTRL_EMPTY, CTRL_TOMBSTONE, 0x7f, OCCUPIED_BIT, u8::MAX] {
+                    for lane in 0..15 {
+                        let mut controls = [OCCUPIED_BIT | 0x2a; 16];
+                        controls[lane] = low;
+                        controls[lane + 1] = high;
+                        let free = controls
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, control)| *control & OCCUPIED_BIT == 0)
+                            .fold(0_u64, |free, (lane, _)| free | 1 << lane);
+                        for lanes in [ALL_LANES, ALL_LANES >> 6, 1 << lane, 0] {
+                            // SAFETY: `controls` holds exactly one 16-byte
+                            // group.
+                            let cut = unsafe { free_lanes_group(controls.as_ptr(), lanes) }.0;
+                            assert_eq!(cut, free & lanes, "{controls:02x?} lanes={lanes:#x}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Portable SWAR-8 fallback control scan: 8 control bytes packed into one
@@ -361,6 +394,19 @@ mod swar {
             for fp in OCCUPIED_BIT..=u8::MAX {
                 assert_eq!(occupied_mask(word([fp; 8])), HI, "fp {fp:#04x}");
                 assert_eq!(free_mask(word([fp; 8])), 0, "fp {fp:#04x}");
+            }
+        }
+
+        #[test]
+        fn free_lanes_are_the_free_lanes_among_the_asked_ones() {
+            const ALL_LANES: u64 = HI;
+            for bytes in sample_words() {
+                let free = ref_occupied(bytes) ^ HI;
+                for lanes in [ALL_LANES, ALL_LANES >> 16, 0x80 << 24, 0] {
+                    // SAFETY: `bytes` holds exactly one 8-byte group.
+                    let cut = unsafe { free_lanes_group(bytes.as_ptr(), lanes) }.0;
+                    assert_eq!(cut, free & lanes, "{bytes:02x?} lanes={lanes:#x}");
+                }
             }
         }
 
