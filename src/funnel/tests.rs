@@ -1120,6 +1120,7 @@ fn assert_head_addresses_storage<K, V, S>(table: &FunnelTable<K, V, S>) {
         assert_eq!(head.ctrl, derived.ctrl, "entry {index}");
         assert_eq!(head.data, derived.data, "entry {index}");
     }
+    assert_eq!(table.head_lanes, table.shape.head_lanes());
 }
 
 /// Every path that gives a table another storage gives it that storage's

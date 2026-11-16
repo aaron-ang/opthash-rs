@@ -13,6 +13,7 @@ mod neon {
     use core::arch::aarch64;
 
     use super::BitMask;
+    use crate::raw::control::OCCUPIED_BIT;
 
     /// Collapses an 8-lane compare into its `BitMask` bit pattern.
     #[inline]
@@ -43,6 +44,20 @@ mod neon {
         }
     }
 
+    /// The slot bits of `lanes` whose control is free. Read as one word, so
+    /// a caller that only tests and locates the lowest free lane keeps the
+    /// group out of the vector registers.
+    #[inline]
+    #[must_use]
+    pub(crate) unsafe fn free_lanes_group(ptr: *const u8, lanes: u64) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`;
+        // a byte array has no alignment to meet.
+        let word = u64::from_le_bytes(unsafe { ptr.cast::<[u8; 8]>().read() });
+        // `OCCUPIED_BIT` is the top bit of each lane; the shift brings it to
+        // the lane's slot bit.
+        BitMask(lanes & !(word >> OCCUPIED_BIT.trailing_zeros()))
+    }
+
     /// Bitmask of occupied slots; padding and tombstones are excluded.
     #[inline]
     #[must_use]
@@ -57,7 +72,32 @@ mod neon {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE, OCCUPIED_BIT};
+        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
+
+        /// One slot bit per lane of a group.
+        const ALL_LANES: u64 = 0x0101_0101_0101_0101;
+
+        #[test]
+        fn free_lanes_are_the_free_mask_cut_to_the_asked_lanes() {
+            // Every pair of control bytes, in every pair of adjacent lanes,
+            // so a lane's answer is seen not to leak into its neighbour.
+            for low in 0..=u8::MAX {
+                for high in [CTRL_EMPTY, CTRL_TOMBSTONE, 0x7f, OCCUPIED_BIT, u8::MAX] {
+                    for lane in 0..7 {
+                        let mut controls = [OCCUPIED_BIT | 0x2a; 8];
+                        controls[lane] = low;
+                        controls[lane + 1] = high;
+                        // SAFETY: `controls` holds exactly one 8-byte group.
+                        let free = unsafe { free_mask_group(controls.as_ptr()) }.0;
+                        for lanes in [ALL_LANES, ALL_LANES >> 16, 1 << (8 * lane), 0] {
+                            // SAFETY: as above.
+                            let cut = unsafe { free_lanes_group(controls.as_ptr(), lanes) }.0;
+                            assert_eq!(cut, free & lanes, "{controls:02x?} lanes={lanes:#x}");
+                        }
+                    }
+                }
+            }
+        }
 
         #[test]
         fn eight_lane_masks_preserve_control_order() {
@@ -139,6 +179,14 @@ mod sse2 {
         BitMask(u64::from(unsafe { occupied_bits(ptr) } ^ 0xFFFF))
     }
 
+    /// The slot bits of `lanes` whose control is free.
+    #[inline]
+    #[must_use]
+    pub(crate) unsafe fn free_lanes_group(ptr: *const u8, lanes: u64) -> BitMask {
+        // SAFETY: caller guarantees 16 readable bytes.
+        BitMask(unsafe { free_mask_group(ptr) }.0 & lanes)
+    }
+
     /// Bitmask of occupied slots; padding and tombstones are excluded.
     #[inline]
     #[must_use]
@@ -205,6 +253,14 @@ mod swar {
     pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
         // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         BitMask(free_mask(unsafe { word(ptr) }))
+    }
+
+    /// The slot bits of `lanes` whose control is free.
+    #[inline]
+    #[must_use]
+    pub(crate) unsafe fn free_lanes_group(ptr: *const u8, lanes: u64) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
+        BitMask(free_mask(unsafe { word(ptr) }) & lanes)
     }
 
     /// Bitmask of occupied slots; padding and tombstones are excluded.
@@ -339,4 +395,4 @@ use sse2 as backend;
 #[cfg(opthash_scalar_group)]
 use swar as backend;
 
-pub(crate) use backend::{eq_mask_group, free_mask_group, occupied_mask_group};
+pub(crate) use backend::{eq_mask_group, free_lanes_group, free_mask_group, occupied_mask_group};

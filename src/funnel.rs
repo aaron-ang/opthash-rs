@@ -209,6 +209,17 @@ impl FunnelShape {
         self.n != 0 && self.beta <= GROUP_SIZE
     }
 
+    /// The slot bits of a group mask that are lanes of a head bucket, the
+    /// rest being its padding. None in a shape without a head.
+    fn head_lanes(&self) -> u64 {
+        if !self.has_head() {
+            return 0;
+        }
+        (0..self.beta).fold(0, |lanes, lane| {
+            lanes | 1 << (lane * BITMASK_STRIDE as usize + BITMASK_SLOT_BIT as usize)
+        })
+    }
+
     /// Entries a table without tombstones may place through its head.
     fn head_insertions(&self) -> usize {
         if self.has_head() {
@@ -1088,8 +1099,10 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// from it before probing; see [`crate::membership`].
     membership: FilterTail,
     exceptional_placement: bool,
-    /// The entry count plus [`Self::head_left`]; see [`Self::entries`].
-    entries_base: usize,
+    /// The lanes of a group that are slots of a head bucket; see
+    /// [`FunnelShape::head_lanes`]. Next to [`Self::head_left`], which the
+    /// head placement reads with it.
+    head_lanes: u64,
     /// Inserts the head placement may still make: the insertion limit less
     /// the entry count in a table without tombstones, zero with any. Kept by
     /// [`Self::set_entries`], so that placement tests and counts with one
@@ -1099,6 +1112,8 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// their addresses in [`Self::storage`]; see [`head_levels`]. Replaced
     /// with the storage it points into.
     head: [HeadLevel<SlotEntry<K, V>>; HEAD_ENTRIES],
+    /// The entry count plus [`Self::head_left`]; see [`Self::entries`].
+    entries_base: usize,
     shape: FunnelShape,
     hash_builder: S,
     reserve_fraction: ReserveFraction,
@@ -1261,6 +1276,7 @@ where
             head,
             entries_base: shape.head_insertions(),
             head_left: shape.head_insertions(),
+            head_lanes: shape.head_lanes(),
             shape,
             storage,
             tombstones: 0,
@@ -1918,11 +1934,14 @@ where
     ) -> Option<HeadVacancy<SlotEntry<K, V>>> {
         let level = &self.head[index];
         let bucket = probe::ordinary_funnel_bucket(probe, level.multiplier, level.buckets);
-        // SAFETY: an ordinary bucket ends at or before `slots`, and the control
-        // array pads one group past them, which is the bucket an absent head
-        // entry draws. Neither that group nor a bucket's padding lanes are
-        // EMPTY, so every EMPTY control of the group is a lane of a bucket.
-        let empty = unsafe { simd::eq_mask_group(level.group(bucket).cast(), CTRL_EMPTY) }.0;
+        // The placement runs in a table without tombstones, so a free lane
+        // of the bucket is an EMPTY one. Every head entry it walks is a
+        // level: a shape with a head has more levels than the walk.
+        debug_assert!(self.tombstones == 0 && index < self.shape.levels.len());
+        // SAFETY: an ordinary bucket is one group, which ends at or before
+        // `slots`.
+        let empty =
+            unsafe { simd::free_lanes_group(level.group(bucket).cast(), self.head_lanes) }.0;
         (empty != 0).then(|| {
             let lane = (empty.trailing_zeros() / BITMASK_STRIDE) as usize;
             HeadVacancy {
@@ -2800,6 +2819,7 @@ where
         mem::swap(&mut self.shape, &mut other.shape);
         mem::swap(&mut self.storage, &mut other.storage);
         mem::swap(&mut self.head, &mut other.head);
+        self.head_lanes = self.shape.head_lanes();
         // The deletes this generation has yet to count are its own.
         self.settle_counts();
         let entries = mem::replace(&mut other.len, self.entries());
