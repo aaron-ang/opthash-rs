@@ -1110,6 +1110,103 @@ fn head_table(
     FunnelTable::try_from_shape(shape, reserve, IdentityBuildHasher, Global).unwrap()
 }
 
+/// The head is the one [`head_levels`] derives from the table's own shape
+/// and storage.
+fn assert_head_addresses_storage<K, V, S>(table: &FunnelTable<K, V, S>) {
+    let derived = head_levels(&table.shape, &table.storage);
+    for (index, (head, derived)) in table.head.iter().zip(&derived).enumerate() {
+        assert_eq!(head.multiplier, derived.multiplier, "entry {index}");
+        assert_eq!(head.buckets, derived.buckets, "entry {index}");
+        assert_eq!(head.ctrl, derived.ctrl, "entry {index}");
+        assert_eq!(head.data, derived.data, "entry {index}");
+    }
+}
+
+/// Every path that gives a table another storage gives it that storage's
+/// head: growth, shrinking, the empty shape, and a clone. A clear keeps
+/// both. Lookups, inserts and removals read and write through the head after
+/// each.
+#[test]
+fn head_follows_its_storage_through_every_replacement() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let reserve = ReserveFraction::from_exponent(3).unwrap();
+    let key_of = |index: u64| index.wrapping_mul(SPREAD);
+    let check = |table: &mut FunnelTable<u64, u64, IdentityBuildHasher>, live: u64| {
+        assert_head_addresses_storage(table);
+        assert_eq!(table.entries() as u64, live);
+        for index in 0..live {
+            let key = key_of(index);
+            let found = table.find_entry_ref(&key, key).map(|entry| entry.value);
+            assert_eq!(found, Some(index), "index {index}");
+        }
+        // Through the head and back out, where the table has room.
+        if table.shape.max_insertions as u64 > live {
+            let key = key_of(live);
+            assert_eq!(map::TableBackend::insert(table, key, live, key), None);
+            assert_eq!(
+                map::TableBackend::remove_key(table, &key, key),
+                Some((key, live))
+            );
+        }
+        assert_eq!(
+            map::TableBackend::remove_key(table, &key_of(live), key_of(live)),
+            None
+        );
+    };
+
+    let mut table = raw_table(144, 3);
+    check(&mut table, 0);
+    let live = 40;
+    for index in 0..live {
+        let key = key_of(index);
+        assert_eq!(map::TableBackend::insert(&mut table, key, index, key), None);
+    }
+    check(&mut table, live);
+
+    let grown = FunnelShape::for_insert_budget(256, reserve).unwrap();
+    map::TableBackend::try_resize(&mut table, grown.n).unwrap();
+    assert_eq!(table.shape.n, grown.n);
+    check(&mut table, live);
+
+    map::TableBackend::shrink_to(&mut table, 0);
+    assert!(table.shape.n < grown.n);
+    check(&mut table, live);
+
+    let mut cloned = map::TableBackend::clone_table(&table);
+    assert_ne!(cloned.storage.ctrl_ptr(), table.storage.ctrl_ptr());
+    check(&mut cloned, live);
+    drop(table);
+    check(&mut cloned, live);
+
+    map::TableBackend::clear(&mut cloned);
+    check(&mut cloned, 0);
+
+    map::TableBackend::shrink_to(&mut cloned, 0);
+    assert_eq!(cloned.shape.n, 0);
+    assert_head_addresses_storage(&cloned);
+    assert_eq!(
+        cloned
+            .find_entry_ref(&key_of(1), key_of(1))
+            .map(|entry| entry.value),
+        None
+    );
+    assert_eq!(
+        map::TableBackend::remove_key(&mut cloned, &key_of(1), key_of(1)),
+        None
+    );
+
+    // Out of the empty shape again, through the insert's own growth.
+    for index in 0..live {
+        let key = key_of(index);
+        assert_eq!(
+            map::TableBackend::insert(&mut cloned, key, index, key),
+            None
+        );
+        assert_head_addresses_storage(&cloned);
+    }
+    check(&mut cloned, live);
+}
+
 /// An empty shape and one with buckets wider than a group keep an all-absent
 /// head, which no insert walks and which matches nothing in a first-match
 /// scan. Any other shape addresses its levels from the head. An entry that
@@ -1982,6 +2079,7 @@ fn panicking_hasher_during_resize_keeps_every_entry() {
     assert_eq!(table.shape.n, 144);
     assert_eq!(table.entries(), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_head_addresses_storage(&table);
     assert_eq!(
         table.entries(),
         (0..table.shape.slots)

@@ -2206,7 +2206,7 @@ where
     /// storage's.
     #[inline]
     fn slot_of(&self, lane: NonNull<u8>) -> usize {
-        lane.as_ptr() as usize - self.storage.ctrl_ptr() as usize
+        lane.as_ptr().addr() - self.storage.ctrl_ptr().addr()
     }
 
     /// Out of line so a filter-rejected miss pays for no probe preparation.
