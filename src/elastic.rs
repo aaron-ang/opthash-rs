@@ -396,6 +396,10 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     /// paths load it rather than build it.
     fold_multiplier: u64,
     probe_schedule: ProbeSchedule,
+    /// The level a settled insert searches after `settled_level`, with its
+    /// own settled budget, or null where the plan has no such level. Set
+    /// and read as `settled_level` is.
+    settled_fallback: *mut Level<SlotEntry<K, V>>,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
     /// First word of the metadata tail, so the gate's address needs one load;
@@ -441,8 +445,8 @@ const _: () = {
 // SAFETY: the table uniquely owns its arena and every entry in it, like
 // `Box<[SlotEntry<K, V>]>`. Its raw pointers address that arena, except:
 // `ProbeSchedule::direct`, which addresses the routes the schedule owns;
-// `settled_level`, which addresses one of the table's own levels and is
-// read only through an exclusive borrow of the table;
+// `settled_level` and `settled_fallback`, which address the table's own
+// levels and are read only through an exclusive borrow of the table;
 // the schedule's sentinel route and, in a table without a metadata tail,
 // `metadata_words`, which address the immutable statics `SENTINEL_CONTROL`
 // and `NO_METADATA` and are only read; and the schedule's entry origin,
@@ -858,6 +862,11 @@ struct SettledPlan {
     level: usize,
     /// Probes of `level` to search, none past its scheduled ones. Not zero.
     budget: u16,
+    /// Probes of the level after `level` to search when those find no free
+    /// slot, none past its scheduled ones and not zero: `Some` where the
+    /// insertion case falls back to that level and `budget` is the whole of
+    /// the case's own, so the search of `level` it ends is the case's.
+    fallback: Option<u16>,
     /// Exclusive bound on the placed count of the inserts the plan holds
     /// for, while each of them is a settled one.
     end: usize,
@@ -1449,6 +1458,7 @@ where
             scheduled_levels: 0,
             probe_schedule,
             settled_level: ptr::null_mut(),
+            settled_fallback: ptr::null_mut(),
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
         })
@@ -1643,7 +1653,11 @@ where
     ) -> (usize, usize) {
         if self.scheduler.settles(self.placed) || self.reopen_settled() {
             // SAFETY: the gate is open.
-            if let Some(found) = unsafe { self.settled_level_slot(prepared.route.probe) } {
+            let found = unsafe {
+                self.settled_level_slot(prepared.route.probe)
+                    .or_else(|| self.settled_fallback_slot(prepared.route.probe))
+            };
+            if let Some(found) = found {
                 // SAFETY: the settled search returns one of this table's levels.
                 let level = unsafe { found.level.offset_from_unsigned(self.levels.as_ptr()) };
                 let slot = found.slot;
@@ -1665,17 +1679,23 @@ where
     #[cfg(test)]
     fn settled_slot(&self, probe: PreparedElasticProbe) -> Option<(usize, usize, u8)> {
         let plan = self.settled_plan()?;
-        let level = &self.levels[plan.level];
-        // SAFETY: a plan's level is one of a table that settles, whose
-        // levels reduce by shift.
-        let found = unsafe {
-            first_settled_vacancy(
-                probe.sequence(self.fold_multiplier),
-                ptr::from_ref(level).cast_mut(),
-                settled_word(level.summary_bit(), plan.budget),
-            )
-        }?;
-        Some((plan.level, found.slot, found.control))
+        let searches = [
+            Some((plan.level, plan.budget)),
+            plan.fallback.map(|budget| (plan.level + 1, budget)),
+        ];
+        searches.into_iter().flatten().find_map(|(index, budget)| {
+            let level = &self.levels[index];
+            // SAFETY: a plan's levels are those of a table that settles,
+            // whose levels reduce by shift.
+            let found = unsafe {
+                first_settled_vacancy(
+                    probe.sequence(self.fold_multiplier),
+                    ptr::from_ref(level).cast_mut(),
+                    settled_word(level.summary_bit(), budget),
+                )
+            }?;
+            Some((index, found.slot, found.control))
+        })
     }
 
     /// The plan the settled gate opens on, when the cached batch covers the
@@ -1683,16 +1703,18 @@ where
     /// insertion case for the batch has a scheduled probe to search.
     ///
     /// The case and its budget follow the fill of the batch's levels, which
-    /// a settled insert raises in the plan's level alone. The plan ends
+    /// a settled insert raises in one of the plan's levels. The plan ends
     /// where that fill changes either: where the level a budgeted case
-    /// searches comes down to half its reserve, or to a free fraction with
-    /// another budget.
+    /// searches comes down to half its reserve or to a free fraction with
+    /// another budget, or where the level it falls back to comes down to a
+    /// quarter free. Counting every insert against both levels ends it no
+    /// later.
     fn settled_plan(&self) -> Option<SettledPlan> {
         let end = self
             .scheduler
             .reopened_end(self.placed, self.stale_membership())?;
         let target = self.scheduler.cached_target();
-        let (case, budget) = self.settled_case(target)?;
+        let (case, budget, fallback) = self.settled_case(target)?;
         let holds_for = match target {
             // The level a case searches without a bound stays the case's
             // while the other level of its pair keeps its fill.
@@ -1728,48 +1750,106 @@ where
             }
             _ => u32::MAX,
         };
+        let holds_for = if fallback.is_some() {
+            let next = &self.levels[case.level + 1];
+            // Not a quarter free or less, the case's test of this level.
+            holds_for.min(next.capacity - next.len() - next.capacity / 4)
+        } else {
+            holds_for
+        };
         let end = end.min(self.placed.saturating_add(holds_for as usize));
         (self.placed < end).then_some(SettledPlan {
             level: case.level,
             budget,
+            fallback,
             end,
         })
     }
 
     /// The paper's insertion case for `target` with the budget a settled
-    /// search gives it, the case's own within the level's scheduled probes:
-    /// `None` for a table whose levels do not reduce by shift, and where no
-    /// probe is left to search.
+    /// search gives it, the case's own within the level's scheduled probes,
+    /// and [`SettledPlan::fallback`]: `None` for a table whose levels do
+    /// not reduce by shift, and where no probe is left to search.
     #[inline]
-    fn settled_case(&self, target: BatchTarget) -> Option<(PlacementCase<'_, K, V>, u16)> {
-        let case = self.placement_case(target, |region, budget| {
-            let scheduled = u64::from(region.scheduled_probes);
-            budget.map_or(scheduled, |budget| budget.min(scheduled))
-        })?;
+    fn settled_case(
+        &self,
+        target: BatchTarget,
+    ) -> Option<(PlacementCase<'_, K, V>, u16, Option<u16>)> {
+        let case = self.placement_case(target, |_, budget| budget.unwrap_or(u64::MAX))?;
         if case.region.index_shift() == GENERAL_REDUCTION {
             return None;
         }
-        let budget = u16::try_from(case.budget).expect("scheduled probes fit u16");
-        (budget != 0).then_some((case, budget))
+        let budget = case.region.scheduled_probes;
+        let budget = u16::try_from(case.budget).map_or(budget, |own| own.min(budget));
+        if budget == 0 {
+            return None;
+        }
+        let fallback = case.fallback.and_then(|next| {
+            // What the general search gives the case's level.
+            let own = case.budget.min(*LEVEL_PROBE_LIMIT.get(case.level)?);
+            let scheduled = self.levels.get(next)?.scheduled_probes;
+            (u64::from(budget) == own && scheduled != 0).then_some(scheduled)
+        });
+        Some((case, budget, fallback))
+    }
+
+    /// What an open gate holds of a plan with these searches: each level
+    /// and its [`settled_word`], the fallback's null and zero without one.
+    fn plan_words(
+        &self,
+        level: usize,
+        budget: u16,
+        fallback: Option<u16>,
+    ) -> [(*const Level<SlotEntry<K, V>>, u32); 2] {
+        let words = |index: usize, budget| {
+            let level = &self.levels[index];
+            (
+                ptr::from_ref(level),
+                settled_word(level.summary_bit(), budget),
+            )
+        };
+        [
+            words(level, budget),
+            fallback.map_or((ptr::null(), 0), |budget| words(level + 1, budget)),
+        ]
+    }
+
+    /// [`Self::plan_words`] of the plan the gate last opened on.
+    ///
+    /// # Safety
+    ///
+    /// The gate opened since the levels were last replaced.
+    unsafe fn open_words(&self) -> [(*const Level<SlotEntry<K, V>>, u32); 2] {
+        let (level, fallback) = (self.settled_level, self.settled_fallback);
+        // SAFETY: the caller's contract: the gate's levels are levels.
+        unsafe {
+            [
+                (level.cast_const(), (*level).search.settled),
+                if fallback.is_null() {
+                    (ptr::null(), 0)
+                } else {
+                    (fallback.cast_const(), (*fallback).search.settled)
+                },
+            ]
+        }
     }
 
     /// Reopens the gate a general insert closed, which stood open to `end`
     /// before it: on the plan it stood open on while the insertion case
-    /// still names that plan's level and budget, and on a fresh plan
+    /// still names that plan's levels and budgets, and on a fresh plan
     /// otherwise.
     ///
-    /// The insert raised the placed count and one level's fill by one. Where
-    /// that level is the plan's, the plan's bound has counted it; elsewhere
-    /// the bound ends the plan an insert early.
+    /// The insert raised the placed count and one level's fill by one, which
+    /// the plan's bound counts against each of its levels.
     fn keep_settled(&mut self, end: usize) {
         let removed = self.stale_membership();
         if self.placed < end && self.scheduler.covers(self.placed - removed) {
             let kept = self
                 .settled_case(self.scheduler.cached_target())
-                .is_some_and(|(case, budget)| {
-                    ptr::eq(case.region, self.settled_level)
-                        && case.region.search.settled
-                            == settled_word(case.region.summary_bit(), budget)
+                .is_some_and(|(case, budget, fallback)| {
+                    // SAFETY: the gate stood open before the insert, which
+                    // took `place_new_entry` and so kept the levels.
+                    self.plan_words(case.level, budget, fallback) == unsafe { self.open_words() }
                 });
             if kept {
                 self.scheduler.settled_end = end;
@@ -1787,9 +1867,23 @@ where
         let Some(plan) = self.settled_plan() else {
             return false;
         };
-        let level = &mut self.levels[plan.level];
-        level.search.settled = settled_word(level.summary_bit(), plan.budget);
-        self.settled_level = ptr::from_mut(level);
+        let [(level, word), (fallback, fallback_word)] =
+            self.plan_words(plan.level, plan.budget, plan.fallback);
+        let levels = self.levels.as_mut_ptr();
+        self.settled_level = levels.with_addr(level.addr());
+        self.settled_fallback = if fallback.is_null() {
+            ptr::null_mut()
+        } else {
+            levels.with_addr(fallback.addr())
+        };
+        // SAFETY: the plan's levels are levels of this table, which
+        // `&mut self` borrows alone.
+        unsafe {
+            (*self.settled_level).search.settled = word;
+            if !fallback.is_null() {
+                (*self.settled_fallback).search.settled = fallback_word;
+            }
+        }
         self.scheduler.settled_end = plan.end;
         true
     }
@@ -1807,14 +1901,10 @@ where
     unsafe fn settled_level_slot(&self, probe: PreparedElasticProbe) -> Option<SettledSlot<K, V>> {
         debug_assert!(self.scheduler.settles(self.placed));
         debug_assert_eq!(
-            self.settled_plan().map(|plan| (
-                ptr::from_ref(&self.levels[plan.level]),
-                settled_word(self.levels[plan.level].summary_bit(), plan.budget)
-            )),
-            // SAFETY: the gate is open, so the settled level is a level.
-            Some((self.settled_level.cast_const(), unsafe {
-                (*self.settled_level).search.settled
-            })),
+            self.settled_plan()
+                .map(|plan| self.plan_words(plan.level, plan.budget, plan.fallback)),
+            // SAFETY: the gate is open.
+            Some(unsafe { self.open_words() }),
             "the open gate's plan is the table's"
         );
         debug_assert!(self.membership.words != 0);
@@ -1826,12 +1916,33 @@ where
         unsafe { core::hint::assert_unchecked(self.membership.words != 0) };
         let sequence = probe.sequence(self.fold_multiplier);
         let level = self.settled_level;
-        // SAFETY: the gate is open, so `settled_level` is the level of the
-        // plan it opened on, with that plan's countdown: every path that
-        // replaces the levels, changes a level's fill other than by a
-        // settled insert, or changes a level's scheduled probes closes the
-        // gate. A plan's level reduces by shift.
+        // SAFETY: the gate is open, so `settled_level` and a
+        // `settled_fallback` that is not null are the levels of the plan it
+        // opened on, with that plan's countdowns: every path that replaces
+        // the levels, changes a level's fill other than by a settled
+        // insert, or changes a level's scheduled probes closes the gate. A
+        // plan's levels reduce by shift.
         unsafe { first_settled_vacancy(sequence, level, (*level).search.settled) }
+    }
+
+    /// The first free slot `probe` reaches in the settled plan's fallback
+    /// level, for a key [`Self::settled_level_slot`] found no slot for;
+    /// `None` without such a level too.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::settled_level_slot`].
+    unsafe fn settled_fallback_slot(
+        &self,
+        probe: PreparedElasticProbe,
+    ) -> Option<SettledSlot<K, V>> {
+        let fallback = self.settled_fallback;
+        if fallback.is_null() {
+            return None;
+        }
+        let sequence = probe.sequence(self.fold_multiplier);
+        // SAFETY: as in `settled_level_slot`.
+        unsafe { first_settled_vacancy(sequence, fallback, (*fallback).search.settled) }
     }
 
     fn insert_for_vacant_entry_prepared(
@@ -1899,16 +2010,29 @@ where
         None
     }
 
-    /// [`map::TableBackend::insert`] of an absent key whose settled search
-    /// found no slot.
+    /// [`map::TableBackend::insert`] of an absent key the open gate's
+    /// [`Self::settled_level_slot`] found no slot for: into the plan's
+    /// fallback level, or else the general insert.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::settled_level_slot`].
     #[inline(never)]
-    fn insert_unsettled(
+    unsafe fn insert_unsettled(
         &mut self,
         key: K,
         value: V,
         prepared: PreparedElasticKey,
         key_fingerprint: u8,
     ) {
+        // SAFETY: the caller's contract.
+        if let Some(found) = unsafe { self.settled_fallback_slot(prepared.route.probe) } {
+            let lane = self.route_filter(prepared).membership;
+            // SAFETY: the settled search returns one of this table's levels
+            // with its words, and a free slot of it with its control byte.
+            unsafe { self.write_new_entry_at(key, value, prepared, key_fingerprint, found, lane) };
+            return;
+        }
         self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
     }
 
@@ -2336,7 +2460,8 @@ where
             if self.scheduler.settles(self.placed) {
                 // SAFETY: the gate is open.
                 let Some(found) = (unsafe { self.settled_level_slot(prepared.route.probe) }) else {
-                    self.insert_unsettled(key, value, prepared, key_fingerprint);
+                    // SAFETY: the gate is open.
+                    unsafe { self.insert_unsettled(key, value, prepared, key_fingerprint) };
                     return None;
                 };
                 // SAFETY: the settled search returns one of this table's
@@ -2566,6 +2691,7 @@ where
             scheduled_levels: self.scheduled_levels,
             probe_schedule,
             settled_level: ptr::null_mut(),
+            settled_fallback: ptr::null_mut(),
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
         };

@@ -3390,3 +3390,93 @@ fn settled_plan_places_every_key_where_the_general_insert_does() {
         }
     }
 }
+
+#[test]
+fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
+    const BLOCK: usize = 64;
+    type Table = ElasticTable<u64, u64, FixedHashBuilder>;
+
+    let build = || {
+        Table::try_with_slots_and_reserve_fraction_and_hasher_in(
+            1 << 12,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap()
+    };
+    let (mut settled, mut general) = (build(), build());
+    let hash_of = |key: u64| fixed_hasher().hash_one(key);
+    let insert = |settled: &mut Table, general: &mut Table, key: u64| {
+        let hash = hash_of(key);
+        assert_eq!(settled.insert(key, key, hash), None);
+        general.insert_for_vacant_entry_prepared(
+            key,
+            key,
+            PreparedElasticKey::new(hash),
+            control::control_fingerprint_low(hash),
+        );
+        assert_eq!(settled.find(&key, hash), general.find(&key, hash));
+    };
+    // What the pair's current level has free above half its reserve.
+    let room = |table: &Table| table.levels[1].free_slots() - table.levels[1].half_reserve as usize;
+    let fallback_low =
+        |table: &Table| table.levels[2].free_slots() * 4 <= table.levels[2].capacity();
+
+    // Far enough into the second pair of levels that its current level's
+    // budget turns keys away.
+    let mut next_key = 0_u64;
+    while settled.scheduler.target_at(settled.live()) != BatchTarget::LevelPair(1)
+        || room(&settled) > 8
+    {
+        insert(&mut settled, &mut general, next_key);
+        next_key += 1;
+    }
+    assert!(!fallback_low(&settled));
+
+    // Blocks of keys leave and as many arrive, so the batch never ends, and
+    // they leave the current level only while it is near half its reserve,
+    // so it stays as full while the keys it turns away fill the level after
+    // it. The gate stays open through a block's arrivals.
+    let mut live_keys: Vec<u64> = (0..next_key).collect();
+    let mut fell_back = 0;
+    let mut blocks_past_low = 0;
+    while blocks_past_low < 8 {
+        assert!(live_keys.len() < 1 << 16, "the fallback level never filled");
+        blocks_past_low += usize::from(fallback_low(&settled));
+        let mut left = 0;
+        live_keys.retain(|&key| {
+            let hash = hash_of(key);
+            let from = usize::from(room(&settled) < 8 + BLOCK);
+            let leaves = left < BLOCK
+                && settled
+                    .find(&key, hash)
+                    .is_some_and(|(level, _)| level == from);
+            if leaves {
+                assert_eq!(settled.take(&key, hash), general.take(&key, hash));
+                left += 1;
+            }
+            !leaves
+        });
+        assert_ne!(left, 0);
+        for _ in 0..left {
+            let before = settled.levels[2].len();
+            let through_fallback =
+                settled.scheduler.settles(settled.placed) && !settled.settled_fallback.is_null();
+            insert(&mut settled, &mut general, next_key);
+            fell_back += usize::from(through_fallback && settled.levels[2].len() > before);
+            live_keys.push(next_key);
+            next_key += 1;
+        }
+        assert_eq!(
+            settled.scheduler.target_at(settled.live()),
+            BatchTarget::LevelPair(1)
+        );
+    }
+    assert!(fell_back > 16, "{fell_back} keys fell back");
+
+    for key in 0..next_key {
+        let hash = hash_of(key);
+        assert_eq!(settled.find(&key, hash), general.find(&key, hash));
+    }
+}
