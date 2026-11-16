@@ -597,8 +597,8 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
 /// The random word of an ordinary level is the folded key times that level's
 /// multiplier, not a counter word: `key_out` already folds every bit of the
 /// key, and a distinct odd multiplier per level decorrelates the levels with
-/// one multiply. The multipliers are successive powers of one constant. The key whose folded word is zero draws bucket zero in
-/// every level.
+/// one multiply. The multipliers are successive powers of one constant. The
+/// key whose folded word is zero draws bucket zero in every level.
 #[inline]
 pub(crate) fn ordinary_funnel_bucket(
     probe: PreparedFastFunnelProbe,
