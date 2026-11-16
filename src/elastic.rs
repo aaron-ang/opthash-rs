@@ -25,8 +25,10 @@ use crate::raw::iter::OccupiedIndices;
 use crate::raw::prefetch;
 use crate::raw::rebuild::{self, Rebuildable};
 
+mod live_count;
 mod schedule;
 
+use live_count::{LiveCount, Uncounted};
 use schedule::{PhiRoute, ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
@@ -287,7 +289,7 @@ const fn settled_summary_bit(settled: u32) -> SummaryBin {
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct LevelCounters {
-    len: u32,
+    len: LiveCount,
     tombstones: u32,
 }
 
@@ -295,7 +297,7 @@ impl LevelCounters {
     /// Counts one live entry turned into a tombstone.
     #[inline]
     fn remove_one(&mut self) {
-        self.len -= 1;
+        self.len.remove_one();
         self.tombstones += 1;
     }
 }
@@ -401,12 +403,6 @@ impl<T> Level<T> {
         unsafe { &mut *level_counters(self.ctrl_ptr) }
     }
 
-    /// Live entries.
-    #[inline]
-    fn len(&self) -> u32 {
-        self.counters().len
-    }
-
     #[inline]
     fn tombstones(&self) -> u32 {
         self.counters().tombstones
@@ -425,17 +421,17 @@ impl<T> Level<T> {
         settled_summary_bit(self.search.settled)
     }
 
-    /// Slots minus live entries (includes tombstones, reusable on insert).
+    /// Slots minus the `live` entries (includes tombstones, reusable on insert).
     #[inline]
-    fn free_slots(&self) -> usize {
-        (self.capacity - self.len()) as usize
+    fn free_slots(&self, live: u32) -> usize {
+        (self.capacity - live) as usize
     }
 
-    /// Case 2's test on the active pair's current level: at most half its
-    /// reserve is left, so new keys go to the next level.
+    /// Case 2's test on the active pair's current level, which holds `live`
+    /// entries: at most half its reserve is left, so new keys go to the next level.
     #[inline]
-    fn low(&self) -> bool {
-        self.capacity - self.len() <= self.half_reserve
+    fn low(&self, live: u32) -> bool {
+        self.capacity - live <= self.half_reserve
     }
 
     /// Tombstones exceed [`capacity::tombstone_cleanup_threshold`], so the
@@ -528,6 +524,8 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     /// one a placement of this epoch chose. A deeper level holds no entry, so
     /// lookups have nothing to visit there.
     scheduled_levels: u32,
+    /// The settled inserts `settled_level`'s stored live count lacks.
+    uncounted: Uncounted,
     hash_builder: S,
     alloc: A,
 }
@@ -1671,6 +1669,7 @@ where
             epoch: EpochState::initial(),
             probe_high_water: empty_high_water(settled_limit),
             scheduled_levels: 0,
+            uncounted: Uncounted::default(),
             probe_schedule,
             settled_level: ptr::null_mut(),
             settled_fallback: ptr::null_mut(),
@@ -1771,7 +1770,9 @@ where
     /// Starts the delete countdown over at the same live count. The placed
     /// count moves with it, so the settled gate closes.
     fn rearm_deletes(&mut self) {
+        self.count_settled();
         self.placed = self.live();
+        self.uncounted = Uncounted::none_at(self.placed);
         self.scheduler
             .rearm(membership::refresh_deletes(self.max_insertions));
     }
@@ -1780,6 +1781,27 @@ where
     #[inline]
     fn live(&self) -> usize {
         self.placed - self.stale_membership()
+    }
+
+    /// Live entries of `level`, one of this table's.
+    #[inline]
+    fn live_in(&self, level: &Level<SlotEntry<K, V>>) -> u32 {
+        let settled = ptr::eq(level, self.settled_level);
+        self.uncounted
+            .live(self.placed, level.counters().len, settled)
+    }
+
+    /// Moves the settled inserts into `settled_level`'s stored live count,
+    /// ahead of a change to the placed count or to the settled level that
+    /// is not a settled insert.
+    fn count_settled(&mut self) {
+        if self.uncounted.pending(self.placed) != 0 {
+            // SAFETY: an insert goes uncounted only into the settled level
+            // of an open gate, which `reopen_settled` set to one of the
+            // levels, and the levels are replaced only after this call.
+            let counters = unsafe { (*self.settled_level).counters_mut() };
+            self.uncounted.count_into(self.placed, &mut counters.len);
+        }
     }
 
     fn copy_membership_from(&mut self, source: &Self) {
@@ -1795,9 +1817,11 @@ where
     }
 
     fn clear(&mut self) {
+        self.count_settled();
         for level in &mut self.levels {
             level.drain_reset(|entry| {
                 self.placed -= 1;
+                self.uncounted.uncover_one();
                 // Before the drop: one that panics leaves the table live
                 // with this count.
                 self.scheduler.close();
@@ -1854,7 +1878,7 @@ where
                 // SAFETY: the settled search returns a free slot of that
                 // level with the level's words.
                 unsafe {
-                    self.write_new_entry_at(key, value, key_fingerprint, found, read);
+                    self.write_new_entry_at::<false>(key, value, key_fingerprint, found, read);
                 }
                 return (level, slot);
             }
@@ -1909,7 +1933,7 @@ where
             // while the other level of its pair keeps its fill.
             BatchTarget::LevelPair(current) if case.level == current => {
                 let region = case.region;
-                let free = region.capacity - region.len();
+                let free = region.capacity - self.live_in(region);
                 let paper_budget = |free: u32| {
                     probe::elastic_level_probe_budget(
                         free,
@@ -1942,7 +1966,7 @@ where
         let holds_for = if fallback.is_some() {
             let next = &self.levels[case.level + 1];
             // Not a quarter free or less, the case's test of this level.
-            holds_for.min(next.capacity - next.len() - next.capacity / 4)
+            holds_for.min(next.capacity - self.live_in(next) - next.capacity / 4)
         } else {
             holds_for
         };
@@ -2058,6 +2082,7 @@ where
         };
         let [(_, word), (_, fallback_word)] =
             self.plan_words(plan.level, plan.budget, plan.fallback);
+        self.count_settled();
         self.levels[plan.level].search.settled = word;
         self.settled_level = self.levels.level_ptr(plan.level);
         self.settled_fallback = if plan.fallback.is_some() {
@@ -2213,7 +2238,7 @@ where
             let read = self.route_filter(prepared).read;
             // SAFETY: the settled search returns one of this table's levels
             // with its words, and a free slot of it with its control byte.
-            unsafe { self.write_new_entry_at(key, value, key_fingerprint, found, read) };
+            unsafe { self.write_new_entry_at::<false>(key, value, key_fingerprint, found, read) };
             return;
         }
         self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
@@ -2342,7 +2367,7 @@ where
             }
         };
         // SAFETY: callers pass a free slot of the level they found it in.
-        unsafe { self.write_new_entry_at(key, value, key_fingerprint, found, read) };
+        unsafe { self.write_new_entry_at::<false>(key, value, key_fingerprint, found, read) };
         // Not a settled insert: it may change the fill or the scheduled
         // probes the settled plan was made for.
         self.scheduler.close();
@@ -2358,9 +2383,12 @@ where
     /// pointer, with that level's pointers and summary bit, a free slot of
     /// it and the slot's control byte. `read` is the key's, as
     /// [`Self::route_filter`] reads it now.
+    ///
+    /// `SETTLED` leaves the insert out of the level's stored live count,
+    /// for a slot of `settled_level` alone.
     #[allow(clippy::needless_pass_by_value)]
     #[inline]
-    unsafe fn write_new_entry_at(
+    unsafe fn write_new_entry_at<const SETTLED: bool>(
         &mut self,
         key: K,
         value: V,
@@ -2388,7 +2416,10 @@ where
             data.add(slot)
                 .write(MaybeUninit::new(SlotEntry { key, value }));
             control_bytes.add(slot).write(key_fingerprint);
-            (*level_counters(control_bytes)).len += 1;
+            if !SETTLED {
+                self.uncounted
+                    .count_one(&mut (*level_counters(control_bytes)).len);
+            }
         }
         self.placed += 1;
         // A free slot that is not empty is a tombstone, which differs from
@@ -2649,7 +2680,7 @@ where
                 // levels with its words, and a free slot of it with its
                 // control byte.
                 unsafe {
-                    self.write_new_entry_at(key, value, key_fingerprint, found, read);
+                    self.write_new_entry_at::<true>(key, value, key_fingerprint, found, read);
                 }
                 return None;
             }
@@ -2818,6 +2849,7 @@ where
             *level.counters_mut() = LevelCounters::default();
         }
         self.placed = self.stale_membership();
+        self.uncounted = Uncounted::none_at(self.placed);
         self.reset_after_clear();
     }
 
@@ -2865,14 +2897,28 @@ where
             epoch: self.epoch,
             probe_high_water: self.probe_high_water,
             scheduled_levels: self.scheduled_levels,
+            uncounted: self.uncounted,
             probe_schedule,
             settled_level: ptr::null_mut(),
             settled_fallback: ptr::null_mut(),
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
         };
-        // The copied gate is open on the source's settled level.
+        // The copied gate is open on the source's settled level, whose
+        // uncounted inserts the copy counts.
         cloned.scheduler.close();
+        if self.uncounted.pending(self.placed) != 0 {
+            // SAFETY: an uncounted insert went into the settled level, one
+            // of the levels, and the copy has the same levels.
+            let settled = unsafe {
+                self.settled_level
+                    .offset_from_unsigned(self.levels.as_ptr())
+            };
+            cloned.uncounted.count_into(
+                cloned.placed,
+                &mut cloned.levels[settled].counters_mut().len,
+            );
+        }
         cloned.copy_membership_from(self);
         cloned
     }
@@ -3005,6 +3051,7 @@ where
             ElasticGeneration {
                 levels,
                 placed: 0,
+                uncounted: Uncounted::default(),
                 total_slots: geometry.total_slots,
                 max_insertions: geometry.max_insertions,
                 scheduler: BatchScheduler::new(
@@ -3059,7 +3106,11 @@ where
         probe: PreparedElasticProbe,
         target: BatchTarget,
     ) -> Option<ExactPlacement> {
-        let has_room = |level: usize| self.levels.get(level).is_some_and(|l| l.free_slots() > 0);
+        let has_room = |level: usize| {
+            self.levels
+                .get(level)
+                .is_some_and(|l| l.free_slots(self.live_in(l)) > 0)
+        };
         let pairs = self.levels.len().saturating_sub(1);
         core::iter::once(BatchTarget::Bootstrap)
             .chain((0..pairs).map(BatchTarget::LevelPair))
@@ -3108,8 +3159,8 @@ where
                 let [current_level, next_level] = self.levels.get(current..=next)? else {
                     return None;
                 };
-                let free_next = next_level.free_slots();
-                let current_low = current_level.low();
+                let free_next = next_level.free_slots(self.live_in(next_level));
+                let current_low = current_level.low(self.live_in(current_level));
                 let next_low = free_next.saturating_mul(4) <= next_level.capacity();
 
                 if current_low {
@@ -3129,7 +3180,7 @@ where
                 } else {
                     // Not low, so the level has a free slot.
                     let budget = probe::elastic_level_probe_budget(
-                        current_level.capacity - current_level.len(),
+                        current_level.capacity - self.live_in(current_level),
                         current_level.capacity,
                         self.reserve_fraction.exponent(),
                         ELASTIC_PROBE_BUDGET_C,
@@ -3699,6 +3750,7 @@ where
 pub(crate) struct ElasticGeneration<K, V> {
     levels: LevelSlice<K, V>,
     placed: usize,
+    uncounted: Uncounted,
     total_slots: usize,
     max_insertions: usize,
     scheduler: BatchScheduler,
@@ -3723,8 +3775,10 @@ where
     type Generation = ElasticGeneration<K, V>;
 
     fn swap_generation(&mut self, other: &mut ElasticGeneration<K, V>) {
+        self.count_settled();
         mem::swap(&mut self.levels, &mut other.levels);
         mem::swap(&mut self.placed, &mut other.placed);
+        mem::swap(&mut self.uncounted, &mut other.uncounted);
         mem::swap(&mut self.total_slots, &mut other.total_slots);
         mem::swap(&mut self.max_insertions, &mut other.max_insertions);
         mem::swap(&mut self.scheduler, &mut other.scheduler);
@@ -3767,7 +3821,7 @@ where
                 let Some(current_level) = self.levels.get(current) else {
                     return;
                 };
-                if current_level.low() {
+                if current_level.low(self.live_in(current_level)) {
                     current + 1
                 } else {
                     current

@@ -145,7 +145,7 @@ impl ExactTrace {
                 table
                     .levels
                     .iter()
-                    .map(|level| level.len() as usize)
+                    .map(|level| table.live_in(level) as usize)
                     .collect::<Vec<_>>(),
                 scalar.level_occupancy()
             );
@@ -189,7 +189,7 @@ impl ExactTrace {
             self.table
                 .levels
                 .iter()
-                .map(|level| level.len() as usize)
+                .map(|level| self.table.live_in(level) as usize)
                 .collect::<Vec<_>>(),
             self.scalar.level_occupancy()
         );
@@ -216,7 +216,7 @@ fn elastic_placement_matches_the_scalar_model_with_the_current_level_low() {
                 identity += 1;
             }
             let level = &trace.table.levels[current];
-            let free = level.capacity() - level.len() as usize;
+            let free = level.capacity() - trace.table.live_in(level) as usize;
             let threshold = level.half_reserve as usize;
             // Only a threshold of two or more tells itself from its half.
             if free != threshold || threshold < 2 {
@@ -655,7 +655,7 @@ fn clear_tombstones_each_slot_before_dropping_its_value() {
         .sum::<usize>();
     assert_eq!(map.len(), live_controls);
     assert!(map.table().levels.iter().all(|level| {
-        level.len() as usize
+        map.table().live_in(level) as usize
             == (0..level.capacity())
                 .filter(|&slot| control::is_occupied(level.checked_control(slot)))
                 .count()
@@ -758,7 +758,7 @@ fn caught_hash_panic_during_try_resize_keeps_every_entry() {
         .sum::<usize>();
     assert_eq!(map.len(), live_controls);
     assert!(map.table().levels.iter().all(|level| {
-        level.len() as usize
+        map.table().live_in(level) as usize
             == (0..level.capacity())
                 .filter(|&slot| control::is_occupied(level.checked_control(slot)))
                 .count()
@@ -820,7 +820,7 @@ fn level_counters_sit_ahead_of_their_control_bytes_without_overlap() {
                 // SAFETY: the slot is in bounds.
                 .filter(|&slot| control::is_occupied(unsafe { level.control_at(slot) }))
                 .count();
-            assert_eq!(level.len() as usize, occupied);
+            assert_eq!(table.live_in(level) as usize, occupied);
             assert_eq!(level.tombstones(), 0);
         }
         for key in 0..capacity as u64 {
@@ -1178,7 +1178,7 @@ fn route_summary_conservatively_records_every_live_level() {
         map.table()
             .levels
             .iter()
-            .filter(|level| level.len() != 0)
+            .filter(|level| map.table().live_in(level) != 0)
             .count()
             > 1,
         "route summary must cover more than one occupied level"
@@ -1458,7 +1458,8 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
                             fingerprint,
                         );
                     }
-                    table.levels[level].counters_mut().len += 1;
+                    let counters = table.levels[level].counters_mut();
+                    table.uncounted.count_one(&mut counters.len);
                     table.placed += 1;
                     *next_key += 1;
                 }
@@ -1524,7 +1525,11 @@ fn direct_lookup_returns_the_compared_slot_reference() {
         );
     let mut insertion_count = 0;
     while insertion_count < table.max_insertions
-        && !table.levels.iter().skip(1).any(|level| level.len() > 0)
+        && !table
+            .levels
+            .iter()
+            .skip(1)
+            .any(|level| table.live_in(level) > 0)
     {
         let key = insertion_count;
         table.place_unique(
@@ -1537,7 +1542,11 @@ fn direct_lookup_returns_the_compared_slot_reference() {
         insertion_count += 1;
     }
     assert!(
-        table.levels.iter().skip(1).any(|level| level.len() > 0),
+        table
+            .levels
+            .iter()
+            .skip(1)
+            .any(|level| table.live_in(level) > 0),
         "test must exercise lookup beyond level 0"
     );
 
@@ -1741,7 +1750,7 @@ fn inserts_spill_to_deeper_levels_at_high_load() {
             .levels
             .iter()
             .skip(1)
-            .any(|level| level.len() > 0),
+            .any(|level| map.table().live_in(level) > 0),
         "expected the exact batch schedule to populate a deeper level"
     );
     for i in 0..max {
@@ -1761,7 +1770,12 @@ fn removing_every_entry_empties_every_level() {
         map.remove(&i);
     }
     assert_eq!(map.len(), 0);
-    assert!(map.table().levels.iter().all(|level| level.len() == 0));
+    assert!(
+        map.table()
+            .levels
+            .iter()
+            .all(|level| map.table().live_in(level) == 0)
+    );
 }
 
 #[test]
@@ -1786,7 +1800,7 @@ fn drop_continues_past_a_panicking_value() {
         .levels
         .iter()
         .skip(1)
-        .any(|level| level.len() > 0)
+        .any(|level| map.table().live_in(level) > 0)
     {
         map.insert(inserted, PanicOnFirstDrop(drops.clone()));
         inserted += 1;
@@ -1887,7 +1901,8 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
     for slot in fill_order {
         if slot == unreachable_slot
             || !control::is_free(table.levels[LEVEL].checked_control(slot))
-            || table.levels[LEVEL].free_slots() == level_slots / 16
+            || table.levels[LEVEL].free_slots(table.live_in(&table.levels[LEVEL]))
+                == level_slots / 16
         {
             continue;
         }
@@ -1902,7 +1917,8 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
                 control::OCCUPIED_BIT,
             );
         }
-        table.levels[LEVEL].counters_mut().len += 1;
+        let counters = table.levels[LEVEL].counters_mut();
+        table.uncounted.count_one(&mut counters.len);
         table.placed += 1;
         next_key += 1;
     }
@@ -2031,12 +2047,12 @@ fn first_entry_in_a_deeper_level_reschedules_through_that_level() {
         let deepest = table
             .levels
             .iter()
-            .rposition(|level| level.len() > 0)
+            .rposition(|level| table.live_in(level) > 0)
             .unwrap();
         assert!(deepest < table.scheduled_levels as usize);
         if table.scheduled_levels != scheduled_levels {
             assert_eq!(table.scheduled_levels as usize, deepest + 1);
-            assert_eq!(table.levels[deepest].len(), 1);
+            assert_eq!(table.live_in(&table.levels[deepest]), 1);
             scheduled_levels = table.scheduled_levels;
             reschedules += 1;
         }
@@ -2746,6 +2762,12 @@ fn the_fold_multiplier_as_a_hash_stays_findable_and_unflagged() {
     }
 }
 
+/// Free slots of the table's level `level`.
+fn free_in<K: Eq + Hash, V, S: BuildHasher>(table: &ElasticTable<K, V, S>, level: usize) -> usize {
+    let level = &table.levels[level];
+    level.free_slots(table.live_in(level))
+}
+
 /// Each level's counters against its control bytes, the table's live count
 /// against the levels', and every stored route summary's sentinel bit.
 fn assert_counters_match_controls(table: &ElasticTable<u64, u64, FixedHashBuilder>) {
@@ -2758,7 +2780,7 @@ fn assert_counters_match_controls(table: &ElasticTable<u64, u64, FixedHashBuilde
             occupied += usize::from(!control::is_free(control));
             tombstones += usize::from(control == crate::raw::control::CTRL_TOMBSTONE);
         }
-        assert_eq!(level.len() as usize, occupied);
+        assert_eq!(table.live_in(level) as usize, occupied);
         assert_eq!(level.tombstones() as usize, tombstones);
         live += occupied;
     }
@@ -3063,7 +3085,7 @@ fn take_agrees_with_find_then_remove() {
 
         assert_eq!(fused.epoch_snapshot(), split.epoch_snapshot());
         for (taken, removed) in fused.levels.iter().zip(&split.levels) {
-            assert_eq!(taken.len(), removed.len());
+            assert_eq!(fused.live_in(taken), split.live_in(removed));
             assert_eq!(taken.tombstones(), removed.tombstones());
         }
         for key in 0..universe {
@@ -3123,7 +3145,7 @@ fn reusing_a_tombstone_past_the_threshold_starts_a_cleanup_inside_the_batch() {
     }
     let threshold = {
         let level = &map.table().levels[0];
-        assert_eq!(u64::from(level.len()), live);
+        assert_eq!(u64::from(map.table().live_in(level)), live);
         capacity::tombstone_cleanup_threshold(level.capacity()) as u64
     };
     let departed = threshold + 4;
@@ -3413,7 +3435,7 @@ fn settled_plan_places_every_key_where_the_general_insert_does() {
 
         assert_eq!(settled.epoch_snapshot(), general.epoch_snapshot());
         for (ours, theirs) in settled.levels.iter().zip(&general.levels) {
-            assert_eq!(ours.len(), theirs.len());
+            assert_eq!(settled.live_in(ours), general.live_in(theirs));
             assert_eq!(ours.tombstones(), theirs.tombstones());
             assert_eq!(ours.scheduled_probes, theirs.scheduled_probes);
         }
@@ -3426,6 +3448,111 @@ fn settled_plan_places_every_key_where_the_general_insert_does() {
             );
         }
     }
+}
+
+/// Settled inserts count late into their level; the general insert counts
+/// at once. Twin tables through the same inserts, removals, clears and
+/// growth, one by each insert, read the same at every step: each level's
+/// live count, which is also the count of its occupied control bytes, the
+/// capacity, the epoch and every key's slot. So do copies taken while
+/// inserts stand uncounted.
+#[test]
+fn late_counted_settled_inserts_read_as_counted_at_once() {
+    const STEPS: u64 = if cfg!(miri) { 1_200 } else { 120_000 };
+    type Table = ElasticTable<u64, u64, FixedHashBuilder>;
+    let build = || {
+        Table::try_with_slots_and_reserve_fraction_and_hasher_in(
+            64,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap()
+    };
+    let (mut late, mut eager) = (build(), build());
+    let mut model = alloc::collections::BTreeMap::<u64, u64>::new();
+    let mut state = 0x853c_49e6_748f_ea9b_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let uncounted = |table: &Table| table.uncounted.pending(table.placed);
+    let (mut removed_under, mut cleared_under, mut copied_under) = (0_u32, 0_u32, 0_u32);
+    let (mut grown, mut most_uncounted) = (0_u32, 0_u32);
+    for step in 0..STEPS {
+        let roll = next() % 1_000;
+        // Past the capacity in the first half, so the tables grow; within
+        // it in the second, so removals and reuse meet a full table.
+        let key_space = if step < STEPS / 2 {
+            late.max_insertions as u64 * 2
+        } else {
+            late.max_insertions as u64
+        };
+        let key = next() % key_space;
+        let hash = late.hash_builder.hash_one(key);
+        let slots = late.total_slots;
+        if roll < 600 {
+            let previous = model.insert(key, step);
+            assert_eq!(late.insert(key, step, hash), previous);
+            if let Some(location) = eager.find(&key, hash) {
+                assert_eq!(Some(eager.replace_value(location, step)), previous);
+            } else {
+                eager.insert_for_vacant_entry_prepared(
+                    key,
+                    step,
+                    PreparedElasticRoute::new(hash),
+                    control::control_fingerprint_low(hash),
+                );
+            }
+        } else if roll < 990 {
+            removed_under += u32::from(uncounted(&late) != 0 && model.contains_key(&key));
+            let removed = model.remove(&key);
+            assert_eq!(late.take(&key, hash).map(|(_, value)| value), removed);
+            assert_eq!(eager.take(&key, hash).map(|(_, value)| value), removed);
+        } else if roll < 992 {
+            cleared_under += u32::from(uncounted(&late) != 0);
+            model.clear();
+            late.clear();
+            eager.clear();
+        } else {
+            copied_under += u32::from(uncounted(&late) != 0);
+            let copy = late.clone_table();
+            assert_eq!(uncounted(&copy), 0);
+            assert_counters_match_controls(&copy);
+            assert_eq!(copy.epoch_snapshot(), late.epoch_snapshot());
+        }
+        assert_eq!(uncounted(&eager), 0);
+        most_uncounted = most_uncounted.max(uncounted(&late));
+        grown += u32::from(late.total_slots > slots);
+        assert_eq!(late.live(), model.len());
+        assert_eq!(late.total_slots, eager.total_slots);
+        assert_eq!(late.epoch_snapshot(), eager.epoch_snapshot());
+        assert_eq!(late.find(&key, hash), eager.find(&key, hash));
+        for (ours, theirs) in late.levels.iter().zip(&eager.levels) {
+            assert_eq!(late.live_in(ours), eager.live_in(theirs));
+            assert_eq!(ours.tombstones(), theirs.tombstones());
+        }
+        if step % 64 == 0 || step + 1 == STEPS {
+            assert_counters_match_controls(&late);
+            for (&key, &value) in &model {
+                let hash = late.hash_builder.hash_one(key);
+                let found = late.find(&key, hash);
+                assert_eq!(found, eager.find(&key, hash));
+                assert_eq!(
+                    late.find_entry(&key, hash).map(|entry| entry.value),
+                    Some(value)
+                );
+            }
+        }
+    }
+    assert!(
+        most_uncounted > 1,
+        "no run of settled inserts stood uncounted"
+    );
+    assert!(removed_under > 0 && cleared_under > 0 && copied_under > 0);
+    assert!(grown > 1, "the tables grew {grown} times");
 }
 
 #[test]
@@ -3459,9 +3586,8 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
         assert_gate_past_an_insert(general);
     };
     // What the pair's current level has free above half its reserve.
-    let room = |table: &Table| table.levels[1].free_slots() - table.levels[1].half_reserve as usize;
-    let fallback_low =
-        |table: &Table| table.levels[2].free_slots() * 4 <= table.levels[2].capacity();
+    let room = |table: &Table| free_in(table, 1) - table.levels[1].half_reserve as usize;
+    let fallback_low = |table: &Table| free_in(table, 2) * 4 <= table.levels[2].capacity();
 
     // Far enough into the second pair of levels that its current level's
     // budget turns keys away.
@@ -3500,11 +3626,12 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
         });
         assert_ne!(left, 0);
         for _ in 0..left {
-            let before = settled.levels[2].len();
+            let before = settled.live_in(&settled.levels[2]);
             let through_fallback =
                 settled.scheduler.settles(settled.placed) && !settled.settled_fallback.is_null();
             insert(&mut settled, &mut general, next_key);
-            fell_back += usize::from(through_fallback && settled.levels[2].len() > before);
+            fell_back +=
+                usize::from(through_fallback && settled.live_in(&settled.levels[2]) > before);
             live_keys.push(next_key);
             next_key += 1;
         }
@@ -3555,12 +3682,8 @@ fn settled_fallback_bound_holds_where_its_level_recrosses_a_quarter_free() {
     };
     // What the pair's current level has free above half its reserve, and
     // the level after it above a quarter of its slots.
-    let room = |table: &Table| table.levels[1].free_slots() - table.levels[1].half_reserve as usize;
-    let margin = |table: &Table| {
-        table.levels[2]
-            .free_slots()
-            .saturating_sub(table.levels[2].capacity() / 4)
-    };
+    let room = |table: &Table| free_in(table, 1) - table.levels[1].half_reserve as usize;
+    let margin = |table: &Table| free_in(table, 2).saturating_sub(table.levels[2].capacity() / 4);
 
     let mut next_key = 0_u64;
     while settled.scheduler.target_at(settled.live()) != BatchTarget::LevelPair(1)
