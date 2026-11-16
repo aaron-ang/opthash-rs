@@ -21,7 +21,7 @@ use crate::exact::probe::{
     PreparedProbeRange,
 };
 use crate::hasher::DefaultHashBuilder;
-use crate::membership::{self, MembershipKey, MembershipRegion};
+use crate::membership::{self, MembershipRegion};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::bitmask::{BITMASK_SLOT_BIT, BITMASK_STRIDE};
 use crate::raw::config::GROUP_SIZE;
@@ -2055,7 +2055,7 @@ where
             return false;
         }
         let bits = membership_bit(key_hash);
-        let word = MembershipKey::word(key_hash, words);
+        let word = membership::word(key_hash, words);
         // SAFETY: `word` is a multiply-high reduction below `words`, and the
         // arena's tail holds exactly that many zero-initialized words.
         unsafe { unit_records(*self.membership_ptr().add(word), bits) }
@@ -2067,7 +2067,7 @@ where
     #[inline]
     fn membership_slot(&self, key_hash: u64) -> MembershipSlot {
         MembershipSlot {
-            index: MembershipKey::word(key_hash, self.membership.region.words),
+            index: membership::word(key_hash, self.membership.region.words),
             bits: membership_bit(key_hash),
         }
     }

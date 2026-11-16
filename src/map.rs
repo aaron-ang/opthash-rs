@@ -440,6 +440,10 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     pub(crate) fn table(&self) -> &P {
         &self.table
     }
+
+    pub(crate) fn table_mut(&mut self) -> &mut P {
+        &mut self.table
+    }
 }
 
 impl<K, V, P> HashMap<K, V, P>

@@ -17,7 +17,7 @@ use crate::exact::probe::{self, CounterPrf, PreparedElasticProbe};
 use crate::hasher::DefaultHashBuilder;
 use crate::macros;
 use crate::map;
-use crate::membership::{self, MembershipKey, MembershipRegion, MetadataWord};
+use crate::membership::{self, MembershipRegion};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
 use crate::raw::config::INITIAL_CAPACITY;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
@@ -25,8 +25,10 @@ use crate::raw::iter::OccupiedIndices;
 use crate::raw::prefetch;
 use crate::raw::rebuild::{self, Rebuildable};
 
+mod live_count;
 mod schedule;
 
+use live_count::{LiveCount, Uncounted};
 use schedule::{PhiRoute, ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
@@ -74,17 +76,118 @@ const fn empty_high_water(settled_limit: usize) -> u32 {
 const QUERY_PROBE_LIMIT: usize = 384;
 /// Largest table: slot positions and schedule bounds are stored as `u32`.
 const MAX_ELASTIC_SLOTS: u64 = 1 << u32::BITS;
-/// Levels a key's route summary tracks, one `u16` bit each above the
-/// sentinel's; the last bit stands for every deeper level.
-const ROUTE_SUMMARY_LEVELS: usize = u16::BITS as usize - 1;
+/// A route summary: the levels the keys of one bin of a metadata word
+/// occupy, as [`ElasticRouteFilter::summary`] reads it.
+type SummaryBin = u8;
+/// Bins a metadata word splits its keys over, by their
+/// [`MetadataPlace::summary_bin`]. A bin's summary opens a level for every
+/// key of the bin, so the fewer keys share one, the fewer levels a walk
+/// visits for nothing.
+const SUMMARY_BINS: usize = 8;
+const _: () = assert!(SUMMARY_BINS.is_power_of_two());
+/// Levels a key's route summary tracks, one bit each above the sentinel's;
+/// the last bit stands for every deeper level.
+const ROUTE_SUMMARY_LEVELS: usize = SummaryBin::BITS as usize - 1;
+
+/// One word of the metadata tail: the route summaries of its bins, then the
+/// membership lane. `repr(C)` keeps the lane in the second machine word.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TailWord {
+    level_bins: [SummaryBin; SUMMARY_BINS],
+    membership: u64,
+}
 /// A stored route summary no level has recorded a key in: every level's bit
 /// set, the sentinel's clear.
-const NO_LEVELS_OCCUPIED: u16 = !1;
+const NO_LEVELS_OCCUPIED: SummaryBin = !1;
 /// Bits each key sets in its membership-filter word. A lookup whose bits are
-/// not all set skips the probe walk, since the key cannot be present. A false
-/// positive walks every level's full schedule, so a third bit rejects enough
-/// extra misses to outweigh its cost.
-const MEMBERSHIP_BITS: usize = 3;
+/// not all set skips the probe walk, since the key cannot be present. Every
+/// operation builds and tests the bits, the ones the filter passes too, so a
+/// further bit costs each of them and saves only the walks of the absent
+/// keys it newly rejects.
+const MEMBERSHIP_BITS: usize = 1;
+/// Logical slots one metadata word covers. Fewer slots a word leave the
+/// filter sparser, so it passes fewer absent keys, and leave each summary
+/// fewer keys, so a walk skips more levels; the metadata tail grows in
+/// proportion.
+const FILTER_SLOTS_PER_WORD: usize = 5;
+
+/// Bits of a [`MetadataPlace`] that pick one bit of a membership lane.
+const LANE_BIT_INDEX_BITS: u32 = u64::BITS.trailing_zeros();
+/// Bits of a [`MetadataPlace`] below its word index: one lane bit index for
+/// each membership bit.
+#[allow(clippy::cast_possible_truncation)]
+const PLACE_FRACTION_BITS: u32 = LANE_BIT_INDEX_BITS * MEMBERSHIP_BITS as u32;
+// A tail has no more words than the largest table has slots, so
+// `MetadataPlace::scale` shifts no word count out: the scale of a tail
+// with a word is not zero.
+const _: () = assert!(MAX_ELASTIC_SLOTS.leading_zeros() >= PLACE_FRACTION_BITS);
+const _: () = assert!(MEMBERSHIP_BITS >= 1 && SUMMARY_BINS <= u64::BITS as usize);
+
+/// A key's place in the metadata tail: its word, its membership bits there
+/// and its summary bin, all from one multiply-high reduction of the
+/// signature. The reduction reads the signature from its top down, so the
+/// place shares no signature bit with the control fingerprint, which is the
+/// low end, until the tail is wide enough to need them all.
+///
+/// The word index is the reduction's top; the bits below it, the fraction
+/// the word index rounds away, hold one lane bit index for each membership
+/// bit; and the summary bin is the top of that fraction.
+#[derive(Clone, Copy)]
+struct MetadataPlace {
+    reduction: u64,
+}
+
+impl MetadataPlace {
+    /// The multiplier [`Self::new`] takes for a tail of `words` words. A
+    /// reduction is below its scale, so every place of the scale has its
+    /// word in the tail. No table's word count shifts out, so only an
+    /// empty tail has a zero scale.
+    #[inline]
+    const fn scale(words: usize) -> u64 {
+        (words as u64) << PLACE_FRACTION_BITS
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline]
+    const fn new(signature: u64, scale: u64) -> Self {
+        Self {
+            reduction: ((signature as u128 * scale as u128) >> u64::BITS) as u64,
+        }
+    }
+
+    /// Index of the key's word, which is below the word count the scale
+    /// was made from ([`Self::scale`]), so the cast loses nothing.
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline]
+    const fn word(self) -> usize {
+        (self.reduction >> PLACE_FRACTION_BITS) as usize
+    }
+
+    /// The key's membership bits of its word's lane. A one-hot shift takes
+    /// its distance modulo the lane's width, so each bit reads its own field
+    /// of the fraction whatever sits above it.
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline]
+    const fn bits(self) -> u64 {
+        let mut bits = 0;
+        let mut field = 0;
+        while field < PLACE_FRACTION_BITS {
+            bits |= 1_u64.wrapping_shl((self.reduction >> field) as u32);
+            field += LANE_BIT_INDEX_BITS;
+        }
+        bits
+    }
+
+    /// The key's bin of its word's summaries.
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline]
+    const fn summary_bin(self) -> usize {
+        (self.reduction >> (PLACE_FRACTION_BITS - SUMMARY_BINS.trailing_zeros())) as usize
+            & (SUMMARY_BINS - 1)
+    }
+}
+
 /// Counter base of level zero's first probe, the schedule's direct route.
 const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
@@ -166,7 +269,7 @@ struct LevelSearch {
 /// spends the budget borrows, so the search needs no separate count; the
 /// low half keeps the summary bit throughout.
 #[inline]
-const fn settled_word(summary_bit: u16, budget: u16) -> u32 {
+const fn settled_word(summary_bit: SummaryBin, budget: u16) -> u32 {
     debug_assert!(budget != 0);
     summary_bit as u32 | ((budget - 1) as u32) << u16::BITS
 }
@@ -177,8 +280,8 @@ const SETTLED_PROBE: u32 = 1 << u16::BITS;
 /// The summary bit of a [`settled_word`], at any point of its countdown.
 #[allow(clippy::cast_possible_truncation)]
 #[inline]
-const fn settled_summary_bit(settled: u32) -> u16 {
-    settled as u16
+const fn settled_summary_bit(settled: u32) -> SummaryBin {
+    settled as SummaryBin
 }
 
 /// A level's live and tombstone counts, stored in the arena directly ahead of
@@ -187,7 +290,7 @@ const fn settled_summary_bit(settled: u32) -> u16 {
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct LevelCounters {
-    len: u32,
+    len: LiveCount,
     tombstones: u32,
 }
 
@@ -195,7 +298,7 @@ impl LevelCounters {
     /// Counts one live entry turned into a tombstone.
     #[inline]
     fn remove_one(&mut self) {
-        self.len -= 1;
+        self.len.remove_one();
         self.tombstones += 1;
     }
 }
@@ -216,7 +319,7 @@ unsafe fn level_counters(control: *mut u8) -> *mut LevelCounters {
 }
 
 /// A level's bit in a stored route summary.
-const fn summary_bit(level: usize) -> u16 {
+const fn summary_bit(level: usize) -> SummaryBin {
     2 << summary_level(level)
 }
 
@@ -301,12 +404,6 @@ impl<T> Level<T> {
         unsafe { &mut *level_counters(self.ctrl_ptr) }
     }
 
-    /// Live entries.
-    #[inline]
-    fn len(&self) -> u32 {
-        self.counters().len
-    }
-
     #[inline]
     fn tombstones(&self) -> u32 {
         self.counters().tombstones
@@ -321,21 +418,21 @@ impl<T> Level<T> {
     /// [`summary_level`]: clear once the level holds a key of the summary's
     /// bin.
     #[inline]
-    fn summary_bit(&self) -> u16 {
+    fn summary_bit(&self) -> SummaryBin {
         settled_summary_bit(self.search.settled)
     }
 
-    /// Slots minus live entries (includes tombstones, reusable on insert).
+    /// Slots minus the `live` entries (includes tombstones, reusable on insert).
     #[inline]
-    fn free_slots(&self) -> usize {
-        (self.capacity - self.len()) as usize
+    fn free_slots(&self, live: u32) -> usize {
+        (self.capacity - live) as usize
     }
 
-    /// Case 2's test on the active pair's current level: at most half its
-    /// reserve is left, so new keys go to the next level.
+    /// Case 2's test on the active pair's current level, which holds `live`
+    /// entries: at most half its reserve is left, so new keys go to the next level.
     #[inline]
-    fn low(&self) -> bool {
-        self.capacity - self.len() <= self.half_reserve
+    fn low(&self, live: u32) -> bool {
+        self.capacity - live <= self.half_reserve
     }
 
     /// Tombstones exceed [`capacity::tombstone_cleanup_threshold`], so the
@@ -404,9 +501,12 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     settled_fallback: *mut Level<SlotEntry<K, V>>,
     /// Cached location of the metadata tail. See [`MembershipRegion`].
     membership: MembershipRegion,
+    /// [`MetadataPlace::scale`] of the tail's word count, so the gate reads
+    /// its multiplier ready made.
+    metadata_scale: u64,
     /// First word of the metadata tail, so the gate's address needs one load;
     /// [`NO_METADATA`] while `membership` has no words.
-    metadata_words: *mut MetadataWord,
+    metadata_words: *mut TailWord,
     /// Live entries plus the removals the scheduler's countdown has counted,
     /// so a removal moves the countdown alone. [`Self::live`] is the live
     /// count.
@@ -425,6 +525,8 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     /// one a placement of this epoch chose. A deeper level holds no entry, so
     /// lookups have nothing to visit there.
     scheduled_levels: u32,
+    /// The settled inserts `settled_level`'s stored live count lacks.
+    uncounted: Uncounted,
     hash_builder: S,
     alloc: A,
 }
@@ -437,7 +539,7 @@ const _: () = {
             && mem::offset_of!(Table, probe_schedule)
                 == mem::offset_of!(Table, fold_multiplier) + size_of::<u64>()
             && mem::offset_of!(Table, metadata_words)
-                == mem::offset_of!(Table, membership) + size_of::<MembershipRegion>()
+                == mem::offset_of!(Table, metadata_scale) + size_of::<u64>()
             && mem::offset_of!(Table, scheduler) == mem::offset_of!(Table, placed) + word
             && mem::offset_of!(BatchScheduler, settled_end) == 0
             && mem::offset_of!(BatchScheduler, deletes_left) == word
@@ -446,7 +548,8 @@ const _: () = {
 
 // SAFETY: the table uniquely owns its arena and every entry in it, like
 // `Box<[SlotEntry<K, V>]>`. Its raw pointers address that arena, except:
-// `ProbeSchedule::direct`, which addresses the routes the schedule owns;
+// the schedule's walk starts, which address the routes the schedule owns
+// and the table of them it owns;
 // `settled_level` and `settled_fallback`, which address the table's own
 // levels and are read only through an exclusive borrow of the table;
 // the schedule's sentinel route and, in a table without a metadata tail,
@@ -471,7 +574,7 @@ struct SettledSlot<K, V> {
     control_bytes: *mut u8,
     data: *mut MaybeUninit<SlotEntry<K, V>>,
     /// [`Level::summary_bit`] of `level`.
-    summary_bit: u16,
+    summary_bit: SummaryBin,
     slot: usize,
     /// The slot's control byte, sign-extended.
     control: i32,
@@ -715,7 +818,8 @@ fn elastic_arena_layout<K, V>(
         .checked_add(counter_bytes(levels))
         .ok_or(TryReserveError::CapacityOverflow)?;
     let (base_layout, data_base_off) = arena::layout_for_extents::<K, V>(ctrl_bytes, ctrl_bytes)?;
-    let (layout, membership) = MembershipRegion::extend::<MetadataWord>(base_layout, total_slots)?;
+    let (layout, membership) =
+        MembershipRegion::extend::<TailWord>(base_layout, total_slots, FILTER_SLOTS_PER_WORD)?;
     Ok(ElasticArenaLayout {
         layout,
         data_base_off,
@@ -747,37 +851,30 @@ impl PreparedElasticRoute {
     const fn key_hash(self) -> u64 {
         self.signature() ^ ELASTIC_PROBE_SEED
     }
-
-    #[inline]
-    fn summary_bin(self) -> usize {
-        (self.signature() & 3) as usize
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PreparedElasticKey {
-    route: PreparedElasticRoute,
-    membership: MembershipKey,
-}
-
-impl PreparedElasticKey {
-    #[inline]
-    fn new(hash: u64) -> Self {
-        let route = PreparedElasticRoute::new(hash);
-        Self {
-            membership: MembershipKey::from_signature::<MEMBERSHIP_BITS>(route.signature()),
-            route,
-        }
-    }
 }
 
 const _: () = assert!(mem::size_of::<PreparedElasticRoute>() == 8);
-const _: () = assert!(mem::size_of::<PreparedElasticKey>() == 16);
 
 /// Marks the path that reaches it as the unlikely one of its branch.
 #[cold]
 #[inline]
 const fn unlikely_path() {}
+
+/// The entry a walk found, as the two addends of its address: the walk has
+/// both in hand, and a caller that adds them reads neither from the table
+/// again.
+#[derive(Clone, Copy)]
+struct EntryAt {
+    entry_origin: *mut u8,
+    offset: usize,
+}
+
+impl EntryAt {
+    #[inline]
+    fn get<T>(self) -> *mut T {
+        ProbeSchedule::entry_at(self.entry_origin, self.offset)
+    }
+}
 
 /// Outcome of [`ElasticTable::walk_schedule`].
 enum ScheduleSearch<R> {
@@ -788,15 +885,24 @@ enum ScheduleSearch<R> {
     Unresolved,
 }
 
+/// A key's place in a table's metadata tail and its word's membership lane
+/// as [`ElasticTable::route_filter`] read it, for an insert to record over
+/// without reducing the key or reading the word again.
+#[derive(Clone, Copy)]
+struct LaneRead {
+    place: MetadataPlace,
+    lane: u64,
+    /// The place's membership bits, which the filter tested.
+    bits: u64,
+}
+
 /// The metadata word of one prepared key and its membership answer.
 #[derive(Clone, Copy)]
 struct ElasticRouteFilter<'a> {
     /// `false` proves no insert ever recorded this key's route.
     maybe_present: bool,
-    /// The word's membership lane as tested, for an insert to record over
-    /// without reading the word again.
-    membership: u64,
-    word: &'a MetadataWord,
+    read: LaneRead,
+    word: &'a TailWord,
 }
 
 impl ElasticRouteFilter<'_> {
@@ -806,24 +912,23 @@ impl ElasticRouteFilter<'_> {
     /// membership answer, so a lookup that ends before it narrows its levels
     /// does not load them.
     #[inline]
-    fn level_mask(self, route: PreparedElasticRoute) -> u16 {
-        !self.word.level_bins[route.summary_bin()] >> 1
+    fn level_mask(self) -> SummaryBin {
+        !self.word.level_bins[self.read.place.summary_bin()] >> 1
     }
 
-    /// The stored summary as a schedule walk's closed-level set: bit zero,
-    /// the sentinel's, is clear, and bit `i + 1` is set for a level `i` the
-    /// bin never occupied. The stored word keeps unoccupied levels set and
-    /// its last bit is its sign, so sign extension alone gives every deeper
-    /// level its own bit and leaves the sentinel open.
+    /// The stored summary of the bin, which keeps the levels the bin never
+    /// occupied set. A schedule walk starts from it
+    /// ([`ProbeSchedule::walk_start`]) and closes its levels
+    /// ([`schedule::closed_levels`]).
     #[inline]
-    fn closed_levels(self, route: PreparedElasticRoute) -> u64 {
-        i64::from(self.word.level_bins[route.summary_bin()].cast_signed()).cast_unsigned()
+    fn summary(self) -> SummaryBin {
+        self.word.level_bins[self.read.place.summary_bin()]
     }
 
     /// [`Self::level_mask`] widened by [`expand_level_mask`].
     #[inline]
-    fn expanded_level_mask(self, route: PreparedElasticRoute) -> u64 {
-        expand_level_mask(self.level_mask(route))
+    fn expanded_level_mask(self) -> u64 {
+        expand_level_mask(self.level_mask())
     }
 }
 
@@ -831,8 +936,7 @@ impl ElasticRouteFilter<'_> {
 /// for, so a lookup tests `1 << level` directly instead of clamping the
 /// level on each schedule step.
 #[inline]
-const fn expand_level_mask(level_mask: u16) -> u64 {
-    const { assert!(ROUTE_SUMMARY_LEVELS == u16::BITS as usize - 1) };
+const fn expand_level_mask(level_mask: SummaryBin) -> u64 {
     // The last bit moves to the sign, extends, and moves back.
     (((level_mask << 1).cast_signed() as i64) >> 1).cast_unsigned()
 }
@@ -1407,20 +1511,20 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
 
 /// The word a table without a metadata tail reads: it records no key, so
 /// the filter rejects every lookup without testing for the missing tail.
-static NO_METADATA: MetadataWord = MetadataWord {
-    level_bins: [NO_LEVELS_OCCUPIED; 4],
+static NO_METADATA: TailWord = TailWord {
+    level_bins: [NO_LEVELS_OCCUPIED; SUMMARY_BINS],
     membership: 0,
 };
 
-/// [`NO_METADATA`] as the two machine words it occupies: the four equal
+/// [`NO_METADATA`] as the two machine words it occupies: the equal
 /// level bins, then the membership lane.
 const NO_METADATA_WORDS: [u64; 2] = {
     assert!(
-        size_of::<MetadataWord>() == size_of::<[u64; 2]>()
-            && mem::offset_of!(MetadataWord, membership) == size_of::<u64>()
+        size_of::<TailWord>() == size_of::<[u64; 2]>()
+            && mem::offset_of!(TailWord, membership) == size_of::<u64>()
     );
     let bin = NO_LEVELS_OCCUPIED as u64;
-    [bin | bin << 16 | bin << 32 | bin << 48, 0]
+    [bin * 0x0101_0101_0101_0101, 0]
 };
 
 /// Writes [`NO_METADATA`] over every word of `membership`'s tail, as plain
@@ -1432,7 +1536,7 @@ const NO_METADATA_WORDS: [u64; 2] = {
 unsafe fn reset_metadata(membership: MembershipRegion, base: *mut u8) {
     if membership.words != 0 {
         // SAFETY: the caller's arena holds the region's words.
-        let words = unsafe { membership.ptr::<MetadataWord>(base) };
+        let words = unsafe { membership.ptr::<TailWord>(base) };
         // SAFETY: as above, nothing else borrows the words, and a metadata
         // word is two machine words, by the assertion beside the pattern.
         // The tail may be uninitialized, which `MaybeUninit` allows.
@@ -1458,12 +1562,12 @@ unsafe fn reset_metadata(membership: MembershipRegion, base: *mut u8) {
 unsafe fn saturate_metadata(membership: MembershipRegion, base: *mut u8) {
     if membership.words != 0 {
         // SAFETY: the caller's arena holds the region's words.
-        let words = unsafe { membership.ptr::<MetadataWord>(base) };
+        let words = unsafe { membership.ptr::<TailWord>(base) };
         // SAFETY: as above, the words are initialized, and nothing else
         // borrows them.
         let tail = unsafe { core::slice::from_raw_parts_mut(words, membership.words) };
-        tail.fill(MetadataWord {
-            level_bins: [0; 4],
+        tail.fill(TailWord {
+            level_bins: [0; SUMMARY_BINS],
             membership: u64::MAX,
         });
     }
@@ -1484,12 +1588,12 @@ impl<K, V, S, A: Allocator + Clone> Drop for SaturateOnUnwind<'_, K, V, S, A> {
 
 /// First metadata word of `membership`'s tail inside `arena`, or
 /// [`NO_METADATA`] when it has none. Only a tail with words is written to.
-fn metadata_words(arena: &Arena, membership: MembershipRegion) -> *mut MetadataWord {
+fn metadata_words(arena: &Arena, membership: MembershipRegion) -> *mut TailWord {
     if membership.words == 0 {
         return (&raw const NO_METADATA).cast_mut();
     }
     // SAFETY: `membership` was laid out together with `arena`.
-    unsafe { membership.ptr::<MetadataWord>(arena.as_ptr()) }
+    unsafe { membership.ptr::<TailWord>(arena.as_ptr()) }
 }
 
 fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
@@ -1536,9 +1640,7 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let schedule_room = ProbeScheduleRoom::try_with_capacity(
-            PROBE_SCHEDULE_CAPACITY[geometry.level_capacities.len()],
-        )?;
+        let schedule_room = ProbeScheduleRoom::try_for_levels(geometry.level_capacities.len())?;
         let (arena, levels, membership) =
             try_alloc_elastic_arena(&geometry.level_capacities, reserve_fraction, &alloc)?;
 
@@ -1562,11 +1664,13 @@ where
             ),
             hash_builder,
             alloc,
+            metadata_scale: MetadataPlace::scale(membership.words),
             metadata_words: metadata_words(&arena, membership),
             arena,
             epoch: EpochState::initial(),
             probe_high_water: empty_high_water(settled_limit),
             scheduled_levels: 0,
+            uncounted: Uncounted::default(),
             probe_schedule,
             settled_level: ptr::null_mut(),
             settled_fallback: ptr::null_mut(),
@@ -1603,7 +1707,7 @@ where
     }
 
     #[inline]
-    fn membership_ptr(&self) -> *mut MetadataWord {
+    fn membership_ptr(&self) -> *mut TailWord {
         self.metadata_words
     }
 
@@ -1611,74 +1715,48 @@ where
     /// `maybe_present == false` proves the key was never recorded. The
     /// word's summary bins narrow the candidate levels.
     #[inline]
-    fn route_filter(&self, prepared: PreparedElasticKey) -> ElasticRouteFilter<'_> {
-        // Zero words reduce every signature to word zero, which is then
-        // `NO_METADATA`: no bit is set there, so the filter rejects the key.
-        let word = MembershipKey::word(prepared.route.signature(), self.membership.words);
-        let bits = prepared.membership.bits();
-        debug_assert!(bits != 0);
-        // SAFETY: `word` is a multiply-high reduction below the word count,
-        // and the cached region covers exactly that many initialized,
-        // properly aligned `MetadataWord`s; with no words it is zero and
-        // `metadata_words` addresses the one word of `NO_METADATA`.
-        let word = unsafe { &*self.membership_ptr().add(word) };
-        let membership = word.membership;
+    fn route_filter(&self, prepared: PreparedElasticRoute) -> ElasticRouteFilter<'_> {
+        // A zero scale reduces every signature to place zero, whose word is
+        // then `NO_METADATA`: no bit is set there, so the filter rejects
+        // the key.
+        let place = MetadataPlace::new(prepared.signature(), self.metadata_scale);
+        let bits = place.bits();
+        // SAFETY: the place's word is below the word count, and the cached
+        // region covers exactly that many initialized, properly aligned
+        // `TailWord`s; with no words it is zero and `metadata_words`
+        // addresses the one word of `NO_METADATA`.
+        let word = unsafe { &*self.membership_ptr().add(place.word()) };
+        let lane = word.membership;
         ElasticRouteFilter {
-            maybe_present: membership & bits == bits,
-            membership,
+            maybe_present: lane & bits == bits,
+            read: LaneRead { place, lane, bits },
             word,
         }
     }
 
-    #[cfg(test)]
-    #[inline(never)]
-    fn membership_maybe_contains(
-        &self,
-        route: PreparedElasticRoute,
-        membership: MembershipKey,
-    ) -> bool {
-        let words = self.membership.words;
-        if words == 0 {
-            return false;
-        }
-        let word = MembershipKey::word(route.signature(), words);
-        // SAFETY: `word < words`, and the region holds that many initialized words.
-        unsafe {
-            (*self.membership_ptr().add(word)).membership & membership.bits() == membership.bits()
-        }
+    #[inline]
+    fn record_membership(&mut self, route: PreparedElasticRoute, summary_bit: SummaryBin) {
+        let read = self.route_filter(route).read;
+        // SAFETY: the filter read `read` just now.
+        unsafe { self.record_membership_over(summary_bit, read) };
     }
 
+    /// Records a key in `summary_bit`'s level over `read`.
+    ///
+    /// # Safety
+    ///
+    /// `read` is the key's, as [`Self::route_filter`] reads it now.
     #[inline]
-    fn record_membership(
-        &mut self,
-        route: PreparedElasticRoute,
-        membership: MembershipKey,
-        summary_bit: u16,
-    ) {
-        let lane = self
-            .route_filter(PreparedElasticKey { route, membership })
-            .membership;
-        self.record_membership_over(route, membership, summary_bit, lane);
-    }
-
-    /// [`Self::record_membership`] over `lane`, the membership lane of the
-    /// key's word as [`Self::route_filter`] last read it.
-    #[inline]
-    fn record_membership_over(
-        &mut self,
-        route: PreparedElasticRoute,
-        membership: MembershipKey,
-        summary_bit: u16,
-        lane: u64,
-    ) {
-        let words = self.membership.words;
-        if words != 0 {
-            let word = MembershipKey::word(route.signature(), words);
-            // SAFETY: `word < words` indexes an initialized word; `&mut self`
-            // makes the borrow exclusive.
-            let metadata = unsafe { &mut *self.membership_ptr().add(word) };
-            metadata.membership = lane | membership.bits();
-            metadata.level_bins[route.summary_bin()] &= !summary_bit;
+    unsafe fn record_membership_over(&mut self, summary_bit: SummaryBin, read: LaneRead) {
+        let LaneRead { place, lane, bits } = read;
+        if self.metadata_scale != 0 {
+            // SAFETY: the caller's place is the one the filter reduces for
+            // this tail, so its word indexes an initialized word of it,
+            // which a scale that is not zero says the table has; `&mut
+            // self` makes the borrow exclusive.
+            let metadata = unsafe { &mut *self.membership_ptr().add(place.word()) };
+            metadata.membership = lane | bits;
+            metadata.level_bins[place.summary_bin()] &= !summary_bit;
         }
     }
 
@@ -1693,7 +1771,9 @@ where
     /// Starts the delete countdown over at the same live count. The placed
     /// count moves with it, so the settled gate closes.
     fn rearm_deletes(&mut self) {
+        self.count_settled();
         self.placed = self.live();
+        self.uncounted = Uncounted::none_at(self.placed);
         self.scheduler
             .rearm(membership::refresh_deletes(self.max_insertions));
     }
@@ -1704,11 +1784,35 @@ where
         self.placed - self.stale_membership()
     }
 
+    /// Live entries of `level`, one of this table's.
+    #[inline]
+    fn live_in(&self, level: &Level<SlotEntry<K, V>>) -> u32 {
+        let settled = ptr::eq(level, self.settled_level);
+        let live = self
+            .uncounted
+            .live(self.placed, level.counters().len, settled);
+        debug_assert!(live <= level.capacity, "a live count fell below zero");
+        live
+    }
+
+    /// Moves the settled inserts into `settled_level`'s stored live count,
+    /// ahead of a change to the placed count or to the settled level that
+    /// is not a settled insert.
+    fn count_settled(&mut self) {
+        if self.uncounted.pending(self.placed) != 0 {
+            // SAFETY: an insert goes uncounted only into the settled level
+            // of an open gate, which `reopen_settled` set to one of the
+            // levels, and the levels are replaced only after this call.
+            let counters = unsafe { (*self.settled_level).counters_mut() };
+            self.uncounted.count_into(self.placed, &mut counters.len);
+        }
+    }
+
     fn copy_membership_from(&mut self, source: &Self) {
         // SAFETY: each region was laid out for its own table's arena, so the two
         // never overlap; clones share geometry, so word counts match.
         unsafe {
-            self.membership.copy_from::<MetadataWord>(
+            self.membership.copy_from::<TailWord>(
                 self.arena.as_ptr(),
                 source.membership,
                 source.arena.as_ptr(),
@@ -1717,9 +1821,11 @@ where
     }
 
     fn clear(&mut self) {
+        self.count_settled();
         for level in &mut self.levels {
             level.drain_reset(|entry| {
                 self.placed -= 1;
+                self.uncounted.uncover_one();
                 // Before the drop: one that panics leaves the table live
                 // with this count.
                 self.scheduler.close();
@@ -1747,7 +1853,7 @@ where
     /// slot so the caller can borrow into it without re-probing.
     #[inline]
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
-        let prepared = PreparedElasticKey::new(key_hash);
+        let prepared = PreparedElasticRoute::new(key_hash);
         let key_fingerprint = control::control_fingerprint_low(key_hash);
         self.insert_absent(key, value, prepared, key_fingerprint)
     }
@@ -1759,24 +1865,24 @@ where
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
     ) -> (usize, usize) {
         if self.scheduler.settles(self.placed) || self.reopen_settled() {
             // SAFETY: the gate is open.
             let found = unsafe {
-                self.settled_level_slot(prepared.route.probe)
-                    .or_else(|| self.settled_fallback_slot(prepared.route.probe))
+                self.settled_level_slot(prepared.probe)
+                    .or_else(|| self.settled_fallback_slot(prepared.probe))
             };
             if let Some(found) = found {
                 // SAFETY: the settled search returns one of this table's levels.
                 let level = unsafe { found.level.offset_from_unsigned(self.levels.as_ptr()) };
                 let slot = found.slot;
-                let lane = self.route_filter(prepared).membership;
+                let read = self.route_filter(prepared).read;
                 // SAFETY: the settled search returns a free slot of that
                 // level with the level's words.
                 unsafe {
-                    self.write_new_entry_at(key, value, prepared, key_fingerprint, found, lane);
+                    self.write_new_entry_at::<false>(key, value, key_fingerprint, found, read);
                 }
                 return (level, slot);
             }
@@ -1831,7 +1937,7 @@ where
             // while the other level of its pair keeps its fill.
             BatchTarget::LevelPair(current) if case.level == current => {
                 let region = case.region;
-                let free = region.capacity - region.len();
+                let free = region.capacity - self.live_in(region);
                 let paper_budget = |free: u32| {
                     probe::elastic_level_probe_budget(
                         free,
@@ -1864,7 +1970,7 @@ where
         let holds_for = if fallback.is_some() {
             let next = &self.levels[case.level + 1];
             // Not a quarter free or less, the case's test of this level.
-            holds_for.min(next.capacity - next.len() - next.capacity / 4)
+            holds_for.min(next.capacity - self.live_in(next) - next.capacity / 4)
         } else {
             holds_for
         };
@@ -1980,6 +2086,7 @@ where
         };
         let [(_, word), (_, fallback_word)] =
             self.plan_words(plan.level, plan.budget, plan.fallback);
+        self.count_settled();
         self.levels[plan.level].search.settled = word;
         self.settled_level = self.levels.level_ptr(plan.level);
         self.settled_fallback = if plan.fallback.is_some() {
@@ -2011,13 +2118,14 @@ where
             Some(unsafe { self.open_words() }),
             "the open gate's plan is the table's"
         );
-        debug_assert!(self.membership.words != 0);
+        debug_assert!(self.metadata_scale != 0);
         // SAFETY: the scheduler settles only below the limit it was built
         // with, which `settled_limit` derives from the levels and the
-        // filter built beside it: zero without a filter word. A clone takes
+        // filter built beside it: zero without a filter word, and a tail
+        // with a word has a nonzero scale. A clone takes
         // the scheduler and builds a filter of the same capacity, and a
         // rebuild swaps both together.
-        unsafe { core::hint::assert_unchecked(self.membership.words != 0) };
+        unsafe { core::hint::assert_unchecked(self.metadata_scale != 0) };
         let sequence = probe.sequence(self.fold_multiplier);
         let level = self.settled_level;
         // SAFETY: the gate is open, so `settled_level` and a
@@ -2053,7 +2161,7 @@ where
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
     ) -> (usize, usize) {
         if self.live() >= self.max_insertions {
@@ -2071,7 +2179,7 @@ where
         let target = self.scheduler.cached_target();
         // The write closes the gate; the next insert finds it open again
         // where it may be.
-        if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
+        if let Some(placement) = self.choose_slot_for_new_key(prepared.probe, target) {
             let open_to = self.scheduler.settled_end;
             let location = self.place_new_entry(key, value, prepared, key_fingerprint, placement);
             self.keep_settled(open_to);
@@ -2093,15 +2201,15 @@ where
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
     ) -> Option<V> {
         let filter = self.route_filter(prepared);
         if filter.maybe_present && self.walk_ends_unresolved() {
-            let level_mask = filter.expanded_level_mask(prepared.route);
+            let level_mask = filter.expanded_level_mask();
             let found = self.find_by_general_schedule(
                 &key,
-                prepared.route,
+                prepared,
                 level_mask,
                 key_fingerprint,
                 |level, slot, _| (level, slot),
@@ -2126,15 +2234,15 @@ where
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
     ) {
         // SAFETY: the caller's contract.
-        if let Some(found) = unsafe { self.settled_fallback_slot(prepared.route.probe) } {
-            let lane = self.route_filter(prepared).membership;
+        if let Some(found) = unsafe { self.settled_fallback_slot(prepared.probe) } {
+            let read = self.route_filter(prepared).read;
             // SAFETY: the settled search returns one of this table's levels
             // with its words, and a free slot of it with its control byte.
-            unsafe { self.write_new_entry_at(key, value, prepared, key_fingerprint, found, lane) };
+            unsafe { self.write_new_entry_at::<false>(key, value, key_fingerprint, found, read) };
             return;
         }
         self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
@@ -2149,11 +2257,11 @@ where
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
         target: BatchTarget,
     ) -> (usize, usize) {
-        if let Some(placement) = self.choose_slot_on_other_targets(prepared.route.probe, target) {
+        if let Some(placement) = self.choose_slot_on_other_targets(prepared.probe, target) {
             return self.place_new_entry(key, value, prepared, key_fingerprint, placement);
         }
         // An epoch that already placed outside its probe routes failed its
@@ -2164,7 +2272,7 @@ where
         }
         self.resize_with_transition(self.total_slots, EpochTransition::PlacementRecovery);
         let target = self.scheduler.target(self.live());
-        if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
+        if let Some(placement) = self.choose_slot_for_new_key(prepared.probe, target) {
             self.place_new_entry(key, value, prepared, key_fingerprint, placement)
         } else {
             self.place_exceptional_entry(key, value, prepared, key_fingerprint)
@@ -2177,7 +2285,7 @@ where
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
         placement: ExactPlacement,
     ) -> (usize, usize) {
@@ -2202,7 +2310,7 @@ where
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
     ) -> (usize, usize) {
         let (level, slot) = self
@@ -2242,7 +2350,7 @@ where
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
         level_idx: usize,
         slot_idx: usize,
@@ -2250,7 +2358,7 @@ where
     ) -> (usize, usize) {
         debug_assert!(level_idx < self.levels.len());
         let level = self.levels.level_ptr(level_idx);
-        let lane = self.route_filter(prepared).membership;
+        let read = self.route_filter(prepared).read;
         // SAFETY: `level_ptr` checked the index, so the pointer is to a level.
         let found = unsafe {
             SettledSlot {
@@ -2263,7 +2371,7 @@ where
             }
         };
         // SAFETY: callers pass a free slot of the level they found it in.
-        unsafe { self.write_new_entry_at(key, value, prepared, key_fingerprint, found, lane) };
+        unsafe { self.write_new_entry_at::<false>(key, value, key_fingerprint, found, read) };
         // Not a settled insert: it may change the fill or the scheduled
         // probes the settled plan was made for.
         self.scheduler.close();
@@ -2277,18 +2385,20 @@ where
     ///
     /// `found` names one of this table's levels, derived from their
     /// pointer, with that level's pointers and summary bit, a free slot of
-    /// it and the slot's control byte. `lane` is the membership lane of the
-    /// key's word as [`Self::route_filter`] reads it now.
+    /// it and the slot's control byte. `read` is the key's, as
+    /// [`Self::route_filter`] reads it now.
+    ///
+    /// `SETTLED` leaves the insert out of the level's stored live count,
+    /// for a slot of `settled_level` alone.
     #[allow(clippy::needless_pass_by_value)]
     #[inline]
-    unsafe fn write_new_entry_at(
+    unsafe fn write_new_entry_at<const SETTLED: bool>(
         &mut self,
         key: K,
         value: V,
-        prepared: PreparedElasticKey,
         key_fingerprint: u8,
         found: SettledSlot<K, V>,
-        lane: u64,
+        read: LaneRead,
     ) {
         let SettledSlot {
             level,
@@ -2298,7 +2408,8 @@ where
             slot,
             control,
         } = found;
-        self.record_membership_over(prepared.route, prepared.membership, summary_bit, lane);
+        // SAFETY: the caller's contract.
+        unsafe { self.record_membership_over(summary_bit, read) };
         debug_assert!(control >= 0);
         // SAFETY: the caller's contract: the slot is a free one of the
         // level these pointers are of, whose counters sit ahead of its
@@ -2309,7 +2420,10 @@ where
             data.add(slot)
                 .write(MaybeUninit::new(SlotEntry { key, value }));
             control_bytes.add(slot).write(key_fingerprint);
-            (*level_counters(control_bytes)).len += 1;
+            if !SETTLED {
+                self.uncounted
+                    .count_one(&mut (*level_counters(control_bytes)).len);
+            }
         }
         self.placed += 1;
         // A free slot that is not empty is a tombstone, which differs from
@@ -2477,7 +2591,7 @@ where
     {
         self.find_by_exact_schedule(
             key,
-            PreparedElasticKey::new(hash),
+            PreparedElasticRoute::new(hash),
             |route| control::control_fingerprint_low(route.key_hash()),
             |level, slot, _entry| (level, slot),
         )
@@ -2490,7 +2604,7 @@ where
     {
         self.find_by_exact_schedule(
             key,
-            PreparedElasticKey::new(hash),
+            PreparedElasticRoute::new(hash),
             |route| control::control_fingerprint_low(route.key_hash()),
             |_level, _slot, entry| entry,
         )
@@ -2505,7 +2619,7 @@ where
     {
         self.find_by_exact_schedule(
             key,
-            PreparedElasticKey::new(hash),
+            PreparedElasticRoute::new(hash),
             |route| control::control_fingerprint_low(route.key_hash()),
             |_level, _slot, entry| entry,
         )
@@ -2531,27 +2645,26 @@ where
     where
         K: Hash + Eq,
     {
-        let prepared = PreparedElasticKey::new(hash);
+        let prepared = PreparedElasticRoute::new(hash);
         let key_fingerprint = control::control_fingerprint_low(hash);
         // Every way off the common path meets in one call, which tells them
         // apart itself.
         'common: {
             let filter = self.route_filter(prepared);
-            let lane = filter.membership;
+            let read = filter.read;
             if filter.maybe_present {
                 let walked = self.walk_schedule(
                     &key,
-                    prepared.route,
+                    prepared,
                     key_fingerprint,
                     filter,
-                    |_, _, offset, _| offset,
+                    |_, _, entry, _| entry,
                 );
                 match walked {
-                    ScheduleSearch::Hit(offset) => {
+                    ScheduleSearch::Hit(entry) => {
                         // SAFETY: the walk hands on an occupied slot of this
                         // table, which `&mut self` borrows alone.
-                        let slot: &mut SlotEntry<K, V> =
-                            unsafe { &mut *self.probe_schedule.entry_at(offset) };
+                        let slot: &mut SlotEntry<K, V> = unsafe { &mut *entry.get() };
                         return Some(mem::replace(&mut slot.value, value));
                     }
                     ScheduleSearch::Absent => {}
@@ -2562,7 +2675,7 @@ where
             // reopens it where it may open.
             if self.scheduler.settles(self.placed) {
                 // SAFETY: the gate is open.
-                let Some(found) = (unsafe { self.settled_level_slot(prepared.route.probe) }) else {
+                let Some(found) = (unsafe { self.settled_level_slot(prepared.probe) }) else {
                     // SAFETY: the gate is open.
                     unsafe { self.insert_unsettled(key, value, prepared, key_fingerprint) };
                     return None;
@@ -2571,7 +2684,7 @@ where
                 // levels with its words, and a free slot of it with its
                 // control byte.
                 unsafe {
-                    self.write_new_entry_at(key, value, prepared, key_fingerprint, found, lane);
+                    self.write_new_entry_at::<true>(key, value, key_fingerprint, found, read);
                 }
                 return None;
             }
@@ -2595,7 +2708,7 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let prepared = PreparedElasticKey::new(hash);
+        let prepared = PreparedElasticRoute::new(hash);
         let filter = self.route_filter(prepared);
         if !filter.maybe_present {
             return None;
@@ -2603,18 +2716,18 @@ where
         let key_fingerprint = control::control_fingerprint_low(hash);
         let walked = self.walk_schedule(
             key,
-            prepared.route,
+            prepared,
             key_fingerprint,
             filter,
-            |_, slot, offset, control| (slot, offset, control),
+            |_, slot, entry, control| (slot, entry, control),
         );
-        let (slot, offset, control) = match walked {
+        let (slot, entry, control) = match walked {
             ScheduleSearch::Hit(hit) => hit,
             ScheduleSearch::Absent => return None,
             ScheduleSearch::Unresolved => {
                 let location = self.find_unresolved(
                     key,
-                    prepared.route,
+                    prepared,
                     key_fingerprint,
                     filter,
                     |level, slot, _| (level, slot),
@@ -2625,11 +2738,7 @@ where
         // SAFETY: the walk hands on an occupied slot of one of this table's
         // levels, which `&mut self` borrows alone. The tombstone below keeps
         // the entry from being read again.
-        let removed = unsafe {
-            self.probe_schedule
-                .entry_at::<SlotEntry<K, V>>(offset)
-                .read()
-        };
+        let removed = unsafe { entry.get::<SlotEntry<K, V>>().read() };
         // SAFETY: `control` is that level's control bytes, which the table
         // owns and may write, and `slot` indexes them. The sentinel's are
         // never handed on: they match no fingerprint.
@@ -2744,6 +2853,7 @@ where
             *level.counters_mut() = LevelCounters::default();
         }
         self.placed = self.stale_membership();
+        self.uncounted = Uncounted::none_at(self.placed);
         self.reset_after_clear();
     }
 
@@ -2771,9 +2881,7 @@ where
         }
 
         let regions = guard.regions_mut();
-        let probe_schedule = self
-            .probe_schedule
-            .clone_onto(PROBE_SCHEDULE_CAPACITY[regions.len()], regions);
+        let probe_schedule = self.probe_schedule.clone_onto(regions);
 
         // Success: reclaim arena + levels so the guard's Drop no-ops.
         let (arena, levels) = guard.disarm();
@@ -2787,19 +2895,34 @@ where
             scheduler,
             hash_builder,
             alloc,
+            metadata_scale: MetadataPlace::scale(membership.words),
             metadata_words: metadata_words(&arena, membership),
             arena,
             epoch: self.epoch,
             probe_high_water: self.probe_high_water,
             scheduled_levels: self.scheduled_levels,
+            uncounted: self.uncounted,
             probe_schedule,
             settled_level: ptr::null_mut(),
             settled_fallback: ptr::null_mut(),
             fold_multiplier: probe::ELASTIC_FOLD_MULTIPLIER,
             membership,
         };
-        // The copied gate is open on the source's settled level.
+        // The copied gate is open on the source's settled level, whose
+        // uncounted inserts the copy counts.
         cloned.scheduler.close();
+        if self.uncounted.pending(self.placed) != 0 {
+            // SAFETY: an uncounted insert went into the settled level, one
+            // of the levels, and the copy has the same levels.
+            let settled = unsafe {
+                self.settled_level
+                    .offset_from_unsigned(self.levels.as_ptr())
+            };
+            cloned.uncounted.count_into(
+                cloned.placed,
+                &mut cloned.levels[settled].counters_mut().len,
+            );
+        }
         cloned.copy_membership_from(self);
         cloned
     }
@@ -2883,9 +3006,9 @@ where
                     let entry = unsafe { table.levels[level_idx].get_ref(slot_idx) };
                     table.hash_builder.hash_one(&entry.key)
                 };
-                let prepared = PreparedElasticKey::new(hash);
+                let prepared = PreparedElasticRoute::new(hash);
                 let summary_bit = table.levels[level_idx].summary_bit();
-                table.record_membership(prepared.route, prepared.membership, summary_bit);
+                table.record_membership(prepared, summary_bit);
             }
         }
         mem::forget(guard);
@@ -2914,9 +3037,7 @@ where
         geometry: &ElasticGeometry,
         transition: EpochTransition,
     ) -> Result<(), TryReserveError> {
-        let schedule_room = ProbeScheduleRoom::try_with_capacity(
-            PROBE_SCHEDULE_CAPACITY[geometry.level_capacities.len()],
-        )?;
+        let schedule_room = ProbeScheduleRoom::try_for_levels(geometry.level_capacities.len())?;
         let (arena, levels, membership) = try_alloc_elastic_arena(
             &geometry.level_capacities,
             self.reserve_fraction,
@@ -2934,6 +3055,7 @@ where
             ElasticGeneration {
                 levels,
                 placed: 0,
+                uncounted: Uncounted::default(),
                 total_slots: geometry.total_slots,
                 max_insertions: geometry.max_insertions,
                 scheduler: BatchScheduler::new(
@@ -2941,6 +3063,7 @@ where
                     settled_limit,
                     membership::refresh_deletes(geometry.max_insertions),
                 ),
+                metadata_scale: MetadataPlace::scale(membership.words),
                 metadata_words: metadata_words(&arena, membership),
                 arena,
                 probe_high_water: empty_high_water(settled_limit),
@@ -2987,7 +3110,11 @@ where
         probe: PreparedElasticProbe,
         target: BatchTarget,
     ) -> Option<ExactPlacement> {
-        let has_room = |level: usize| self.levels.get(level).is_some_and(|l| l.free_slots() > 0);
+        let has_room = |level: usize| {
+            self.levels
+                .get(level)
+                .is_some_and(|l| l.free_slots(self.live_in(l)) > 0)
+        };
         let pairs = self.levels.len().saturating_sub(1);
         core::iter::once(BatchTarget::Bootstrap)
             .chain((0..pairs).map(BatchTarget::LevelPair))
@@ -3036,8 +3163,8 @@ where
                 let [current_level, next_level] = self.levels.get(current..=next)? else {
                     return None;
                 };
-                let free_next = next_level.free_slots();
-                let current_low = current_level.low();
+                let free_next = next_level.free_slots(self.live_in(next_level));
+                let current_low = current_level.low(self.live_in(current_level));
                 let next_low = free_next.saturating_mul(4) <= next_level.capacity();
 
                 if current_low {
@@ -3057,7 +3184,7 @@ where
                 } else {
                     // Not low, so the level has a free slot.
                     let budget = probe::elastic_level_probe_budget(
-                        current_level.capacity - current_level.len(),
+                        current_level.capacity - self.live_in(current_level),
                         current_level.capacity,
                         self.reserve_fraction.exponent(),
                         ELASTIC_PROBE_BUDGET_C,
@@ -3229,7 +3356,7 @@ where
     fn find_slot_indices_prepared<Q>(
         &self,
         key: &Q,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
     ) -> Option<(usize, usize)>
     where
@@ -3247,7 +3374,7 @@ where
     fn find_entry_prepared<'a, Q>(
         &'a self,
         key: &Q,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: u8,
     ) -> Option<&'a SlotEntry<K, V>>
     where
@@ -3269,7 +3396,7 @@ where
     fn find_by_exact_schedule<'a, Q, R>(
         &'a self,
         key: &Q,
-        prepared: PreparedElasticKey,
+        prepared: PreparedElasticRoute,
         key_fingerprint: impl FnOnce(PreparedElasticRoute) -> u8,
         on_hit: impl FnMut(usize, usize, &'a SlotEntry<K, V>) -> R,
     ) -> Option<R>
@@ -3282,7 +3409,7 @@ where
         if !filter.maybe_present {
             return None;
         }
-        self.find_after_filter(key, prepared.route, key_fingerprint, filter, on_hit)
+        self.find_after_filter(key, prepared, key_fingerprint, filter, on_hit)
     }
 
     /// The lookup of a key that passed `filter`: the schedule walk, then the
@@ -3306,15 +3433,13 @@ where
             route,
             key_fingerprint,
             filter,
-            |level, slot, offset, _| (level, slot, offset),
+            |level, slot, entry, _| (level, slot, entry),
         );
         match walked {
-            ScheduleSearch::Hit((level, slot, offset)) => {
+            ScheduleSearch::Hit((level, slot, entry)) => {
                 // SAFETY: the walk hands on an occupied slot of this table,
                 // which `&'a self` keeps from changing.
-                Some(on_hit(level, slot, unsafe {
-                    &*self.probe_schedule.entry_at(offset)
-                }))
+                Some(on_hit(level, slot, unsafe { &*entry.get() }))
             }
             ScheduleSearch::Absent => None,
             ScheduleSearch::Unresolved => {
@@ -3341,7 +3466,7 @@ where
         self.find_by_general_schedule(
             key,
             route,
-            filter.expanded_level_mask(route),
+            filter.expanded_level_mask(),
             key_fingerprint,
             on_hit,
         )
@@ -3356,10 +3481,9 @@ where
     }
 
     /// Walks the candidates of a key that passed `filter` in schedule order
-    /// and hands `on_hit` the level and slot that hold the key, the entry's
-    /// offset for [`ProbeSchedule::entry_at`], and the level's control
-    /// bytes. A table that needs the general reduction has routes that
-    /// probe nothing, so its walk ends unresolved.
+    /// and hands `on_hit` the level and slot that hold the key, the entry,
+    /// and the level's control bytes. A table that needs the general
+    /// reduction has routes that probe nothing, so its walk ends unresolved.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn walk_schedule<Q, R>(
@@ -3368,79 +3492,139 @@ where
         prepared: PreparedElasticRoute,
         key_fingerprint: u8,
         filter: ElasticRouteFilter<'_>,
-        mut on_hit: impl FnMut(usize, usize, usize, *const u8) -> R,
+        mut on_hit: impl FnMut(usize, usize, EntryAt, *const u8) -> R,
     ) -> ScheduleSearch<R>
     where
         Q: Equivalent<K> + ?Sized,
     {
         let sequence = prepared.probe.sequence(self.fold_multiplier);
-        let direct = self.probe_schedule.direct();
-        // SAFETY: the schedule starts with its direct route.
-        let route = unsafe { &*direct };
-        let h11_slot = probe::masked_shift_elastic_index(sequence.word(0), route.index_shift());
-        // SAFETY: the route's shifted index maps into the control bytes it
-        // holds.
-        if unsafe { *route.control().add(h11_slot) } == key_fingerprint {
-            let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(route.control(), h11_slot);
+        let (index_shift, direct_control, entry_origin) = self.probe_schedule.direct_reach();
+        let h11_slot = probe::masked_shift_elastic_index(sequence.word(0), index_shift);
+        // SAFETY: the direct route's shifted index maps into the control
+        // bytes it holds.
+        if unsafe { *direct_control.add(h11_slot) } == key_fingerprint {
+            let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(direct_control, h11_slot);
+            let entry: *mut SlotEntry<K, V> = ProbeSchedule::entry_at(entry_origin, offset);
             // SAFETY: only a level's own control bytes hold a fingerprint,
-            // and one marks an occupied slot.
-            let entry: *mut SlotEntry<K, V> = unsafe { self.probe_schedule.entry_at(offset) };
-            // SAFETY: as above, the slot holds an entry.
+            // and one marks an occupied slot, so the slot holds an entry.
             if key.equivalent(unsafe { &(*entry).key }) {
-                return ScheduleSearch::Hit(on_hit(0, h11_slot, offset, route.control()));
+                let entry = EntryAt {
+                    entry_origin,
+                    offset,
+                };
+                return ScheduleSearch::Hit(on_hit(0, h11_slot, entry, direct_control));
             }
         }
 
-        let mut closed_levels = filter.closed_levels(prepared);
-        let mut route = direct;
-        loop {
-            // SAFETY: the schedule ends with its sentinel, and the walk
-            // cannot pass it: the sentinel's level stays open until its own
-            // probe, which reads `EMPTY` and ends the walk below. So `route`
-            // is ahead of the sentinel here.
-            let step = unsafe { PhiRoute::step(&mut route) };
-            if step.is_closed(closed_levels) {
-                continue;
-            }
-            // SAFETY: as above, `route` is at most the sentinel.
-            let (index_shift, level_control) = unsafe { PhiRoute::reach(route) };
-            // The route holds a shift whichever reduction its level needs.
-            let slot = probe::masked_shift_elastic_index(
-                sequence.word_at(step.sequence_index()),
-                index_shift,
-            );
-            // SAFETY: the route's shifted index maps into the control bytes
-            // it holds.
-            let control = unsafe { *level_control.add(slot) };
-            if control == key_fingerprint {
-                let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
-                // SAFETY: the sentinel's control bytes match no fingerprint,
-                // so the route names a real level, and a fingerprint match
-                // means the slot is occupied.
-                let entry: *mut SlotEntry<K, V> = unsafe { self.probe_schedule.entry_at(offset) };
-                // SAFETY: as above, the slot holds an entry.
-                if key.equivalent(unsafe { &(*entry).key }) {
-                    // SAFETY: as above.
-                    let level = unsafe { (*route).level() };
-                    return ScheduleSearch::Hit(on_hit(
-                        level as usize,
-                        slot,
-                        offset,
-                        level_control,
-                    ));
-                }
-                unlikely_path();
-            } else if control == CTRL_EMPTY {
-                // A key takes its level's first free probe, and a slot
-                // returns to `EMPTY` only when its whole level is reset: a
-                // removal leaves a tombstone, and so does a `clear` until its
-                // last entry is out, even one a panicking drop interrupts. So
-                // the key cannot sit at a later probe of this level.
-                closed_levels = step.close(closed_levels);
-                // Either this was the sentinel, or no real level is left
-                // open.
-                if closed_levels & SENTINEL_BIT != 0 || closed_levels == !SENTINEL_BIT {
+        let summary = filter.summary();
+        match self.probe_schedule.walk_start(summary).run() {
+            Ok(mut run) => loop {
+                // SAFETY: a sentinel closes the run, and the walk cannot
+                // pass it: its probe reads `EMPTY` and ends the walk below.
+                // So the walk is ahead of that sentinel here.
+                let sequence_index = unsafe { run.step() };
+                let route = run.route();
+                // SAFETY: the walk has stepped, so `route` is a route of the
+                // schedule, at most the sentinel.
+                let (index_shift, level_control) = unsafe { PhiRoute::reach(route) };
+                let slot = probe::masked_shift_elastic_index(
+                    sequence.word_at(sequence_index),
+                    index_shift,
+                );
+                // SAFETY: the route's shifted index maps into the control
+                // bytes it holds.
+                let control = unsafe { *level_control.add(slot) };
+                if control == key_fingerprint {
+                    let offset =
+                        ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
+                    let entry: *mut SlotEntry<K, V> = ProbeSchedule::entry_at(entry_origin, offset);
+                    // SAFETY: the sentinel's control bytes match no
+                    // fingerprint, so the route names a real level, and a
+                    // fingerprint match means the slot is occupied and
+                    // holds an entry.
+                    if key.equivalent(unsafe { &(*entry).key }) {
+                        // SAFETY: as above.
+                        let level = unsafe { (*route).level() };
+                        let entry = EntryAt {
+                            entry_origin,
+                            offset,
+                        };
+                        return ScheduleSearch::Hit(on_hit(
+                            level as usize,
+                            slot,
+                            entry,
+                            level_control,
+                        ));
+                    }
+                    unlikely_path();
+                } else if control == CTRL_EMPTY {
+                    // The run's level has no later probe to hold the key,
+                    // as below, and the walk has no other level to visit.
                     break;
+                }
+            },
+            Err(direct) => {
+                let mut closed_levels = schedule::closed_levels(summary);
+                let mut route = direct;
+                loop {
+                    // SAFETY: a sentinel closes the routes after the direct
+                    // route, and the walk cannot pass it: the sentinel's
+                    // level stays open until its own probe, which reads
+                    // `EMPTY` and ends the walk below. So `route` is ahead
+                    // of that sentinel here.
+                    let step = unsafe { PhiRoute::step(&mut route) };
+                    if step.is_closed(closed_levels) {
+                        continue;
+                    }
+                    // SAFETY: as above, `route` is at most the sentinel.
+                    let (index_shift, level_control) = unsafe { PhiRoute::reach(route) };
+                    // The route holds a shift whichever reduction its level
+                    // needs.
+                    let slot = probe::masked_shift_elastic_index(
+                        sequence.word_at(step.sequence_index()),
+                        index_shift,
+                    );
+                    // SAFETY: the route's shifted index maps into the
+                    // control bytes it holds.
+                    let control = unsafe { *level_control.add(slot) };
+                    if control == key_fingerprint {
+                        let offset =
+                            ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
+                        let entry: *mut SlotEntry<K, V> =
+                            ProbeSchedule::entry_at(entry_origin, offset);
+                        // SAFETY: the sentinel's control bytes match no
+                        // fingerprint, so the route names a real level, and
+                        // a fingerprint match means the slot is occupied and
+                        // holds an entry.
+                        if key.equivalent(unsafe { &(*entry).key }) {
+                            // SAFETY: as above.
+                            let level = unsafe { (*route).level() };
+                            let entry = EntryAt {
+                                entry_origin,
+                                offset,
+                            };
+                            return ScheduleSearch::Hit(on_hit(
+                                level as usize,
+                                slot,
+                                entry,
+                                level_control,
+                            ));
+                        }
+                        unlikely_path();
+                    } else if control == CTRL_EMPTY {
+                        // A key takes its level's first free probe, and a
+                        // slot returns to `EMPTY` only when its whole level
+                        // is reset: a removal leaves a tombstone, and so
+                        // does a `clear` until its last entry is out, even
+                        // one a panicking drop interrupts. So the key cannot
+                        // sit at a later probe of this level.
+                        closed_levels = step.close(closed_levels);
+                        // Either this was the sentinel, or no real level is
+                        // left open.
+                        if closed_levels & SENTINEL_BIT != 0 || closed_levels == !SENTINEL_BIT {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -3570,6 +3754,7 @@ where
 pub(crate) struct ElasticGeneration<K, V> {
     levels: LevelSlice<K, V>,
     placed: usize,
+    uncounted: Uncounted,
     total_slots: usize,
     max_insertions: usize,
     scheduler: BatchScheduler,
@@ -3578,7 +3763,8 @@ pub(crate) struct ElasticGeneration<K, V> {
     scheduled_levels: u32,
     probe_schedule: ProbeSchedule,
     membership: MembershipRegion,
-    metadata_words: *mut MetadataWord,
+    metadata_scale: u64,
+    metadata_words: *mut TailWord,
 }
 
 impl<K, V, S, A> Rebuildable for ElasticTable<K, V, S, A>
@@ -3593,8 +3779,10 @@ where
     type Generation = ElasticGeneration<K, V>;
 
     fn swap_generation(&mut self, other: &mut ElasticGeneration<K, V>) {
+        self.count_settled();
         mem::swap(&mut self.levels, &mut other.levels);
         mem::swap(&mut self.placed, &mut other.placed);
+        mem::swap(&mut self.uncounted, &mut other.uncounted);
         mem::swap(&mut self.total_slots, &mut other.total_slots);
         mem::swap(&mut self.max_insertions, &mut other.max_insertions);
         mem::swap(&mut self.scheduler, &mut other.scheduler);
@@ -3606,6 +3794,7 @@ where
         mem::swap(&mut self.scheduled_levels, &mut other.scheduled_levels);
         mem::swap(&mut self.probe_schedule, &mut other.probe_schedule);
         mem::swap(&mut self.membership, &mut other.membership);
+        mem::swap(&mut self.metadata_scale, &mut other.metadata_scale);
         mem::swap(&mut self.metadata_words, &mut other.metadata_words);
     }
 
@@ -3623,11 +3812,10 @@ where
 
     #[inline]
     fn prefetch_placement(&self, key_hash: u64) {
-        let prepared = PreparedElasticKey::new(key_hash);
-        let words = self.membership.words;
-        if words != 0 {
-            let word = MembershipKey::word(prepared.route.signature(), words);
-            prefetch::prefetch_write(self.membership_ptr().wrapping_add(word));
+        let prepared = PreparedElasticRoute::new(key_hash);
+        if self.metadata_scale != 0 {
+            let place = MetadataPlace::new(prepared.signature(), self.metadata_scale);
+            prefetch::prefetch_write(self.membership_ptr().wrapping_add(place.word()));
         }
         // The level whose first probe `choose_slot_for_new_key` reads, judged
         // from the cached batch; a stale batch only misdirects the hint.
@@ -3637,7 +3825,7 @@ where
                 let Some(current_level) = self.levels.get(current) else {
                     return;
                 };
-                if current_level.low() {
+                if current_level.low(self.live_in(current_level)) {
                     current + 1
                 } else {
                     current
@@ -3646,7 +3834,7 @@ where
         };
         if let (Some(region), Some(slot)) = (
             self.levels.get(level),
-            self.route_prepared(level, prepared.route.probe, 0),
+            self.route_prepared(level, prepared.probe, 0),
         ) {
             region.prefetch_slot(slot);
         }
@@ -3656,10 +3844,10 @@ where
     /// generation starts all-EMPTY, so neither can succeed.
     #[inline]
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
-        let prepared = PreparedElasticKey::new(key_hash);
+        let prepared = PreparedElasticRoute::new(key_hash);
         let key_fingerprint = control::control_fingerprint_low(key_hash);
         let target = self.scheduler.target(self.live());
-        if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
+        if let Some(placement) = self.choose_slot_for_new_key(prepared.probe, target) {
             self.place_new_entry(entry.key, entry.value, prepared, key_fingerprint, placement);
             false
         } else {

@@ -14,15 +14,11 @@ use allocator_api2::alloc::Layout;
 
 use crate::error::TryReserveError;
 
-/// Logical slots covered by one filter word. Ten keeps the membership lane under
-/// a byte per slot while leaving words sparse enough for the few bits a backend
-/// sets per key to stay selective.
-pub(crate) const SLOTS_PER_WORD: usize = 10;
-
-/// Filter words needed to cover `total_slots` logical slots.
+/// Filter words needed to cover `total_slots` logical slots at
+/// `slots_per_word` slots a word.
 #[inline]
-fn word_count(total_slots: usize) -> usize {
-    total_slots.div_ceil(SLOTS_PER_WORD)
+fn word_count(total_slots: usize, slots_per_word: usize) -> usize {
+    total_slots.div_ceil(slots_per_word)
 }
 
 /// Deletes a filter tolerates before it is re-recorded from the live entries.
@@ -37,9 +33,9 @@ pub(crate) const fn refresh_deletes(max_insertions: usize) -> usize {
     max_insertions
 }
 
-/// One word of a backend's metadata tail: the membership lane, plus four level
-/// bins that each summarize which levels the keys sharing the word and bin
-/// occupy.
+/// One word of a metadata tail that keeps four level bins beside its
+/// membership lane. Each bin summarizes which levels the keys sharing the
+/// word and bin occupy.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetadataWord {
@@ -49,43 +45,14 @@ pub(crate) struct MetadataWord {
 
 const _: () = assert!(core::mem::size_of::<MetadataWord>() == 16);
 
-/// One key's filter bits, derived once per operation.
-#[derive(Clone, Copy)]
-pub(crate) struct MembershipKey {
-    bits: u64,
-}
-
-impl MembershipKey {
-    /// `BITS` bits of one word, from disjoint signature fields. Each extra bit
-    /// cuts false positives but costs a shift and OR per insert and fills the
-    /// filter faster between refreshes, so each backend picks its own count.
-    #[inline]
-    pub(crate) const fn from_signature<const BITS: usize>(signature: u64) -> Self {
-        const SHIFTS: [u32; 3] = [0, 32, 16];
-        const { assert!(BITS >= 1 && BITS <= SHIFTS.len()) };
-        let mut bits = 0;
-        let mut field = 0;
-        while field < BITS {
-            bits |= 1_u64 << ((signature >> SHIFTS[field]) & 63);
-            field += 1;
-        }
-        Self { bits }
-    }
-
-    #[inline]
-    pub(crate) const fn bits(self) -> u64 {
-        self.bits
-    }
-
-    /// Multiply-high reduction of `signature` into `word_count` words. The high
-    /// half is below `word_count`, so the cast cannot lose bits and needs no
-    /// checked path in front of the load it feeds.
-    #[inline]
-    #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn word(signature: u64, word_count: usize) -> usize {
-        let product = u128::from(signature) * word_count as u128;
-        (product >> 64) as usize
-    }
+/// Multiply-high reduction of `signature` into `word_count` words. The high
+/// half is below `word_count`, so the cast cannot lose bits and needs no
+/// checked path in front of the load it feeds.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn word(signature: u64, word_count: usize) -> usize {
+    let product = u128::from(signature) * word_count as u128;
+    (product >> 64) as usize
 }
 
 /// Cached position of a filter tail inside its arena. The gate is a lookup's
@@ -104,14 +71,16 @@ impl MembershipRegion {
         words: 0,
     };
 
-    /// Appends a `W`-word tail covering `total_slots` to `base`, returning the
-    /// padded arena layout and where the tail sits inside it. An empty geometry
-    /// keeps `base` unchanged and yields [`Self::EMPTY`].
+    /// Appends a `W`-word tail covering `total_slots` at `slots_per_word`
+    /// slots a word to `base`, returning the padded arena layout and where
+    /// the tail sits inside it. An empty geometry keeps `base` unchanged and
+    /// yields [`Self::EMPTY`].
     pub(crate) fn extend<W>(
         base: Layout,
         total_slots: usize,
+        slots_per_word: usize,
     ) -> Result<(Layout, Self), TryReserveError> {
-        Self::extend_words::<W>(base, word_count(total_slots))
+        Self::extend_words::<W>(base, word_count(total_slots, slots_per_word))
     }
 
     /// [`Self::extend`] for a tail of `words` words.

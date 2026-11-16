@@ -102,12 +102,12 @@ impl ExactTrace {
     fn insert(&mut self, identity: u64) -> usize {
         let Self { table, scalar } = self;
         {
-            let prepared = PreparedElasticKey::new(identity);
+            let prepared = PreparedElasticRoute::new(identity);
             assert_eq!(table.hash_builder.hash_one(identity), identity);
             assert!(table.live() < table.max_insertions);
             let target = table.scheduler.target(table.live());
             let placement = table
-                .choose_slot_for_new_key(prepared.route.probe, target)
+                .choose_slot_for_new_key(prepared.probe, target)
                 .unwrap();
             let expected = scalar.insert(identity);
             let global_slot = table.levels[..placement.level]
@@ -145,7 +145,7 @@ impl ExactTrace {
                 table
                     .levels
                     .iter()
-                    .map(|level| level.len() as usize)
+                    .map(|level| table.live_in(level) as usize)
                     .collect::<Vec<_>>(),
                 scalar.level_occupancy()
             );
@@ -171,7 +171,7 @@ impl ExactTrace {
 
     /// Removes `identity` from both.
     fn remove(&mut self, identity: u64) {
-        let prepared = PreparedElasticKey::new(identity);
+        let prepared = PreparedElasticRoute::new(identity);
         let location = self
             .table
             .find_slot_indices_prepared(
@@ -189,7 +189,7 @@ impl ExactTrace {
             self.table
                 .levels
                 .iter()
-                .map(|level| level.len() as usize)
+                .map(|level| self.table.live_in(level) as usize)
                 .collect::<Vec<_>>(),
             self.scalar.level_occupancy()
         );
@@ -216,7 +216,7 @@ fn elastic_placement_matches_the_scalar_model_with_the_current_level_low() {
                 identity += 1;
             }
             let level = &trace.table.levels[current];
-            let free = level.capacity() - level.len() as usize;
+            let free = level.capacity() - trace.table.live_in(level) as usize;
             let threshold = level.half_reserve as usize;
             // Only a threshold of two or more tells itself from its half.
             if free != threshold || threshold < 2 {
@@ -655,7 +655,7 @@ fn clear_tombstones_each_slot_before_dropping_its_value() {
         .sum::<usize>();
     assert_eq!(map.len(), live_controls);
     assert!(map.table().levels.iter().all(|level| {
-        level.len() as usize
+        map.table().live_in(level) as usize
             == (0..level.capacity())
                 .filter(|&slot| control::is_occupied(level.checked_control(slot)))
                 .count()
@@ -758,7 +758,7 @@ fn caught_hash_panic_during_try_resize_keeps_every_entry() {
         .sum::<usize>();
     assert_eq!(map.len(), live_controls);
     assert!(map.table().levels.iter().all(|level| {
-        level.len() as usize
+        map.table().live_in(level) as usize
             == (0..level.capacity())
                 .filter(|&slot| control::is_occupied(level.checked_control(slot)))
                 .count()
@@ -820,7 +820,7 @@ fn level_counters_sit_ahead_of_their_control_bytes_without_overlap() {
                 // SAFETY: the slot is in bounds.
                 .filter(|&slot| control::is_occupied(unsafe { level.control_at(slot) }))
                 .count();
-            assert_eq!(level.len() as usize, occupied);
+            assert_eq!(table.live_in(level) as usize, occupied);
             assert_eq!(level.tombstones(), 0);
         }
         for key in 0..capacity as u64 {
@@ -846,7 +846,7 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
                 assert_eq!(extended.membership.offset, base.size());
                 assert_eq!(
                     extended.membership.words,
-                    slots.div_ceil(membership::SLOTS_PER_WORD)
+                    slots.div_ceil(FILTER_SLOTS_PER_WORD)
                 );
                 assert!(extended.layout.size() > base.size());
             }
@@ -856,7 +856,7 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
     assert_layout::<u64, u64>();
     assert_layout::<Zst, Zst>();
     assert_layout::<OverAligned, OverAligned>();
-    assert!(mem::size_of::<MetadataWord>() <= 2 * membership::SLOTS_PER_WORD);
+    assert!(5 * mem::size_of::<TailWord>() <= 16 * FILTER_SLOTS_PER_WORD);
 
     let table =
         ElasticTable::<OverAligned, OverAligned, FixedHashBuilder>::with_capacity_and_reserve_and_hasher_in(
@@ -874,14 +874,14 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
         unsafe { table.arena.as_ptr().add(layout.membership.offset) }.addr()
     );
     assert_eq!(
-        table.membership_ptr().addr() % mem::align_of::<MetadataWord>(),
+        table.membership_ptr().addr() % mem::align_of::<TailWord>(),
         0
     );
     for word in 0..table.membership.words {
         // SAFETY: `word < words` indexes an initialized metadata word.
         let metadata = unsafe { *table.membership_ptr().add(word) };
         assert_eq!(metadata.membership, 0);
-        assert_eq!(metadata.level_bins, [NO_LEVELS_OCCUPIED; 4]);
+        assert_eq!(metadata.level_bins, [NO_LEVELS_OCCUPIED; SUMMARY_BINS]);
     }
     assert_eq!(
         table.levels[0].data_ptr().addr() % mem::align_of::<OverAligned>(),
@@ -969,7 +969,7 @@ fn deletes_past_the_threshold_refresh_the_membership_filter() {
         ElasticTable<u64, u64, FixedHashBuilder>,
     >(
         |table, key| {
-            let prepared = PreparedElasticKey::new(table.hash_builder.hash_one(key));
+            let prepared = PreparedElasticRoute::new(table.hash_builder.hash_one(key));
             table.route_filter(prepared).maybe_present
         },
         ElasticTable::stale_membership,
@@ -993,33 +993,37 @@ fn duplicate_insert_does_not_advance_the_paper_schedule() {
     assert_eq!(map.get(&7), Some(&13));
 }
 
-/// Independent restatement of the filter's bit pattern, kept here so a
-/// change to the shared derivation has to be deliberate.
-fn membership_bits_from_signature(signature: u64) -> u64 {
-    let first = signature & 63;
-    let second = (signature >> 32) & 63;
-    let third = (signature >> 16) & 63;
-    (1_u64 << first) | (1_u64 << second) | (1_u64 << third)
-}
-
-fn membership_maybe_contains_prepared<K, V, S, A>(
-    table: &ElasticTable<K, V, S, A>,
-    prepared: PreparedElasticKey,
-) -> bool
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    table.membership_maybe_contains(prepared.route, prepared.membership)
+/// Independent restatement of a key's place in a tail of `words` words, as
+/// its word, its membership bits and its summary bin, kept here so a change
+/// to the derivation has to be deliberate.
+fn metadata_place_from_signature(signature: u64, words: usize) -> (usize, u64, usize) {
+    let lane_bits = u128::from(u64::BITS);
+    let fraction = lane_bits.pow(u32::try_from(MEMBERSHIP_BITS).unwrap());
+    let reduction =
+        (u128::from(signature) * u128::try_from(words).unwrap() * fraction) >> u64::BITS;
+    let mut bits = 0;
+    let mut field = reduction % fraction;
+    let mut top_field = 0;
+    for _ in 0..MEMBERSHIP_BITS {
+        top_field = field % lane_bits;
+        bits |= 1_u64 << top_field;
+        field /= lane_bits;
+    }
+    let bin = top_field / (lane_bits / u128::try_from(SUMMARY_BINS).unwrap());
+    (
+        usize::try_from(reduction / fraction).unwrap(),
+        bits,
+        usize::try_from(bin).unwrap(),
+    )
 }
 
 #[test]
 fn compact_prepared_elastic_state_is_register_sized() {
     assert_eq!(mem::size_of::<PreparedElasticRoute>(), 8);
-    assert_eq!(mem::align_of::<PreparedElasticRoute>(), 8);
-    assert_eq!(mem::size_of::<PreparedElasticKey>(), 16);
-    assert_eq!(mem::align_of::<PreparedElasticKey>(), 8);
+    assert_eq!(
+        mem::align_of::<PreparedElasticRoute>(),
+        mem::align_of::<u64>()
+    );
 }
 
 #[test]
@@ -1070,11 +1074,8 @@ fn route_summary_still_narrows_shallow_levels_on_wide_geometries() {
         map.insert(key, key);
     }
     for key in 0..key_count {
-        let prepared = PreparedElasticKey::new(key);
-        let mask = map
-            .table()
-            .route_filter(prepared)
-            .level_mask(prepared.route);
+        let prepared = PreparedElasticRoute::new(key);
+        let mask = map.table().route_filter(prepared).level_mask();
         assert!(mask != 0, "key {key} has no level recorded");
         assert!(
             mask.count_ones() < u32::try_from(ROUTE_SUMMARY_LEVELS).unwrap(),
@@ -1095,36 +1096,27 @@ fn prepared_route_keeps_the_geometry_independent_signature() {
 }
 
 #[test]
-fn compact_membership_matches_the_existing_signature_formula() {
-    for hash in (0..16_384_u64).map(|value| value.rotate_left(19)) {
-        let prepared = PreparedElasticKey::new(hash);
-        let signature = prepared.route.signature();
-        let expected = membership_bits_from_signature(signature);
-        assert_eq!(prepared.membership.bits(), expected);
-        for words in [1_usize, 3, 17, 257] {
-            let product = u128::from(signature) * u128::try_from(words).unwrap();
+fn metadata_place_matches_its_restatement() {
+    for hash in (0..16_384_u64).map(|value| value.rotate_left(19) ^ value.rotate_left(51)) {
+        let signature = PreparedElasticRoute::new(hash).signature();
+        // The last two are the largest counts whose scale keeps every bit.
+        let most = usize::MAX >> PLACE_FRACTION_BITS;
+        for words in [1_usize, 3, 17, 257, 65_537, most - 1, most] {
+            let place = MetadataPlace::new(signature, MetadataPlace::scale(words));
+            assert!(place.word() < words);
             assert_eq!(
-                MembershipKey::word(signature, words),
-                usize::try_from(product >> 64).unwrap(),
+                (place.word(), place.bits(), place.summary_bin()),
+                metadata_place_from_signature(signature, words),
+                "signature {signature:#x} over {words} words"
             );
         }
     }
 }
 
 #[test]
-fn prepared_elastic_key_uses_the_exact_probe_signature() {
-    let hash = 0xd1b5_4a32_d192_ed03;
-    let prepared = PreparedElasticKey::new(hash);
-    assert_eq!(
-        prepared.route.signature(),
-        prepared.route.probe.routing_signature()
-    );
-}
-
-#[test]
 fn elastic_controls_keep_the_public_hash_fingerprint() {
     let hash = 1_u64;
-    let prepared = PreparedElasticKey::new(hash);
+    let prepared = PreparedElasticRoute::new(hash);
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
 
@@ -1165,12 +1157,9 @@ fn route_summary_conservatively_records_every_live_level() {
     }
     for (key, level_index) in (0..key_count).zip(key_levels) {
         let level_index = level_index.unwrap();
-        let prepared = PreparedElasticKey::new(key);
+        let prepared = PreparedElasticRoute::new(key);
         assert_ne!(
-            map.table()
-                .route_filter(prepared)
-                .level_mask(prepared.route)
-                & (1 << summary_level(level_index)),
+            map.table().route_filter(prepared).level_mask() & (1 << summary_level(level_index)),
             0,
             "key {key} at level {level_index}"
         );
@@ -1180,7 +1169,7 @@ fn route_summary_conservatively_records_every_live_level() {
         map.table()
             .levels
             .iter()
-            .filter(|level| level.len() != 0)
+            .filter(|level| map.table().live_in(level) != 0)
             .count()
             > 1,
         "route summary must cover more than one occupied level"
@@ -1197,25 +1186,24 @@ fn route_summary_conservatively_records_every_live_level() {
     }
 
     map.clear();
-    assert!(map.table().levels.len() <= ROUTE_SUMMARY_LEVELS);
     for word in 0..map.table().membership.words {
         assert_eq!(
             // SAFETY: `word < words` indexes an initialized metadata word.
             unsafe { (*map.table().membership_ptr().add(word)).level_bins },
-            [NO_LEVELS_OCCUPIED; 4]
+            [NO_LEVELS_OCCUPIED; SUMMARY_BINS]
         );
     }
 }
 
 #[test]
-fn prepared_elastic_key_remains_geometry_independent_across_growth() {
+fn prepared_route_remains_geometry_independent_across_growth() {
     let hash = 0x9e37_79b9_7f4a_7c15;
-    let prepared = PreparedElasticKey::new(hash);
+    let prepared = PreparedElasticRoute::new(hash);
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(1, IdentityBuildHasher);
     map.insert(hash, 7);
     map.reserve(4_096);
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
     assert_eq!(map.get(&hash), Some(&7));
 }
 
@@ -1224,18 +1212,18 @@ fn membership_filter_never_forgets_live_or_deleted_hashes() {
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
     let inserted_hash = map.table().hash_builder.hash_one(7_u64);
-    let prepared = PreparedElasticKey::new(inserted_hash);
-    assert!(!membership_maybe_contains_prepared(map.table(), prepared));
+    let prepared = PreparedElasticRoute::new(inserted_hash);
+    assert!(!map.table().route_filter(prepared).maybe_present);
 
     assert_eq!(map.insert(7, 11), None);
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
 
     assert_eq!(map.insert(7, 13), Some(11));
     assert_eq!(map.len(), 1);
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
 
     assert_eq!(map.remove(&7), Some(13));
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
     assert_eq!(map.insert(7, 17), None);
     assert_eq!(map.get(&7), Some(&17));
 }
@@ -1252,27 +1240,28 @@ fn blocked_membership_never_forgets_inserted_hashes() {
         map.insert(key, key);
     }
     for key in 0..key_count {
-        assert!(membership_maybe_contains_prepared(
-            map.table(),
-            PreparedElasticKey::new(key)
-        ));
+        assert!(
+            map.table()
+                .route_filter(PreparedElasticRoute::new(key))
+                .maybe_present
+        );
     }
 }
 
 #[test]
 fn prepared_membership_remains_valid_across_growth() {
     let key = 0xD1B5_4A32_D192_ED03_u64;
-    let prepared = PreparedElasticKey::new(key);
+    let prepared = PreparedElasticRoute::new(key);
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(1, IdentityBuildHasher);
 
     map.insert(key, 7);
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
     let old_slots = map.table().total_slots;
 
     map.reserve(1_024);
     assert!(map.table().total_slots > old_slots);
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
     assert_eq!(map.get(&key), Some(&7));
 }
 
@@ -1287,20 +1276,24 @@ fn membership_filter_resets_and_rebuilds_at_table_boundaries() {
     let mut cloned = map.clone();
     for key in 0_u64..96 {
         let hash = cloned.table().hash_builder.hash_one(key);
-        assert!(membership_maybe_contains_prepared(
-            cloned.table(),
-            PreparedElasticKey::new(hash),
-        ));
+        assert!(
+            cloned
+                .table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
         assert_eq!(cloned.get(&key), Some(&(key ^ 0x55)));
     }
 
     cloned.clear();
     for key in 0_u64..96 {
         let hash = cloned.table().hash_builder.hash_one(key);
-        assert!(!membership_maybe_contains_prepared(
-            cloned.table(),
-            PreparedElasticKey::new(hash),
-        ));
+        assert!(
+            !cloned
+                .table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
     }
 
     for key in 256_u64..384 {
@@ -1309,10 +1302,12 @@ fn membership_filter_resets_and_rebuilds_at_table_boundaries() {
     cloned.reserve(512);
     for key in 256_u64..384 {
         let hash = cloned.table().hash_builder.hash_one(key);
-        assert!(membership_maybe_contains_prepared(
-            cloned.table(),
-            PreparedElasticKey::new(hash),
-        ));
+        assert!(
+            cloned
+                .table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
         assert_eq!(cloned.get(&key), Some(&key));
     }
 }
@@ -1328,10 +1323,11 @@ fn all_vacant_entry_apis_record_membership() {
 
     for key in [11_u64, 22, 33] {
         let hash = map.table().hash_builder.hash_one(key);
-        assert!(membership_maybe_contains_prepared(
-            map.table(),
-            PreparedElasticKey::new(hash)
-        ));
+        assert!(
+            map.table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
         assert!(map.contains_key(&key));
     }
 }
@@ -1346,10 +1342,11 @@ fn drain_and_failed_reserve_preserve_membership_invariants() {
     assert!(map.try_reserve(usize::MAX).is_err());
     for key in 0_u64..64 {
         let hash = map.table().hash_builder.hash_one(key);
-        assert!(membership_maybe_contains_prepared(
-            map.table(),
-            PreparedElasticKey::new(hash)
-        ));
+        assert!(
+            map.table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
         assert_eq!(map.get(&key), Some(&key));
     }
 
@@ -1357,10 +1354,11 @@ fn drain_and_failed_reserve_preserve_membership_invariants() {
     assert!(map.is_empty());
     for key in 0_u64..64 {
         let hash = map.table().hash_builder.hash_one(key);
-        assert!(!membership_maybe_contains_prepared(
-            map.table(),
-            PreparedElasticKey::new(hash)
-        ));
+        assert!(
+            !map.table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
     }
 }
 
@@ -1396,10 +1394,11 @@ fn allocator_failure_does_not_publish_or_forget_membership() {
     assert_eq!(map.try_reserve(4_096), Err(TryReserveError::AllocError));
     for key in 0_u64..64 {
         let hash = map.table().hash_builder.hash_one(key);
-        assert!(membership_maybe_contains_prepared(
-            map.table(),
-            PreparedElasticKey::new(hash)
-        ));
+        assert!(
+            map.table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
         assert_eq!(map.get(&key), Some(&(key ^ 0x5a)));
     }
 }
@@ -1434,7 +1433,7 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
         )
         .unwrap();
     let fingerprint = control::control_fingerprint_low(0);
-    let prepared = PreparedElasticKey::new(0);
+    let prepared = PreparedElasticRoute::new(0);
     let mut next_key = 0_u64;
 
     // Occupy every slot the shared hash can reach in every level, so no batch
@@ -1461,7 +1460,8 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
                             fingerprint,
                         );
                     }
-                    table.levels[level].counters_mut().len += 1;
+                    let counters = table.levels[level].counters_mut();
+                    table.uncounted.count_one(&mut counters.len);
                     table.placed += 1;
                     *next_key += 1;
                 }
@@ -1472,12 +1472,12 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
     assert!(table.live() < table.max_insertions);
     assert!(
         table
-            .choose_slot_for_new_key(prepared.route.probe, BatchTarget::Bootstrap)
+            .choose_slot_for_new_key(prepared.probe, BatchTarget::Bootstrap)
             .is_none()
     );
     assert!(
         table
-            .choose_slot_on_other_targets(prepared.route.probe, BatchTarget::Bootstrap)
+            .choose_slot_on_other_targets(prepared.probe, BatchTarget::Bootstrap)
             .is_none()
     );
 
@@ -1488,7 +1488,7 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
     assert_eq!(after.placement_recoveries, before.placement_recoveries + 1);
     assert_eq!(after.transition, EpochTransition::PlacementRecovery);
     assert_ne!(table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
-    assert!(membership_maybe_contains_prepared(&table, prepared));
+    assert!(table.route_filter(prepared).maybe_present);
     assert_eq!(
         table.find_slot_indices_prepared(&u64::MAX, prepared, fingerprint),
         Some(location)
@@ -1527,7 +1527,11 @@ fn direct_lookup_returns_the_compared_slot_reference() {
         );
     let mut insertion_count = 0;
     while insertion_count < table.max_insertions
-        && !table.levels.iter().skip(1).any(|level| level.len() > 0)
+        && !table
+            .levels
+            .iter()
+            .skip(1)
+            .any(|level| table.live_in(level) > 0)
     {
         let key = insertion_count;
         table.place_unique(
@@ -1540,13 +1544,17 @@ fn direct_lookup_returns_the_compared_slot_reference() {
         insertion_count += 1;
     }
     assert!(
-        table.levels.iter().skip(1).any(|level| level.len() > 0),
+        table
+            .levels
+            .iter()
+            .skip(1)
+            .any(|level| table.live_in(level) > 0),
         "test must exercise lookup beyond level 0"
     );
 
     for key in 0..insertion_count {
         let hash = table.hash_builder.hash_one(key);
-        let prepared = PreparedElasticKey::new(hash);
+        let prepared = PreparedElasticRoute::new(hash);
         let fingerprint = control::control_fingerprint_low(hash);
         let location = table
             .find_slot_indices_prepared(&key, prepared, fingerprint)
@@ -1561,7 +1569,7 @@ fn direct_lookup_returns_the_compared_slot_reference() {
 
     let missing = usize::MAX;
     let hash = table.hash_builder.hash_one(missing);
-    let prepared = PreparedElasticKey::new(hash);
+    let prepared = PreparedElasticRoute::new(hash);
     let fingerprint = control::control_fingerprint_low(hash);
     assert!(
         table
@@ -1582,7 +1590,7 @@ fn delete_below_cleanup_threshold_preserves_survivor_locations() {
             map.table()
                 .find_slot_indices_prepared(
                     &key,
-                    PreparedElasticKey::new(hash),
+                    PreparedElasticRoute::new(hash),
                     control::control_fingerprint_low(hash),
                 )
                 .unwrap()
@@ -1597,7 +1605,7 @@ fn delete_below_cleanup_threshold_preserves_survivor_locations() {
             map.table()
                 .find_slot_indices_prepared(
                     &key,
-                    PreparedElasticKey::new(hash),
+                    PreparedElasticRoute::new(hash),
                     control::control_fingerprint_low(hash),
                 )
                 .unwrap()
@@ -1744,7 +1752,7 @@ fn inserts_spill_to_deeper_levels_at_high_load() {
             .levels
             .iter()
             .skip(1)
-            .any(|level| level.len() > 0),
+            .any(|level| map.table().live_in(level) > 0),
         "expected the exact batch schedule to populate a deeper level"
     );
     for i in 0..max {
@@ -1764,7 +1772,12 @@ fn removing_every_entry_empties_every_level() {
         map.remove(&i);
     }
     assert_eq!(map.len(), 0);
-    assert!(map.table().levels.iter().all(|level| level.len() == 0));
+    assert!(
+        map.table()
+            .levels
+            .iter()
+            .all(|level| map.table().live_in(level) == 0)
+    );
 }
 
 #[test]
@@ -1789,7 +1802,7 @@ fn drop_continues_past_a_panicking_value() {
         .levels
         .iter()
         .skip(1)
-        .any(|level| level.len() > 0)
+        .any(|level| map.table().live_in(level) > 0)
     {
         map.insert(inserted, PanicOnFirstDrop(drops.clone()));
         inserted += 1;
@@ -1890,7 +1903,8 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
     for slot in fill_order {
         if slot == unreachable_slot
             || !control::is_free(table.levels[LEVEL].checked_control(slot))
-            || table.levels[LEVEL].free_slots() == level_slots / 16
+            || table.levels[LEVEL].free_slots(table.live_in(&table.levels[LEVEL]))
+                == level_slots / 16
         {
             continue;
         }
@@ -1905,7 +1919,8 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
                 control::OCCUPIED_BIT,
             );
         }
-        table.levels[LEVEL].counters_mut().len += 1;
+        let counters = table.levels[LEVEL].counters_mut();
+        table.uncounted.count_one(&mut counters.len);
         table.placed += 1;
         next_key += 1;
     }
@@ -1917,9 +1932,9 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
         "every reachable probe must be occupied"
     );
 
-    let prepared = PreparedElasticKey::new(key_hash);
+    let prepared = PreparedElasticRoute::new(key_hash);
     let placement = table
-        .choose_slot_for_new_key(prepared.route.probe, BatchTarget::LevelPair(LEVEL))
+        .choose_slot_for_new_key(prepared.probe, BatchTarget::LevelPair(LEVEL))
         .expect("Case 1 falls through to the next level");
     assert_eq!(placement.level, LEVEL + 1);
 }
@@ -1936,8 +1951,7 @@ fn keys_behind_another_on_their_route(
         let hash = table.hash_builder.hash_one(key);
         let (level, slot) = table.find(&key, hash).unwrap();
         let region = &table.levels[level];
-        let word = PreparedElasticKey::new(hash)
-            .route
+        let word = PreparedElasticRoute::new(hash)
             .probe
             .sequence(table.fold_multiplier)
             .word(probe::elastic_level_run(level).0);
@@ -2002,10 +2016,10 @@ fn a_table_without_metadata_words_rejects_every_lookup() {
     let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(0);
     assert_eq!(map.table().membership.words, 0);
     for key in 0..1_000_u64 {
-        let prepared = PreparedElasticKey::new(map.table().hash_builder.hash_one(key));
+        let prepared = PreparedElasticRoute::new(map.table().hash_builder.hash_one(key));
         let filter = map.table().route_filter(prepared);
         assert!(!filter.maybe_present);
-        assert_eq!(filter.level_mask(prepared.route), 0);
+        assert_eq!(filter.level_mask(), 0);
         assert_eq!(map.get(&key), None);
         assert!(!map.contains_key(&key));
         assert_eq!(map.remove(&key), None);
@@ -2035,12 +2049,12 @@ fn first_entry_in_a_deeper_level_reschedules_through_that_level() {
         let deepest = table
             .levels
             .iter()
-            .rposition(|level| level.len() > 0)
+            .rposition(|level| table.live_in(level) > 0)
             .unwrap();
         assert!(deepest < table.scheduled_levels as usize);
         if table.scheduled_levels != scheduled_levels {
             assert_eq!(table.scheduled_levels as usize, deepest + 1);
-            assert_eq!(table.levels[deepest].len(), 1);
+            assert_eq!(table.live_in(&table.levels[deepest]), 1);
             scheduled_levels = table.scheduled_levels;
             reschedules += 1;
         }
@@ -2174,7 +2188,7 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
         assert!(table.probe_schedule.addresses(&table.levels));
         for key in 0..2 * budget {
             let hash = table.hash_builder.hash_one(key);
-            let prepared = PreparedElasticKey::new(hash);
+            let prepared = PreparedElasticRoute::new(hash);
             let fingerprint = control::control_fingerprint_low(hash);
             let scheduled = table.find_slot_indices_prepared(&key, prepared, fingerprint);
             let scanned =
@@ -2185,8 +2199,8 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
             if filter.maybe_present {
                 let walked = table.find_by_general_schedule(
                     &key,
-                    prepared.route,
-                    filter.expanded_level_mask(prepared.route),
+                    prepared,
+                    filter.expanded_level_mask(),
                     fingerprint,
                     |level, slot, _| (level, slot),
                 );
@@ -2216,9 +2230,7 @@ fn settled_insert_slot_agrees_with_the_general_placement() {
             map.remove(&(key / 2));
         }
         let table = map.table();
-        let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
-            .route
-            .probe;
+        let probe = PreparedElasticRoute::new(table.hash_builder.hash_one(key)).probe;
         if let Some((level, slot, control)) = table.settled_slot(probe) {
             // SAFETY: the settled search returns a slot of `level`.
             assert_eq!(control, unsafe { table.levels[level].control_at(slot) });
@@ -2254,9 +2266,7 @@ fn shifted_vacancy_search_agrees_with_the_general_one() {
     let mut missed = 0;
     let keys = if cfg!(miri) { 300_u64 } else { 2_000 };
     for key in 0..keys {
-        let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
-            .route
-            .probe;
+        let probe = PreparedElasticRoute::new(table.hash_builder.hash_one(key)).probe;
         for level in 0..table.levels.len() {
             for budget in [0, 1, 2, 7, 64] {
                 let region = &table.levels[level];
@@ -2417,7 +2427,8 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
                 // in bounds; neither pointer is read.
                 let (scheduled, direct) = unsafe {
                     (
-                        table.probe_schedule.entry_at::<SlotEntry<u64, u64>>(
+                        ProbeSchedule::entry_at::<SlotEntry<u64, u64>>(
+                            table.probe_schedule.direct_reach().2,
                             ProbeSchedule::entry_offset::<SlotEntry<u64, u64>>(
                                 level.ctrl_ptr,
                                 slot,
@@ -2506,7 +2517,7 @@ fn lookup_and_insert_paths_hold_on_every_small_table_shape() {
                 None => {}
             }
             let hash = table.hash_builder.hash_one(key);
-            let probe = PreparedElasticKey::new(hash).route.probe;
+            let probe = PreparedElasticRoute::new(hash).probe;
             settled += usize::from(table.settled_slot(probe).is_some());
             assert_eq!(table.insert(key, key, hash), None);
             assert_eq!(table.insert(key, key, hash), Some(key));
@@ -2753,6 +2764,12 @@ fn the_fold_multiplier_as_a_hash_stays_findable_and_unflagged() {
     }
 }
 
+/// Free slots of the table's level `level`.
+fn free_in<K: Eq + Hash, V, S: BuildHasher>(table: &ElasticTable<K, V, S>, level: usize) -> usize {
+    let level = &table.levels[level];
+    level.free_slots(table.live_in(level))
+}
+
 /// Each level's counters against its control bytes, the table's live count
 /// against the levels', and every stored route summary's sentinel bit.
 fn assert_counters_match_controls(table: &ElasticTable<u64, u64, FixedHashBuilder>) {
@@ -2765,7 +2782,7 @@ fn assert_counters_match_controls(table: &ElasticTable<u64, u64, FixedHashBuilde
             occupied += usize::from(!control::is_free(control));
             tombstones += usize::from(control == crate::raw::control::CTRL_TOMBSTONE);
         }
-        assert_eq!(level.len() as usize, occupied);
+        assert_eq!(table.live_in(level) as usize, occupied);
         assert_eq!(level.tombstones() as usize, tombstones);
         live += occupied;
     }
@@ -2826,10 +2843,11 @@ fn settled_inserts_match_an_ordered_map_model() {
                 if settles {
                     settled += 1;
                     reused += usize::from(tombstones(&table) < before);
-                    assert!(membership_maybe_contains_prepared(
-                        &table,
-                        PreparedElasticKey::new(hash)
-                    ));
+                    assert!(
+                        table
+                            .route_filter(PreparedElasticRoute::new(hash))
+                            .maybe_present
+                    );
                 }
             } else if roll < 85 {
                 let removed = table
@@ -2900,9 +2918,7 @@ fn settled_gate_follows_the_live_count_through_a_clear_that_panicked() {
                     .would_settle(table.placed, table.stale_membership()),
                 table.scheduler.covers(table.live())
             );
-            let probe = PreparedElasticKey::new(table.hash_builder.hash_one(key))
-                .route
-                .probe;
+            let probe = PreparedElasticRoute::new(table.hash_builder.hash_one(key)).probe;
             let general = table
                 .choose_slot_for_new_key(probe, table.scheduler.target_at(table.live()))
                 .map(|placement| (placement.level, placement.slot));
@@ -3072,7 +3088,7 @@ fn take_agrees_with_find_then_remove() {
 
         assert_eq!(fused.epoch_snapshot(), split.epoch_snapshot());
         for (taken, removed) in fused.levels.iter().zip(&split.levels) {
-            assert_eq!(taken.len(), removed.len());
+            assert_eq!(fused.live_in(taken), split.live_in(removed));
             assert_eq!(taken.tombstones(), removed.tombstones());
         }
         for key in 0..universe {
@@ -3132,7 +3148,7 @@ fn reusing_a_tombstone_past_the_threshold_starts_a_cleanup_inside_the_batch() {
     }
     let threshold = {
         let level = &map.table().levels[0];
-        assert_eq!(u64::from(level.len()), live);
+        assert_eq!(u64::from(map.table().live_in(level)), live);
         capacity::tombstone_cleanup_threshold(level.capacity()) as u64
     };
     let departed = threshold + 4;
@@ -3214,13 +3230,15 @@ fn schedule_push_past_its_room_panics_instead_of_moving_the_routes() {
             Global,
         )
         .unwrap();
-    let mut schedule = ProbeScheduleRoom::try_with_capacity(1)
+    let mut schedule = ProbeScheduleRoom::try_for_levels(table.levels.len())
         .unwrap()
         .schedule(&table.levels);
-    assert_eq!(schedule.route_capacity(), 1);
-    schedule.push(&table.levels, 0, 1);
+    for logical_probe_index in 1..LEVEL_PROBE_LIMIT[0] {
+        schedule.push(&table.levels, 0, logical_probe_index);
+    }
     assert!(schedule.addresses(&table.levels));
-    schedule.push(&table.levels, 0, 2);
+    // One past the last probe level zero's run has a slot for.
+    schedule.push(&table.levels, 0, LEVEL_PROBE_LIMIT[0]);
 }
 
 #[test]
@@ -3243,7 +3261,7 @@ fn removing_a_full_table_leaves_no_tombstone_for_lookups() {
     assert_eq!(table.stale_membership(), 0);
     assert!(table.levels.iter().all(|level| level.tombstones() == 0));
     assert!((0..live).all(|key| {
-        let prepared = PreparedElasticKey::new(table.hash_builder.hash_one(key));
+        let prepared = PreparedElasticRoute::new(table.hash_builder.hash_one(key));
         !table.route_filter(prepared).maybe_present
     }));
 }
@@ -3252,7 +3270,9 @@ fn removing_a_full_table_leaves_no_tombstone_for_lookups() {
 #[cfg_attr(miri, ignore)]
 fn schedule_lookup_agrees_past_the_summary_width() {
     const SAMPLE_STRIDE: u64 = 4_099;
-    const DEEP_MISS_STRIDE: u64 = 61;
+    const ABSENT_STRIDE: usize = 16;
+    const SCATTER: u64 = 0x9E37_79B9_7F4A_7C15;
+    const ABSENT: u64 = 1 << 63;
     // A thin reserve lets the fill reach the levels that share the
     // summary's last bit, and the ones past it.
     let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
@@ -3279,19 +3299,29 @@ fn schedule_lookup_agrees_past_the_summary_width() {
     let mut deep_walked_misses = 0;
     let mut shallow_walked_misses = 0;
     let mut filtered_misses = 0;
-    for key in 0..2 * budget {
+    // A walk for an absent key the filter passes is the slow case, so the
+    // absent keys are a sample.
+    for index in (0..budget).chain((budget..2 * budget).step_by(ABSENT_STRIDE)) {
+        // The absent keys are scattered: a run of consecutive ones folds
+        // to places that interleave with the present run's, and then the
+        // filter rejects nearly all of them.
+        let key = if index < budget {
+            index
+        } else {
+            index.wrapping_mul(SCATTER) | ABSENT
+        };
         let hash = table.hash_builder.hash_one(key);
-        let prepared = PreparedElasticKey::new(hash);
+        let prepared = PreparedElasticRoute::new(hash);
         let fingerprint = control::control_fingerprint_low(hash);
         let scheduled = table.find_slot_indices_prepared(&key, prepared, fingerprint);
-        assert_eq!(scheduled.is_some(), key < budget, "key {key}");
+        assert_eq!(scheduled.is_some(), index < budget, "key {key}");
         let filter = table.route_filter(prepared);
-        let mask = filter.expanded_level_mask(prepared.route);
+        let mask = filter.expanded_level_mask();
         let deep_open = filter.maybe_present && mask >> saturated != 0;
         if filter.maybe_present {
             let walked = table.find_by_general_schedule(
                 &key,
-                prepared.route,
+                prepared,
                 mask,
                 fingerprint,
                 |level, slot, _| (level, slot),
@@ -3310,16 +3340,20 @@ fn schedule_lookup_agrees_past_the_summary_width() {
         } else {
             filtered_misses += 1;
         }
-        // The scan reads every slot, so it runs on the deep hits and a
-        // sample of the rest.
-        if deep_hit || key % SAMPLE_STRIDE == 0 || (deep_open && key % DEEP_MISS_STRIDE == 0) {
+        // The scan reads every slot, so it runs on the deep hits, the deep
+        // walked misses and a sample of the rest.
+        if deep_hit || deep_open || index % SAMPLE_STRIDE == 0 {
             let scanned =
                 table.find_by_full_scan(&key, fingerprint, |level, slot, _| (level, slot));
             assert_eq!(scheduled, scanned, "key {key}");
         }
     }
     assert!(saturated_hits > 0 && hits_past_the_summary > 0);
-    assert!(deep_walked_misses > 0 && shallow_walked_misses > 0 && filtered_misses > 0);
+    assert!(
+        deep_walked_misses > 0 && shallow_walked_misses > 0 && filtered_misses > 0,
+        "{deep_walked_misses} {shallow_walked_misses} {filtered_misses} {saturated_hits} \
+         {hits_past_the_summary}"
+    );
 }
 
 /// A settled insert against the general one, on twin tables through the
@@ -3375,7 +3409,7 @@ fn settled_plan_places_every_key_where_the_general_insert_does() {
                 if let Some(location) = general.find(&key, hash) {
                     assert_eq!(Some(general.replace_value(location, step)), previous);
                 } else {
-                    let prepared = PreparedElasticKey::new(hash);
+                    let prepared = PreparedElasticRoute::new(hash);
                     general.insert_for_vacant_entry_prepared(
                         key,
                         step,
@@ -3405,7 +3439,7 @@ fn settled_plan_places_every_key_where_the_general_insert_does() {
 
         assert_eq!(settled.epoch_snapshot(), general.epoch_snapshot());
         for (ours, theirs) in settled.levels.iter().zip(&general.levels) {
-            assert_eq!(ours.len(), theirs.len());
+            assert_eq!(settled.live_in(ours), general.live_in(theirs));
             assert_eq!(ours.tombstones(), theirs.tombstones());
             assert_eq!(ours.scheduled_probes, theirs.scheduled_probes);
         }
@@ -3418,6 +3452,111 @@ fn settled_plan_places_every_key_where_the_general_insert_does() {
             );
         }
     }
+}
+
+/// Settled inserts count late into their level; the general insert counts
+/// at once. Twin tables through the same inserts, removals, clears and
+/// growth, one by each insert, read the same at every step: each level's
+/// live count, which is also the count of its occupied control bytes, the
+/// capacity, the epoch and every key's slot. So do copies taken while
+/// inserts stand uncounted.
+#[test]
+fn late_counted_settled_inserts_read_as_counted_at_once() {
+    const STEPS: u64 = if cfg!(miri) { 1_200 } else { 120_000 };
+    type Table = ElasticTable<u64, u64, FixedHashBuilder>;
+    let build = || {
+        Table::try_with_slots_and_reserve_fraction_and_hasher_in(
+            64,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap()
+    };
+    let (mut late, mut eager) = (build(), build());
+    let mut model = alloc::collections::BTreeMap::<u64, u64>::new();
+    let mut state = 0x853c_49e6_748f_ea9b_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let uncounted = |table: &Table| table.uncounted.pending(table.placed);
+    let (mut removed_under, mut cleared_under, mut copied_under) = (0_u32, 0_u32, 0_u32);
+    let (mut grown, mut most_uncounted) = (0_u32, 0_u32);
+    for step in 0..STEPS {
+        let roll = next() % 1_000;
+        // Past the capacity in the first half, so the tables grow; within
+        // it in the second, so removals and reuse meet a full table.
+        let key_space = if step < STEPS / 2 {
+            late.max_insertions as u64 * 2
+        } else {
+            late.max_insertions as u64
+        };
+        let key = next() % key_space;
+        let hash = late.hash_builder.hash_one(key);
+        let slots = late.total_slots;
+        if roll < 600 {
+            let previous = model.insert(key, step);
+            assert_eq!(late.insert(key, step, hash), previous);
+            if let Some(location) = eager.find(&key, hash) {
+                assert_eq!(Some(eager.replace_value(location, step)), previous);
+            } else {
+                eager.insert_for_vacant_entry_prepared(
+                    key,
+                    step,
+                    PreparedElasticRoute::new(hash),
+                    control::control_fingerprint_low(hash),
+                );
+            }
+        } else if roll < 990 {
+            removed_under += u32::from(uncounted(&late) != 0 && model.contains_key(&key));
+            let removed = model.remove(&key);
+            assert_eq!(late.take(&key, hash).map(|(_, value)| value), removed);
+            assert_eq!(eager.take(&key, hash).map(|(_, value)| value), removed);
+        } else if roll < 992 {
+            cleared_under += u32::from(uncounted(&late) != 0);
+            model.clear();
+            late.clear();
+            eager.clear();
+        } else {
+            copied_under += u32::from(uncounted(&late) != 0);
+            let copy = late.clone_table();
+            assert_eq!(uncounted(&copy), 0);
+            assert_counters_match_controls(&copy);
+            assert_eq!(copy.epoch_snapshot(), late.epoch_snapshot());
+        }
+        assert_eq!(uncounted(&eager), 0);
+        most_uncounted = most_uncounted.max(uncounted(&late));
+        grown += u32::from(late.total_slots > slots);
+        assert_eq!(late.live(), model.len());
+        assert_eq!(late.total_slots, eager.total_slots);
+        assert_eq!(late.epoch_snapshot(), eager.epoch_snapshot());
+        assert_eq!(late.find(&key, hash), eager.find(&key, hash));
+        for (ours, theirs) in late.levels.iter().zip(&eager.levels) {
+            assert_eq!(late.live_in(ours), eager.live_in(theirs));
+            assert_eq!(ours.tombstones(), theirs.tombstones());
+        }
+        if step % 64 == 0 || step + 1 == STEPS {
+            assert_counters_match_controls(&late);
+            for (&key, &value) in &model {
+                let hash = late.hash_builder.hash_one(key);
+                let found = late.find(&key, hash);
+                assert_eq!(found, eager.find(&key, hash));
+                assert_eq!(
+                    late.find_entry(&key, hash).map(|entry| entry.value),
+                    Some(value)
+                );
+            }
+        }
+    }
+    assert!(
+        most_uncounted > 1,
+        "no run of settled inserts stood uncounted"
+    );
+    assert!(removed_under > 0 && cleared_under > 0 && copied_under > 0);
+    assert!(grown > 1, "the tables grew {grown} times");
 }
 
 #[test]
@@ -3443,7 +3582,7 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
         general.insert_for_vacant_entry_prepared(
             key,
             key,
-            PreparedElasticKey::new(hash),
+            PreparedElasticRoute::new(hash),
             control::control_fingerprint_low(hash),
         );
         assert_eq!(settled.find(&key, hash), general.find(&key, hash));
@@ -3451,9 +3590,8 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
         assert_gate_past_an_insert(general);
     };
     // What the pair's current level has free above half its reserve.
-    let room = |table: &Table| table.levels[1].free_slots() - table.levels[1].half_reserve as usize;
-    let fallback_low =
-        |table: &Table| table.levels[2].free_slots() * 4 <= table.levels[2].capacity();
+    let room = |table: &Table| free_in(table, 1) - table.levels[1].half_reserve as usize;
+    let fallback_low = |table: &Table| free_in(table, 2) * 4 <= table.levels[2].capacity();
 
     // Far enough into the second pair of levels that its current level's
     // budget turns keys away.
@@ -3492,11 +3630,12 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
         });
         assert_ne!(left, 0);
         for _ in 0..left {
-            let before = settled.levels[2].len();
+            let before = settled.live_in(&settled.levels[2]);
             let through_fallback =
                 settled.scheduler.settles(settled.placed) && !settled.settled_fallback.is_null();
             insert(&mut settled, &mut general, next_key);
-            fell_back += usize::from(through_fallback && settled.levels[2].len() > before);
+            fell_back +=
+                usize::from(through_fallback && settled.live_in(&settled.levels[2]) > before);
             live_keys.push(next_key);
             next_key += 1;
         }
@@ -3535,7 +3674,7 @@ fn settled_fallback_bound_holds_where_its_level_recrosses_a_quarter_free() {
         general.insert_for_vacant_entry_prepared(
             key,
             key,
-            PreparedElasticKey::new(hash),
+            PreparedElasticRoute::new(hash),
             control::control_fingerprint_low(hash),
         );
         assert_eq!(
@@ -3547,12 +3686,8 @@ fn settled_fallback_bound_holds_where_its_level_recrosses_a_quarter_free() {
     };
     // What the pair's current level has free above half its reserve, and
     // the level after it above a quarter of its slots.
-    let room = |table: &Table| table.levels[1].free_slots() - table.levels[1].half_reserve as usize;
-    let margin = |table: &Table| {
-        table.levels[2]
-            .free_slots()
-            .saturating_sub(table.levels[2].capacity() / 4)
-    };
+    let room = |table: &Table| free_in(table, 1) - table.levels[1].half_reserve as usize;
+    let margin = |table: &Table| free_in(table, 2).saturating_sub(table.levels[2].capacity() / 4);
 
     let mut next_key = 0_u64;
     while settled.scheduler.target_at(settled.live()) != BatchTarget::LevelPair(1)
@@ -3653,6 +3788,267 @@ fn settled_plan_stays_readable_past_a_leaked_drain() {
     }
 }
 
+/// Model check of the walk starts: under every summary value, the routes
+/// between a walk's start and its sentinel that the summary leaves open are
+/// the pushed routes it leaves open, in the same order. The walk skips the
+/// others and closes levels by what it probes, so it probes the same slots
+/// from either start. Checked through a schedule's whole growth, where the
+/// pushed routes take the runs' slots one level after another, and again
+/// after the schedule is dropped and rebuilt.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn every_walk_start_leads_to_the_routes_its_summary_leaves_open() {
+    for slots in [16, 64, 1_024, 1 << 15] {
+        let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                slots,
+                ReserveFraction::DEFAULT,
+                IdentityBuildHasher,
+                Global,
+            )
+            .unwrap();
+        let level_count = table.levels.len();
+        let assert_starts = |table: &ElasticTable<u64, u64, IdentityBuildHasher>| {
+            let schedule = &table.probe_schedule;
+            assert!(schedule.addresses(&table.levels));
+            for summary in SummaryBin::MIN..=SummaryBin::MAX {
+                let closed = schedule::closed_levels(summary);
+                let open = |route: &&PhiRoute| !route.as_step().is_closed(closed);
+                let walked = schedule.walk_routes(summary);
+                assert!(
+                    walked
+                        .iter()
+                        .filter(open)
+                        .eq(schedule.routes().iter().filter(open)),
+                    "{slots} slots, summary {summary:#010b}"
+                );
+                // A summary that leaves at most one level open, and that a
+                // level whose run is whole, has no route to skip.
+                let open_levels = (0..level_count)
+                    .filter(|&level| closed & (2 << level) == 0)
+                    .collect::<Vec<_>>();
+                let stored = summary & !NO_LEVELS_OCCUPIED == 0
+                    && (level_count..ROUTE_SUMMARY_LEVELS).all(|level| summary & (2 << level) != 0);
+                if stored
+                    && (open_levels.is_empty()
+                        || open_levels.len() == 1 && open_levels[0] < schedule.whole_runs())
+                {
+                    assert_eq!(walked.iter().filter(open).count(), walked.len());
+                }
+            }
+        };
+
+        let mut whole_runs_seen = alloc::vec![false; level_count + 1];
+        for _ in 0..2 {
+            // Rebuilt up to no position at all, the schedule is empty.
+            table.probe_high_water &= HIGH_WATER_FLAGS;
+            table.schedule_levels_through(level_count - 1);
+            assert_eq!(table.probe_schedule.routes(), []);
+            assert_eq!(table.probe_schedule.whole_runs(), level_count);
+            let mut high_water = 0_u128;
+            while high_water < QUERY_POSITION_CAP {
+                high_water = (high_water + high_water / 4 + 1).min(QUERY_POSITION_CAP);
+                table.extend_probe_schedule(high_water);
+                assert_starts(&table);
+                whole_runs_seen[table.probe_schedule.whole_runs()] = true;
+            }
+            assert_eq!(
+                table.probe_schedule.routes().len(),
+                table.probe_schedule.route_capacity()
+            );
+        }
+        // The full schedule leaves no run whole, and takes them over its
+        // growth, not at once.
+        let seen = whole_runs_seen.iter().filter(|&&seen| seen).count();
+        assert!(
+            whole_runs_seen[0] && seen >= 3.min(level_count + 1),
+            "{slots} slots"
+        );
+    }
+}
+
+#[test]
+fn run_walk_steps_over_its_level_routes_and_stops_at_a_sentinel() {
+    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            8_193,
+            ReserveFraction::DEFAULT,
+            IdentityBuildHasher,
+            Global,
+        )
+        .unwrap();
+    let level_count = table.levels.len();
+    table.schedule_levels_through(level_count - 1);
+    table.extend_probe_schedule(1_024);
+    let schedule = &table.probe_schedule;
+    assert!(schedule.whole_runs() >= ROUTE_SUMMARY_LEVELS);
+
+    let walk = |summary: SummaryBin, level: Option<usize>| {
+        let mut run = schedule.walk_start(summary).run().unwrap();
+        let held = schedule
+            .routes()
+            .iter()
+            .filter(|route| Some(usize::from(route.level())) == level);
+        let mut steps = 0;
+        for held in held {
+            // SAFETY: the walk is ahead of the run's sentinel, which follows
+            // every route of the level.
+            let sequence_index = unsafe { run.step() };
+            assert_eq!(sequence_index, held.as_step().sequence_index());
+            // SAFETY: the walk has stepped onto a route of the schedule.
+            assert_eq!(unsafe { *run.route() }, *held);
+            steps += 1;
+        }
+        // SAFETY: as above; the level's last route is ahead of the sentinel.
+        assert_eq!(unsafe { run.step() }, 0);
+        // SAFETY: the sentinel is a route of the schedule.
+        assert_eq!(unsafe { (*run.route()).level() }, SENTINEL_LEVEL);
+        steps
+    };
+    assert_eq!(walk(NO_LEVELS_OCCUPIED, None), 0);
+    for level in 0..ROUTE_SUMMARY_LEVELS - 1 {
+        assert_ne!(walk(NO_LEVELS_OCCUPIED & !(2 << level), Some(level)), 0);
+    }
+    // Two open levels are no run's.
+    assert!(
+        schedule
+            .walk_start(NO_LEVELS_OCCUPIED & !0b110)
+            .run()
+            .is_err()
+    );
+}
+
+type ComparesCountedMap = ElasticHashMap<ComparesCounted, u64, FixedHashBuilder>;
+
+/// Clears the count of key compares and returns what it was.
+fn take_key_compares() -> u64 {
+    KEY_COMPARES.with(|compares| compares.replace(0))
+}
+
+/// Looks every key below `universe` up in both maps and asserts that they
+/// find it in the same slot after the same key compares, and hold what
+/// `model` does. Returns how many of the walks `started` would make start
+/// at a run and how many at the direct route.
+fn assert_twin_lookups_agree(
+    started: &ComparesCountedMap,
+    direct: &ComparesCountedMap,
+    model: &alloc::collections::BTreeMap<u64, u64>,
+    universe: u64,
+) -> (u64, u64) {
+    let (started, direct) = (started.table(), direct.table());
+    let (mut from_runs, mut from_direct) = (0, 0);
+    for key in 0..universe {
+        let counted = ComparesCounted::new(key, &started.hash_builder);
+        let hash = started.hash_builder.hash_one(counted);
+        take_key_compares();
+        let found = started.find(&counted, hash);
+        let ours = take_key_compares();
+        assert_eq!(found, direct.find(&counted, hash));
+        assert_eq!(ours, take_key_compares(), "key {key}");
+        assert_eq!(
+            started.find_entry(&counted, hash).map(|entry| entry.value),
+            model.get(&key).copied()
+        );
+        let summary = started
+            .route_filter(PreparedElasticRoute::new(hash))
+            .summary();
+        assert!(direct.probe_schedule.walk_start(summary).run().is_err());
+        let at_direct = started.probe_schedule.walk_start(summary).run().is_err();
+        from_runs += u64::from(!at_direct);
+        from_direct += u64::from(at_direct);
+    }
+    (from_runs, from_direct)
+}
+
+/// Twin maps take the same inserts and removals, with an ordered map as the
+/// model: one starts each walk where its summary says, the other starts
+/// every walk at the direct route. Through fills, removals that leave
+/// tombstones, the rebuilds they bring and growth, both find every key in
+/// the same slot after the same key compares, and neither finds an absent
+/// one.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn walks_from_their_starts_probe_what_walks_from_the_direct_route_do() {
+    let start_at_direct = |map: &mut ComparesCountedMap| {
+        map.table_mut()
+            .probe_schedule
+            .start_walks_at_the_direct_route();
+    };
+    let mut cleanups = 0_u64;
+    for capacity in [48, 900, 28_672] {
+        let build = || ComparesCountedMap::with_capacity_and_hasher(capacity, fixed_hasher());
+        let (mut started, mut direct) = (build(), build());
+        let mut model = alloc::collections::BTreeMap::new();
+        let universe = started.capacity() as u64;
+
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let (mut from_runs, mut from_direct) = (0_u64, 0_u64);
+        let mut tombstones = 0_u64;
+        for step in 0..universe * 8 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let key = (state >> 33) % universe;
+            let counted = ComparesCounted::new(key, started.hasher());
+            // Fill, thin out, refill, then churn.
+            let insert = match step / (universe * 2) {
+                0 | 2 => state >> 60 != 0,
+                1 => state >> 62 == 0,
+                _ => state >> 63 == 0,
+            };
+            let generation = started.epoch().generation;
+            take_key_compares();
+            let ours = if insert {
+                let previous = model.insert(key, step);
+                assert_eq!(started.insert(counted, step), previous);
+                let ours = take_key_compares();
+                assert_eq!(direct.insert(counted, step), previous);
+                ours
+            } else {
+                let removed = model.remove(&key);
+                assert_eq!(started.remove(&counted), removed);
+                let ours = take_key_compares();
+                assert_eq!(direct.remove(&counted), removed);
+                ours
+            };
+            assert_eq!(ours, take_key_compares(), "step {step}");
+            start_at_direct(&mut direct);
+            assert_eq!(started.len(), model.len());
+            assert_eq!(started.epoch(), direct.epoch());
+            let epoch = started.epoch();
+            cleanups += u64::from(
+                epoch.generation != generation
+                    && epoch.transition == EpochTransition::TombstoneCleanup,
+            );
+            let levels = &started.table().levels;
+            tombstones += u64::from(levels.iter().any(|level| level.tombstones() != 0));
+            if (step + 1) % universe == 0 {
+                let (runs, direct) = assert_twin_lookups_agree(&started, &direct, &model, universe);
+                from_runs += runs;
+                from_direct += direct;
+            }
+        }
+        assert_eq!(started.capacity() as u64, universe);
+        assert!(tombstones > universe, "{capacity}");
+        assert!(
+            from_runs > universe && from_direct > universe / 8,
+            "{capacity}: {from_runs} walks from runs, {from_direct} from the direct route"
+        );
+
+        // Then past the capacity, into a grown table.
+        for key in universe..2 * universe {
+            let counted = ComparesCounted::new(key, started.hasher());
+            model.insert(key, key);
+            assert_eq!(started.insert(counted, key), None);
+            assert_eq!(direct.insert(counted, key), None);
+            start_at_direct(&mut direct);
+        }
+        assert!(started.capacity() as u64 > universe);
+        assert_twin_lookups_agree(&started, &direct, &model, 2 * universe);
+    }
+    assert_ne!(cleanups, 0);
+}
+
 #[test]
 fn route_step_and_reach_read_what_each_route_holds() {
     let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
@@ -3700,5 +4096,212 @@ fn signed_control_sign_extends_every_byte() {
         assert_eq!(signed, i32::from(byte.cast_signed()));
         assert_eq!(signed >= 0, control::is_free(byte));
         assert_eq!(signed.to_le_bytes()[0], byte);
+    }
+}
+
+/// Splitmix64 of `index`: keys with no structure in any bit.
+fn scattered(index: u64) -> u64 {
+    let mut word = index.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    word = (word ^ (word >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    word = (word ^ (word >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    word ^ (word >> 31)
+}
+
+/// A hasher with nothing in its low bits leaves the filter as selective as
+/// one that fills them: a key's place comes from the top of its hash.
+///
+/// Two bounds hold for every family. A key passes only if its first bit is
+/// set, and the keys of a full table set at most [`MEMBERSHIP_BITS`] bits
+/// each, so the passes of uniformly placed absent keys are a count whose
+/// mean is at most that share of the sample. And the passes of a family
+/// without low bits and of the family with them are two such counts. A
+/// count of independent passes has a variance of at most its mean, so six
+/// deviations allow the square of an excess thirty-six times the mean, and
+/// the square of a difference of two counts twice that. The families share
+/// their high bits, so their counts sit closer than counts of independent
+/// samples would; the bound asks for no more than it can derive.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn the_filter_keeps_its_rate_for_hashes_without_low_bits() {
+    const CAPACITY: u64 = 28_672;
+    const SAMPLE: u64 = 4 * CAPACITY;
+    let passes = |low_bits: u32| {
+        let key_at = |index: u64| scattered(index) & !((1 << low_bits) - 1);
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(
+                usize::try_from(CAPACITY).unwrap(),
+                IdentityBuildHasher,
+            );
+        for index in 0..CAPACITY {
+            assert_eq!(map.insert(key_at(index), index), None);
+        }
+        let table = map.table();
+        let lane_bits = u64::try_from(table.membership.words).unwrap() * u64::from(u64::BITS);
+        let mean =
+            (SAMPLE * CAPACITY * u64::try_from(MEMBERSHIP_BITS).unwrap()).div_ceil(lane_bits);
+        let mut passes = 0_u64;
+        for index in CAPACITY..CAPACITY + SAMPLE {
+            let key = key_at(index);
+            assert!(!map.contains_key(&key));
+            let filter = table.route_filter(PreparedElasticRoute::new(key));
+            passes += u64::from(filter.maybe_present);
+        }
+        let excess = passes.saturating_sub(mean);
+        assert!(
+            excess * excess <= 36 * mean,
+            "{passes} of {SAMPLE} keys without their low {low_bits} bits pass, over a mean of \
+             {mean}"
+        );
+        passes
+    };
+    let uniform = passes(0);
+    for low_bits in [3, 6, 7] {
+        let difference = passes(low_bits).abs_diff(uniform);
+        assert!(
+            difference * difference <= 72 * uniform,
+            "keys without their low {low_bits} bits pass {difference} apart from {uniform}"
+        );
+    }
+}
+
+std::thread_local! {
+    /// Key compares [`ComparesCounted`] made on this thread.
+    static KEY_COMPARES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// A key that counts its compares and hashes as the `u64` it holds. It
+/// carries its control fingerprint, so a compare with a key of another
+/// fingerprint, which the control byte should have ruled out, fails.
+#[derive(Clone, Copy, Debug)]
+struct ComparesCounted {
+    key: u64,
+    fingerprint: u8,
+}
+
+impl ComparesCounted {
+    fn new(key: u64, hasher: &impl BuildHasher) -> Self {
+        let unmarked = Self {
+            key,
+            fingerprint: 0,
+        };
+        Self {
+            key,
+            fingerprint: control::control_fingerprint_low(hasher.hash_one(unmarked)),
+        }
+    }
+}
+
+impl PartialEq for ComparesCounted {
+    fn eq(&self, other: &Self) -> bool {
+        assert_eq!(self.fingerprint, other.fingerprint);
+        KEY_COMPARES.with(|compares| compares.set(compares.get() + 1));
+        self.key == other.key
+    }
+}
+
+impl Eq for ComparesCounted {}
+
+impl Hash for ComparesCounted {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.key);
+    }
+}
+
+/// Fills a table with the first keys of a family and looks up those and as
+/// many more, absent ones, asserting that the compares against other keys
+/// stay within what the family's own fingerprints explain.
+///
+/// A lookup probes each scheduled route at most once, and a probed slot
+/// holds another key of the family, which shares the fingerprint with the
+/// family's collision probability: the pairs of keys with equal
+/// fingerprints, over all pairs. So the mean of the compares of as many
+/// lookups as keys is at most the routes times the equal pairs over the
+/// keys, and six deviations of a count with that mean allow the square of
+/// an excess thirty-six times it. The routes overstate the probes a lookup
+/// makes, so the bound catches compares that multiply past the family's
+/// collisions, not a rate above the expected one, and a family whose keys
+/// share one fingerprint is bound by the routes alone.
+fn assert_compares_within_fingerprint_collisions<S: BuildHasher + Clone>(
+    family: &str,
+    hasher: &S,
+    distinct_fingerprints: usize,
+    key_at: impl Fn(u64) -> u64,
+) {
+    const CAPACITY: u64 = 28_672;
+    let mut map: ElasticHashMap<ComparesCounted, u64, S> = ElasticHashMap::with_capacity_and_hasher(
+        usize::try_from(CAPACITY).unwrap(),
+        hasher.clone(),
+    );
+    let mut fingerprints = [0_u64; 1 << u8::BITS];
+    for index in 0..CAPACITY {
+        let key = ComparesCounted::new(key_at(index), hasher);
+        fingerprints[usize::from(key.fingerprint)] += 1;
+        assert_eq!(map.insert(key, index), None);
+    }
+    assert!(
+        fingerprints.iter().filter(|&&keys| keys != 0).count() >= distinct_fingerprints,
+        "{family}: fewer than {distinct_fingerprints} fingerprints"
+    );
+    let equal_pairs: u64 = fingerprints.iter().map(|keys| keys * keys).sum();
+    let routes = u64::try_from(map.table().probe_schedule.routes().len()).unwrap() + 1;
+    let mean = (routes * equal_pairs).div_ceil(CAPACITY);
+    let within = |compares: u64, lookups: &str| {
+        let excess = compares.saturating_sub(mean);
+        assert!(
+            excess * excess <= 36 * mean,
+            "{family}: {compares} compares against other keys on {lookups}, over a mean of {mean}"
+        );
+    };
+
+    KEY_COMPARES.with(|compares| compares.set(0));
+    for index in 0..CAPACITY {
+        assert_eq!(
+            map.get(&ComparesCounted::new(key_at(index), hasher)),
+            Some(&index)
+        );
+    }
+    within(KEY_COMPARES.with(core::cell::Cell::get) - CAPACITY, "hits");
+
+    KEY_COMPARES.with(|compares| compares.set(0));
+    for index in CAPACITY..2 * CAPACITY {
+        assert_eq!(map.get(&ComparesCounted::new(key_at(index), hasher)), None);
+    }
+    within(KEY_COMPARES.with(core::cell::Cell::get), "misses");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn compares_against_other_keys_stay_within_routes_times_fingerprint_collisions() {
+    let fingerprints = 1_usize << (u8::BITS - 1);
+    assert_compares_within_fingerprint_collisions(
+        "hashed, consecutive",
+        &fixed_hasher(),
+        fingerprints,
+        |index| index,
+    );
+    let identity = |family: &str, distinct_fingerprints: usize, key_at: &dyn Fn(u64) -> u64| {
+        assert_compares_within_fingerprint_collisions(
+            family,
+            &IdentityBuildHasher,
+            distinct_fingerprints,
+            key_at,
+        );
+    };
+    identity("consecutive", fingerprints, &|index| index);
+    identity("odd multiples", fingerprints, &|index| {
+        index.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    });
+    // A step with three low zero bits leaves the fingerprint four.
+    identity("thousands", fingerprints >> 3, &|index| index * 1_000);
+    for shift in [6_u32, 7, 16, 32, 48] {
+        let distinct = fingerprints >> shift.min(u8::BITS - 1);
+        identity("shifted", distinct, &|index| (index + 1) << shift);
+    }
+    for low_bits in [3_u32, 6, 7] {
+        identity(
+            "scattered, no low bits",
+            fingerprints >> low_bits,
+            &|index| scattered(index) & !((1 << low_bits) - 1),
+        );
     }
 }
