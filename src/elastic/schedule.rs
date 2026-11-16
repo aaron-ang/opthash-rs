@@ -1148,9 +1148,10 @@ impl ProbeSchedule {
 
     /// Whether every route is the one its level in `levels` gives, every
     /// whole run holds its level's pushed routes in order and every whole
-    /// group's run its levels', and every walk start is the direct route,
-    /// the lead of a whole run or of a whole group's, or the slot ahead of
-    /// the last.
+    /// group's run its levels', and every walk start is the one its
+    /// summary has: the lead of the whole run of the one level or group it
+    /// leaves open, the slot ahead of the last where it leaves none open,
+    /// and the direct route otherwise.
     #[cfg(test)]
     pub(super) fn addresses<T>(&self, levels: &[Level<T>]) -> bool {
         let book = &*self.book;
@@ -1211,23 +1212,22 @@ impl ProbeSchedule {
                     && slot(first + len) == SENTINEL
             })
             && (SummaryBin::MIN..=SummaryBin::MAX).all(|summary| {
-                match self.walk_start(summary).run() {
-                    Err(ahead) => {
-                        ahead == self.direct()
-                            || (0..GROUPS).any(|group| {
-                                book.whole_groups >> group & 1 != 0
-                                    && summary == group_summary(group)
-                                    && ahead
-                                        == self.slots[book.group_runs[group].lead()].as_ptr().cast()
-                            })
-                    }
-                    Ok(run) => {
-                        run.route() == self.slots[self.slots.len() - 2].as_ptr()
-                            || (0..book.whole_runs).any(|level| {
-                                run.route() == self.slots[run_lead(book.levels, level)].as_ptr()
-                            })
-                    }
-                }
+                let slot = |slot: usize| self.slots[slot].as_ptr().cast::<PhiRoute>();
+                let group = (0..GROUPS).find(|&group| {
+                    book.whole_groups >> group & 1 != 0 && summary == group_summary(group)
+                });
+                let level = (0..book.whole_runs)
+                    .find(|&level| lone_level_summary(book.levels, level) == Some(summary));
+                let start = if let Some(group) = group {
+                    WalkStart::at_list(slot(book.group_runs[group].lead()))
+                } else if let Some(level) = level {
+                    WalkStart::at_run(slot(run_lead(book.levels, level)))
+                } else if summary == NO_LEVELS_OCCUPIED {
+                    WalkStart::at_run(slot(self.slots.len() - 2))
+                } else {
+                    WalkStart::at_list(self.direct())
+                };
+                self.walk_start(summary) == start
             })
     }
 
