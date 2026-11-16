@@ -111,7 +111,14 @@ impl MembershipRegion {
         base: Layout,
         total_slots: usize,
     ) -> Result<(Layout, Self), TryReserveError> {
-        let words = word_count(total_slots);
+        Self::extend_words::<W>(base, word_count(total_slots))
+    }
+
+    /// [`Self::extend`] for a tail of `words` words.
+    pub(crate) fn extend_words<W>(
+        base: Layout,
+        words: usize,
+    ) -> Result<(Layout, Self), TryReserveError> {
         if words == 0 {
             return Ok((base, Self::EMPTY));
         }
