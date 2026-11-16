@@ -20,8 +20,8 @@ pub(crate) fn is_free(byte: u8) -> bool {
     byte & OCCUPIED_BIT == 0
 }
 
-/// Occupied control byte for a word that is already mixed: its low seven
-/// bits under `OCCUPIED_BIT`.
+/// Occupied control byte from `word`'s low seven bits, under
+/// `OCCUPIED_BIT`.
 #[inline]
 #[must_use]
 pub(crate) const fn control_fingerprint_low(word: u64) -> u8 {

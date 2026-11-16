@@ -2941,6 +2941,32 @@ fn assert_settled_gate(table: &ElasticTable<u64, u64, FixedHashBuilder>, shifted
     assert!(in_batch || !table.scheduler.settles(table.placed));
 }
 
+/// An open gate stands on the plan the table gives now, and ends no later
+/// than that plan does.
+fn assert_open_gate_is_the_plan(table: &ElasticTable<u64, u64, FixedHashBuilder>) {
+    if !table.scheduler.settles(table.placed) {
+        return;
+    }
+    let plan = table.settled_plan().expect("an open gate has a plan");
+    assert_eq!(
+        table.plan_words(plan.level, plan.budget, plan.fallback),
+        // SAFETY: the gate is open.
+        unsafe { table.open_words() }
+    );
+    assert!(table.scheduler.settled_end <= plan.end);
+}
+
+/// Past an insert the gate is open wherever the table has a plan, on that
+/// plan, except where the insert was the last its plan held for.
+fn assert_gate_past_an_insert(table: &ElasticTable<u64, u64, FixedHashBuilder>) {
+    assert_open_gate_is_the_plan(table);
+    assert!(
+        table.scheduler.settles(table.placed)
+            || table.scheduler.settled_end == table.placed
+            || table.settled_plan().is_none()
+    );
+}
+
 #[test]
 fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
     for (slots, shifted) in [(1_024, true), (1_000, false), (4_096, true)] {
@@ -2979,13 +3005,7 @@ fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
                 let hash = table.hash_builder.hash_one(fresh);
                 assert_eq!(table.insert(fresh, fresh, hash), None);
                 assert_settled_gate(&table, shifted);
-                // Past an insert the gate is open only where it may be.
-                assert!(
-                    !table.scheduler.settles(table.placed)
-                        || table
-                            .scheduler
-                            .would_settle(table.placed, table.stale_membership())
-                );
+                assert_gate_past_an_insert(&table);
                 reopened += usize::from(table.scheduler.settles(table.placed));
             }
         }
@@ -3361,10 +3381,17 @@ fn settled_plan_places_every_key_where_the_general_insert_does() {
                         control::control_fingerprint_low(hash),
                     );
                 }
+                assert_open_gate_is_the_plan(&settled);
+                assert_open_gate_is_the_plan(&general);
+                if absent {
+                    assert_gate_past_an_insert(&settled);
+                    assert_gate_past_an_insert(&general);
+                }
             } else {
                 let removed = model.remove(&key);
                 assert_eq!(settled.take(&key, hash).map(|(_, value)| value), removed);
                 assert_eq!(general.take(&key, hash).map(|(_, value)| value), removed);
+                assert!(!settled.scheduler.settles(settled.placed) || removed.is_none());
             }
             assert_eq!(settled.find(&key, hash), general.find(&key, hash));
             assert_eq!(settled.live(), model.len());
@@ -3417,6 +3444,8 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
             control::control_fingerprint_low(hash),
         );
         assert_eq!(settled.find(&key, hash), general.find(&key, hash));
+        assert_gate_past_an_insert(settled);
+        assert_gate_past_an_insert(general);
     };
     // What the pair's current level has free above half its reserve.
     let room = |table: &Table| table.levels[1].free_slots() - table.levels[1].half_reserve as usize;
@@ -3479,4 +3508,182 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
         let hash = hash_of(key);
         assert_eq!(settled.find(&key, hash), general.find(&key, hash));
     }
+}
+
+#[test]
+fn settled_fallback_bound_holds_where_its_level_recrosses_a_quarter_free() {
+    type Table = ElasticTable<u64, u64, FixedHashBuilder>;
+
+    let build = || {
+        Table::try_with_slots_and_reserve_fraction_and_hasher_in(
+            1 << 12,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap()
+    };
+    let (mut settled, mut general) = (build(), build());
+    let hash_of = |key: u64| fixed_hasher().hash_one(key);
+    let insert = |settled: &mut Table, general: &mut Table, key: u64| {
+        let hash = hash_of(key);
+        assert_eq!(settled.insert(key, key, hash), None);
+        general.insert_for_vacant_entry_prepared(
+            key,
+            key,
+            PreparedElasticKey::new(hash),
+            control::control_fingerprint_low(hash),
+        );
+        assert_eq!(
+            settled.find(&key, hash),
+            general.find(&key, hash),
+            "key {key}"
+        );
+        assert_gate_past_an_insert(settled);
+    };
+    // What the pair's current level has free above half its reserve, and
+    // the level after it above a quarter of its slots.
+    let room = |table: &Table| table.levels[1].free_slots() - table.levels[1].half_reserve as usize;
+    let margin = |table: &Table| {
+        table.levels[2]
+            .free_slots()
+            .saturating_sub(table.levels[2].capacity() / 4)
+    };
+
+    let mut next_key = 0_u64;
+    while settled.scheduler.target_at(settled.live()) != BatchTarget::LevelPair(1)
+        || room(&settled) > 8
+    {
+        insert(&mut settled, &mut general, next_key);
+        next_key += 1;
+    }
+
+    // Keys leave the current level to keep it near half its reserve, the
+    // level after it to keep it near a quarter free, and the first level to
+    // keep the batch from ending, so the level after the current one comes
+    // down to a quarter free again and again, under an open gate.
+    let mut live_keys: Vec<u64> = (0..next_key).collect();
+    let base_live = settled.live();
+    let mut crossed_open = 0;
+    let rounds = if cfg!(miri) { 40 } else { 4_000 };
+    for _ in 0..rounds {
+        let mut removed = 0_usize;
+        live_keys.retain(|&key| {
+            let hash = hash_of(key);
+            let level = settled.find(&key, hash).unwrap().0;
+            let leaves = (level == 1 && room(&settled) < 40)
+                || (level == 2 && margin(&settled) < 2)
+                || (level == 0 && settled.live() > base_live);
+            if leaves {
+                assert_eq!(settled.take(&key, hash), general.take(&key, hash));
+                removed += 1;
+            }
+            !leaves
+        });
+        let was_above = margin(&settled) > 0;
+        let mut open_through = true;
+        for _ in 0..removed.max(8) {
+            if room(&settled) <= 1 {
+                break;
+            }
+            let open = settled.scheduler.settles(settled.placed);
+            insert(&mut settled, &mut general, next_key);
+            open_through &= open || settled.scheduler.settles(settled.placed);
+            live_keys.push(next_key);
+            next_key += 1;
+        }
+        crossed_open += usize::from(was_above && margin(&settled) == 0 && open_through);
+        assert_eq!(
+            settled.scheduler.target_at(settled.live()),
+            BatchTarget::LevelPair(1)
+        );
+    }
+    assert!(cfg!(miri) || crossed_open > 4, "{crossed_open} crossings");
+}
+
+#[test]
+fn settled_plan_stays_readable_past_a_replaced_value() {
+    let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            1 << 8,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+    for key in 0..20_u64 {
+        let hash = table.hash_builder.hash_one(key);
+        assert_eq!(table.insert(key, key, hash), None);
+    }
+    assert!(table.scheduler.settles(table.placed));
+    let hash = table.hash_builder.hash_one(3_u64);
+    let location = table.find(&3, hash).unwrap();
+    assert_eq!(map::TableBackend::replace_value(&mut table, location, 9), 3);
+    // Replacing a value borrows the levels and leaves the gate open on the
+    // plan the next inserts read.
+    assert!(table.scheduler.settles(table.placed));
+    for key in 100..110_u64 {
+        let hash = table.hash_builder.hash_one(key);
+        assert_eq!(table.insert(key, key, hash), None);
+    }
+    assert_eq!(table.find(&3, hash).map(|_| ()), Some(()));
+}
+
+#[test]
+fn settled_plan_stays_readable_past_a_leaked_drain() {
+    let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(256);
+    for key in 0..20 {
+        map.insert(key, key);
+    }
+    assert!(map.table().scheduler.settles(map.table().placed));
+    // A drain tombstones the slot of each key it yields through a borrow of
+    // the levels, and only its drop closes the gate.
+    let mut drain = map.drain();
+    let (taken, _) = drain.next().unwrap();
+    mem::forget(drain);
+    assert!(map.table().scheduler.settles(map.table().placed));
+    for key in 100..110 {
+        assert_eq!(map.insert(key, key), None);
+    }
+    for key in (0..20).chain(100..110) {
+        assert_eq!(map.get(&key).is_some(), key != taken, "{key}");
+    }
+}
+
+#[test]
+fn route_step_and_reach_read_what_each_route_holds() {
+    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            8_193,
+            ReserveFraction::DEFAULT,
+            IdentityBuildHasher,
+            Global,
+        )
+        .unwrap();
+    table.schedule_levels_through(table.levels.len() - 1);
+    table.extend_probe_schedule(QUERY_POSITION_CAP);
+    assert_ne!(table.probe_schedule.routes(), []);
+
+    let reads = |route: &PhiRoute| {
+        let step = route.as_step();
+        (step.close(0), step.sequence_index())
+    };
+    let mut route = table.probe_schedule.direct();
+    for held in table.probe_schedule.routes() {
+        // SAFETY: the walk is ahead of the sentinel, which follows every
+        // pushed route.
+        let step = unsafe { PhiRoute::step(&mut route) };
+        assert!(ptr::eq(route, held));
+        assert_eq!((step.close(0), step.sequence_index()), reads(held));
+        assert!(step.is_closed(step.close(0)) && !step.is_closed(!step.close(0)));
+        // SAFETY: `route` is a route of the schedule.
+        let (index_shift, control) = unsafe { PhiRoute::reach(route) };
+        assert_eq!(index_shift, held.index_shift());
+        assert_eq!(control, held.control());
+    }
+    // SAFETY: as above; the last pushed route is ahead of the sentinel.
+    let step = unsafe { PhiRoute::step(&mut route) };
+    assert_eq!(step.close(0), SENTINEL_BIT);
+    // SAFETY: the sentinel is a route of the schedule.
+    assert_eq!(unsafe { (*route).level() }, SENTINEL_LEVEL);
 }

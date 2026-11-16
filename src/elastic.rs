@@ -391,6 +391,8 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     /// The level a settled insert searches, with that level's settled
     /// budget, while the scheduler's gate is open; [`Self::reopen_settled`]
     /// sets both as it opens the gate. Not read while the gate is closed.
+    /// It is [`Levels::level_ptr`] of the level, so borrows of the levels
+    /// leave it good to read through.
     settled_level: *mut Level<SlotEntry<K, V>>,
     /// [`probe::ELASTIC_FOLD_MULTIPLIER`], kept in the table so the hot
     /// paths load it rather than build it.
@@ -587,7 +589,86 @@ macros::declare_backend_aliases! {
 }
 
 /// Boxed slice of levels for one `(K, V)` parameterization.
-type LevelSlice<K, V> = Box<[Level<SlotEntry<K, V>>]>;
+type LevelSlice<K, V> = Levels<SlotEntry<K, V>>;
+
+/// A boxed slice of levels held by its raw pointer.
+///
+/// Every borrow of the levels is taken from that pointer and
+/// [`Self::level_ptr`] is that pointer offset, so a level's address stays
+/// good to read through for as long as the slice is owned here, whatever
+/// borrows of the levels come and go in between.
+struct Levels<T> {
+    first: ptr::NonNull<Level<T>>,
+    len: usize,
+}
+
+impl<T> Levels<T> {
+    /// Level `index`, addressed from the pointer the slice is held by.
+    #[inline]
+    fn level_ptr(&self, index: usize) -> *mut Level<T> {
+        assert!(index < self.len);
+        // SAFETY: `index` is in bounds of the slice at `first`.
+        unsafe { self.first.as_ptr().add(index) }
+    }
+}
+
+impl<T> From<Box<[Level<T>]>> for Levels<T> {
+    fn from(levels: Box<[Level<T>]>) -> Self {
+        let len = levels.len();
+        let first = ptr::NonNull::from(Box::leak(levels)).cast();
+        Self { first, len }
+    }
+}
+
+impl<T> Drop for Levels<T> {
+    fn drop(&mut self) {
+        let levels = ptr::slice_from_raw_parts_mut(self.first.as_ptr(), self.len);
+        // SAFETY: `from` took these levels out of a box of this length.
+        drop(unsafe { Box::from_raw(levels) });
+    }
+}
+
+impl<T> core::ops::Deref for Levels<T> {
+    type Target = [Level<T>];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `first` addresses `len` levels this owns, which nothing
+        // writes while `self` is borrowed shared.
+        unsafe { core::slice::from_raw_parts(self.first.as_ptr(), self.len) }
+    }
+}
+
+impl<T> core::ops::DerefMut for Levels<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as in `deref`, and `self` is borrowed alone.
+        unsafe { core::slice::from_raw_parts_mut(self.first.as_ptr(), self.len) }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Levels<T> {
+    type Item = &'a Level<T>;
+    type IntoIter = core::slice::Iter<'a, Level<T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut Levels<T> {
+    type Item = &'a mut Level<T>;
+    type IntoIter = core::slice::IterMut<'a, Level<T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+// SAFETY: this owns its levels as the box it was made from does.
+unsafe impl<T> Send for Levels<T> where Box<[Level<T>]>: Send {}
+// SAFETY: as above.
+unsafe impl<T> Sync for Levels<T> where Box<[Level<T>]>: Sync {}
 /// A fresh arena, its level descriptors, and the metadata tail they share.
 type ElasticArenaBuild<K, V> = (Arena, LevelSlice<K, V>, MembershipRegion);
 
@@ -826,14 +907,15 @@ fn settled_limit<T>(
 pub(crate) struct BatchScheduler {
     /// Exclusive bound of the cached batch's settled inserts, on the table's
     /// placed count: the lower of `batch_end` and `settled_limit` plus the
-    /// removals the placed count still holds, lowered by [`Self::narrow`] to
-    /// the inserts one [`SettledPlan`] holds for, or zero since a removal or
+    /// removals the placed count still holds, or less where the
+    /// [`SettledPlan`] it opened on ends sooner, or zero since a removal or
     /// a re-sync. Every path that lowers the table's live count or changes
     /// those removals, and every insert that is not a settled one, closes it
     /// through [`Self::note_removal`] or [`Self::close`], or re-syncs the
-    /// batch, and only [`Self::reopen`] raises it, so a placed count under
-    /// this bound is a live count inside the cached batch that only settled
-    /// inserts reached since the gate opened.
+    /// batch, and only the table raises it, to a plan's end and no further
+    /// than [`Self::reopened_end`], so a placed count under this bound is a
+    /// live count inside the cached batch that only settled inserts reached
+    /// since the gate opened.
     settled_end: usize,
     /// Removals the table's filter still tolerates, counted down from
     /// [`membership::refresh_deletes`] less one, so the removal that
@@ -1027,7 +1109,7 @@ impl BatchScheduler {
         self.settles(placed)
     }
 
-    /// The bound [`Self::reopen`] gives the gate: `None` while the cached
+    /// The highest bound the gate may reopen to: `None` while the cached
     /// batch does not cover the live entries.
     #[inline]
     fn reopened_end(&self, placed: usize, removed: usize) -> Option<usize> {
@@ -1250,7 +1332,7 @@ fn build_elastic_levels<K, V>(
             data_ptr,
         ));
     }
-    Ok(levels.into_boxed_slice())
+    Ok(levels.into_boxed_slice().into())
 }
 
 fn total_ctrl(level_capacities: &[usize]) -> Option<usize> {
@@ -1867,23 +1949,16 @@ where
         let Some(plan) = self.settled_plan() else {
             return false;
         };
-        let [(level, word), (fallback, fallback_word)] =
+        let [(_, word), (_, fallback_word)] =
             self.plan_words(plan.level, plan.budget, plan.fallback);
-        let levels = self.levels.as_mut_ptr();
-        self.settled_level = levels.with_addr(level.addr());
-        self.settled_fallback = if fallback.is_null() {
-            ptr::null_mut()
+        self.levels[plan.level].search.settled = word;
+        self.settled_level = self.levels.level_ptr(plan.level);
+        self.settled_fallback = if plan.fallback.is_some() {
+            self.levels[plan.level + 1].search.settled = fallback_word;
+            self.levels.level_ptr(plan.level + 1)
         } else {
-            levels.with_addr(fallback.addr())
+            ptr::null_mut()
         };
-        // SAFETY: the plan's levels are levels of this table, which
-        // `&mut self` borrows alone.
-        unsafe {
-            (*self.settled_level).search.settled = word;
-            if !fallback.is_null() {
-                (*self.settled_fallback).search.settled = fallback_word;
-            }
-        }
         self.scheduler.settled_end = plan.end;
         true
     }
@@ -2146,7 +2221,7 @@ where
     ) -> (usize, usize) {
         debug_assert!(level_idx < self.levels.len());
         // SAFETY: callers pass a level they found a free slot in.
-        let level = unsafe { self.levels.as_mut_ptr().add(level_idx) };
+        let level = self.levels.level_ptr(level_idx);
         let lane = self.route_filter(prepared).membership;
         // SAFETY: as above.
         let found = unsafe {
