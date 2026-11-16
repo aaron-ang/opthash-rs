@@ -102,12 +102,12 @@ const NO_LEVELS_OCCUPIED: SummaryBin = !1;
 /// operation builds and tests the bits, the ones the filter passes too, so a
 /// further bit costs each of them and saves only the walks of the absent
 /// keys it newly rejects.
-const MEMBERSHIP_BITS: usize = 2;
+const MEMBERSHIP_BITS: usize = 1;
 /// Logical slots one metadata word covers. Fewer slots a word leave the
 /// filter sparser, so it passes fewer absent keys, and leave each summary
 /// fewer keys, so a walk skips more levels; the metadata tail grows in
 /// proportion.
-const FILTER_SLOTS_PER_WORD: usize = 8;
+const FILTER_SLOTS_PER_WORD: usize = 5;
 
 /// Bits of a [`MetadataPlace`] that pick one bit of a membership lane.
 const LANE_BIT_INDEX_BITS: u32 = u64::BITS.trailing_zeros();

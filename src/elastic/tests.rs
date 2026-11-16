@@ -856,7 +856,7 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
     assert_layout::<u64, u64>();
     assert_layout::<Zst, Zst>();
     assert_layout::<OverAligned, OverAligned>();
-    assert!(8 * mem::size_of::<TailWord>() <= 16 * FILTER_SLOTS_PER_WORD);
+    assert!(5 * mem::size_of::<TailWord>() <= 16 * FILTER_SLOTS_PER_WORD);
 
     let table =
         ElasticTable::<OverAligned, OverAligned, FixedHashBuilder>::with_capacity_and_reserve_and_hasher_in(
