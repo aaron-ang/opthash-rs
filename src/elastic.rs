@@ -1692,17 +1692,7 @@ where
             .scheduler
             .reopened_end(self.placed, self.stale_membership())?;
         let target = self.scheduler.cached_target();
-        let case = self.placement_case(target, |region, budget| {
-            let scheduled = u64::from(region.scheduled_probes);
-            budget.map_or(scheduled, |budget| budget.min(scheduled))
-        })?;
-        if case.region.index_shift() == GENERAL_REDUCTION {
-            return None;
-        }
-        let budget = u16::try_from(case.budget).expect("scheduled probes fit u16");
-        if budget == 0 {
-            return None;
-        }
+        let (case, budget) = self.settled_case(target)?;
         let holds_for = match target {
             // The level a case searches without a bound stays the case's
             // while the other level of its pair keeps its fill.
@@ -1744,6 +1734,49 @@ where
             budget,
             end,
         })
+    }
+
+    /// The paper's insertion case for `target` with the budget a settled
+    /// search gives it, the case's own within the level's scheduled probes:
+    /// `None` for a table whose levels do not reduce by shift, and where no
+    /// probe is left to search.
+    #[inline]
+    fn settled_case(&self, target: BatchTarget) -> Option<(PlacementCase<'_, K, V>, u16)> {
+        let case = self.placement_case(target, |region, budget| {
+            let scheduled = u64::from(region.scheduled_probes);
+            budget.map_or(scheduled, |budget| budget.min(scheduled))
+        })?;
+        if case.region.index_shift() == GENERAL_REDUCTION {
+            return None;
+        }
+        let budget = u16::try_from(case.budget).expect("scheduled probes fit u16");
+        (budget != 0).then_some((case, budget))
+    }
+
+    /// Reopens the gate a general insert closed, which stood open to `end`
+    /// before it: on the plan it stood open on while the insertion case
+    /// still names that plan's level and budget, and on a fresh plan
+    /// otherwise.
+    ///
+    /// The insert raised the placed count and one level's fill by one. Where
+    /// that level is the plan's, the plan's bound has counted it; elsewhere
+    /// the bound ends the plan an insert early.
+    fn keep_settled(&mut self, end: usize) {
+        let removed = self.stale_membership();
+        if self.placed < end && self.scheduler.covers(self.placed - removed) {
+            let kept = self
+                .settled_case(self.scheduler.cached_target())
+                .is_some_and(|(case, budget)| {
+                    ptr::eq(case.region, self.settled_level)
+                        && case.region.search.settled
+                            == settled_word(case.region.summary_bit(), budget)
+                });
+            if kept {
+                self.scheduler.settled_end = end;
+                return;
+            }
+        }
+        self.reopen_settled();
     }
 
     /// Opens the settled gate on [`Self::settled_plan`], and reports whether
@@ -1821,16 +1854,19 @@ where
             self.enter_batch();
         }
         let target = self.scheduler.cached_target();
-        let location =
-            if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
-                self.place_new_entry(key, value, prepared, key_fingerprint, placement)
-            } else {
-                self.place_after_target_failure(key, value, prepared, key_fingerprint, target)
-            };
-        // The write closed the gate; the next insert finds it open again
+        // The write closes the gate; the next insert finds it open again
         // where it may be.
-        self.reopen_settled();
-        location
+        if let Some(placement) = self.choose_slot_for_new_key(prepared.route.probe, target) {
+            let open_to = self.scheduler.settled_end;
+            let location = self.place_new_entry(key, value, prepared, key_fingerprint, placement);
+            self.keep_settled(open_to);
+            location
+        } else {
+            let location =
+                self.place_after_target_failure(key, value, prepared, key_fingerprint, target);
+            self.reopen_settled();
+            location
+        }
     }
 
     /// [`map::TableBackend::insert`] off its common path: a key the walk
