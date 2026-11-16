@@ -3,7 +3,7 @@ use core::fmt;
 use core::hash::{BuildHasher, Hash};
 use core::marker::PhantomData;
 use core::mem::{self, MaybeUninit};
-use core::ptr::NonNull;
+use core::ptr::{self, NonNull};
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -52,11 +52,10 @@ enum FunnelScanMode {
     Sparse(OccupiedIndices),
 }
 
-/// Leading zeros of a level bin widened to a word, ahead of its top bit.
-const BIN_LEAD: usize = (u32::BITS - u16::BITS) as usize;
-/// Entries of [`FunnelTable::head`]: one per level-bin bit, then one for the
-/// leading zeros of an empty bin.
-const HEAD_ENTRIES: usize = u16::BITS as usize + 1;
+/// Entries of [`FunnelTable::head`]: one for each count of leading zeros a
+/// [`WideLevelBin`] can have. A level-bin bit's count is its level's index,
+/// and an empty bin's is the last.
+const HEAD_ENTRIES: usize = u32::BITS as usize + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LevelShape {
@@ -553,14 +552,21 @@ struct MembershipSlot {
 use level_bin::WideLevelBin;
 
 mod level_bin {
-    /// A level bin at register width, as its load left it. Built only from a
-    /// bin, so no bit at or above `u16::BITS` is ever set: the first-match
-    /// walk steps the head by the positions of these bits and relies on that
-    /// bound.
+    /// A level bin in the top half of a word, where the leading zeros of
+    /// the word are the index of the bin's shallowest level. The first-match
+    /// walk steps the head by those counts; the head has an entry for every
+    /// count a word can have, so the walk needs nothing of the low half.
     #[derive(Clone, Copy)]
     pub(super) struct WideLevelBin(u32);
 
     impl WideLevelBin {
+        /// The bin of a filter unit, from the half of the unit that holds
+        /// it.
+        #[inline]
+        pub(super) const fn of_unit_half(half: u32) -> Self {
+            Self(half)
+        }
+
         #[inline]
         pub(super) fn get(self) -> u32 {
             self.0
@@ -570,7 +576,7 @@ mod level_bin {
     impl From<u16> for WideLevelBin {
         #[inline]
         fn from(levels: u16) -> Self {
-            Self(u32::from(levels))
+            Self(u32::from(levels) << (u32::BITS - u16::BITS))
         }
     }
 }
@@ -593,6 +599,12 @@ impl MembershipGate {
         unit_records(self.unit, self.bits)
     }
 
+    /// [`Self::levels`] as the first-match walk reads it.
+    #[inline]
+    const fn wide_levels(self) -> WideLevelBin {
+        unit_wide_levels(self.unit)
+    }
+
     /// The unit's level bin: a set bit marks a level some key sharing the
     /// unit was recorded at.
     #[inline]
@@ -608,17 +620,28 @@ const fn unit_records(unit: u64, bits: u32) -> bool {
     unit as u32 & bits != 0
 }
 
-/// The level bin of a filter unit, above its membership half.
+/// Where a filter unit keeps its level bin: its top bits, so the half above
+/// the membership bits is the bin as a [`WideLevelBin`].
+const LEVEL_BIN_SHIFT: u32 = u64::BITS - u16::BITS;
+
+/// The level bin of a filter unit.
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
 const fn unit_levels(unit: u64) -> u16 {
-    (unit >> MEMBERSHIP_BITS) as u16
+    (unit >> LEVEL_BIN_SHIFT) as u16
 }
 
-/// A membership bit and a level bin, each in its half of a filter unit.
+/// The level bin of a filter unit, as the first-match walk reads it.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+const fn unit_wide_levels(unit: u64) -> WideLevelBin {
+    WideLevelBin::of_unit_half((unit >> MEMBERSHIP_BITS) as u32)
+}
+
+/// A membership bit and a level bin, each in its place in a filter unit.
 #[inline]
 const fn unit_of(bits: u32, levels: u16) -> u64 {
-    bits as u64 | (levels as u64) << MEMBERSHIP_BITS
+    bits as u64 | (levels as u64) << LEVEL_BIN_SHIFT
 }
 
 /// Where each region of one Funnel epoch's arena lives.
@@ -1587,29 +1610,31 @@ where
         };
         // A passed gate means a recorded key, so the table has slots.
         debug_assert_ne!(self.shape.n, 0);
-        // The bin is walked as it is, in the low half of the word: its
-        // leading zeros are `BIN_LEAD` more than the index of the shallowest
-        // level, so the walk starts that many entries ahead of the head. Two
-        // sets reach an absent entry, as every scan of a shape without lanes
-        // does: the overflow bit stands where the level past the last
-        // recorded one would, and an empty set, which the walk tests for
+        // The leading zeros of the bin are the index of its shallowest
+        // level. The overflow bit reaches an absent entry, as every scan of
+        // a shape without lanes does: it stands where the level past the
+        // last recorded one would. An empty set, which the walk tests for
         // after a scan and not before one, has a whole word of leading
-        // zeros. An absent entry scans the group past the slots, which
-        // matches nothing.
+        // zeros, and the head's last entry. An absent entry scans the group
+        // past the slots, which matches nothing.
         let mut pending = levels.get();
-        let mut entry = self.head.as_ptr().wrapping_sub(BIN_LEAD);
+        // The walk steps a pointer to the table itself and reads the head
+        // at its offset from there, so the head's address is never formed.
+        // The first step is taken from the table and the rest from the
+        // step before, so the first costs no copy of the table's address.
+        let table = ptr::from_ref(self).cast::<HeadLevel<SlotEntry<K, V>>>();
+        let mut distance = pending.leading_zeros();
+        let mut stepped = table.wrapping_add(distance as usize);
         loop {
-            let distance = pending.leading_zeros();
-            entry = entry.wrapping_add(distance as usize);
+            let entry = stepped.wrapping_byte_add(mem::offset_of!(Self, head));
             // The scanned level's bit moves to the top and is cleared, so
             // the rest keep their distances from its entry. An empty set
             // shifts by its whole width, which wraps to none.
             pending = pending.wrapping_shl(distance) & !SHALLOWEST_LEVEL;
-            // SAFETY: the distances stepped so far add up to `BIN_LEAD` plus
-            // the index of a set bit, which a `WideLevelBin` keeps below
-            // `u16::BITS`, or to `u32::BITS` for an empty set. Either way the
-            // entry is one of the head's `HEAD_ENTRIES`, which outlive the
-            // borrow of `self`.
+            // SAFETY: the distances stepped so far add up to the index of a
+            // set bit of the bin, or to `u32::BITS` for an empty set. Either
+            // way the entry is one of the head's `HEAD_ENTRIES`, which
+            // outlive the borrow of `self`.
             let level = unsafe { &*entry };
             let (bucket, mut matches) = scan(level);
             while matches != 0 {
@@ -1624,6 +1649,8 @@ where
             if pending == 0 {
                 return Err(level);
             }
+            distance = pending.leading_zeros();
+            stepped = stepped.wrapping_add(distance as usize);
         }
     }
 
@@ -2200,7 +2227,7 @@ where
         if !gate.passes() {
             return None;
         }
-        self.find_after_gate::<Q, P>(key, key_hash, gate.levels().into())
+        self.find_after_gate::<Q, P>(key, key_hash, gate.wide_levels())
     }
 
     #[inline]
@@ -2587,7 +2614,7 @@ where
                     return None;
                 }
                 HeadSearch::Unsettled => {
-                    self.find_after_gate::<K, FoundLane>(&key, hash, gate.levels().into())
+                    self.find_after_gate::<K, FoundLane>(&key, hash, gate.wide_levels())
                 }
             };
             if let Some(lane) = found {
@@ -3126,7 +3153,7 @@ where
         if !gate.passes() {
             return None;
         }
-        let entry = self.unlink_after_gate(key, hash, gate.levels().into())?;
+        let entry = self.unlink_after_gate(key, hash, gate.wide_levels())?;
         // SAFETY: the entry was occupied until its control byte was
         // tombstoned, which keeps it from being read again.
         let entry = unsafe { entry.as_ptr().read() };

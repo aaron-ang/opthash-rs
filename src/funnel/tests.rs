@@ -1103,6 +1103,26 @@ fn levels_past_the_head_share_the_overflow_bit() {
     assert_eq!(level_bit_of(usize::MAX), OVERFLOW_LEVEL_BIT);
 }
 
+/// A bin's leading zeros, as the first-match walk reads it from a unit, name
+/// the head entry of its shallowest level: the level's own for a level with a
+/// bit, the absent one after them for the overflow bit, and the last for an
+/// empty bin.
+#[test]
+fn a_wide_bin_leads_with_the_index_of_its_shallowest_level() {
+    let lead = |levels: u16| {
+        let wide = WideLevelBin::from(levels).get();
+        assert_eq!(unit_wide_levels(unit_of(u32::MAX, levels)).get(), wide);
+        assert_eq!(unit_levels(unit_of(u32::MAX, levels)), levels);
+        wide.leading_zeros() as usize
+    };
+    for level in 0..OVERFLOW_LEVEL {
+        assert_eq!(lead(level_bit_of(level)), level);
+        assert_eq!(lead(level_bit_of(level) | OVERFLOW_LEVEL_BIT), level);
+    }
+    assert_eq!(lead(OVERFLOW_LEVEL_BIT), OVERFLOW_LEVEL);
+    assert_eq!(lead(0), HEAD_ENTRIES - 1);
+}
+
 fn head_table(
     shape: FunnelShape,
     reserve: ReserveFraction,
