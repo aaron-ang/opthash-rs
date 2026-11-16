@@ -302,7 +302,7 @@ fn refresh_membership_rebuilds_the_recorded_filter() {
 }
 
 /// Every unit of `table`'s filter tail, level bin and membership alike.
-fn filter_tail<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> Vec<u32> {
+fn filter_tail<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> Vec<u64> {
     let units = table.membership.region.words;
     // SAFETY: the tail holds `units` initialized units from its base on; a
     // table without any reads none.
@@ -310,7 +310,7 @@ fn filter_tail<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> Vec<u32> 
 }
 
 /// Every control byte and filter word of `table`.
-fn controls_and_filter<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> (Vec<u8>, Vec<u32>) {
+fn controls_and_filter<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> (Vec<u8>, Vec<u64>) {
     // SAFETY: `slot < slots`, the storage capacity.
     let controls = (0..table.shape.slots)
         .map(|slot| unsafe { table.storage.control_at(slot) })

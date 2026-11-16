@@ -515,8 +515,10 @@ fn recorded_head_levels(levels: u16) -> u32 {
     u32::from(levels & !OVERFLOW_LEVEL_BIT) << (u32::BITS - u16::BITS)
 }
 
-/// Membership bits of a filter unit; its level bin is the other half.
-const MEMBERSHIP_BITS: u32 = u16::BITS;
+/// Membership bits of a filter unit, its low half; the level bin sits above
+/// them. The half is as wide as the register the bit is shifted in, so the
+/// shift takes its count from the hash without a mask.
+const MEMBERSHIP_BITS: u32 = u32::BITS;
 
 /// The key's bit of a filter unit's membership half, from the low bits of
 /// the hash; the unit index draws on the high half.
@@ -524,7 +526,7 @@ const MEMBERSHIP_BITS: u32 = u16::BITS;
 const fn membership_bit(key_hash: u64) -> u32 {
     #[allow(clippy::cast_possible_truncation)]
     {
-        1 << (key_hash as u32 & (MEMBERSHIP_BITS - 1))
+        1_u32.wrapping_shl(key_hash as u32)
     }
 }
 
@@ -569,7 +571,7 @@ mod level_bin {
 /// every call.
 #[derive(Clone, Copy)]
 struct MembershipGate {
-    unit: u32,
+    unit: u64,
     bits: u32,
 }
 
@@ -577,7 +579,7 @@ impl MembershipGate {
     /// `false` proves no insert ever recorded this key.
     #[inline]
     const fn passes(self) -> bool {
-        self.unit & self.bits == self.bits
+        unit_records(self.unit, self.bits)
     }
 
     /// The unit's level bin: a set bit marks a level some key sharing the
@@ -588,16 +590,24 @@ impl MembershipGate {
     }
 }
 
-/// The level bin of a filter unit, its high half.
+/// Whether a filter unit's membership half holds the bit `bits`.
 #[inline]
-const fn unit_levels(unit: u32) -> u16 {
+#[allow(clippy::cast_possible_truncation)]
+const fn unit_records(unit: u64, bits: u32) -> bool {
+    unit as u32 & bits != 0
+}
+
+/// The level bin of a filter unit, above its membership half.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+const fn unit_levels(unit: u64) -> u16 {
     (unit >> MEMBERSHIP_BITS) as u16
 }
 
-/// A level bin, placed in its half of a filter unit.
+/// A membership bit and a level bin, each in its half of a filter unit.
 #[inline]
-const fn levels_in_unit(levels: u16) -> u32 {
-    (levels as u32) << MEMBERSHIP_BITS
+const fn unit_of(bits: u32, levels: u16) -> u64 {
+    bits as u64 | (levels as u64) << MEMBERSHIP_BITS
 }
 
 /// Where each region of one Funnel epoch's arena lives.
@@ -619,11 +629,11 @@ struct FilterTail {
     ///
     /// A unit holds a membership half and one level bin, so one load at a
     /// scaled index off the base reads both.
-    base: *mut u32,
+    base: *mut u64,
 }
 
 /// The filter unit an empty table's gate reads: nothing recorded.
-static NO_FILTER_UNIT: u32 = 0;
+static NO_FILTER_UNIT: u64 = 0;
 
 /// Filter units of a table of `n` entries: eight for every five. A key sets
 /// one membership bit, so the share of absent keys a gate lets through is
@@ -644,7 +654,7 @@ impl FilterTail {
             (&raw const NO_FILTER_UNIT).cast_mut()
         } else {
             // SAFETY: the caller's contract is `ptr`'s.
-            unsafe { region.ptr::<u32>(arena_base) }
+            unsafe { region.ptr::<u64>(arena_base) }
         };
         Self { region, base }
     }
@@ -670,7 +680,7 @@ fn try_allocate_storage<K, V, A: Allocator>(
     // The arena zeroes control bytes only; an empty filter must read as
     // "nothing recorded".
     // SAFETY: `shape.membership` was laid out for this arena by `funnel_layout`.
-    unsafe { shape.membership.clear::<u32>(arena.as_ptr()) };
+    unsafe { shape.membership.clear::<u64>(arena.as_ptr()) };
     // SAFETY: the arena holds `geometry.slots` control bytes and no entry.
     unsafe { geometry.reset_ordinary_controls(arena.as_ptr()) };
     if n != 0 {
@@ -713,7 +723,7 @@ fn funnel_layout<K, V>(slots: usize, n: usize) -> Result<FunnelLayout, TryReserv
     };
     let (base_layout, data_offset) = arena::layout_for_extents::<K, V>(control_bytes, slots)?;
     let (layout, membership) =
-        MembershipRegion::extend_words::<u32>(base_layout, filter_units(n)?)?;
+        MembershipRegion::extend_words::<u64>(base_layout, filter_units(n)?)?;
     Ok(FunnelLayout {
         layout,
         data_offset,
@@ -1986,7 +1996,7 @@ where
     }
 
     #[inline]
-    fn membership_ptr(&self) -> *mut u32 {
+    fn membership_ptr(&self) -> *mut u64 {
         self.membership.base
     }
 
@@ -2002,7 +2012,7 @@ where
         let word = MembershipKey::word(key_hash, words);
         // SAFETY: `word` is a multiply-high reduction below `words`, and the
         // arena's tail holds exactly that many zero-initialized words.
-        unsafe { *self.membership_ptr().add(word) & bits == bits }
+        unsafe { unit_records(*self.membership_ptr().add(word), bits) }
     }
 
     /// This key's filter unit index and bit for the current epoch. Only an
@@ -2071,8 +2081,7 @@ where
             // SAFETY: as in `membership_gate`; `&mut self` makes the borrow
             // exclusive.
             unsafe {
-                *self.membership_ptr().add(membership.index) |=
-                    membership.bits | levels_in_unit(level_bit);
+                *self.membership_ptr().add(membership.index) |= unit_of(membership.bits, level_bit);
             }
         }
     }
@@ -2080,7 +2089,7 @@ where
     fn clear_membership(&mut self) {
         // SAFETY: `region` was laid out for `self.arena`.
         unsafe {
-            self.membership.region.clear::<u32>(self.arena.as_ptr());
+            self.membership.region.clear::<u64>(self.arena.as_ptr());
         }
         self.stale_membership = 0;
     }
@@ -2164,7 +2173,7 @@ where
         // SAFETY: each region belongs to its own table's arena; the source has
         // the same shape, so equal word counts; distinct arenas never overlap.
         unsafe {
-            self.membership.region.copy_from::<u32>(
+            self.membership.region.copy_from::<u64>(
                 self.arena.as_ptr(),
                 source.membership.region,
                 source.arena.as_ptr(),
@@ -2427,7 +2436,7 @@ where
         key: K,
         value: V,
         membership: MembershipSlot,
-        unit: u32,
+        unit: u64,
         probe: PreparedFastFunnelProbe,
         vacancy: &HeadVacancy<SlotEntry<K, V>>,
     ) {
@@ -2459,7 +2468,7 @@ where
         }
         // SAFETY: `recorded` is this key's filter unit, as above, and
         // `&mut self` makes the access exclusive.
-        unsafe { *recorded = unit | membership.bits | levels_in_unit(vacancy.level_bit) };
+        unsafe { *recorded = unit | unit_of(membership.bits, vacancy.level_bit) };
         self.head_left = head_left - 1;
     }
 
@@ -3002,7 +3011,7 @@ where
         let membership = self.membership_slot(hash);
         // SAFETY: as in `membership_gate_at`.
         let unit = unsafe { *self.membership_ptr().add(membership.index) };
-        if unit & membership.bits != membership.bits {
+        if !unit_records(unit, membership.bits) {
             let probe = self.prf.prepare(hash);
             if let Some(vacancy) = self.head_vacancy(probe) {
                 // SAFETY: slot, unit and vacancy were read just above, with
