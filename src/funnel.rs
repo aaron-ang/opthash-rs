@@ -1601,9 +1601,8 @@ where
     /// on without the ordered walk's `EMPTY` test, which only shortens misses
     /// the filter let through.
     ///
-    /// Calls nothing but the key comparison, and keeps nothing for the lookup
-    /// that finds nothing, so a caller that hands that lookup off by tail
-    /// call keeps no frame.
+    /// Calls nothing but the key comparison, so the lookup that finds its key
+    /// runs wherever this is inlined without a call.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn first_match<Q>(
@@ -2289,11 +2288,13 @@ where
     /// exceptional full scan around the tombstone-blind lookup walk, which
     /// visits only the levels the key's bin has recorded.
     ///
-    /// Only the filter test is inline: the walk keeps many registers live, and
-    /// LLVM saves them all ahead of the test, so filter-rejected misses would
-    /// pay for a walk they never run. The fingerprint is derived past the
-    /// gate for the same reason.
-    #[inline]
+    /// Forced inline down from the shell's lookups, as the walk behind the
+    /// gate is: a lookup that finds its key then runs in its caller, which
+    /// makes no call for it and reads the entry at the address the walk
+    /// formed. The fingerprint is derived past the gate, so a filter-rejected
+    /// miss prepares no probe.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn find_live<'a, Q, P>(&'a self, key: &Q, key_hash: u64) -> Option<P::Part>
     where
         Q: Equivalent<K> + ?Sized,
@@ -2306,7 +2307,8 @@ where
         self.find_after_gate::<Q, P>(key, key_hash, gate.wide_levels())
     }
 
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn find_location<Q>(&self, key: &Q, key_hash: u64) -> Option<usize>
     where
         Q: Equivalent<K> + ?Sized,
@@ -2322,14 +2324,13 @@ where
         lane.as_ptr().addr() - self.storage.ctrl_ptr().addr()
     }
 
-    /// Out of line so a filter-rejected miss pays for no probe preparation.
-    /// A lookup that finds its key returns from here without a frame, and so
-    /// does one the scan settles as absent. The ordered walk sits in tail
-    /// position, so its call needs no frame here either.
+    /// The lookup behind a passed gate. Only the ordered walk, which decides
+    /// what the first-match scan cannot, is a call.
     ///
     /// Takes the level bin at register width, as the gate's load left it, so
     /// the walk does not widen it again.
-    #[inline(never)]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn find_after_gate<'a, Q, P>(
         &'a self,
         key: &Q,
@@ -2350,9 +2351,8 @@ where
 
     /// [`Self::find_after_gate`] for a removal: tombstones the key's control
     /// byte and returns its entry, still initialized, for the caller to take.
-    /// Writing the control here leaves one pointer to return, which keeps
-    /// the hand-off to the ordered walk a tail call.
-    #[inline(never)]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn unlink_after_gate<Q>(
         &mut self,
         key: &Q,
@@ -2745,7 +2745,8 @@ where
         }
     }
 
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn find_entry_ref<'a, Q>(&'a self, key: &Q, key_hash: u64) -> Option<&'a SlotEntry<K, V>>
     where
         Q: Equivalent<K> + ?Sized,
@@ -3147,7 +3148,8 @@ where
         mem::replace(&mut entry.value, value)
     }
 
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn find<Q>(&self, key: &Q, hash: u64) -> Option<usize>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -3155,7 +3157,8 @@ where
         self.find_location(key, hash)
     }
 
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn find_entry<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a SlotEntry<K, V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -3225,7 +3228,9 @@ where
         self.insert_general(key, value, hash)
     }
 
-    #[inline]
+    // Forced inline with the shell's removal, as the lookups are.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn remove_key<Q>(&mut self, key: &Q, hash: u64) -> Option<(K, V)>
     where
         Q: Hash + Equivalent<K> + ?Sized,

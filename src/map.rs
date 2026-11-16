@@ -434,7 +434,8 @@ where
     K: Eq + Hash,
     P: TableBackend<K, V>,
 {
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn find_location<Q>(&self, key: &Q) -> Option<P::Location>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -455,7 +456,8 @@ where
         unsafe { &mut *self.table.slot_ptr(loc) }
     }
 
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn lookup_entry<Q>(&self, key: &Q) -> Option<&SlotEntry<K, V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -476,6 +478,10 @@ where
 
     /// Returns a reference to the value for `key`.
     #[must_use]
+    // Forced inline, as `insert` is: the caller hashes the key, and a backend
+    // that inlines its lookup then finds the key without a call.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -485,6 +491,10 @@ where
 
     /// Returns the stored `(key, value)` pair for `key`.
     #[must_use]
+    // Forced inline, as `insert` is: the caller hashes the key, and a backend
+    // that inlines its lookup then finds the key without a call.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -516,6 +526,10 @@ where
     }
 
     /// Returns a mutable reference to the value for `key`.
+    // Forced inline, as `insert` is: the caller hashes the key, and a backend
+    // that inlines its lookup then finds the key without a call.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -527,6 +541,10 @@ where
 
     /// Returns `true` if `key` is present.
     #[must_use]
+    // Forced inline, as `insert` is: the caller hashes the key, and a backend
+    // that inlines its lookup then finds the key without a call.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -535,6 +553,10 @@ where
     }
 
     /// Removes `key`, returning its value.
+    // Forced inline, as `insert` is: the caller hashes the key, and a backend
+    // that inlines its lookup then finds the key without a call.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -543,6 +565,10 @@ where
     }
 
     /// Removes `key`, returning the stored `(key, value)` pair.
+    // Forced inline, as `insert` is: the caller hashes the key, and a backend
+    // that inlines its lookup then finds the key without a call.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
