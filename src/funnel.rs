@@ -1411,6 +1411,7 @@ where
             let entry = unsafe { self.storage.get_ref(slot) };
             hashes.push(self.hash_builder.hash_one(&entry.key));
         }
+        debug_assert_eq!(hashes.len(), self.len);
         self.clear_membership();
         // The same scan order as above pairs each entry with its hash.
         let mut scan = OccupiedIndices::new();
