@@ -72,10 +72,8 @@ impl PhiRoute {
     }
 
     /// Steps `route` to the route after it and reads the two words a walk's
-    /// step takes there: the level's bit and the sequence index. On `AArch64`
-    /// the step and both reads are one pre-indexed pair load; the compiler
-    /// left to itself reads the second word apart, in the probe that uses
-    /// it, and carries the route's address twice.
+    /// step takes there: the level's bit and the sequence index. On 64-bit
+    /// `AArch64` the step and both reads are one pre-indexed pair load.
     ///
     /// # Safety
     ///
@@ -83,7 +81,7 @@ impl PhiRoute {
     /// sentinel.
     #[inline]
     pub(super) unsafe fn step(route: &mut *const Self) -> RouteStep {
-        #[cfg(all(target_arch = "aarch64", not(miri)))]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64", not(miri)))]
         {
             const _: () = assert!(size_of::<PhiRoute>() == 32);
             let level_bit: u64;
@@ -104,7 +102,7 @@ impl PhiRoute {
                 sequence_index,
             }
         }
-        #[cfg(not(all(target_arch = "aarch64", not(miri))))]
+        #[cfg(not(all(target_arch = "aarch64", target_pointer_width = "64", not(miri))))]
         {
             // SAFETY: the caller's contract.
             *route = unsafe { route.add(1) };
@@ -114,7 +112,10 @@ impl PhiRoute {
     }
 
     /// What [`Self::step`] reads of this route.
-    #[cfg(any(test, not(all(target_arch = "aarch64", not(miri)))))]
+    #[cfg(any(
+        test,
+        not(all(target_arch = "aarch64", target_pointer_width = "64", not(miri)))
+    ))]
     pub(super) fn as_step(&self) -> RouteStep {
         RouteStep {
             level_bit: self.level_bit,
@@ -123,7 +124,10 @@ impl PhiRoute {
     }
 
     /// The two words a walk's probe reads at `route`: the index shift, as
-    /// [`Self::index_shift`] gives it, and the level's control bytes.
+    /// [`Self::index_shift`] gives it, and the level's control bytes. Where
+    /// a pointer is as wide as the reduction and the target is little-endian,
+    /// so that one wide load splits into the two in order, it reads them
+    /// together.
     ///
     /// # Safety
     ///
@@ -131,14 +135,32 @@ impl PhiRoute {
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub(super) unsafe fn reach(route: *const Self) -> (u32, *const u8) {
+        #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+        {
+            const _: () = assert!(
+                size_of::<*const u8>() == size_of::<u64>()
+                    && core::mem::offset_of!(PhiRoute, control)
+                        == core::mem::offset_of!(PhiRoute, reduction) + size_of::<u64>()
+                    && size_of::<PhiRoute>()
+                        == core::mem::offset_of!(PhiRoute, control) + size_of::<u64>()
+            );
+            // SAFETY: the caller's contract; the reduction and the control
+            // pointer are the route's last two words, with no padding
+            // between or after them.
+            let both = unsafe {
+                (&raw const (*route).reduction)
+                    .cast::<u128>()
+                    .read_unaligned()
+            };
+            // SAFETY: the caller's contract.
+            let control = unsafe { (*route).control }.with_addr((both >> u64::BITS) as usize);
+            (both as u32, control)
+        }
+        #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
         // SAFETY: the caller's contract.
-        let reduction = unsafe { &raw const (*route).reduction };
-        // SAFETY: the reduction and the control pointer are the route's last
-        // two words.
-        let (reduction, control) = unsafe { read_pair(reduction) };
-        // SAFETY: the caller's contract.
-        let control = unsafe { (*route).control }.with_addr(control as usize);
-        (reduction as u32, control)
+        unsafe {
+            ((*route).reduction as u32, (*route).control)
+        }
     }
 
     /// Level the route probes; [`SENTINEL_LEVEL`] for the sentinel.
@@ -184,34 +206,9 @@ impl PhiRoute {
 }
 
 const _: () = assert!(
-    size_of::<PhiRoute>() == 4 * size_of::<u64>()
-        && core::mem::offset_of!(PhiRoute, level_bit) == 0
+    core::mem::offset_of!(PhiRoute, level_bit) == 0
         && core::mem::offset_of!(PhiRoute, sequence_index) == size_of::<u64>()
-        && core::mem::offset_of!(PhiRoute, control)
-            == core::mem::offset_of!(PhiRoute, reduction) + size_of::<u64>()
 );
-
-/// Two adjacent words at `words`, read together where the target is
-/// little-endian and so splits one wide load into them in order.
-///
-/// # Safety
-///
-/// `words` addresses two initialized words.
-#[inline]
-#[allow(clippy::cast_possible_truncation)]
-unsafe fn read_pair(words: *const u64) -> (u64, u64) {
-    #[cfg(target_endian = "little")]
-    {
-        // SAFETY: the caller's contract.
-        let both = unsafe { words.cast::<u128>().read_unaligned() };
-        (both as u64, (both >> u64::BITS) as u64)
-    }
-    #[cfg(not(target_endian = "little"))]
-    // SAFETY: the caller's contract.
-    unsafe {
-        (words.read(), words.add(1).read())
-    }
-}
 
 /// What a walk's step reads of a route.
 #[derive(Clone, Copy)]
