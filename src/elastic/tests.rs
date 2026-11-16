@@ -1017,18 +1017,6 @@ fn metadata_place_from_signature(signature: u64, words: usize) -> (usize, u64, u
     )
 }
 
-fn membership_maybe_contains_prepared<K, V, S, A>(
-    table: &ElasticTable<K, V, S, A>,
-    prepared: PreparedElasticRoute,
-) -> bool
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-    A: Allocator + Clone,
-{
-    table.route_filter(prepared).maybe_present
-}
-
 #[test]
 fn compact_prepared_elastic_state_is_register_sized() {
     assert_eq!(mem::size_of::<PreparedElasticRoute>(), 8);
@@ -1111,8 +1099,11 @@ fn prepared_route_keeps_the_geometry_independent_signature() {
 fn metadata_place_matches_its_restatement() {
     for hash in (0..16_384_u64).map(|value| value.rotate_left(19) ^ value.rotate_left(51)) {
         let signature = PreparedElasticRoute::new(hash).signature();
-        for words in [1_usize, 3, 17, 257, 65_537] {
+        // The last two are the largest counts whose scale keeps every bit.
+        let most = usize::MAX >> PLACE_FRACTION_BITS;
+        for words in [1_usize, 3, 17, 257, 65_537, most - 1, most] {
             let place = MetadataPlace::new(signature, MetadataPlace::scale(words));
+            assert!(place.word() < words);
             assert_eq!(
                 (place.word(), place.bits(), place.summary_bin()),
                 metadata_place_from_signature(signature, words),
@@ -1212,7 +1203,7 @@ fn prepared_route_remains_geometry_independent_across_growth() {
         ElasticHashMap::with_capacity_and_hasher(1, IdentityBuildHasher);
     map.insert(hash, 7);
     map.reserve(4_096);
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
     assert_eq!(map.get(&hash), Some(&7));
 }
 
@@ -1222,17 +1213,17 @@ fn membership_filter_never_forgets_live_or_deleted_hashes() {
         ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
     let inserted_hash = map.table().hash_builder.hash_one(7_u64);
     let prepared = PreparedElasticRoute::new(inserted_hash);
-    assert!(!membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(!map.table().route_filter(prepared).maybe_present);
 
     assert_eq!(map.insert(7, 11), None);
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
 
     assert_eq!(map.insert(7, 13), Some(11));
     assert_eq!(map.len(), 1);
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
 
     assert_eq!(map.remove(&7), Some(13));
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
     assert_eq!(map.insert(7, 17), None);
     assert_eq!(map.get(&7), Some(&17));
 }
@@ -1249,10 +1240,11 @@ fn blocked_membership_never_forgets_inserted_hashes() {
         map.insert(key, key);
     }
     for key in 0..key_count {
-        assert!(membership_maybe_contains_prepared(
-            map.table(),
-            PreparedElasticRoute::new(key)
-        ));
+        assert!(
+            map.table()
+                .route_filter(PreparedElasticRoute::new(key))
+                .maybe_present
+        );
     }
 }
 
@@ -1264,12 +1256,12 @@ fn prepared_membership_remains_valid_across_growth() {
         ElasticHashMap::with_capacity_and_hasher(1, IdentityBuildHasher);
 
     map.insert(key, 7);
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
     let old_slots = map.table().total_slots;
 
     map.reserve(1_024);
     assert!(map.table().total_slots > old_slots);
-    assert!(membership_maybe_contains_prepared(map.table(), prepared));
+    assert!(map.table().route_filter(prepared).maybe_present);
     assert_eq!(map.get(&key), Some(&7));
 }
 
@@ -1284,20 +1276,24 @@ fn membership_filter_resets_and_rebuilds_at_table_boundaries() {
     let mut cloned = map.clone();
     for key in 0_u64..96 {
         let hash = cloned.table().hash_builder.hash_one(key);
-        assert!(membership_maybe_contains_prepared(
-            cloned.table(),
-            PreparedElasticRoute::new(hash),
-        ));
+        assert!(
+            cloned
+                .table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
         assert_eq!(cloned.get(&key), Some(&(key ^ 0x55)));
     }
 
     cloned.clear();
     for key in 0_u64..96 {
         let hash = cloned.table().hash_builder.hash_one(key);
-        assert!(!membership_maybe_contains_prepared(
-            cloned.table(),
-            PreparedElasticRoute::new(hash),
-        ));
+        assert!(
+            !cloned
+                .table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
     }
 
     for key in 256_u64..384 {
@@ -1306,10 +1302,12 @@ fn membership_filter_resets_and_rebuilds_at_table_boundaries() {
     cloned.reserve(512);
     for key in 256_u64..384 {
         let hash = cloned.table().hash_builder.hash_one(key);
-        assert!(membership_maybe_contains_prepared(
-            cloned.table(),
-            PreparedElasticRoute::new(hash),
-        ));
+        assert!(
+            cloned
+                .table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
         assert_eq!(cloned.get(&key), Some(&key));
     }
 }
@@ -1325,10 +1323,11 @@ fn all_vacant_entry_apis_record_membership() {
 
     for key in [11_u64, 22, 33] {
         let hash = map.table().hash_builder.hash_one(key);
-        assert!(membership_maybe_contains_prepared(
-            map.table(),
-            PreparedElasticRoute::new(hash)
-        ));
+        assert!(
+            map.table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
         assert!(map.contains_key(&key));
     }
 }
@@ -1343,10 +1342,11 @@ fn drain_and_failed_reserve_preserve_membership_invariants() {
     assert!(map.try_reserve(usize::MAX).is_err());
     for key in 0_u64..64 {
         let hash = map.table().hash_builder.hash_one(key);
-        assert!(membership_maybe_contains_prepared(
-            map.table(),
-            PreparedElasticRoute::new(hash)
-        ));
+        assert!(
+            map.table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
         assert_eq!(map.get(&key), Some(&key));
     }
 
@@ -1354,10 +1354,11 @@ fn drain_and_failed_reserve_preserve_membership_invariants() {
     assert!(map.is_empty());
     for key in 0_u64..64 {
         let hash = map.table().hash_builder.hash_one(key);
-        assert!(!membership_maybe_contains_prepared(
-            map.table(),
-            PreparedElasticRoute::new(hash)
-        ));
+        assert!(
+            !map.table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
     }
 }
 
@@ -1393,10 +1394,11 @@ fn allocator_failure_does_not_publish_or_forget_membership() {
     assert_eq!(map.try_reserve(4_096), Err(TryReserveError::AllocError));
     for key in 0_u64..64 {
         let hash = map.table().hash_builder.hash_one(key);
-        assert!(membership_maybe_contains_prepared(
-            map.table(),
-            PreparedElasticRoute::new(hash)
-        ));
+        assert!(
+            map.table()
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        );
         assert_eq!(map.get(&key), Some(&(key ^ 0x5a)));
     }
 }
@@ -1486,7 +1488,7 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
     assert_eq!(after.placement_recoveries, before.placement_recoveries + 1);
     assert_eq!(after.transition, EpochTransition::PlacementRecovery);
     assert_ne!(table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
-    assert!(membership_maybe_contains_prepared(&table, prepared));
+    assert!(table.route_filter(prepared).maybe_present);
     assert_eq!(
         table.find_slot_indices_prepared(&u64::MAX, prepared, fingerprint),
         Some(location)
@@ -2841,10 +2843,11 @@ fn settled_inserts_match_an_ordered_map_model() {
                 if settles {
                     settled += 1;
                     reused += usize::from(tombstones(&table) < before);
-                    assert!(membership_maybe_contains_prepared(
-                        &table,
-                        PreparedElasticRoute::new(hash)
-                    ));
+                    assert!(
+                        table
+                            .route_filter(PreparedElasticRoute::new(hash))
+                            .maybe_present
+                    );
                 }
             } else if roll < 85 {
                 let removed = table
@@ -3348,7 +3351,8 @@ fn schedule_lookup_agrees_past_the_summary_width() {
     assert!(saturated_hits > 0 && hits_past_the_summary > 0);
     assert!(
         deep_walked_misses > 0 && shallow_walked_misses > 0 && filtered_misses > 0,
-        "{deep_walked_misses} {shallow_walked_misses} {filtered_misses} {saturated_hits} {hits_past_the_summary}"
+        "{deep_walked_misses} {shallow_walked_misses} {filtered_misses} {saturated_hits} \
+         {hits_past_the_summary}"
     );
 }
 
@@ -4145,7 +4149,8 @@ fn the_filter_keeps_its_rate_for_hashes_without_low_bits() {
         let excess = passes.saturating_sub(mean);
         assert!(
             excess * excess <= 36 * mean,
-            "{passes} of {SAMPLE} keys without their low {low_bits} bits pass, over a mean of {mean}"
+            "{passes} of {SAMPLE} keys without their low {low_bits} bits pass, over a mean of \
+             {mean}"
         );
         passes
     };
@@ -4214,7 +4219,8 @@ impl Hash for ComparesCounted {
 /// keys, and six deviations of a count with that mean allow the square of
 /// an excess thirty-six times it. The routes overstate the probes a lookup
 /// makes, so the bound catches compares that multiply past the family's
-/// collisions, not a rate above the expected one.
+/// collisions, not a rate above the expected one, and a family whose keys
+/// share one fingerprint is bound by the routes alone.
 fn assert_compares_within_fingerprint_collisions<S: BuildHasher + Clone>(
     family: &str,
     hasher: &S,
@@ -4265,7 +4271,7 @@ fn assert_compares_within_fingerprint_collisions<S: BuildHasher + Clone>(
 
 #[test]
 #[cfg_attr(miri, ignore)]
-fn compares_against_other_keys_stay_within_fingerprint_collisions() {
+fn compares_against_other_keys_stay_within_routes_times_fingerprint_collisions() {
     let fingerprints = 1_usize << (u8::BITS - 1);
     assert_compares_within_fingerprint_collisions(
         "hashed, consecutive",

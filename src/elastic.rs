@@ -77,11 +77,12 @@ const QUERY_PROBE_LIMIT: usize = 384;
 /// Largest table: slot positions and schedule bounds are stored as `u32`.
 const MAX_ELASTIC_SLOTS: u64 = 1 << u32::BITS;
 /// A route summary: the levels the keys of one bin of a metadata word
-/// occupy, as [`ElasticRouteFilter::closed_levels`] reads it.
+/// occupy, as [`ElasticRouteFilter::summary`] reads it.
 type SummaryBin = u8;
 /// Bins a metadata word splits its keys over, by their
-/// [`MetadataPlace::summary_bin`]. A bin's summary opens a level for every key of the bin, so
-/// the fewer keys share one, the fewer levels a walk visits for nothing.
+/// [`MetadataPlace::summary_bin`]. A bin's summary opens a level for every
+/// key of the bin, so the fewer keys share one, the fewer levels a walk
+/// visits for nothing.
 const SUMMARY_BINS: usize = 8;
 const _: () = assert!(SUMMARY_BINS.is_power_of_two());
 /// Levels a key's route summary tracks, one bit each above the sentinel's;
