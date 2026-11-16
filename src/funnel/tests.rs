@@ -1197,6 +1197,13 @@ fn panicking_hasher_during_resize_keeps_every_entry() {
 }
 
 #[test]
+fn interrupted_filter_refresh_keeps_every_live_key_reachable() {
+    test_support::assert_interrupted_refresh_keeps_live_keys_reachable::<
+        FunnelTable<PanicHashKey, u64, test_support::FixedHashBuilder, ToggleAllocator>,
+    >(|table| table.stale_membership);
+}
+
+#[test]
 fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
     let fail = Arc::new(AtomicBool::new(true));
     let allocations = Arc::new(AtomicUsize::new(0));
