@@ -33,18 +33,6 @@ pub(crate) const fn refresh_deletes(max_insertions: usize) -> usize {
     max_insertions
 }
 
-/// One word of a metadata tail that keeps four level bins beside its
-/// membership lane. Each bin summarizes which levels the keys sharing the
-/// word and bin occupy.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct MetadataWord {
-    pub(crate) level_bins: [u16; 4],
-    pub(crate) membership: u64,
-}
-
-const _: () = assert!(core::mem::size_of::<MetadataWord>() == 16);
-
 /// Multiply-high reduction of `signature` into `word_count` words. The high
 /// half is below `word_count`, so the cast cannot lose bits and needs no
 /// checked path in front of the load it feeds.
