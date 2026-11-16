@@ -1698,37 +1698,58 @@ where
         let table = ptr::from_ref(self).cast::<HeadLevel<SlotEntry<K, V>>>();
         let mut distance = pending.leading_zeros();
         let mut stepped = table.wrapping_add(distance as usize);
-        loop {
-            let entry = stepped.wrapping_byte_add(mem::offset_of!(Self, head));
-            // The scanned level's bit moves to the top and is cleared, so
-            // the rest keep their distances from its entry. The mask also
-            // drops what the shift brought up from under the bin. A word of
-            // zeros shifts by its whole width, which wraps to none.
-            pending = pending.wrapping_shl(distance) & DEEPER_WIDE_LEVELS;
-            // SAFETY: the distances stepped so far add up to the index of a
-            // set bit of the word, or to `u64::BITS` for a word of zeros:
-            // each step but the first is the leading zeros of what the
-            // shifts so far left of the word. Either way the entry is one
-            // of the head's `HEAD_ENTRIES`, which outlive the borrow of
-            // `self`.
-            let level = unsafe { &*entry };
-            let (bucket, mut matches) = scan(level);
-            while matches != 0 {
-                if let Some(found) = holding_key(level, bucket, matches) {
-                    return Ok(found);
+        // The head entry the walk stands on, with the walk's level bit
+        // moved to the top and cleared, so the rest keep their distances
+        // from the entry. The mask also drops what the shift brought up
+        // from under the bin. A word of zeros shifts by its whole width,
+        // which wraps to none.
+        macro_rules! take_level {
+            () => {{
+                pending = pending.wrapping_shl(distance) & DEEPER_WIDE_LEVELS;
+                // SAFETY: the distances stepped so far add up to the index
+                // of a set bit of the word, or to `u64::BITS` for a word of
+                // zeros: each step but the first is the leading zeros of
+                // what the shifts so far left of the word. Either way the
+                // entry is one of the head's `HEAD_ENTRIES`, which outlive
+                // the borrow of `self`.
+                unsafe { &*stepped.wrapping_byte_add(mem::offset_of!(Self, head)) }
+            }};
+        }
+        // The key in a head level, if the level holds it. A macro and not a
+        // closure, so that each scan is laid out where it is used: the
+        // first level then runs in line from the gate, and only a deeper
+        // level takes the loop's jump back.
+        macro_rules! key_in {
+            ($level:expr) => {{
+                let (bucket, mut matches) = scan($level);
+                loop {
+                    if matches == 0 {
+                        break None;
+                    }
+                    if let Some(found) = holding_key($level, bucket, matches) {
+                        break Some(found);
+                    }
+                    // Another key shares the fingerprint.
+                    rarely_taken();
+                    // SAFETY: the test above: the set is not empty, and it
+                    // is the scan's mask less whole lanes.
+                    matches = unsafe { below_highest_lane(matches) };
                 }
-                // Another key shares the fingerprint.
-                rarely_taken();
-                // SAFETY: the loop's test: the set is not empty, and it is
-                // the scan's mask less whole lanes.
-                matches = unsafe { below_highest_lane(matches) };
-            }
-            if pending == 0 {
-                return Err(level);
-            }
+            }};
+        }
+        let mut level = take_level!();
+        if let Some(found) = key_in!(level) {
+            return Ok(found);
+        }
+        while pending != 0 {
             distance = pending.leading_zeros();
             stepped = stepped.wrapping_add(distance as usize);
+            level = take_level!();
+            if let Some(found) = key_in!(level) {
+                return Ok(found);
+            }
         }
+        Err(level)
     }
 
     /// Whether a lookup [`Self::first_match`] found nothing for is absent,
