@@ -1497,11 +1497,29 @@ where
 
 /// Removal scan behind map and set `ExtractIf`. Holds the map's exclusive
 /// borrow and finishes deferred cleanup once exhausted or dropped.
+///
+/// Every removal is counted as it happens; the deferred cleanup only reclaims
+/// tombstones, so the map is consistent without it. Cleanup may hash keys and
+/// allocate, so a scan the predicate is unwinding out of skips it rather than
+/// risk a second panic.
 pub(crate) struct ExtractScan<'a, K, V, P: TableBackend<K, V>> {
     table: TableBorrow<'a, P>,
     scan: P::Scan,
-    finished: bool,
+    state: ExtractState,
     _marker: PhantomData<&'a mut HashMap<K, V, P>>,
+}
+
+/// Where an [`ExtractScan`] stands. One field, so dropping the scan decides
+/// on cleanup with a single comparison.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ExtractState {
+    /// Between predicate calls, with cleanup still owed.
+    Scanning,
+    /// Inside a predicate call. A scan dropped in this state is being
+    /// unwound by the predicate; the next call that returns leaves it.
+    InPredicate,
+    /// Exhausted; cleanup has run.
+    Finished,
 }
 
 impl<'a, K, V, P: TableBackend<K, V>> ExtractScan<'a, K, V, P> {
@@ -1510,7 +1528,7 @@ impl<'a, K, V, P: TableBackend<K, V>> ExtractScan<'a, K, V, P> {
         Self {
             table: TableBorrow::new(&mut map.table),
             scan,
-            finished: false,
+            state: ExtractState::Scanning,
             _marker: PhantomData,
         }
     }
@@ -1521,14 +1539,14 @@ impl<'a, K, V, P: TableBackend<K, V>> ExtractScan<'a, K, V, P> {
         &mut self,
         mut pred: impl FnMut(&K, &mut V) -> bool,
     ) -> Option<(K, V)> {
-        if self.finished {
+        if self.state == ExtractState::Finished {
             return None;
         }
         loop {
             // SAFETY: `table` points to the borrowed map for the iterator's life.
             let Some((ptr, loc)) = (unsafe { (*self.table.as_ptr()).scan_next(&mut self.scan) })
             else {
-                self.finished = true;
+                self.state = ExtractState::Finished;
                 // SAFETY: the scan is exhausted and the iterator still owns the
                 // map's exclusive borrow, so a same-size cleanup is now safe.
                 unsafe { (*self.table.as_ptr()).finish_deferred_removals() };
@@ -1536,7 +1554,10 @@ impl<'a, K, V, P: TableBackend<K, V>> ExtractScan<'a, K, V, P> {
             };
             // SAFETY: live slot; exclusive via the `&mut` map borrow.
             let slot = unsafe { &mut *ptr };
-            if pred(&slot.key, &mut slot.value) {
+            self.state = ExtractState::InPredicate;
+            let matched = pred(&slot.key, &mut slot.value);
+            self.state = ExtractState::Scanning;
+            if matched {
                 // SAFETY: matched — read the entry out, then finalize removal
                 // (tombstone + counters; the map keeps being used).
                 let entry = unsafe { core::ptr::read(ptr) };
@@ -1564,7 +1585,7 @@ where
 
 impl<K, V, P: TableBackend<K, V>> Drop for ExtractScan<'_, K, V, P> {
     fn drop(&mut self) {
-        if !self.finished {
+        if self.state == ExtractState::Scanning {
             // SAFETY: the iterator still owns the map's exclusive borrow.
             unsafe { (*self.table.as_ptr()).finish_deferred_removals() };
         }

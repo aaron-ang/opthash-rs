@@ -1,4 +1,5 @@
 use std::hash::{BuildHasher, Hasher};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use opthash::{EpochTransition, ReserveFraction};
 
@@ -220,6 +221,41 @@ fn partial_extract_drop_finishes_deferred_tombstone_cleanup() {
 
             let after = map.epoch();
             assert_eq!(map.len(), 1);
+            assert_eq!(map.capacity(), capacity);
+            assert_eq!(after.generation, before.generation + 1);
+            assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
+        }};
+    }
+
+    check!(ElasticHashMap::<usize, usize>::with_capacity(512));
+    check!(FunnelHashMap::<usize, usize>::with_capacity(512));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn extract_drop_after_a_caught_predicate_panic_finishes_cleanup() {
+    macro_rules! check {
+        ($map:expr) => {{
+            let mut map = $map;
+            let capacity = fill_to_capacity!(map);
+            let before = map.epoch();
+
+            {
+                let mut visited = 0;
+                let mut extracted = map.extract_if(|_, _| {
+                    visited += 1;
+                    assert!(visited != 2, "predicate");
+                    true
+                });
+                assert!(extracted.next().is_some());
+                assert!(catch_unwind(AssertUnwindSafe(|| extracted.next())).is_err());
+                for _ in 0..capacity - 3 {
+                    assert!(extracted.next().is_some());
+                }
+            }
+
+            let after = map.epoch();
+            assert_eq!(map.len(), 2);
             assert_eq!(map.capacity(), capacity);
             assert_eq!(after.generation, before.generation + 1);
             assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
