@@ -4,9 +4,8 @@
 //! of the first few levels again as a run per set of them for a lookup that
 //! has that set left.
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::mem::MaybeUninit;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ptr::{self, NonNull};
 
 use super::{
@@ -425,12 +424,8 @@ impl ProbeScheduleRoom {
             grouped_pushed: 0,
             grouped_held: 0,
             whole_groups: 0,
+            allocated: book.capacity(),
         });
-        let book: Box<[ScheduleBook; 1]> = book
-            .into_boxed_slice()
-            .try_into()
-            .ok()
-            .expect("the room holds one book");
         let mut schedule = ProbeSchedule {
             direct_reduction: direct.reduction,
             direct_control: direct.control(),
@@ -488,6 +483,8 @@ struct ScheduleBook {
     /// the lead of or before it, and that had a slot for every route their
     /// levels pushed.
     whole_groups: u8,
+    /// Books the allocation has room for, which freeing it takes.
+    allocated: usize,
 }
 
 const _: () = assert!(core::mem::offset_of!(ScheduleBook, starts) == 0);
@@ -771,15 +768,17 @@ struct OwnedBook {
 }
 
 impl OwnedBook {
-    fn new(book: Box<[ScheduleBook; 1]>) -> Self {
-        let starts = Box::into_raw(book).cast::<WalkStart>();
+    /// Owns `book`, which holds one book and its own capacity in it.
+    fn new(book: Vec<ScheduleBook>) -> Self {
+        assert!(book.len() == 1 && book[0].allocated == book.capacity());
+        let starts = ManuallyDrop::new(book).as_mut_ptr().cast::<WalkStart>();
         // SAFETY: the book begins with its `WALK_STARTS` starts, so the
         // entry is in the allocation, which is not at address zero.
         let zero_start = unsafe { NonNull::new_unchecked(starts.add(WALK_STARTS / 2)) };
         Self { zero_start }
     }
 
-    /// The book, with the provenance of the box it came in.
+    /// The book, with the provenance of the vector it came in.
     fn as_ptr(&self) -> *mut ScheduleBook {
         // SAFETY: `new` stepped this far into the book.
         unsafe { self.zero_start.as_ptr().sub(WALK_STARTS / 2).cast() }
@@ -804,9 +803,10 @@ impl core::ops::DerefMut for OwnedBook {
 
 impl Drop for OwnedBook {
     fn drop(&mut self) {
-        // SAFETY: `new` took the book out of a box of this type, and
-        // nothing else frees it.
-        drop(unsafe { Box::from_raw(self.as_ptr().cast::<[ScheduleBook; 1]>()) });
+        let allocated = self.allocated;
+        // SAFETY: `new` took the book out of a vector of this length and
+        // capacity, and nothing else frees it.
+        drop(unsafe { Vec::from_raw_parts(self.as_ptr(), 1, allocated) });
     }
 }
 
