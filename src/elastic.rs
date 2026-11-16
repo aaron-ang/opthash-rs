@@ -2249,10 +2249,9 @@ where
         prev_ctrl: u8,
     ) -> (usize, usize) {
         debug_assert!(level_idx < self.levels.len());
-        // SAFETY: callers pass a level they found a free slot in.
         let level = self.levels.level_ptr(level_idx);
         let lane = self.route_filter(prepared).membership;
-        // SAFETY: as above.
+        // SAFETY: `level_ptr` checked the index, so the pointer is to a level.
         let found = unsafe {
             SettledSlot {
                 level,
@@ -2263,7 +2262,7 @@ where
                 control: i32::from(prev_ctrl.cast_signed()),
             }
         };
-        // SAFETY: as above, and the slot is a free one of that level.
+        // SAFETY: callers pass a free slot of the level they found it in.
         unsafe { self.write_new_entry_at(key, value, prepared, key_fingerprint, found, lane) };
         // Not a settled insert: it may change the fill or the scheduled
         // probes the settled plan was made for.
