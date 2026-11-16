@@ -301,16 +301,16 @@ fn refresh_membership_rebuilds_the_recorded_filter() {
     assert_eq!(filter_tail(&table), recorded);
 }
 
-/// Every word of `table`'s filter tail, level bins and membership alike.
-fn filter_tail<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> Vec<u64> {
-    let words = table.membership.region.words;
-    // SAFETY: the tail holds `words` words of level bins below its base and
-    // as many membership words from it on, all initialized.
-    unsafe { core::slice::from_raw_parts(table.membership_ptr().sub(words), 2 * words).to_vec() }
+/// Every unit of `table`'s filter tail, level bin and membership alike.
+fn filter_tail<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> Vec<u32> {
+    let units = table.membership.region.words;
+    // SAFETY: the tail holds `units` initialized units from its base on; a
+    // table without any reads none.
+    unsafe { core::slice::from_raw_parts(table.membership_ptr(), units).to_vec() }
 }
 
 /// Every control byte and filter word of `table`.
-fn controls_and_filter<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> (Vec<u8>, Vec<u64>) {
+fn controls_and_filter<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> (Vec<u8>, Vec<u32>) {
     // SAFETY: `slot < slots`, the storage capacity.
     let controls = (0..table.shape.slots)
         .map(|slot| unsafe { table.storage.control_at(slot) })
@@ -536,19 +536,17 @@ fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
     const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut table = raw_table(4096, 3);
     let level = table.shape.levels[0];
-    let buckets = level.bucket_range.upper();
-    let mut accepted_elsewhere = 0;
     for index in 1..=32_u64 {
         let key = index.wrapping_mul(SPREAD);
         let probe = table.prf.prepare(key);
-        let own = probe::ordinary_funnel_first_index(probe, level.multiplier, level.bucket_range);
+        let own = probe::ordinary_funnel_bucket(probe, level.multiplier, level.buckets);
         // The first lane of an untouched level-zero bucket the probe does
         // not select.
-        let (_, slot) = (0..buckets)
+        let (_, slot) = (0..level.buckets)
             .map(|bucket| (bucket, level.offset + bucket * table.shape.stride))
             .find(|&(bucket, slot)| {
                 // SAFETY: a level-zero bucket starts inside the storage.
-                own != Some(bucket) && control::is_free(unsafe { table.storage.control_at(slot) })
+                own != bucket && control::is_free(unsafe { table.storage.control_at(slot) })
             })
             .unwrap();
         let vacancy = table.vacancy_at(slot);
@@ -561,13 +559,11 @@ fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
             table.prf.prepare(key).fingerprint(),
             true,
         );
-        accepted_elsewhere += usize::from(own.is_some());
     }
     assert!(table.exceptional_placement);
-    assert_ne!(accepted_elsewhere, 0);
     for index in 1..=32_u64 {
         let key = index.wrapping_mul(SPREAD);
-        assert_eq!(table.membership_gate(key).levels & OVERFLOW_LEVEL_BIT, 0);
+        assert_eq!(table.membership_gate(key).levels() & OVERFLOW_LEVEL_BIT, 0);
         assert_eq!(
             map::TableBackend::find_entry(&table, &key, key).map(|entry| entry.value),
             Some(index),
@@ -600,7 +596,8 @@ struct DifferentialCoverage {
     reseeds: usize,
     exceptional: bool,
     overflow_entries: bool,
-    rejected_first_words: bool,
+    /// A live key whose folded word is zero.
+    zero_word_keys: bool,
     overwrites: usize,
     wide_buckets: bool,
     narrow_buckets: bool,
@@ -609,9 +606,6 @@ struct DifferentialCoverage {
     /// Inserts of an unrecorded key below the budget that tombstones kept
     /// from the head walk.
     blocked_head_inserts: usize,
-    /// Lookups past the gate whose bin records no head level, which scan
-    /// an absent head entry.
-    absent_entry_scans: usize,
     /// Checks of a table holding deletes its counters had yet to see.
     uncounted_deletes: usize,
 }
@@ -656,7 +650,7 @@ fn assert_matches_model(
     assert!(table.entries() <= table.shape.max_insertions);
     // The head placements left are those of a table without tombstones.
     let head_limit = if table.tombstones() == 0 {
-        table.shape.max_insertions
+        table.shape.head_insertions()
     } else {
         0
     };
@@ -677,12 +671,6 @@ fn assert_matches_model(
     assert!(table.stale_membership() <= membership::refresh_deletes(table.shape.max_insertions));
     assert!(table.settle_left >= 1);
     coverage.uncounted_deletes += usize::from(table.uncounted_deletes() != 0);
-    let mut scans_absent_entry = |key: &HashedKey| {
-        let gate = table.membership_gate(key.hash);
-        coverage.absent_entry_scans +=
-            usize::from(gate.passes() && gate.levels & !OVERFLOW_LEVEL_BIT == 0);
-    };
-    model.keys().chain(absent).for_each(&mut scans_absent_entry);
     coverage.wide_buckets |= table.shape.beta > GROUP_SIZE;
     coverage.narrow_buckets |= table.shape.n != 0 && table.shape.beta <= GROUP_SIZE;
     let mut scan = OccupiedIndices::new();
@@ -730,7 +718,7 @@ fn assert_matches_model(
             "{key:?}"
         );
         assert_ne!(
-            table.membership_gate(key.hash).levels & table.level_bit(slot),
+            table.membership_gate(key.hash).levels() & table.level_bit(slot),
             0,
             "{key:?} lost its level bit"
         );
@@ -739,14 +727,7 @@ fn assert_matches_model(
             "{key:?} sits in a padding lane"
         );
         coverage.overflow_entries |= slot >= overflow_start;
-        if let Some(level) = table.shape.levels.first() {
-            coverage.rejected_first_words |= probe::ordinary_funnel_first_index(
-                table.prf.prepare(key.hash),
-                level.multiplier,
-                level.bucket_range,
-            )
-            .is_none();
-        }
+        coverage.zero_word_keys |= key.hash == table.prf.zero_word_hash();
     }
     for key in absent {
         if !model.contains_key(key) {
@@ -772,10 +753,10 @@ fn insert_checking_the_head_walk(
 ) {
     use crate::map::TableBackend;
 
-    let membership = table.membership_slot(key.hash);
-    let unrecorded = !table.membership_gate_at(membership).passes();
+    let before = table.membership_gate(key.hash);
+    let unrecorded = !before.passes();
     let head = unrecorded
-        .then(|| table.head_vacancy(table.prf.prepare(key.hash), membership))
+        .then(|| table.head_vacancy(table.prf.prepare(key.hash)))
         .flatten();
     coverage.blocked_head_inserts += usize::from(
         unrecorded && table.head_left == 0 && table.entries() < table.shape.max_insertions,
@@ -785,10 +766,14 @@ fn insert_checking_the_head_walk(
         assert_eq!(previous, None, "{key:?}");
         assert_eq!(
             table.find_location(&key, key.hash),
-            Some(head.slot),
+            Some(table.slot_of(NonNull::new(head.lane).unwrap())),
             "{key:?}"
         );
-        assert_eq!(table.membership_gate(key.hash).levels, head.bins, "{key:?}");
+        assert_eq!(
+            table.membership_gate(key.hash).levels(),
+            before.levels() | head.level_bit,
+            "{key:?}"
+        );
         coverage.head_placements += 1;
     }
 }
@@ -903,14 +888,14 @@ fn run_differential(
 }
 
 fn spread_universe(len: u64) -> Vec<HashedKey> {
-    // The first key's word is rejected by a level unless its bucket count
-    // is a power of two.
-    let rejected = FunnelPrf::new(FUNNEL_PROBE_SEED).zero_word_hash();
+    // The first key's folded word is zero until a reseed, so it draws
+    // bucket zero in every level.
+    let zero_word = FunnelPrf::new(FUNNEL_PROBE_SEED).zero_word_hash();
     (0..len)
         .map(|id| HashedKey {
             id,
             hash: if id == 0 {
-                rejected
+                zero_word
             } else {
                 id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             },
@@ -937,11 +922,10 @@ fn operation_streams_agree_with_a_model_map_and_the_ordered_walk() {
         assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
         assert!(coverage.clears > 0, "{coverage:?}");
         assert!(coverage.overwrites > 0, "{coverage:?}");
-        assert!(coverage.rejected_first_words, "{coverage:?}");
+        assert!(coverage.zero_word_keys, "{coverage:?}");
         assert!(!coverage.exceptional, "{coverage:?}");
         assert!(coverage.head_placements > 0, "{coverage:?}");
         assert!(coverage.blocked_head_inserts > 0, "{coverage:?}");
-        assert!(coverage.absent_entry_scans > 0, "{coverage:?}");
         assert!(coverage.uncounted_deletes > 0, "{coverage:?}");
     }
 }
@@ -1112,77 +1096,170 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
     }
 }
 
-/// Every set of recorded levels yields its head entries in level order, and
-/// the overflow bit yields none.
 #[test]
-fn recorded_head_yields_the_entry_of_every_recorded_level_shallowest_first() {
-    let shape = FunnelShape::for_insert_budget(1 << 12, ReserveFraction::from_exponent(3).unwrap())
-        .unwrap();
-    let yielded = |levels: u16| -> Vec<*const LevelShape> {
-        RecordedHead::new(&shape, levels)
-            .map(core::ptr::from_ref)
-            .collect()
-    };
-    let entries = |levels: &[usize]| -> Vec<*const LevelShape> {
-        levels
-            .iter()
-            .map(|&level| core::ptr::from_ref(&shape.head[level]))
-            .collect()
-    };
-    assert_eq!(yielded(0), []);
-    assert_eq!(yielded(OVERFLOW_LEVEL_BIT), []);
-    assert_eq!(
-        yielded(u16::MAX),
-        entries(&(0..OVERFLOW_LEVEL).collect::<Vec<_>>())
-    );
-    for shallow in 0..OVERFLOW_LEVEL {
-        assert_eq!(
-            yielded(level_bit_of(shallow)),
-            entries(&[shallow]),
-            "level {shallow}"
-        );
-        for deep in shallow + 1..OVERFLOW_LEVEL {
-            for overflow in [0, OVERFLOW_LEVEL_BIT] {
-                assert_eq!(
-                    yielded(level_bit_of(shallow) | level_bit_of(deep) | overflow),
-                    entries(&[shallow, deep]),
-                    "levels {shallow} and {deep}"
-                );
-            }
-        }
-    }
+fn levels_past_the_head_share_the_overflow_bit() {
     // A deeper level shares the overflow bit, which names no head entry.
     assert_eq!(level_bit_of(OVERFLOW_LEVEL), OVERFLOW_LEVEL_BIT);
     assert_eq!(level_bit_of(usize::MAX), OVERFLOW_LEVEL_BIT);
 }
 
+fn head_table(
+    shape: FunnelShape,
+    reserve: ReserveFraction,
+) -> FunnelTable<u64, u64, IdentityBuildHasher> {
+    FunnelTable::try_from_shape(shape, reserve, IdentityBuildHasher, Global).unwrap()
+}
+
+/// The head is the one [`head_levels`] derives from the table's own shape
+/// and storage.
+fn assert_head_addresses_storage<K, V, S>(table: &FunnelTable<K, V, S>) {
+    let derived = head_levels(&table.shape, &table.storage);
+    for (index, (head, derived)) in table.head.iter().zip(&derived).enumerate() {
+        assert_eq!(head.multiplier, derived.multiplier, "entry {index}");
+        assert_eq!(head.buckets, derived.buckets, "entry {index}");
+        assert_eq!(head.ctrl, derived.ctrl, "entry {index}");
+        assert_eq!(head.data, derived.data, "entry {index}");
+    }
+}
+
+/// Every path that gives a table another storage gives it that storage's
+/// head: growth, shrinking, the empty shape, and a clone. A clear keeps
+/// both. Lookups, inserts and removals read and write through the head after
+/// each.
+#[test]
+fn head_follows_its_storage_through_every_replacement() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let reserve = ReserveFraction::from_exponent(3).unwrap();
+    let key_of = |index: u64| index.wrapping_mul(SPREAD);
+    let check = |table: &mut FunnelTable<u64, u64, IdentityBuildHasher>, live: u64| {
+        assert_head_addresses_storage(table);
+        assert_eq!(table.entries() as u64, live);
+        for index in 0..live {
+            let key = key_of(index);
+            let found = table.find_entry_ref(&key, key).map(|entry| entry.value);
+            assert_eq!(found, Some(index), "index {index}");
+        }
+        // Through the head and back out, where the table has room.
+        if table.shape.max_insertions as u64 > live {
+            let key = key_of(live);
+            assert_eq!(map::TableBackend::insert(table, key, live, key), None);
+            assert_eq!(map::TableBackend::take(table, &key, key), Some((key, live)));
+        }
+        assert_eq!(
+            map::TableBackend::take(table, &key_of(live), key_of(live)),
+            None
+        );
+    };
+
+    let mut table = raw_table(144, 3);
+    check(&mut table, 0);
+    let live = 40;
+    for index in 0..live {
+        let key = key_of(index);
+        assert_eq!(map::TableBackend::insert(&mut table, key, index, key), None);
+    }
+    check(&mut table, live);
+
+    let grown = FunnelShape::for_insert_budget(256, reserve).unwrap();
+    map::TableBackend::try_resize(&mut table, grown.n).unwrap();
+    assert_eq!(table.shape.n, grown.n);
+    check(&mut table, live);
+
+    map::TableBackend::shrink_to(&mut table, 0);
+    assert!(table.shape.n < grown.n);
+    check(&mut table, live);
+
+    let mut cloned = map::TableBackend::clone_table(&table);
+    assert_ne!(cloned.storage.ctrl_ptr(), table.storage.ctrl_ptr());
+    check(&mut cloned, live);
+    drop(table);
+    check(&mut cloned, live);
+
+    map::TableBackend::clear(&mut cloned);
+    check(&mut cloned, 0);
+
+    map::TableBackend::shrink_to(&mut cloned, 0);
+    assert_eq!(cloned.shape.n, 0);
+    assert_head_addresses_storage(&cloned);
+    assert_eq!(
+        cloned
+            .find_entry_ref(&key_of(1), key_of(1))
+            .map(|entry| entry.value),
+        None
+    );
+    assert_eq!(
+        map::TableBackend::take(&mut cloned, &key_of(1), key_of(1)),
+        None
+    );
+
+    // Out of the empty shape again, through the insert's own growth.
+    for index in 0..live {
+        let key = key_of(index);
+        assert_eq!(
+            map::TableBackend::insert(&mut cloned, key, index, key),
+            None
+        );
+        assert_head_addresses_storage(&cloned);
+    }
+    check(&mut cloned, live);
+}
+
 /// An empty shape and one with buckets wider than a group keep an all-absent
-/// head, which ends the insert's head walk at once and matches nothing in a
-/// first-match scan. Any other shape copies its levels into the head.
+/// head, which no insert walks and which matches nothing in a first-match
+/// scan. Any other shape addresses its levels from the head. An entry that
+/// is no level points at the group past the slots.
 #[test]
 fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     let (wide, smallest_wide) = smallest_wide_shape();
     let wide_reserve = ReserveFraction::from_exponent(wide).unwrap();
     let large_wide = FunnelShape::for_insert_budget(1 << 19, wide_reserve).unwrap();
+    let past_the_slots = |table: &FunnelTable<u64, u64, IdentityBuildHasher>,
+                          head: &HeadLevel<SlotEntry<u64, u64>>| {
+        head.buckets == 0 && table.slot_of(NonNull::new(head.ctrl).unwrap()) == table.shape.slots
+    };
     for shape in [FunnelShape::empty(), smallest_wide, large_wide] {
-        assert_eq!(
-            shape.head,
-            [LevelShape::ABSENT; HEAD_ENTRIES],
+        assert!(!shape.has_head());
+        assert_eq!(shape.head_insertions(), 0);
+        let table = head_table(shape, wide_reserve);
+        assert!(
+            table.head[..OVERFLOW_LEVEL]
+                .iter()
+                .all(HeadLevel::is_absent),
             "n {}",
-            shape.n
+            table.shape.n
         );
+        assert!(table.head.iter().all(|head| past_the_slots(&table, head)));
     }
 
     let narrow_reserve = ReserveFraction::from_exponent(3).unwrap();
     for budget in [1, 1 << 19] {
         let shape = FunnelShape::for_insert_budget(budget, narrow_reserve).unwrap();
         assert!(shape.beta <= GROUP_SIZE);
-        let recorded = shape.levels.len().min(OVERFLOW_LEVEL);
-        assert_eq!(shape.head[..recorded], shape.levels[..recorded]);
+        assert_eq!(shape.head_insertions(), shape.max_insertions);
+        let table = head_table(shape, narrow_reserve);
+        let recorded = table.shape.levels.len().min(OVERFLOW_LEVEL);
+        for (head, level) in table.head.iter().zip(&table.shape.levels[..recorded]) {
+            assert_eq!(head.multiplier, level.multiplier);
+            assert_eq!(head.buckets, level.buckets);
+            assert_eq!(
+                table.slot_of(NonNull::new(head.ctrl).unwrap()),
+                level.offset
+            );
+            // SAFETY: a level starts inside the storage.
+            let data = unsafe { table.storage.slot_ptr(level.offset) };
+            assert_eq!(head.data.cast(), data);
+        }
         assert!(
-            shape.head[recorded..]
+            table.head[recorded..OVERFLOW_LEVEL]
                 .iter()
-                .all(|level| *level == LevelShape::ABSENT)
+                .all(HeadLevel::is_absent)
+        );
+        assert!(table.head[OVERFLOW_LEVEL].is_absent());
+        assert!(!table.head[HEAD_ENTRIES - 1].is_absent());
+        assert!(
+            table.head[recorded..]
+                .iter()
+                .all(|head| past_the_slots(&table, head))
         );
     }
 }
@@ -1364,7 +1441,7 @@ fn decompose_scalar_location(shape: &FunnelShape, location: ScalarFunnelLocation
             slot_in_bucket,
             ..
         } => {
-            assert!(bucket < shape.levels[level].bucket_range.upper());
+            assert!(bucket < shape.levels[level].buckets);
             assert!(slot_in_bucket < shape.beta);
             shape.levels[level].offset + bucket * shape.stride + slot_in_bucket
         }
@@ -1530,7 +1607,7 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
                 level: level_index as u64,
             },
             0,
-            level.bucket_range.upper(),
+            level.buckets,
         );
         let start = level.offset + bucket * table.shape.stride;
         for lane in 0..table.shape.beta {
@@ -1761,7 +1838,7 @@ fn assert_level_masks_cover_live(table: &FunnelTable<u64, u64, IdentityBuildHash
         let hash = table.hash_builder.hash_one(key);
         let level_bit = table.level_bit(slot);
         assert_ne!(
-            table.membership_gate(hash).levels & level_bit,
+            table.membership_gate(hash).levels() & level_bit,
             0,
             "slot {slot} lost its level bit"
         );
@@ -1830,7 +1907,7 @@ fn exact_geometry_sums_to_n() {
         .shape
         .levels
         .iter()
-        .map(|level| level.bucket_range.upper() * table.shape.beta)
+        .map(|level| level.buckets * table.shape.beta)
         .sum::<usize>();
     assert_eq!(
         ordinary_slots
@@ -1842,7 +1919,7 @@ fn exact_geometry_sums_to_n() {
         .shape
         .levels
         .iter()
-        .map(|level| level.bucket_range.upper() * (table.shape.stride - table.shape.beta))
+        .map(|level| level.buckets * (table.shape.stride - table.shape.beta))
         .sum::<usize>();
     assert_eq!(table.storage.capacity(), table.shape.n + padding);
     assert_eq!(table.shape.slots, table.shape.n + padding);
@@ -2000,6 +2077,7 @@ fn panicking_hasher_during_resize_keeps_every_entry() {
     assert_eq!(table.shape.n, 144);
     assert_eq!(table.entries(), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_head_addresses_storage(&table);
     assert_eq!(
         table.entries(),
         (0..table.shape.slots)
@@ -2549,11 +2627,8 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
             let prf = table.prf;
             let shared = prf.prepare(0).fingerprint();
             let kept = |key: &u64| !shared_fingerprint || prf.prepare(*key).fingerprint() == shared;
-            // Two rounds: multiples of the spread alone fill the bins of a
-            // filter word too evenly to leave one empty.
             let keys: Vec<u64> = (0..)
                 .map(|index: u64| index.wrapping_mul(SPREAD))
-                .map(|key| (key ^ (key >> 32)).wrapping_mul(SPREAD))
                 .filter(kept)
                 .take(2 * table.shape.max_insertions)
                 .collect();
@@ -2575,7 +2650,7 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 if !gate.passes() {
                     continue;
                 }
-                let walk = table.find_location_by_walk(&key, key, gate.levels);
+                let walk = table.find_location_by_walk(&key, key, gate.levels());
                 let live = index < inserted && index % 3 != 0;
                 assert_eq!(walk.is_some(), live, "n {n} d {d} index {index}");
                 // The whole lookup, through whichever path settles it.
@@ -2585,45 +2660,207 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                     "n {n} d {d} index {index}"
                 );
                 let probe = table.prf.prepare(key);
-                let found = table
-                    .first_match(&key, probe, gate.levels.into())
-                    .map(|found| found.slot);
+                let scan = table
+                    .first_match(&key, probe, gate.levels().into())
+                    .map(|found| table.slot_of(found.lane));
+                let found = scan.ok();
                 // An empty bin and the overflow bit each scan an absent head
-                // entry, which finds nothing but the key itself.
+                // entry, which finds nothing.
                 for absent in [0, OVERFLOW_LEVEL_BIT] {
                     let at_absent = table
                         .first_match(&key, probe, absent.into())
-                        .map(|found| found.slot);
-                    assert!(
-                        at_absent.is_none() || at_absent == walk,
-                        "n {n} d {d} index {index}"
-                    );
+                        .map(|found| table.slot_of(found.lane))
+                        .ok();
+                    assert_eq!(at_absent, None, "n {n} d {d} index {index}");
                 }
-                if found.is_some() || table.unmatched_is_absent(probe, gate.levels) {
+                if scan.map_or_else(|last| table.unmatched_is_absent(last), |_| true) {
                     assert_eq!(found, walk, "n {n} d {d} index {index}");
-                    // A bucket wider than a group is never scanned here:
-                    // only a key no level recorded is answered, or one the
-                    // scan of an absent entry meets in the first group.
-                    assert!(
-                        !wide
-                            || gate.levels & !OVERFLOW_LEVEL_BIT == 0
-                            || found.is_some_and(|slot| slot < GROUP_SIZE),
-                        "n {n} d {d} index {index}"
-                    );
+                    // A bucket wider than a group is never scanned here.
+                    assert!(!wide, "n {n} d {d} index {index}");
                     answered += 1;
                 } else {
                     handed_off += 1;
                 }
             }
-            // A wide table still answers the lookups with no level to scan,
-            // which spread keys leave it.
-            if !(wide && shared_fingerprint) {
-                assert_ne!(answered, 0, "n {n} d {d}");
-            }
             if wide {
                 assert_ne!(handed_off, 0, "n {n} d {d}");
+            } else {
+                assert_ne!(answered, 0, "n {n} d {d}");
             }
         }
+    }
+}
+
+/// The walk that searches and places a recorded key at once answers as the
+/// lookup and the head placement do apart: a key it reports present is where
+/// the lookup finds it, and a vacancy it reports is the head walk's, for a
+/// key the lookup does not find. It settles nothing in a table with
+/// tombstones, and inserts through it agree with a model map.
+#[test]
+#[cfg_attr(miri, ignore = "fills tens of thousands of slots")]
+fn recorded_key_search_agrees_with_the_lookup_and_the_head_walk() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let feasible = |n: &usize, d: u32| {
+        FunnelShape::from_slots(*n, ReserveFraction::from_exponent(d).unwrap()).is_ok()
+    };
+    // (present, vacant, unsettled) over every recorded key below `keys`.
+    let census = |table: &FunnelTable<u64, u64, IdentityBuildHasher>, keys: u64| {
+        let (mut present, mut vacant, mut unsettled) = (0_usize, 0_usize, 0_usize);
+        // The inserted sequence, then a scrambled one whose keys the filter
+        // records by chance.
+        let scrambled = |index: u64| {
+            let word = index.wrapping_mul(SPREAD);
+            (word ^ (word >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        };
+        let sequence = (0..keys)
+            .map(|index| index.wrapping_mul(SPREAD))
+            .chain((0..keys).map(scrambled));
+        for (index, key) in sequence.enumerate() {
+            let gate = table.membership_gate(key);
+            if !gate.passes() {
+                continue;
+            }
+            let probe = table.prf.prepare(key);
+            let location = table.find_location(&key, key);
+            match table.search_head(&key, probe, gate.levels()) {
+                HeadSearch::Present(lane) => {
+                    assert_eq!(Some(table.slot_of(lane)), location, "index {index}");
+                    present += 1;
+                }
+                HeadSearch::Vacant(vacancy) => {
+                    assert_eq!(location, None, "index {index}");
+                    let head = table.head_vacancy(probe).unwrap();
+                    assert_eq!(vacancy.lane, head.lane, "index {index}");
+                    assert_eq!(vacancy.entry, head.entry, "index {index}");
+                    assert_eq!(vacancy.level_bit, head.level_bit, "index {index}");
+                    vacant += 1;
+                }
+                HeadSearch::Unsettled => unsettled += 1,
+            }
+        }
+        (present, vacant, unsettled)
+    };
+    for (at_least, d) in [(600, 3), (6_000, 4), (60_000, 9)] {
+        let n = (at_least..2 * at_least).find(|n| feasible(n, d)).unwrap();
+        let mut table = raw_table(n, d);
+        let wide = !table.shape.has_head();
+        let mut model = alloc::collections::BTreeMap::new();
+        let limit = table.shape.max_insertions as u64;
+        let keys = 2 * limit;
+        let (mut present, mut vacant) = (0, 0);
+        // Odd indices first, so the even ones are absent keys the filter
+        // partly records by the time they are inserted.
+        for parity in [1, 0] {
+            for index in (1..limit - 1).filter(|index| index % 2 == parity) {
+                let key = index.wrapping_mul(SPREAD);
+                assert_eq!(
+                    map::TableBackend::insert(&mut table, key, index, key),
+                    model.insert(key, index),
+                    "n {n} d {d} index {index}"
+                );
+            }
+            let (now_present, now_vacant, unsettled) = census(&table, keys);
+            present += now_present;
+            vacant += now_vacant;
+            assert!(!wide || now_present + now_vacant == 0, "n {n} d {d}");
+            assert!(wide || unsettled < now_present, "n {n} d {d}");
+        }
+        assert_eq!(wide, present == 0, "n {n} d {d}");
+        assert_eq!(wide, vacant == 0, "n {n} d {d}");
+        // Every key again: a present one is replaced, never placed twice.
+        for index in 1..limit - 1 {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(
+                map::TableBackend::insert(&mut table, key, !index, key),
+                model.insert(key, !index),
+                "n {n} d {d} index {index}"
+            );
+        }
+        assert_eq!(table.entries(), model.len());
+        for index in 0..keys {
+            let key = index.wrapping_mul(SPREAD);
+            let found = table.find_entry_ref(&key, key).map(|entry| entry.value);
+            assert_eq!(found, model.get(&key).copied(), "n {n} d {d} index {index}");
+        }
+        // A tombstone takes the head placement away, and the walk with it.
+        let key = SPREAD;
+        assert!(map::TableBackend::take(&mut table, &key, key).is_some());
+        assert_eq!(table.head_left, 0);
+        let (present, vacant, _) = census(&table, keys);
+        assert_eq!((present, vacant), (0, 0), "n {n} d {d}");
+    }
+}
+
+/// Removal by key takes each entry a model map holds and nothing else,
+/// whichever lookup path finds it: the first-match scan, the ordered walk a
+/// wide bucket hands the lookup to, and both again over the tombstones
+/// earlier removals left.
+#[test]
+#[cfg_attr(miri, ignore = "fills tens of thousands of slots")]
+fn removal_by_key_agrees_with_a_model_on_every_lookup_path() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let feasible = |n: &usize, d: u32| {
+        FunnelShape::from_slots(*n, ReserveFraction::from_exponent(d).unwrap()).is_ok()
+    };
+    let check = |table: &FunnelTable<u64, u64, IdentityBuildHasher>,
+                 model: &alloc::collections::BTreeMap<u64, u64>,
+                 keys: u64| {
+        assert_eq!(table.entries(), model.len());
+        for index in 0..keys {
+            let key = index.wrapping_mul(SPREAD);
+            let found = table.find_entry_ref(&key, key).map(|entry| entry.value);
+            assert_eq!(found, model.get(&key).copied(), "index {index}");
+        }
+    };
+    for (at_least, d) in [(600, 3), (6_000, 4), (60_000, 9)] {
+        let n = (at_least..2 * at_least).find(|n| feasible(n, d)).unwrap();
+        let mut table = raw_table(n, d);
+        let mut model = alloc::collections::BTreeMap::new();
+        let inserted = table.shape.max_insertions as u64 - 1;
+        for index in 1..inserted {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(map::TableBackend::insert(&mut table, key, index, key), None);
+            model.insert(key, index);
+        }
+        let keys = 2 * inserted;
+        check(&table, &model, keys);
+        // Present and absent keys, interleaved.
+        for index in (0..keys).filter(|index| index % 3 != 1) {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(
+                map::TableBackend::take(&mut table, &key, key),
+                model.remove_entry(&key),
+                "n {n} d {d} index {index}"
+            );
+            // A removed key is gone at once.
+            assert_eq!(
+                map::TableBackend::take(&mut table, &key, key),
+                None,
+                "n {n} d {d} index {index}"
+            );
+        }
+        assert!(!model.is_empty());
+        check(&table, &model, keys);
+        // Over tombstones, and into the slots they free.
+        for index in (1..inserted).filter(|index| index % 3 == 0) {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(
+                map::TableBackend::insert(&mut table, key, !index, key),
+                None
+            );
+            model.insert(key, !index);
+        }
+        check(&table, &model, keys);
+        for index in 0..keys {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(
+                map::TableBackend::take(&mut table, &key, key),
+                model.remove_entry(&key),
+                "n {n} d {d} index {index}"
+            );
+        }
+        assert!(model.is_empty());
+        check(&table, &model, keys);
     }
 }
 
@@ -2648,17 +2885,12 @@ fn head_vacancy_agrees_with_the_placement_walk_whenever_it_answers() {
             let key = index.wrapping_mul(SPREAD);
             let probe = table.prf.prepare(key);
             let general = table.search_vacancy(probe);
-            let membership = table.membership_slot(key);
-            let recorded = table.membership_gate_at(membership).levels;
-            if let Some(head) = table.first_empty_in_head(probe, membership) {
-                let general = general.unwrap();
-                assert_eq!(head.slot, general.slot, "n {n} d {d} index {index}");
-                // The bin comes back with the level's bit set in it.
-                assert_eq!(
-                    head.bins,
-                    recorded | general.level_bit,
-                    "n {n} d {d} index {index}"
-                );
+            if let Some(head) = table.first_empty_in_head(probe) {
+                let head = Vacancy {
+                    slot: table.slot_of(NonNull::new(head.lane).unwrap()),
+                    level_bit: head.level_bit,
+                };
+                assert_eq!(Some(head), general, "n {n} d {d} index {index}");
                 answered += 1;
             }
             assert_eq!(map::TableBackend::insert(&mut table, key, index, key), None);

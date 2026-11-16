@@ -218,8 +218,8 @@ impl FunnelPrf {
         }
     }
 
-    /// The key hash whose folded word is zero. Every level whose bucket
-    /// count is not a power of two rejects that first word.
+    /// The key hash whose folded word is zero, which draws bucket zero in
+    /// every ordinary level.
     #[cfg(test)]
     pub(crate) const fn zero_word_hash(self) -> u64 {
         self.lane_seed.wrapping_neg()
@@ -660,14 +660,6 @@ impl PreparedProbeRange {
         }
     }
 
-    /// A range with no index, which rejects every word.
-    pub(crate) const fn rejecting() -> Self {
-        Self {
-            upper: 0,
-            rejection_threshold: u64::MAX,
-        }
-    }
-
     pub(crate) fn new(upper: usize) -> Result<Self, RangeReductionError> {
         if upper == 0 {
             return Err(RangeReductionError::ZeroUpperBound);
@@ -827,76 +819,27 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
     reduce_prepared_funnel_retries(probe, logical_probe_index, range, last_rejection_index)
 }
 
-/// The bucket an ordinary level's first random word selects, and whether that
-/// word is accepted. The bucket is below the range's upper bound either way;
-/// a rejected word needs [`ordinary_funnel_retry_index`].
+/// The bucket of a key in an ordinary level of `buckets` buckets: the
+/// multiply-high reduction of the level's random word, with no rejection
+/// test. Consecutive runs of words draw each bucket, and two runs differ by
+/// at most one word, so a bucket's share of the words departs from an even
+/// one by less than `buckets` parts in `2^64`. A level with no buckets draws
+/// bucket zero.
 ///
-/// The first word of an ordinary level is the folded key times that level's
+/// The random word of an ordinary level is the folded key times that level's
 /// multiplier, not a counter word: `key_out` already folds every bit of the
 /// key, and a distinct odd multiplier per level decorrelates the levels with
-/// one multiply.
+/// one multiply. The key whose folded word is zero draws bucket zero in
+/// every level.
 #[allow(clippy::cast_possible_truncation)]
 #[inline]
-pub(crate) fn ordinary_funnel_first_draw(
+pub(crate) fn ordinary_funnel_bucket(
     probe: PreparedFastFunnelProbe,
     multiplier: u64,
-    range: PreparedProbeRange,
-) -> (usize, bool) {
-    let product =
-        u128::from(probe.ordinary_first_word(multiplier)) * u128::from(range.upper as u64);
-    (
-        (product >> u64::BITS) as usize,
-        product as u64 >= range.rejection_threshold,
-    )
-}
-
-/// [`ordinary_funnel_first_draw`]'s bucket when its word is accepted.
-#[inline]
-pub(crate) fn ordinary_funnel_first_index(
-    probe: PreparedFastFunnelProbe,
-    multiplier: u64,
-    range: PreparedProbeRange,
-) -> Option<usize> {
-    let (bucket, accepted) = ordinary_funnel_first_draw(probe, multiplier, range);
-    accepted.then_some(bucket)
-}
-
-/// [`ordinary_funnel_first_draw`]'s bucket when the range's upper bound alone
-/// shows the word accepted: the rejection threshold is below that bound, so a
-/// low product above the bound is at or above the threshold. `None` leaves
-/// the word to the exact test, and is the answer for every word of a range
-/// with no index.
-#[allow(clippy::cast_possible_truncation)]
-#[inline]
-pub(crate) fn ordinary_funnel_first_certain_index(
-    probe: PreparedFastFunnelProbe,
-    multiplier: u64,
-    range: PreparedProbeRange,
-) -> Option<usize> {
-    let upper = range.upper as u64;
-    let product = u128::from(probe.ordinary_first_word(multiplier)) * u128::from(upper);
-    (product as u64 > upper).then_some((product >> u64::BITS) as usize)
-}
-
-/// Counter words one to [`RANGE_WORD_CAP`] of ordinary level `level`, for a
-/// probe whose first word was rejected. `None` is a range failure.
-#[cold]
-#[inline(never)]
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) fn ordinary_funnel_retry_index(
-    probe: PreparedFastFunnelProbe,
-    level: usize,
-    range: PreparedProbeRange,
-) -> Option<usize> {
-    let counter_base = FunnelPrf::ordinary_counter_base(level as u64)?;
-    reduce_prepared_funnel_retries(
-        &probe.prepare_counter_base(counter_base),
-        0,
-        range,
-        (RANGE_WORD_CAP - 1) as u8,
-    )
-    .ok()
-    .map(|probe| probe.index)
+    buckets: usize,
+) -> usize {
+    let product = u128::from(probe.ordinary_first_word(multiplier)) * u128::from(buckets as u64);
+    (product >> u64::BITS) as usize
 }
 
 #[cold]
