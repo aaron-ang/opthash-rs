@@ -766,7 +766,7 @@ fn insert_checking_the_head_walk(
         assert_eq!(previous, None, "{key:?}");
         assert_eq!(
             table.find_location(&key, key.hash),
-            Some(head.slot),
+            Some(table.slot_of(NonNull::new(head.lane).unwrap())),
             "{key:?}"
         );
         assert_eq!(
@@ -1103,37 +1103,70 @@ fn levels_past_the_head_share_the_overflow_bit() {
     assert_eq!(level_bit_of(usize::MAX), OVERFLOW_LEVEL_BIT);
 }
 
+fn head_table(
+    shape: FunnelShape,
+    reserve: ReserveFraction,
+) -> FunnelTable<u64, u64, IdentityBuildHasher> {
+    FunnelTable::try_from_shape(shape, reserve, IdentityBuildHasher, Global).unwrap()
+}
+
 /// An empty shape and one with buckets wider than a group keep an all-absent
 /// head, which no insert walks and which matches nothing in a first-match
-/// scan. Any other shape copies its levels into the head.
+/// scan. Any other shape addresses its levels from the head. An entry that
+/// is no level points at the group past the slots.
 #[test]
 fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     let (wide, smallest_wide) = smallest_wide_shape();
     let wide_reserve = ReserveFraction::from_exponent(wide).unwrap();
     let large_wide = FunnelShape::for_insert_budget(1 << 19, wide_reserve).unwrap();
+    let past_the_slots = |table: &FunnelTable<u64, u64, IdentityBuildHasher>,
+                          head: &HeadLevel<SlotEntry<u64, u64>>| {
+        head.buckets == 0 && table.slot_of(NonNull::new(head.ctrl).unwrap()) == table.shape.slots
+    };
     for shape in [FunnelShape::empty(), smallest_wide, large_wide] {
-        assert_eq!(
-            shape.head,
-            [LevelShape::absent(shape.slots); HEAD_ENTRIES],
-            "n {}",
-            shape.n
-        );
         assert!(!shape.has_head());
         assert_eq!(shape.head_insertions(), 0);
+        let table = head_table(shape, wide_reserve);
+        assert!(
+            table.head[..OVERFLOW_LEVEL]
+                .iter()
+                .all(HeadLevel::is_absent),
+            "n {}",
+            table.shape.n
+        );
+        assert!(table.head.iter().all(|head| past_the_slots(&table, head)));
     }
 
     let narrow_reserve = ReserveFraction::from_exponent(3).unwrap();
     for budget in [1, 1 << 19] {
         let shape = FunnelShape::for_insert_budget(budget, narrow_reserve).unwrap();
         assert!(shape.beta <= GROUP_SIZE);
-        let recorded = shape.levels.len().min(OVERFLOW_LEVEL);
-        assert_eq!(shape.head[..recorded], shape.levels[..recorded]);
-        assert!(
-            shape.head[recorded..]
-                .iter()
-                .all(|level| *level == LevelShape::absent(shape.slots))
-        );
         assert_eq!(shape.head_insertions(), shape.max_insertions);
+        let table = head_table(shape, narrow_reserve);
+        let recorded = table.shape.levels.len().min(OVERFLOW_LEVEL);
+        for (head, level) in table.head.iter().zip(&table.shape.levels[..recorded]) {
+            assert_eq!(head.multiplier, level.multiplier);
+            assert_eq!(head.buckets, level.buckets);
+            assert_eq!(
+                table.slot_of(NonNull::new(head.ctrl).unwrap()),
+                level.offset
+            );
+            // SAFETY: a level starts inside the storage.
+            let data = unsafe { table.storage.slot_ptr(level.offset) };
+            assert_eq!(head.data.cast(), data);
+        }
+        assert!(
+            table.head[recorded..OVERFLOW_LEVEL]
+                .iter()
+                .all(HeadLevel::is_absent)
+        );
+        assert!(table.head[OVERFLOW_LEVEL].is_absent());
+        assert!(!table.head[HEAD_ENTRIES - 1].is_absent());
+        assert!(
+            table.head[recorded..]
+                .iter()
+                .all(|head| past_the_slots(&table, head))
+        );
     }
 }
 
@@ -2531,18 +2564,20 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                     "n {n} d {d} index {index}"
                 );
                 let probe = table.prf.prepare(key);
-                let found = table
+                let scan = table
                     .first_match(&key, probe, gate.levels().into())
-                    .map(|found| found.slot);
+                    .map(|found| table.slot_of(found.lane));
+                let found = scan.ok();
                 // An empty bin and the overflow bit each scan an absent head
                 // entry, which finds nothing.
                 for absent in [0, OVERFLOW_LEVEL_BIT] {
                     let at_absent = table
                         .first_match(&key, probe, absent.into())
-                        .map(|found| found.slot);
+                        .map(|found| table.slot_of(found.lane))
+                        .ok();
                     assert_eq!(at_absent, None, "n {n} d {d} index {index}");
                 }
-                if found.is_some() || table.unmatched_is_absent(gate.levels()) {
+                if scan.map_or_else(|last| table.unmatched_is_absent(last), |_| true) {
                     assert_eq!(found, walk, "n {n} d {d} index {index}");
                     // A bucket wider than a group is never scanned here.
                     assert!(!wide, "n {n} d {d} index {index}");
@@ -2557,6 +2592,79 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 assert_ne!(answered, 0, "n {n} d {d}");
             }
         }
+    }
+}
+
+/// Removal by key takes each entry a model map holds and nothing else,
+/// whichever lookup path finds it: the first-match scan, the ordered walk a
+/// wide bucket hands the lookup to, and both again over the tombstones
+/// earlier removals left.
+#[test]
+#[cfg_attr(miri, ignore = "fills tens of thousands of slots")]
+fn removal_by_key_agrees_with_a_model_on_every_lookup_path() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let feasible = |n: &usize, d: u32| {
+        FunnelShape::from_slots(*n, ReserveFraction::from_exponent(d).unwrap()).is_ok()
+    };
+    let check = |table: &FunnelTable<u64, u64, IdentityBuildHasher>,
+                 model: &alloc::collections::BTreeMap<u64, u64>,
+                 keys: u64| {
+        assert_eq!(table.entries(), model.len());
+        for index in 0..keys {
+            let key = index.wrapping_mul(SPREAD);
+            let found = table.find_entry_ref(&key, key).map(|entry| entry.value);
+            assert_eq!(found, model.get(&key).copied(), "index {index}");
+        }
+    };
+    for (at_least, d) in [(600, 3), (6_000, 4), (60_000, 9)] {
+        let n = (at_least..2 * at_least).find(|n| feasible(n, d)).unwrap();
+        let mut table = raw_table(n, d);
+        let mut model = alloc::collections::BTreeMap::new();
+        let inserted = table.shape.max_insertions as u64 - 1;
+        for index in 1..inserted {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(map::TableBackend::insert(&mut table, key, index, key), None);
+            model.insert(key, index);
+        }
+        let keys = 2 * inserted;
+        check(&table, &model, keys);
+        // Present and absent keys, interleaved.
+        for index in (0..keys).filter(|index| index % 3 != 1) {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(
+                map::TableBackend::remove_key(&mut table, &key, key),
+                model.remove_entry(&key),
+                "n {n} d {d} index {index}"
+            );
+            // A removed key is gone at once.
+            assert_eq!(
+                map::TableBackend::remove_key(&mut table, &key, key),
+                None,
+                "n {n} d {d} index {index}"
+            );
+        }
+        assert!(!model.is_empty());
+        check(&table, &model, keys);
+        // Over tombstones, and into the slots they free.
+        for index in (1..inserted).filter(|index| index % 3 == 0) {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(
+                map::TableBackend::insert(&mut table, key, !index, key),
+                None
+            );
+            model.insert(key, !index);
+        }
+        check(&table, &model, keys);
+        for index in 0..keys {
+            let key = index.wrapping_mul(SPREAD);
+            assert_eq!(
+                map::TableBackend::remove_key(&mut table, &key, key),
+                model.remove_entry(&key),
+                "n {n} d {d} index {index}"
+            );
+        }
+        assert!(model.is_empty());
+        check(&table, &model, keys);
     }
 }
 
@@ -2582,6 +2690,10 @@ fn head_vacancy_agrees_with_the_placement_walk_whenever_it_answers() {
             let probe = table.prf.prepare(key);
             let general = table.search_vacancy(probe);
             if let Some(head) = table.first_empty_in_head(probe) {
+                let head = Vacancy {
+                    slot: table.slot_of(NonNull::new(head.lane).unwrap()),
+                    level_bit: head.level_bit,
+                };
                 assert_eq!(Some(head), general, "n {n} d {d} index {index}");
                 answered += 1;
             }
