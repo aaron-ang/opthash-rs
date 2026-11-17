@@ -1721,12 +1721,13 @@ where
         // level takes the loop's jump back.
         macro_rules! key_in {
             ($level:expr) => {{
-                let (bucket, mut matches) = scan($level);
+                let level = $level;
+                let (bucket, mut matches) = scan(level);
                 loop {
                     if matches == 0 {
                         break None;
                     }
-                    if let Some(found) = holding_key($level, bucket, matches) {
+                    if let Some(found) = holding_key(level, bucket, matches) {
                         break Some(found);
                     }
                     // Another key shares the fingerprint.
