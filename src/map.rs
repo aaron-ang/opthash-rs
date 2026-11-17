@@ -44,12 +44,6 @@ pub trait TableBackend<K, V>: Sized {
     /// Return the hash builder.
     fn hasher(&self) -> &Self::Hasher;
 
-    /// Whether the shell runs this backend's keyed lookups and removals in
-    /// their callers. A backend sets it when its lookup is marked to inline
-    /// and finds a key without a call: behind the shell's own function the
-    /// caller would pay a call for a lookup that needs none.
-    const LOOKUP_IN_CALLER: bool = false;
-
     /// Hash `key` with the table's hash builder.
     fn hash<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
         self.hasher().hash_one(key)
@@ -90,6 +84,12 @@ pub trait TableBackend<K, V>: Sized {
     fn replace_value(&mut self, loc: Self::Location, value: V) -> V;
 
     // -- Lookup --
+
+    /// Whether the shell runs this backend's keyed lookups and removals in
+    /// their callers. A backend sets it when its lookup is marked to inline
+    /// and finds a key without a call: behind the shell's own function the
+    /// caller would pay a call for a lookup that needs none.
+    const LOOKUP_IN_CALLER: bool = false;
 
     /// Find the slot for `key` by precomputed hash; the
     /// location is valid per [`Location`](TableBackend::Location).
@@ -480,12 +480,13 @@ where
         self.table.insert(key, value, hash)
     }
 
+    // The keyed lookups and removals below are forced inline. Each only
+    // picks one of two forms by the backend's `LOOKUP_IN_CALLER`, a choice
+    // settled once the backend is known. One form hashes and looks up in
+    // place, so in the caller; the other calls a function that does.
+
     /// Returns a reference to the value for `key`.
     #[must_use]
-    // The keyed lookups and removals are forced inline: each only picks a
-    // form by [`TableBackend::LOOKUP_IN_CALLER`], which is settled once the
-    // backend is known. One form hashes and looks up where it stands, so in
-    // the caller; the other is the function of its own the caller calls.
     #[inline(always)]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
@@ -606,8 +607,7 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         if P::LOOKUP_IN_CALLER {
-            let hash = self.table.hash(key);
-            self.table.remove_key(key, hash).map(|(_, v)| v)
+            self.remove_entry(key).map(|(_, v)| v)
         } else {
             self.remove_by_call(key)
         }

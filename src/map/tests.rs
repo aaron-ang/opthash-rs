@@ -6,13 +6,16 @@ use crate::test_support::{Deterministic, FixedElasticHashMap, FixedHashBuilder};
 
 const KEYS: u64 = 600;
 
-/// Every keyed lookup and removal answers alike in both of its forms,
-/// whichever one the backend selects, over hits, misses and removed keys.
+/// Every keyed lookup and removal answers alike through the public function,
+/// which takes the form the backend selects, and through the by-call form:
+/// on an empty map, over hits, misses and removed keys, and after the
+/// removed keys are inserted again.
 fn assert_forms_agree<P>(mut public: HashMap<u64, u64, P>, mut by_call: HashMap<u64, u64, P>)
 where
     P: TableBackend<u64, u64>,
 {
     let mut model = BTreeMap::new();
+    assert_lookups_agree(&mut public, &mut by_call, &model);
     for key in 0..KEYS {
         public.insert(key, key * 3);
         by_call.insert(key, key * 3);
@@ -29,6 +32,26 @@ where
             assert_eq!(by_call.remove_entry_by_call(&key), expected);
         }
     }
+    assert_lookups_agree(&mut public, &mut by_call, &model);
+    // The removed keys come back into a table that holds their tombstones.
+    for key in (0..KEYS).step_by(3) {
+        public.insert(key, key + 1);
+        by_call.insert(key, key + 1);
+        model.insert(key, key + 1);
+    }
+    assert_lookups_agree(&mut public, &mut by_call, &model);
+}
+
+/// Looks every key of the universe up in both forms, and writes through
+/// each mutable reference: `public` through the public form and `by_call`
+/// through the other, so each map's later answers show its own writes.
+fn assert_lookups_agree<P>(
+    public: &mut HashMap<u64, u64, P>,
+    by_call: &mut HashMap<u64, u64, P>,
+    model: &BTreeMap<u64, u64>,
+) where
+    P: TableBackend<u64, u64>,
+{
     assert_eq!(public.len(), model.len());
     assert_eq!(by_call.len(), model.len());
     for key in 0..KEYS * 2 {
@@ -40,9 +63,23 @@ where
         assert_eq!(public.get_key_value_by_call(&key), pair);
         assert_eq!(public.contains_key(&key), expected.is_some());
         assert_eq!(public.contains_key_by_call(&key), expected.is_some());
-        let mut value = expected.copied();
-        assert_eq!(public.get_mut(&key).copied(), value);
-        assert_eq!(by_call.get_mut_by_call(&key), value.as_mut());
+        if let Some(value) = public.get_mut(&key) {
+            *value += 1;
+        }
+        if let Some(value) = by_call.get_mut_by_call(&key) {
+            *value += 1;
+        }
+        let written = expected.map(|value| value + 1);
+        assert_eq!(public.get(&key).copied(), written);
+        assert_eq!(by_call.get_by_call(&key).copied(), written);
+        if let Some(value) = public.get_mut_by_call(&key) {
+            *value -= 1;
+        }
+        if let Some(value) = by_call.get_mut(&key) {
+            *value -= 1;
+        }
+        assert_eq!(public.get(&key), expected);
+        assert_eq!(by_call.get(&key), expected);
     }
 }
 
