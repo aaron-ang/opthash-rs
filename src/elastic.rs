@@ -29,7 +29,9 @@ mod live_count;
 mod schedule;
 
 use live_count::{LiveCount, Uncounted};
-use schedule::{PhiRoute, ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL};
+use schedule::{
+    PhiRoute, ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL, WalkedEntry,
+};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -875,6 +877,10 @@ unsafe fn found_key<'k, K, V>(entry: *mut SlotEntry<K, V>) -> &'k K {
         core::hint::assert_unchecked(!entry.is_null());
         &(*entry).key
     }
+}
+
+impl<K, V> WalkedEntry for SlotEntry<K, V> {
+    const LEAD: usize = mem::offset_of!(Self, value);
 }
 
 /// Outcome of [`ElasticTable::walk_schedule`].
@@ -2621,13 +2627,29 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
         K: 'a,
     {
-        self.find_by_exact_schedule(
-            key,
-            PreparedElasticRoute::new(hash),
-            |route| control::control_fingerprint_low(route.key_hash()),
-            |_level, _slot, entry| entry,
-        )
-        .map(|entry| &entry.value)
+        let prepared = PreparedElasticRoute::new(hash);
+        let filter = self.route_filter(prepared);
+        if !filter.maybe_present {
+            return None;
+        }
+        let key_fingerprint = control::control_fingerprint_low(hash);
+        // Every way to an answer ends on the value itself, so the lookup
+        // off the schedule returns in this one's place.
+        let walked =
+            self.walk_schedule(key, prepared, key_fingerprint, filter, |_, _, entry, _| {
+                // SAFETY: the walk hands on an occupied slot of this table,
+                // which `&'a self` keeps from changing.
+                unsafe { &(*entry).value }
+            });
+        match walked {
+            ScheduleSearch::Hit(value) => Some(value),
+            ScheduleSearch::Absent => None,
+            ScheduleSearch::Unresolved => {
+                self.find_unresolved(key, prepared, key_fingerprint, filter, |_, _, entry| {
+                    &entry.value
+                })
+            }
+        }
     }
 
     #[inline]
@@ -3507,9 +3529,7 @@ where
         // SAFETY: the direct route's shifted index maps into the control
         // bytes it holds.
         if unsafe { *direct_control.add(h11_slot) } == key_fingerprint {
-            let entry = direct_entries
-                .cast::<SlotEntry<K, V>>()
-                .wrapping_add(h11_slot);
+            let entry: *mut SlotEntry<K, V> = ProbeSchedule::direct_entry(direct_entries, h11_slot);
             // SAFETY: only a level's own control bytes hold a fingerprint,
             // and one marks an occupied slot, so the slot holds an entry,
             // level zero's at the slot's index.

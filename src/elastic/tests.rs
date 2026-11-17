@@ -2488,6 +2488,17 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
                 assert_eq!(scheduled, direct);
             }
         }
+        let first = &table.levels[0];
+        for slot in [0, first.capacity() - 1] {
+            assert_eq!(
+                ProbeSchedule::direct_entry::<SlotEntry<u64, u64>>(
+                    table.probe_schedule.direct_reach().2,
+                    slot,
+                ),
+                // SAFETY: the slot is in bounds; the pointer is not read.
+                unsafe { first.slot_ptr(slot) },
+            );
+        }
         table.levels[0].index_shift() == GENERAL_REDUCTION
     }
     let mut general_tables = 0;
