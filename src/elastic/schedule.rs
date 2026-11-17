@@ -438,7 +438,8 @@ impl ProbeScheduleRoom {
             book: OwnedBook::new(book),
             slots,
         };
-        schedule.clear();
+        // The book counts no route yet.
+        schedule.open(0);
         schedule.fill_starts();
         schedule
     }
@@ -1020,6 +1021,16 @@ impl ProbeSchedule {
     /// not: a walk of a group's levels has no route to skip until then.
     pub(super) fn rewind(&mut self, after: usize) {
         let book = &mut *self.book;
+        book.run_len = [0; MAX_LEVELS];
+        book.pushed = 0;
+        book.grouped_pushed = 0;
+        self.open(after);
+    }
+
+    /// Ends every run at its lead for a book that counts no pushed route,
+    /// as [`Self::rewind`] does for the first `after` levels.
+    fn open(&mut self, after: usize) {
+        let book = &mut *self.book;
         // Every level's run is whole again, and empty: a sentinel follows
         // its lead. So does one follow the direct route, and one is the
         // last slot.
@@ -1032,9 +1043,6 @@ impl ProbeSchedule {
             .last_mut()
             .expect("a schedule has slots")
             .write(SENTINEL);
-        book.run_len = [0; MAX_LEVELS];
-        book.pushed = 0;
-        book.grouped_pushed = 0;
         let mut groups = book.whole_groups;
         if groups == 0 || after < GROUPED_LEVELS {
             groups = if after < GROUPED_LEVELS {
