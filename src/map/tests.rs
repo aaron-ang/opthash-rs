@@ -4,7 +4,9 @@ use super::{HashMap, TableBackend};
 use crate::FunnelHashMap;
 use crate::test_support::{Deterministic, FixedElasticHashMap, FixedHashBuilder};
 
-const KEYS: u64 = 600;
+/// Keys inserted. Fewer under Miri, where each lookup is slow; still enough
+/// for the maps to grow and to hold tombstones.
+const KEYS: u64 = if cfg!(miri) { 96 } else { 600 };
 
 /// Every keyed lookup and removal answers alike through the public function,
 /// which takes the form the backend selects, and through the by-call form:
