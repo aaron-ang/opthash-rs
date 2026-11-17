@@ -441,7 +441,7 @@ where
     K: Eq + Hash,
     P: TableBackend<K, V>,
 {
-    #[inline]
+    #[inline(always)]
     fn find_location<Q>(&self, key: &Q) -> Option<P::Location>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -462,7 +462,7 @@ where
         unsafe { &mut *self.table.slot_ptr(loc) }
     }
 
-    #[inline]
+    #[inline(always)]
     fn lookup_entry<Q>(&self, key: &Q) -> Option<&SlotEntry<K, V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -480,10 +480,11 @@ where
         self.table.insert(key, value, hash)
     }
 
-    // The keyed lookups and removals below are forced inline. Each only
-    // picks one of two forms by the backend's `LOOKUP_IN_CALLER`, a choice
-    // settled once the backend is known. One form hashes and looks up in
-    // place, so in the caller; the other calls a function that does.
+    // Each keyed lookup and removal below is three functions. The body is
+    // in `*_in_place`, forced inline. `*_by_call` is that body as a
+    // function to call. The public one, forced inline as well, only picks
+    // between the two by the backend's `LOOKUP_IN_CALLER`, a choice settled
+    // once the backend is known: the body in the caller, or a call.
 
     /// Returns a reference to the value for `key`.
     #[must_use]
@@ -493,18 +494,25 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         if P::LOOKUP_IN_CALLER {
-            let hash = self.table.hash(key);
-            self.table.find_entry(key, hash).map(|entry| &entry.value)
+            self.get_in_place(key)
         } else {
             self.get_by_call(key)
         }
+    }
+
+    #[inline(always)]
+    fn get_in_place<Q>(&self, key: &Q) -> Option<&V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.lookup_entry(key).map(|entry| &entry.value)
     }
 
     fn get_by_call<Q>(&self, key: &Q) -> Option<&V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.lookup_entry(key).map(|entry| &entry.value)
+        self.get_in_place(key)
     }
 
     /// Returns the stored `(key, value)` pair for `key`.
@@ -515,20 +523,26 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         if P::LOOKUP_IN_CALLER {
-            let hash = self.table.hash(key);
-            let entry = self.table.find_entry(key, hash)?;
-            Some((&entry.key, &entry.value))
+            self.get_key_value_in_place(key)
         } else {
             self.get_key_value_by_call(key)
         }
+    }
+
+    #[inline(always)]
+    fn get_key_value_in_place<Q>(&self, key: &Q) -> Option<(&K, &V)>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let entry = self.lookup_entry(key)?;
+        Some((&entry.key, &entry.value))
     }
 
     fn get_key_value_by_call<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let entry = self.lookup_entry(key)?;
-        Some((&entry.key, &entry.value))
+        self.get_key_value_in_place(key)
     }
 
     /// Returns the stored key equal to `key`, inserting `f(key)` (with `value`)
@@ -560,22 +574,27 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         if P::LOOKUP_IN_CALLER {
-            let hash = self.table.hash(key);
-            let loc = self.table.find(key, hash)?;
-            // SAFETY: `find` returned a live location; `&mut self` proves exclusivity.
-            Some(unsafe { &mut self.slot_entry_mut(loc).value })
+            self.get_mut_in_place(key)
         } else {
             self.get_mut_by_call(key)
         }
     }
 
-    fn get_mut_by_call<Q>(&mut self, key: &Q) -> Option<&mut V>
+    #[inline(always)]
+    fn get_mut_in_place<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let loc = self.find_location(key)?;
         // SAFETY: `find_location` returned a live location; `&mut self` proves exclusivity.
         Some(unsafe { &mut self.slot_entry_mut(loc).value })
+    }
+
+    fn get_mut_by_call<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.get_mut_in_place(key)
     }
 
     /// Returns `true` if `key` is present.
@@ -586,18 +605,25 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         if P::LOOKUP_IN_CALLER {
-            let hash = self.table.hash(key);
-            self.table.find(key, hash).is_some()
+            self.contains_key_in_place(key)
         } else {
             self.contains_key_by_call(key)
         }
+    }
+
+    #[inline(always)]
+    fn contains_key_in_place<Q>(&self, key: &Q) -> bool
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.find_location(key).is_some()
     }
 
     fn contains_key_by_call<Q>(&self, key: &Q) -> bool
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.find_location(key).is_some()
+        self.contains_key_in_place(key)
     }
 
     /// Removes `key`, returning its value.
@@ -607,12 +633,22 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         if P::LOOKUP_IN_CALLER {
-            self.remove_entry(key).map(|(_, v)| v)
+            self.remove_in_place(key)
         } else {
             self.remove_by_call(key)
         }
     }
 
+    #[inline(always)]
+    fn remove_in_place<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.remove_entry_in_place(key).map(|(_, v)| v)
+    }
+
+    // Goes through `remove_entry_by_call`, so the two removals share one
+    // body out of line.
     fn remove_by_call<Q>(&mut self, key: &Q) -> Option<V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -627,19 +663,26 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         if P::LOOKUP_IN_CALLER {
-            let hash = self.table.hash(key);
-            self.table.remove_key(key, hash)
+            self.remove_entry_in_place(key)
         } else {
             self.remove_entry_by_call(key)
         }
+    }
+
+    #[inline(always)]
+    fn remove_entry_in_place<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let hash = self.table.hash(key);
+        self.table.remove_key(key, hash)
     }
 
     fn remove_entry_by_call<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let hash = self.table.hash(key);
-        self.table.remove_key(key, hash)
+        self.remove_entry_in_place(key)
     }
 
     /// Returns `N` disjoint mutable references, `None` for absent keys.
