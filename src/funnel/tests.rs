@@ -10,7 +10,7 @@ use super::*;
 use crate::exact::probe::{self, ProbeDomain};
 use crate::exact::reference::{ScalarFunnel, ScalarFunnelInsert, ScalarFunnelLocation};
 use crate::test_support::{
-    self, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
+    self, CountDrop, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
 };
 
 std::thread_local! {
@@ -2550,6 +2550,104 @@ fn panicking_hasher_during_filter_refresh_keeps_every_key_recorded() {
         assert_eq!(
             map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
             Some(id)
+        );
+    }
+}
+
+/// A keyed removal whose settling unwinds, on a hasher that panics in the
+/// filter refresh, still drops the pair it unlinked, once: the key is gone
+/// from the table and nothing is left to drop it later. On a shape whose
+/// head finds the key, and on one without a head, where the ordered walk
+/// does.
+#[test]
+fn panicking_hasher_while_a_keyed_removal_settles_drops_the_removed_pair() {
+    const LIVE: u64 = 12;
+    const CHURN: u64 = LIVE;
+    let headed = {
+        let reserve = ReserveFraction::from_exponent(3).unwrap();
+        (FunnelShape::from_slots(144, reserve).unwrap(), reserve)
+    };
+    let headless = {
+        let (wide, _) = smallest_wide_shape();
+        let reserve = ReserveFraction::from_exponent(wide).unwrap();
+        let shape =
+            FunnelShape::for_insert_budget(usize::try_from(LIVE).unwrap() + 1, reserve).unwrap();
+        (shape, reserve)
+    };
+    assert!(headed.0.has_head());
+    assert!(!headless.0.has_head());
+    for (shape, reserve) in [headed, headless] {
+        let armed = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut table =
+            FunnelTable::<PanicHashKey, CountDrop, IdentityBuildHasher>::try_from_shape(
+                shape,
+                reserve,
+                IdentityBuildHasher,
+                Global,
+            )
+            .unwrap();
+        let key_of = |id: u64| PanicHashKey {
+            id,
+            armed: armed.clone(),
+            drops: drops.clone(),
+        };
+        let value_drops = Arc::new(AtomicUsize::new(0));
+        for id in 0..=CHURN {
+            let value = CountDrop(value_drops.clone());
+            assert!(map::TableBackend::insert(&mut table, key_of(id), value, id).is_none());
+        }
+        // Cycling one key re-takes its tombstone, so only the stale-filter
+        // count grows and the delete that passes its threshold refreshes
+        // the filter.
+        let threshold = membership::refresh_deletes(table.shape.max_insertions);
+        let probe = key_of(CHURN);
+        for _ in 0..threshold {
+            assert!(map::TableBackend::remove_key(&mut table, &probe, CHURN).is_some());
+            let value = CountDrop(value_drops.clone());
+            assert!(map::TableBackend::insert(&mut table, key_of(CHURN), value, CHURN).is_none());
+        }
+        // The head finds the key exactly on the shape that has one.
+        let gate = table.membership_gate(CHURN);
+        let prepared = table.prf.prepare(CHURN);
+        assert_eq!(
+            table
+                .first_match(&probe, prepared, gate.wide_levels())
+                .is_ok(),
+            table.shape.has_head()
+        );
+        let (keys_before, values_before) = (
+            drops.load(Ordering::SeqCst),
+            value_drops.load(Ordering::SeqCst),
+        );
+        armed.store(true, Ordering::SeqCst);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            map::TableBackend::remove_key(&mut table, &probe, CHURN)
+        }));
+        armed.store(false, Ordering::SeqCst);
+        let panic = result.err().expect("the refresh hashed no key");
+        assert!(
+            panic
+                .downcast_ref::<&str>()
+                .is_some_and(|message| message.contains("armed key hash"))
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), keys_before + 1);
+        assert_eq!(value_drops.load(Ordering::SeqCst), values_before + 1);
+        assert_eq!(table.entries() as u64, LIVE);
+        assert!(map::TableBackend::find_entry(&table, &probe, CHURN).is_none());
+        for id in 0..LIVE {
+            assert!(map::TableBackend::find_entry(&table, &key_of(id), id).is_some());
+        }
+        // Only the live pairs are left for the table to drop.
+        let (keys_before, values_before) = (
+            drops.load(Ordering::SeqCst),
+            value_drops.load(Ordering::SeqCst),
+        );
+        drop(table);
+        assert_eq!((drops.load(Ordering::SeqCst) - keys_before) as u64, LIVE);
+        assert_eq!(
+            (value_drops.load(Ordering::SeqCst) - values_before) as u64,
+            LIVE
         );
     }
 }

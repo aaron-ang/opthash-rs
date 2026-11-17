@@ -2366,45 +2366,63 @@ where
         }
     }
 
-    /// [`Self::find_after_gate`] for a removal: tombstones the key's control
-    /// byte and returns its entry, still initialized, for the caller to take.
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
-    fn unlink_after_gate<Q>(
+    /// The rest of a removal that [`TableBackend::remove_key`] does not
+    /// finish itself, which is every call a removal makes. `unlinked` is the
+    /// entry of a key already tombstoned and counted, whose count needs
+    /// settling; `None` leaves the key to the ordered walk. Returns the
+    /// removed entry, still initialized, for the caller to take.
+    ///
+    /// The caller reads the entry from what this returns, also when it
+    /// passed that entry in, so it keeps nothing across the call.
+    ///
+    /// # Safety
+    ///
+    /// `unlinked`, if any, must be an initialized entry of this table whose
+    /// control byte is a tombstone and whose delete is counted, with no
+    /// other owner of its key and value.
+    #[inline(never)]
+    unsafe fn finish_removal<Q>(
         &mut self,
         key: &Q,
         key_hash: u64,
-        levels: WideLevelBin,
+        unlinked: Option<NonNull<SlotEntry<K, V>>>,
     ) -> Option<NonNull<SlotEntry<K, V>>>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let probe = self.prf.prepare(key_hash);
-        match self.first_match(key, probe, levels) {
-            Ok(Found { lane, entry, .. }) => {
-                // SAFETY: the scan found an occupied control byte of the
-                // storage, which this table borrows mutably.
-                unsafe { lane.as_ptr().write(CTRL_TOMBSTONE) };
-                Some(entry)
+        let (entry, settle) = if let Some(entry) = unlinked {
+            (entry, true)
+        } else {
+            let levels = self.membership_gate(key_hash).levels();
+            let slot = self.find_location_by_walk(key, key_hash, levels)?;
+            // SAFETY: the walk returns only occupied in-bounds slots, and
+            // the data base is not null.
+            let entry = unsafe {
+                self.storage.mark_tombstone(slot);
+                NonNull::new_unchecked(self.storage.slot_ptr(slot))
+            };
+            (entry, self.count_delete())
+        };
+        if settle {
+            /// Drops the unlinked entry if settling unwinds, which a
+            /// panicking hasher makes it do: nothing reaches the entry
+            /// again once its control byte is a tombstone.
+            struct DropOnUnwind<E>(NonNull<E>);
+            impl<E> Drop for DropOnUnwind<E> {
+                fn drop(&mut self) {
+                    // SAFETY: the entry is initialized and out of the
+                    // table's reach, and this runs only on unwind, when no
+                    // caller takes it.
+                    unsafe { self.0.as_ptr().drop_in_place() };
+                }
             }
-            Err(last) if self.unmatched_is_absent(last) => None,
-            Err(_) => self.unlink_by_walk(key, key_hash),
+            let unwinding = DropOnUnwind(entry);
+            // Settling a lone delete moves no entry and frees no arena, so
+            // the entry stays readable where it is.
+            self.settle_after_delete();
+            mem::forget(unwinding);
         }
-    }
-
-    #[inline(never)]
-    fn unlink_by_walk<Q>(&mut self, key: &Q, key_hash: u64) -> Option<NonNull<SlotEntry<K, V>>>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        let levels = self.membership_gate(key_hash).levels();
-        let slot = self.find_location_by_walk(key, key_hash, levels)?;
-        // SAFETY: the walk returns only occupied in-bounds slots, and the
-        // data base is not null.
-        unsafe {
-            self.storage.mark_tombstone(slot);
-            Some(NonNull::new_unchecked(self.storage.slot_ptr(slot)))
-        }
+        Some(entry)
     }
 
     /// Probe preparation stays next to the walk so the prepared probe never
@@ -3258,13 +3276,28 @@ where
         if !gate.passes() {
             return None;
         }
-        let entry = self.unlink_after_gate(key, hash, gate.wide_levels())?;
-        // SAFETY: the entry was occupied until its control byte was
-        // tombstoned, which keeps it from being read again.
+        let probe = self.prf.prepare(hash);
+        let unlinked = match self.first_match(key, probe, gate.wide_levels()) {
+            Ok(Found { lane, entry, .. }) => {
+                // SAFETY: the scan found an occupied control byte of this
+                // table's storage; `&mut self` makes the write exclusive.
+                unsafe { lane.as_ptr().write(CTRL_TOMBSTONE) };
+                if !self.count_delete() {
+                    // SAFETY: the entry was occupied until its control byte
+                    // was tombstoned, which keeps it from being read again.
+                    let entry = unsafe { entry.as_ptr().read() };
+                    return Some((entry.key, entry.value));
+                }
+                Some(entry)
+            }
+            Err(last) if self.unmatched_is_absent(last) => return None,
+            Err(_) => None,
+        };
+        // SAFETY: an entry passed on was tombstoned and counted just above
+        // and not read out, so the table still holds the only copy.
+        let entry = unsafe { self.finish_removal(key, hash, unlinked) }?;
+        // SAFETY: as above; no slot has been written since the tombstone.
         let entry = unsafe { entry.as_ptr().read() };
-        if self.count_delete() {
-            self.settle_after_delete();
-        }
         Some((entry.key, entry.value))
     }
 
