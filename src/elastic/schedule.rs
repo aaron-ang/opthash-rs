@@ -5,7 +5,7 @@
 //! has that set left.
 
 use alloc::vec::Vec;
-use core::mem::{self, ManuallyDrop, MaybeUninit};
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ptr::{self, NonNull};
 
 use super::{
@@ -424,7 +424,6 @@ impl ProbeScheduleRoom {
             grouped_pushed: 0,
             grouped_held: 0,
             whole_groups: 0,
-            scheduled: 0,
             allocated: book.capacity(),
             #[cfg(test)]
             group_appends: 0,
@@ -486,9 +485,6 @@ struct ScheduleBook {
     /// the lead of or before it, and that had a slot for every route their
     /// levels pushed.
     whole_groups: u8,
-    /// The levels the pushed routes are of, as the last
-    /// [`ProbeSchedule::rewind`] was told.
-    scheduled: usize,
     /// Books the allocation has room for, which freeing it takes.
     allocated: usize,
     /// Routes written to groups' runs since the schedule was made.
@@ -934,9 +930,15 @@ impl ProbeSchedule {
     }
 
     /// A copy of `self` for `levels`: each route addresses its level there.
+    /// Its groups have runs where a group's run of `self` is whole.
     pub(super) fn clone_onto<T>(&self, levels: &[Level<T>]) -> Self {
         let mut copy = ProbeScheduleRoom::for_levels(levels.len()).schedule(levels);
-        copy.rewind(self.book.scheduled);
+        // A whole group's run means every grouped level is pushed.
+        copy.rewind(if self.book.whole_groups == 0 {
+            0
+        } else {
+            GROUPED_LEVELS
+        });
         for route in self.routes() {
             let (level, logical_probe_index) = route.coordinates();
             copy.push(levels, level as usize, logical_probe_index);
@@ -1006,16 +1008,18 @@ impl ProbeSchedule {
     }
 
     /// Drops the pushed routes ahead of pushing those of the first `after`
-    /// levels, where the last call named the levels pushed since: the
-    /// routes of the levels in both are pushed again, in the same order and
-    /// every one of them. A group's run holds no route of another level, so where
-    /// every grouped level is in both the groups' runs keep their routes
-    /// and are not written again. The groups have runs from the first push
-    /// on once every grouped level is pushed, and none before: a walk of a
-    /// group's levels has no route to skip until then.
+    /// levels, every one of them and in the order a schedule of those
+    /// levels takes them.
+    ///
+    /// A group's run is whole only since a call that named every grouped
+    /// level, and it holds no route of another level. So where one is whole
+    /// and every grouped level is named again, the routes the groups' runs
+    /// hold are pushed again in the same order: the runs keep them and are
+    /// not written again. Otherwise the groups have runs from the first
+    /// push on where every grouped level is named, and none where one is
+    /// not: a walk of a group's levels has no route to skip until then.
     pub(super) fn rewind(&mut self, after: usize) {
         let book = &mut *self.book;
-        let before = mem::replace(&mut book.scheduled, after);
         // Every level's run is whole again, and empty: a sentinel follows
         // its lead. So does one follow the direct route, and one is the
         // last slot.
@@ -1032,7 +1036,7 @@ impl ProbeSchedule {
         book.pushed = 0;
         book.grouped_pushed = 0;
         let mut groups = book.whole_groups;
-        if before.min(after) < GROUPED_LEVELS {
+        if groups == 0 || after < GROUPED_LEVELS {
             groups = if after < GROUPED_LEVELS {
                 0
             } else {
@@ -1214,8 +1218,7 @@ impl ProbeSchedule {
     }
 
     /// Starts every walk at the direct route, as a schedule without runs
-    /// would. Dropping its routes brings the levels' runs back, and the
-    /// groups' with them only where it resets those.
+    /// would, until its routes are dropped.
     #[cfg(test)]
     pub(super) fn start_walks_at_the_direct_route(&mut self) {
         let direct = self.direct();
