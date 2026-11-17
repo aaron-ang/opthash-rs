@@ -3121,6 +3121,8 @@ where
     type Alloc = A;
     type Scan = FunnelScan;
 
+    const LOOKUP_IN_CALLER: bool = true;
+
     #[inline]
     fn hasher(&self) -> &S {
         &self.hash_builder

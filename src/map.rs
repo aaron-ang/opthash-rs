@@ -44,6 +44,12 @@ pub trait TableBackend<K, V>: Sized {
     /// Return the hash builder.
     fn hasher(&self) -> &Self::Hasher;
 
+    /// Whether the shell runs this backend's keyed lookups and removals in
+    /// their callers. A backend sets it when its lookup is marked to inline
+    /// and finds a key without a call: behind the shell's own function the
+    /// caller would pay a call for a lookup that needs none.
+    const LOOKUP_IN_CALLER: bool = false;
+
     /// Hash `key` with the table's hash builder.
     fn hash<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
         self.hasher().hash_one(key)
@@ -429,13 +435,13 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     }
 }
 
+#[allow(clippy::inline_always)]
 impl<K, V, P> HashMap<K, V, P>
 where
     K: Eq + Hash,
     P: TableBackend<K, V>,
 {
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
+    #[inline]
     fn find_location<Q>(&self, key: &Q) -> Option<P::Location>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -456,8 +462,7 @@ where
         unsafe { &mut *self.table.slot_ptr(loc) }
     }
 
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
+    #[inline]
     fn lookup_entry<Q>(&self, key: &Q) -> Option<&SlotEntry<K, V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -469,7 +474,6 @@ where
     /// Inserts `key`/`value`. Returns the previous value for `key`, if any.
     // Forced inline: the caller hashes the key, so a loop of inserts builds
     // the hasher's constants once.
-    #[allow(clippy::inline_always)]
     #[inline(always)]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let hash = self.table.hash(&key);
@@ -478,11 +482,24 @@ where
 
     /// Returns a reference to the value for `key`.
     #[must_use]
-    // Forced inline, as `insert` is: the caller hashes the key, and a backend
-    // that inlines its lookup then finds the key without a call.
-    #[allow(clippy::inline_always)]
+    // The keyed lookups and removals are forced inline: each only picks a
+    // form by [`TableBackend::LOOKUP_IN_CALLER`], which is settled once the
+    // backend is known. One form hashes and looks up where it stands, so in
+    // the caller; the other is the function of its own the caller calls.
     #[inline(always)]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        if P::LOOKUP_IN_CALLER {
+            let hash = self.table.hash(key);
+            self.table.find_entry(key, hash).map(|entry| &entry.value)
+        } else {
+            self.get_by_call(key)
+        }
+    }
+
+    fn get_by_call<Q>(&self, key: &Q) -> Option<&V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
@@ -491,11 +508,21 @@ where
 
     /// Returns the stored `(key, value)` pair for `key`.
     #[must_use]
-    // Forced inline, as `insert` is: the caller hashes the key, and a backend
-    // that inlines its lookup then finds the key without a call.
-    #[allow(clippy::inline_always)]
     #[inline(always)]
     pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        if P::LOOKUP_IN_CALLER {
+            let hash = self.table.hash(key);
+            let entry = self.table.find_entry(key, hash)?;
+            Some((&entry.key, &entry.value))
+        } else {
+            self.get_key_value_by_call(key)
+        }
+    }
+
+    fn get_key_value_by_call<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
@@ -526,11 +553,22 @@ where
     }
 
     /// Returns a mutable reference to the value for `key`.
-    // Forced inline, as `insert` is: the caller hashes the key, and a backend
-    // that inlines its lookup then finds the key without a call.
-    #[allow(clippy::inline_always)]
     #[inline(always)]
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        if P::LOOKUP_IN_CALLER {
+            let hash = self.table.hash(key);
+            let loc = self.table.find(key, hash)?;
+            // SAFETY: `find` returned a live location; `&mut self` proves exclusivity.
+            Some(unsafe { &mut self.slot_entry_mut(loc).value })
+        } else {
+            self.get_mut_by_call(key)
+        }
+    }
+
+    fn get_mut_by_call<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
@@ -541,11 +579,20 @@ where
 
     /// Returns `true` if `key` is present.
     #[must_use]
-    // Forced inline, as `insert` is: the caller hashes the key, and a backend
-    // that inlines its lookup then finds the key without a call.
-    #[allow(clippy::inline_always)]
     #[inline(always)]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        if P::LOOKUP_IN_CALLER {
+            let hash = self.table.hash(key);
+            self.table.find(key, hash).is_some()
+        } else {
+            self.contains_key_by_call(key)
+        }
+    }
+
+    fn contains_key_by_call<Q>(&self, key: &Q) -> bool
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
@@ -553,23 +600,41 @@ where
     }
 
     /// Removes `key`, returning its value.
-    // Forced inline, as `insert` is: the caller hashes the key, and a backend
-    // that inlines its lookup then finds the key without a call.
-    #[allow(clippy::inline_always)]
     #[inline(always)]
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.remove_entry(key).map(|(_, v)| v)
+        if P::LOOKUP_IN_CALLER {
+            let hash = self.table.hash(key);
+            self.table.remove_key(key, hash).map(|(_, v)| v)
+        } else {
+            self.remove_by_call(key)
+        }
+    }
+
+    fn remove_by_call<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.remove_entry_by_call(key).map(|(_, v)| v)
     }
 
     /// Removes `key`, returning the stored `(key, value)` pair.
-    // Forced inline, as `insert` is: the caller hashes the key, and a backend
-    // that inlines its lookup then finds the key without a call.
-    #[allow(clippy::inline_always)]
     #[inline(always)]
     pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        if P::LOOKUP_IN_CALLER {
+            let hash = self.table.hash(key);
+            self.table.remove_key(key, hash)
+        } else {
+            self.remove_entry_by_call(key)
+        }
+    }
+
+    fn remove_entry_by_call<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
@@ -1872,3 +1937,6 @@ impl<K, V, P: TableBackend<K, V>> IntoIterator for HashMap<K, V, P> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
