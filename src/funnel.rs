@@ -3255,9 +3255,6 @@ where
                 return None;
             }
         }
-        // Laid out off the common insert's path, which then falls through
-        // to its caller.
-        rarely_taken();
         self.insert_general(key, value, hash)
     }
 
