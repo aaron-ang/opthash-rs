@@ -3016,6 +3016,77 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
     }
 }
 
+/// The first-match walk takes any half-word for a bin: an empty one, bits
+/// under the bin, every bit. It ends on the head entry of the lowest set
+/// bit, or on the last entry for an empty half-word; a key it finds is
+/// where the ordered walk finds it, and bits added to a key's own bin do
+/// not hide the key. On a shape with a head and on one without.
+#[test]
+fn first_match_walks_any_half_word_to_the_entry_of_its_lowest_bit() {
+    const HALVES: [u32; 9] = [
+        0,
+        1,
+        1 << 15,
+        1 << 16,
+        0x0000_FFFF,
+        0x8000_0001,
+        0x5555_5555,
+        0xDEAD_BEEF,
+        u32::MAX,
+    ];
+    let reserve = ReserveFraction::from_exponent(3).unwrap();
+    let headed = head_table(
+        FunnelShape::for_insert_budget(24, reserve).unwrap(),
+        reserve,
+    );
+    let (wide, _) = smallest_wide_shape();
+    let wide_reserve = ReserveFraction::from_exponent(wide).unwrap();
+    let headless = head_table(
+        FunnelShape::for_insert_budget(24, wide_reserve).unwrap(),
+        wide_reserve,
+    );
+    assert!(headed.shape.has_head());
+    assert!(!headless.shape.has_head());
+    for mut table in [headed, headless] {
+        let inserted = 24;
+        assert!(table.shape.max_insertions as u64 >= inserted);
+        for key in 0..inserted {
+            assert_eq!(map::TableBackend::insert(&mut table, key, key, key), None);
+        }
+        let mut found_in_head = 0_usize;
+        for key in 0..inserted + 4 {
+            let probe = table.prf.prepare(key);
+            let walk = table.find_location_by_walk(&key, key, u16::MAX);
+            assert_eq!(walk.is_some(), key < inserted, "key {key}");
+            let gate = table.membership_gate(key);
+            let own = gate.wide_levels().get();
+            let in_head =
+                gate.passes() && table.first_match(&key, probe, gate.wide_levels()).is_ok();
+            found_in_head += usize::from(in_head);
+            for half in HALVES.into_iter().chain(HALVES.map(|half| half | own)) {
+                let lowest = match half {
+                    0 => HEAD_ENTRIES - 1,
+                    _ => (u32::BITS - 1 - half.trailing_zeros()) as usize,
+                };
+                match table.first_match(&key, probe, WideLevelBin::of_unit_half(half)) {
+                    Ok(found) => {
+                        let slot = table.slot_of(found.lane);
+                        assert_eq!(Some(slot), walk, "key {key} half {half:#x}");
+                    }
+                    Err(last) => {
+                        assert!(
+                            core::ptr::eq(last, &raw const table.head[lowest]),
+                            "key {key} half {half:#x}"
+                        );
+                        assert!(!in_head || half & own != own, "key {key} half {half:#x}");
+                    }
+                }
+            }
+        }
+        assert_eq!(found_in_head != 0, table.shape.has_head());
+    }
+}
+
 /// The walk that searches and places a recorded key at once answers as the
 /// lookup and the head placement do apart: a key it reports present is where
 /// the lookup finds it, and a vacancy it reports is the head walk's, for a
