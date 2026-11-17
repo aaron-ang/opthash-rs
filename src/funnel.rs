@@ -169,8 +169,9 @@ impl<T> HeadLevel<T> {
 }
 
 /// The head of a table with `shape` over `storage`: an entry for each level
-/// that owns a level-bin bit, then one for the overflow bit and one for the
-/// leading zeros of an empty bin. A shape without a head has no level to
+/// that owns a level-bin bit, then one for the overflow bit, absent ones
+/// for the counts no bin leads with, and a last one for the leading zeros
+/// of an empty bin. A shape without a head has no level to
 /// place in or to scan for first matches, so all its level entries are
 /// absent. Every entry that is no level draws bucket zero at the group of
 /// [`CTRL_PADDING`] that ends the control array: a scan of it finds no
@@ -1676,8 +1677,8 @@ where
         // a shape without lanes does: it stands where the level past the
         // last recorded one would. An empty set, which the walk tests for
         // after a scan and not before one, has a whole word of leading
-        // zeros, and the head's last entry. An absent entry scans the group
-        // past the slots, which matches nothing.
+        // zeros, and the head's last entry. Neither is a level, and each
+        // scans the group past the slots, which matches nothing.
         let mut pending = levels.get();
         // The walk steps a pointer to the table itself and reads the head
         // at its offset from there, so the head's address is never formed.

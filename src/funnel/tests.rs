@@ -1522,7 +1522,11 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
                 .iter()
                 .all(HeadLevel::is_absent)
         );
-        assert!(table.head[OVERFLOW_LEVEL].is_absent());
+        assert!(
+            table.head[OVERFLOW_LEVEL..HEAD_ENTRIES - 1]
+                .iter()
+                .all(HeadLevel::is_absent)
+        );
         assert!(!table.head[HEAD_ENTRIES - 1].is_absent());
         assert!(
             table.head[recorded..]
@@ -2979,15 +2983,21 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                     .first_match(&key, probe, gate.wide_levels())
                     .map(|found| table.slot_of(found.lane));
                 let found = scan.ok();
-                // An empty bin scans an entry that is no level and the
-                // overflow bit an absent one; neither finds anything.
-                for absent in [0, OVERFLOW_LEVEL_BIT] {
-                    let at_absent = table
-                        .first_match(&key, probe, unit_wide_levels(unit_of(0, absent)))
+                // An empty bin ends on the entry that is no level and the
+                // overflow bit on an absent one; neither finds anything.
+                let ends_on = |levels: u16| {
+                    table
+                        .first_match(&key, probe, unit_wide_levels(unit_of(0, levels)))
                         .map(|found| table.slot_of(found.lane))
-                        .ok();
-                    assert_eq!(at_absent, None, "n {n} d {d} index {index}");
-                }
+                };
+                assert!(
+                    ends_on(0).is_err_and(|last| !last.is_absent()),
+                    "n {n} d {d} index {index}"
+                );
+                assert!(
+                    ends_on(OVERFLOW_LEVEL_BIT).is_err_and(HeadLevel::is_absent),
+                    "n {n} d {d} index {index}"
+                );
                 if scan.map_or_else(|last| table.unmatched_is_absent(last), |_| true) {
                     assert_eq!(found, walk, "n {n} d {d} index {index}");
                     // A bucket wider than a group is never scanned here.
