@@ -3868,13 +3868,6 @@ fn settled_plan_stays_readable_past_a_leaked_drain() {
     }
 }
 
-/// Model check of the walk starts: under every summary value, the routes
-/// between a walk's start and its sentinel that the summary leaves open are
-/// the pushed routes it leaves open, in the same order. The walk skips the
-/// others and closes levels by what it probes, so it probes the same slots
-/// from either start. Checked through a schedule's whole growth, where the
-/// pushed routes take the runs' slots one level after another, and again
-/// after the schedule is dropped and rebuilt.
 #[test]
 fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
     let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
@@ -3912,6 +3905,10 @@ fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
         table.extend_probe_schedule(40 * (through as u128 + 1));
         assert!(table.probe_schedule.addresses(&table.levels));
     }
+    assert_eq!(table.probe_schedule.whole_groups().0, fitted);
+    let held = table.probe_schedule.group_appends();
+    table.extend_probe_schedule(QUERY_POSITION_CAP);
+    assert!(table.probe_schedule.group_appends() > held);
 }
 
 #[test]
@@ -3939,6 +3936,13 @@ fn rebuild_leaves_a_group_run_that_stopped_being_whole_as_it_is() {
     assert!(table.probe_schedule.addresses(&table.levels));
 }
 
+/// Model check of the walk starts: under every summary value, the routes
+/// between a walk's start and its sentinel that the summary leaves open are
+/// the pushed routes it leaves open, in the same order. The walk skips the
+/// others and closes levels by what it probes, so it probes the same slots
+/// from either start. Checked through a schedule's whole growth, where the
+/// pushed routes take the runs' slots one level after another, and again
+/// after the schedule is dropped and rebuilt.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn every_walk_start_leads_to_the_routes_its_summary_leaves_open() {
