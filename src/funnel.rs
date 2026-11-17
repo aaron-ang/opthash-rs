@@ -53,15 +53,9 @@ enum FunnelScanMode {
 }
 
 /// Entries of [`FunnelTable::head`]: one for each count of leading zeros a
-/// [`WideLevelBin`] can have. A level-bin bit's count is its level's index;
-/// the counts from [`NO_LEVEL_ENTRIES`] on are those of a word whose bin is
-/// empty.
-const HEAD_ENTRIES: usize = u64::BITS as usize + 1;
-
-/// First head entry a [`WideLevelBin`] with an empty bin leads to: the
-/// leading zeros of such a word run past the bin and the unused bits under
-/// it.
-const NO_LEVEL_ENTRIES: usize = (u64::BITS - MEMBERSHIP_BITS) as usize;
+/// [`WideLevelBin`] can have. A level-bin bit's count is its level's index,
+/// and an empty bin's is the last.
+const HEAD_ENTRIES: usize = u32::BITS as usize + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LevelShape {
@@ -175,9 +169,8 @@ impl<T> HeadLevel<T> {
 }
 
 /// The head of a table with `shape` over `storage`: an entry for each level
-/// that owns a level-bin bit, then one for the overflow bit, and from
-/// [`NO_LEVEL_ENTRIES`] on one for each count of leading zeros a word with
-/// an empty bin can have. A shape without a head has no level to
+/// that owns a level-bin bit, then one for the overflow bit and one for the
+/// leading zeros of an empty bin. A shape without a head has no level to
 /// place in or to scan for first matches, so all its level entries are
 /// absent. Every entry that is no level draws bucket zero at the group of
 /// [`CTRL_PADDING`] that ends the control array: a scan of it finds no
@@ -211,9 +204,7 @@ fn head_levels<T>(shape: &FunnelShape, storage: &FlatStorage<T>) -> [HeadLevel<T
             };
         }
     }
-    for entry in &mut head[NO_LEVEL_ENTRIES..] {
-        entry.multiplier = HeadLevel::<T>::NO_LEVEL_RECORDED;
-    }
+    head[HEAD_ENTRIES - 1].multiplier = HeadLevel::<T>::NO_LEVEL_RECORDED;
     head
 }
 
@@ -583,10 +574,6 @@ fn level_bit_of(level: usize) -> u16 {
 /// Bit of level zero in [`recorded_head_levels`].
 const SHALLOWEST_LEVEL: u32 = 1 << (u32::BITS - 1);
 
-/// The level bin's place in a [`WideLevelBin`], less the bit of level zero:
-/// what is left to scan once the walk has moved a level's bit to the top.
-const DEEPER_WIDE_LEVELS: u64 = (u16::MAX as u64) << LEVEL_BIN_SHIFT & !(1 << (u64::BITS - 1));
-
 /// The levels below `OVERFLOW_LEVEL` that a level bin records, level zero in
 /// the top bit, so the leading zeros of a non-empty set are the index of its
 /// shallowest level.
@@ -622,23 +609,23 @@ struct MembershipSlot {
 use level_bin::WideLevelBin;
 
 mod level_bin {
-    /// A level bin at the top of a word, where the leading zeros of the
-    /// word are the index of the bin's shallowest level. The first-match
+    /// A level bin in the top half of a word, where the leading zeros of
+    /// the word are the index of the bin's shallowest level. The first-match
     /// walk steps the head by those counts; the head has an entry for every
-    /// count a word can have, so the walk takes a filter unit as it was
-    /// loaded, membership bits and all.
+    /// count a word can have, so the walk needs nothing of the low half.
     #[derive(Clone, Copy)]
-    pub(super) struct WideLevelBin(u64);
+    pub(super) struct WideLevelBin(u32);
 
     impl WideLevelBin {
-        /// The bin of a filter unit, which keeps it in its top bits.
+        /// The bin of a filter unit, from the half of the unit that holds
+        /// it.
         #[inline]
-        pub(super) const fn of_unit(unit: u64) -> Self {
-            Self(unit)
+        pub(super) const fn of_unit_half(half: u32) -> Self {
+            Self(half)
         }
 
         #[inline]
-        pub(super) fn get(self) -> u64 {
+        pub(super) fn get(self) -> u32 {
             self.0
         }
     }
@@ -683,8 +670,8 @@ const fn unit_records(unit: u64, bits: u32) -> bool {
     unit as u32 & bits != 0
 }
 
-/// Where a filter unit keeps its level bin: its top bits, so the unit is
-/// the bin as a [`WideLevelBin`].
+/// Where a filter unit keeps its level bin: its top bits, so the half above
+/// the membership bits is the bin as a [`WideLevelBin`].
 const LEVEL_BIN_SHIFT: u32 = u64::BITS - u16::BITS;
 
 /// The level bin of a filter unit.
@@ -696,8 +683,9 @@ const fn unit_levels(unit: u64) -> u16 {
 
 /// The level bin of a filter unit, as the first-match walk reads it.
 #[inline]
+#[allow(clippy::cast_possible_truncation)]
 const fn unit_wide_levels(unit: u64) -> WideLevelBin {
-    WideLevelBin::of_unit(unit)
+    WideLevelBin::of_unit_half((unit >> MEMBERSHIP_BITS) as u32)
 }
 
 /// A membership bit and a level bin, each in its place in a filter unit.
@@ -1686,10 +1674,10 @@ where
         // The leading zeros of the bin are the index of its shallowest
         // level. The overflow bit reaches an absent entry, as every scan of
         // a shape without lanes does: it stands where the level past the
-        // last recorded one would. An empty bin, which the walk tests for
-        // after a scan and not before one, leads with the zeros of the
-        // whole bin and more, and so with an entry that is no level. Such
-        // an entry scans the group past the slots, which matches nothing.
+        // last recorded one would. An empty set, which the walk tests for
+        // after a scan and not before one, has a whole word of leading
+        // zeros, and the head's last entry. An absent entry scans the group
+        // past the slots, which matches nothing.
         let mut pending = levels.get();
         // The walk steps a pointer to the table itself and reads the head
         // at its offset from there, so the head's address is never formed.
@@ -1700,18 +1688,15 @@ where
         let mut stepped = table.wrapping_add(distance as usize);
         // The head entry the walk stands on, with the walk's level bit
         // moved to the top and cleared, so the rest keep their distances
-        // from the entry. The mask also drops what the shift brought up
-        // from under the bin. A word of zeros shifts by its whole width,
-        // which wraps to none.
+        // from the entry. An empty set shifts by its whole width, which
+        // wraps to none.
         macro_rules! take_level {
             () => {{
-                pending = pending.wrapping_shl(distance) & DEEPER_WIDE_LEVELS;
+                pending = pending.wrapping_shl(distance) & !SHALLOWEST_LEVEL;
                 // SAFETY: the distances stepped so far add up to the index
-                // of a set bit of the word, or to `u64::BITS` for a word of
-                // zeros: each step but the first is the leading zeros of
-                // what the shifts so far left of the word. Either way the
-                // entry is one of the head's `HEAD_ENTRIES`, which outlive
-                // the borrow of `self`.
+                // of a set bit of the bin, or to `u32::BITS` for an empty
+                // set. Either way the entry is one of the head's
+                // `HEAD_ENTRIES`, which outlive the borrow of `self`.
                 unsafe { &*stepped.wrapping_byte_add(mem::offset_of!(Self, head)) }
             }};
         }

@@ -1105,20 +1105,14 @@ fn levels_past_the_head_share_the_overflow_bit() {
 
 /// A bin's leading zeros, as the first-match walk reads it from a unit, name
 /// the head entry of its shallowest level: the level's own for a level with a
-/// bit, the absent one after them for the overflow bit, the last for an
-/// empty bin alone, and one that is no level for a unit whose bin is empty.
+/// bit, the absent one after them for the overflow bit, and the last for an
+/// empty bin.
 #[test]
 fn a_wide_bin_leads_with_the_index_of_its_shallowest_level() {
     let lead = |levels: u16| {
         let wide = unit_wide_levels(unit_of(0, levels)).get();
-        let unit = unit_of(u32::MAX, levels);
-        // The unit's membership bits lie under its bin, so a bin that is
-        // not empty leads the unit as it leads the bin alone.
-        assert_eq!(
-            unit_wide_levels(unit).get() >> MEMBERSHIP_BITS,
-            wide >> MEMBERSHIP_BITS
-        );
-        assert_eq!(unit_levels(unit), levels);
+        assert_eq!(unit_wide_levels(unit_of(u32::MAX, levels)).get(), wide);
+        assert_eq!(unit_levels(unit_of(u32::MAX, levels)), levels);
         wide.leading_zeros() as usize
     };
     for level in 0..OVERFLOW_LEVEL {
@@ -1127,11 +1121,6 @@ fn a_wide_bin_leads_with_the_index_of_its_shallowest_level() {
     }
     assert_eq!(lead(OVERFLOW_LEVEL_BIT), OVERFLOW_LEVEL);
     assert_eq!(lead(0), HEAD_ENTRIES - 1);
-    // A unit whose bin is empty leads with one of its membership bits.
-    for bit in 0..MEMBERSHIP_BITS {
-        let lead = unit_wide_levels(unit_of(1 << bit, 0)).get().leading_zeros() as usize;
-        assert!((NO_LEVEL_ENTRIES..HEAD_ENTRIES - 1).contains(&lead));
-    }
 }
 
 fn head_table(
@@ -1534,16 +1523,7 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
                 .all(HeadLevel::is_absent)
         );
         assert!(table.head[OVERFLOW_LEVEL].is_absent());
-        assert!(
-            table.head[OVERFLOW_LEVEL..NO_LEVEL_ENTRIES]
-                .iter()
-                .all(HeadLevel::is_absent)
-        );
-        assert!(
-            !table.head[NO_LEVEL_ENTRIES..]
-                .iter()
-                .any(HeadLevel::is_absent)
-        );
+        assert!(!table.head[HEAD_ENTRIES - 1].is_absent());
         assert!(
             table.head[recorded..]
                 .iter()
@@ -2995,22 +2975,9 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                     "n {n} d {d} index {index}"
                 );
                 let probe = table.prf.prepare(key);
-                // The walk takes the unit as the gate loaded it, and reads
-                // the same bin from it as from the bin alone: the same slot,
-                // or the same head entry scanned last.
                 let scan = table
                     .first_match(&key, probe, gate.wide_levels())
                     .map(|found| table.slot_of(found.lane));
-                assert_eq!(
-                    table
-                        .first_match(&key, probe, unit_wide_levels(unit_of(0, gate.levels())))
-                        .map(|found| table.slot_of(found.lane))
-                        .map_err(core::ptr::from_ref),
-                    scan.as_ref()
-                        .copied()
-                        .map_err(|last| core::ptr::from_ref(*last)),
-                    "n {n} d {d} index {index}"
-                );
                 let found = scan.ok();
                 // An empty bin scans an entry that is no level and the
                 // overflow bit an absent one; neither finds anything.
@@ -3020,17 +2987,6 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                         .map(|found| table.slot_of(found.lane))
                         .ok();
                     assert_eq!(at_absent, None, "n {n} d {d} index {index}");
-                }
-                // A unit with membership bits under an empty bin walks
-                // entries that are no level, and finds nothing either.
-                for bits in [1, 1 << (MEMBERSHIP_BITS - 1), u32::MAX] {
-                    let no_level = table
-                        .first_match(&key, probe, unit_wide_levels(unit_of(bits, 0)))
-                        .map(|found| table.slot_of(found.lane));
-                    assert!(
-                        no_level.is_err_and(|last| !last.is_absent()),
-                        "n {n} d {d} index {index}"
-                    );
                 }
                 if scan.map_or_else(|last| table.unmatched_is_absent(last), |_| true) {
                     assert_eq!(found, walk, "n {n} d {d} index {index}");
