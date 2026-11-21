@@ -85,8 +85,8 @@ pub trait TableBackend<K, V>: Sized {
 
     // -- Lookup --
 
-    /// Whether the shell runs this backend's keyed lookups and removals in
-    /// their callers. A backend sets it when its lookup is marked to inline
+    /// Whether the shell runs this backend's keyed operations in their
+    /// callers. A backend sets it when its lookup is marked to inline
     /// and finds a key without a call: behind the shell's own function the
     /// caller would pay a call for a lookup that needs none.
     const LOOKUP_IN_CALLER: bool = false;
@@ -481,8 +481,8 @@ where
     }
 
     // Each keyed lookup and removal below is three functions. The body is
-    // in `*_in_place`, forced inline. `*_by_call` is that body as a
-    // function to call. The public one, forced inline as well, only picks
+    // in `*_in_place`, forced inline. `*_by_call` is that body behind
+    // a function boundary the compiler may still inline. The public one, forced inline as well, only picks
     // between the two by the backend's `LOOKUP_IN_CALLER`, a choice settled
     // once the backend is known: the body in the caller, or a call.
 

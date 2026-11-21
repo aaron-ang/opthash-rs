@@ -2378,8 +2378,9 @@ where
     /// # Safety
     ///
     /// `unlinked`, if any, must be an initialized entry of this table whose
-    /// control byte is a tombstone and whose delete is counted, with no
-    /// other owner of its key and value.
+    /// control byte is a tombstone and whose delete is counted and reported
+    /// as needing its count settled, with no other owner of its key and
+    /// value.
     #[inline(never)]
     unsafe fn finish_removal<Q>(
         &mut self,
@@ -3296,7 +3297,9 @@ where
         // SAFETY: an entry passed on was tombstoned and counted just above
         // and not read out, so the table still holds the only copy.
         let entry = unsafe { self.finish_removal(key, hash, unlinked) }?;
-        // SAFETY: as above; no slot has been written since the tombstone.
+        // SAFETY: `finish_removal` returns an initialized entry the table
+        // has unlinked and no longer owns, whether it was passed in or found
+        // by the walk, and no slot has been written since.
         let entry = unsafe { entry.as_ptr().read() };
         Some((entry.key, entry.value))
     }
