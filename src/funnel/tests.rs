@@ -10,7 +10,7 @@ use super::*;
 use crate::exact::probe::{self, ProbeDomain};
 use crate::exact::reference::{ScalarFunnel, ScalarFunnelInsert, ScalarFunnelLocation};
 use crate::test_support::{
-    self, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
+    self, CountDrop, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
 };
 
 std::thread_local! {
@@ -1110,7 +1110,7 @@ fn levels_past_the_head_share_the_overflow_bit() {
 #[test]
 fn a_wide_bin_leads_with_the_index_of_its_shallowest_level() {
     let lead = |levels: u16| {
-        let wide = WideLevelBin::from(levels).get();
+        let wide = unit_wide_levels(unit_of(0, levels)).get();
         assert_eq!(unit_wide_levels(unit_of(u32::MAX, levels)).get(), wide);
         assert_eq!(unit_levels(unit_of(u32::MAX, levels)), levels);
         wide.leading_zeros() as usize
@@ -1138,7 +1138,7 @@ fn assert_head_addresses_storage<K, V, S>(table: &FunnelTable<K, V, S>) {
         assert_eq!(head.multiplier, derived.multiplier, "entry {index}");
         assert_eq!(head.buckets, derived.buckets, "entry {index}");
         assert_eq!(head.ctrl, derived.ctrl, "entry {index}");
-        assert_eq!(head.data, derived.data, "entry {index}");
+        assert_eq!(head.last, derived.last, "entry {index}");
     }
     assert_eq!(table.head_lanes, table.shape.head_lanes());
 }
@@ -1514,14 +1514,19 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
             );
             // SAFETY: a level starts inside the storage.
             let data = unsafe { table.storage.slot_ptr(level.offset) };
-            assert_eq!(head.data.cast(), data);
+            // SAFETY: slot zero of a level is inside it.
+            assert_eq!(unsafe { head.entry(0) }.cast(), data);
         }
         assert!(
             table.head[recorded..OVERFLOW_LEVEL]
                 .iter()
                 .all(HeadLevel::is_absent)
         );
-        assert!(table.head[OVERFLOW_LEVEL].is_absent());
+        assert!(
+            table.head[OVERFLOW_LEVEL..HEAD_ENTRIES - 1]
+                .iter()
+                .all(HeadLevel::is_absent)
+        );
         assert!(!table.head[HEAD_ENTRIES - 1].is_absent());
         assert!(
             table.head[recorded..]
@@ -2549,6 +2554,104 @@ fn panicking_hasher_during_filter_refresh_keeps_every_key_recorded() {
     }
 }
 
+/// A keyed removal whose settling unwinds, on a hasher that panics in the
+/// filter refresh, still drops the pair it unlinked, once: the key is gone
+/// from the table and nothing is left to drop it later. On a shape whose
+/// head finds the key, and on one without a head, where the ordered walk
+/// does.
+#[test]
+fn panicking_hasher_while_a_keyed_removal_settles_drops_the_removed_pair() {
+    const LIVE: u64 = 12;
+    const CHURN: u64 = LIVE;
+    let headed = {
+        let reserve = ReserveFraction::from_exponent(3).unwrap();
+        (FunnelShape::from_slots(144, reserve).unwrap(), reserve)
+    };
+    let headless = {
+        let (wide, _) = smallest_wide_shape();
+        let reserve = ReserveFraction::from_exponent(wide).unwrap();
+        let shape =
+            FunnelShape::for_insert_budget(usize::try_from(LIVE).unwrap() + 1, reserve).unwrap();
+        (shape, reserve)
+    };
+    assert!(headed.0.has_head());
+    assert!(!headless.0.has_head());
+    for (shape, reserve) in [headed, headless] {
+        let armed = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut table =
+            FunnelTable::<PanicHashKey, CountDrop, IdentityBuildHasher>::try_from_shape(
+                shape,
+                reserve,
+                IdentityBuildHasher,
+                Global,
+            )
+            .unwrap();
+        let key_of = |id: u64| PanicHashKey {
+            id,
+            armed: armed.clone(),
+            drops: drops.clone(),
+        };
+        let value_drops = Arc::new(AtomicUsize::new(0));
+        for id in 0..=CHURN {
+            let value = CountDrop(value_drops.clone());
+            assert!(map::TableBackend::insert(&mut table, key_of(id), value, id).is_none());
+        }
+        // Cycling one key re-takes its tombstone, so only the stale-filter
+        // count grows and the delete that passes its threshold refreshes
+        // the filter.
+        let threshold = membership::refresh_deletes(table.shape.max_insertions);
+        let probe = key_of(CHURN);
+        for _ in 0..threshold {
+            assert!(map::TableBackend::remove_key(&mut table, &probe, CHURN).is_some());
+            let value = CountDrop(value_drops.clone());
+            assert!(map::TableBackend::insert(&mut table, key_of(CHURN), value, CHURN).is_none());
+        }
+        // The head finds the key exactly on the shape that has one.
+        let gate = table.membership_gate(CHURN);
+        let prepared = table.prf.prepare(CHURN);
+        assert_eq!(
+            table
+                .first_match(&probe, prepared, gate.wide_levels())
+                .is_ok(),
+            table.shape.has_head()
+        );
+        let (keys_before, values_before) = (
+            drops.load(Ordering::SeqCst),
+            value_drops.load(Ordering::SeqCst),
+        );
+        armed.store(true, Ordering::SeqCst);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            map::TableBackend::remove_key(&mut table, &probe, CHURN)
+        }));
+        armed.store(false, Ordering::SeqCst);
+        let panic = result.err().expect("the refresh hashed no key");
+        assert!(
+            panic
+                .downcast_ref::<&str>()
+                .is_some_and(|message| message.contains("armed key hash"))
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), keys_before + 1);
+        assert_eq!(value_drops.load(Ordering::SeqCst), values_before + 1);
+        assert_eq!(table.entries() as u64, LIVE);
+        assert!(map::TableBackend::find_entry(&table, &probe, CHURN).is_none());
+        for id in 0..LIVE {
+            assert!(map::TableBackend::find_entry(&table, &key_of(id), id).is_some());
+        }
+        // Only the live pairs are left for the table to drop.
+        let (keys_before, values_before) = (
+            drops.load(Ordering::SeqCst),
+            value_drops.load(Ordering::SeqCst),
+        );
+        drop(table);
+        assert_eq!((drops.load(Ordering::SeqCst) - keys_before) as u64, LIVE);
+        assert_eq!(
+            (value_drops.load(Ordering::SeqCst) - values_before) as u64,
+            LIVE
+        );
+    }
+}
+
 #[test]
 fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
     let fail = Arc::new(AtomicBool::new(true));
@@ -2607,6 +2710,54 @@ fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
     drop(table);
     assert_eq!(allocations.load(Ordering::SeqCst), 1);
     assert_eq!(deallocations.load(Ordering::SeqCst), 1);
+}
+
+/// The first-match lookup walks a group mask from its highest lane down.
+/// For every set of matching lanes, that walk visits the lanes the mask's
+/// own iterator yields, in reverse, and each lane's depth is a whole number
+/// of lanes below the group's last.
+#[test]
+fn a_group_mask_walked_from_the_top_visits_its_lanes_in_reverse() {
+    const FP: u8 = 0x80 | 7;
+    // One bit of `chosen` per lane. Miri takes the sets of eight lanes, and
+    // repeats each in the upper half of a wider group.
+    let sets = if cfg!(miri) {
+        1 << u8::BITS
+    } else {
+        1_u32 << GROUP_SIZE
+    };
+    for set in 0..sets {
+        let chosen = if cfg!(miri) {
+            set | set << u8::BITS
+        } else {
+            set
+        };
+        let controls: [u8; GROUP_SIZE] = core::array::from_fn(|lane| {
+            if chosen >> lane & 1 == 1 {
+                FP
+            } else {
+                CTRL_EMPTY
+            }
+        });
+        // SAFETY: `controls` is one whole group.
+        let mask = unsafe { simd::eq_mask_group(controls.as_ptr(), FP) };
+        let mut ascending: Vec<usize> = mask.clone().collect();
+        ascending.reverse();
+        let mut descending = Vec::new();
+        let mut matches = mask.0;
+        while matches != 0 {
+            // SAFETY: `matches` is a group mask less whole lanes, and not
+            // empty.
+            let depth = unsafe { highest_lane_depth(matches) };
+            assert_eq!(depth % BITMASK_STRIDE, 0, "{controls:02x?}");
+            descending.push(GROUP_SIZE - 1 - (depth / BITMASK_STRIDE) as usize);
+            // SAFETY: as above.
+            let rest = unsafe { below_highest_lane(matches) };
+            assert!(rest < matches, "{controls:02x?}");
+            matches = rest;
+        }
+        assert_eq!(descending, ascending, "{controls:02x?}");
+    }
 }
 
 #[test]
@@ -2927,18 +3078,24 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 );
                 let probe = table.prf.prepare(key);
                 let scan = table
-                    .first_match(&key, probe, gate.levels().into())
+                    .first_match(&key, probe, gate.wide_levels())
                     .map(|found| table.slot_of(found.lane));
                 let found = scan.ok();
-                // An empty bin and the overflow bit each scan an absent head
-                // entry, which finds nothing.
-                for absent in [0, OVERFLOW_LEVEL_BIT] {
-                    let at_absent = table
-                        .first_match(&key, probe, absent.into())
+                // An empty bin ends on the entry that is no level and the
+                // overflow bit on an absent one; neither finds anything.
+                let ends_on = |levels: u16| {
+                    table
+                        .first_match(&key, probe, unit_wide_levels(unit_of(0, levels)))
                         .map(|found| table.slot_of(found.lane))
-                        .ok();
-                    assert_eq!(at_absent, None, "n {n} d {d} index {index}");
-                }
+                };
+                assert!(
+                    ends_on(0).is_err_and(|last| !last.is_absent()),
+                    "n {n} d {d} index {index}"
+                );
+                assert!(
+                    ends_on(OVERFLOW_LEVEL_BIT).is_err_and(HeadLevel::is_absent),
+                    "n {n} d {d} index {index}"
+                );
                 if scan.map_or_else(|last| table.unmatched_is_absent(last), |_| true) {
                     assert_eq!(found, walk, "n {n} d {d} index {index}");
                     // A bucket wider than a group is never scanned here.
@@ -2954,6 +3111,77 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 assert_ne!(answered, 0, "n {n} d {d}");
             }
         }
+    }
+}
+
+/// The first-match walk takes any half-word for a bin: an empty one, bits
+/// under the bin, every bit. It ends on the head entry of the lowest set
+/// bit, or on the last entry for an empty half-word; a key it finds is
+/// where the ordered walk finds it, and bits added to a key's own bin do
+/// not hide the key. On a shape with a head and on one without.
+#[test]
+fn first_match_walks_any_half_word_to_the_entry_of_its_lowest_bit() {
+    const HALVES: [u32; 9] = [
+        0,
+        1,
+        1 << 15,
+        1 << 16,
+        0x0000_FFFF,
+        0x8000_0001,
+        0x5555_5555,
+        0xDEAD_BEEF,
+        u32::MAX,
+    ];
+    let reserve = ReserveFraction::from_exponent(3).unwrap();
+    let headed = head_table(
+        FunnelShape::for_insert_budget(24, reserve).unwrap(),
+        reserve,
+    );
+    let (wide, _) = smallest_wide_shape();
+    let wide_reserve = ReserveFraction::from_exponent(wide).unwrap();
+    let headless = head_table(
+        FunnelShape::for_insert_budget(24, wide_reserve).unwrap(),
+        wide_reserve,
+    );
+    assert!(headed.shape.has_head());
+    assert!(!headless.shape.has_head());
+    for mut table in [headed, headless] {
+        let inserted = 24;
+        assert!(table.shape.max_insertions as u64 >= inserted);
+        for key in 0..inserted {
+            assert_eq!(map::TableBackend::insert(&mut table, key, key, key), None);
+        }
+        let mut found_in_head = 0_usize;
+        for key in 0..inserted + 4 {
+            let probe = table.prf.prepare(key);
+            let walk = table.find_location_by_walk(&key, key, u16::MAX);
+            assert_eq!(walk.is_some(), key < inserted, "key {key}");
+            let gate = table.membership_gate(key);
+            let own = gate.wide_levels().get();
+            let in_head =
+                gate.passes() && table.first_match(&key, probe, gate.wide_levels()).is_ok();
+            found_in_head += usize::from(in_head);
+            for half in HALVES.into_iter().chain(HALVES.map(|half| half | own)) {
+                let lowest = match half {
+                    0 => HEAD_ENTRIES - 1,
+                    _ => (u32::BITS - 1 - half.trailing_zeros()) as usize,
+                };
+                match table.first_match(&key, probe, WideLevelBin::of_unit_half(half)) {
+                    Ok(found) => {
+                        let slot = table.slot_of(found.lane);
+                        assert_eq!(Some(slot), walk, "key {key} half {half:#x}");
+                    }
+                    Err(last) => {
+                        assert!(
+                            core::ptr::eq(last, &raw const table.head[lowest]),
+                            "key {key} half {half:#x}"
+                        );
+                        assert!(!in_head || half & own != own, "key {key} half {half:#x}");
+                    }
+                }
+            }
+        }
+        assert_eq!(found_in_head != 0, table.shape.has_head());
     }
 }
 
