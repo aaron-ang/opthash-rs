@@ -1151,6 +1151,8 @@ struct PlacementCase<'a, K, V> {
     budget: u64,
     /// The level to search when the budget finds no slot.
     fallback: Option<usize>,
+    /// `level` has no free slot by its counts, so no search of it finds one.
+    full: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2182,7 +2184,7 @@ where
         let target = self.scheduler.cached_target();
         // The write closes the gate; the next insert finds it open again
         // where it may be.
-        if let Some(placement) = self.choose_slot_for_new_key(prepared.probe, target) {
+        if let Some(placement) = self.choose_slot_for_insert(prepared.probe, target) {
             let open_to = self.scheduler.settled_end;
             let location = self.place_new_entry(key, value, prepared, key_fingerprint, placement);
             self.keep_settled(open_to);
@@ -3184,7 +3186,19 @@ where
         probe: PreparedElasticProbe,
         target: BatchTarget,
     ) -> Option<ExactPlacement> {
-        self.choose_slot_with(target, |level, budget| {
+        self.choose_slot_with::<false>(target, |level, budget| {
+            self.first_vacancy(probe, level, budget)
+        })
+    }
+
+    /// [`Self::choose_slot_for_new_key`] without the search of a level the
+    /// case already counts as full, which finds nothing.
+    fn choose_slot_for_insert(
+        &self,
+        probe: PreparedElasticProbe,
+        target: BatchTarget,
+    ) -> Option<ExactPlacement> {
+        self.choose_slot_with::<true>(target, |level, budget| {
             self.first_vacancy(probe, level, budget)
         })
     }
@@ -3210,6 +3224,7 @@ where
                 region: self.levels.first()?,
                 budget: budget_of(self.levels.first()?, None),
                 fallback: None,
+                full: false,
             },
             BatchTarget::LevelPair(current) => {
                 let next = current.checked_add(1)?;
@@ -3226,6 +3241,7 @@ where
                         region: next_level,
                         budget: budget_of(next_level, None),
                         fallback: None,
+                        full: free_next == 0,
                     }
                 } else if next_low {
                     PlacementCase {
@@ -3233,6 +3249,7 @@ where
                         region: current_level,
                         budget: budget_of(current_level, None),
                         fallback: None,
+                        full: false,
                     }
                 } else {
                     // Not low, so the level has a free slot.
@@ -3247,6 +3264,7 @@ where
                         region: current_level,
                         budget: budget_of(current_level, Some(budget)),
                         fallback: Some(next),
+                        full: false,
                     }
                 }
             }
@@ -3255,10 +3273,11 @@ where
 
     /// Chooses `target`'s slot for a new key. `first_vacancy(level, budget)`
     /// yields the first free slot among `level`'s first `budget` probes and
-    /// the one-based probe that reached it.
+    /// the one-based probe that reached it. `SKIP_FULL` answers for a level
+    /// the case counts as full without searching it.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn choose_slot_with(
+    fn choose_slot_with<const SKIP_FULL: bool>(
         &self,
         target: BatchTarget,
         first_vacancy: impl Fn(usize, u64) -> Option<(usize, u64)>,
@@ -3267,8 +3286,12 @@ where
             mut level,
             mut budget,
             mut fallback,
+            full,
             ..
         } = self.placement_case(target, |_, budget| budget.unwrap_or(u64::MAX))?;
+        if SKIP_FULL && full {
+            return None;
+        }
         // One search site serves every case, so the search inlines once.
         let (slot, paper_probe) = loop {
             let limit = *LEVEL_PROBE_LIMIT.get(level)?;

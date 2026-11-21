@@ -4724,7 +4724,7 @@ fn lookup_off_the_schedule_returns_a_value_aligned_past_its_key() {
 
 /// Where the placement walk puts a new key with `probe`: the first free
 /// slot of the batch's insertion case, then of every other target's in
-/// order.
+/// order, each level searched whatever its counts say of its fill.
 fn walked_placement(
     table: &ElasticTable<u64, u64, FixedHashBuilder>,
     probe: PreparedElasticProbe,
@@ -4740,7 +4740,7 @@ fn walked_placement(
         .filter(|&candidate| candidate != target);
     core::iter::once(target)
         .chain(others)
-        .find_map(|candidate| table.choose_slot_with(candidate, search))
+        .find_map(|candidate| table.choose_slot_with::<false>(candidate, search))
         .map(|placement| (placement.level, placement.slot))
 }
 
