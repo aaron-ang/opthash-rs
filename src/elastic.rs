@@ -2239,6 +2239,25 @@ where
         self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
     }
 
+    /// [`Self::place_unique`] of a key the cached batch's target has no
+    /// slot for. Kept out of line, and deriving the key's route again, so
+    /// the rebuild's loop holds a single target attempt and nothing for
+    /// this one.
+    #[cold]
+    #[inline(never)]
+    fn place_unique_off_target(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
+        let prepared = PreparedElasticRoute::new(key_hash);
+        let key_fingerprint = control::control_fingerprint_low(key_hash);
+        let target = self.scheduler.cached_target();
+        if let Some(placement) = self.choose_slot_on_other_targets(prepared.probe, target) {
+            self.place_new_entry(entry.key, entry.value, prepared, key_fingerprint, placement);
+            false
+        } else {
+            self.place_exceptional_entry(entry.key, entry.value, prepared, key_fingerprint);
+            true
+        }
+    }
+
     /// Places a key whose active batch target has no slot: another target,
     /// then a same-size rebuild, then exceptional placement. Kept out of line
     /// so the common path inlines as a single target attempt.
@@ -3871,15 +3890,11 @@ where
         let prepared = PreparedElasticRoute::new(key_hash);
         let key_fingerprint = control::control_fingerprint_low(key_hash);
         let target = self.scheduler.target(self.live());
-        let placement = self
-            .choose_slot_for_new_key(prepared.probe, target)
-            .or_else(|| self.choose_slot_on_other_targets(prepared.probe, target));
-        if let Some(placement) = placement {
+        if let Some(placement) = self.choose_slot_for_new_key(prepared.probe, target) {
             self.place_new_entry(entry.key, entry.value, prepared, key_fingerprint, placement);
             false
         } else {
-            self.place_exceptional_entry(entry.key, entry.value, prepared, key_fingerprint);
-            true
+            self.place_unique_off_target(entry, key_hash)
         }
     }
 }
