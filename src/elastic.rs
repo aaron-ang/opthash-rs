@@ -1939,10 +1939,6 @@ where
         let (case, budget, fallback) = self.settled_case(target)?;
         let region = case.region;
         let free = region.capacity - self.live_in(region);
-        // A settled search of a full level spends its budget for nothing.
-        if free == 0 {
-            return None;
-        }
         let holds_for = match target {
             // The level a case searches without a bound stays the case's
             // while the other level of its pair keeps its fill.
@@ -3269,11 +3265,6 @@ where
         budget: u64,
     ) -> Option<(usize, u64)> {
         let region = self.levels.get(level)?;
-        // A full level has no probe to find free, and under churn at the
-        // insertion limit the active pair's levels stay full.
-        if region.free_slots(self.live_in(region)) == 0 {
-            return None;
-        }
         if region.index_shift() == GENERAL_REDUCTION {
             return self.first_vacancy_general(probe, level, budget);
         }
