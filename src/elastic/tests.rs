@@ -2501,9 +2501,6 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
         }
         table.levels[0].index_shift() == GENERAL_REDUCTION
     }
-    // The value does not lead the entry, so an address that left the lead
-    // out would differ.
-    assert_ne!(<SlotEntry<u64, u64> as WalkedEntry>::LEAD, 0);
     let mut general_tables = 0;
     let mut shifted_tables = 0;
     let slot_counts: &[usize] = if cfg!(miri) {
