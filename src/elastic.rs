@@ -29,9 +29,7 @@ mod live_count;
 mod schedule;
 
 use live_count::{LiveCount, Uncounted};
-use schedule::{
-    PhiRoute, ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL, WalkedEntry,
-};
+use schedule::{PhiRoute, ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -879,10 +877,6 @@ unsafe fn found_key<'k, K, V>(entry: *mut SlotEntry<K, V>) -> &'k K {
         core::hint::assert_unchecked(!entry.is_null());
         &(*entry).key
     }
-}
-
-impl<K, V> WalkedEntry for SlotEntry<K, V> {
-    const LEAD: usize = mem::offset_of!(Self, value);
 }
 
 /// Outcome of [`ElasticTable::walk_schedule`].

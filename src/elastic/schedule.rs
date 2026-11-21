@@ -401,7 +401,7 @@ impl ProbeScheduleRoom {
     }
 
     /// The empty schedule of `levels`, the levels the room was taken for.
-    pub(super) fn schedule<T: WalkedEntry>(self, levels: &[Level<T>]) -> ProbeSchedule {
+    pub(super) fn schedule<T>(self, levels: &[Level<T>]) -> ProbeSchedule {
         assert_eq!(levels.len(), self.levels);
         let Self {
             mut slots,
@@ -431,7 +431,7 @@ impl ProbeScheduleRoom {
             direct_control: direct.control(),
             direct_entries: levels
                 .first()
-                .map_or(ptr::null_mut(), |level| lead_of(level.data_ptr)),
+                .map_or(ptr::null_mut(), |level| level.data_ptr.cast()),
             entry_origin: entry_origin(levels),
             book: OwnedBook::new(book),
             slots,
@@ -754,8 +754,7 @@ pub(super) struct ProbeSchedule {
     /// alone writes them, from the route it puts first.
     direct_reduction: u64,
     direct_control: *const u8,
-    /// The [`WalkedEntry::LEAD`] of level zero's first entry, or null for a
-    /// table without levels.
+    /// Level zero's first entry, or null for a table without levels.
     direct_entries: *mut u8,
     /// See [`entry_origin`].
     entry_origin: *mut u8,
@@ -822,27 +821,16 @@ impl Drop for OwnedBook {
     }
 }
 
-/// The part of an entry a schedule's entry addresses name.
-pub(super) trait WalkedEntry {
-    /// Offset in the entry of the part a lookup hands on. A walk reaches
-    /// that part with the address it computes and the rest of the entry at
-    /// a constant offset from it, so neither costs an addition.
-    const LEAD: usize;
-}
-
-/// The [`WalkedEntry::LEAD`] of the entry at `entry`.
-fn lead_of<T: WalkedEntry>(entry: *mut MaybeUninit<T>) -> *mut u8 {
-    entry.cast::<u8>().wrapping_add(T::LEAD)
-}
-
-/// Where the [`WalkedEntry::LEAD`] of the entry of a control byte at
-/// address zero would lie. The arena lays the levels' control bytes and
-/// their entries out in the same order and leaves the same number of slots
-/// between two levels in both, so that part of an entry is at this plus
-/// its control byte's address times the entry size.
-fn entry_origin<T: WalkedEntry>(levels: &[Level<T>]) -> *mut u8 {
+/// Where the entry of a control byte at address zero would lie. The arena
+/// lays the levels' control bytes and their entries out in the same order
+/// and leaves the same number of slots between two levels in both, so an
+/// entry is at this plus its control byte's address times the entry size.
+fn entry_origin<T>(levels: &[Level<T>]) -> *mut u8 {
     let origin_of = |region: &Level<T>| {
-        lead_of(region.data_ptr).wrapping_sub(region.ctrl_ptr.addr().wrapping_mul(size_of::<T>()))
+        region
+            .data_ptr
+            .cast::<u8>()
+            .wrapping_sub(region.ctrl_ptr.addr().wrapping_mul(size_of::<T>()))
     };
     let origin = levels.first().map_or(core::ptr::null_mut(), origin_of);
     debug_assert!(levels.iter().all(|region| origin_of(region) == origin));
@@ -937,16 +925,11 @@ impl ProbeSchedule {
     /// control bytes of one of them, `slot` one of its slots and `T` their
     /// entry type.
     #[inline]
-    pub(super) fn entry_at<T: WalkedEntry>(
-        entry_origin: *mut u8,
-        control: *const u8,
-        slot: usize,
-    ) -> *mut T {
+    pub(super) fn entry_at<T>(entry_origin: *mut u8, control: *const u8, slot: usize) -> *mut T {
         entry_origin
             .wrapping_add(control.addr().wrapping_mul(size_of::<T>()))
             .cast::<T>()
             .wrapping_add(slot)
-            .wrapping_byte_sub(T::LEAD)
     }
 
     /// Entry `slot` of level zero, by `direct_entries`, the entries
@@ -954,16 +937,13 @@ impl ProbeSchedule {
     /// schedule was built for when `slot` is one of level zero's slots and
     /// `T` their entry type.
     #[inline]
-    pub(super) fn direct_entry<T: WalkedEntry>(direct_entries: *mut u8, slot: usize) -> *mut T {
-        direct_entries
-            .cast::<T>()
-            .wrapping_add(slot)
-            .wrapping_byte_sub(T::LEAD)
+    pub(super) fn direct_entry<T>(direct_entries: *mut u8, slot: usize) -> *mut T {
+        direct_entries.cast::<T>().wrapping_add(slot)
     }
 
     /// A copy of `self` for `levels`: each route addresses its level there.
     /// Its groups have runs where a group's run of `self` is whole.
-    pub(super) fn clone_onto<T: WalkedEntry>(&self, levels: &[Level<T>]) -> Self {
+    pub(super) fn clone_onto<T>(&self, levels: &[Level<T>]) -> Self {
         let mut copy = ProbeScheduleRoom::for_levels(levels.len()).schedule(levels);
         // A whole group's run means every grouped level is pushed. Without
         // one the copy stays as it was made, with no group's run.
@@ -1274,7 +1254,7 @@ impl ProbeSchedule {
     /// leaves open, the slot ahead of the last where it leaves none open,
     /// and the direct route otherwise.
     #[cfg(test)]
-    pub(super) fn addresses<T: WalkedEntry>(&self, levels: &[Level<T>]) -> bool {
+    pub(super) fn addresses<T>(&self, levels: &[Level<T>]) -> bool {
         let book = &*self.book;
         let pushed_of = |level: usize| {
             self.routes()
@@ -1291,7 +1271,7 @@ impl ProbeSchedule {
             && self.direct_reach().2
                 == levels
                     .first()
-                    .map_or(ptr::null_mut(), |level| lead_of(level.data_ptr))
+                    .map_or(ptr::null_mut(), |level| level.data_ptr.cast())
             && self.entry_origin == entry_origin(levels)
             && self.walk_reach(0).0 == self.entry_origin
             && self.routes().iter().all(|route| {
