@@ -2501,6 +2501,9 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
         }
         table.levels[0].index_shift() == GENERAL_REDUCTION
     }
+    // The value does not lead the entry, so an address that left the lead
+    // out would differ.
+    assert_ne!(<SlotEntry<u64, u64> as WalkedEntry>::LEAD, 0);
     let mut general_tables = 0;
     let mut shifted_tables = 0;
     let slot_counts: &[usize] = if cfg!(miri) {
@@ -3890,7 +3893,8 @@ fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
         )
         .unwrap();
     let level_count = table.levels.len();
-    let fitted = table.probe_schedule.whole_groups().1;
+    let (whole, fitted) = table.probe_schedule.whole_groups();
+    assert_eq!(whole, 0);
     assert_ne!(fitted, 0);
     assert!(level_count > schedule::GROUPED_LEVELS + 1);
     // A rebuild that first brings a grouped level in writes the groups'
