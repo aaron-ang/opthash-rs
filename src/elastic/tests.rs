@@ -4853,6 +4853,7 @@ impl Hash for SharedProbeKey {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn a_recovery_rebuild_tries_every_target_before_placing_off_the_probes() {
     const SHARED: u64 = 0x9e37_79b9_7f4a_7c15;
     // Keys of their own probes: enough to hold slots the shared probes
@@ -4940,6 +4941,7 @@ fn a_recovery_rebuild_tries_every_target_before_placing_off_the_probes() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn a_removal_finds_a_key_placed_off_its_probes() {
     let shared = |id: u64| SharedProbeKey {
         hash: 0x9e37_79b9_7f4a_7c15,
@@ -4969,4 +4971,40 @@ fn a_removal_finds_a_key_placed_off_its_probes() {
         assert_eq!(map.len() as u64, id);
     }
     assert_eq!(map.remove(&shared(0)), None);
+}
+
+#[test]
+fn a_removal_takes_an_entry_placed_off_the_schedule() {
+    let mut table =
+        ElasticTable::<u64, u64, FixedHashBuilder>::try_with_slots_and_reserve_fraction_and_hasher_in(
+            1_024,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+    for key in 0..200_u64 {
+        let hash = table.hash_builder.hash_one(key);
+        table.insert_for_vacant_entry(key, !key, hash);
+    }
+    let strays = [u64::MAX, u64::MAX - 1];
+    for stray in strays {
+        let hash = table.hash_builder.hash_one(stray);
+        let fingerprint = control::control_fingerprint_low(hash);
+        table.place_exceptional_entry(stray, !stray, PreparedElasticRoute::new(hash), fingerprint);
+    }
+    assert!(table.walk_ends_unresolved());
+
+    let [by_entry, by_value] = strays;
+    let hash = table.hash_builder.hash_one(by_entry);
+    assert_eq!(table.take(&by_entry, hash), Some((by_entry, !by_entry)));
+    assert_eq!(table.take(&by_entry, hash), None);
+    let hash = table.hash_builder.hash_one(by_value);
+    assert_eq!(table.take_value(&by_value, hash), Some(!by_value));
+    assert_eq!(table.take_value(&by_value, hash), None);
+    assert_eq!(table.live(), 200);
+    for key in 0..200_u64 {
+        let hash = table.hash_builder.hash_one(key);
+        assert_eq!(TableBackend::find_value(&table, &key, hash), Some(&!key));
+    }
 }
