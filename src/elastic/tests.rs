@@ -4631,3 +4631,27 @@ fn compares_against_other_keys_stay_within_routes_times_fingerprint_collisions()
         );
     }
 }
+
+#[test]
+fn draining_a_map_leaves_no_level_a_tombstone() {
+    let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(3_000);
+    for key in 0..3_000 {
+        map.insert(key, key);
+    }
+    for key in 0..1_000 {
+        assert_eq!(map.remove(&key), Some(key));
+    }
+    assert_ne!(
+        map.table()
+            .levels
+            .iter()
+            .map(Level::tombstones)
+            .sum::<u32>(),
+        0
+    );
+    drop(map.drain());
+    for level in &map.table().levels {
+        assert_eq!(level.tombstones(), 0);
+    }
+    assert!(map.is_empty());
+}
