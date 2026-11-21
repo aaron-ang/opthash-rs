@@ -12,11 +12,23 @@
 pub(super) struct LiveCount(u32);
 
 impl LiveCount {
-    /// Counts one live entry gone. The stored count of the settled level
-    /// may pass below zero here, and comes back with its uncounted inserts.
+    /// Counts one live entry turned into a tombstone, which raises
+    /// `tombstones` by one. The stored count of the settled level may pass
+    /// below zero here, and comes back with its uncounted inserts.
+    ///
+    /// The two counts are the halves of one word, tombstones low, so one
+    /// subtraction moves both; the live count is the high half, where
+    /// passing below zero borrows from nothing.
+    #[allow(clippy::cast_possible_truncation)]
     #[inline]
-    pub(super) fn remove_one(&mut self) {
-        self.0 = self.0.wrapping_sub(1);
+    pub(super) fn entomb_one(&mut self, tombstones: &mut u32) {
+        // The removed entry was live, so the tombstones are fewer than the
+        // level's slots.
+        debug_assert!(*tombstones < u32::MAX);
+        let both = u64::from(*tombstones) | u64::from(self.0) << 32;
+        let both = both.wrapping_sub(u64::from(u32::MAX));
+        *tombstones = both as u32;
+        self.0 = (both >> 32) as u32;
     }
 }
 
@@ -72,5 +84,27 @@ impl Uncounted {
     #[inline]
     pub(super) fn uncover_one(&mut self) {
         self.covered -= 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LiveCount;
+
+    #[test]
+    fn entombing_moves_each_count_by_one_at_every_edge() {
+        let edges = [0, 1, 2, u32::MAX / 2, u32::MAX - 1, u32::MAX];
+        for live in edges {
+            for tombstones in edges {
+                if tombstones == u32::MAX {
+                    continue;
+                }
+                let mut count = LiveCount(live);
+                let mut entombed = tombstones;
+                count.entomb_one(&mut entombed);
+                assert_eq!(count.0, live.wrapping_sub(1));
+                assert_eq!(entombed, tombstones + 1);
+            }
+        }
     }
 }

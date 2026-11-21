@@ -30,7 +30,10 @@ pub(crate) trait Rebuildable {
 
     /// Places an entry known to be absent from a table being rebuilt.
     /// Returns `true` on exceptional placement. Must run no user code: a
-    /// panic here would leave the entry owned by both generations.
+    /// panic here would leave the entry owned by both generations. Must
+    /// leave the state [`swap_generation`](Self::swap_generation) does not
+    /// swap as it found it: a rollback swaps the old generation back under
+    /// that state.
     fn place_unique(&mut self, entry: SlotEntry<Self::Key, Self::Value>, key_hash: u64) -> bool;
 }
 

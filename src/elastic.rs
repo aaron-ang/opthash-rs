@@ -29,7 +29,9 @@ mod live_count;
 mod schedule;
 
 use live_count::{LiveCount, Uncounted};
-use schedule::{PhiRoute, ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL};
+use schedule::{
+    PhiRoute, ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL, WalkedEntry,
+};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -290,16 +292,18 @@ const fn settled_summary_bit(settled: u32) -> SummaryBin {
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct LevelCounters {
-    len: LiveCount,
+    // Ahead of the live count: on a little-endian target that is the order
+    // of the halves `LiveCount::entomb_one` moves as one word. Elsewhere
+    // only its speed differs.
     tombstones: u32,
+    len: LiveCount,
 }
 
 impl LevelCounters {
     /// Counts one live entry turned into a tombstone.
     #[inline]
     fn remove_one(&mut self) {
-        self.len.remove_one();
-        self.tombstones += 1;
+        self.len.entomb_one(&mut self.tombstones);
     }
 }
 
@@ -860,20 +864,25 @@ const _: () = assert!(mem::size_of::<PreparedElasticRoute>() == 8);
 #[inline]
 const fn unlikely_path() {}
 
-/// The entry a walk found, as the two addends of its address: the walk has
-/// both in hand, and a caller that adds them reads neither from the table
-/// again.
-#[derive(Clone, Copy)]
-struct EntryAt {
-    entry_origin: *mut u8,
-    offset: usize,
+/// The key of the entry a walk found at `entry`, read as an address that is
+/// not zero, so a caller that hands the entry on tests it for nothing.
+///
+/// # Safety
+///
+/// `entry` is an occupied slot of a live level, and nothing writes its key
+/// while the borrow lasts.
+#[inline]
+unsafe fn found_key<'k, K, V>(entry: *mut SlotEntry<K, V>) -> &'k K {
+    // SAFETY: a slot of an allocation is not at address zero, and the
+    // caller's contract covers the read.
+    unsafe {
+        core::hint::assert_unchecked(!entry.is_null());
+        &(*entry).key
+    }
 }
 
-impl EntryAt {
-    #[inline]
-    fn get<T>(self) -> *mut T {
-        ProbeSchedule::entry_at(self.entry_origin, self.offset)
-    }
+impl<K, V> WalkedEntry for SlotEntry<K, V> {
+    const LEAD: usize = mem::offset_of!(Self, value);
 }
 
 /// Outcome of [`ElasticTable::walk_schedule`].
@@ -1802,7 +1811,8 @@ where
         if self.uncounted.pending(self.placed) != 0 {
             // SAFETY: an insert goes uncounted only into the settled level
             // of an open gate, which `reopen_settled` set to one of the
-            // levels, and the levels are replaced only after this call.
+            // levels. A generation swap moves the uncounted inserts with
+            // their levels and leaves the pointer on them.
             let counters = unsafe { (*self.settled_level).counters_mut() };
             self.uncounted.count_into(self.placed, &mut counters.len);
         }
@@ -2452,7 +2462,9 @@ where
     fn schedule_levels_through(&mut self, level: usize) {
         let high_water = self.probe_high_water & !HIGH_WATER_FLAGS;
         self.probe_high_water &= HIGH_WATER_FLAGS;
-        self.probe_schedule.clear();
+        // The levels scheduled before and after are scheduled again, to the
+        // same position.
+        self.probe_schedule.rewind(level + 1);
         self.scheduled_levels = u32::try_from(level + 1).expect("Elastic level count fits u32");
         for level in &mut self.levels {
             level.scheduled_probes = 0;
@@ -2610,6 +2622,9 @@ where
         )
     }
 
+    /// [`Self::find_by_exact_schedule`] with the walk and the lookup off
+    /// the schedule each handing on the value, where
+    /// [`Self::find_after_filter`] hands both an entry.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn find_value<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a V>
@@ -2617,13 +2632,29 @@ where
         Q: Hash + Equivalent<K> + ?Sized,
         K: 'a,
     {
-        self.find_by_exact_schedule(
-            key,
-            PreparedElasticRoute::new(hash),
-            |route| control::control_fingerprint_low(route.key_hash()),
-            |_level, _slot, entry| entry,
-        )
-        .map(|entry| &entry.value)
+        let prepared = PreparedElasticRoute::new(hash);
+        let filter = self.route_filter(prepared);
+        if !filter.maybe_present {
+            return None;
+        }
+        let key_fingerprint = control::control_fingerprint_low(hash);
+        // Every way to an answer ends on the value itself, so the lookup
+        // off the schedule returns in this one's place.
+        let walked =
+            self.walk_schedule(key, prepared, key_fingerprint, filter, |_, _, entry, _| {
+                // SAFETY: the walk hands on an occupied slot of this table,
+                // which `&'a self` keeps from changing.
+                unsafe { &(*entry).value }
+            });
+        match walked {
+            ScheduleSearch::Hit(value) => Some(value),
+            ScheduleSearch::Absent => None,
+            ScheduleSearch::Unresolved => {
+                self.find_unresolved(key, prepared, key_fingerprint, filter, |_, _, entry| {
+                    &entry.value
+                })
+            }
+        }
     }
 
     #[inline]
@@ -2664,7 +2695,7 @@ where
                     ScheduleSearch::Hit(entry) => {
                         // SAFETY: the walk hands on an occupied slot of this
                         // table, which `&mut self` borrows alone.
-                        let slot: &mut SlotEntry<K, V> = unsafe { &mut *entry.get() };
+                        let slot: &mut SlotEntry<K, V> = unsafe { &mut *entry };
                         return Some(mem::replace(&mut slot.value, value));
                     }
                     ScheduleSearch::Absent => {}
@@ -2738,7 +2769,7 @@ where
         // SAFETY: the walk hands on an occupied slot of one of this table's
         // levels, which `&mut self` borrows alone. The tombstone below keeps
         // the entry from being read again.
-        let removed = unsafe { entry.get::<SlotEntry<K, V>>().read() };
+        let removed = unsafe { entry.read() };
         // SAFETY: `control` is that level's control bytes, which the table
         // owns and may write, and `slot` indexes them. The sentinel's are
         // never handed on: they match no fingerprint.
@@ -3439,7 +3470,7 @@ where
             ScheduleSearch::Hit((level, slot, entry)) => {
                 // SAFETY: the walk hands on an occupied slot of this table,
                 // which `&'a self` keeps from changing.
-                Some(on_hit(level, slot, unsafe { &*entry.get() }))
+                Some(on_hit(level, slot, unsafe { &*entry }))
             }
             ScheduleSearch::Absent => None,
             ScheduleSearch::Unresolved => {
@@ -3492,32 +3523,29 @@ where
         prepared: PreparedElasticRoute,
         key_fingerprint: u8,
         filter: ElasticRouteFilter<'_>,
-        mut on_hit: impl FnMut(usize, usize, EntryAt, *const u8) -> R,
+        mut on_hit: impl FnMut(usize, usize, *mut SlotEntry<K, V>, *const u8) -> R,
     ) -> ScheduleSearch<R>
     where
         Q: Equivalent<K> + ?Sized,
     {
         let sequence = prepared.probe.sequence(self.fold_multiplier);
-        let (index_shift, direct_control, entry_origin) = self.probe_schedule.direct_reach();
+        let (index_shift, direct_control, direct_entries) = self.probe_schedule.direct_reach();
         let h11_slot = probe::masked_shift_elastic_index(sequence.word(0), index_shift);
         // SAFETY: the direct route's shifted index maps into the control
         // bytes it holds.
         if unsafe { *direct_control.add(h11_slot) } == key_fingerprint {
-            let offset = ProbeSchedule::entry_offset::<SlotEntry<K, V>>(direct_control, h11_slot);
-            let entry: *mut SlotEntry<K, V> = ProbeSchedule::entry_at(entry_origin, offset);
+            let entry: *mut SlotEntry<K, V> = ProbeSchedule::direct_entry(direct_entries, h11_slot);
             // SAFETY: only a level's own control bytes hold a fingerprint,
-            // and one marks an occupied slot, so the slot holds an entry.
-            if key.equivalent(unsafe { &(*entry).key }) {
-                let entry = EntryAt {
-                    entry_origin,
-                    offset,
-                };
+            // and one marks an occupied slot, so the slot holds an entry,
+            // level zero's at the slot's index.
+            if key.equivalent(unsafe { found_key(entry) }) {
                 return ScheduleSearch::Hit(on_hit(0, h11_slot, entry, direct_control));
             }
         }
 
         let summary = filter.summary();
-        match self.probe_schedule.walk_start(summary).run() {
+        let (entry_origin, start) = self.probe_schedule.walk_reach(summary);
+        match start.run() {
             Ok(mut run) => loop {
                 // SAFETY: a sentinel closes the run, and the walk cannot
                 // pass it: its probe reads `EMPTY` and ends the walk below.
@@ -3535,20 +3563,15 @@ where
                 // bytes it holds.
                 let control = unsafe { *level_control.add(slot) };
                 if control == key_fingerprint {
-                    let offset =
-                        ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
-                    let entry: *mut SlotEntry<K, V> = ProbeSchedule::entry_at(entry_origin, offset);
+                    let entry: *mut SlotEntry<K, V> =
+                        ProbeSchedule::entry_at(entry_origin, level_control, slot);
                     // SAFETY: the sentinel's control bytes match no
                     // fingerprint, so the route names a real level, and a
                     // fingerprint match means the slot is occupied and
                     // holds an entry.
-                    if key.equivalent(unsafe { &(*entry).key }) {
+                    if key.equivalent(unsafe { found_key(entry) }) {
                         // SAFETY: as above.
                         let level = unsafe { (*route).level() };
-                        let entry = EntryAt {
-                            entry_origin,
-                            offset,
-                        };
                         return ScheduleSearch::Hit(on_hit(
                             level as usize,
                             slot,
@@ -3588,21 +3611,15 @@ where
                     // control bytes it holds.
                     let control = unsafe { *level_control.add(slot) };
                     if control == key_fingerprint {
-                        let offset =
-                            ProbeSchedule::entry_offset::<SlotEntry<K, V>>(level_control, slot);
                         let entry: *mut SlotEntry<K, V> =
-                            ProbeSchedule::entry_at(entry_origin, offset);
+                            ProbeSchedule::entry_at(entry_origin, level_control, slot);
                         // SAFETY: the sentinel's control bytes match no
                         // fingerprint, so the route names a real level, and
                         // a fingerprint match means the slot is occupied and
                         // holds an entry.
-                        if key.equivalent(unsafe { &(*entry).key }) {
+                        if key.equivalent(unsafe { found_key(entry) }) {
                             // SAFETY: as above.
                             let level = unsafe { (*route).level() };
-                            let entry = EntryAt {
-                                entry_origin,
-                                offset,
-                            };
                             return ScheduleSearch::Hit(on_hit(
                                 level as usize,
                                 slot,
@@ -3779,10 +3796,20 @@ where
     type Generation = ElasticGeneration<K, V>;
 
     fn swap_generation(&mut self, other: &mut ElasticGeneration<K, V>) {
-        self.count_settled();
         mem::swap(&mut self.levels, &mut other.levels);
         mem::swap(&mut self.placed, &mut other.placed);
+        // The uncounted inserts go with the levels they went into, and
+        // `settled_level` stays on those: a rebuild places by the general
+        // insert, which sets no settled level, so levels put back find it
+        // where they left it.
         mem::swap(&mut self.uncounted, &mut other.uncounted);
+        debug_assert!(
+            self.uncounted.pending(self.placed) == 0
+                || self
+                    .levels
+                    .as_ptr_range()
+                    .contains(&self.settled_level.cast_const())
+        );
         mem::swap(&mut self.total_slots, &mut other.total_slots);
         mem::swap(&mut self.max_insertions, &mut other.max_insertions);
         mem::swap(&mut self.scheduler, &mut other.scheduler);
@@ -3841,7 +3868,9 @@ where
     }
 
     /// Skips the existence and capacity checks in `insert`: the new
-    /// generation starts all-EMPTY, so neither can succeed.
+    /// generation starts all-EMPTY, so neither can succeed. Never sets
+    /// `settled_level` ([`Self::reopen_settled`]), which
+    /// [`Self::swap_generation`] leaves on the levels a rollback puts back.
     #[inline]
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let prepared = PreparedElasticRoute::new(key_hash);
