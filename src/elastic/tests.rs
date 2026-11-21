@@ -3897,6 +3897,7 @@ fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
     assert_eq!(whole, 0);
     assert_ne!(fitted, 0);
     assert!(level_count > schedule::GROUPED_LEVELS + 1);
+    let unwritten = ProbeSchedule::group_appends();
     // A rebuild that first brings a grouped level in writes the groups'
     // runs from their start.
     for through in 0..schedule::GROUPED_LEVELS {
@@ -3904,26 +3905,26 @@ fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
         table.extend_probe_schedule(40 * (through as u128 + 1));
         assert!(table.probe_schedule.addresses(&table.levels));
         if through + 1 < schedule::GROUPED_LEVELS {
-            assert_eq!(table.probe_schedule.group_appends(), 0);
+            assert_eq!(ProbeSchedule::group_appends(), unwritten);
         }
     }
     assert_eq!(table.probe_schedule.whole_groups().0, fitted);
-    assert_ne!(table.probe_schedule.group_appends(), 0);
+    assert_ne!(ProbeSchedule::group_appends(), unwritten);
     for through in schedule::GROUPED_LEVELS..level_count {
-        let held = table.probe_schedule.group_appends();
+        let held = ProbeSchedule::group_appends();
         // One that brings a deeper level in pushes the same routes of the
         // grouped levels, which the runs hold.
         table.schedule_levels_through(through);
-        assert_eq!(table.probe_schedule.group_appends(), held);
+        assert_eq!(ProbeSchedule::group_appends(), held);
         assert!(table.probe_schedule.addresses(&table.levels));
         // Only the routes past them are written.
         table.extend_probe_schedule(40 * (through as u128 + 1));
         assert!(table.probe_schedule.addresses(&table.levels));
     }
     assert_eq!(table.probe_schedule.whole_groups().0, fitted);
-    let held = table.probe_schedule.group_appends();
+    let held = ProbeSchedule::group_appends();
     table.extend_probe_schedule(QUERY_POSITION_CAP);
-    assert!(table.probe_schedule.group_appends() > held);
+    assert!(ProbeSchedule::group_appends() > held);
 }
 
 #[test]
@@ -3967,20 +3968,22 @@ fn clone_has_group_runs_only_where_its_source_has_one_whole() {
     table.extend_probe_schedule(40);
     // A source short of a grouped level gives its copy no group's run, and
     // the copy takes them when its own rebuild brings that level in.
+    let held = ProbeSchedule::group_appends();
     let mut copy = table.clone_table();
     assert_eq!(copy.probe_schedule.whole_groups().0, 0);
-    assert_eq!(copy.probe_schedule.group_appends(), 0);
+    assert_eq!(ProbeSchedule::group_appends(), held);
     assert!(copy.probe_schedule.addresses(&copy.levels));
     copy.schedule_levels_through(copy.levels.len() - 1);
     assert_eq!(copy.probe_schedule.whole_groups().0, fitted);
-    assert_ne!(copy.probe_schedule.group_appends(), 0);
+    assert_ne!(ProbeSchedule::group_appends(), held);
     assert!(copy.probe_schedule.addresses(&copy.levels));
     // A source with whole groups gives its copy the same ones.
     table.schedule_levels_through(table.levels.len() - 1);
     assert_eq!(table.probe_schedule.whole_groups().0, fitted);
+    let held = ProbeSchedule::group_appends();
     let copy = table.clone_table();
     assert_eq!(copy.probe_schedule.whole_groups().0, fitted);
-    assert_ne!(copy.probe_schedule.group_appends(), 0);
+    assert_ne!(ProbeSchedule::group_appends(), held);
     assert!(copy.probe_schedule.addresses(&copy.levels));
 }
 

@@ -425,8 +425,6 @@ impl ProbeScheduleRoom {
             grouped_held: 0,
             whole_groups: 0,
             allocated: book.capacity(),
-            #[cfg(test)]
-            group_appends: 0,
         });
         let mut schedule = ProbeSchedule {
             direct_reduction: direct.reduction,
@@ -488,9 +486,13 @@ struct ScheduleBook {
     whole_groups: u8,
     /// Books the allocation has room for, which freeing it takes.
     allocated: usize,
-    /// Routes written to groups' runs since the schedule was made.
-    #[cfg(test)]
-    group_appends: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Routes this thread wrote to groups' runs. Kept out of the book, so a
+    /// test build lays the book out as a release build does.
+    static GROUP_APPENDS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 const _: () = assert!(core::mem::offset_of!(ScheduleBook, starts) == 0);
@@ -1216,9 +1218,7 @@ impl ProbeSchedule {
             self.slots[usize::from(slot) + 1].write(SENTINEL);
             book.group_next[group] = slot + 1;
             #[cfg(test)]
-            {
-                book.group_appends += 1;
-            }
+            GROUP_APPENDS.set(GROUP_APPENDS.get() + 1);
         }
         if whole != book.whole_groups {
             let runs = book.whole_runs;
@@ -1363,9 +1363,10 @@ impl ProbeSchedule {
         named_levels(self.book.levels)
     }
 
+    /// Routes the calling thread wrote to groups' runs, of any schedule.
     #[cfg(test)]
-    pub(super) fn group_appends(&self) -> usize {
-        self.book.group_appends
+    pub(super) fn group_appends() -> usize {
+        GROUP_APPENDS.get()
     }
 
     /// Groups whose runs a walk may start at, of how many the schedule has
