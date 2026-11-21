@@ -1222,6 +1222,12 @@ impl BatchScheduler {
         self.deletes_left.cast_signed() < 0
     }
 
+    /// One more removal makes [`Self::maintenance_is_due`].
+    #[inline]
+    fn next_removal_is_due(&self) -> bool {
+        self.deletes_left.wrapping_sub(1).cast_signed() < 0
+    }
+
     /// Removals counted since the countdown started from `budget`.
     #[inline]
     fn removed(&self, budget: usize) -> usize {
@@ -2753,56 +2759,16 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let prepared = PreparedElasticRoute::new(hash);
-        let filter = self.route_filter(prepared);
-        if !filter.maybe_present {
-            return None;
-        }
-        let key_fingerprint = control::control_fingerprint_low(hash);
-        let walked = self.walk_schedule(
-            key,
-            prepared,
-            key_fingerprint,
-            filter,
-            |_, slot, entry, control| (slot, entry, control),
-        );
-        let (slot, entry, control) = match walked {
-            ScheduleSearch::Hit(hit) => hit,
-            ScheduleSearch::Absent => return None,
-            ScheduleSearch::Unresolved => {
-                let location = self.find_unresolved(
-                    key,
-                    prepared,
-                    key_fingerprint,
-                    filter,
-                    |level, slot, _| (level, slot),
-                )?;
-                return Some(map::TableBackend::remove(self, location));
-            }
-        };
-        // SAFETY: the walk hands on an occupied slot of one of this table's
-        // levels, which `&mut self` borrows alone. The tombstone below keeps
-        // the entry from being read again.
-        let removed = unsafe { entry.read() };
-        // SAFETY: `control` is that level's control bytes, which the table
-        // owns and may write, and `slot` indexes them. The sentinel's are
-        // never handed on: they match no fingerprint.
-        unsafe { control.cast_mut().add(slot).write(control::CTRL_TOMBSTONE) };
-        // SAFETY: `control` is the control bytes of one of this table's
-        // levels, which its counters precede, and `&mut self` borrows them
-        // alone.
-        unsafe { (*level_counters(control.cast_mut())).remove_one() };
-        debug_assert!(
-            self.levels
-                .iter()
-                .all(|level| level.tombstones() <= level.capacity),
-            "a level counts more tombstones than it has slots"
-        );
-        self.scheduler.note_removal();
-        if self.maintenance_is_due() {
-            self.maintain_after_deletes();
-        }
-        Some((removed.key, removed.value))
+        self.take_as(key, hash, |key, value| (key, value))
+    }
+
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn take_value<Q>(&mut self, key: &Q, hash: u64) -> Option<V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.take_as(key, hash, |_, value| value)
     }
 
     #[inline]
@@ -3008,6 +2974,93 @@ where
     fn stale_membership(&self) -> usize {
         self.scheduler
             .removed(membership::refresh_deletes(self.max_insertions))
+    }
+
+    /// [`map::TableBackend::take`] with the removed pair handed through
+    /// `project`. Both ways off the common path leave before anything is
+    /// written and end in one call that returns the answer itself, so the
+    /// removal keeps nothing across it.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn take_as<Q, R>(&mut self, key: &Q, hash: u64, project: impl Fn(K, V) -> R) -> Option<R>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let prepared = PreparedElasticRoute::new(hash);
+        let filter = self.route_filter(prepared);
+        if !filter.maybe_present {
+            // A removal mostly names a key the table holds.
+            unlikely_path();
+            return None;
+        }
+        let key_fingerprint = control::control_fingerprint_low(hash);
+        let walked = self.walk_schedule(
+            key,
+            prepared,
+            key_fingerprint,
+            filter,
+            |_, slot, entry, control| (slot, entry, control),
+        );
+        let (slot, entry, control) = match walked {
+            ScheduleSearch::Hit(hit) if !self.scheduler.next_removal_is_due() => hit,
+            ScheduleSearch::Absent => return None,
+            ScheduleSearch::Hit(_) | ScheduleSearch::Unresolved => {
+                return self.take_off_schedule(key, hash, key_fingerprint, project);
+            }
+        };
+        self.scheduler.note_removal();
+        // SAFETY: the walk hands on an occupied slot of one of this table's
+        // levels, which `&mut self` borrows alone. The tombstone below keeps
+        // the entry from being read again.
+        let removed = unsafe { entry.read() };
+        // SAFETY: `control` is that level's control bytes, which the table
+        // owns and may write, and `slot` indexes them. The sentinel's are
+        // never handed on: they match no fingerprint.
+        unsafe { control.cast_mut().add(slot).write(control::CTRL_TOMBSTONE) };
+        // SAFETY: `control` is the control bytes of one of this table's
+        // levels, which its counters precede, and `&mut self` borrows them
+        // alone.
+        unsafe { (*level_counters(control.cast_mut())).remove_one() };
+        debug_assert!(
+            self.levels
+                .iter()
+                .all(|level| level.tombstones() <= level.capacity),
+            "a level counts more tombstones than it has slots"
+        );
+        Some(project(removed.key, removed.value))
+    }
+
+    /// [`Self::take_as`] by location: for a key the walk left unresolved,
+    /// and for the removal that makes delete maintenance due, which walks
+    /// to its key again.
+    #[cold]
+    #[inline(never)]
+    fn take_off_schedule<Q, R>(
+        &mut self,
+        key: &Q,
+        hash: u64,
+        key_fingerprint: u8,
+        project: impl Fn(K, V) -> R,
+    ) -> Option<R>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let prepared = PreparedElasticRoute::new(hash);
+        let location = if self.walk_ends_unresolved() {
+            let filter = self.route_filter(prepared);
+            self.find_unresolved(key, prepared, key_fingerprint, filter, |level, slot, _| {
+                (level, slot)
+            })?
+        } else {
+            self.find_by_exact_schedule(
+                key,
+                prepared,
+                |_| key_fingerprint,
+                |level, slot, _| (level, slot),
+            )?
+        };
+        let (key, value) = map::TableBackend::remove(self, location);
+        Some(project(key, value))
     }
 
     /// Same-size cleanup when a level passed its tombstone threshold;

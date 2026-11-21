@@ -152,6 +152,20 @@ pub trait TableBackend<K, V>: Sized {
         Some(self.remove(loc))
     }
 
+    /// [`Self::take`] for a caller that wants the value alone. A backend
+    /// whose removal can end in a call overrides it to return the value
+    /// from that call, which keeps the call in tail position.
+    // Forced inline: the default must cost a caller nothing over
+    // projecting the value itself.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn take_value<Q>(&mut self, key: &Q, hash: u64) -> Option<V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.take(key, hash).map(|(_, value)| value)
+    }
+
     /// Mark `loc` (valid per [`Location`](TableBackend::Location)) as a tombstone
     /// without updating counters — draining iterators use it after moving the
     /// value out to avoid a double drop.
@@ -665,16 +679,15 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.remove_entry_in_place(key).map(|(_, v)| v)
+        let hash = self.table.hash(key);
+        self.table.take_value(key, hash)
     }
 
-    // Goes through `remove_entry_by_call`, so the two removals share one
-    // body out of line.
     fn remove_by_call<Q>(&mut self, key: &Q) -> Option<V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.remove_entry_by_call(key).map(|(_, v)| v)
+        self.remove_in_place(key)
     }
 
     /// Removes `key`, returning the stored `(key, value)` pair.
