@@ -3947,6 +3947,39 @@ fn rebuild_leaves_a_group_run_that_stopped_being_whole_as_it_is() {
     assert!(table.probe_schedule.addresses(&table.levels));
 }
 
+#[test]
+fn clone_has_group_runs_only_where_its_source_has_one_whole() {
+    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            1 << 8,
+            ReserveFraction::DEFAULT,
+            IdentityBuildHasher,
+            Global,
+        )
+        .unwrap();
+    let fitted = table.probe_schedule.whole_groups().1;
+    assert_ne!(fitted, 0);
+    table.schedule_levels_through(schedule::GROUPED_LEVELS - 2);
+    table.extend_probe_schedule(40);
+    // A source short of a grouped level gives its copy no group's run, and
+    // the copy takes them when its own rebuild brings that level in.
+    let mut copy = table.clone_table();
+    assert_eq!(copy.probe_schedule.whole_groups().0, 0);
+    assert_eq!(copy.probe_schedule.group_appends(), 0);
+    assert!(copy.probe_schedule.addresses(&copy.levels));
+    copy.schedule_levels_through(copy.levels.len() - 1);
+    assert_eq!(copy.probe_schedule.whole_groups().0, fitted);
+    assert_ne!(copy.probe_schedule.group_appends(), 0);
+    assert!(copy.probe_schedule.addresses(&copy.levels));
+    // A source with whole groups gives its copy the same ones.
+    table.schedule_levels_through(table.levels.len() - 1);
+    assert_eq!(table.probe_schedule.whole_groups().0, fitted);
+    let copy = table.clone_table();
+    assert_eq!(copy.probe_schedule.whole_groups().0, fitted);
+    assert_ne!(copy.probe_schedule.group_appends(), 0);
+    assert!(copy.probe_schedule.addresses(&copy.levels));
+}
+
 /// Model check of the walk starts: under every summary value, the routes
 /// between a walk's start and its sentinel that the summary leaves open are
 /// the pushed routes it leaves open, in the same order. The walk skips the

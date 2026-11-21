@@ -963,12 +963,11 @@ impl ProbeSchedule {
     /// Its groups have runs where a group's run of `self` is whole.
     pub(super) fn clone_onto<T: WalkedEntry>(&self, levels: &[Level<T>]) -> Self {
         let mut copy = ProbeScheduleRoom::for_levels(levels.len()).schedule(levels);
-        // A whole group's run means every grouped level is pushed.
-        copy.rewind(if self.book.whole_groups == 0 {
-            0
-        } else {
-            GROUPED_LEVELS
-        });
+        // A whole group's run means every grouped level is pushed. Without
+        // one the copy stays as it was made, with no group's run.
+        if self.book.whole_groups != 0 {
+            copy.rewind(GROUPED_LEVELS);
+        }
         for route in self.routes() {
             let (level, logical_probe_index) = route.coordinates();
             copy.push(levels, level as usize, logical_probe_index);
@@ -1039,7 +1038,8 @@ impl ProbeSchedule {
 
     /// Drops the pushed routes ahead of pushing those of the first `after`
     /// levels, every one of them and in the order a schedule of those
-    /// levels takes them.
+    /// levels takes them. Only whether every grouped level is among them is
+    /// read, so [`GROUPED_LEVELS`] stands for any count from there up.
     ///
     /// A group's run is whole only since a call that named every grouped
     /// level, and it holds no route of another level. So where one is whole
