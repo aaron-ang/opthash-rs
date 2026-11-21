@@ -326,10 +326,13 @@ pub(crate) fn drop_values<T, R: ArenaSlots<T>>(regions: &mut [R]) {
 
 /// One slot's `(key, value)` pair. Co-located so `read`/`drop_in_place`
 /// touches both in one shot.
+// The value leads, so a borrow of it is the entry's own address and a
+// lookup that returns an entry returns the value with it.
 #[derive(Clone)]
+#[repr(C)]
 pub(crate) struct SlotEntry<K, V> {
-    pub(crate) key: K,
     pub(crate) value: V,
+    pub(crate) key: K,
 }
 
 /// Per-region view of a map's arena. Descriptors borrow into the arena

@@ -1103,7 +1103,7 @@ where
             let prev_ctrl = unsafe { level.control_at(slot_idx) };
             // SAFETY: as above; `key_fingerprint` is an occupied control byte.
             unsafe {
-                level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+                level.write_with_control(slot_idx, SlotEntry { value, key }, key_fingerprint);
             }
             level.len += 1;
             if prev_ctrl == CTRL_TOMBSTONE {
