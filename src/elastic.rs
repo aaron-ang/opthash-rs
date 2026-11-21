@@ -2279,7 +2279,7 @@ where
     }
 
     /// Places a key whose active batch target has no slot: another target,
-    /// then a same-size rebuild, then exceptional placement. Kept out of line
+    /// then [`Self::place_after_recovery`]. Kept out of line
     /// so the common path inlines as a single target attempt.
     #[cold]
     #[inline(never)]
@@ -2300,9 +2300,28 @@ where
             self.epoch.note_placement_recovery();
             return self.place_exceptional_entry(key, value, prepared, key_fingerprint);
         }
+        self.place_after_recovery(key, value, prepared, key_fingerprint)
+    }
+
+    /// Places a key no target has a slot for: a same-size rebuild, which
+    /// moves the entries, then every target again, then exceptional
+    /// placement. Out of line, so the failure that another target absorbs
+    /// carries none of it.
+    #[cold]
+    #[inline(never)]
+    fn place_after_recovery(
+        &mut self,
+        key: K,
+        value: V,
+        prepared: PreparedElasticRoute,
+        key_fingerprint: u8,
+    ) -> (usize, usize) {
         self.resize_with_transition(self.total_slots, EpochTransition::PlacementRecovery);
         let target = self.scheduler.target(self.live());
-        if let Some(placement) = self.choose_slot_for_new_key(prepared.probe, target) {
+        let placement = self
+            .choose_slot_for_new_key(prepared.probe, target)
+            .or_else(|| self.choose_slot_on_other_targets(prepared.probe, target));
+        if let Some(placement) = placement {
             self.place_new_entry(key, value, prepared, key_fingerprint, placement)
         } else {
             self.place_exceptional_entry(key, value, prepared, key_fingerprint)

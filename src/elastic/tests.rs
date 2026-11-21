@@ -4838,3 +4838,103 @@ fn rebuild_places_a_key_its_target_fails_on_another_target() {
         assert_eq!(TableBackend::find_value(&table, &key, 0), Some(&key));
     }
 }
+
+/// A key hashed by `hash` alone, so keys of one hash share every probe.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct SharedProbeKey {
+    hash: u64,
+    id: u64,
+}
+
+impl Hash for SharedProbeKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+#[test]
+fn a_recovery_rebuild_tries_every_target_before_placing_off_the_probes() {
+    const SHARED: u64 = 0x9e37_79b9_7f4a_7c15;
+    // Keys of their own probes: enough to hold slots the shared probes
+    // reach, few enough that the shared keys run out of slots before the
+    // table's budget. The asserts on the rebuilt copy below hold the count
+    // to that.
+    const SPREAD: u64 = 44;
+    let spread_hash = |id: u64| {
+        let mut hash = id.wrapping_add(SHARED);
+        hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        hash ^ (hash >> 31)
+    };
+    let shared = |id: u64| SharedProbeKey { hash: SHARED, id };
+    let mut map: ElasticHashMap<SharedProbeKey, u64, IdentityBuildHasher> =
+        ElasticHashMap::with_capacity_and_hasher(256, IdentityBuildHasher);
+    let slots = map.table().total_slots;
+    // A rebuild moves the keys of their own probes.
+    for id in 0..SPREAD {
+        map.insert(
+            SharedProbeKey {
+                hash: spread_hash(id),
+                id,
+            },
+            id,
+        );
+    }
+    // Keys of the shared hash, until no target has a slot for the next.
+    let prepared = PreparedElasticRoute::new(SHARED);
+    let no_slot = |table: &ElasticTable<SharedProbeKey, u64, IdentityBuildHasher>| {
+        let target = table.scheduler.target_at(table.live());
+        table
+            .choose_slot_for_new_key(prepared.probe, target)
+            .is_none()
+            && table
+                .choose_slot_on_other_targets(prepared.probe, target)
+                .is_none()
+    };
+    let mut next = SPREAD;
+    while !no_slot(map.table()) {
+        map.insert(shared(next), next);
+        next += 1;
+    }
+    assert!(map.len() < map.capacity());
+    assert_eq!(map.table().probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
+
+    // What the rebuild leaves the next key: no slot on the active target,
+    // one on another.
+    let mut rebuilt = map.clone();
+    let table = rebuilt.table_mut();
+    table.resize_with_transition(table.total_slots, EpochTransition::PlacementRecovery);
+    let target = table.scheduler.target(table.live());
+    assert!(
+        table
+            .choose_slot_for_new_key(prepared.probe, target)
+            .is_none()
+    );
+    assert!(
+        table
+            .choose_slot_on_other_targets(prepared.probe, target)
+            .is_some()
+    );
+
+    let before = map.epoch();
+    assert_eq!(map.insert(shared(next), next), None);
+    let after = map.epoch();
+    assert_eq!(after.placement_recoveries, before.placement_recoveries + 1);
+    assert_eq!(after.transition, EpochTransition::PlacementRecovery);
+    assert_eq!(map.table().total_slots, slots);
+    assert_eq!(
+        map.table().probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG,
+        0,
+        "the key was placed off its probes with a slot left on them"
+    );
+    for id in SPREAD..=next {
+        assert_eq!(map.get(&shared(id)), Some(&id));
+    }
+    for id in 0..SPREAD {
+        let key = SharedProbeKey {
+            hash: spread_hash(id),
+            id,
+        };
+        assert_eq!(map.get(&key), Some(&id));
+    }
+}
