@@ -4721,3 +4721,93 @@ fn lookup_off_the_schedule_returns_a_value_aligned_past_its_key() {
     assert!(align_of::<u64>() > align_of::<u8>());
     assert_lookup_off_the_schedule_returns_the_stored_value(0..200_u8, u8::MAX, u64::from);
 }
+
+/// Where the placement walk puts a new key with `probe`: the first free
+/// slot of the batch's insertion case, then of every other target's in
+/// order, each level searched probe by probe whatever its fill.
+fn walked_placement(
+    table: &ElasticTable<u64, u64, FixedHashBuilder>,
+    probe: PreparedElasticProbe,
+) -> Option<(usize, usize)> {
+    let search = |level: usize, budget: u64| {
+        // SAFETY: the level is the table's, which reduces by shift.
+        unsafe { table.first_shifted_vacancy(probe, level, &table.levels[level], budget) }
+    };
+    let target = table.scheduler.target_at(table.live());
+    let pairs = table.levels.len().saturating_sub(1);
+    let others = core::iter::once(BatchTarget::Bootstrap)
+        .chain((0..pairs).map(BatchTarget::LevelPair))
+        .filter(|&candidate| candidate != target);
+    core::iter::once(target)
+        .chain(others)
+        .find_map(|candidate| table.choose_slot_with(candidate, search))
+        .map(|placement| (placement.level, placement.slot))
+}
+
+/// Removes a key and inserts it again, over and over, in a table at
+/// `live` keys, and checks each insert against [`walked_placement`].
+/// Returns the inserts that found the gate's plan gone for a full level and
+/// those that settled.
+fn assert_churn_places_where_the_walk_does(live: u64, pairs: u64) -> (u64, u64) {
+    let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(896);
+    assert_eq!(map.table().max_insertions, 896);
+    assert_ne!(map.table().levels[0].index_shift(), GENERAL_REDUCTION);
+    for key in 0..live {
+        map.insert(key, key);
+    }
+    let (mut full, mut settled, mut rebuilt) = (0, 0, 0);
+    let mut draw = 1_u64;
+    for _ in 0..pairs {
+        draw = draw
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let key = (draw >> 33) % live;
+        assert_eq!(map.remove(&key), Some(key));
+        let table = map.table();
+        let hash = table.hash_builder.hash_one(key);
+        let probe = PreparedElasticRoute::new(hash).probe;
+        for (level, region) in table.levels.iter().enumerate() {
+            for budget in [1, 7, u64::MAX] {
+                let budget = budget.min(LEVEL_PROBE_LIMIT[level]);
+                assert_eq!(
+                    table.first_vacancy(probe, level, budget),
+                    // SAFETY: the level is the table's, which reduces by shift.
+                    unsafe { table.first_shifted_vacancy(probe, level, region, budget) }
+                );
+            }
+        }
+        let case = table.settled_case(table.scheduler.target_at(table.live()));
+        if case.is_some_and(|(case, ..)| table.live_in(case.region) == case.region.capacity) {
+            assert_eq!(table.settled_plan(), None);
+            full += 1;
+        }
+        let expected = walked_placement(table, probe);
+        let generation = table.epoch.snapshot(table.live()).generation;
+        settled += u64::from(table.settled_slot(probe).is_some());
+        assert_eq!(map.insert(key, key), None);
+        let table = map.table();
+        if table.epoch.snapshot(table.live()).generation == generation {
+            assert_eq!(table.find(&key, hash), expected);
+        } else {
+            rebuilt += 1;
+        }
+        assert_eq!(map.get(&key), Some(&key));
+    }
+    assert!(rebuilt * 100 < pairs);
+    (full, settled)
+}
+
+#[test]
+fn churn_at_the_insertion_limit_places_where_the_walk_does() {
+    let pairs = if cfg!(miri) { 400 } else { 8_000 };
+    let (full, settled) = assert_churn_places_where_the_walk_does(896, pairs);
+    assert_ne!(full, 0);
+    assert_ne!(settled, 0);
+}
+
+#[test]
+fn churn_below_the_insertion_limit_places_where_the_walk_does() {
+    let pairs = if cfg!(miri) { 400 } else { 8_000 };
+    let (_, settled) = assert_churn_places_where_the_walk_does(600, pairs);
+    assert!(settled * 10 > pairs * 9);
+}

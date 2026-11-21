@@ -1921,27 +1921,32 @@ where
 
     /// The plan the settled gate opens on, when the cached batch covers the
     /// live count, that count is below the settled limit, and the paper's
-    /// insertion case for the batch has a scheduled probe to search.
+    /// insertion case for the batch has a scheduled probe to search in a
+    /// level with a free slot.
     ///
     /// The case and its budget follow the fill of the batch's levels, which
     /// a settled insert raises in one of the plan's levels. The plan ends
     /// where that fill changes either: where the level a budgeted case
     /// searches comes down to half its reserve or to a free fraction with
-    /// another budget, or where the level it falls back to comes down to a
-    /// quarter free. Counting every insert against both levels ends it no
-    /// later.
+    /// another budget, where the level it falls back to comes down to a
+    /// quarter free, or where the level another case searches is full.
+    /// Counting every insert against both levels ends it no later.
     fn settled_plan(&self) -> Option<SettledPlan> {
         let end = self
             .scheduler
             .reopened_end(self.placed, self.stale_membership())?;
         let target = self.scheduler.cached_target();
         let (case, budget, fallback) = self.settled_case(target)?;
+        let region = case.region;
+        let free = region.capacity - self.live_in(region);
+        // A settled search of a full level spends its budget for nothing.
+        if free == 0 {
+            return None;
+        }
         let holds_for = match target {
             // The level a case searches without a bound stays the case's
             // while the other level of its pair keeps its fill.
             BatchTarget::LevelPair(current) if case.level == current => {
-                let region = case.region;
-                let free = region.capacity - self.live_in(region);
                 // Not low, so above half the reserve.
                 let until_low = free - region.half_reserve;
                 if case.fallback.is_none() {
@@ -1954,7 +1959,8 @@ where
                     ))
                 }
             }
-            _ => u32::MAX,
+            // Until the level is full.
+            _ => free,
         };
         let holds_for = if fallback.is_some() {
             let next = &self.levels[case.level + 1];
@@ -3263,6 +3269,11 @@ where
         budget: u64,
     ) -> Option<(usize, u64)> {
         let region = self.levels.get(level)?;
+        // A full level has no probe to find free, and under churn at the
+        // insertion limit the active pair's levels stay full.
+        if region.free_slots(self.live_in(region)) == 0 {
+            return None;
+        }
         if region.index_shift() == GENERAL_REDUCTION {
             return self.first_vacancy_general(probe, level, budget);
         }
