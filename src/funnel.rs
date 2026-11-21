@@ -2344,6 +2344,12 @@ where
         lane.as_ptr().addr() - self.storage.ctrl_ptr().addr()
     }
 
+    /// The slot of a vacancy of this table's head walk.
+    #[inline]
+    fn slot_of_vacancy(&self, vacancy: &HeadVacancy<SlotEntry<K, V>>) -> usize {
+        vacancy.lane.addr() - self.storage.ctrl_ptr().addr()
+    }
+
     /// The lookup behind a passed gate. Only the ordered walk, which decides
     /// what the first-match scan cannot, is a call.
     ///
@@ -2866,11 +2872,16 @@ where
     /// Stores an absent key at `vacancy` in a table with tombstones, records
     /// it in the filter and counts it, with the tombstone it may take.
     ///
+    /// Forced inline: with two callers LLVM outlines it, and the call costs
+    /// more than the counting it holds.
+    ///
     /// # Safety
     ///
     /// `vacancy` must be from [`Self::first_free_in_head`] with no write to
     /// the table since, and `membership` from [`Self::membership_slot`] for
     /// the key.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     unsafe fn place_among_tombstones(
         &mut self,
         key: K,
@@ -2903,38 +2914,6 @@ where
         // the delete countdown early at worst.
         debug_assert_eq!(self.head_left, 0);
         self.entries_base += 1;
-    }
-
-    /// Entry-side lookup, which keeps the exact walk's vacancy for the insert
-    /// that may follow. `Err(None)` means the
-    /// filter rejected the key before any walk; `Err(Some(_))` maps the exact
-    /// walk's miss, which is never `Hit`, through `on_miss`.
-    #[inline]
-    fn locate<Q, R>(
-        &self,
-        key: &Q,
-        key_hash: u64,
-        on_miss: impl FnOnce(SearchResult) -> R,
-    ) -> Result<usize, Option<R>>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        // Issue the filter load, then prepare the probe while it is in flight. A
-        // key the filter never recorded was never inserted, so neither the walk
-        // nor the exceptional full scan can find it.
-        let gate = self.membership_gate(key_hash);
-        let probe = self.prf.prepare(key_hash);
-        if !gate.passes() {
-            return Err(None);
-        }
-        let key_fingerprint = probe.fingerprint();
-        match self.search_exact_prepared(key, probe, key_fingerprint) {
-            SearchResult::Hit(slot) => Ok(slot),
-            miss if self.exceptional_placement => self
-                .find_by_full_scan(key, key_fingerprint)
-                .ok_or_else(|| Some(on_miss(miss))),
-            miss => Err(Some(on_miss(miss))),
-        }
     }
 
     #[allow(clippy::inline_always)]
@@ -3110,11 +3089,59 @@ where
     /// only, which lands on the same slot the exact search would report.
     #[cfg(test)]
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> usize {
-        let vacant = FunnelVacant {
-            hash: key_hash,
-            exact: FunnelVacant::UNSEARCHED,
+        self.prepare_vacant_insert();
+        let vacancy = self.search_vacancy(self.prf.prepare(key_hash));
+        let membership = self.membership_slot(key_hash);
+        self.place_absent_after_search(key, value, key_hash, membership, vacancy)
+    }
+
+    /// [`map::TableBackend::insert_for_vacant`] by the placement walk, after
+    /// the growth or cleanup the table is due, or at the vacancy the exact
+    /// walk kept. Apart from its caller, whose own placement then keeps
+    /// nothing across a call.
+    #[inline(never)]
+    fn insert_for_vacant_by_walk(&mut self, key: K, value: V, hash: u64, exact: usize) -> usize {
+        let vacancy = if self.prepare_vacant_insert() || exact == FunnelVacant::UNSEARCHED {
+            // Growth invalidates any recorded slot or exhaustion; an unsearched
+            // token never had one.
+            let probe = self.prf.prepare(hash);
+            self.search_vacancy(probe)
+        } else if exact == FunnelVacant::EXHAUSTED {
+            // Both exhaustion reasons take the same recovery path.
+            None
+        } else {
+            Some(self.vacancy_at(exact))
         };
-        map::TableBackend::insert_for_vacant(self, key, value, vacant)
+        // Filter geometry may have changed during growth too.
+        let membership = self.membership_slot(hash);
+        self.place_absent_after_search(key, value, hash, membership, vacancy)
+    }
+
+    /// [`map::TableBackend::find_for_entry`] by the exact walk, which
+    /// settles the keys the first-match scan cannot and keeps the walk's
+    /// vacancy for the insert that may follow.
+    #[cold]
+    #[inline(never)]
+    fn find_for_entry_by_walk<Q>(&self, key: &Q, hash: u64) -> Result<usize, FunnelVacant>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let probe = self.prf.prepare(hash);
+        let key_fingerprint = probe.fingerprint();
+        let miss = match self.search_exact_prepared(key, probe, key_fingerprint) {
+            SearchResult::Hit(slot) => return Ok(slot),
+            miss => miss,
+        };
+        if self.exceptional_placement
+            && let Some(slot) = self.find_by_full_scan(key, key_fingerprint)
+        {
+            return Ok(slot);
+        }
+        let exact = match miss {
+            SearchResult::Vacant(slot) => slot,
+            _ => FunnelVacant::EXHAUSTED,
+        };
+        Err(FunnelVacant { hash, exact })
     }
 
     fn resize_with_transition(&mut self, slots: usize, transition: EpochTransition) {
@@ -3360,38 +3387,60 @@ where
         self.find_entry_ref(key, hash)
     }
 
+    // The lookup's gate and first-match scan settle a present key and
+    // nearly every absent one, which then stays unsearched: its insert
+    // finds the vacancy. Only a key they leave open takes the exact walk.
     #[inline]
     fn find_for_entry<Q>(&self, key: &Q, hash: u64) -> Result<usize, FunnelVacant>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let found = self.locate(key, hash, |miss| match miss {
-            SearchResult::Vacant(slot) => slot,
-            _ => FunnelVacant::EXHAUSTED,
-        });
-        let exact = match found {
-            Ok(slot) => return Ok(slot),
-            Err(exact) => exact.unwrap_or(FunnelVacant::UNSEARCHED),
-        };
-        Err(FunnelVacant { hash, exact })
+        let gate = self.membership_gate(hash);
+        if gate.passes() {
+            let probe = self.prf.prepare(hash);
+            match self.first_match(key, probe, gate.wide_levels()) {
+                Ok(found) => return Ok(self.slot_of(found.lane)),
+                Err(last) if self.unmatched_is_absent(last) => {}
+                Err(_) => return self.find_for_entry_by_walk(key, hash),
+            }
+        }
+        Err(FunnelVacant {
+            hash,
+            exact: FunnelVacant::UNSEARCHED,
+        })
     }
 
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, vacant: FunnelVacant) -> usize {
-        let vacancy = if self.prepare_vacant_insert() || vacant.exact == FunnelVacant::UNSEARCHED {
-            // Growth invalidates any recorded slot or exhaustion; an unsearched
-            // token never had one.
+        if vacant.exact == FunnelVacant::UNSEARCHED {
+            // An unsearched key goes where the insert puts an absent one:
+            // the first free lane of the head walk, which is the placement
+            // walk's slot, where the table's counts allow it.
             let probe = self.prf.prepare(vacant.hash);
-            self.search_vacancy(probe)
-        } else if vacant.exact == FunnelVacant::EXHAUSTED {
-            // Both exhaustion reasons take the same recovery path.
-            None
-        } else {
-            Some(self.vacancy_at(vacant.exact))
-        };
-        // Filter geometry may have changed during growth too.
-        let membership = self.membership_slot(vacant.hash);
-        self.place_absent_after_search(key, value, vacant.hash, membership, vacancy)
+            let membership = self.membership_slot(vacant.hash);
+            if let Some(vacancy) = self.head_vacancy(probe) {
+                let slot = self.slot_of_vacancy(&vacancy);
+                // SAFETY: a vacancy exists only in a table with slots, so
+                // its filter has words and `membership.index` is below
+                // their count. Unit and vacancy are read here, with no
+                // write between.
+                unsafe {
+                    let unit = *self.membership_ptr().add(membership.index);
+                    self.place_in_head(key, value, membership, unit, probe, &vacancy);
+                }
+                return slot;
+            }
+            if self.places_among_tombstones()
+                && let Some(vacancy) = self.first_free_in_head(probe)
+            {
+                let slot = self.slot_of_vacancy(&vacancy);
+                // SAFETY: the vacancy was read just above, with no write
+                // since, and the slot is this key's.
+                unsafe { self.place_among_tombstones(key, value, membership, probe, &vacancy) };
+                return slot;
+            }
+        }
+        self.insert_for_vacant_by_walk(key, value, vacant.hash, vacant.exact)
     }
 
     // Forced inline with the shell's insert: the common insert then runs in

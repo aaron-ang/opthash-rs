@@ -136,8 +136,11 @@ fn entry_search_checks_exceptional_hits_before_reusing_vacancy() {
     assert_eq!(table.find_location(&key, key), Some(slot));
 }
 
+/// A key the filter rejects reaches its vacant entry unsearched, and the
+/// entry's insert then places it through the head walk: no comparison and
+/// no general placement walk.
 #[test]
-fn vacant_entry_filter_rejection_still_searches_for_placement() {
+fn vacant_entry_filter_rejection_places_through_the_head_walk() {
     let comparisons = Arc::new(AtomicUsize::new(0));
     let key = CountingKey {
         id: 1,
@@ -145,9 +148,11 @@ fn vacant_entry_filter_rejection_still_searches_for_placement() {
     };
     let mut map = FunnelHashMap::with_capacity_and_hasher(64, test_support::fixed_hasher());
     VACANCY_WALKS.with(|walks| walks.set(0));
+    let open = map.table().head_left;
     assert_eq!(*map.entry(key.clone()).or_insert(10), 10);
     assert_eq!(comparisons.load(Ordering::Relaxed), 0);
-    assert_eq!(VACANCY_WALKS.with(Cell::get), 1);
+    assert_eq!(VACANCY_WALKS.with(Cell::get), 0);
+    assert_eq!(map.table().head_left, open - 1);
     assert_eq!(map.get(&key), Some(&10));
 }
 
@@ -713,6 +718,90 @@ fn insert_among_tombstones_cleans_up_and_grows_like_the_placement_walk() {
     assert_ne!(limit_with_tombstones, 0);
 }
 
+/// An insert through a vacant entry lands where the placement walk lands
+/// and leaves the same controls, filter and counts, in a table without
+/// tombstones and in one with them, sized for its keys or grown from empty,
+/// and the entry search then finds the key where the lookup does. Among
+/// tombstones a shape with a head places some keys without the walk.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn vacant_entry_insert_places_like_the_placement_walk() {
+    use crate::map::TableBackend;
+
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    type Table = FunnelTable<u64, u64, IdentityBuildHasher>;
+
+    fn enter(table: &mut Table, key: u64, value: u64) -> usize {
+        let vacant = table.find_for_entry(&key, key).err().unwrap();
+        table.insert_for_vacant(key, value, vacant)
+    }
+    fn counts(table: &Table) -> [usize; 4] {
+        [
+            table.entries(),
+            table.tombstones(),
+            table.stale_membership(),
+            table.head_left,
+        ]
+    }
+
+    let (wide, wide_shape) = smallest_wide_shape();
+    for (n, d) in [
+        (0, 3),
+        (344, 4),
+        (4096, 3),
+        (1 << 14, 3),
+        (wide_shape.n, wide),
+    ] {
+        let mut entered = raw_table(n, d);
+        let mut walked = raw_table(n, d);
+        let budget = match entered.shape.max_insertions {
+            0 => 3_000,
+            sized => sized as u64,
+        };
+        for index in 0..budget {
+            let key = index.wrapping_mul(SPREAD);
+            let slot = enter(&mut entered, key, index);
+            assert_eq!(
+                slot,
+                walked.insert_for_vacant_entry(key, index, key),
+                "n {n} d {d} index {index}"
+            );
+            assert_eq!(entered.find_for_entry(&key, key).ok(), Some(slot));
+        }
+        assert_eq!(counts(&entered), counts(&walked), "n {n} d {d}");
+        for index in (0..budget).step_by(4) {
+            let key = index.wrapping_mul(SPREAD);
+            for table in [&mut entered, &mut walked] {
+                let slot = table.find_location(&key, key).unwrap();
+                TableBackend::remove(table, slot);
+            }
+        }
+        // Removed keys, which the filter still records, and new ones in turn.
+        let mut without_walk = 0;
+        for (turn, index) in (0..budget).step_by(4).enumerate() {
+            let index = if turn % 2 == 0 { index } else { budget + index };
+            let key = index.wrapping_mul(SPREAD);
+            VACANCY_WALKS.with(|walks| walks.set(0));
+            let slot = enter(&mut entered, key, index);
+            without_walk += usize::from(VACANCY_WALKS.with(Cell::get) == 0);
+            assert_eq!(
+                slot,
+                walked.insert_for_vacant_entry(key, index, key),
+                "n {n} d {d} index {index}"
+            );
+            assert_eq!(entered.find_for_entry(&key, key).ok(), Some(slot));
+            assert_eq!(counts(&entered), counts(&walked), "n {n} d {d}");
+            assert_eq!(
+                entered.epoch_snapshot(),
+                walked.epoch_snapshot(),
+                "n {n} d {d}"
+            );
+        }
+        assert!(without_walk != 0 || entered.head_lanes == 0, "n {n} d {d}");
+        assert_eq!(controls_and_filter(&entered), controls_and_filter(&walked));
+    }
+}
+
 /// A key placed outside its funnel records the level it landed in, not the
 /// overflow bit, so only the table's flag sends its lookup past the buckets
 /// its probe selects.
@@ -752,6 +841,13 @@ fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
         assert_eq!(
             map::TableBackend::find_entry(&table, &key, key).map(|entry| entry.value),
             Some(index),
+            "index {index}"
+        );
+        let slot = table.find_location(&key, key);
+        assert!(slot.is_some(), "index {index}");
+        assert_eq!(
+            map::TableBackend::find_for_entry(&table, &key, key).ok(),
+            slot,
             "index {index}"
         );
     }
@@ -1183,6 +1279,35 @@ fn operation_streams_agree_with_a_model_map_under_colliding_hashes() {
     }
 }
 
+/// With a key outside its funnel, the entry search and the insert still
+/// find every key of `model` where the lookup does, and a vacant entry
+/// stores `absent`.
+fn enter_with_a_key_outside_its_funnel(
+    table: &mut DifferentialTable,
+    model: &mut alloc::collections::BTreeMap<HashedKey, u64>,
+    absent: HashedKey,
+) {
+    use crate::map::TableBackend;
+
+    assert!(table.exceptional_placement);
+    for (key, value) in model.iter_mut() {
+        let slot = table.find(key, key.hash);
+        assert!(slot.is_some(), "{key:?}");
+        assert_eq!(table.find_for_entry(key, key.hash).ok(), slot, "{key:?}");
+        assert_eq!(
+            table.insert(*key, *value + 1, key.hash),
+            Some(*value),
+            "{key:?}"
+        );
+        *value += 1;
+        assert_eq!(table.find(key, key.hash), slot, "{key:?}");
+    }
+    let vacant = table.find_for_entry(&absent, absent.hash).err().unwrap();
+    let slot = table.insert_for_vacant(absent, absent.id, vacant);
+    assert_eq!(table.find(&absent, absent.hash), Some(slot));
+    model.insert(absent, absent.id);
+}
+
 /// The smallest shapes on both sides of the group width, from a table without
 /// storage through a spent budget, tombstones, a growth, a clear and a
 /// reseeding rebuild, with a clone checked at each stage. Miri runs the wide
@@ -1277,6 +1402,13 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
             assert!(model.len() <= table.shape.max_insertions, "d {d}");
         }
         assert!(table.exceptional_placement, "d {d}");
+        check(&table, &model);
+
+        let absent = HashedKey {
+            id,
+            hash: 0x9E37_79B9_7F4A_7C15,
+        };
+        enter_with_a_key_outside_its_funnel(&mut table, &mut model, absent);
         check(&table, &model);
     }
 }
