@@ -292,16 +292,17 @@ const fn settled_summary_bit(settled: u32) -> SummaryBin {
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct LevelCounters {
-    len: LiveCount,
+    // Ahead of the live count: `LiveCount::entomb_one` moves both as one
+    // word where the two are stored in this order.
     tombstones: u32,
+    len: LiveCount,
 }
 
 impl LevelCounters {
     /// Counts one live entry turned into a tombstone.
     #[inline]
     fn remove_one(&mut self) {
-        self.len.remove_one();
-        self.tombstones += 1;
+        self.len.entomb_one(&mut self.tombstones);
     }
 }
 
