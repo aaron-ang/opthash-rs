@@ -59,17 +59,61 @@ impl OccupiedIndices {
                 return None;
             }
             self.current_group_slot = next_group;
-            // SAFETY: `next_group` is in bounds. A padded region keeps a full
-            // group readable past it, and its padding never reads occupied;
-            // otherwise `occupied_mask` reads at most the remaining controls.
-            self.current_mask = unsafe {
-                let ctrl = region.ctrl_ptr().add(next_group);
-                if D::PADDED_TAIL {
-                    simd::occupied_mask_group(ctrl)
-                } else {
-                    occupied_mask(ctrl, region.capacity() - next_group)
+            // SAFETY: `next_group` is in bounds.
+            self.current_mask = unsafe { group_mask(region, next_group) };
+        }
+    }
+
+    /// Folds the slots [`step`](Self::step) would yield from here on. `f`
+    /// gets the region back so it can remove the slot it is handed.
+    ///
+    /// Empty groups are skipped in a loop of their own, which keeps the
+    /// per-group work of a sparse region below that of repeated `step` calls.
+    #[inline]
+    pub(crate) fn fold<T, D: ArenaSlots<T> + ?Sized, B>(
+        self,
+        region: &mut D,
+        init: B,
+        mut f: impl FnMut(B, &mut D, usize) -> B,
+    ) -> B {
+        let capacity = region.capacity();
+        let mut group = self.current_group_slot;
+        let mut mask = self.current_mask;
+        let mut acc = init;
+        loop {
+            for bit in mask {
+                acc = f(acc, region, group + bit);
+            }
+            loop {
+                group = group.wrapping_add(GROUP_SIZE);
+                if group >= capacity {
+                    return acc;
                 }
-            };
+                // SAFETY: `group` is in bounds.
+                mask = unsafe { group_mask(region, group) };
+                if mask.0 != 0 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Occupied lanes of the group starting at slot `group`.
+///
+/// # Safety
+/// `group < region.capacity()`.
+#[inline]
+unsafe fn group_mask<T, D: ArenaSlots<T> + ?Sized>(region: &D, group: usize) -> BitMask {
+    // SAFETY: `group` is in bounds. A padded region keeps a full group
+    // readable past it, and its padding never reads occupied; otherwise
+    // `occupied_mask` reads at most the remaining controls.
+    unsafe {
+        let ctrl = region.ctrl_ptr().add(group);
+        if D::PADDED_TAIL {
+            simd::occupied_mask_group(ctrl)
+        } else {
+            occupied_mask(ctrl, region.capacity() - group)
         }
     }
 }
