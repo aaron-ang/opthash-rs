@@ -1257,8 +1257,8 @@ pub(crate) const fn elastic_level_budget_run(
     if log_ceiling as u64 * log_ceiling as u64 >= reserve_exponent as u64 {
         return u32::MAX;
     }
-    // The fewest free slots with this logarithm, which is at most the
-    // width of the counts.
+    // The fewest free slots with this logarithm. The logarithm is at most
+    // the width of the counts, so the shifts are in range.
     let fewest = ((level_slots as u64 + (1 << log_ceiling) - 1) >> log_ceiling) as u32;
     free_slots - fewest + 1
 }
