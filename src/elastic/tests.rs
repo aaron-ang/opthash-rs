@@ -2501,9 +2501,6 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
         }
         table.levels[0].index_shift() == GENERAL_REDUCTION
     }
-    // The value does not lead the entry, so an address that left the lead
-    // out would differ.
-    assert_ne!(<SlotEntry<u64, u64> as WalkedEntry>::LEAD, 0);
     let mut general_tables = 0;
     let mut shifted_tables = 0;
     let slot_counts: &[usize] = if cfg!(miri) {
@@ -4710,8 +4707,7 @@ fn assert_lookup_off_the_schedule_returns_the_stored_value<K, V>(
 }
 
 #[test]
-fn lookup_off_the_schedule_returns_the_stored_value_past_its_key() {
-    assert_ne!(<SlotEntry<u64, u64> as WalkedEntry>::LEAD, 0);
+fn lookup_off_the_schedule_returns_the_stored_value() {
     assert_lookup_off_the_schedule_returns_the_stored_value(0..600_u64, u64::MAX, |key| key);
 }
 

@@ -2413,7 +2413,7 @@ where
         unsafe {
             debug_assert_eq!(control, signed_control(control_bytes, slot));
             data.add(slot)
-                .write(MaybeUninit::new(SlotEntry { key, value }));
+                .write(MaybeUninit::new(SlotEntry { value, key }));
             control_bytes.add(slot).write(key_fingerprint);
             if !SETTLED {
                 self.uncounted

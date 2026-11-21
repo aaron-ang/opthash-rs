@@ -2000,7 +2000,7 @@ where
         unsafe {
             self.storage.write_with_control(
                 vacancy.slot,
-                SlotEntry { key, value },
+                SlotEntry { value, key },
                 key_fingerprint,
             );
         }
@@ -2109,7 +2109,7 @@ where
         // SAFETY: as above, and `key_fingerprint` is an occupied control.
         unsafe {
             self.storage
-                .write_with_control(slot, SlotEntry { key, value }, key_fingerprint);
+                .write_with_control(slot, SlotEntry { value, key }, key_fingerprint);
         }
         debug_assert_eq!(level_bit, self.level_bit(slot), "level bit of slot {slot}");
         self.record_membership(membership, level_bit);
