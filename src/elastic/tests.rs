@@ -4655,3 +4655,70 @@ fn draining_a_map_leaves_no_level_a_tombstone() {
     }
     assert!(map.is_empty());
 }
+
+/// Places `stray` off the schedule in a table of `keys` and looks every key
+/// up: each lookup returns the value where the table stores it, the stray
+/// key's through the lookup off the schedule.
+fn assert_lookup_off_the_schedule_returns_the_stored_value<K, V>(
+    keys: impl IntoIterator<Item = K>,
+    stray: K,
+    value_of: impl Fn(K) -> V,
+) where
+    K: Eq + Hash + Copy,
+{
+    let mut table =
+        ElasticTable::<K, V, FixedHashBuilder>::try_with_slots_and_reserve_fraction_and_hasher_in(
+            1_024,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+    assert_ne!(table.levels[0].index_shift(), GENERAL_REDUCTION);
+    let mut placed = Vec::new();
+    for key in keys {
+        let hash = table.hash_builder.hash_one(key);
+        placed.push((key, table.insert_for_vacant_entry(key, value_of(key), hash)));
+    }
+    let hash = table.hash_builder.hash_one(stray);
+    let prepared = PreparedElasticRoute::new(hash);
+    let fingerprint = control::control_fingerprint_low(hash);
+    placed.push((
+        stray,
+        table.place_exceptional_entry(stray, value_of(stray), prepared, fingerprint),
+    ));
+    assert!(matches!(
+        table.walk_schedule(
+            &stray,
+            prepared,
+            fingerprint,
+            table.route_filter(prepared),
+            |_, _, _, _| ()
+        ),
+        ScheduleSearch::Unresolved
+    ));
+    for (key, (level, slot)) in placed {
+        let hash = table.hash_builder.hash_one(key);
+        let found = TableBackend::find_value(&table, &key, hash).unwrap();
+        // SAFETY: the insert returned the slot it filled.
+        let stored = unsafe { &table.levels[level].get_ref(slot).value };
+        assert!(ptr::eq(found, stored));
+    }
+}
+
+#[test]
+fn lookup_off_the_schedule_returns_the_stored_value_past_its_key() {
+    assert_ne!(<SlotEntry<u64, u64> as WalkedEntry>::LEAD, 0);
+    assert_lookup_off_the_schedule_returns_the_stored_value(0..600_u64, u64::MAX, |key| key);
+}
+
+#[test]
+fn lookup_off_the_schedule_returns_a_zero_sized_value() {
+    assert_lookup_off_the_schedule_returns_the_stored_value(0..600_u64, u64::MAX, |_| ());
+}
+
+#[test]
+fn lookup_off_the_schedule_returns_a_value_aligned_past_its_key() {
+    assert!(align_of::<u64>() > align_of::<u8>());
+    assert_lookup_off_the_schedule_returns_the_stored_value(0..200_u8, u8::MAX, u64::from);
+}
