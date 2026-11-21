@@ -721,16 +721,6 @@ struct FilterTail {
 /// The filter unit an empty table's gate reads: nothing recorded.
 static NO_FILTER_UNIT: u64 = 0;
 
-/// Filter units of a table of `n` entries: eight for every five. A key sets
-/// one membership bit, so the share of absent keys a gate lets through is
-/// the share of bits set, which falls only with more bits per entry; fewer
-/// entries per level bin also leave a lookup fewer levels to scan.
-fn filter_units(n: usize) -> Result<usize, TryReserveError> {
-    Ok(n.checked_mul(8)
-        .ok_or(TryReserveError::CapacityOverflow)?
-        .div_ceil(5))
-}
-
 impl FilterTail {
     /// # Safety
     ///
@@ -808,8 +798,8 @@ fn funnel_layout<K, V>(slots: usize, n: usize) -> Result<FunnelLayout, TryReserv
             .ok_or(TryReserveError::CapacityOverflow)?
     };
     let (base_layout, data_offset) = arena::layout_for_extents::<K, V>(control_bytes, slots)?;
-    let (layout, membership) =
-        MembershipRegion::extend_words::<u64>(base_layout, filter_units(n)?)?;
+    // One filter unit an entry.
+    let (layout, membership) = MembershipRegion::extend_words::<u64>(base_layout, n)?;
     Ok(FunnelLayout {
         layout,
         data_offset,
