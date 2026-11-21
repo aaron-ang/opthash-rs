@@ -2620,6 +2620,9 @@ where
         )
     }
 
+    /// [`Self::find_by_exact_schedule`] with the walk and the lookup off
+    /// the schedule each handing on the value, where
+    /// [`Self::find_after_filter`] hands both an entry.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn find_value<'a, Q>(&'a self, key: &Q, hash: u64) -> Option<&'a V>
