@@ -481,8 +481,8 @@ where
     rebuilt
 }
 
-/// With tombstones the frameless insert stands aside: the placement walk
-/// takes a tombstone ahead of the first EMPTY lane.
+/// With tombstones the frameless insert stands aside, and the insert takes
+/// a tombstone ahead of the first EMPTY lane, as the placement walk does.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn insert_reuses_tombstones_like_the_placement_walk() {
@@ -526,6 +526,191 @@ fn insert_reuses_tombstones_like_the_placement_walk() {
         assert_eq!(inline.tombstones(), walked.tombstones());
         assert_eq!(controls_and_filter(&inline), controls_and_filter(&walked));
     }
+}
+
+/// Removals and inserts in turn, through the calls a map makes, leave the
+/// table as the slot removal and the placement walk leave it: each key's
+/// slot, every control, the filter and each count. The turns take back the
+/// key just removed or a new one, alone or two at a time, at half the
+/// insertion limit and at the limit, for long enough to refresh the filter.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn churn_places_and_counts_like_the_placement_walk() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    type Table = FunnelTable<u64, u64, IdentityBuildHasher>;
+
+    fn counts(table: &Table) -> [usize; 4] {
+        [
+            table.entries(),
+            table.tombstones(),
+            table.stale_membership(),
+            table.head_left,
+        ]
+    }
+
+    for (n, d, fill) in [(4096, 3, 2), (4096, 3, 1), (1 << 14, 3, 1)] {
+        let mut churned = raw_table(n, d);
+        let mut walked = raw_table(n, d);
+        let budget = churned.shape.max_insertions as u64;
+        let mut live = (0..budget / fill).collect::<Vec<_>>();
+        for &index in &live {
+            let key = index.wrapping_mul(SPREAD);
+            map::TableBackend::insert(&mut churned, key, index, key);
+            walked.insert_for_vacant_entry(key, index, key);
+        }
+        let mut fresh = budget;
+        let (mut among_tombstones, mut taken_back, mut reopened) = (0, 0, 0);
+        for turn in 0..3 * churned.shape.max_insertions {
+            let pairs = if turn % 7 == 6 { 2 } else { 1 };
+            let mut removed = Vec::new();
+            for pair in 0..pairs {
+                let at = (turn * 31 + pair) % live.len();
+                let index = live.swap_remove(at);
+                let key = index.wrapping_mul(SPREAD);
+                let slot = walked.find_location(&key, key).unwrap();
+                assert_eq!(
+                    map::TableBackend::remove_key(&mut churned, &key, key),
+                    Some((key, index))
+                );
+                assert_eq!(map::TableBackend::remove(&mut walked, slot), (key, index));
+                assert_eq!(counts(&churned), counts(&walked), "n {n} turn {turn}");
+                removed.push(index);
+            }
+            for index in removed {
+                let index = if turn % 2 == 0 {
+                    index
+                } else {
+                    fresh += 1;
+                    fresh
+                };
+                let key = index.wrapping_mul(SPREAD);
+                let probe = churned.prf.prepare(key);
+                let (tombstones, open) = (churned.tombstones(), churned.head_left);
+                if churned.places_among_tombstones()
+                    && let Some(head) = churned.first_free_in_head(probe)
+                {
+                    let head = Vacancy {
+                        slot: churned.slot_of(NonNull::new(head.lane).unwrap()),
+                        level_bit: head.level_bit,
+                    };
+                    assert_eq!(
+                        Some(head),
+                        walked.search_vacancy(probe),
+                        "n {n} turn {turn}"
+                    );
+                    among_tombstones += 1;
+                }
+                assert_eq!(
+                    map::TableBackend::insert(&mut churned, key, index, key),
+                    None
+                );
+                let slot = walked.insert_for_vacant_entry(key, index, key);
+                assert_eq!(
+                    churned.find_location(&key, key),
+                    Some(slot),
+                    "n {n} turn {turn}"
+                );
+                assert_eq!(counts(&churned), counts(&walked), "n {n} turn {turn}");
+                assert_eq!(
+                    map::TableBackend::epoch_snapshot(&churned),
+                    map::TableBackend::epoch_snapshot(&walked),
+                    "n {n} turn {turn}"
+                );
+                taken_back += usize::from(churned.tombstones() < tombstones);
+                reopened += usize::from(open == 0 && churned.head_left != 0);
+                live.push(index);
+            }
+        }
+        assert_ne!(among_tombstones, 0, "n {n} fill {fill}");
+        assert_ne!(taken_back, 0, "n {n} fill {fill}");
+        assert_eq!(reopened == 0, fill == 1, "n {n} fill {fill}");
+        assert_eq!(controls_and_filter(&churned), controls_and_filter(&walked));
+    }
+}
+
+/// Where the counts send an insert among tombstones to the placement walk,
+/// it leaves the table as that walk leaves it: with the cleanup due, which
+/// the insert then runs, and at the insertion limit, where it grows.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn insert_among_tombstones_cleans_up_and_grows_like_the_placement_walk() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    type Table = FunnelTable<u64, u64, IdentityBuildHasher>;
+
+    fn filled() -> (Table, Table, u64) {
+        let mut inserted = raw_table(4096, 3);
+        let mut walked = raw_table(4096, 3);
+        let budget = inserted.shape.max_insertions as u64;
+        for index in 0..budget {
+            let key = index.wrapping_mul(SPREAD);
+            map::TableBackend::insert(&mut inserted, key, index, key);
+            walked.insert_for_vacant_entry(key, index, key);
+        }
+        (inserted, walked, budget)
+    }
+    fn remove(inserted: &mut Table, walked: &mut Table, index: u64) {
+        let key = index.wrapping_mul(SPREAD);
+        let slot = walked.find_location(&key, key).unwrap();
+        assert_eq!(
+            map::TableBackend::remove_key(inserted, &key, key),
+            Some((key, index))
+        );
+        assert_eq!(map::TableBackend::remove(walked, slot), (key, index));
+    }
+    fn insert(inserted: &mut Table, walked: &mut Table, index: u64) {
+        let key = index.wrapping_mul(SPREAD);
+        assert_eq!(map::TableBackend::insert(inserted, key, index, key), None);
+        let slot = walked.insert_for_vacant_entry(key, index, key);
+        assert_eq!(inserted.find_location(&key, key), Some(slot), "{index}");
+        assert_same(inserted, walked);
+    }
+    fn assert_same(inserted: &Table, walked: &Table) {
+        assert_eq!(inserted.shape.slots, walked.shape.slots);
+        assert_eq!(
+            [
+                inserted.entries(),
+                inserted.tombstones(),
+                inserted.stale_membership(),
+                inserted.head_left,
+            ],
+            [
+                walked.entries(),
+                walked.tombstones(),
+                walked.stale_membership(),
+                walked.head_left,
+            ]
+        );
+        assert_eq!(
+            map::TableBackend::epoch_snapshot(inserted),
+            map::TableBackend::epoch_snapshot(walked)
+        );
+        assert_eq!(controls_and_filter(inserted), controls_and_filter(walked));
+    }
+
+    let (mut inserted, mut walked, budget) = filled();
+    let mut removed = 0;
+    while !inserted.cleanup_due() {
+        remove(&mut inserted, &mut walked, removed);
+        removed += 1;
+    }
+    assert_same(&inserted, &walked);
+    assert!(!inserted.places_among_tombstones());
+    insert(&mut inserted, &mut walked, budget);
+    assert_eq!(inserted.tombstones(), 0);
+    insert(&mut inserted, &mut walked, budget + 1);
+
+    let mut limit_with_tombstones = 0;
+    for turn in 0..32 {
+        let (mut inserted, mut walked, budget) = filled();
+        let slots = inserted.shape.slots;
+        remove(&mut inserted, &mut walked, turn * 97);
+        insert(&mut inserted, &mut walked, budget + turn);
+        assert_eq!(inserted.entries(), inserted.shape.max_insertions);
+        limit_with_tombstones += usize::from(inserted.tombstones() != 0);
+        insert(&mut inserted, &mut walked, budget + 32 + turn);
+        assert!(inserted.shape.slots > slots, "turn {turn}");
+    }
+    assert_ne!(limit_with_tombstones, 0);
 }
 
 /// A key placed outside its funnel records the level it landed in, not the
@@ -3379,7 +3564,7 @@ fn head_vacancy_agrees_with_the_placement_walk_whenever_it_answers() {
             let key = index.wrapping_mul(SPREAD);
             let probe = table.prf.prepare(key);
             let general = table.search_vacancy(probe);
-            if let Some(head) = table.first_empty_in_head(probe) {
+            if let Some(head) = table.first_free_in_head(probe) {
                 let head = Vacancy {
                     slot: table.slot_of(NonNull::new(head.lane).unwrap()),
                     level_bit: head.level_bit,
