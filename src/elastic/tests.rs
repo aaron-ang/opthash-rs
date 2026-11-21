@@ -4840,7 +4840,7 @@ fn rebuild_places_a_key_its_target_fails_on_another_target() {
 }
 
 /// A key hashed by `hash` alone, so keys of one hash share every probe.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SharedProbeKey {
     hash: u64,
     id: u64,
@@ -4937,4 +4937,36 @@ fn a_recovery_rebuild_tries_every_target_before_placing_off_the_probes() {
         };
         assert_eq!(map.get(&key), Some(&id));
     }
+}
+
+#[test]
+fn a_removal_finds_a_key_placed_off_its_probes() {
+    let shared = |id: u64| SharedProbeKey {
+        hash: 0x9e37_79b9_7f4a_7c15,
+        id,
+    };
+    let mut map: ElasticHashMap<SharedProbeKey, u64, IdentityBuildHasher> =
+        ElasticHashMap::with_capacity_and_hasher(256, IdentityBuildHasher);
+    let keys = map.capacity() as u64;
+    // One hash for every key: its probes run out of slots before the
+    // table's budget does, and the rest are placed off them.
+    for id in 0..keys {
+        assert_eq!(map.insert(shared(id), !id), None);
+    }
+    assert!(map.table().walk_ends_unresolved());
+
+    assert_eq!(map.remove(&shared(keys)), None);
+    assert_eq!(map.remove_entry(&shared(keys)), None);
+    // Last placed first, so the keys off the probes go while the table
+    // still leaves its walks unresolved.
+    for id in (0..keys).rev() {
+        if id % 2 == 0 {
+            assert_eq!(map.remove(&shared(id)), Some(!id));
+        } else {
+            assert_eq!(map.remove_entry(&shared(id)), Some((shared(id), !id)));
+        }
+        assert_eq!(map.get(&shared(id)), None);
+        assert_eq!(map.len() as u64, id);
+    }
+    assert_eq!(map.remove(&shared(0)), None);
 }

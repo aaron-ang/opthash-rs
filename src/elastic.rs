@@ -2781,6 +2781,8 @@ where
         self.take_as(key, hash, |key, value| (key, value))
     }
 
+    // Forced inline, as `take_as` is: the shell's removal is the one
+    // function boundary a removal has.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn take_value<Q>(&mut self, key: &Q, hash: u64) -> Option<V>
@@ -3596,9 +3598,10 @@ where
         }
     }
 
-    /// [`Self::find_by_general_schedule`] for a walk that ended unresolved.
-    /// Out of line with the filter, so the summary is read here and the walk
-    /// keeps no copy of it for this path.
+    /// [`Self::find_by_general_schedule`] for a table whose walk can end
+    /// unresolved ([`Self::walk_ends_unresolved`]). Out of line with the
+    /// filter, so the summary is read here and the walk keeps no copy of it
+    /// for this path.
     #[inline(never)]
     fn find_unresolved<'a, Q, R>(
         &'a self,
