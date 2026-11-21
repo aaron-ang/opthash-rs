@@ -3894,6 +3894,7 @@ fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
     assert_eq!(whole, 0);
     assert_ne!(fitted, 0);
     assert!(level_count > schedule::GROUPED_LEVELS + 1);
+    let unwritten = ProbeSchedule::group_appends();
     // A rebuild that first brings a grouped level in writes the groups'
     // runs from their start.
     for through in 0..schedule::GROUPED_LEVELS {
@@ -3901,26 +3902,26 @@ fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
         table.extend_probe_schedule(40 * (through as u128 + 1));
         assert!(table.probe_schedule.addresses(&table.levels));
         if through + 1 < schedule::GROUPED_LEVELS {
-            assert_eq!(table.probe_schedule.group_appends(), 0);
+            assert_eq!(ProbeSchedule::group_appends(), unwritten);
         }
     }
     assert_eq!(table.probe_schedule.whole_groups().0, fitted);
-    assert_ne!(table.probe_schedule.group_appends(), 0);
+    assert_ne!(ProbeSchedule::group_appends(), unwritten);
     for through in schedule::GROUPED_LEVELS..level_count {
-        let held = table.probe_schedule.group_appends();
+        let held = ProbeSchedule::group_appends();
         // One that brings a deeper level in pushes the same routes of the
         // grouped levels, which the runs hold.
         table.schedule_levels_through(through);
-        assert_eq!(table.probe_schedule.group_appends(), held);
+        assert_eq!(ProbeSchedule::group_appends(), held);
         assert!(table.probe_schedule.addresses(&table.levels));
         // Only the routes past them are written.
         table.extend_probe_schedule(40 * (through as u128 + 1));
         assert!(table.probe_schedule.addresses(&table.levels));
     }
     assert_eq!(table.probe_schedule.whole_groups().0, fitted);
-    let held = table.probe_schedule.group_appends();
+    let held = ProbeSchedule::group_appends();
     table.extend_probe_schedule(QUERY_POSITION_CAP);
-    assert!(table.probe_schedule.group_appends() > held);
+    assert!(ProbeSchedule::group_appends() > held);
 }
 
 #[test]
@@ -3964,20 +3965,22 @@ fn clone_has_group_runs_only_where_its_source_has_one_whole() {
     table.extend_probe_schedule(40);
     // A source short of a grouped level gives its copy no group's run, and
     // the copy takes them when its own rebuild brings that level in.
+    let held = ProbeSchedule::group_appends();
     let mut copy = table.clone_table();
     assert_eq!(copy.probe_schedule.whole_groups().0, 0);
-    assert_eq!(copy.probe_schedule.group_appends(), 0);
+    assert_eq!(ProbeSchedule::group_appends(), held);
     assert!(copy.probe_schedule.addresses(&copy.levels));
     copy.schedule_levels_through(copy.levels.len() - 1);
     assert_eq!(copy.probe_schedule.whole_groups().0, fitted);
-    assert_ne!(copy.probe_schedule.group_appends(), 0);
+    assert_ne!(ProbeSchedule::group_appends(), held);
     assert!(copy.probe_schedule.addresses(&copy.levels));
     // A source with whole groups gives its copy the same ones.
     table.schedule_levels_through(table.levels.len() - 1);
     assert_eq!(table.probe_schedule.whole_groups().0, fitted);
+    let held = ProbeSchedule::group_appends();
     let copy = table.clone_table();
     assert_eq!(copy.probe_schedule.whole_groups().0, fitted);
-    assert_ne!(copy.probe_schedule.group_appends(), 0);
+    assert_ne!(ProbeSchedule::group_appends(), held);
     assert!(copy.probe_schedule.addresses(&copy.levels));
 }
 
@@ -4626,5 +4629,212 @@ fn compares_against_other_keys_stay_within_routes_times_fingerprint_collisions()
             fingerprints >> low_bits,
             &|index| scattered(index) & !((1 << low_bits) - 1),
         );
+    }
+}
+
+#[test]
+fn draining_a_map_leaves_no_level_a_tombstone() {
+    let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(3_000);
+    for key in 0..3_000 {
+        map.insert(key, key);
+    }
+    for key in 0..1_000 {
+        assert_eq!(map.remove(&key), Some(key));
+    }
+    assert_ne!(
+        map.table()
+            .levels
+            .iter()
+            .map(Level::tombstones)
+            .sum::<u32>(),
+        0
+    );
+    drop(map.drain());
+    for level in &map.table().levels {
+        assert_eq!(level.tombstones(), 0);
+    }
+    assert!(map.is_empty());
+}
+
+/// Places `stray` off the schedule in a table of `keys` and looks every key
+/// up: each lookup returns the value where the table stores it, the stray
+/// key's through the lookup off the schedule.
+fn assert_lookup_off_the_schedule_returns_the_stored_value<K, V>(
+    keys: impl IntoIterator<Item = K>,
+    stray: K,
+    value_of: impl Fn(K) -> V,
+) where
+    K: Eq + Hash + Copy,
+{
+    let mut table =
+        ElasticTable::<K, V, FixedHashBuilder>::try_with_slots_and_reserve_fraction_and_hasher_in(
+            1_024,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+    assert_ne!(table.levels[0].index_shift(), GENERAL_REDUCTION);
+    let mut placed = Vec::new();
+    for key in keys {
+        let hash = table.hash_builder.hash_one(key);
+        placed.push((key, table.insert_for_vacant_entry(key, value_of(key), hash)));
+    }
+    let hash = table.hash_builder.hash_one(stray);
+    let prepared = PreparedElasticRoute::new(hash);
+    let fingerprint = control::control_fingerprint_low(hash);
+    placed.push((
+        stray,
+        table.place_exceptional_entry(stray, value_of(stray), prepared, fingerprint),
+    ));
+    assert!(matches!(
+        table.walk_schedule(
+            &stray,
+            prepared,
+            fingerprint,
+            table.route_filter(prepared),
+            |_, _, _, _| ()
+        ),
+        ScheduleSearch::Unresolved
+    ));
+    for (key, (level, slot)) in placed {
+        let hash = table.hash_builder.hash_one(key);
+        let found = TableBackend::find_value(&table, &key, hash).unwrap();
+        // SAFETY: the insert returned the slot it filled.
+        let stored = unsafe { &table.levels[level].get_ref(slot).value };
+        assert!(ptr::eq(found, stored));
+    }
+}
+
+#[test]
+fn lookup_off_the_schedule_returns_the_stored_value() {
+    assert_lookup_off_the_schedule_returns_the_stored_value(0..600_u64, u64::MAX, |key| key);
+}
+
+#[test]
+fn lookup_off_the_schedule_returns_a_zero_sized_value() {
+    assert_lookup_off_the_schedule_returns_the_stored_value(0..600_u64, u64::MAX, |_| ());
+}
+
+#[test]
+fn lookup_off_the_schedule_returns_a_value_aligned_past_its_key() {
+    assert!(align_of::<u64>() > align_of::<u8>());
+    assert_lookup_off_the_schedule_returns_the_stored_value(0..200_u8, u8::MAX, u64::from);
+}
+
+/// Where the placement walk puts a new key with `probe`: the first free
+/// slot of the batch's insertion case, then of every other target's in
+/// order, each level searched whatever its counts say of its fill.
+fn walked_placement(
+    table: &ElasticTable<u64, u64, FixedHashBuilder>,
+    probe: PreparedElasticProbe,
+) -> Option<(usize, usize)> {
+    let search = |level: usize, budget: u64| {
+        // SAFETY: the level is the table's, which reduces by shift.
+        unsafe { table.first_shifted_vacancy(probe, level, &table.levels[level], budget) }
+    };
+    let target = table.scheduler.target_at(table.live());
+    let pairs = table.levels.len().saturating_sub(1);
+    let others = core::iter::once(BatchTarget::Bootstrap)
+        .chain((0..pairs).map(BatchTarget::LevelPair))
+        .filter(|&candidate| candidate != target);
+    core::iter::once(target)
+        .chain(others)
+        .find_map(|candidate| table.choose_slot_with::<false>(candidate, search))
+        .map(|placement| (placement.level, placement.slot))
+}
+
+/// Removes a key and inserts it again, over and over, in a table at
+/// `live` keys, and checks each insert against [`walked_placement`].
+/// Returns the inserts that found the gate's plan gone for a full level and
+/// those that settled.
+fn assert_churn_places_where_the_walk_does(live: u64, pairs: u64) -> (u64, u64) {
+    let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(896);
+    assert_eq!(map.table().max_insertions, 896);
+    assert_ne!(map.table().levels[0].index_shift(), GENERAL_REDUCTION);
+    for key in 0..live {
+        map.insert(key, key);
+    }
+    let (mut full, mut settled, mut rebuilt) = (0, 0, 0);
+    let mut draw = 1_u64;
+    for _ in 0..pairs {
+        draw = draw
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let key = (draw >> 33) % live;
+        assert_eq!(map.remove(&key), Some(key));
+        let table = map.table();
+        let hash = table.hash_builder.hash_one(key);
+        let probe = PreparedElasticRoute::new(hash).probe;
+        let case = table.settled_case(table.scheduler.target_at(table.live()));
+        if case.is_some_and(|(case, ..)| table.live_in(case.region) == case.region.capacity) {
+            assert_eq!(table.settled_plan(), None);
+            full += 1;
+        }
+        let expected = walked_placement(table, probe);
+        let generation = table.epoch.snapshot(table.live()).generation;
+        settled += u64::from(table.settled_slot(probe).is_some());
+        assert_eq!(map.insert(key, key), None);
+        let table = map.table();
+        if table.epoch.snapshot(table.live()).generation == generation {
+            assert_eq!(table.find(&key, hash), expected);
+        } else {
+            rebuilt += 1;
+        }
+        assert_eq!(map.get(&key), Some(&key));
+    }
+    assert!(rebuilt * 100 < pairs);
+    (full, settled)
+}
+
+#[test]
+fn churn_at_the_insertion_limit_places_where_the_walk_does() {
+    let pairs = if cfg!(miri) { 400 } else { 8_000 };
+    let (full, settled) = assert_churn_places_where_the_walk_does(896, pairs);
+    assert_ne!(full, 0);
+    assert_ne!(settled, 0);
+}
+
+#[test]
+fn churn_below_the_insertion_limit_places_where_the_walk_does() {
+    let pairs = if cfg!(miri) { 400 } else { 8_000 };
+    let (_, settled) = assert_churn_places_where_the_walk_does(600, pairs);
+    assert!(settled * 10 > pairs * 9);
+}
+
+/// Keys that share one probe sequence fill the bootstrap level's probes
+/// long before the level, so the keys after them fail the batch's target
+/// and another target places them, in an insert and in a rebuild alike.
+#[test]
+fn rebuild_places_a_key_its_target_fails_on_another_target() {
+    let mut table = ElasticTable::<u64, u64, ConstHashBuilder>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            4_096,
+            ReserveFraction::DEFAULT,
+            ConstHashBuilder,
+            Global,
+        )
+        .unwrap();
+    assert_ne!(table.levels[0].index_shift(), GENERAL_REDUCTION);
+    let keys = LEVEL_PROBE_LIMIT[0] + 40;
+    assert!(keys < table.scheduler.batch_ends[0] as u64);
+    for key in 0..keys {
+        assert_eq!(table.insert(key, key, 0), None);
+    }
+    let off_target = |table: &ElasticTable<u64, u64, ConstHashBuilder>| {
+        table.levels[1..]
+            .iter()
+            .map(|level| table.live_in(level))
+            .sum::<u32>()
+    };
+    assert_eq!(off_target(&table), 40);
+    assert_eq!(table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
+
+    table.resize(4_096);
+    assert_eq!(off_target(&table), 40);
+    assert_eq!(table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
+    assert_eq!(table.epoch.snapshot(table.live()).placement_recoveries, 0);
+    for key in 0..keys {
+        assert_eq!(TableBackend::find_value(&table, &key, 0), Some(&key));
     }
 }

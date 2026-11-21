@@ -16,15 +16,17 @@ impl LiveCount {
     /// `tombstones` by one. The stored count of the settled level may pass
     /// below zero here, and comes back with its uncounted inserts.
     ///
-    /// The two counts are the halves of one word, tombstones low, so one
-    /// subtraction moves both; the live count is the high half, where
-    /// passing below zero borrows from nothing.
+    /// The two counts are the halves of one 64-bit value, tombstones low,
+    /// which a target with registers that wide moves by one subtraction;
+    /// the live count is the high half, where passing below zero borrows
+    /// from nothing.
+    ///
+    /// The entry was live, so `tombstones` is below the level's slots and
+    /// cannot carry into the live count. The callers assert that bound,
+    /// which takes the level.
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
     pub(super) fn entomb_one(&mut self, tombstones: &mut u32) {
-        // The removed entry was live, so the tombstones are fewer than the
-        // level's slots.
-        debug_assert!(*tombstones < u32::MAX);
         let both = u64::from(*tombstones) | u64::from(self.0) << 32;
         let both = both.wrapping_sub(u64::from(u32::MAX));
         *tombstones = both as u32;

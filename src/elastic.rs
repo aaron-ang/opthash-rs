@@ -29,9 +29,7 @@ mod live_count;
 mod schedule;
 
 use live_count::{LiveCount, Uncounted};
-use schedule::{
-    PhiRoute, ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL, WalkedEntry,
-};
+use schedule::{PhiRoute, ProbeSchedule, ProbeScheduleRoom, SENTINEL_BIT, SENTINEL_LEVEL};
 
 /// `(slot pointer, location)` yielded by the scan cursor: the pointer is read
 /// by iterators, the `(level, slot)` location backs removal.
@@ -293,8 +291,8 @@ const fn settled_summary_bit(settled: u32) -> SummaryBin {
 #[repr(C)]
 struct LevelCounters {
     // Ahead of the live count: on a little-endian target that is the order
-    // of the halves `LiveCount::entomb_one` moves as one word. Elsewhere
-    // only its speed differs.
+    // of the halves `LiveCount::entomb_one` moves as one 64-bit value.
+    // Elsewhere only its speed differs.
     tombstones: u32,
     len: LiveCount,
 }
@@ -881,10 +879,6 @@ unsafe fn found_key<'k, K, V>(entry: *mut SlotEntry<K, V>) -> &'k K {
     }
 }
 
-impl<K, V> WalkedEntry for SlotEntry<K, V> {
-    const LEAD: usize = mem::offset_of!(Self, value);
-}
-
 /// Outcome of [`ElasticTable::walk_schedule`].
 enum ScheduleSearch<R> {
     Hit(R),
@@ -1157,6 +1151,8 @@ struct PlacementCase<'a, K, V> {
     budget: u64,
     /// The level to search when the budget finds no slot.
     fallback: Option<usize>,
+    /// `level` has no free slot by its counts, so no search of it finds one.
+    full: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1927,55 +1923,42 @@ where
 
     /// The plan the settled gate opens on, when the cached batch covers the
     /// live count, that count is below the settled limit, and the paper's
-    /// insertion case for the batch has a scheduled probe to search.
+    /// insertion case for the batch has a scheduled probe to search in a
+    /// level with a free slot.
     ///
     /// The case and its budget follow the fill of the batch's levels, which
     /// a settled insert raises in one of the plan's levels. The plan ends
     /// where that fill changes either: where the level a budgeted case
     /// searches comes down to half its reserve or to a free fraction with
-    /// another budget, or where the level it falls back to comes down to a
-    /// quarter free. Counting every insert against both levels ends it no
-    /// later.
+    /// another budget, where the level it falls back to comes down to a
+    /// quarter free, or where the level another case searches is full.
+    /// Counting every insert against both levels ends it no later.
     fn settled_plan(&self) -> Option<SettledPlan> {
         let end = self
             .scheduler
             .reopened_end(self.placed, self.stale_membership())?;
         let target = self.scheduler.cached_target();
         let (case, budget, fallback) = self.settled_case(target)?;
+        let region = case.region;
+        let free = region.capacity - self.live_in(region);
         let holds_for = match target {
             // The level a case searches without a bound stays the case's
             // while the other level of its pair keeps its fill.
             BatchTarget::LevelPair(current) if case.level == current => {
-                let region = case.region;
-                let free = region.capacity - self.live_in(region);
-                let paper_budget = |free: u32| {
-                    probe::elastic_level_probe_budget(
-                        free,
-                        region.capacity,
-                        self.reserve_fraction.exponent(),
-                        ELASTIC_PROBE_BUDGET_C,
-                    )
-                };
                 // Not low, so above half the reserve.
                 let until_low = free - region.half_reserve;
                 if case.fallback.is_none() {
                     until_low
                 } else {
-                    // The budget only grows as the level fills, so the
-                    // inserts that keep it are a prefix.
-                    let (mut keeps, mut changes) = (1, until_low + 1);
-                    while changes - keeps > 1 {
-                        let middle = keeps + (changes - keeps) / 2;
-                        if paper_budget(free - (middle - 1)) == paper_budget(free) {
-                            keeps = middle;
-                        } else {
-                            changes = middle;
-                        }
-                    }
-                    keeps
+                    until_low.min(probe::elastic_level_budget_run(
+                        free,
+                        region.capacity,
+                        self.reserve_fraction.exponent(),
+                    ))
                 }
             }
-            _ => u32::MAX,
+            // Until the level is full.
+            _ => free,
         };
         let holds_for = if fallback.is_some() {
             let next = &self.levels[case.level + 1];
@@ -2094,17 +2077,29 @@ where
         let Some(plan) = self.settled_plan() else {
             return false;
         };
-        let [(_, word), (_, fallback_word)] =
-            self.plan_words(plan.level, plan.budget, plan.fallback);
         self.count_settled();
-        self.levels[plan.level].search.settled = word;
-        self.settled_level = self.levels.level_ptr(plan.level);
-        self.settled_fallback = if plan.fallback.is_some() {
-            self.levels[plan.level + 1].search.settled = fallback_word;
-            self.levels.level_ptr(plan.level + 1)
-        } else {
-            ptr::null_mut()
+        // Both levels by address before either write, so the writes reload
+        // nothing of the table.
+        let level = self.levels.level_ptr(plan.level);
+        let fallback = match plan.fallback {
+            Some(_) => self.levels.level_ptr(plan.level + 1),
+            None => ptr::null_mut(),
         };
+        // SAFETY: `level_ptr` checked each index, so the pointers are to
+        // levels, which `&mut self` borrows alone.
+        unsafe {
+            (*level).search.settled = settled_word((*level).summary_bit(), plan.budget);
+            if let Some(budget) = plan.fallback {
+                (*fallback).search.settled = settled_word((*fallback).summary_bit(), budget);
+            }
+        }
+        self.settled_level = level;
+        self.settled_fallback = fallback;
+        debug_assert_eq!(
+            // SAFETY: the gate's levels were set just above.
+            unsafe { self.open_words() },
+            self.plan_words(plan.level, plan.budget, plan.fallback),
+        );
         self.scheduler.settled_end = plan.end;
         true
     }
@@ -2189,7 +2184,7 @@ where
         let target = self.scheduler.cached_target();
         // The write closes the gate; the next insert finds it open again
         // where it may be.
-        if let Some(placement) = self.choose_slot_for_new_key(prepared.probe, target) {
+        if let Some(placement) = self.choose_slot_for_insert(prepared.probe, target) {
             let open_to = self.scheduler.settled_end;
             let location = self.place_new_entry(key, value, prepared, key_fingerprint, placement);
             self.keep_settled(open_to);
@@ -2256,6 +2251,25 @@ where
             return;
         }
         self.insert_for_vacant_entry_prepared(key, value, prepared, key_fingerprint);
+    }
+
+    /// [`Self::place_unique`] of a key the cached batch's target has no
+    /// slot for. Kept out of line, and deriving the key's route again, so
+    /// the rebuild's loop holds a single target attempt and nothing for
+    /// this one.
+    #[cold]
+    #[inline(never)]
+    fn place_unique_off_target(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
+        let prepared = PreparedElasticRoute::new(key_hash);
+        let key_fingerprint = control::control_fingerprint_low(key_hash);
+        let target = self.scheduler.cached_target();
+        if let Some(placement) = self.choose_slot_on_other_targets(prepared.probe, target) {
+            self.place_new_entry(entry.key, entry.value, prepared, key_fingerprint, placement);
+            false
+        } else {
+            self.place_exceptional_entry(entry.key, entry.value, prepared, key_fingerprint);
+            true
+        }
     }
 
     /// Places a key whose active batch target has no slot: another target,
@@ -2778,6 +2792,12 @@ where
         // levels, which its counters precede, and `&mut self` borrows them
         // alone.
         unsafe { (*level_counters(control.cast_mut())).remove_one() };
+        debug_assert!(
+            self.levels
+                .iter()
+                .all(|level| level.tombstones() <= level.capacity),
+            "a level counts more tombstones than it has slots"
+        );
         self.scheduler.note_removal();
         if self.maintenance_is_due() {
             self.maintain_after_deletes();
@@ -2799,6 +2819,10 @@ where
             // SAFETY: and an in-bounds slot of it.
             unsafe { level.mark_tombstone(slot_idx) };
             level.counters_mut().remove_one();
+            debug_assert!(
+                level.tombstones() <= level.capacity,
+                "a level counts more tombstones than it has slots"
+            );
         }
         self.scheduler.note_removal();
     }
@@ -3162,7 +3186,19 @@ where
         probe: PreparedElasticProbe,
         target: BatchTarget,
     ) -> Option<ExactPlacement> {
-        self.choose_slot_with(target, |level, budget| {
+        self.choose_slot_with::<false>(target, |level, budget| {
+            self.first_vacancy(probe, level, budget)
+        })
+    }
+
+    /// [`Self::choose_slot_for_new_key`] without the search of a level the
+    /// case already counts as full, which finds nothing.
+    fn choose_slot_for_insert(
+        &self,
+        probe: PreparedElasticProbe,
+        target: BatchTarget,
+    ) -> Option<ExactPlacement> {
+        self.choose_slot_with::<true>(target, |level, budget| {
             self.first_vacancy(probe, level, budget)
         })
     }
@@ -3188,6 +3224,7 @@ where
                 region: self.levels.first()?,
                 budget: budget_of(self.levels.first()?, None),
                 fallback: None,
+                full: false,
             },
             BatchTarget::LevelPair(current) => {
                 let next = current.checked_add(1)?;
@@ -3204,6 +3241,7 @@ where
                         region: next_level,
                         budget: budget_of(next_level, None),
                         fallback: None,
+                        full: free_next == 0,
                     }
                 } else if next_low {
                     PlacementCase {
@@ -3211,6 +3249,7 @@ where
                         region: current_level,
                         budget: budget_of(current_level, None),
                         fallback: None,
+                        full: false,
                     }
                 } else {
                     // Not low, so the level has a free slot.
@@ -3225,6 +3264,7 @@ where
                         region: current_level,
                         budget: budget_of(current_level, Some(budget)),
                         fallback: Some(next),
+                        full: false,
                     }
                 }
             }
@@ -3233,10 +3273,11 @@ where
 
     /// Chooses `target`'s slot for a new key. `first_vacancy(level, budget)`
     /// yields the first free slot among `level`'s first `budget` probes and
-    /// the one-based probe that reached it.
+    /// the one-based probe that reached it. `SKIP_FULL` answers for a level
+    /// the case counts as full without searching it.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn choose_slot_with(
+    fn choose_slot_with<const SKIP_FULL: bool>(
         &self,
         target: BatchTarget,
         first_vacancy: impl Fn(usize, u64) -> Option<(usize, u64)>,
@@ -3245,8 +3286,12 @@ where
             mut level,
             mut budget,
             mut fallback,
+            full,
             ..
         } = self.placement_case(target, |_, budget| budget.unwrap_or(u64::MAX))?;
+        if SKIP_FULL && full {
+            return None;
+        }
         // One search site serves every case, so the search inlines once.
         let (slot, paper_probe) = loop {
             let limit = *LEVEL_PROBE_LIMIT.get(level)?;
@@ -3871,6 +3916,10 @@ where
     /// generation starts all-EMPTY, so neither can succeed. Never sets
     /// `settled_level` ([`Self::reopen_settled`]), which
     /// [`Self::swap_generation`] leaves on the levels a rollback puts back.
+    ///
+    /// A key its batch's target has no slot for goes to another target, as
+    /// an insert's does, and off its probes only when none has one: a key
+    /// placed there leaves every walk of the epoch unresolved.
     #[inline]
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let prepared = PreparedElasticRoute::new(key_hash);
@@ -3880,8 +3929,7 @@ where
             self.place_new_entry(entry.key, entry.value, prepared, key_fingerprint, placement);
             false
         } else {
-            self.place_exceptional_entry(entry.key, entry.value, prepared, key_fingerprint);
-            true
+            self.place_unique_off_target(entry, key_hash)
         }
     }
 }
