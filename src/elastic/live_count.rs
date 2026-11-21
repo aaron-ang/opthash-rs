@@ -22,8 +22,10 @@ impl LiveCount {
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
     pub(super) fn entomb_one(&mut self, tombstones: &mut u32) {
-        let both = u64::from(*tombstones) | u64::from(self.0) << 32;
+        // The removed entry was live, so the tombstones are fewer than the
+        // level's slots.
         debug_assert!(*tombstones < u32::MAX);
+        let both = u64::from(*tombstones) | u64::from(self.0) << 32;
         let both = both.wrapping_sub(u64::from(u32::MAX));
         *tombstones = both as u32;
         self.0 = (both >> 32) as u32;

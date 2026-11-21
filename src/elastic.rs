@@ -292,8 +292,9 @@ const fn settled_summary_bit(settled: u32) -> SummaryBin {
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct LevelCounters {
-    // Ahead of the live count: `LiveCount::entomb_one` moves both as one
-    // word where the two are stored in this order.
+    // Ahead of the live count: on a little-endian target that is the order
+    // of the halves `LiveCount::entomb_one` moves as one word. Elsewhere
+    // only its speed differs.
     tombstones: u32,
     len: LiveCount,
 }
