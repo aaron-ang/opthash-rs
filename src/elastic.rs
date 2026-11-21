@@ -293,8 +293,8 @@ const fn settled_summary_bit(settled: u32) -> SummaryBin {
 #[repr(C)]
 struct LevelCounters {
     // Ahead of the live count: on a little-endian target that is the order
-    // of the halves `LiveCount::entomb_one` moves as one word. Elsewhere
-    // only its speed differs.
+    // of the halves `LiveCount::entomb_one` moves as one 64-bit value.
+    // Elsewhere only its speed differs.
     tombstones: u32,
     len: LiveCount,
 }
@@ -2778,6 +2778,12 @@ where
         // levels, which its counters precede, and `&mut self` borrows them
         // alone.
         unsafe { (*level_counters(control.cast_mut())).remove_one() };
+        debug_assert!(
+            self.levels
+                .iter()
+                .all(|level| level.tombstones() <= level.capacity),
+            "a level counts more tombstones than it has slots"
+        );
         self.scheduler.note_removal();
         if self.maintenance_is_due() {
             self.maintain_after_deletes();
@@ -2799,6 +2805,10 @@ where
             // SAFETY: and an in-bounds slot of it.
             unsafe { level.mark_tombstone(slot_idx) };
             level.counters_mut().remove_one();
+            debug_assert!(
+                level.tombstones() <= level.capacity,
+                "a level counts more tombstones than it has slots"
+            );
         }
         self.scheduler.note_removal();
     }
