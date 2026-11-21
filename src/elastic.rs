@@ -3871,12 +3871,19 @@ where
     /// generation starts all-EMPTY, so neither can succeed. Never sets
     /// `settled_level` ([`Self::reopen_settled`]), which
     /// [`Self::swap_generation`] leaves on the levels a rollback puts back.
+    ///
+    /// A key its batch's target has no slot for goes to another target, as
+    /// an insert's does, and off its probes only when none has one: a key
+    /// placed there leaves every walk of the epoch unresolved.
     #[inline]
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let prepared = PreparedElasticRoute::new(key_hash);
         let key_fingerprint = control::control_fingerprint_low(key_hash);
         let target = self.scheduler.target(self.live());
-        if let Some(placement) = self.choose_slot_for_new_key(prepared.probe, target) {
+        let placement = self
+            .choose_slot_for_new_key(prepared.probe, target)
+            .or_else(|| self.choose_slot_on_other_targets(prepared.probe, target));
+        if let Some(placement) = placement {
             self.place_new_entry(entry.key, entry.value, prepared, key_fingerprint, placement);
             false
         } else {
