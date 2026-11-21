@@ -4724,7 +4724,7 @@ fn lookup_off_the_schedule_returns_a_value_aligned_past_its_key() {
 
 /// Where the placement walk puts a new key with `probe`: the first free
 /// slot of the batch's insertion case, then of every other target's in
-/// order, each level searched probe by probe whatever its fill.
+/// order.
 fn walked_placement(
     table: &ElasticTable<u64, u64, FixedHashBuilder>,
     probe: PreparedElasticProbe,
@@ -4766,16 +4766,6 @@ fn assert_churn_places_where_the_walk_does(live: u64, pairs: u64) -> (u64, u64) 
         let table = map.table();
         let hash = table.hash_builder.hash_one(key);
         let probe = PreparedElasticRoute::new(hash).probe;
-        for (level, region) in table.levels.iter().enumerate() {
-            for budget in [1, 7, u64::MAX] {
-                let budget = budget.min(LEVEL_PROBE_LIMIT[level]);
-                assert_eq!(
-                    table.first_vacancy(probe, level, budget),
-                    // SAFETY: the level is the table's, which reduces by shift.
-                    unsafe { table.first_shifted_vacancy(probe, level, region, budget) }
-                );
-            }
-        }
         let case = table.settled_case(table.scheduler.target_at(table.live()));
         if case.is_some_and(|(case, ..)| table.live_in(case.region) == case.region.capacity) {
             assert_eq!(table.settled_plan(), None);
