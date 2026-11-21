@@ -1930,8 +1930,8 @@ where
     /// The walk visits the key's bucket in each head level in placement
     /// order, compares the key against the fingerprint matches of every
     /// level its bin recorded, and stops at the first EMPTY lane. Reaching
-    /// that lane without a match means the key is absent: the head placement
-    /// runs only in a table without tombstones, where every bucket a placed
+    /// that lane without a match means the key is absent: the placement that
+    /// trusts this walk runs only in a table without tombstones, where every bucket a placed
     /// key passed over is still full, so the walk meets a present key's
     /// level before any EMPTY lane. A key in a level the head does not hold,
     /// or outside its funnel, passed over every head bucket, so the walk
@@ -2304,8 +2304,8 @@ where
         };
     }
 
-    /// Read-side counterpart of [`Self::locate`]: the same filter gate and
-    /// exceptional full scan around the tombstone-blind lookup walk, which
+    /// The filter gate and exceptional full scan around the
+    /// tombstone-blind lookup walk, which
     /// visits only the levels the key's bin has recorded.
     ///
     /// Forced inline down from the shell's lookups, as the walk behind the
@@ -2877,9 +2877,9 @@ where
     ///
     /// # Safety
     ///
-    /// `vacancy` must be from [`Self::first_free_in_head`] with no write to
-    /// the table since, and `membership` from [`Self::membership_slot`] for
-    /// the key.
+    /// [`Self::places_among_tombstones`] must hold, `vacancy` must be from
+    /// [`Self::first_free_in_head`] with no write to the table since either,
+    /// and `membership` from [`Self::membership_slot`] for the key.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     unsafe fn place_among_tombstones(
