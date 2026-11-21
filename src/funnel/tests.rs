@@ -323,6 +323,58 @@ fn controls_and_filter<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> (
     (controls, filter_tail(table))
 }
 
+/// Replacing a present key swaps it where it sits: every control, the
+/// filter, each count and the epoch stay as they were, in a table without
+/// tombstones and in one with them. An absent key is inserted.
+#[test]
+fn replace_key_leaves_the_table_of_a_present_key_as_it_was() {
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+    const KEYS: u64 = 600;
+    type Map = FunnelHashMap<u64, u64, IdentityBuildHasher>;
+
+    fn state(map: &Map) -> impl PartialEq + use<> {
+        let table = map.table();
+        (
+            controls_and_filter(table),
+            [
+                table.entries(),
+                table.tombstones(),
+                table.stale_membership(),
+                table.head_left,
+            ],
+            map::TableBackend::epoch_snapshot(table),
+        )
+    }
+
+    let mut map =
+        Map::with_capacity_and_hasher(usize::try_from(KEYS).unwrap(), IdentityBuildHasher);
+    for index in 0..KEYS {
+        map.insert(index.wrapping_mul(SPREAD), index);
+    }
+    for removed in [0, 3] {
+        for index in (0..KEYS).step_by(removed.max(1)).take(removed * 50) {
+            assert_eq!(map.remove(&index.wrapping_mul(SPREAD)), Some(index));
+        }
+        assert_eq!(map.table().tombstones() != 0, removed != 0);
+        let before = state(&map);
+        let present = map.len();
+        for index in 0..KEYS {
+            let key = index.wrapping_mul(SPREAD);
+            if map.contains_key(&key) {
+                assert_eq!(map.replace_key(key, u64::MAX), Some(key));
+                assert_eq!(map.get(&key), Some(&index));
+            }
+        }
+        assert_eq!(map.len(), present);
+        assert!(state(&map) == before, "removed {removed}");
+    }
+    let absent = KEYS.wrapping_mul(SPREAD);
+    let len = map.len();
+    assert_eq!(map.replace_key(absent, 7), None);
+    assert_eq!(map.get(&absent), Some(&7));
+    assert_eq!(map.len(), len + 1);
+}
+
 /// The reference side inserts through the vacant-entry placement walk, which
 /// shares no lookup or vacancy code with the frameless insert.
 #[test]
