@@ -1948,31 +1948,16 @@ where
             BatchTarget::LevelPair(current) if case.level == current => {
                 let region = case.region;
                 let free = region.capacity - self.live_in(region);
-                let paper_budget = |free: u32| {
-                    probe::elastic_level_probe_budget(
-                        free,
-                        region.capacity,
-                        self.reserve_fraction.exponent(),
-                        ELASTIC_PROBE_BUDGET_C,
-                    )
-                };
                 // Not low, so above half the reserve.
                 let until_low = free - region.half_reserve;
                 if case.fallback.is_none() {
                     until_low
                 } else {
-                    // The budget only grows as the level fills, so the
-                    // inserts that keep it are a prefix.
-                    let (mut keeps, mut changes) = (1, until_low + 1);
-                    while changes - keeps > 1 {
-                        let middle = keeps + (changes - keeps) / 2;
-                        if paper_budget(free - (middle - 1)) == paper_budget(free) {
-                            keeps = middle;
-                        } else {
-                            changes = middle;
-                        }
-                    }
-                    keeps
+                    until_low.min(probe::elastic_level_budget_run(
+                        free,
+                        region.capacity,
+                        self.reserve_fraction.exponent(),
+                    ))
                 }
             }
             _ => u32::MAX,

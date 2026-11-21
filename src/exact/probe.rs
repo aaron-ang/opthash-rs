@@ -1240,6 +1240,29 @@ pub(crate) const fn elastic_level_probe_budget(
     c as u64 * capped
 }
 
+/// The inserts into a level of `level_slots` with `free_slots` of them
+/// free, each taking one, that [`elastic_level_probe_budget`] gives the
+/// budget it gives the first: all of them once the budget is the capped
+/// one, which a fuller level keeps, and otherwise those that leave the
+/// logarithm as it is.
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+pub(crate) const fn elastic_level_budget_run(
+    free_slots: u32,
+    level_slots: u32,
+    reserve_exponent: u32,
+) -> u32 {
+    debug_assert!(0 < free_slots && free_slots <= level_slots);
+    let log_ceiling = dyadic_log_ceiling(free_slots as u64, level_slots as u64);
+    if log_ceiling as u64 * log_ceiling as u64 >= reserve_exponent as u64 {
+        return u32::MAX;
+    }
+    // The fewest free slots with this logarithm, which is at most the
+    // width of the counts.
+    let fewest = ((level_slots as u64 + (1 << log_ceiling) - 1) >> log_ceiling) as u32;
+    free_slots - fewest + 1
+}
+
 /// `ceil(log2(level_slots / free_slots))` for `0 < free_slots <=
 /// level_slots`: the least `k` with `free_slots << k >= level_slots`. The
 /// gap between the two bit lengths lines the top bits up, which makes it

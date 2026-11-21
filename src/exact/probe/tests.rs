@@ -765,6 +765,47 @@ fn certain_first_index_agrees_with_the_exact_draw_whenever_it_answers() {
 }
 
 #[test]
+fn elastic_budget_run_counts_the_inserts_that_keep_the_budget() {
+    let exhaustive_levels: u32 = if cfg!(miri) { 70 } else { 600 };
+    let levels = (1..=exhaustive_levels).chain([1 << 15, (1 << 15) + 1, u32::MAX]);
+    for level in levels {
+        let frees: &mut dyn Iterator<Item = u32> = if level <= exhaustive_levels {
+            &mut (1..=level)
+        } else {
+            &mut [
+                1,
+                2,
+                3,
+                level / 3,
+                level / 2,
+                level / 2 + 1,
+                level - 1,
+                level,
+            ]
+            .into_iter()
+        };
+        for free in frees {
+            for exponent in [1, 3, 4, 64, u32::MAX] {
+                let budget = |free| elastic_level_probe_budget(free, level, exponent, 8);
+                let run = elastic_level_budget_run(free, level, exponent);
+                let kept = run.min(free);
+                assert_ne!(kept, 0, "free {free} of {level}");
+                // The budget only grows as the level fills, so the last
+                // insert of the run keeps it and the next one does not.
+                assert_eq!(
+                    budget(free - (kept - 1)),
+                    budget(free),
+                    "free {free} of {level}"
+                );
+                if kept < free {
+                    assert_ne!(budget(free - kept), budget(free), "free {free} of {level}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn elastic_probe_budget_matches_the_ceiling_quotient_form() {
     let by_quotient = |free: usize, level: usize, exponent: u32, c: usize| {
         let ratio_ceiling = level.div_ceil(free);
