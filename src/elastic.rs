@@ -2075,17 +2075,29 @@ where
         let Some(plan) = self.settled_plan() else {
             return false;
         };
-        let [(_, word), (_, fallback_word)] =
-            self.plan_words(plan.level, plan.budget, plan.fallback);
         self.count_settled();
-        self.levels[plan.level].search.settled = word;
-        self.settled_level = self.levels.level_ptr(plan.level);
-        self.settled_fallback = if plan.fallback.is_some() {
-            self.levels[plan.level + 1].search.settled = fallback_word;
-            self.levels.level_ptr(plan.level + 1)
-        } else {
-            ptr::null_mut()
+        // Both levels by address before either write, so the writes reload
+        // nothing of the table.
+        let level = self.levels.level_ptr(plan.level);
+        let fallback = match plan.fallback {
+            Some(_) => self.levels.level_ptr(plan.level + 1),
+            None => ptr::null_mut(),
         };
+        // SAFETY: `level_ptr` checked each index, so the pointers are to
+        // levels, which `&mut self` borrows alone.
+        unsafe {
+            (*level).search.settled = settled_word((*level).summary_bit(), plan.budget);
+            if let Some(budget) = plan.fallback {
+                (*fallback).search.settled = settled_word((*fallback).summary_bit(), budget);
+            }
+        }
+        self.settled_level = level;
+        self.settled_fallback = fallback;
+        debug_assert_eq!(
+            // SAFETY: the gate's levels were set just above.
+            unsafe { self.open_words() },
+            self.plan_words(plan.level, plan.budget, plan.fallback),
+        );
         self.scheduler.settled_end = plan.end;
         true
     }
