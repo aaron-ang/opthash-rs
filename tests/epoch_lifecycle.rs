@@ -374,6 +374,45 @@ fn partial_extract_drop_finishes_deferred_tombstone_cleanup() {
     check!(FunnelHashMap::<usize, usize>::with_capacity(512));
 }
 
+/// A shrink that reaches no smaller table is not a resize: the entries stay
+/// in the allocation and the epoch they were placed in.
+#[test]
+fn shrink_that_reaches_no_smaller_table_keeps_the_epoch() {
+    macro_rules! check {
+        ($Map:ident) => {{
+            let mut map = $Map::<usize, usize>::with_capacity(64);
+            let capacity = fill_to_capacity!(map);
+            let before = map.epoch();
+
+            map.shrink_to_fit();
+            map.shrink_to(capacity);
+            assert_eq!(map.epoch(), before);
+            assert_eq!(map.capacity(), capacity);
+            assert_identity_present!(map, 0..capacity);
+        }};
+    }
+    check!(ElasticHashMap);
+    check!(FunnelHashMap);
+}
+
+/// A map that never allocated has nothing to shrink.
+#[test]
+fn shrink_of_an_unallocated_map_keeps_the_epoch() {
+    macro_rules! check {
+        ($Map:ident) => {{
+            let mut map = $Map::<usize, usize>::new();
+            let before = map.epoch();
+
+            map.shrink_to_fit();
+            map.shrink_to(0);
+            assert_eq!(map.epoch(), before);
+            assert_eq!(map.capacity(), 0);
+        }};
+    }
+    check!(ElasticHashMap);
+    check!(FunnelHashMap);
+}
+
 #[test]
 fn clear_starts_a_fresh_epoch_in_the_same_allocation() {
     let mut map = FunnelHashMap::<usize, usize>::with_capacity(64);
