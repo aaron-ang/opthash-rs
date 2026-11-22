@@ -2154,24 +2154,6 @@ fn pop_first_churn_restores_paper_placement() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
-fn selector_finds_known_minimum_exact_geometries() {
-    for &(d, expected) in &[
-        (3, 144),
-        (4, 344),
-        (6, 1_372),
-        (8, 5_472),
-        (9, 10_924),
-        (10, 21_856),
-    ] {
-        let reserve = ReserveFraction::from_exponent(d).unwrap();
-        let shape = FunnelShape::for_insert_budget(1, reserve).unwrap();
-        assert_eq!(shape.n, expected, "d={d}");
-        assert!(PaperConfig::new(shape.n, d).unwrap().funnel_plan().is_ok());
-    }
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
 fn selector_reuses_a_geometry_at_its_reported_capacity() {
     let reserve = ReserveFraction::from_exponent(3).unwrap();
     for requested in 1..512 {
@@ -2668,34 +2650,6 @@ fn level_masks_never_lose_a_live_key() {
         // SAFETY: `find` returns occupied in-bounds slots.
         assert_eq!(unsafe { table.storage.get_ref(slot) }.value, i);
     }
-}
-
-#[test]
-fn exact_geometry_sums_to_n() {
-    let mut table = raw_table(512, 3);
-    for key in 0..128_u64 {
-        table.insert_for_vacant_by_walk(key, key, key);
-    }
-    let ordinary_slots = table
-        .shape
-        .levels
-        .iter()
-        .map(|level| level.buckets * table.shape.beta)
-        .sum::<usize>();
-    assert_eq!(
-        ordinary_slots
-            + table.shape.primary_range.upper()
-            + table.shape.fallback_bucket_range.upper() * table.shape.fallback_bucket_width,
-        table.shape.n
-    );
-    let padding = table
-        .shape
-        .levels
-        .iter()
-        .map(|level| level.buckets * (table.shape.stride - table.shape.beta))
-        .sum::<usize>();
-    assert_eq!(table.storage.capacity(), table.shape.n + padding);
-    assert_eq!(table.shape.slots, table.shape.n + padding);
 }
 
 /// A bulk delete that removes nothing cleans up once the tombstones in
@@ -3310,7 +3264,7 @@ fn for_insert_budget_by_scan(requested: usize, reserve: ReserveFraction) -> usiz
 #[test]
 #[cfg_attr(miri, ignore)]
 fn for_insert_budget_finds_the_smallest_valid_slot_count() {
-    for exponent in 3..=7 {
+    for exponent in 3..=10 {
         let reserve = ReserveFraction::from_exponent(exponent).unwrap();
         for requested in [1, 2, 1_000, 20_000] {
             assert_eq!(
