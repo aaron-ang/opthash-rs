@@ -9,11 +9,15 @@
 //! It is an accelerator, not paper geometry: candidate order is unchanged, only
 //! whether the candidates are worth visiting.
 
+use core::hash::{BuildHasher, Hash};
 use core::ptr;
 
-use allocator_api2::alloc::Layout;
+use allocator_api2::alloc::{Allocator, Layout};
+use allocator_api2::vec::Vec;
 
 use crate::error::TryReserveError;
+use crate::raw::arena::{ArenaSlots, SlotEntry};
+use crate::raw::iter::OccupiedIndices;
 
 /// Filter words needed to cover `total_slots` logical slots at
 /// `slots_per_word` slots a word.
@@ -32,6 +36,39 @@ fn word_count(total_slots: usize, slots_per_word: usize) -> usize {
 #[must_use]
 pub(crate) const fn refresh_deletes(max_insertions: usize) -> usize {
     max_insertions
+}
+
+/// The first step of a filter refresh: the hash of every live key, in slot
+/// order across `regions`, with `on_slot` handed each slot as its key is
+/// hashed. Every key is hashed before the caller clears the filter, so a
+/// hasher that unwinds leaves the filter as it was. `None` when scratch
+/// memory for `live` hashes is not available.
+pub(crate) fn hash_live_keys<K, V, R, S, A>(
+    regions: &[R],
+    live: usize,
+    hash_builder: &S,
+    alloc: A,
+    mut on_slot: impl FnMut(usize),
+) -> Option<Vec<u64, A>>
+where
+    K: Hash,
+    R: ArenaSlots<SlotEntry<K, V>>,
+    S: BuildHasher,
+    A: Allocator,
+{
+    let mut hashes = Vec::new_in(alloc);
+    hashes.try_reserve_exact(live).ok()?;
+    for region in regions {
+        let mut scan = OccupiedIndices::new();
+        while let Some(slot) = scan.step(region) {
+            on_slot(slot);
+            // SAFETY: `step` yields occupied in-bounds slots.
+            let entry = unsafe { region.get_ref(slot) };
+            hashes.push(hash_builder.hash_one(&entry.key));
+        }
+    }
+    debug_assert_eq!(hashes.len(), live);
+    Some(hashes)
 }
 
 /// Multiply-high reduction of `signature` into `word_count` words. The high

@@ -1817,22 +1817,6 @@ where
         };
     }
 
-    fn clear(&mut self) {
-        self.count_settled();
-        for level in &mut self.levels {
-            level.drain_reset(|entry| {
-                self.placed -= 1;
-                self.uncounted.uncover_one();
-                // Before the drop: one that panics leaves the table live
-                // with this count.
-                self.scheduler.close();
-                drop(entry);
-            });
-        }
-        debug_assert_eq!(self.live(), 0);
-        self.reset_after_clear();
-    }
-
     /// Resets placement, lookup, and filter state once every level is empty.
     fn reset_after_clear(&mut self) {
         self.scheduler.reset();
@@ -2095,7 +2079,7 @@ where
         true
     }
 
-    /// The level and free slot [`Self::choose_slot_for_new_key`] gives a
+    /// The level and free slot [`Self::choose_slot`] gives a
     /// new key, with the level's words a write needs, when the plan the
     /// settled gate opened on finds a free slot among its probes. `None`
     /// leaves the insert to [`Self::insert_for_vacant_entry_prepared`].
@@ -2175,7 +2159,7 @@ where
         let target = self.scheduler.cached_target();
         // The write closes the gate; the next insert finds it open again
         // where it may be.
-        if let Some(placement) = self.choose_slot_for_insert(prepared.probe, target) {
+        if let Some(placement) = self.choose_slot::<true>(prepared.probe, target) {
             let open_to = self.scheduler.settled_end;
             let location = self.place_new_entry(key, value, prepared, key_fingerprint, placement);
             self.keep_settled(open_to);
@@ -2304,7 +2288,7 @@ where
         self.resize_with_transition(self.total_slots, EpochTransition::PlacementRecovery);
         let target = self.scheduler.target(self.live());
         let placement = self
-            .choose_slot_for_new_key(prepared.probe, target)
+            .choose_slot::<false>(prepared.probe, target)
             .or_else(|| self.choose_slot_on_other_targets(prepared.probe, target));
         if let Some(placement) = placement {
             self.place_new_entry(key, value, prepared, key_fingerprint, placement)
@@ -2861,19 +2845,30 @@ where
         )
     }
 
-    #[inline]
     fn resize(&mut self, new_capacity: usize) {
-        self.resize(new_capacity);
+        self.resize_with_transition(new_capacity, EpochTransition::ExplicitResize);
     }
 
-    #[inline]
     fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError> {
-        self.try_resize(new_capacity)
+        let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        self.try_resize_to(&geometry, EpochTransition::ExplicitResize)
     }
 
-    #[inline]
     fn clear(&mut self) {
-        self.clear();
+        self.count_settled();
+        for level in &mut self.levels {
+            level.drain_reset(|entry| {
+                self.placed -= 1;
+                self.uncounted.uncover_one();
+                // Before the drop: one that panics leaves the table live
+                // with this count.
+                self.scheduler.close();
+                drop(entry);
+            });
+        }
+        debug_assert_eq!(self.live(), 0);
+        self.reset_after_clear();
     }
 
     fn wipe_all(&mut self) {
@@ -3110,28 +3105,20 @@ where
 
     /// Re-record the filter from the live entries, dropping the bits departed
     /// keys left behind. Entries stay put; only the metadata tail is rewritten.
-    ///
-    /// Every key is hashed before the filter is cleared, so a hasher that
-    /// unwinds leaves it recording every live key. The hashes need scratch
-    /// memory; without it the filter stays as it was. Either way the refresh
-    /// stays owed to the next settling delete.
+    /// A refresh that [`membership::hash_live_keys`] cannot finish leaves
+    /// the filter as it was and stays owed to the next settling delete.
     #[cold]
     #[inline(never)]
     fn refresh_membership(&mut self) {
-        let live = self.live();
-        let mut hashes = allocator_api2::vec::Vec::new_in(self.alloc.clone());
-        if hashes.try_reserve_exact(live).is_err() {
+        let Some(hashes) = membership::hash_live_keys(
+            &self.levels,
+            self.live(),
+            &self.hash_builder,
+            self.alloc.clone(),
+            |_| {},
+        ) else {
             return;
-        }
-        for level in &self.levels {
-            let mut scan = OccupiedIndices::new();
-            while let Some(slot_idx) = scan.step(level) {
-                // SAFETY: `step` yields occupied in-bounds slots.
-                let entry = unsafe { level.get_ref(slot_idx) };
-                hashes.push(self.hash_builder.hash_one(&entry.key));
-            }
-        }
-        debug_assert_eq!(hashes.len(), live);
+        };
         self.epoch.note_deletes(self.stale_membership());
         self.clear_membership();
         // The same scan order as above pairs each entry with its hash.
@@ -3146,12 +3133,6 @@ where
                 self.record_membership(PreparedElasticRoute::new(hash), summary_bit);
             }
         }
-    }
-
-    /// Rebuilds levels at `new_capacity` and moves every live entry across.
-    /// Passing the current capacity flushes tombstones without growing.
-    fn resize(&mut self, new_capacity: usize) {
-        self.resize_with_transition(new_capacity, EpochTransition::ExplicitResize);
     }
 
     fn resize_with_transition(&mut self, new_capacity: usize, transition: EpochTransition) {
@@ -3213,13 +3194,6 @@ where
         Ok(())
     }
 
-    /// Fallible counterpart to [`Self::resize`]; `Err` leaves the map intact.
-    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError> {
-        let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction)
-            .ok_or(TryReserveError::CapacityOverflow)?;
-        self.try_resize_to(&geometry, EpochTransition::ExplicitResize)
-    }
-
     /// Test constructor taking a raw slot count; public constructors take an
     /// insertion budget and inflate it via `capacity_for`.
     #[cfg(test)]
@@ -3257,27 +3231,16 @@ where
                 BatchTarget::Bootstrap => has_room(0),
                 BatchTarget::LevelPair(current) => has_room(current) || has_room(current + 1),
             })
-            .find_map(|candidate| self.choose_slot_for_new_key(probe, candidate))
+            .find_map(|candidate| self.choose_slot::<false>(probe, candidate))
     }
 
-    fn choose_slot_for_new_key(
+    /// [`Self::choose_slot_with`] searching the key's own probes.
+    fn choose_slot<const SKIP_FULL: bool>(
         &self,
         probe: PreparedElasticProbe,
         target: BatchTarget,
     ) -> Option<ExactPlacement> {
-        self.choose_slot_with::<false>(target, |level, budget| {
-            self.first_vacancy(probe, level, budget)
-        })
-    }
-
-    /// [`Self::choose_slot_for_new_key`] without the search of a level the
-    /// case already counts as full, which finds nothing.
-    fn choose_slot_for_insert(
-        &self,
-        probe: PreparedElasticProbe,
-        target: BatchTarget,
-    ) -> Option<ExactPlacement> {
-        self.choose_slot_with::<true>(target, |level, budget| {
+        self.choose_slot_with::<SKIP_FULL>(target, |level, budget| {
             self.first_vacancy(probe, level, budget)
         })
     }
@@ -3482,16 +3445,7 @@ where
         counter_base: u32,
     ) -> Option<usize> {
         let upper = self.levels.get(level)?.capacity();
-        Self::route_prepared_counter_for_upper(probe, counter_base, upper)
-    }
-
-    #[inline]
-    fn route_prepared_counter_for_upper(
-        prepared: PreparedElasticProbe,
-        counter_base: u32,
-        upper: usize,
-    ) -> Option<usize> {
-        probe::unbiased_prepared_elastic_probe_index(prepared, counter_base, upper)
+        probe::unbiased_prepared_elastic_probe_index(probe, counter_base, upper)
             .ok()
             .map(|probe| probe.index)
     }
@@ -3782,11 +3736,8 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let Some(h11_slot) = Self::route_prepared_counter_for_upper(
-            prepared.probe,
-            H11_COUNTER_BASE,
-            self.levels[0].capacity(),
-        ) else {
+        let Some(h11_slot) = self.route_prepared_counter(0, prepared.probe, H11_COUNTER_BASE)
+        else {
             return self.find_by_full_scan(key, key_fingerprint, on_hit);
         };
         // SAFETY: the counter route maps into level zero's capacity.
@@ -3876,7 +3827,6 @@ where
 {
     fn route_exact(&self, level: usize, key_hash: u64, logical_index: u64) -> Option<usize> {
         let probe = CounterPrf::new(ELASTIC_PROBE_SEED).prepare_elastic(key_hash);
-        self.levels.get(level)?;
         self.route_prepared(level, probe, logical_index)
     }
 }
@@ -3958,7 +3908,7 @@ where
             let place = MetadataPlace::new(prepared.signature(), self.metadata_scale);
             prefetch::prefetch_write(self.membership_ptr().wrapping_add(place.word()));
         }
-        // The level whose first probe `choose_slot_for_new_key` reads, judged
+        // The level whose first probe `choose_slot` reads, judged
         // from the cached batch; a stale batch only misdirects the hint.
         let level = match self.scheduler.cached_target() {
             BatchTarget::Bootstrap => 0,
@@ -3994,7 +3944,7 @@ where
         let prepared = PreparedElasticRoute::new(key_hash);
         let key_fingerprint = control::control_fingerprint_low(key_hash);
         let target = self.scheduler.target(self.live());
-        if let Some(placement) = self.choose_slot_for_new_key(prepared.probe, target) {
+        if let Some(placement) = self.choose_slot::<false>(prepared.probe, target) {
             self.place_new_entry(entry.key, entry.value, prepared, key_fingerprint, placement);
             false
         } else {
