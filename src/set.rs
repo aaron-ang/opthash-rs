@@ -450,27 +450,75 @@ where
     }
 }
 
+#[allow(clippy::inline_always)]
 impl<T, P> HashSet<T, P>
 where
     T: Eq + Hash,
     P: TableBackend<T, ()>,
 {
+    // `contains`, `get`, `insert`, `remove` and `take` are each three
+    // functions, as the map's keyed methods are: the body in a forced-inline
+    // `*_in_place`, that body as a function to call in `*_by_call`, and the
+    // public function, forced inline, picking by the backend's
+    // `LOOKUP_IN_CALLER`. A backend that looks up in the caller then does
+    // so through the set as well.
+
     /// Returns `true` if the set contains a value equal to `value`.
     #[must_use]
+    #[inline(always)]
     pub fn contains<Q>(&self, value: &Q) -> bool
+    where
+        Q: Hash + Equivalent<T> + ?Sized,
+    {
+        if P::LOOKUP_IN_CALLER {
+            self.contains_in_place(value)
+        } else {
+            self.contains_by_call(value)
+        }
+    }
+
+    #[inline(always)]
+    fn contains_in_place<Q>(&self, value: &Q) -> bool
     where
         Q: Hash + Equivalent<T> + ?Sized,
     {
         self.map.contains_key(value)
     }
 
+    fn contains_by_call<Q>(&self, value: &Q) -> bool
+    where
+        Q: Hash + Equivalent<T> + ?Sized,
+    {
+        self.contains_in_place(value)
+    }
+
     /// Returns a reference to the value equal to `value`, if any.
     #[must_use]
+    #[inline(always)]
     pub fn get<Q>(&self, value: &Q) -> Option<&T>
     where
         Q: Hash + Equivalent<T> + ?Sized,
     {
+        if P::LOOKUP_IN_CALLER {
+            self.get_in_place(value)
+        } else {
+            self.get_by_call(value)
+        }
+    }
+
+    #[inline(always)]
+    fn get_in_place<Q>(&self, value: &Q) -> Option<&T>
+    where
+        Q: Hash + Equivalent<T> + ?Sized,
+    {
         self.map.get_key_value(value).map(|(k, ())| k)
+    }
+
+    fn get_by_call<Q>(&self, value: &Q) -> Option<&T>
+    where
+        Q: Hash + Equivalent<T> + ?Sized,
+    {
+        self.get_in_place(value)
     }
 
     /// Inserts `value` if absent, then returns a reference to the stored value.
@@ -492,31 +540,83 @@ where
     }
 
     /// Inserts `value`. Returns `true` if it was newly added.
+    #[inline(always)]
     pub fn insert(&mut self, value: T) -> bool {
+        if P::LOOKUP_IN_CALLER {
+            self.insert_in_place(value)
+        } else {
+            self.insert_by_call(value)
+        }
+    }
+
+    #[inline(always)]
+    fn insert_in_place(&mut self, value: T) -> bool {
         self.map.insert(value, ()).is_none()
+    }
+
+    fn insert_by_call(&mut self, value: T) -> bool {
+        self.insert_in_place(value)
     }
 
     /// Inserts `value`, replacing and returning any equal existing value.
     pub fn replace(&mut self, value: T) -> Option<T> {
-        let replaced = self.map.remove_entry(&value).map(|(k, ())| k);
-        self.map.insert(value, ());
-        replaced
+        self.map.replace_key(value, ())
     }
 
     /// Removes the value equal to `value`. Returns whether it was present.
+    #[inline(always)]
     pub fn remove<Q>(&mut self, value: &Q) -> bool
+    where
+        Q: Hash + Equivalent<T> + ?Sized,
+    {
+        if P::LOOKUP_IN_CALLER {
+            self.remove_in_place(value)
+        } else {
+            self.remove_by_call(value)
+        }
+    }
+
+    #[inline(always)]
+    fn remove_in_place<Q>(&mut self, value: &Q) -> bool
     where
         Q: Hash + Equivalent<T> + ?Sized,
     {
         self.map.remove(value).is_some()
     }
 
+    fn remove_by_call<Q>(&mut self, value: &Q) -> bool
+    where
+        Q: Hash + Equivalent<T> + ?Sized,
+    {
+        self.remove_in_place(value)
+    }
+
     /// Removes and returns the value equal to `value`, if any.
+    #[inline(always)]
     pub fn take<Q>(&mut self, value: &Q) -> Option<T>
     where
         Q: Hash + Equivalent<T> + ?Sized,
     {
+        if P::LOOKUP_IN_CALLER {
+            self.take_in_place(value)
+        } else {
+            self.take_by_call(value)
+        }
+    }
+
+    #[inline(always)]
+    fn take_in_place<Q>(&mut self, value: &Q) -> Option<T>
+    where
+        Q: Hash + Equivalent<T> + ?Sized,
+    {
         self.map.remove_entry(value).map(|(k, ())| k)
+    }
+
+    fn take_by_call<Q>(&mut self, value: &Q) -> Option<T>
+    where
+        Q: Hash + Equivalent<T> + ?Sized,
+    {
+        self.take_in_place(value)
     }
 
     /// Retains only the values for which `f` returns `true`.
@@ -1101,3 +1201,6 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

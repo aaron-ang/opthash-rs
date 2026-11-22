@@ -3,7 +3,7 @@ use std::hash::{BuildHasher, Hasher};
 use opthash::{EpochTransition, ReserveFraction};
 
 mod support;
-use support::{Deterministic, ElasticHashMap, ElasticHashSet, FunnelHashMap};
+use support::{Deterministic, ElasticHashMap, ElasticHashSet, FunnelHashMap, FunnelHashSet};
 
 #[derive(Clone, Copy, Default)]
 struct ConstantBuildHasher;
@@ -160,22 +160,166 @@ fn tombstone_cleanup_is_an_observable_same_size_epoch_boundary() {
     let capacity = fill_to_capacity!(map);
     let before = map.epoch();
 
-    let mut removed = 0;
+    // Removals leave tombstones and no rebuild behind them.
+    for key in 1..capacity {
+        assert_eq!(map.remove(&key), Some(key));
+    }
+    assert_eq!(map.epoch().generation, before.generation);
+    assert!(map.epoch().had_delete);
+
+    // The inserts that reuse them start the cleanup.
+    let mut inserted = 0;
     while map.epoch().generation == before.generation {
-        assert_eq!(map.remove(&removed), Some(removed));
-        removed += 1;
-        assert!(
-            removed < capacity,
-            "cleanup must occur before the map empties"
-        );
+        inserted += 1;
+        assert!(inserted < capacity, "cleanup must occur before the refill");
+        assert_eq!(map.insert(inserted, inserted), None);
     }
 
     let after = map.epoch();
     assert_eq!(map.capacity(), capacity);
     assert_eq!(after.generation, before.generation + 1);
     assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
+    assert!(inserted <= 2, "took {inserted} inserts");
+    for key in 0..=inserted {
+        assert_eq!(map.get(&key), Some(&key));
+    }
+    assert_eq!(map.len(), inserted + 1);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn removals_alone_clean_up_once_per_capacity_of_deletes() {
+    let mut map = ElasticHashMap::<usize, usize>::with_capacity(512);
+    let capacity = fill_to_capacity!(map);
+    let before = map.epoch();
+
+    // Churn on the last key: every insert lands on the tombstone its
+    // removal left, so the deletes count and no level passes its threshold.
+    let churned = capacity - 1;
+    let churns = capacity / 4;
+    for _ in 0..churns {
+        assert_eq!(map.remove(&churned), Some(churned));
+        assert_eq!(map.insert(churned, churned), None);
+    }
+    assert_eq!(map.epoch().generation, before.generation);
+
+    // The rebuild waits for a capacity's worth of deletes, well past the
+    // removal that took a level over its threshold.
+    let mut removed = 0;
+    while map.epoch().generation == before.generation {
+        assert_eq!(map.remove(&removed), Some(removed));
+        removed += 1;
+        assert!(
+            removed < churned,
+            "cleanup must occur before the map empties"
+        );
+    }
+    assert_eq!(removed + churns, capacity);
+    let after = map.epoch();
+    assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
     assert!(!after.had_delete);
     assert_eq!(after.distinct_insertions, map.len());
+    assert_eq!(map.capacity(), capacity);
+}
+
+/// Drains a full map to one key with single removals, runs `$insert` to add
+/// one absent key, and asserts that the insert took a tombstone's slot in
+/// the epoch the removals left.
+macro_rules! assert_absent_insert_reuses_a_tombstone {
+    ($map:expr, |$m:ident, $key:ident| $insert:expr) => {{
+        let mut map = $map;
+        let capacity = fill_to_capacity!(map);
+        let before = map.epoch();
+        let kept = capacity - 1;
+        for key in 0..kept {
+            assert!(map.remove(&key).is_some());
+        }
+        assert_eq!(map.epoch().generation, before.generation);
+        assert!(map.contains_key(&kept));
+        assert!(!map.contains_key(&0));
+
+        {
+            let $m = &mut map;
+            let $key = capacity;
+            $insert;
+        }
+        assert_eq!(map.epoch().generation, before.generation);
+        assert_eq!(map.capacity(), capacity);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key(&kept));
+        assert!(map.contains_key(&capacity));
+        assert!(!map.contains_key(&0));
+    }};
+}
+
+/// Single removals rebuild nothing, and neither does the insert after them:
+/// it places in a slot a removal freed. The bulk removals run the cleanup.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn funnel_absent_insert_reuses_a_tombstone_on_every_insert_path() {
+    assert_absent_insert_reuses_a_tombstone!(
+        FunnelHashMap::<usize, usize>::with_capacity(512),
+        |map, key| {
+            // Replacing a value places nothing.
+            let kept = key - 1;
+            assert_eq!(map.insert(kept, 0), Some(kept));
+            assert_eq!(map.insert(key, key), None);
+        }
+    );
+    assert_absent_insert_reuses_a_tombstone!(
+        FunnelHashMap::<usize, usize>::with_capacity(512),
+        |map, key| {
+            assert_eq!(*map.entry(key).or_insert(key), key);
+        }
+    );
+    assert_absent_insert_reuses_a_tombstone!(
+        FunnelHashMap::<usize, usize>::with_capacity(512),
+        |map, key| {
+            assert_eq!(map.try_insert(key, key).ok(), Some(&mut { key }));
+        }
+    );
+
+    let mut set = FunnelHashSet::<usize>::with_capacity(512);
+    let capacity = set.capacity();
+    for key in 0..capacity {
+        assert!(set.insert(key));
+    }
+    let before = set.epoch();
+    let kept = capacity - 1;
+    for key in 0..kept {
+        assert!(set.remove(&key));
+    }
+    assert_eq!(*set.get_or_insert(capacity), capacity);
+    assert_eq!(set.epoch().generation, before.generation);
+    assert_eq!(set.capacity(), capacity);
+    assert_eq!(set.len(), 2);
+    assert!(set.contains(&kept) && set.contains(&capacity));
+}
+
+/// Removed keys stay counted as distinct insertions of their epoch, and a
+/// clone reports the epoch its source does.
+#[test]
+fn removed_keys_stay_distinct_insertions_and_a_clone_agrees() {
+    macro_rules! check {
+        ($map:ty) => {{
+            let mut map = <$map>::with_capacity(512);
+            fill_identity!(map, 0..200);
+            for key in 0..10 {
+                assert_eq!(map.remove(&key), Some(key));
+            }
+            let epoch = map.epoch();
+            assert_eq!(epoch.distinct_insertions, 200);
+            assert!(epoch.had_delete);
+            assert_eq!(map.clone().epoch(), epoch);
+
+            fill_identity!(map, 200..210);
+            let epoch = map.epoch();
+            assert_eq!(epoch.distinct_insertions, 210);
+            assert_eq!(map.clone().epoch(), epoch);
+        }};
+    }
+    check!(FunnelHashMap<usize, usize>);
+    check!(ElasticHashMap<usize, usize>);
 }
 
 #[test]
@@ -228,6 +372,101 @@ fn partial_extract_drop_finishes_deferred_tombstone_cleanup() {
 
     check!(ElasticHashMap::<usize, usize>::with_capacity(512));
     check!(FunnelHashMap::<usize, usize>::with_capacity(512));
+}
+
+/// A shrink that reaches no smaller table is not a resize: the entries stay
+/// in the allocation and the epoch they were placed in.
+#[test]
+fn shrink_that_reaches_no_smaller_table_keeps_the_epoch() {
+    macro_rules! check {
+        ($Map:ident) => {{
+            let mut map = $Map::<usize, usize>::with_capacity(64);
+            let capacity = fill_to_capacity!(map);
+            let before = map.epoch();
+
+            map.shrink_to_fit();
+            map.shrink_to(capacity);
+            assert_eq!(map.epoch(), before);
+            assert_eq!(map.capacity(), capacity);
+            assert_identity_present!(map, 0..capacity);
+        }};
+    }
+    check!(ElasticHashMap);
+    check!(FunnelHashMap);
+}
+
+/// A map that never allocated has nothing to shrink.
+#[test]
+fn shrink_of_an_unallocated_map_keeps_the_epoch() {
+    macro_rules! check {
+        ($Map:ident) => {{
+            let mut map = $Map::<usize, usize>::new();
+            let before = map.epoch();
+
+            map.shrink_to_fit();
+            map.shrink_to(0);
+            assert_eq!(map.epoch(), before);
+            assert_eq!(map.capacity(), 0);
+        }};
+    }
+    check!(ElasticHashMap);
+    check!(FunnelHashMap);
+}
+
+/// A bulk removal cleans up the tombstones single removals left, even when
+/// it removes nothing itself and even when the single removals have gone on
+/// to refresh the filter. It rebuilds nothing once inserts have taken those
+/// tombstones back.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn funnel_bulk_removal_cleans_only_the_tombstones_still_in_place() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Then {
+        Nothing,
+        Refill,
+        RefreshFilter,
+    }
+
+    for then in [Then::Nothing, Then::Refill, Then::RefreshFilter] {
+        let mut map = FunnelHashMap::<usize, usize>::with_capacity(512);
+        let capacity = fill_to_capacity!(map);
+        let before = map.epoch();
+        for key in 1..capacity {
+            assert_eq!(map.remove(&key), Some(key));
+        }
+        match then {
+            Then::Nothing => {}
+            Then::Refill => {
+                for key in 1..capacity {
+                    assert_eq!(map.insert(key, key), None);
+                }
+            }
+            // One removal short of a capacity of them so far: these take
+            // the count past it.
+            Then::RefreshFilter => {
+                for key in capacity..capacity + 8 {
+                    assert_eq!(map.insert(key, key), None);
+                    assert_eq!(map.remove(&key), Some(key));
+                }
+            }
+        }
+        assert_eq!(map.epoch().generation, before.generation, "{then:?}");
+
+        map.retain(|_, _| true);
+
+        let after = map.epoch();
+        assert_eq!(map.capacity(), capacity, "{then:?}");
+        if then == Then::Refill {
+            assert_eq!(after.generation, before.generation);
+            assert_identity_present!(map, 0..capacity);
+        } else {
+            assert_eq!(after.generation, before.generation + 1, "{then:?}");
+            assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
+            assert_eq!(map.len(), 1, "{then:?}");
+            assert_eq!(map.get(&0), Some(&0), "{then:?}");
+            assert_eq!(map.get(&1), None, "{then:?}");
+        }
+    }
 }
 
 #[test]

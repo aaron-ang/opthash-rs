@@ -218,11 +218,18 @@ impl FunnelPrf {
         }
     }
 
-    /// The key hash whose folded word is zero. Every level whose bucket
-    /// count is not a power of two rejects that first word.
+    /// The key hash whose folded word is zero, which draws bucket zero in
+    /// every ordinary level.
     #[cfg(test)]
     pub(crate) const fn zero_word_hash(self) -> u64 {
         self.lane_seed.wrapping_neg()
+    }
+
+    /// The factor from one ordinary level's multiplier to the next level's,
+    /// which a walk over consecutive levels applies to its running word.
+    #[inline]
+    pub(crate) const fn level_step(self) -> u64 {
+        self.fold
     }
 
     #[inline]
@@ -235,16 +242,25 @@ impl FunnelPrf {
     }
 
     /// Odd multiplier that turns a key's folded word into its first random
-    /// word in ordinary level `level`.
+    /// word in ordinary level `level`: [`KEY_FOLD`] raised to one more than
+    /// the level, so each level's word is the level before's times
+    /// [`Self::level_step`] and the first level's is not the folded word the
+    /// fingerprint is cut from.
     pub(crate) const fn ordinary_multiplier(level: u64) -> Option<u64> {
-        match Self::ordinary_counter_base(level) {
-            Some(counter_base) => Some(mix64(counter_base ^ INITIAL_LANE) | 1),
-            None => None,
+        if try_pack_funnel_counter(ProbeDomain::FunnelOrdinary { level }, 0, 0).is_none() {
+            return None;
         }
-    }
-
-    pub(crate) const fn ordinary_counter_base(level: u64) -> Option<u64> {
-        try_pack_funnel_counter(ProbeDomain::FunnelOrdinary { level }, 0, 0)
+        let mut multiplier = KEY_FOLD;
+        let mut square = KEY_FOLD;
+        let mut exponent = level;
+        while exponent != 0 {
+            if exponent & 1 == 1 {
+                multiplier = multiplier.wrapping_mul(square);
+            }
+            square = square.wrapping_mul(square);
+            exponent >>= 1;
+        }
+        Some(multiplier)
     }
 }
 
@@ -458,8 +474,14 @@ impl ElasticProbeSequence {
     #[allow(clippy::cast_lossless)]
     #[inline]
     pub(crate) const fn word(self, sequence_index: u32) -> u64 {
+        self.word_at(sequence_index as u64)
+    }
+
+    /// [`Self::word`] for a sequence index already as wide as the word.
+    #[inline]
+    pub(crate) const fn word_at(self, sequence_index: u64) -> u64 {
         self.origin
-            .wrapping_add((sequence_index as u64).wrapping_mul(self.stride))
+            .wrapping_add(sequence_index.wrapping_mul(self.stride))
     }
 
     /// First random word of the first logical probe of the level whose
@@ -501,7 +523,7 @@ impl PreparedFastFunnelProbe {
     }
 
     #[inline]
-    const fn ordinary_first_word(self, multiplier: u64) -> u64 {
+    pub(crate) const fn ordinary_first_word(self, multiplier: u64) -> u64 {
         self.key_out.wrapping_mul(multiplier)
     }
 
@@ -660,14 +682,6 @@ impl PreparedProbeRange {
         }
     }
 
-    /// A range with no index, which rejects every word.
-    pub(crate) const fn rejecting() -> Self {
-        Self {
-            upper: 0,
-            rejection_threshold: u64::MAX,
-        }
-    }
-
     pub(crate) fn new(upper: usize) -> Result<Self, RangeReductionError> {
         if upper == 0 {
             return Err(RangeReductionError::ZeroUpperBound);
@@ -746,19 +760,8 @@ pub(crate) fn unbiased_prepared_elastic_probe_index(
     probe: PreparedElasticProbe,
     counter_base: u32,
     upper: usize,
-    max_random_words: u32,
 ) -> Result<ProbeIndex, RangeReductionError> {
-    if max_random_words > ELASTIC_REJECTION_LIMIT {
-        return Err(RangeReductionError::RejectionLimitExceeded {
-            random_word_count: 0,
-        });
-    }
     if upper.is_power_of_two() {
-        if max_random_words == 0 {
-            return Err(RangeReductionError::RejectionLimitExceeded {
-                random_word_count: 0,
-            });
-        }
         let word = probe.word_from_counter_base(counter_base, 0);
         let index = if upper == 1 {
             0
@@ -771,7 +774,7 @@ pub(crate) fn unbiased_prepared_elastic_probe_index(
             random_word_count: 1,
         });
     }
-    reduce_prepared_elastic_non_power(probe, counter_base, upper, max_random_words)
+    reduce_prepared_elastic_non_power(probe, counter_base, upper)
 }
 
 /// Shift that reduces a random word to an index in `[0, upper)` by keeping
@@ -794,6 +797,14 @@ pub(crate) const fn elastic_index_shift(upper: usize) -> Option<u32> {
 pub(crate) const fn shifted_elastic_index(word: u64, index_shift: u32) -> usize {
     debug_assert!(index_shift < u64::BITS);
     (word >> index_shift) as usize
+}
+
+/// [`shifted_elastic_index`] by the low six bits of `index_shift`, for a
+/// caller whose shift shares its word with other fields above them.
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+pub(crate) const fn masked_shift_elastic_index(word: u64, index_shift: u32) -> usize {
+    word.wrapping_shr(index_shift) as usize
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -827,76 +838,32 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
     reduce_prepared_funnel_retries(probe, logical_probe_index, range, last_rejection_index)
 }
 
-/// The bucket an ordinary level's first random word selects, and whether that
-/// word is accepted. The bucket is below the range's upper bound either way;
-/// a rejected word needs [`ordinary_funnel_retry_index`].
+/// The bucket of a key in an ordinary level of `buckets` buckets: the
+/// multiply-high reduction of the level's random word, with no rejection
+/// test. Consecutive runs of words draw each bucket, and two runs differ by
+/// at most one word, so a bucket's share of the words departs from an even
+/// one by less than `buckets` parts in `2^64`. A level with no buckets draws
+/// bucket zero.
 ///
-/// The first word of an ordinary level is the folded key times that level's
+/// The random word of an ordinary level is the folded key times that level's
 /// multiplier, not a counter word: `key_out` already folds every bit of the
 /// key, and a distinct odd multiplier per level decorrelates the levels with
-/// one multiply.
-#[allow(clippy::cast_possible_truncation)]
+/// one multiply. The multipliers are successive powers of one constant. The
+/// key whose folded word is zero draws bucket zero in every level.
 #[inline]
-pub(crate) fn ordinary_funnel_first_draw(
+pub(crate) fn ordinary_funnel_bucket(
     probe: PreparedFastFunnelProbe,
     multiplier: u64,
-    range: PreparedProbeRange,
-) -> (usize, bool) {
-    let product =
-        u128::from(probe.ordinary_first_word(multiplier)) * u128::from(range.upper as u64);
-    (
-        (product >> u64::BITS) as usize,
-        product as u64 >= range.rejection_threshold,
-    )
+    buckets: usize,
+) -> usize {
+    ordinary_bucket_of_word(probe.ordinary_first_word(multiplier), buckets)
 }
 
-/// [`ordinary_funnel_first_draw`]'s bucket when its word is accepted.
-#[inline]
-pub(crate) fn ordinary_funnel_first_index(
-    probe: PreparedFastFunnelProbe,
-    multiplier: u64,
-    range: PreparedProbeRange,
-) -> Option<usize> {
-    let (bucket, accepted) = ordinary_funnel_first_draw(probe, multiplier, range);
-    accepted.then_some(bucket)
-}
-
-/// [`ordinary_funnel_first_draw`]'s bucket when the range's upper bound alone
-/// shows the word accepted: the rejection threshold is below that bound, so a
-/// low product above the bound is at or above the threshold. `None` leaves
-/// the word to the exact test, and is the answer for every word of a range
-/// with no index.
+/// [`ordinary_funnel_bucket`] of a level's random word.
 #[allow(clippy::cast_possible_truncation)]
 #[inline]
-pub(crate) fn ordinary_funnel_first_certain_index(
-    probe: PreparedFastFunnelProbe,
-    multiplier: u64,
-    range: PreparedProbeRange,
-) -> Option<usize> {
-    let upper = range.upper as u64;
-    let product = u128::from(probe.ordinary_first_word(multiplier)) * u128::from(upper);
-    (product as u64 > upper).then_some((product >> u64::BITS) as usize)
-}
-
-/// Counter words one to [`RANGE_WORD_CAP`] of ordinary level `level`, for a
-/// probe whose first word was rejected. `None` is a range failure.
-#[cold]
-#[inline(never)]
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) fn ordinary_funnel_retry_index(
-    probe: PreparedFastFunnelProbe,
-    level: usize,
-    range: PreparedProbeRange,
-) -> Option<usize> {
-    let counter_base = FunnelPrf::ordinary_counter_base(level as u64)?;
-    reduce_prepared_funnel_retries(
-        &probe.prepare_counter_base(counter_base),
-        0,
-        range,
-        (RANGE_WORD_CAP - 1) as u8,
-    )
-    .ok()
-    .map(|probe| probe.index)
+pub(crate) const fn ordinary_bucket_of_word(word: u64, buckets: usize) -> usize {
+    ((word as u128 * buckets as u128) >> u64::BITS) as usize
 }
 
 #[cold]
@@ -930,9 +897,8 @@ fn reduce_prepared_elastic_non_power(
     probe: PreparedElasticProbe,
     counter_base: u32,
     upper: usize,
-    max_random_words: u32,
 ) -> Result<ProbeIndex, RangeReductionError> {
-    reduce_probe_words(upper, max_random_words, |rejection_index| {
+    reduce_probe_words(upper, RANGE_WORD_CAP, |rejection_index| {
         probe.word_from_counter_base(counter_base, rejection_index)
     })
 }
@@ -1224,6 +1190,29 @@ pub(crate) const fn elastic_level_probe_budget(
         reserve_exponent as u64
     };
     c as u64 * capped
+}
+
+/// The inserts into a level of `level_slots` with `free_slots` of them
+/// free, each taking one, that [`elastic_level_probe_budget`] gives the
+/// budget it gives the first: all of them once the budget is the capped
+/// one, which a fuller level keeps, and otherwise those that leave the
+/// logarithm as it is.
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+pub(crate) const fn elastic_level_budget_run(
+    free_slots: u32,
+    level_slots: u32,
+    reserve_exponent: u32,
+) -> u32 {
+    debug_assert!(0 < free_slots && free_slots <= level_slots);
+    let log_ceiling = dyadic_log_ceiling(free_slots as u64, level_slots as u64);
+    if log_ceiling as u64 * log_ceiling as u64 >= reserve_exponent as u64 {
+        return u32::MAX;
+    }
+    // The fewest free slots with this logarithm. The logarithm is at most
+    // the width of the counts, so the shifts are in range.
+    let fewest = ((level_slots as u64 + (1 << log_ceiling) - 1) >> log_ceiling) as u32;
+    free_slots - fewest + 1
 }
 
 /// `ceil(log2(level_slots / free_slots))` for `0 < free_slots <=

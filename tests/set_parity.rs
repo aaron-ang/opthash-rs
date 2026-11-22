@@ -11,8 +11,11 @@ macro_rules! set_suite {
     ($mod_name:ident, $TestSet:ident, $Entry:ident) => {
         mod $mod_name {
             use crate::support::{Deterministic, $TestSet as HashSet};
+            use core::cell::Cell;
+            use core::hash::{Hash, Hasher};
             use opthash::DefaultHashBuilder;
             use opthash::$Entry as Entry;
+            use std::collections::BTreeSet;
 
             #[test]
             fn test_zero_capacities() {
@@ -376,6 +379,50 @@ macro_rules! set_suite {
             }
 
             #[test]
+            fn test_replace_among_removals() {
+                use core::hash;
+
+                #[derive(Debug)]
+                struct Tagged(u32, u32);
+
+                impl PartialEq for Tagged {
+                    fn eq(&self, other: &Self) -> bool {
+                        self.0 == other.0
+                    }
+                }
+
+                impl Eq for Tagged {}
+
+                impl hash::Hash for Tagged {
+                    fn hash<H: hash::Hasher>(&self, h: &mut H) {
+                        self.0.hash(h);
+                    }
+                }
+
+                const KEYS: u32 = 2_000;
+                let mut s = HashSet::new();
+                for id in 0..KEYS {
+                    assert!(s.insert(Tagged(id, 0)));
+                }
+                for id in (0..KEYS).step_by(3) {
+                    assert!(s.remove(&Tagged(id, 0)));
+                }
+                for id in 0..KEYS {
+                    let displaced = s.replace(Tagged(id, 1));
+                    if id % 3 == 0 {
+                        assert!(displaced.is_none(), "id {id}");
+                    } else {
+                        assert_eq!(displaced.map(|old| old.1), Some(0), "id {id}");
+                    }
+                }
+                assert_eq!(s.len(), KEYS as usize);
+                for id in 0..KEYS {
+                    assert_eq!(s.get(&Tagged(id, 0)).map(|kept| kept.1), Some(1));
+                }
+                assert!(s.iter().all(|kept| kept.1 == 1));
+            }
+
+            #[test]
             fn test_extend_ref() {
                 let mut a = HashSet::new();
                 a.insert(1);
@@ -451,6 +498,212 @@ macro_rules! set_suite {
                     opthash::$TestSet::with_hasher(MyHasher);
                 set.insert(19);
                 assert!(set.contains(&19));
+            }
+
+            /// A value that counts how often the calling thread hashes one.
+            #[derive(Clone, Copy, PartialEq, Eq)]
+            struct Counted(u32);
+
+            thread_local! {
+                static HASHES: Cell<usize> = const { Cell::new(0) };
+            }
+
+            impl Hash for Counted {
+                fn hash<H: Hasher>(&self, state: &mut H) {
+                    HASHES.set(HASHES.get() + 1);
+                    self.0.hash(state);
+                }
+            }
+
+            fn hashes_during(run: impl FnOnce()) -> usize {
+                let before = HASHES.get();
+                run();
+                HASHES.get() - before
+            }
+
+            /// Pairs of operands: disjoint, overlapping, nested, equal and
+            /// empty, the longer one on either side.
+            fn operand_pairs() -> Vec<(Vec<u32>, Vec<u32>)> {
+                let ranges = [
+                    (0..0, 0..0),
+                    (0..5, 0..0),
+                    (0..5, 5..9),
+                    (0..5, 3..12),
+                    (0..40, 10..13),
+                    (0..7, 0..7),
+                    (0..7, 3..10),
+                ];
+                ranges
+                    .into_iter()
+                    .flat_map(|(left, right)| {
+                        let (left, right): (Vec<u32>, Vec<u32>) = (left.collect(), right.collect());
+                        [(left.clone(), right.clone()), (right, left)]
+                    })
+                    .collect()
+            }
+
+            fn sorted<T: Ord>(values: impl IntoIterator<Item = T>) -> Vec<T> {
+                let mut values: Vec<T> = values.into_iter().collect();
+                values.sort_unstable();
+                values
+            }
+
+            #[test]
+            fn operators_match_the_ordered_set_operators() {
+                type Assign = (fn(&mut HashSet<u32>, &HashSet<u32>), BTreeSet<u32>);
+                for (left, right) in operand_pairs() {
+                    let (a, b): (HashSet<u32>, HashSet<u32>) = (
+                        left.iter().copied().collect(),
+                        right.iter().copied().collect(),
+                    );
+                    let (x, y): (BTreeSet<u32>, BTreeSet<u32>) = (
+                        left.iter().copied().collect(),
+                        right.iter().copied().collect(),
+                    );
+
+                    assert_eq!(sorted(&a | &b), sorted(&x | &y), "{left:?} | {right:?}");
+                    assert_eq!(sorted(&a & &b), sorted(&x & &y), "{left:?} & {right:?}");
+                    assert_eq!(sorted(&a ^ &b), sorted(&x ^ &y), "{left:?} ^ {right:?}");
+                    assert_eq!(sorted(&a - &b), sorted(&x - &y), "{left:?} - {right:?}");
+
+                    let assigns: [Assign; 4] = [
+                        (|a, b| *a |= b, &x | &y),
+                        (|a, b| *a &= b, &x & &y),
+                        (|a, b| *a ^= b, &x ^ &y),
+                        (|a, b| *a -= b, &x - &y),
+                    ];
+                    for (index, (assign, expected)) in assigns.into_iter().enumerate() {
+                        let mut assigned = a.clone();
+                        assign(&mut assigned, &b);
+                        assert_eq!(
+                            sorted(assigned),
+                            sorted(expected),
+                            "operator {index} of {left:?} and {right:?}"
+                        );
+                    }
+                    // The compound assignments worked on clones; the operands are unchanged.
+                    assert_eq!(sorted(a), left);
+                    assert_eq!(sorted(b), right);
+                }
+            }
+
+            #[test]
+            fn set_operations_look_up_only_the_shorter_operand() {
+                let long: HashSet<Counted> = (0..64).map(Counted).collect();
+                let short: HashSet<Counted> = (60..63).map(Counted).collect();
+                for (a, b) in [(&long, &short), (&short, &long)] {
+                    let hashes = hashes_during(|| assert_eq!(a.intersection(b).count(), 3));
+                    assert_eq!(hashes, short.len(), "intersection");
+                    let hashes = hashes_during(|| assert_eq!(a.union(b).count(), 64));
+                    assert_eq!(hashes, short.len(), "union");
+                }
+
+                let mut left = long.clone();
+                let hashes = hashes_during(|| left -= &short);
+                assert_eq!(hashes, short.len());
+                assert_eq!(left.len(), 61);
+                let mut left = short.clone();
+                let hashes = hashes_during(|| left -= &long);
+                assert_eq!(hashes, short.len());
+                assert!(left.is_empty());
+            }
+
+            #[test]
+            fn capacity_calls_reach_the_table() {
+                let mut set: HashSet<u32> = HashSet::new();
+                let mut model = BTreeSet::new();
+                assert!(set.is_empty());
+                set.reserve(100);
+                assert!(set.capacity() >= 100);
+                for value in 0..10 {
+                    assert_eq!(set.insert(value), model.insert(value));
+                    assert_eq!(set.is_empty(), model.is_empty());
+                }
+
+                let reserved = set.capacity();
+                assert_eq!(set.try_reserve(4 * reserved), Ok(()));
+                let grown = set.capacity();
+                assert!(grown >= set.len() + 4 * reserved);
+                assert!(set.try_reserve(usize::MAX).is_err());
+                assert_eq!(set.capacity(), grown);
+
+                set.shrink_to(reserved);
+                assert!((reserved..grown).contains(&set.capacity()));
+                assert_eq!(sorted(set.iter().copied()), sorted(model.iter().copied()));
+
+                set.clear();
+                model.clear();
+                assert_eq!(set.len(), model.len());
+                assert!(set.is_empty());
+                assert!(!set.contains(&3));
+                assert!(set.insert(3));
+            }
+
+            #[test]
+            fn default_hasher_constructors_keep_their_reserve() {
+                // Default-hasher constructor surface; no value is hashed here.
+                type HS = opthash::$TestSet<i32>;
+                let reserve = opthash::ReserveFraction::from_exponent(4).unwrap();
+                assert_ne!(reserve, opthash::ReserveFraction::default());
+                assert_eq!(HS::with_reserve(reserve).reserve_fraction(), reserve);
+                assert_eq!(
+                    HS::with_capacity_and_reserve(100, reserve).reserve_fraction(),
+                    reserve
+                );
+                assert!(HS::with_capacity_and_reserve(100, reserve).capacity() >= 100);
+            }
+
+            #[test]
+            fn from_array_holds_each_distinct_value() {
+                let values = [4, 1, 4, 9, 1, 7];
+                let set = <HashSet<i32>>::from(values);
+                assert_eq!(sorted(set), sorted(BTreeSet::from(values)));
+            }
+
+            #[test]
+            fn extract_if_size_hint_is_unbounded_and_the_filter_decides_the_count() {
+                type Keep = fn(u32) -> bool;
+                let keeps: [(Keep, usize); 3] =
+                    [(|_| false, 0), (|value| value % 2 == 0, 20), (|_| true, 40)];
+                for (extract, expected) in keeps {
+                    let mut set: HashSet<u32> = (0..40).collect();
+                    let mut extracted = set.extract_if(|value| extract(*value));
+                    let mut yielded = 0;
+                    loop {
+                        assert_eq!(extracted.size_hint(), (0, None));
+                        if extracted.next().is_none() {
+                            break;
+                        }
+                        yielded += 1;
+                    }
+                    assert_eq!(yielded, expected);
+                    drop(extracted);
+                    assert_eq!(set.len(), 40 - expected);
+                }
+            }
+
+            #[test]
+            fn entry_or_insert_adds_only_an_absent_value() {
+                let mut set: HashSet<&str> = HashSet::new();
+                let mut model = BTreeSet::new();
+                for value in ["a", "b", "a", "c", "b"] {
+                    set.entry(value).or_insert();
+                    model.insert(value);
+                    assert!(set.contains(value));
+                    assert_eq!(set.len(), model.len());
+                }
+            }
+
+            #[test]
+            fn set_equality_follows_the_values() {
+                let model = BTreeSet::from([1, 2, 3]);
+                let base: HashSet<i32> = model.iter().copied().collect();
+                for other in [vec![1, 2, 4], vec![1, 2], vec![1, 2, 3, 4], vec![3, 1, 2]] {
+                    let theirs: BTreeSet<i32> = other.iter().copied().collect();
+                    let ours: HashSet<i32> = other.into_iter().collect();
+                    assert_eq!(base == ours, model == theirs);
+                    assert_eq!(ours == base, model == theirs);
+                }
             }
 
             #[test]

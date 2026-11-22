@@ -170,16 +170,39 @@ impl Drop for PanicHashKey {
 ///
 /// `gate_passes` reports whether the backend's filter still admits `key`;
 /// `stale_membership` reads the backend's count of deletes since the last
-/// refresh.
+/// refresh; the refresh runs with delete number `refresh_at(threshold)`.
+/// Until then the filter admits every departed key.
 pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
     gate_passes: impl Fn(&P, u64) -> bool,
     stale_membership: impl Fn(&P) -> usize,
+    refresh_at: impl Fn(u64) -> u64,
+) where
+    P: TableBackend<u64, u64, Hasher = FixedHashBuilder, Alloc = Global>,
+{
+    assert_deletes_past_threshold_refresh_filter_from(
+        gate_passes,
+        stale_membership,
+        refresh_at,
+        |admitted, departed| assert_eq!(admitted, departed),
+    );
+}
+
+/// [`assert_deletes_past_threshold_refresh_filter`] for a filter that may
+/// drop a key as it departs: `admitted_before_refresh` checks how many of
+/// the departed keys the filter admits before the refresh, of how many
+/// departed.
+pub(crate) fn assert_deletes_past_threshold_refresh_filter_from<P>(
+    gate_passes: impl Fn(&P, u64) -> bool,
+    stale_membership: impl Fn(&P) -> usize,
+    refresh_at: impl Fn(u64) -> u64,
+    admitted_before_refresh: impl Fn(usize, usize),
 ) where
     P: TableBackend<u64, u64, Hasher = FixedHashBuilder, Alloc = Global>,
 {
     let mut map: HashMap<u64, u64, P> = Deterministic::with_capacity(2_048);
     let live = map.capacity() as u64;
     let threshold = membership::refresh_deletes(map.capacity()) as u64;
+    let refresh_at = refresh_at(threshold);
     for key in 0..live {
         map.insert(key, key);
     }
@@ -189,7 +212,11 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
     for &key in &departed {
         assert_eq!(map.remove(&key), Some(key));
     }
-    assert!(departed.iter().all(|&key| gate_passes(map.table(), key)));
+    let admitted = departed
+        .iter()
+        .filter(|&&key| gate_passes(map.table(), key))
+        .count();
+    admitted_before_refresh(admitted, departed.len());
     assert_eq!(stale_membership(map.table()) as u64, departed.len() as u64);
     assert_eq!(map.epoch().generation, 0);
 
@@ -204,11 +231,25 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
         if stale_membership(map.table()) == 0 {
             break;
         }
-        assert!(cycles <= threshold, "refresh never ran");
+        assert!(cycles < refresh_at, "refresh never ran");
     }
-    assert_eq!(cycles + departed.len() as u64, threshold + 1);
+    assert_eq!(cycles + departed.len() as u64, refresh_at);
     assert_eq!(map.epoch().generation, 0, "no rebuild ran");
     assert_eq!(stale_membership(map.table()), 0, "refresh resets the count");
+    assert_eq!(map.len() as u64, live - departed.len() as u64);
+    // The epoch still counts every delete, on either side of the refresh.
+    let epoch = map.epoch();
+    assert!(epoch.had_delete);
+    assert_eq!(
+        epoch.distinct_insertions as u64,
+        map.len() as u64 + refresh_at
+    );
+    map.insert(churn, churn);
+    assert_eq!(map.remove(&churn), Some(churn));
+    assert_eq!(
+        map.epoch().distinct_insertions as u64,
+        map.len() as u64 + refresh_at + 1
+    );
 
     // Live keys are still recorded and found; departed keys mostly are not.
     for key in (0..live).filter(|key| key % 3 != 0) {
@@ -224,6 +265,7 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
         "{false_positives} of {} departed keys still pass",
         departed.len()
     );
+    assert!(false_positives <= admitted);
 
     // Clearing every entry and refreshing empties the filter completely.
     map.retain(|_, _| false);
@@ -243,7 +285,8 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
 /// owed, so it runs once neither stands in its way.
 ///
 /// `stale_membership` reads the backend's count of deletes since the last
-/// refresh.
+/// refresh. A refresh that ran would have zeroed it, so a count still at the
+/// threshold is a refresh still owed.
 pub(crate) fn assert_interrupted_refresh_keeps_live_keys_reachable<P>(
     stale_membership: impl Fn(&P) -> usize,
 ) where
@@ -298,7 +341,7 @@ pub(crate) fn assert_interrupted_refresh_keeps_live_keys_reachable<P>(
     assert!(unwound, "no refresh hashed a live key");
     assert_eq!(map.epoch().generation, generation, "a rebuild ran");
     assert_live_keys_reachable(&map);
-    assert!(stale_membership(map.table()) > threshold);
+    assert!(stale_membership(map.table()) >= threshold);
 
     // Without scratch memory the refresh is skipped and stays owed.
     assert_eq!(map.insert(key(churn), churn), None);
@@ -306,7 +349,7 @@ pub(crate) fn assert_interrupted_refresh_keeps_live_keys_reachable<P>(
     assert_eq!(map.remove(&key(churn)), Some(churn));
     fail.store(false, Ordering::SeqCst);
     assert_live_keys_reachable(&map);
-    assert!(stale_membership(map.table()) > threshold);
+    assert!(stale_membership(map.table()) >= threshold);
 
     // The owed refresh runs at the next settling delete.
     assert_eq!(map.insert(key(churn), churn), None);
