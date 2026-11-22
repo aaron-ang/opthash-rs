@@ -1018,10 +1018,11 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// Deletes since the filter last matched the live set, less
     /// [`Self::uncounted_deletes`]; see [`membership::refresh_deletes`].
     stale_membership: usize,
-    /// With [`Self::stale_membership`], a bound on the tombstones: the
-    /// deletes a filter refresh took out of that count, since the controls
-    /// were last reset or counted. A placement that takes a tombstone's
-    /// lane leaves it as it is.
+    /// What [`Self::stale_membership`] lacks of a bound on the tombstones,
+    /// modulo the word: the sum of the two is the bound. A filter refresh
+    /// moves its deletes here, a count of the tombstones sets the sum to the
+    /// count, and a placement that takes a tombstone's lane leaves it as it
+    /// is.
     refreshed_deletes: usize,
     /// Deletes left before one has to look at the counters: a delete only
     /// counts this word down, and the first to exhaust it settles the rest.
@@ -1859,7 +1860,7 @@ where
         }
         bin_entries[bin] = in_bin;
         // The tombstones of the deletes the filter now forgets stay.
-        self.refreshed_deletes = self.refreshed_deletes.saturating_add(self.stale_membership);
+        self.refreshed_deletes = self.refreshed_deletes.wrapping_add(self.stale_membership);
         self.clear_membership();
         let mut hashes = hashes.into_iter();
         for (bin, entries) in bin_entries.into_iter().enumerate() {
@@ -1905,11 +1906,14 @@ where
 
     /// Whether a bulk delete leaves a cleanup due: the bound on the
     /// tombstones is past the cleanup threshold and a count of them
-    /// confirms it. A count that leaves the cleanup off becomes the bound,
-    /// so the next count waits for as many deletes again.
+    /// confirms it. A count that leaves the cleanup off becomes the bound.
+    ///
+    /// A count reads every control byte, so the cleanup comes a group's
+    /// share of the slots early: the deletes that then lie between two
+    /// counts pay for a count at one group read each.
     fn cleanup_is_due(&mut self) -> bool {
         let threshold = capacity::tombstone_cleanup_threshold(self.shape.n);
-        if self.refreshed_deletes.saturating_add(self.stale_membership) <= threshold {
+        if self.refreshed_deletes.wrapping_add(self.stale_membership) <= threshold {
             return false;
         }
         // SAFETY: the storage holds `shape.slots` initialized control bytes,
@@ -1920,8 +1924,8 @@ where
             .iter()
             .map(|&control| usize::from(control == CTRL_TOMBSTONE))
             .sum();
-        self.refreshed_deletes = tombstones.saturating_sub(self.stale_membership);
-        tombstones > threshold
+        self.refreshed_deletes = tombstones.wrapping_sub(self.stale_membership);
+        tombstones + self.shape.slots / GROUP_SIZE > threshold
     }
 
     /// The filter gate and exceptional full scan around the
@@ -2081,7 +2085,7 @@ where
     /// The bound on the tombstones, with the uncounted deletes in it.
     #[cfg(test)]
     fn tombstone_bound(&self) -> usize {
-        self.refreshed_deletes + self.stale_membership()
+        self.refreshed_deletes.wrapping_add(self.stale_membership())
     }
 
     #[cfg(test)]
@@ -3023,6 +3027,7 @@ where
                 let entry = unsafe { self.storage.take(slot) };
                 // SAFETY: `slot` is in bounds and its value was moved out.
                 unsafe { self.storage.set_control(slot, CTRL_TOMBSTONE) };
+                self.refreshed_deletes = self.refreshed_deletes.wrapping_add(1);
                 self.set_entries(self.entries() - 1);
                 drop(entry);
             }

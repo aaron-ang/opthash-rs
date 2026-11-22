@@ -419,13 +419,10 @@ fn funnel_bulk_removal_cleans_only_the_tombstones_still_in_place() {
         assert_eq!(map.capacity(), capacity, "{then:?}");
         if then == Then::Refill {
             assert_eq!(after.generation, before.generation);
+            assert_identity_present!(map, 0..capacity);
         } else {
             assert_eq!(after.generation, before.generation + 1, "{then:?}");
             assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
-        }
-        if then == Then::Refill {
-            assert_identity_present!(map, 0..capacity);
-        } else {
             assert_eq!(map.len(), 1, "{then:?}");
             assert_eq!(map.get(&0), Some(&0), "{then:?}");
             assert_eq!(map.get(&1), None, "{then:?}");
