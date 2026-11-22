@@ -3659,7 +3659,7 @@ where
 
         let summary = filter.summary();
         let (entry_origin, start) = self.probe_schedule.walk_reach(summary);
-        match start {
+        match start.run() {
             Ok(mut run) => loop {
                 // SAFETY: a sentinel closes the run, and the walk cannot
                 // pass it: its probe reads `EMPTY` and ends the walk below.

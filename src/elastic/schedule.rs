@@ -383,19 +383,6 @@ const LEVEL_ZERO_ALONE: SummaryBin = NO_LEVELS_OCCUPIED & !(1 << level_bit(0));
 const SPECULATED_LEVELS: usize = 2;
 const _: () = assert!(SPECULATED_LEVELS < GROUPED_LEVELS);
 
-/// Whether walks of the schedule of `levels` levels may speculate: level
-/// zero has a run, and the routes of [`SPECULATED_LEVELS`] levels and their
-/// sentinel end ahead of its lead, so it stays whole while they are all the
-/// schedule holds.
-const fn speculates_whole(levels: usize) -> bool {
-    let held = if levels < SPECULATED_LEVELS {
-        levels
-    } else {
-        SPECULATED_LEVELS
-    };
-    named_levels(levels) > 0 && whole_runs(levels, PROBE_SCHEDULE_CAPACITY[held], 1) == 1
-}
-
 /// A value no summary takes as a signed byte.
 const NO_SPECULATION: i64 = i8::MAX as i64 + 1;
 
@@ -716,7 +703,7 @@ pub(super) struct ProbeSchedule {
     /// does not read: the signed summary a walk takes its start for before
     /// its own summary arrives, [`LEVEL_ZERO_ALONE`] while the schedule
     /// holds routes of no more than [`SPECULATED_LEVELS`] levels and
-    /// [`speculates_whole`] holds, and [`NO_SPECULATION`] otherwise. [`Self::open`] writes them, and
+    /// [`NO_SPECULATION`] otherwise. [`Self::open`] writes them, and
     /// [`Self::clone_onto`] copies them from its source.
     direct_reduction: u64,
     direct_control: *const u8,
@@ -831,10 +818,7 @@ impl ProbeSchedule {
     /// steps on from, as [`Self::walk_start`] gives it.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn walk_reach(
-        &self,
-        summary: SummaryBin,
-    ) -> (*mut u8, Result<RunWalk, *const PhiRoute>) {
+    pub(super) fn walk_reach(&self, summary: SummaryBin) -> (*mut u8, WalkStart) {
         let (entry_origin, zero_start) = (self.entry_origin, self.book.zero_start.as_ptr());
         let summary = summary.cast_signed();
         // The top bits, sign-extended as the summary is. They fit an `i32`,
@@ -848,18 +832,14 @@ impl ProbeSchedule {
             // its way. A volatile read keeps the two reads apart, so they do
             // not merge into one read at a selected address.
             // SAFETY: `starts` has an entry at every signed byte's distance.
-            let lead = unsafe {
+            unsafe {
                 zero_start
                     .offset(isize::from(LEVEL_ZERO_ALONE.cast_signed()))
                     .read_volatile()
-            };
-            // Walks speculate only on a schedule whose level zero's run
-            // stays whole, so the entry is the lead of that run.
-            debug_assert!(lead.run().is_ok());
-            Ok(RunWalk(lead.0.cast()))
+            }
         } else {
             // SAFETY: `starts` has an entry at every signed byte's distance.
-            unsafe { *zero_start.offset(isize::from(summary)) }.run()
+            unsafe { *zero_start.offset(isize::from(summary)) }
         };
         (entry_origin, start)
     }
@@ -923,7 +903,7 @@ impl ProbeSchedule {
     /// routes; after the lead of a level's run, no other route at all.
     #[cfg(test)]
     pub(super) fn walk_start(&self, summary: SummaryBin) -> WalkStart {
-        self.book.starts[(WALK_STARTS / 2 + usize::from(summary)) % WALK_STARTS]
+        self.walk_reach(summary).1
     }
 
     #[cfg(test)]
@@ -1016,7 +996,7 @@ impl ProbeSchedule {
             }
         }
         self.set_whole(runs, groups);
-        let speculated = if after <= SPECULATED_LEVELS && speculates_whole(self.book.levels) {
+        let speculated = if after <= SPECULATED_LEVELS {
             i64::from(LEVEL_ZERO_ALONE.cast_signed())
         } else {
             NO_SPECULATION
@@ -1198,8 +1178,6 @@ impl ProbeSchedule {
         book.open_groups = 0;
         book.reach = PROBE_SCHEDULE_CAPACITY[book.levels] + 1;
         book.starts = [WalkStart::at_list(direct); WALK_STARTS];
-        self.direct_reduction = self.direct_reduction & !(u64::MAX << SPECULATED_SHIFT)
-            | NO_SPECULATION.cast_unsigned() << SPECULATED_SHIFT;
     }
 
     /// Whether every route is the one its level in `levels` gives, every
