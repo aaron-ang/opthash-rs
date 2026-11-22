@@ -3334,7 +3334,7 @@ fn a_group_mask_walked_from_the_top_visits_its_lanes_in_reverse() {
             // SAFETY: `matches` is a group mask less whole lanes, and not
             // empty.
             let depth = unsafe { highest_lane_depth(matches) };
-            assert_eq!(depth % BITMASK_STRIDE, 0, "{controls:02x?}");
+            assert!(depth.is_multiple_of(BITMASK_STRIDE), "{controls:02x?}");
             descending.push(GROUP_SIZE - 1 - (depth / BITMASK_STRIDE) as usize);
             // SAFETY: as above.
             let rest = unsafe { below_highest_lane(matches) };

@@ -469,7 +469,7 @@ const BITMASK_UNUSED_BITS: u32 = u64::BITS - GROUP_SIZE as u32 * BITMASK_STRIDE;
 unsafe fn highest_lane_depth(matches: u64) -> u32 {
     debug_assert_ne!(matches, 0);
     let depth = matches.leading_zeros() - BITMASK_UNUSED_BITS;
-    debug_assert_eq!(depth % BITMASK_STRIDE, 0);
+    debug_assert!(depth.is_multiple_of(BITMASK_STRIDE));
     // SAFETY: the caller's contract. Stating it lets the division by the
     // stride fold into the scaling of whatever the lane indexes.
     unsafe { core::hint::assert_unchecked(depth.is_multiple_of(BITMASK_STRIDE)) };
