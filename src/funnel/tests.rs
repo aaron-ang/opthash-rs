@@ -2051,11 +2051,12 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
     }
 }
 
-/// The placement walk must land where the ordered walk reports `Vacant`
-/// for an absent key, on clean epochs and with tombstones on the walk.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn vacancy_walk_matches_the_ordered_walk_for_absent_keys() {
+/// Runs `check` on a full table, then again once every third key has left
+/// a tombstone on the walks of the rest. `check` gets the table, the count
+/// of keys placed in it, and a label for its messages.
+fn check_full_then_tombstoned(
+    check: impl Fn(&FunnelTable<u64, u64, IdentityBuildHasher>, u64, &str),
+) {
     let mut table = raw_table(5_472, 8);
     let live = table.shape.max_insertions as u64;
     for key in 0..live {
@@ -2064,7 +2065,22 @@ fn vacancy_walk_matches_the_ordered_walk_for_absent_keys() {
             table.hash_builder.hash_one(key)
         ));
     }
-    let check = |table: &FunnelTable<u64, u64, IdentityBuildHasher>, label: &str| {
+    check(&table, live, "clean full table");
+    for key in (0..live).step_by(3) {
+        let hash = table.hash_builder.hash_one(key);
+        let slot = table.find(&key, hash).unwrap();
+        map::TableBackend::remove(&mut table, slot);
+    }
+    assert!(tombstone_controls(&table) > 0);
+    check(&table, live, "tombstoned table");
+}
+
+/// The placement walk must land where the ordered walk reports `Vacant`
+/// for an absent key, on clean epochs and with tombstones on the walk.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn vacancy_walk_matches_the_ordered_walk_for_absent_keys() {
+    check_full_then_tombstoned(|table, live, label| {
         let mut vacant = 0_usize;
         for key in live..live + 4_096 {
             let hash = table.hash_builder.hash_one(key);
@@ -2081,16 +2097,7 @@ fn vacancy_walk_matches_the_ordered_walk_for_absent_keys() {
             vacant += usize::from(matches!(exact, Walked::Vacant(_)));
         }
         assert!(vacant > 0, "{label}: fixture never reached a vacancy");
-    };
-    check(&table, "clean full table");
-
-    for key in (0..live).step_by(3) {
-        let hash = table.hash_builder.hash_one(key);
-        let slot = table.find(&key, hash).unwrap();
-        map::TableBackend::remove(&mut table, slot);
-    }
-    assert!(tombstone_controls(&table) > 0);
-    check(&table, "tombstoned table");
+    });
 }
 
 /// With every level bit set, the read-only walk must report exactly the
@@ -2099,19 +2106,11 @@ fn vacancy_walk_matches_the_ordered_walk_for_absent_keys() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn lookup_walk_matches_the_ordered_walk_hits() {
-    let mut table = raw_table(5_472, 8);
-    let live = table.shape.max_insertions as u64;
-    for key in 0..live {
-        assert!(!table.place_unique(
-            SlotEntry { key, value: key },
-            table.hash_builder.hash_one(key)
-        ));
-    }
-    // Every bit `level_bit` can record for this shape; a bit past the last
-    // level would index out of bounds.
-    let every_level = (0..table.shape.levels.len())
-        .fold(OVERFLOW_LEVEL_BIT, |mask, level| mask | level_bit_of(level));
-    let check = |table: &FunnelTable<u64, u64, IdentityBuildHasher>, label: &str| {
+    check_full_then_tombstoned(|table, live, label| {
+        // Every bit `level_bit` can record for this shape; a bit past the
+        // last level would index out of bounds.
+        let every_level = (0..table.shape.levels.len())
+            .fold(OVERFLOW_LEVEL_BIT, |mask, level| mask | level_bit_of(level));
         for key in 0..live + 4_096 {
             let hash = table.hash_builder.hash_one(key);
             let fingerprint = table.prf.prepare(hash).fingerprint();
@@ -2126,16 +2125,7 @@ fn lookup_walk_matches_the_ordered_walk_hits() {
                 "{label} key={key}"
             );
         }
-    };
-    check(&table, "clean full table");
-
-    for key in (0..live).step_by(3) {
-        let hash = table.hash_builder.hash_one(key);
-        let slot = table.find(&key, hash).unwrap();
-        map::TableBackend::remove(&mut table, slot);
-    }
-    assert!(tombstone_controls(&table) > 0);
-    check(&table, "tombstoned table");
+    });
 }
 
 #[test]

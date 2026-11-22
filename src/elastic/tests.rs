@@ -3310,41 +3310,59 @@ fn late_counted_settled_inserts_read_as_counted_at_once() {
     assert!(grown > 1, "the tables grew {grown} times");
 }
 
+type FallbackTable = ElasticTable<u64, u64, FixedHashBuilder>;
+
+/// Inserts `key` into the table that inserts settled and into the one that
+/// takes the general insert alone, and checks both place it alike.
+fn insert_settled_and_general(settled: &mut FallbackTable, general: &mut FallbackTable, key: u64) {
+    let hash = fixed_hasher().hash_one(key);
+    assert_eq!(settled.insert(key, key, hash), None);
+    general.insert_for_vacant_entry_prepared(
+        key,
+        key,
+        PreparedElasticRoute::new(hash),
+        control::control_fingerprint_low(hash),
+    );
+    assert_eq!(
+        settled.find(&key, hash),
+        general.find(&key, hash),
+        "key {key}"
+    );
+    assert_gate_past_an_insert(settled);
+    assert_gate_past_an_insert(general);
+}
+
+/// What the second pair's current level has free above half its reserve.
+fn fallback_room(table: &FallbackTable) -> usize {
+    free_in(table, 1) - table.levels[1].half_reserve as usize
+}
+
+/// A settled and a general table filled alike far enough into the second
+/// pair of levels that its current level's budget turns keys away, with
+/// the next key to insert.
+fn tables_at_the_fallback() -> (FallbackTable, FallbackTable, u64) {
+    let build = || table_with_slots(1 << 12, fixed_hasher());
+    let (mut settled, mut general) = (build(), build());
+    let mut next_key = 0_u64;
+    while settled.scheduler.target_at(settled.live()) != BatchTarget::LevelPair(1)
+        || fallback_room(&settled) > 8
+    {
+        insert_settled_and_general(&mut settled, &mut general, next_key);
+        next_key += 1;
+    }
+    (settled, general, next_key)
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
     const BLOCK: usize = 64;
-    type Table = ElasticTable<u64, u64, FixedHashBuilder>;
-
-    let build = || table_with_slots(1 << 12, fixed_hasher());
-    let (mut settled, mut general) = (build(), build());
+    let insert = insert_settled_and_general;
     let hash_of = |key: u64| fixed_hasher().hash_one(key);
-    let insert = |settled: &mut Table, general: &mut Table, key: u64| {
-        let hash = hash_of(key);
-        assert_eq!(settled.insert(key, key, hash), None);
-        general.insert_for_vacant_entry_prepared(
-            key,
-            key,
-            PreparedElasticRoute::new(hash),
-            control::control_fingerprint_low(hash),
-        );
-        assert_eq!(settled.find(&key, hash), general.find(&key, hash));
-        assert_gate_past_an_insert(settled);
-        assert_gate_past_an_insert(general);
-    };
-    // What the pair's current level has free above half its reserve.
-    let room = |table: &Table| free_in(table, 1) - table.levels[1].half_reserve as usize;
-    let fallback_low = |table: &Table| free_in(table, 2) * 4 <= table.levels[2].capacity();
+    let room = fallback_room;
+    let fallback_low = |table: &FallbackTable| free_in(table, 2) * 4 <= table.levels[2].capacity();
 
-    // Far enough into the second pair of levels that its current level's
-    // budget turns keys away.
-    let mut next_key = 0_u64;
-    while settled.scheduler.target_at(settled.live()) != BatchTarget::LevelPair(1)
-        || room(&settled) > 8
-    {
-        insert(&mut settled, &mut general, next_key);
-        next_key += 1;
-    }
+    let (mut settled, mut general, mut next_key) = tables_at_the_fallback();
     assert!(!fallback_low(&settled));
 
     // Blocks of keys leave and as many arrive, so the batch never ends, and
@@ -3398,39 +3416,15 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn settled_fallback_bound_holds_where_its_level_recrosses_a_quarter_free() {
-    type Table = ElasticTable<u64, u64, FixedHashBuilder>;
-
-    let build = || table_with_slots(1 << 12, fixed_hasher());
-    let (mut settled, mut general) = (build(), build());
+    let insert = insert_settled_and_general;
     let hash_of = |key: u64| fixed_hasher().hash_one(key);
-    let insert = |settled: &mut Table, general: &mut Table, key: u64| {
-        let hash = hash_of(key);
-        assert_eq!(settled.insert(key, key, hash), None);
-        general.insert_for_vacant_entry_prepared(
-            key,
-            key,
-            PreparedElasticRoute::new(hash),
-            control::control_fingerprint_low(hash),
-        );
-        assert_eq!(
-            settled.find(&key, hash),
-            general.find(&key, hash),
-            "key {key}"
-        );
-        assert_gate_past_an_insert(settled);
-    };
-    // What the pair's current level has free above half its reserve, and
-    // the level after it above a quarter of its slots.
-    let room = |table: &Table| free_in(table, 1) - table.levels[1].half_reserve as usize;
-    let margin = |table: &Table| free_in(table, 2).saturating_sub(table.levels[2].capacity() / 4);
+    let room = fallback_room;
+    // What the level after the current one has free above a quarter of its
+    // slots.
+    let margin =
+        |table: &FallbackTable| free_in(table, 2).saturating_sub(table.levels[2].capacity() / 4);
 
-    let mut next_key = 0_u64;
-    while settled.scheduler.target_at(settled.live()) != BatchTarget::LevelPair(1)
-        || room(&settled) > 8
-    {
-        insert(&mut settled, &mut general, next_key);
-        next_key += 1;
-    }
+    let (mut settled, mut general, mut next_key) = tables_at_the_fallback();
 
     // Keys leave the current level to keep it near half its reserve, the
     // level after it to keep it near a quarter free, and the first level to
