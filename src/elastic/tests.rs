@@ -4178,16 +4178,18 @@ fn run_walk_steps_over_its_level_routes_and_stops_at_a_sentinel() {
 type ComparesCountedMap = ElasticHashMap<ComparesCounted, u64, FixedHashBuilder>;
 
 /// A schedule takes the level-zero walk start ahead of the summary while
-/// no level past the first two holds an entry, stops once one does, keeps
-/// that through a clone and takes it up again after a clear. The walk
-/// starts stay those the summaries name either way.
+/// no level past the first two holds an entry and stops once one does,
+/// through a clone, a rebuild into more slots, a shrink and a clear. The
+/// walk starts stay those the summaries name either way.
 #[test]
 fn walks_speculate_on_level_zero_until_a_deeper_level_is_scheduled() {
     let mut map = FixedElasticHashMap::<u64, u64>::with_capacity_and_hasher(900, fixed_hasher());
     let schedule = |map: &FixedElasticHashMap<u64, u64>| {
         let table = map.table();
         assert!(table.probe_schedule.addresses(&table.levels));
-        (table.scheduled_levels, table.probe_schedule.speculates())
+        let speculates = table.probe_schedule.speculates();
+        assert_eq!(speculates, table.scheduled_levels <= 2);
+        (table.scheduled_levels, speculates)
     };
     assert_eq!(schedule(&map), (0, true));
     let mut key = 0;
@@ -4202,8 +4204,34 @@ fn walks_speculate_on_level_zero_until_a_deeper_level_is_scheduled() {
     for key in 0..key {
         assert_eq!(map.get(&key), Some(&key));
     }
+    map.reserve(4 * map.capacity());
+    schedule(&map);
+    map.retain(|&key, _| key < 8);
+    map.shrink_to_fit();
+    assert!(schedule(&map).1);
     map.clear();
     assert!(schedule(&map).1);
+}
+
+/// A copy keeps its source's choice not to speculate where the source
+/// holds a deeper level but no group's run, which a schedule too small to
+/// fit one has: the copy names no grouped level when it is made.
+#[test]
+fn clone_of_a_deep_schedule_without_group_runs_does_not_speculate() {
+    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            64,
+            ReserveFraction::DEFAULT,
+            IdentityBuildHasher,
+            Global,
+        )
+        .unwrap();
+    table.schedule_levels_through(schedule::GROUPED_LEVELS);
+    assert_eq!(table.probe_schedule.whole_groups(), (0, 0));
+    assert!(!table.probe_schedule.speculates());
+    let copy = table.clone_table();
+    assert!(!copy.probe_schedule.speculates());
+    assert!(copy.probe_schedule.addresses(&copy.levels));
 }
 
 /// Clears the count of key compares and returns what it was.
