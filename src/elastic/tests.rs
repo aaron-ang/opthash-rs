@@ -4196,6 +4196,7 @@ fn walks_speculate_on_level_zero_until_a_deeper_level_is_scheduled() {
         assert!(table.probe_schedule.addresses(&table.levels));
         let speculates = table.probe_schedule.speculates();
         assert_eq!(speculates, table.scheduled_levels <= 2);
+        assert!(!speculates || table.probe_schedule.whole_runs() > 0);
         (table.scheduled_levels, speculates)
     };
     assert_eq!(schedule(&map), (0, true));
@@ -5225,4 +5226,35 @@ fn a_live_count_at_or_past_the_last_batch_end_stays_in_the_last_batch() {
         assert_eq!(scheduler.target(len), BatchTarget::LevelPair(1), "{len}");
     }
     assert_eq!(scheduler.target(4), BatchTarget::LevelPair(0));
+}
+
+/// A schedule of two levels pushed to the query-position cap still holds
+/// level zero's run whole, which a walk that speculates enters directly.
+#[test]
+fn speculating_walks_keep_level_zero_run_whole_at_the_query_cap() {
+    for slots in [64, 1_024, 16_384] {
+        let mut table =
+            ElasticTable::<u64, u64, FixedHashBuilder>::try_with_slots_and_reserve_fraction_and_hasher_in(
+                slots,
+                ReserveFraction::DEFAULT,
+                fixed_hasher(),
+                Global,
+            )
+            .unwrap();
+        let keys = 8;
+        for key in 0..keys {
+            let hash = table.hash_key(&key);
+            table.insert(key, key, hash);
+        }
+        table.schedule_levels_through(1);
+        table.extend_probe_schedule(QUERY_POSITION_CAP);
+        assert_eq!(table.scheduled_levels, 2);
+        assert!(table.probe_schedule.speculates());
+        assert!(table.probe_schedule.whole_runs() > 0);
+        assert!(table.probe_schedule.addresses(&table.levels));
+        for key in 0..=keys {
+            let hash = table.hash_key(&key);
+            assert_eq!(table.find_value(&key, hash), (key < keys).then_some(&key));
+        }
+    }
 }
