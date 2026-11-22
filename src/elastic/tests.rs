@@ -106,9 +106,7 @@ impl ExactTrace {
             assert_eq!(table.hash_builder.hash_one(identity), identity);
             assert!(table.live() < table.max_insertions);
             let target = table.scheduler.target(table.live());
-            let placement = table
-                .choose_slot_for_new_key(prepared.probe, target)
-                .unwrap();
+            let placement = table.choose_slot::<false>(prepared.probe, target).unwrap();
             let expected = scalar.insert(identity);
             let global_slot = table.levels[..placement.level]
                 .iter()
@@ -1353,7 +1351,7 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
     assert!(table.live() < table.max_insertions);
     assert!(
         table
-            .choose_slot_for_new_key(prepared.probe, BatchTarget::Bootstrap)
+            .choose_slot::<false>(prepared.probe, BatchTarget::Bootstrap)
             .is_none()
     );
     assert!(
@@ -1815,7 +1813,7 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
 
     let prepared = PreparedElasticRoute::new(key_hash);
     let placement = table
-        .choose_slot_for_new_key(prepared.probe, BatchTarget::LevelPair(LEVEL))
+        .choose_slot::<false>(prepared.probe, BatchTarget::LevelPair(LEVEL))
         .expect("Case 1 falls through to the next level");
     assert_eq!(placement.level, LEVEL + 1);
 }
@@ -2117,7 +2115,7 @@ fn settled_insert_slot_agrees_with_the_general_placement() {
             assert_eq!(control, unsafe { table.levels[level].control_at(slot) });
             let target = table.scheduler.target_at(table.live());
             let general = table
-                .choose_slot_for_new_key(probe, target)
+                .choose_slot::<false>(probe, target)
                 .expect("the settled search found a slot");
             assert_eq!((level, slot), (general.level, general.slot));
             assert!(general.paper_probe <= u64::from(table.levels[level].scheduled_probes));
@@ -2796,7 +2794,7 @@ fn settled_gate_follows_the_live_count_through_a_clear_that_panicked() {
             );
             let probe = PreparedElasticRoute::new(table.hash_builder.hash_one(key)).probe;
             let general = table
-                .choose_slot_for_new_key(probe, table.scheduler.target_at(table.live()))
+                .choose_slot::<false>(probe, table.scheduler.target_at(table.live()))
                 .map(|placement| (placement.level, placement.slot));
             let settles = table
                 .scheduler
@@ -4711,9 +4709,7 @@ fn a_recovery_rebuild_tries_every_target_before_placing_off_the_probes() {
     let prepared = PreparedElasticRoute::new(SHARED);
     let no_slot = |table: &ElasticTable<SharedProbeKey, u64, IdentityBuildHasher>| {
         let target = table.scheduler.target_at(table.live());
-        table
-            .choose_slot_for_new_key(prepared.probe, target)
-            .is_none()
+        table.choose_slot::<false>(prepared.probe, target).is_none()
             && table
                 .choose_slot_on_other_targets(prepared.probe, target)
                 .is_none()
@@ -4732,11 +4728,7 @@ fn a_recovery_rebuild_tries_every_target_before_placing_off_the_probes() {
     let table = rebuilt.table_mut();
     table.resize_with_transition(table.total_slots, EpochTransition::PlacementRecovery);
     let target = table.scheduler.target(table.live());
-    assert!(
-        table
-            .choose_slot_for_new_key(prepared.probe, target)
-            .is_none()
-    );
+    assert!(table.choose_slot::<false>(prepared.probe, target).is_none());
     assert!(
         table
             .choose_slot_on_other_targets(prepared.probe, target)
@@ -4987,7 +4979,7 @@ fn a_general_insert_on_the_open_plan_keeps_the_gate_end_past_removals() {
             // SAFETY: the gate is open.
             .then(|| unsafe { table.open_words() });
         let on_case = table
-            .choose_slot_for_insert(prepared.probe, table.scheduler.cached_target())
+            .choose_slot::<true>(prepared.probe, table.scheduler.cached_target())
             .is_some();
 
         table.insert_for_vacant_entry_prepared(
