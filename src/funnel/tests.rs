@@ -636,7 +636,6 @@ fn insert_reuses_tombstones_like_the_placement_walk() {
             }
         }
         assert_eq!(tombstone_controls(&inline), removed.clone().count());
-        assert_eq!(inline.tombstone_bound(), walked.tombstone_bound());
         let mut reused_unrecorded = 0;
         for index in (budget..).take(removed.count()) {
             let key = index.wrapping_mul(SPREAD);
@@ -657,6 +656,7 @@ fn insert_reuses_tombstones_like_the_placement_walk() {
         }
         assert_ne!(reused_unrecorded, 0, "n {n} d {d}");
         assert_eq!(controls_and_filter(&inline), controls_and_filter(&walked));
+        assert_eq!(inline.tombstone_bound(), walked.tombstone_bound());
     }
 }
 

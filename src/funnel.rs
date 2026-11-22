@@ -1018,11 +1018,11 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// Deletes since the filter last matched the live set, less
     /// [`Self::uncounted_deletes`]; see [`membership::refresh_deletes`].
     stale_membership: usize,
-    /// What [`Self::stale_membership`] lacks of a bound on the tombstones,
-    /// modulo the word: the sum of the two is the bound. A filter refresh
-    /// moves its deletes here, a count of the tombstones sets the sum to the
-    /// count, and a placement that takes a tombstone's lane leaves it as it
-    /// is.
+    /// What [`Self::stale_membership`] and [`Self::uncounted_deletes`] lack
+    /// of a bound on the tombstones, modulo the word: the sum of the three
+    /// is the bound. A filter refresh moves its deletes here, a count of the
+    /// tombstones sets the sum to the count, and a placement that takes a
+    /// tombstone's lane leaves it as it is.
     refreshed_deletes: usize,
     /// Deletes left before one has to look at the counters: a delete only
     /// counts this word down, and the first to exhaust it settles the rest.
