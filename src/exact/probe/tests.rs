@@ -41,6 +41,22 @@ fn bounded_elastic_phi_matches_checked_encoder_for_every_hot_coordinate() {
     }
 }
 
+/// The widest image that fits a word is encoded, and one bit more is not.
+#[test]
+fn bounded_elastic_phi_encodes_up_to_a_full_word() {
+    let widest_j = u64::from(u16::MAX);
+    for i in [1 << 30, (1 << 30) + 12_345, i32::MAX.cast_unsigned()] {
+        for j in [1 << 15, widest_j] {
+            let checked = elastic_phi(u128::from(i), u128::from(j)).unwrap();
+            assert_eq!(checked.leading_zeros(), u64::BITS, "i={i}, j={j}");
+            assert_eq!(elastic_phi_bounded(i, j).map(u128::from), Some(checked));
+        }
+    }
+    let wider = elastic_phi(1 << 31, u128::from(widest_j)).unwrap();
+    assert!(wider > u128::from(u64::MAX));
+    assert_eq!(elastic_phi_bounded(1 << 31, widest_j), None);
+}
+
 #[test]
 fn bounded_elastic_phi_rejects_zero_and_unrepresentable_coordinates() {
     assert_eq!(elastic_phi_bounded(0, 1), None);
@@ -500,11 +516,16 @@ fn fast_funnel_retries_and_exhaustion_use_distinct_checked_counters() {
             random_word_count: 1
         })
     );
+    // The accepted retry's word alone picks the index.
+    let accepted = u128::from(retry.word(9, 1)) * u128::from(range.upper as u64);
+    let index = (accepted >> u64::BITS) as usize;
+    assert_ne!(index, 0);
     assert_eq!(
-        unbiased_prepared_funnel_probe_index_in_range(&retry, 9, range, 2)
-            .unwrap()
-            .random_word_count,
-        2
+        unbiased_prepared_funnel_probe_index_in_range(&retry, 9, range, 2),
+        Ok(ProbeIndex {
+            index,
+            random_word_count: 2
+        })
     );
 
     let exhausted = three_rejections.expect("fixed seed must exercise bounded exhaustion");
