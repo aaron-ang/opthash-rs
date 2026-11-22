@@ -451,10 +451,11 @@ const LEVEL_ZERO_ALONE: SummaryBin = NO_LEVELS_OCCUPIED & !(1 << level_bit(0));
 
 /// Levels a schedule holds routes of while a walk speculates on
 /// [`LEVEL_ZERO_ALONE`]. The paper's first two batches place in levels zero
-/// and one alone, and level one is half the size of level zero, so while
-/// no deeper level holds an entry most walks have level zero alone open.
-/// Once a deeper level does, the summaries spread over more levels and a
-/// branch on one of them is a guess the predictor misses.
+/// and one alone, and level one takes entries only in the second, so while
+/// no deeper level holds an entry the walks have level zero alone open more
+/// often than any other set of levels. Once a deeper level does, the
+/// summaries spread over more levels and a branch on one of them is a guess
+/// the predictor misses.
 const SPECULATED_LEVELS: usize = 2;
 const _: () = assert!(SPECULATED_LEVELS < GROUPED_LEVELS);
 
@@ -778,7 +779,8 @@ pub(super) struct ProbeSchedule {
     /// does not read: the signed summary a walk takes its start for before
     /// its own summary arrives, [`LEVEL_ZERO_ALONE`] while the schedule
     /// holds routes of no more than [`SPECULATED_LEVELS`] levels and
-    /// [`NO_SPECULATION`] otherwise. [`Self::open`] writes them.
+    /// [`NO_SPECULATION`] otherwise. [`Self::open`] writes them, and
+    /// [`Self::clone_onto`] copies them from its source.
     direct_reduction: u64,
     direct_control: *const u8,
     /// Level zero's first entry, or null for a table without levels.
@@ -940,10 +942,11 @@ impl ProbeSchedule {
         };
         #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
         let (entry_origin, zero_start) = (self.entry_origin, self.book.zero_start.as_ptr());
-        let summary = i64::from(summary.cast_signed());
-        // The top bits, sign-extended as the summary is.
-        let speculated = self.direct_reduction.cast_signed() >> SPECULATED_SHIFT;
-        let start = if summary == speculated {
+        let summary = summary.cast_signed();
+        // The top bits, sign-extended as the summary is. They fit an `i32`,
+        // so on every target the compare takes one register a side.
+        let speculated = (self.direct_reduction.cast_signed() >> SPECULATED_SHIFT) as i32;
+        let start = if i32::from(summary) == speculated {
             // The summary is `LEVEL_ZERO_ALONE`, the one summary the top
             // bits hold. Its entry is read at an address that does not wait
             // for the summary: on the branch's predicted path the walk's
@@ -958,7 +961,7 @@ impl ProbeSchedule {
             }
         } else {
             // SAFETY: `starts` has an entry at every signed byte's distance.
-            unsafe { *zero_start.offset(summary as isize) }
+            unsafe { *zero_start.offset(isize::from(summary)) }
         };
         (entry_origin, start)
     }
