@@ -1203,11 +1203,10 @@ macro_rules! parity_suite {
             #[test]
             fn consuming_iterators_report_the_std_size_hint_at_every_step() {
                 let pairs = (0..40_u32).map(|key| (key, key * 3));
-                let model: std::collections::HashMap<u32, u32> = pairs.clone().collect();
+                let model: std::collections::BTreeMap<u32, u32> = pairs.clone().collect();
 
                 let mut map: HashMap<u32, u32> = pairs.clone().collect();
-                let mut model_drain = model.clone();
-                let (mut ours, mut theirs) = (map.drain(), model_drain.drain());
+                let (mut ours, mut theirs) = (map.drain(), model.clone().into_iter());
                 loop {
                     assert_eq!(ours.size_hint(), theirs.size_hint());
                     assert_eq!(ours.len(), theirs.len());
@@ -1231,27 +1230,22 @@ macro_rules! parity_suite {
             }
 
             #[test]
-            fn extract_if_size_hint_brackets_what_it_yields() {
+            fn extract_if_size_hint_is_unbounded_and_the_filter_decides_the_count() {
                 type Keep = fn(u32) -> bool;
                 let keeps: [(Keep, usize); 3] =
                     [(|_| false, 0), (|key| key % 2 == 0, 20), (|_| true, 40)];
                 for (extract, expected) in keeps {
                     let mut map: HashMap<u32, u32> = (0..40).map(|key| (key, key)).collect();
                     let mut extracted = map.extract_if(|key, _| extract(*key));
-                    let mut left = expected;
+                    let mut yielded = 0;
                     loop {
-                        let (lower, upper) = extracted.size_hint();
-                        assert!(lower <= left, "{lower} of {left}");
-                        assert!(
-                            upper.is_none_or(|upper| left <= upper),
-                            "{upper:?} of {left}"
-                        );
+                        assert_eq!(extracted.size_hint(), (0, None));
                         if extracted.next().is_none() {
                             break;
                         }
-                        left -= 1;
+                        yielded += 1;
                     }
-                    assert_eq!(left, 0);
+                    assert_eq!(yielded, expected);
                     drop(extracted);
                     assert_eq!(map.len(), 40 - expected);
                 }
@@ -1291,8 +1285,8 @@ macro_rules! parity_suite {
             }
 
             #[test]
-            fn maps_of_one_length_compare_by_their_pairs() {
-                let model = std::collections::HashMap::from([(1, 2), (2, 3), (3, 4)]);
+            fn map_equality_follows_the_pairs() {
+                let model = std::collections::BTreeMap::from([(1, 2), (2, 3), (3, 4)]);
                 let base: HashMap<i32, i32> = model.iter().map(|(&k, &v)| (k, v)).collect();
                 // Another key, another value, a subset and a superset.
                 for other in [
@@ -1302,7 +1296,7 @@ macro_rules! parity_suite {
                     vec![(1, 2), (2, 3), (3, 4), (4, 5)],
                     vec![(3, 4), (2, 3), (1, 2)],
                 ] {
-                    let theirs: std::collections::HashMap<i32, i32> =
+                    let theirs: std::collections::BTreeMap<i32, i32> =
                         other.iter().copied().collect();
                     let ours: HashMap<i32, i32> = other.into_iter().collect();
                     assert_eq!(base == ours, model == theirs);
