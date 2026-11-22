@@ -1,9 +1,10 @@
 //! Bloom-style membership filter shared by both table backends.
 //!
 //! Each backend appends filter words to its arena tail and gates lookups on
-//! them. Bits are set on insert and never cleared, so a missing bit proves no
-//! insert ever recorded that key and the lookup can skip probing; the filter
-//! reports false positives, never false negatives.
+//! them. Bits are set on insert, and a backend clears one only where no live
+//! key can hold it, so a missing bit proves the key is absent and the lookup
+//! can skip probing; the filter reports false positives, never false
+//! negatives.
 //!
 //! It is an accelerator, not paper geometry: candidate order is unchanged, only
 //! whether the candidates are worth visiting.
@@ -23,8 +24,8 @@ fn word_count(total_slots: usize, slots_per_word: usize) -> usize {
 
 /// Deletes a filter tolerates before it is re-recorded from the live entries.
 ///
-/// Bits are never cleared per key, so departed keys raise the filter's load
-/// until nearly every gate passes. One capacity's worth of departures doubles
+/// A departed key can leave its bits set, so departed keys raise the
+/// filter's load until nearly every gate passes. One capacity's worth of departures doubles
 /// the load; re-recording then costs one hash per live entry, amortised to a
 /// few instructions per delete.
 #[inline]
