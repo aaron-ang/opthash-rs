@@ -280,20 +280,36 @@ fn assert_awkward_ranges_have_no_large_skew(sample: impl Fn(u64, usize) -> usize
 #[test]
 #[cfg_attr(miri, ignore)]
 fn elastic_fixed_seed_distribution_smoke() {
+    const STEP_BITS: u32 = ELASTIC_LEVEL_COUNT.trailing_zeros();
+    const FREE_LOW_BITS: u32 = u32::BITS - STEP_BITS - 1;
+    const LOW_HALF: u64 = u32::MAX as u64;
     let oracle = CounterPrf::new(FIXED_SEED);
     let word = |key, level| oracle.word(key, ProbeDomain::ElasticOrdinary { level }, 3, 0);
-    // Consecutive probes of a level are a multiple of the level count apart
-    // in the sequence, so their words share the lowest bits. A slot index is
-    // drawn from the top of the word; the high half is what must differ.
-    let high_half = |word: u64| word >> u32::BITS;
+    // Consecutive probes of a level are an odd multiple of the level count
+    // apart in the sequence and the stride is odd, so their words share the
+    // bits under the level count's and differ in the next one. A slot index
+    // is drawn from the top of the word; the high half is what must differ.
+    // The low half enters the product of a level that reduces by multiply,
+    // so its bits above those the step fixes are held to the same.
     let mut cross_probe_equal_bits = 0_u64;
+    let mut cross_probe_equal_low_bits = 0_u64;
     assert_fixed_seed_word_distribution(word, |key| {
         let next_probe = oracle.word(key, ProbeDomain::ElasticOrdinary { level: 7 }, 4, 0);
-        let differing = high_half(word(key, 7) ^ next_probe).count_ones();
-        cross_probe_equal_bits += u64::from(u32::BITS - differing);
+        let differing = word(key, 7) ^ next_probe;
+        cross_probe_equal_bits += u64::from((!differing >> u32::BITS).count_ones());
+        let low = differing & LOW_HALF;
+        assert_eq!(low & ((2 << STEP_BITS) - 1), 1 << STEP_BITS, "key={key}");
+        let equal_low = (!low & LOW_HALF) >> (STEP_BITS + 1);
+        cross_probe_equal_low_bits += u64::from(equal_low.count_ones());
     });
     assert!(
         (DISTRIBUTION_SAMPLES * 15..=DISTRIBUTION_SAMPLES * 17).contains(&cross_probe_equal_bits)
+    );
+    let even = DISTRIBUTION_SAMPLES * u64::from(FREE_LOW_BITS) / 2;
+    assert!(
+        (even - DISTRIBUTION_SAMPLES..=even + DISTRIBUTION_SAMPLES)
+            .contains(&cross_probe_equal_low_bits),
+        "{cross_probe_equal_low_bits}"
     );
 }
 
@@ -349,9 +365,20 @@ fn fast_funnel_narrow_indices_match_checked_counter_encoding() {
     }
 }
 
+/// The first random word of ordinary level `level`, restated without the
+/// prepared probe: the two halves of the keyed hash's product with the fold
+/// constant, xored, times that constant once for each level up to `level`.
+#[allow(clippy::cast_possible_truncation)]
+fn scalar_ordinary_first_word(seed: u64, key: u64, level: u64) -> u64 {
+    let keyed = key.wrapping_add(seed).wrapping_add(DOMAIN_KIND_LANE);
+    let product = u128::from(keyed) * u128::from(KEY_FOLD);
+    let folded = product as u64 ^ (product >> u64::BITS) as u64;
+    (0..=level).fold(folded, |word, _| word.wrapping_mul(KEY_FOLD))
+}
+
 #[test]
 fn fast_funnel_prepared_words_and_reductions_match_the_generic_oracle() {
-    let oracle = FunnelPrf::new(0x1234_5678_9abc_def0);
+    let oracle = FunnelPrf::new(FIXED_SEED);
     for key in [0, 1, u64::MAX, 0xd1b5_4a32_d192_ed03] {
         let prepared = oracle.prepare(key);
         for domain in [
@@ -371,15 +398,16 @@ fn fast_funnel_prepared_words_and_reductions_match_the_generic_oracle() {
             for logical in [0_u8, 1, 7, u8::MAX] {
                 let first_word_level = ordinary_level.filter(|_| logical == 0);
                 for retry in [0_u8, 1, 7, u8::MAX] {
+                    let generic = oracle.word(key, domain, u64::from(logical), u32::from(retry));
                     let word = match first_word_level {
-                        Some(level) if retry == 0 => prepared
-                            .ordinary_first_word(FunnelPrf::ordinary_multiplier(level).unwrap()),
+                        Some(level) if retry == 0 => {
+                            assert_eq!(generic, scalar_ordinary_first_word(FIXED_SEED, key, level));
+                            prepared
+                                .ordinary_first_word(FunnelPrf::ordinary_multiplier(level).unwrap())
+                        }
                         _ => prepared_domain.word(u64::from(logical), u32::from(retry)),
                     };
-                    assert_eq!(
-                        word,
-                        oracle.word(key, domain, u64::from(logical), u32::from(retry))
-                    );
+                    assert_eq!(word, generic);
                 }
                 for upper in [1, 2, 3, 16, 191, 1_237, 1 << 20] {
                     let range = PreparedProbeRange::new(upper).unwrap();
@@ -389,7 +417,7 @@ fn fast_funnel_prepared_words_and_reductions_match_the_generic_oracle() {
                         // An ordinary level reduces its word without a
                         // rejection test.
                         let multiplier = FunnelPrf::ordinary_multiplier(level).unwrap();
-                        let word = oracle.word(key, domain, 0, 0);
+                        let word = scalar_ordinary_first_word(FIXED_SEED, key, level);
                         assert_eq!(
                             ordinary_funnel_bucket(prepared, multiplier, upper) as u128,
                             (u128::from(word) * upper as u128) >> u64::BITS
