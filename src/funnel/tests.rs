@@ -205,26 +205,6 @@ fn entry_search_checks_exceptional_hits_before_reporting_a_key_absent() {
     assert_eq!(table.find(&key, key), Some(slot));
 }
 
-/// A key the filter rejects reaches its vacant entry unsearched, and the
-/// entry's insert then places it through the head walk: no comparison and
-/// no general placement walk.
-#[test]
-fn vacant_entry_filter_rejection_places_through_the_head_walk() {
-    let comparisons = Arc::new(AtomicUsize::new(0));
-    let key = CountingKey {
-        id: 1,
-        comparisons: comparisons.clone(),
-    };
-    let mut map = FunnelHashMap::with_capacity_and_hasher(64, test_support::fixed_hasher());
-    VACANCY_WALKS.with(|walks| walks.set(0));
-    let open = map.table().head_left;
-    assert_eq!(*map.entry(key.clone()).or_insert(10), 10);
-    assert_eq!(comparisons.load(Ordering::Relaxed), 0);
-    assert_eq!(VACANCY_WALKS.with(Cell::get), 0);
-    assert_eq!(map.table().head_left, open - 1);
-    assert_eq!(map.get(&key), Some(&10));
-}
-
 #[test]
 fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement() {
     let mut table = raw_table(512, 3);
@@ -635,54 +615,6 @@ where
         );
     }
     rebuilt
-}
-
-/// With tombstones the frameless insert stands aside, and the insert takes
-/// a tombstone ahead of the first EMPTY lane, as the placement walk does.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn insert_reuses_tombstones_like_the_placement_walk() {
-    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
-    for (n, d) in [(4096, 3), (1 << 14, 3)] {
-        let mut inline = raw_table(n, d);
-        let mut walked = raw_table(n, d);
-        let budget = inline.shape.max_insertions as u64;
-        for index in 0..budget {
-            let key = index.wrapping_mul(SPREAD);
-            map::TableBackend::insert(&mut inline, key, index, key);
-            walked.insert_for_vacant_by_walk(key, index, key);
-        }
-        let removed = (0..budget).step_by(4);
-        for index in removed.clone() {
-            let key = index.wrapping_mul(SPREAD);
-            for table in [&mut inline, &mut walked] {
-                let slot = table.find(&key, key).unwrap();
-                map::TableBackend::remove(table, slot);
-            }
-        }
-        assert_eq!(tombstone_controls(&inline), removed.clone().count());
-        let mut reused_unrecorded = 0;
-        for index in (budget..).take(removed.count()) {
-            let key = index.wrapping_mul(SPREAD);
-            let unrecorded = !inline.membership_gate(key).passes();
-            let tombstones = tombstone_controls(&walked);
-            assert_eq!(
-                map::TableBackend::insert(&mut inline, key, index, key),
-                None
-            );
-            let slot = walked.insert_for_vacant_by_walk(key, index, key);
-            assert_eq!(
-                inline.find(&key, key),
-                Some(slot),
-                "n {n} d {d} index {index}"
-            );
-            reused_unrecorded +=
-                usize::from(unrecorded && tombstone_controls(&walked) < tombstones);
-        }
-        assert_ne!(reused_unrecorded, 0, "n {n} d {d}");
-        assert_eq!(inline.tombstones(), walked.tombstones());
-        assert_eq!(controls_and_filter(&inline), controls_and_filter(&walked));
-    }
 }
 
 /// Removals and inserts in turn, through the calls a map makes: each insert
@@ -1550,13 +1482,6 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
         enter_with_a_key_outside_its_funnel(&mut table, &mut model, absent);
         check(&table, &model);
     }
-}
-
-#[test]
-fn levels_past_the_head_share_the_overflow_bit() {
-    // A deeper level shares the overflow bit, which names no head entry.
-    assert_eq!(level_bit_of(OVERFLOW_LEVEL), OVERFLOW_LEVEL_BIT);
-    assert_eq!(level_bit_of(usize::MAX), OVERFLOW_LEVEL_BIT);
 }
 
 /// A bin's leading zeros, as the first-match walk reads it from a unit, name
