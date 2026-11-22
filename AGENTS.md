@@ -100,6 +100,7 @@ Don't duplicate primitives across `src/` and `benches/`.
 
 - Every item earns its place: no dead code, self-explanatory comments, or docs restating the signature. Keep SAFETY, invariants, and non-obvious "why".
 - No raw numbers, benchmark results, or experiment history in comments or docs; put them in commit bodies and PR descriptions.
+- A comment says what its item is. It does not compare Elastic with Funnel or justify one backend's choice against the other's; that reasoning goes in the commit body or PR description.
 
 ## Worktree Naming
 
@@ -109,6 +110,15 @@ When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-
 
 ### Design Priorities
 
+These lists and [Reject](#reject) are defaults to test, not prohibitions: for
+a performance experiment, build the variant and let the measurements decide.
+A change to placement or probe words is fine while it keeps the paper's
+assumptions (uniform, independent per-level choices; same geometry and probe
+order) and updates the test oracle.
+
+- To express an invariant or precondition, first make it uncompilable to
+  violate (branded lifetimes, opaque tokens, typestate), then document it,
+  and add `unsafe` only when the first two cost measurable performance.
 - Import types and traits, but call free functions through their owning module
   (for example, `probe::elastic_phi`). Do not flatten internal functions through
   `mod.rs`; keep crate-root re-exports limited to the curated public interface.
@@ -120,6 +130,10 @@ When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-
 ### Reject
 
 - Metadata that costs work on every insert/delete unless benchmarks prove a net win.
+- Size or load thresholds picked by a sweep on one machine. Tie a threshold
+  to its mechanism (for example control-byte footprint against cache size) or
+  to a conservative documented bound, and say in the PR which machines were
+  measured.
 - Optimizations that improve a narrow microbenchmark but regress the public `speedup` suite. `target/criterion/` is the final gate — if the relevant benchmark regresses, the change does not stay.
 
 ### Verification
