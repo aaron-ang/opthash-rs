@@ -143,7 +143,7 @@ fn vacant_paths_place_without_a_walk_unless_the_table_grows() {
             if tombstone {
                 map.insert(key(1), 0);
                 map.remove(&key(1));
-                assert_eq!(map.table().tombstones(), 1);
+                assert_eq!(tombstone_controls(map.table()), 1);
             }
             comparisons.store(0, Ordering::Relaxed);
             VACANCY_WALKS.with(|walks| walks.set(0));
@@ -417,7 +417,7 @@ fn replace_key_leaves_the_table_of_a_present_key_as_it_was() {
             controls_and_filter(table),
             [
                 table.entries(),
-                table.tombstones(),
+                table.tombstone_bound(),
                 table.stale_membership(),
                 table.head_left,
             ],
@@ -434,7 +434,7 @@ fn replace_key_leaves_the_table_of_a_present_key_as_it_was() {
         for index in (0..KEYS).step_by(removed.max(1)).take(removed * 50) {
             assert_eq!(map.remove(&index.wrapping_mul(SPREAD)), Some(index));
         }
-        assert_eq!(map.table().tombstones() != 0, removed != 0);
+        assert_eq!(tombstone_controls(map.table()) != 0, removed != 0);
         let before = state(&map);
         let present = map.len();
         for index in 0..KEYS {
@@ -603,7 +603,7 @@ where
     }
     assert_eq!(rebuilt.entries(), survivors.len(), "n {n} d {d}");
     assert_eq!(rebuilt.head_left, walked.head_left, "n {n} d {d}");
-    assert_eq!(rebuilt.tombstones(), 0);
+    assert_eq!(tombstone_controls(&rebuilt), 0);
     assert!(
         controls_and_filter(&rebuilt) == controls_and_filter(&walked),
         "n {n} d {d}"
@@ -639,8 +639,8 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
             model.insert(key, index);
         }
         let generation = table.epoch_snapshot().generation;
-        let threshold = capacity::tombstone_cleanup_threshold(table.shape.n);
         let mut fresh = budget;
+        let threshold = capacity::tombstone_cleanup_threshold(table.shape.n);
         let (mut taken_back, mut reopened, mut refreshed, mut past_threshold) = (0, 0, 0, 0);
         for turn in 0..3 * table.shape.max_insertions {
             let pairs = if turn % 7 == 6 { 2 } else { 1 };
@@ -680,7 +680,7 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
                 let control = unsafe { table.storage.control_at(walk.slot) };
                 taken_back += usize::from(control == CTRL_TOMBSTONE);
                 reopened += usize::from(table.head_left == 0);
-                past_threshold += usize::from(table.tombstones() > threshold);
+                past_threshold += usize::from(table.tombstone_bound() > threshold);
                 assert_eq!(
                     map::TableBackend::insert(&mut table, key, index, key),
                     model.insert(key, index),
@@ -696,7 +696,7 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
                 live.push(index);
             }
             if turn % 257 == 0 {
-                assert!(tombstone_controls(&table) <= table.tombstones());
+                assert!(tombstone_controls(&table) <= table.tombstone_bound());
             }
         }
         assert_eq!(
@@ -789,7 +789,7 @@ fn vacant_entry_insert_places_like_the_placement_walk() {
     fn counts(table: &Table) -> [usize; 3] {
         [
             table.entries(),
-            table.tombstones(),
+            tombstone_controls(table),
             table.stale_membership(),
         ]
     }
@@ -922,9 +922,10 @@ impl core::hash::Hash for HashedKey {
 struct DifferentialCoverage {
     growths: usize,
     full_budget_inserts: usize,
-    tombstone_cleanups: usize,
     clears: usize,
     reseeds: usize,
+    tombstone_cleanups: usize,
+    past_cleanup_threshold: bool,
     exceptional: bool,
     overflow_entries: bool,
     /// A live key whose folded word is zero.
@@ -982,9 +983,9 @@ fn assert_matches_model(
     // The head never has more placements left than the limit less the
     // entries.
     assert!(table.head_left <= table.shape.head_insertions().saturating_sub(model.len()));
-    // The tombstone count is a bound with the uncounted deletes added, and
-    // no delete ran past a threshold it had to settle at.
-    assert!(table.tombstones() >= tombstone_controls(table));
+    // The tombstone bound holds with the uncounted deletes added, and no
+    // delete ran past the threshold it had to settle at.
+    assert!(table.tombstone_bound() >= tombstone_controls(table));
     assert!(table.stale_membership() <= membership::refresh_deletes(table.shape.max_insertions));
     assert!(table.settle_left >= 1);
     coverage.uncounted_deletes += usize::from(table.uncounted_deletes() != 0);
@@ -1138,6 +1139,25 @@ fn insert_checking_the_head_walk(
     rebuilt
 }
 
+/// Ends a bulk delete, which cleans up when the bound is past the threshold
+/// and the tombstones are within a group's share of the slots of it.
+/// `true` if it cleaned up.
+fn end_bulk_delete_checking_the_cleanup(table: &mut DifferentialTable) -> bool {
+    let threshold = capacity::tombstone_cleanup_threshold(table.shape.n);
+    let due = table.tombstone_bound() > threshold
+        && tombstone_controls(table) + table.shape.slots / GROUP_SIZE > threshold;
+    let (slots, prf) = (table.shape.n, table.prf);
+    let generation = table.epoch_snapshot().generation;
+    map::TableBackend::finish_deferred_removals(table);
+    let cleaned = table.epoch_snapshot().generation != generation;
+    assert_eq!(cleaned, due);
+    if cleaned {
+        assert_eq!((table.shape.n, table.prf), (slots, prf));
+        assert_eq!(tombstone_controls(table), 0);
+    }
+    cleaned
+}
+
 /// Runs a fixed pseudo-random insert, overwrite, remove, lookup and clear
 /// stream against a model map, starting from a table with no storage, and
 /// checks a clone of the final table against the model too.
@@ -1170,7 +1190,7 @@ fn run_differential(
         // A filling stretch meets the insertion budget and growth, a mixed
         // one reuses tombstones, and a draining one removes only live keys,
         // so tombstones pass the cleanup threshold; its few inserts draw
-        // from the whole universe, so one meets the cleanup left due.
+        // from the whole universe, and none of them cleans up.
         let (insert_below, draining) = match step % cycle {
             at if at < stream.filling => (85, false),
             at if at < stream.filling + stream.mixed => (50, false),
@@ -1184,7 +1204,6 @@ fn run_differential(
             drawn
         };
         let slots = table.shape.n;
-        let tombstones = table.tombstones();
         let prf = table.prf;
         if roll < 2 {
             assert_eq!(
@@ -1202,38 +1221,54 @@ fn run_differential(
             );
             let previous = model.insert(key, value);
             coverage.overwrites += usize::from(previous.is_some());
+            // The count reads every control byte, so it runs on a sample of
+            // the inserts, and only on a table with that many lanes free.
+            let threshold = capacity::tombstone_cleanup_threshold(slots);
+            let past_threshold = step % 16 == 0
+                && slots != 0
+                && table.shape.slots - table.entries() > threshold
+                && tombstone_controls(&table) > threshold;
             let rebuilt =
                 insert_checking_the_head_walk(&mut table, key, value, previous, &mut coverage);
-            // Only an absent key's insert rebuilds, and a rebuild at the
-            // same size under the same seed is a cleanup.
+            // Only an absent key's insert rebuilds, and never at the same
+            // size under the same seed, which is a cleanup.
             assert!(!(rebuilt && previous.is_some()), "step {step}");
-            coverage.tombstone_cleanups +=
-                usize::from(rebuilt && table.shape.n == slots && table.prf == prf);
+            assert!(
+                !(rebuilt && table.shape.n == slots && table.prf == prf),
+                "step {step}"
+            );
+            coverage.past_cleanup_threshold |= past_threshold && !rebuilt;
         } else if step % stream.clear_every == stream.clear_every - 1 {
             table.clear();
             model.clear();
             coverage.clears += 1;
         } else {
-            let removed = table
-                .find(&key, key.hash)
-                .map(|location| table.remove(location));
+            let location = table.find(&key, key.hash);
+            let generation = table.epoch_snapshot().generation;
+            let removed = location.map(|location| table.remove(location));
             assert_eq!(
                 removed,
                 model.remove(&key).map(|value| (key, value)),
                 "step {step} remove {key:?}"
             );
-            // A remove of a live key adds a tombstone and never rebuilds.
-            assert_eq!(
-                table.tombstones(),
-                tombstones + usize::from(removed.is_some()),
-                "step {step}"
-            );
+            // A remove of a live key leaves a tombstone in its lane and
+            // never rebuilds.
+            if let Some(slot) = location {
+                // SAFETY: `find` returns a slot below the storage capacity.
+                let control = unsafe { table.storage.control_at(slot) };
+                assert_eq!(control, CTRL_TOMBSTONE, "step {step}");
+            }
+            assert_eq!(table.epoch_snapshot().generation, generation, "step {step}");
         }
         assert!(table.entries() <= table.shape.max_insertions, "step {step}");
         // The first allocation is not a growth.
         coverage.growths += usize::from(slots != 0 && table.shape.n > slots);
         coverage.reseeds += usize::from(table.prf != prf);
         coverage.exceptional |= table.exceptional_placement;
+        if step % cycle == cycle - 1 {
+            coverage.tombstone_cleanups +=
+                usize::from(end_bulk_delete_checking_the_cleanup(&mut table));
+        }
         if step % stream.check_every == 0 {
             assert_matches_model(&table, &model, universe, &mut coverage);
         }
@@ -1313,6 +1348,7 @@ fn operation_streams_agree_with_a_model_map_in_wide_buckets() {
         );
         assert!(coverage.growths > 0, "{coverage:?}");
         assert!(coverage.full_budget_inserts > 0, "{coverage:?}");
+        assert!(coverage.past_cleanup_threshold, "{coverage:?}");
         assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
         assert!(coverage.overwrites > 0, "{coverage:?}");
     }
@@ -1349,6 +1385,7 @@ fn operation_streams_agree_with_a_model_map_under_colliding_hashes() {
         if d != wide || outgrown {
             assert!(coverage.reseeds > 0, "{coverage:?}");
             assert!(coverage.exceptional, "{coverage:?}");
+            assert!(coverage.past_cleanup_threshold, "{coverage:?}");
             assert!(coverage.tombstone_cleanups > 0, "{coverage:?}");
         }
     }
@@ -1421,7 +1458,11 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
             model.insert(*key, key.id);
         }
         assert_eq!(table.shape.max_insertions, budget, "d {d}");
-        assert_eq!((table.entries(), table.tombstones()), (budget, 0), "d {d}");
+        assert_eq!(
+            (table.entries(), tombstone_controls(&table)),
+            (budget, 0),
+            "d {d}"
+        );
         check(&table, &model);
 
         // Tombstones on the walks, then inserts that reuse some of them.
@@ -1430,7 +1471,7 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
             assert_eq!(table.remove(location), (*key, key.id), "d {d}");
             model.remove(key);
         }
-        assert_ne!(table.tombstones(), 0, "d {d}");
+        assert_ne!(tombstone_controls(&table), 0, "d {d}");
         check(&table, &model);
         for key in universe[..budget].iter().step_by(6) {
             assert_eq!(
@@ -1543,7 +1584,7 @@ fn inserts_place_like_the_placement_walk_around_every_removal() {
     fn check(map: &Map, model: &BTreeMap<u64, u64>) {
         let table = map.table();
         assert!(table.head_left <= table.shape.head_insertions() - map.len());
-        assert!(table.tombstones() >= tombstone_lanes(map));
+        assert!(table.tombstone_bound() >= tombstone_lanes(map));
         assert_eq!(map.len(), model.len());
         for (key, value) in model {
             assert_eq!(map.get(key), Some(value), "key {key}");
@@ -1670,7 +1711,7 @@ fn inserts_place_like_the_placement_walk_around_every_removal() {
     check(&map, &model);
     assert_ne!(map.table().head_left, 0);
 
-    // Churn through tombstone cleanups and growth.
+    // Churn through tombstone reuse and growth.
     stream.insert(&mut map, &mut model, 100);
     for _ in 0..if cfg!(miri) { 200 } else { 3_000 } {
         let key = *model.keys().next().unwrap();
@@ -1955,7 +1996,7 @@ fn vacancy_walk_matches_the_ordered_walk_for_absent_keys() {
         let slot = table.find(&key, hash).unwrap();
         map::TableBackend::remove(&mut table, slot);
     }
-    assert!(table.tombstones() > 0);
+    assert!(tombstone_controls(&table) > 0);
     check(&table, "tombstoned table");
 }
 
@@ -2000,7 +2041,7 @@ fn lookup_walk_matches_the_ordered_walk_hits() {
         let slot = table.find(&key, hash).unwrap();
         map::TableBackend::remove(&mut table, slot);
     }
-    assert!(table.tombstones() > 0);
+    assert!(tombstone_controls(&table) > 0);
     check(&table, "tombstoned table");
 }
 
@@ -2574,6 +2615,55 @@ fn exact_geometry_sums_to_n() {
     assert_eq!(table.shape.slots, table.shape.n + padding);
 }
 
+/// A bulk delete that removes nothing cleans up once the tombstones in
+/// place come within a group's share of the slots of the threshold, however
+/// many placements took a tombstone's lane since the deletes. One tombstone
+/// fewer leaves the table as it is, with the count as the bound.
+#[test]
+fn bulk_delete_cleans_up_a_group_share_of_the_slots_early() {
+    type Map = FunnelHashMap<u64, u64, IdentityBuildHasher>;
+    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    for requested in [1, 512, 4_096] {
+        for (short, cleans) in [(0, true), (1, false)] {
+            let mut map = Map::with_capacity_and_hasher(requested, IdentityBuildHasher);
+            let capacity = map.capacity() as u64;
+            for index in 0..capacity {
+                map.insert(index.wrapping_mul(SPREAD), index);
+            }
+            let (n, slots) = (map.table().shape.n, map.table().shape.slots);
+            let threshold = capacity::tombstone_cleanup_threshold(n);
+            let in_place = threshold + 1 - slots / GROUP_SIZE - short;
+            for index in 0..=threshold as u64 {
+                assert_eq!(map.remove(&index.wrapping_mul(SPREAD)), Some(index));
+            }
+            let mut fresh = capacity;
+            while tombstone_controls(map.table()) > in_place {
+                assert_eq!(map.insert(fresh.wrapping_mul(SPREAD), fresh), None);
+                fresh += 1;
+            }
+            assert_eq!(tombstone_controls(map.table()), in_place);
+            assert!(map.table().tombstone_bound() > threshold);
+            let generation = map.epoch().generation;
+
+            map.retain(|_, _| true);
+
+            let table = map.table();
+            let tombstones = if cleans { 0 } else { in_place };
+            assert_eq!(tombstone_controls(table), tombstones, "{requested}");
+            assert_eq!(table.tombstone_bound(), tombstones, "{requested}");
+            assert_eq!(
+                map.epoch().generation,
+                generation + u64::from(cleans),
+                "{requested}"
+            );
+            for index in threshold as u64 + 1..fresh {
+                assert_eq!(map.get(&index.wrapping_mul(SPREAD)), Some(&index));
+            }
+        }
+    }
+}
+
 #[test]
 fn tombstones_never_hide_survivors_and_are_reused() {
     let mut table = raw_table(512, 3);
@@ -2679,6 +2769,7 @@ fn clear_interrupted_by_a_panicking_drop_keeps_survivors_reachable() {
     }
 
     assert!(catch_unwind(AssertUnwindSafe(|| map.clear())).is_err());
+    assert!(map.table().tombstone_bound() >= tombstone_controls(map.table()));
     let reachable = keys.clone().filter(|key| map.get(key).is_some()).count();
     assert_eq!(reachable, map.len(), "every counted survivor is reachable");
     assert!(!map.is_empty(), "the panic interrupted the clear");
@@ -2819,7 +2910,7 @@ fn panicking_hasher_during_resize_rolls_back_uncounted_deletes() {
 
     assert_eq!(table.shape.n, 144);
     assert_eq!(table.entries() as u64, INSERTED - REMOVED);
-    assert_eq!(table.tombstones() as u64, REMOVED);
+    assert_eq!(tombstone_controls(&table) as u64, REMOVED);
     assert_eq!(table.stale_membership() as u64, REMOVED);
     assert_eq!(map::TableBackend::epoch_snapshot(&table), before);
     assert_eq!(
@@ -2846,7 +2937,7 @@ fn panicking_hasher_during_resize_rolls_back_uncounted_deletes() {
     assert_eq!(table.entries() as u64, INSERTED);
     map::TableBackend::try_resize(&mut table, next_shape.n).unwrap();
     assert_eq!(table.entries() as u64, INSERTED);
-    assert_eq!(table.tombstones(), 0);
+    assert_eq!(tombstone_controls(&table), 0);
     for id in 0..INSERTED {
         assert_eq!(
             map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),

@@ -1018,10 +1018,12 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// Deletes since the filter last matched the live set, less
     /// [`Self::uncounted_deletes`]; see [`membership::refresh_deletes`].
     stale_membership: usize,
-    /// A bound on the tombstones, less [`Self::uncounted_deletes`]: the
-    /// deletes since the controls were last reset or counted. A placement
-    /// that takes a tombstone's lane leaves it as it is.
-    tombstones: usize,
+    /// What [`Self::stale_membership`] and [`Self::uncounted_deletes`] lack
+    /// of a bound on the tombstones, modulo the word: the sum of the three
+    /// is the bound. A filter refresh moves its deletes here, a count of the
+    /// tombstones sets the sum to the count, and a placement that takes a
+    /// tombstone's lane leaves it as it is.
+    refreshed_deletes: usize,
     /// Deletes left before one has to look at the counters: a delete only
     /// counts this word down, and the first to exhaust it settles the rest.
     settle_left: usize,
@@ -1175,7 +1177,6 @@ where
             head_lanes: shape.head_lanes(),
             shape,
             storage,
-            tombstones: 0,
             reserve_fraction,
             hash_builder,
             alloc,
@@ -1185,6 +1186,7 @@ where
             prf: FunnelPrf::new(FUNNEL_PROBE_SEED),
             membership,
             stale_membership: 0,
+            refreshed_deletes: 0,
             settle_left: 1,
             settle_armed: 1,
         };
@@ -1857,6 +1859,8 @@ where
             hashes.push(self.hash_builder.hash_one(&entry.key));
         }
         bin_entries[bin] = in_bin;
+        // The tombstones of the deletes the filter now forgets stay.
+        self.refreshed_deletes = self.refreshed_deletes.wrapping_add(self.stale_membership);
         self.clear_membership();
         let mut hashes = hashes.into_iter();
         for (bin, entries) in bin_entries.into_iter().enumerate() {
@@ -1867,9 +1871,10 @@ where
         }
     }
 
-    /// Same-size cleanup once tombstones pass their threshold; otherwise a
-    /// filter refresh once departed keys pass theirs. The cleanup rebuilds
-    /// the filter too, so the two never stack.
+    /// Settles the counts after a bulk delete: a same-size cleanup if it
+    /// left the table mostly tombstones, otherwise a filter refresh once
+    /// departed keys pass its threshold. The cleanup rebuilds the filter
+    /// too, so the two never stack.
     #[cold]
     #[inline(never)]
     fn settle_after_deletes(&mut self) {
@@ -1881,9 +1886,9 @@ where
         }
     }
 
-    /// [`Self::settle_after_deletes`] for a lone delete, which leaves a due
-    /// cleanup to [`Self::prepare_vacant_insert`]. No lookup stops at a
-    /// tombstone and only an insert places around one, so a run of deletes
+    /// [`Self::settle_after_deletes`] for a lone delete, which moves no
+    /// entry: a tombstone stays until a placement takes its lane or a
+    /// rebuild drops it. No lookup stops at a tombstone, so a run of deletes
     /// re-places no survivor that a later delete of the run removes.
     #[cold]
     #[inline(never)]
@@ -1899,40 +1904,28 @@ where
         }
     }
 
-    /// Whether a cleanup is due: the settled tombstone bound is past the
-    /// threshold and a count of the tombstones confirms it. The delete that
-    /// crosses the threshold settles, so no uncounted delete hides one.
-    fn cleanup_is_due(&mut self) -> bool {
-        // No threshold is below half the capacity, which takes less to form.
-        self.tombstones > self.shape.n / 2
-            && self.tombstones > capacity::tombstone_cleanup_threshold(self.shape.n)
-            && self.count_confirms_cleanup()
-    }
-
-    /// Counts the tombstones and reports whether a cleanup is due by the
-    /// count. A count that leaves the cleanup off becomes the bound.
+    /// Whether a bulk delete leaves a cleanup due: the bound on the
+    /// tombstones is past the cleanup threshold and a count of them
+    /// confirms it. A count that leaves the cleanup off becomes the bound.
     ///
     /// A count reads every control byte, so the cleanup comes a group's
     /// share of the slots early: the deletes that then lie between two
     /// counts pay for a count at one group read each.
-    #[cold]
-    #[inline(never)]
-    fn count_confirms_cleanup(&mut self) -> bool {
-        self.settle_counts();
-        // SAFETY: the storage holds `shape.slots` control bytes.
+    fn cleanup_is_due(&mut self) -> bool {
+        let threshold = capacity::tombstone_cleanup_threshold(self.shape.n);
+        if self.refreshed_deletes.wrapping_add(self.stale_membership) <= threshold {
+            return false;
+        }
+        // SAFETY: the storage holds `shape.slots` initialized control bytes,
+        // and `&mut self` keeps writers out.
         let controls =
             unsafe { core::slice::from_raw_parts(self.storage.ctrl_ptr(), self.shape.slots) };
-        self.tombstones = controls
+        let tombstones: usize = controls
             .iter()
             .map(|&control| usize::from(control == CTRL_TOMBSTONE))
             .sum();
-        let early = self.shape.slots / GROUP_SIZE;
-        let due = self.tombstones + early > capacity::tombstone_cleanup_threshold(self.shape.n);
-        if !due {
-            // The deletes left before the next settle follow the count.
-            self.settle_counts();
-        }
-        due
+        self.refreshed_deletes = tombstones.wrapping_sub(self.stale_membership);
+        tombstones + self.shape.slots / GROUP_SIZE > threshold
     }
 
     /// The filter gate and exceptional full scan around the
@@ -2083,15 +2076,16 @@ where
     }
 
     /// Deletes since the counts were last settled, which the entry,
-    /// tombstone, stale-filter and epoch counts have yet to see.
+    /// stale-filter and epoch counts have yet to see.
     #[inline]
     fn uncounted_deletes(&self) -> usize {
         self.settle_armed.wrapping_sub(self.settle_left)
     }
 
+    /// The bound on the tombstones, with the uncounted deletes in it.
     #[cfg(test)]
-    fn tombstones(&self) -> usize {
-        self.tombstones + self.uncounted_deletes()
+    fn tombstone_bound(&self) -> usize {
+        self.refreshed_deletes.wrapping_add(self.stale_membership())
     }
 
     #[cfg(test)]
@@ -2110,26 +2104,20 @@ where
     }
 
     /// Sets the entry count, and with it [`Self::head_left`]. Also restores
-    /// that word after a change to the tombstone count or the shape, moves
-    /// the uncounted deletes into the counts they belong to, and sets
-    /// [`Self::settle_left`] to the deletes that cannot yet reach a
-    /// threshold of [`Self::settle_after_deletes`].
+    /// that word after a change to the shape, moves the uncounted deletes
+    /// into the counts they belong to, and sets [`Self::settle_left`] to the
+    /// deletes that cannot yet reach the threshold of
+    /// [`Self::refresh_stale_membership`].
     fn set_entries(&mut self, entries: usize) {
         let deletes = self.uncounted_deletes();
         if deletes != 0 {
-            self.tombstones += deletes;
             self.stale_membership = self.stale_membership.saturating_add(deletes);
             self.epoch.note_deletes(deletes);
         }
         self.head_left = self.shape.head_insertions().saturating_sub(entries);
         self.entries_base = entries + self.head_left;
-        // A bound past its threshold has no later delete to settle at.
-        let cleanup = capacity::tombstone_cleanup_threshold(self.shape.n)
-            .checked_sub(self.tombstones)
-            .unwrap_or(usize::MAX);
-        let refresh = membership::refresh_deletes(self.shape.max_insertions)
+        let left = membership::refresh_deletes(self.shape.max_insertions)
             .saturating_sub(self.stale_membership);
-        let left = cleanup.min(refresh);
         self.settle_left = left + 1;
         self.settle_armed = left + 1;
     }
@@ -2331,7 +2319,7 @@ where
     /// The rest of [`Self::insert_general`] for a key the head did not
     /// take: the ordered walk finds a key the first-match scan could not
     /// settle, and the placement walk places an `absent` one after the
-    /// growth or cleanup the table is due.
+    /// growth the table is due.
     ///
     /// One function for both, and the last thing its caller does, so that
     /// caller keeps nothing across a call.
@@ -2419,21 +2407,12 @@ where
             .map(|shape| shape.n)
     }
 
-    /// Grows the table if the next insert would exceed the insertion limit,
-    /// or rebuilds it at its size if lone deletes left a cleanup due.
+    /// Grows the table if the next insert would exceed the insertion limit.
     #[inline]
     fn prepare_vacant_insert(&mut self) {
         if self.entries() >= self.shape.max_insertions {
             self.grow_for_next_insert();
-        } else if self.cleanup_is_due() {
-            self.clean_tombstones_for_next_insert();
         }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn clean_tombstones_for_next_insert(&mut self) {
-        self.resize_with_transition(self.shape.n, EpochTransition::TombstoneCleanup);
     }
 
     #[cold]
@@ -2523,7 +2502,7 @@ where
     }
 
     /// Places a key the caller has proven absent by the placement walk,
-    /// after the growth or cleanup the table is due. Apart from its callers,
+    /// after the growth the table is due. Apart from its callers,
     /// whose own placement then keeps nothing across a call.
     #[inline(never)]
     fn insert_for_vacant_by_walk(&mut self, key: K, value: V, hash: u64) -> usize {
@@ -2585,7 +2564,6 @@ where
                 storage,
                 head,
                 len: 0,
-                tombstones: 0,
                 arena,
                 exceptional_placement: false,
                 prf,
@@ -2593,6 +2571,7 @@ where
                 stale_membership: 0,
             },
         );
+        self.refreshed_deletes = 0;
         self.epoch.start_epoch(transition, recovered);
         Ok(())
     }
@@ -2605,7 +2584,6 @@ pub(crate) struct FunnelGeneration<K, V> {
     /// Addresses into `storage`; the two move together.
     head: [HeadLevel<SlotEntry<K, V>>; HEAD_ENTRIES],
     len: usize,
-    tombstones: usize,
     arena: Arena,
     exceptional_placement: bool,
     prf: FunnelPrf,
@@ -2632,7 +2610,6 @@ where
         // The deletes this generation has yet to count are its own.
         self.settle_counts();
         let entries = mem::replace(&mut other.len, self.entries());
-        mem::swap(&mut self.tombstones, &mut other.tombstones);
         mem::swap(&mut self.stale_membership, &mut other.stale_membership);
         self.set_entries(entries);
         mem::swap(&mut self.arena, &mut other.arena);
@@ -3050,7 +3027,7 @@ where
                 let entry = unsafe { self.storage.take(slot) };
                 // SAFETY: `slot` is in bounds and its value was moved out.
                 unsafe { self.storage.set_control(slot, CTRL_TOMBSTONE) };
-                self.tombstones += 1;
+                self.refreshed_deletes = self.refreshed_deletes.wrapping_add(1);
                 self.set_entries(self.entries() - 1);
                 drop(entry);
             }
@@ -3064,7 +3041,7 @@ where
         // entry was dropped.
         unsafe { self.shape.reset_ordinary_controls(self.storage.ctrl_ptr()) };
         self.settle_counts();
-        self.tombstones = 0;
+        self.refreshed_deletes = 0;
         self.exceptional_placement = false;
         // Before the counts, which arm the next settle from the filter's
         // stale count.
@@ -3088,8 +3065,8 @@ where
         .unwrap_or_else(|error| panic!("Funnel clone allocation failed: {error}"));
         cloned.storage.clone_region_from(&self.storage);
         cloned.epoch = self.epoch;
-        cloned.tombstones = self.tombstones;
         cloned.stale_membership = self.stale_membership;
+        cloned.refreshed_deletes = self.refreshed_deletes;
         // The uncounted deletes come along: counted here, they land in the
         // clone's own counts.
         cloned.settle_left = cloned.settle_armed.wrapping_sub(self.uncounted_deletes());
