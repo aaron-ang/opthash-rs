@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2](https://github.com/aaron-ang/opthash-rs/compare/v0.12.1...v0.12.2) - 2026-11-22
+
+### Fixed
+
+- keep live keys reachable when a filter refresh unwinds ([#192](https://github.com/aaron-ang/opthash-rs/pull/192))
+
+### Other
+
+- *(deps)* update rust crate hashbrown to v0.17.2 ([#195](https://github.com/aaron-ang/opthash-rs/pull/195))
+- *(deps)* update rust crate criterion to v6.1.0 ([#193](https://github.com/aaron-ang/opthash-rs/pull/193))
+- use one initial capacity and document the prefetch constants ([#189](https://github.com/aaron-ang/opthash-rs/pull/189))
+- prefetch placements ahead during large rebuilds ([#185](https://github.com/aaron-ang/opthash-rs/pull/185))
+- Use plain Renovate schedule and grouping
+
 ## [0.12.1](https://github.com/aaron-ang/opthash-rs/compare/v0.12.0...v0.12.1) - 2026-11-06
 
 ### Added
