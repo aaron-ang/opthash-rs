@@ -5079,3 +5079,148 @@ fn a_removal_forgets_only_a_bit_no_live_key_holds() {
     assert!(forgotten > 0, "no removal cleared its key's bit");
     assert!(kept > 0, "no removal met a bit it had to keep");
 }
+
+/// A general insert the batch's own case places leaves the gate ending
+/// where it stood, while the table stays on the plan the gate opened on:
+/// with removals outstanding the bound is one on the placed count, which
+/// still holds them.
+#[test]
+fn a_general_insert_on_the_open_plan_keeps_the_gate_end_past_removals() {
+    const SLOTS: usize = if cfg!(miri) { 256 } else { 1_024 };
+    let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            SLOTS,
+            ReserveFraction::DEFAULT,
+            fixed_hasher(),
+            Global,
+        )
+        .unwrap();
+    let capacity = table.max_insertions as u64;
+    let universe = capacity + capacity / 2;
+    let mut model = alloc::collections::BTreeMap::<u64, u64>::new();
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut kept_past_removals = 0;
+    for step in 0..capacity * 8 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let key = (state >> 33) % universe;
+        let hash = table.hash_builder.hash_one(key);
+        // Fill, thin out, refill, then churn.
+        let insert = match step / (capacity * 2) {
+            0 | 2 => state >> 60 != 0,
+            1 => state >> 62 == 0,
+            _ => state >> 63 == 0,
+        };
+        if !insert {
+            let removed = table.take(&key, hash).map(|(_, value)| value);
+            assert_eq!(removed, model.remove(&key));
+            continue;
+        }
+        if model.contains_key(&key) || model.len() == table.max_insertions {
+            continue;
+        }
+        let prepared = PreparedElasticRoute::new(hash);
+        let end = table.scheduler.settled_end;
+        let open = table
+            .scheduler
+            .settles(table.placed)
+            // SAFETY: the gate is open.
+            .then(|| unsafe { table.open_words() });
+        let on_case = table
+            .choose_slot_for_insert(prepared.probe, table.scheduler.cached_target())
+            .is_some();
+
+        table.insert_for_vacant_entry_prepared(
+            key,
+            step,
+            prepared,
+            control::control_fingerprint_low(hash),
+        );
+        model.insert(key, step);
+        assert_eq!(table.find_value(&key, hash), Some(&step));
+        assert_eq!(table.live(), model.len());
+        assert_open_gate_is_the_plan(&table);
+
+        let same_plan = table
+            .settled_case(table.scheduler.cached_target())
+            .is_some_and(|(case, budget, fallback)| {
+                Some(table.plan_words(case.level, budget, fallback)) == open
+            });
+        if on_case && same_plan && table.placed < end && table.scheduler.covers(table.live()) {
+            assert_eq!(table.scheduler.settled_end, end, "step {step}");
+            // The placed count alone is past the batch the live count is in.
+            let removals = table.stale_membership();
+            kept_past_removals += usize::from(!table.scheduler.covers(table.placed + removals));
+        }
+    }
+    for (key, value) in &model {
+        let hash = table.hash_builder.hash_one(key);
+        assert_eq!(table.find_value(key, hash), Some(value));
+    }
+    assert_counters_match_controls(&table);
+    assert!(kept_past_removals > 0);
+}
+
+/// A level holding more tombstones than half its slots, and no more than
+/// its cleanup threshold, takes an insert into one of them as any other:
+/// the cached batch still covers the live count and no cleanup follows.
+#[test]
+fn reusing_a_tombstone_under_the_threshold_keeps_the_batch() {
+    let mut map = FixedElasticHashMap::<u64, u64>::with_capacity(1_024);
+    let live = {
+        let scheduler = &map.table().scheduler;
+        assert_eq!(scheduler.current_batch_index, 0);
+        scheduler.batch_end as u64 - 8
+    };
+    for key in 0..live {
+        map.insert(key, key);
+    }
+    let (half, threshold) = {
+        let level = &map.table().levels[0];
+        assert_eq!(u64::from(map.table().live_in(level)), live);
+        (
+            level.capacity() as u64 / 2,
+            capacity::tombstone_cleanup_threshold(level.capacity()) as u64,
+        )
+    };
+    // Two reused tombstones still leave the level over half.
+    let departed = half + 3;
+    assert!(departed <= threshold && departed < live);
+    for key in 0..departed {
+        assert_eq!(map.remove(&key), Some(key));
+    }
+
+    let mut key = live;
+    for _ in 0..2 {
+        loop {
+            let tombstones = map.table().levels[0].tombstones();
+            map.insert(key, key);
+            key += 1;
+            if map.table().levels[0].tombstones() < tombstones {
+                break;
+            }
+            assert!(key < live + departed, "no insert reused a tombstone");
+        }
+        let table = map.table();
+        assert!(u64::from(table.levels[0].tombstones()) > half);
+        assert!(!table.levels[0].needs_cleanup());
+        assert!(table.scheduler.covers(table.live()));
+    }
+    assert_eq!(map.epoch().generation, 0);
+    for present in departed..key {
+        assert_eq!(map.get(&present), Some(&present));
+    }
+}
+
+/// Past the last batch's end the last batch stays the active one.
+#[test]
+fn a_live_count_at_or_past_the_last_batch_end_stays_in_the_last_batch() {
+    let mut scheduler = BatchScheduler::new(&[4, 6, 2], 0, 0);
+    assert_eq!(scheduler.target(3), BatchTarget::Bootstrap);
+    assert_eq!(scheduler.target(11), BatchTarget::LevelPair(1));
+    for len in [12, 13, usize::MAX] {
+        assert_eq!(scheduler.target(len), BatchTarget::LevelPair(1), "{len}");
+    }
+    assert_eq!(scheduler.target(4), BatchTarget::LevelPair(0));
+}
