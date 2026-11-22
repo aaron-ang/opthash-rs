@@ -1453,7 +1453,7 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
                     key: next_key,
                     value: next_key,
                 },
-                1,
+                control::OCCUPIED_BIT,
             );
         }
         table.levels[LEVEL].len += 1;
