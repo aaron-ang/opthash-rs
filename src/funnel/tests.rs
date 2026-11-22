@@ -287,6 +287,31 @@ fn raw_table_of<V>(n: usize, d: u32) -> FunnelTable<u64, V, IdentityBuildHasher>
     .unwrap()
 }
 
+/// A table holding all its limit allows still shrinks when a smaller slot
+/// count has the same limit.
+#[test]
+fn shrink_of_a_full_table_drops_the_slots_its_limit_does_not_need() {
+    let reserve = ReserveFraction::from_exponent(3).unwrap();
+    let (slack, smallest) = (64..4096)
+        .find_map(|n| {
+            let shape = FunnelShape::from_slots(n, reserve).ok()?;
+            let smallest = FunnelShape::for_insert_budget(shape.max_insertions, reserve).ok()?;
+            (smallest.n < shape.n).then_some((shape.n, smallest.n))
+        })
+        .expect("a slot count past the smallest for its limit");
+    let mut table = raw_table(slack, 3);
+    let limit = table.shape.max_insertions as u64;
+    for key in 0..limit {
+        assert_eq!(map::TableBackend::insert(&mut table, key, key, key), None);
+    }
+    map::TableBackend::shrink_to(&mut table, 0);
+    assert_eq!(table.shape.n, smallest);
+    assert_eq!(table.shape.max_insertions as u64, limit);
+    for key in 0..limit {
+        assert!(table.find(&key, key).is_some());
+    }
+}
+
 #[test]
 fn dense_scan_preserves_order_while_removals_make_the_table_sparse() {
     let mut table = raw_table(344, 4);
@@ -1859,10 +1884,12 @@ fn head_follows_its_storage_through_every_replacement() {
     let grown = FunnelShape::for_insert_budget(256, reserve).unwrap();
     map::TableBackend::try_resize(&mut table, grown.n).unwrap();
     assert_eq!(table.shape.n, grown.n);
+    assert_eq!(map::TableBackend::total_slots(&table), grown.n);
     check(&mut table, live);
 
     map::TableBackend::shrink_to(&mut table, 0);
     assert!(table.shape.n < grown.n);
+    assert_eq!(map::TableBackend::total_slots(&table), table.shape.n);
     check(&mut table, live);
 
     let mut cloned = map::TableBackend::clone_table(&table);
