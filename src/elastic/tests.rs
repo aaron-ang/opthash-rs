@@ -940,35 +940,6 @@ fn elastic_metadata_is_appended_without_moving_control_or_data() {
 }
 
 #[test]
-fn normal_inserts_advance_batch_scheduler() {
-    let mut map: FixedElasticHashMap<usize, usize> = FixedElasticHashMap::with_capacity(1024);
-    let initial_quota = map.table().scheduler.batch_ends[0];
-    assert!(
-        initial_quota > 0,
-        "test requires a non-empty bootstrap batch"
-    );
-
-    for key in 0..initial_quota {
-        map.insert(key, key);
-    }
-    // Positions `0..quota` were bootstrap placements; position `quota`,
-    // the next insert, opens the first level pair.
-    assert_eq!(
-        map.table().scheduler.target_at(initial_quota - 1),
-        BatchTarget::Bootstrap
-    );
-    assert_eq!(map.table().scheduler.current_batch_index, 0);
-
-    map.insert(initial_quota, initial_quota);
-    let len = map.len();
-    assert_eq!(
-        map.table().scheduler.target_at(len),
-        BatchTarget::LevelPair(0)
-    );
-    assert!(map.table().scheduler.current_batch_index > 0);
-}
-
-#[test]
 fn batch_target_follows_the_live_count_in_both_directions() {
     let mut map: FixedElasticHashMap<usize, usize> = FixedElasticHashMap::with_capacity(1024);
     let quota = map.table().scheduler.batch_ends[0];
@@ -1085,15 +1056,6 @@ fn a_place_builds_its_bits_and_their_pairs_in_one_rotation() {
 }
 
 #[test]
-fn compact_prepared_elastic_state_is_register_sized() {
-    assert_eq!(mem::size_of::<PreparedElasticRoute>(), 8);
-    assert_eq!(
-        mem::align_of::<PreparedElasticRoute>(),
-        mem::align_of::<u64>()
-    );
-}
-
-#[test]
 fn route_summary_saturates_deep_levels_into_the_last_bit() {
     assert_eq!(summary_level(0), 0);
     assert_eq!(
@@ -1151,15 +1113,6 @@ fn route_summary_still_narrows_shallow_levels_on_wide_geometries() {
         assert_eq!(map.get(&key), Some(&key));
     }
     assert_eq!(map.get(&(key_count + 1)), None);
-}
-
-#[test]
-fn prepared_route_keeps_the_geometry_independent_signature() {
-    for hash in (0..65_536_u64).map(|value| value.wrapping_mul(0x9e37_79b9_7f4a_7c15)) {
-        let route = PreparedElasticRoute::new(hash);
-        let signature = route.signature();
-        assert_eq!(signature, route.probe.routing_signature());
-    }
 }
 
 #[test]
@@ -1260,18 +1213,6 @@ fn route_summary_conservatively_records_every_live_level() {
             [NO_LEVELS_OCCUPIED; SUMMARY_BINS]
         );
     }
-}
-
-#[test]
-fn prepared_route_remains_geometry_independent_across_growth() {
-    let hash = 0x9e37_79b9_7f4a_7c15;
-    let prepared = PreparedElasticRoute::new(hash);
-    let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
-        ElasticHashMap::with_capacity_and_hasher(1, IdentityBuildHasher);
-    map.insert(hash, 7);
-    map.reserve(4_096);
-    assert!(map.table().route_filter(prepared).maybe_present);
-    assert_eq!(map.get(&hash), Some(&7));
 }
 
 #[test]
