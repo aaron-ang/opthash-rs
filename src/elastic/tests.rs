@@ -945,9 +945,14 @@ fn batch_target_follows_the_live_count_in_both_directions() {
     let quota = map.table().scheduler.batch_ends[0];
     assert!(quota > 0);
 
-    for key in 0..=quota {
+    for key in 0..quota {
         map.insert(key, key);
     }
+    // The inserts so far were bootstrap placements; the next opens the
+    // first level pair and moves the cached batch with it.
+    assert_eq!(map.table().scheduler.current_batch_index, 0);
+    map.insert(quota, quota);
+    assert!(map.table().scheduler.current_batch_index > 0);
     let len = map.len();
     assert_eq!(
         map.table().scheduler.target_at(len),
@@ -4969,6 +4974,60 @@ fn a_removal_takes_an_entry_placed_off_the_schedule() {
         let hash = table.hash_builder.hash_one(key);
         assert_eq!(TableBackend::find_value(&table, &key, hash), Some(&!key));
     }
+}
+
+/// A key's lone bit goes with it; a bit two keys set stays for the one that
+/// is left, and so does a bit whose pair is another live key's own bit.
+#[test]
+fn a_removal_keeps_a_bit_whose_pair_is_set() {
+    let new_map = || -> FixedElasticHashMap<u64, u64> { FixedElasticHashMap::with_capacity(64) };
+    let passes = |map: &FixedElasticHashMap<u64, u64>, key: u64| {
+        let prepared = PreparedElasticRoute::new(map.table().hash_builder.hash_one(key));
+        map.table().route_filter(prepared).maybe_present
+    };
+    let empty = new_map();
+    let place = |key: u64| {
+        let prepared = PreparedElasticRoute::new(empty.table().hash_builder.hash_one(key));
+        let place = empty.table().route_filter(prepared).read.place;
+        (place.word(), place.bits())
+    };
+    // Two keys on one bit, and a third whose own bit is their pair.
+    let mut places = Vec::new();
+    let (first, second) = (0_u64..10_000)
+        .find_map(|second| {
+            let first = places.iter().position(|&seen| seen == place(second));
+            places.push(place(second));
+            first.map(|first| (first as u64, second))
+        })
+        .unwrap();
+    let (word, bit) = place(first);
+    let opposite = (0_u64..100_000)
+        .find(|&key| place(key) == (word, paired_bits(bit)))
+        .unwrap();
+
+    let mut map = new_map();
+    map.insert(first, 1);
+    assert_eq!(map.remove(&first), Some(1));
+    assert!(!passes(&map, first));
+
+    map.insert(first, 1);
+    map.insert(second, 2);
+    assert_eq!(map.remove(&first), Some(1));
+    assert!(passes(&map, second));
+    assert_eq!(map.get(&second), Some(&2));
+    assert_eq!(map.remove(&second), Some(2));
+    assert_eq!(map.get(&second), None);
+
+    let mut map = new_map();
+    map.insert(first, 1);
+    map.insert(opposite, 3);
+    assert_eq!(map.remove(&first), Some(1));
+    assert!(passes(&map, opposite));
+    assert_eq!(map.get(&opposite), Some(&3));
+    map.insert(first, 1);
+    assert_eq!(map.remove(&opposite), Some(3));
+    assert!(passes(&map, first));
+    assert_eq!(map.get(&first), Some(&1));
 }
 
 #[test]
