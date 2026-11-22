@@ -46,9 +46,22 @@ pub struct FunnelScan {
     mode: FunnelScanMode,
 }
 
+/// A slot-by-slot scan over the lanes that can hold entries. Below
+/// `padded_end` a bucket's group holds its `lanes` lanes and then padding,
+/// so the scan runs to `lane_end`, the end of the current bucket's lanes, and
+/// then steps to the next group; from `padded_end` on it runs to the end of
+/// the slots.
+#[derive(Clone, Debug)]
+struct DenseScan {
+    next: usize,
+    lane_end: usize,
+    lanes: usize,
+    padded_end: usize,
+}
+
 #[derive(Clone, Debug)]
 enum FunnelScanMode {
-    Dense(usize),
+    Dense(DenseScan),
     Sparse(OccupiedIndices),
 }
 
@@ -552,10 +565,12 @@ fn recorded_head_levels(levels: u16) -> u32 {
     u32::from(levels & !OVERFLOW_LEVEL_BIT) << (u32::BITS - u16::BITS)
 }
 
-/// Membership bits of a filter unit, its low half; the level bin sits above
-/// them. The half is as wide as the register the bit is shifted in, so the
-/// shift takes its count from the hash without a mask.
-const MEMBERSHIP_BITS: u32 = u32::BITS;
+/// A filter unit: membership bits in its low half, the key's level bin in
+/// its high half.
+type FilterUnit = u32;
+
+/// Membership bits of a filter unit, its low half.
+const MEMBERSHIP_BITS: u32 = FilterUnit::BITS - u16::BITS;
 
 /// The key's bit of a filter unit's membership half, from the low bits of
 /// the hash; the unit index draws on the high half.
@@ -563,7 +578,7 @@ const MEMBERSHIP_BITS: u32 = u32::BITS;
 const fn membership_bit(key_hash: u64) -> u32 {
     #[allow(clippy::cast_possible_truncation)]
     {
-        1_u32.wrapping_shl(key_hash as u32)
+        1 << (key_hash as u32 & (MEMBERSHIP_BITS - 1))
     }
 }
 
@@ -587,11 +602,13 @@ mod level_bin {
     pub(super) struct WideLevelBin(u32);
 
     impl WideLevelBin {
-        /// The bin of a filter unit, from the half of the unit that holds
-        /// it.
+        /// A word whose top half is a filter unit's bin, in its place. The
+        /// walk visits the head entry of every set bit's count of leading
+        /// zeros, so bits set below the bin are allowed: each indexes an
+        /// entry that is no level.
         #[inline]
-        pub(super) const fn of_unit_half(half: u32) -> Self {
-            Self(half)
+        pub(super) const fn of_unit_bin(bin: u32) -> Self {
+            Self(bin)
         }
 
         #[inline]
@@ -608,7 +625,7 @@ mod level_bin {
 /// every call.
 #[derive(Clone, Copy)]
 struct MembershipGate {
-    unit: u64,
+    unit: FilterUnit,
     bits: u32,
 }
 
@@ -635,33 +652,28 @@ impl MembershipGate {
 
 /// Whether a filter unit's membership half holds the bit `bits`.
 #[inline]
-#[allow(clippy::cast_possible_truncation)]
-const fn unit_records(unit: u64, bits: u32) -> bool {
-    unit as u32 & bits != 0
+const fn unit_records(unit: FilterUnit, bits: u32) -> bool {
+    unit & bits != 0
 }
-
-/// Where a filter unit keeps its level bin: its top bits, so the half above
-/// the membership bits is the bin as a [`WideLevelBin`].
-const LEVEL_BIN_SHIFT: u32 = u64::BITS - u16::BITS;
 
 /// The level bin of a filter unit.
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
-const fn unit_levels(unit: u64) -> u16 {
-    (unit >> LEVEL_BIN_SHIFT) as u16
+const fn unit_levels(unit: FilterUnit) -> u16 {
+    (unit >> MEMBERSHIP_BITS) as u16
 }
 
-/// The level bin of a filter unit, as the first-match walk reads it.
+/// The level bin of a filter unit in place, its membership half cleared, as
+/// the first-match walk reads it.
 #[inline]
-#[allow(clippy::cast_possible_truncation)]
-const fn unit_wide_levels(unit: u64) -> WideLevelBin {
-    WideLevelBin::of_unit_half((unit >> MEMBERSHIP_BITS) as u32)
+const fn unit_wide_levels(unit: FilterUnit) -> WideLevelBin {
+    WideLevelBin::of_unit_bin(unit & !((1 << MEMBERSHIP_BITS) - 1))
 }
 
-/// A membership bit and a level bin, each in its place in a filter unit.
+/// A membership bit and a level bin, each in its half of a filter unit.
 #[inline]
-const fn unit_of(bits: u32, levels: u16) -> u64 {
-    bits as u64 | (levels as u64) << LEVEL_BIN_SHIFT
+const fn unit_of(bits: u32, levels: u16) -> FilterUnit {
+    bits | (levels as FilterUnit) << MEMBERSHIP_BITS
 }
 
 /// Where each region of one Funnel epoch's arena lives.
@@ -683,11 +695,11 @@ struct FilterTail {
     ///
     /// A unit holds a membership half and one level bin, so one load at a
     /// scaled index off the base reads both.
-    base: *mut u64,
+    base: *mut FilterUnit,
 }
 
 /// The filter unit an empty table's gate reads: nothing recorded.
-static NO_FILTER_UNIT: u64 = 0;
+static NO_FILTER_UNIT: FilterUnit = 0;
 
 impl FilterTail {
     /// # Safety
@@ -698,7 +710,7 @@ impl FilterTail {
             (&raw const NO_FILTER_UNIT).cast_mut()
         } else {
             // SAFETY: the caller's contract is `ptr`'s.
-            unsafe { region.ptr::<u64>(arena_base) }
+            unsafe { region.ptr::<FilterUnit>(arena_base) }
         };
         Self { region, base }
     }
@@ -724,7 +736,7 @@ fn try_allocate_storage<K, V, A: Allocator>(
     // The arena zeroes control bytes only; an empty filter must read as
     // "nothing recorded".
     // SAFETY: `shape.membership` was laid out for this arena by `funnel_layout`.
-    unsafe { shape.membership.clear::<u64>(arena.as_ptr()) };
+    unsafe { shape.membership.clear::<FilterUnit>(arena.as_ptr()) };
     // SAFETY: the arena holds `geometry.slots` control bytes and no entry.
     unsafe { geometry.reset_ordinary_controls(arena.as_ptr()) };
     if n != 0 {
@@ -767,7 +779,7 @@ fn funnel_layout<K, V>(slots: usize, n: usize) -> Result<FunnelLayout, TryReserv
     };
     let (base_layout, data_offset) = arena::layout_for_extents::<K, V>(control_bytes, slots)?;
     // One filter unit an entry.
-    let (layout, membership) = MembershipRegion::extend_words::<u64>(base_layout, n)?;
+    let (layout, membership) = MembershipRegion::extend_words::<FilterUnit>(base_layout, n)?;
     Ok(FunnelLayout {
         layout,
         data_offset,
@@ -1713,7 +1725,7 @@ where
     }
 
     #[inline]
-    fn membership_ptr(&self) -> *mut u64 {
+    fn membership_ptr(&self) -> *mut FilterUnit {
         self.membership.base
     }
 
@@ -1817,7 +1829,9 @@ where
     fn clear_membership(&mut self) {
         // SAFETY: `region` was laid out for `self.arena`.
         unsafe {
-            self.membership.region.clear::<u64>(self.arena.as_ptr());
+            self.membership
+                .region
+                .clear::<FilterUnit>(self.arena.as_ptr());
         }
         self.stale_membership = 0;
     }
@@ -2151,7 +2165,7 @@ where
         key: &K,
         value: &V,
         membership: MembershipSlot,
-        unit: u64,
+        unit: FilterUnit,
         probe: PreparedFastFunnelProbe,
     ) -> Option<NonNull<u8>> {
         // No more placements than the limit less the entries, and none on
@@ -2219,9 +2233,9 @@ where
     unsafe fn record_in_head(
         &mut self,
         head_left: usize,
-        recorded: *mut u64,
+        recorded: *mut FilterUnit,
         membership: MembershipSlot,
-        unit: u64,
+        unit: FilterUnit,
         probe: PreparedFastFunnelProbe,
         vacancy: &HeadVacancy<SlotEntry<K, V>>,
     ) {
@@ -2261,7 +2275,7 @@ where
         value: V,
         hash: u64,
         index: usize,
-        unit: u64,
+        unit: FilterUnit,
     ) -> Option<V> {
         let probe = self.prf.prepare(hash);
         if unit_records(unit, membership_bit(hash)) {
@@ -2296,7 +2310,7 @@ where
         value: V,
         hash: u64,
         index: usize,
-        unit: u64,
+        unit: FilterUnit,
         probe: PreparedFastFunnelProbe,
     ) -> Option<V> {
         let membership = MembershipSlot {
@@ -2931,7 +2945,23 @@ where
             mode: if self.entries() <= self.shape.slots / 4 {
                 FunnelScanMode::Sparse(OccupiedIndices::new())
             } else {
-                FunnelScanMode::Dense(0)
+                FunnelScanMode::Dense(
+                    if self.shape.beta < GROUP_SIZE && self.shape.primary_offset != 0 {
+                        DenseScan {
+                            next: 0,
+                            lane_end: self.shape.beta,
+                            lanes: self.shape.beta,
+                            padded_end: self.shape.primary_offset,
+                        }
+                    } else {
+                        DenseScan {
+                            next: 0,
+                            lane_end: self.shape.slots,
+                            lanes: 0,
+                            padded_end: 0,
+                        }
+                    },
+                )
             },
         }
     }
@@ -2939,19 +2969,29 @@ where
     #[inline]
     fn scan_next(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, usize)> {
         match &mut scan.mode {
-            FunnelScanMode::Dense(next) => {
-                while *next < self.shape.slots {
-                    let slot = *next;
-                    *next += 1;
-                    // SAFETY: `slot < slots`, the storage capacity.
+            FunnelScanMode::Dense(dense) => loop {
+                while dense.next < dense.lane_end {
+                    let slot = dense.next;
+                    dense.next += 1;
+                    // SAFETY: `lane_end` is at most `slots`, the storage
+                    // capacity.
                     unsafe {
                         if control::is_occupied(self.storage.control_at(slot)) {
                             return Some((self.storage.slot_ptr(slot), slot));
                         }
                     }
                 }
-                None
-            }
+                let group_end = dense.lane_end - dense.lanes + GROUP_SIZE;
+                if group_end < dense.padded_end {
+                    dense.next = group_end;
+                    dense.lane_end = group_end + dense.lanes;
+                } else if dense.lane_end < self.shape.slots {
+                    dense.next = dense.padded_end;
+                    dense.lane_end = self.shape.slots;
+                } else {
+                    return None;
+                }
+            },
             FunnelScanMode::Sparse(cursor) => {
                 let slot = cursor.step(&self.storage)?;
                 // SAFETY: `step` yields in-bounds slots.
@@ -3077,7 +3117,7 @@ where
         // SAFETY: each region belongs to its own table's arena; the source has
         // the same shape, so equal word counts; distinct arenas never overlap.
         unsafe {
-            cloned.membership.region.copy_from::<u64>(
+            cloned.membership.region.copy_from::<FilterUnit>(
                 cloned.arena.as_ptr(),
                 self.membership.region,
                 self.arena.as_ptr(),
