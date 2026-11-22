@@ -10,7 +10,8 @@ use crate::exact::probe::{self, ProbeDomain};
 use crate::exact::reference::{ScalarFunnel, ScalarFunnelInsert, ScalarFunnelLocation};
 use crate::map::TableBackend;
 use crate::test_support::{
-    self, CountDrop, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator,
+    self, CountDrop, HashedKey, IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop,
+    ToggleAllocator,
 };
 
 std::thread_local! {
@@ -1003,19 +1004,6 @@ fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
     }
 }
 
-/// A key whose hash the test chooses, so several keys can share one.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct HashedKey {
-    id: u64,
-    hash: u64,
-}
-
-impl core::hash::Hash for HashedKey {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        state.write_u64(self.hash);
-    }
-}
-
 /// What a differential run met, so each fixture can prove its coverage.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
@@ -1283,13 +1271,7 @@ fn run_differential(
     assert_eq!(table.shape.n, 0);
     let mut model = alloc::collections::BTreeMap::new();
     let mut coverage = DifferentialCoverage::default();
-    let mut state = seed;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
+    let mut next = test_support::xorshift_stream(seed);
     assert_matches_model(&table, &model, universe, &mut coverage);
     let cycle = stream.filling + stream.mixed + stream.draining;
     for step in 0..stream.operations {

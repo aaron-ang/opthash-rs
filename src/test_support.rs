@@ -139,6 +139,31 @@ impl Drop for PanicOnFirstDrop {
     }
 }
 
+/// A seeded xorshift64 stream: each call yields the next word.
+pub(crate) fn xorshift_stream(seed: u64) -> impl FnMut() -> u64 {
+    let mut state = seed;
+    move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    }
+}
+
+/// A key whose hash the test chooses, so several keys can share one and
+/// with it every probe.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct HashedKey {
+    pub(crate) id: u64,
+    pub(crate) hash: u64,
+}
+
+impl Hash for HashedKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
 /// Key whose `Hash` panics while `armed` is set; counts every drop.
 pub(crate) struct PanicHashKey {
     pub(crate) id: u64,

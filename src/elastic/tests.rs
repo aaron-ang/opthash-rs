@@ -10,8 +10,8 @@ use crate::exact::reference::{ScalarElastic, ScalarElasticLimits};
 use crate::map::TableBackend;
 use crate::raw::control::CTRL_TOMBSTONE;
 use crate::test_support::{
-    self, CountDrop, Deterministic, FixedElasticHashMap, FixedHashBuilder, IdentityBuildHasher,
-    PanicHashKey, PanicOnFirstDrop, ToggleAllocator, fixed_hasher,
+    self, CountDrop, Deterministic, FixedElasticHashMap, FixedHashBuilder, HashedKey,
+    IdentityBuildHasher, PanicHashKey, PanicOnFirstDrop, ToggleAllocator, fixed_hasher,
 };
 use alloc::sync::Arc;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -199,6 +199,17 @@ impl ExactTrace {
 /// a key of the next level leaves the table inside the batch with the
 /// current level exactly at its threshold and the next level above its
 /// own.
+/// An empty table of `slots` slots at the default reserve.
+fn table_with_slots<S: BuildHasher>(slots: usize, hash_builder: S) -> ElasticTable<u64, u64, S> {
+    ElasticTable::try_with_slots_and_reserve_fraction_and_hasher_in(
+        slots,
+        ReserveFraction::DEFAULT,
+        hash_builder,
+        Global,
+    )
+    .unwrap()
+}
+
 #[test]
 fn elastic_placement_matches_the_scalar_model_with_the_current_level_low() {
     let mut low_placements = 0;
@@ -241,16 +252,7 @@ fn elastic_placement_matches_the_scalar_model_with_the_current_level_low() {
 
 #[test]
 fn settled_limit_is_zero_without_the_bounds_a_settled_insert_assumes() {
-    type Table = ElasticTable<u64, u64, FixedHashBuilder>;
-    let table = |slots| {
-        Table::try_with_slots_and_reserve_fraction_and_hasher_in(
-            slots,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap()
-    };
+    let table = |slots| table_with_slots(slots, fixed_hasher());
     let shifted = table(32);
     let levels = &shifted.levels;
     assert_ne!(levels[0].index_shift(), GENERAL_REDUCTION);
@@ -392,14 +394,7 @@ fn routes_in_position_order(levels: usize, high_water: u128) -> Vec<(usize, u128
 
 #[test]
 fn query_schedule_stays_in_position_order_through_every_extension() {
-    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            4_096,
-            ReserveFraction::DEFAULT,
-            IdentityBuildHasher,
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(4_096, IdentityBuildHasher);
     let scheduled = |table: &ElasticTable<u64, u64, IdentityBuildHasher>| {
         table
             .probe_schedule
@@ -444,14 +439,7 @@ fn query_schedule_stays_in_position_order_through_every_extension() {
 
 #[test]
 fn query_schedule_never_reallocates_within_an_epoch() {
-    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            8_192,
-            ReserveFraction::DEFAULT,
-            IdentityBuildHasher,
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(8_192, IdentityBuildHasher);
     let initial_ptr = table.probe_schedule.direct();
     let initial_capacity = table.probe_schedule.route_capacity();
 
@@ -465,14 +453,7 @@ fn query_schedule_never_reallocates_within_an_epoch() {
 
 #[test]
 fn query_schedule_holds_every_route_once_in_position_order() {
-    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            8_193,
-            ReserveFraction::DEFAULT,
-            IdentityBuildHasher,
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(8_193, IdentityBuildHasher);
 
     table.schedule_levels_through(table.levels.len() - 1);
     table.extend_probe_schedule(QUERY_POSITION_CAP);
@@ -1987,14 +1968,7 @@ fn assert_reinsert_replaces<S: BuildHasher + Clone>(
 #[test]
 fn reinsert_replaces_the_value_on_a_general_reduction_table() {
     const KEYS: u64 = 600;
-    let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            1_000,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(1_000, fixed_hasher());
     assert_eq!(table.levels[0].index_shift(), GENERAL_REDUCTION);
     for key in 0..KEYS {
         let hash = table.hash_builder.hash_one(key);
@@ -2006,14 +1980,7 @@ fn reinsert_replaces_the_value_on_a_general_reduction_table() {
 #[test]
 fn reinsert_replaces_the_value_on_a_table_flagged_exceptional() {
     const KEYS: u64 = 600;
-    let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            1_024,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(1_024, fixed_hasher());
     assert_ne!(table.levels[0].index_shift(), GENERAL_REDUCTION);
     for key in 0..KEYS {
         let hash = table.hash_builder.hash_one(key);
@@ -2037,14 +2004,7 @@ fn schedule_lookup_agrees_with_the_general_walk_and_the_full_scan() {
         (&[32, 128, 1_000, 2_048, 3_000, 8_192], 1_000)
     };
     for &slots in slot_counts {
-        let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
-            try_with_slots_and_reserve_fraction_and_hasher_in(
-                slots,
-                ReserveFraction::DEFAULT,
-                fixed_hasher(),
-                Global,
-            )
-            .unwrap();
+        let mut table = table_with_slots(slots, fixed_hasher());
         if table.levels[0].index_shift() == GENERAL_REDUCTION {
             general_tables += 1;
         } else {
@@ -2195,14 +2155,7 @@ fn levels_reduce_all_by_shift_or_all_by_the_general_reduction() {
         if cfg!(miri) && slots > 100 {
             continue;
         }
-        let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
-            try_with_slots_and_reserve_fraction_and_hasher_in(
-                slots,
-                ReserveFraction::DEFAULT,
-                fixed_hasher(),
-                Global,
-            )
-            .unwrap();
+        let mut table = table_with_slots(slots, fixed_hasher());
         let shifts = table
             .levels
             .iter()
@@ -2314,13 +2267,7 @@ fn schedule_addresses_the_levels_of_every_table_it_serves() {
         &[1, 3, 32, 1_000, 2_048, 3_000]
     };
     for &slots in slot_counts {
-        let mut table = Table::try_with_slots_and_reserve_fraction_and_hasher_in(
-            slots,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap();
+        let mut table = table_with_slots(slots, fixed_hasher());
         let mut seen = vec![check(&table)];
         // Twice the budget takes the table through a growth.
         let keys = 2 * table.max_insertions as u64;
@@ -2363,13 +2310,7 @@ fn lookup_and_insert_paths_hold_on_every_small_table_shape() {
     let mut general_tables = 0;
     let mut shifted_tables = 0;
     for slots in [0, 1, 2, 3, 5, 16, 24, 64] {
-        let mut table = Table::try_with_slots_and_reserve_fraction_and_hasher_in(
-            slots,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap();
+        let mut table = table_with_slots(slots, fixed_hasher());
         assert_holds(&table, |_| false, 0);
         // Twice the budget takes the table through a growth.
         let budget = table.max_insertions;
@@ -2413,14 +2354,7 @@ fn lookup_and_insert_paths_hold_on_every_small_table_shape() {
 fn lookups_resolve_on_the_smallest_tables() {
     let mut single_slot_first_levels = 0;
     for slots in 1..=5 {
-        let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
-            try_with_slots_and_reserve_fraction_and_hasher_in(
-                slots,
-                ReserveFraction::DEFAULT,
-                fixed_hasher(),
-                Global,
-            )
-            .unwrap();
+        let mut table = table_with_slots(slots, fixed_hasher());
         single_slot_first_levels += usize::from(table.levels[0].capacity() == 1);
         let budget = table.max_insertions as u64;
         for key in 0..budget {
@@ -2510,13 +2444,7 @@ fn clone_carries_the_schedule_onto_its_own_levels() {
 fn seeded_operation_mix_matches_an_ordered_map_model() {
     const KEY_SPACE: u64 = if cfg!(miri) { 200 } else { 3_000 };
     const STEPS: u64 = if cfg!(miri) { 4_000 } else { 200_000 };
-    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
+    let mut next = test_support::xorshift_stream(0x9e37_79b9_7f4a_7c15_u64);
     let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(16);
     let mut model = alloc::collections::BTreeMap::<u64, u64>::new();
     for step in 0..STEPS {
@@ -2677,24 +2605,11 @@ fn settled_inserts_match_an_ordered_map_model() {
     const STEPS: u64 = if cfg!(miri) { 1_500 } else { 60_000 };
     let slot_counts: &[usize] = if cfg!(miri) { &[256] } else { &[1_024, 4_096] };
     for &slots in slot_counts {
-        let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
-            try_with_slots_and_reserve_fraction_and_hasher_in(
-                slots,
-                ReserveFraction::DEFAULT,
-                fixed_hasher(),
-                Global,
-            )
-            .unwrap();
+        let mut table = table_with_slots(slots, fixed_hasher());
         assert_ne!(table.levels[0].index_shift(), GENERAL_REDUCTION);
         let key_space = table.max_insertions as u64 * 2;
         let mut model = alloc::collections::BTreeMap::<u64, u64>::new();
-        let mut state = 0x2545_f491_4f6c_dd1d_u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut next = test_support::xorshift_stream(0x2545_f491_4f6c_dd1d_u64);
         let (mut settled, mut reused) = (0, 0);
         for step in 0..STEPS {
             let roll = next() % 100;
@@ -2862,14 +2777,7 @@ fn assert_gate_past_an_insert(table: &ElasticTable<u64, u64, FixedHashBuilder>) 
 #[test]
 fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
     for (slots, shifted) in [(1_024, true), (1_000, false), (4_096, true)] {
-        let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
-            try_with_slots_and_reserve_fraction_and_hasher_in(
-                slots,
-                ReserveFraction::DEFAULT,
-                fixed_hasher(),
-                Global,
-            )
-            .unwrap();
+        let mut table = table_with_slots(slots, fixed_hasher());
         assert_eq!(table.levels[0].index_shift() != GENERAL_REDUCTION, shifted);
         let mut settled_inserts = 0;
         for key in 0..table.max_insertions as u64 {
@@ -2913,16 +2821,7 @@ fn settled_gate_is_the_batch_window_under_the_insertion_limit() {
 #[cfg_attr(miri, ignore)]
 fn take_agrees_with_find_then_remove() {
     for (slots, shifted) in [(1_024, true), (1_000, false)] {
-        let build = || {
-            ElasticTable::<u64, u64, FixedHashBuilder>::
-                try_with_slots_and_reserve_fraction_and_hasher_in(
-                    slots,
-                    ReserveFraction::DEFAULT,
-                    fixed_hasher(),
-                    Global,
-                )
-                .unwrap()
-        };
+        let build = || table_with_slots(slots, fixed_hasher());
         let (mut fused, mut split) = (build(), build());
         assert_eq!(fused.levels[0].index_shift() != GENERAL_REDUCTION, shifted);
         let capacity = fused.max_insertions as u64;
@@ -2978,14 +2877,7 @@ fn take_agrees_with_find_then_remove() {
 
 #[test]
 fn settled_gate_closes_when_the_removal_count_starts_over() {
-    let mut table =
-        ElasticTable::<u64, u64, FixedHashBuilder>::try_with_slots_and_reserve_fraction_and_hasher_in(
-            1_024,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(1_024, fixed_hasher());
     let live = table.max_insertions as u64 / 2;
     for key in 0..live {
         let hash = table.hash_builder.hash_one(key);
@@ -3096,14 +2988,7 @@ fn a_scan_that_spends_the_delete_budget_refreshes_the_filter() {
 #[test]
 #[should_panic(expected = "probe schedule outgrew its room")]
 fn schedule_push_past_its_room_panics_instead_of_moving_the_routes() {
-    let table =
-        ElasticTable::<u64, u64, FixedHashBuilder>::try_with_slots_and_reserve_fraction_and_hasher_in(
-            1_024,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap();
+    let table = table_with_slots(1_024, fixed_hasher());
     let mut schedule = ProbeScheduleRoom::try_for_levels(table.levels.len())
         .unwrap()
         .schedule(&table.levels);
@@ -3118,14 +3003,7 @@ fn schedule_push_past_its_room_panics_instead_of_moving_the_routes() {
 #[test]
 #[should_panic(expected = "probe schedule outgrew its room")]
 fn schedule_push_past_every_route_panics_where_no_run_is_whole() {
-    let mut table =
-        ElasticTable::<u64, u64, FixedHashBuilder>::try_with_slots_and_reserve_fraction_and_hasher_in(
-            1_024,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(1_024, fixed_hasher());
     let last = table.levels.len() - 1;
     table.schedule_levels_through(last);
     table.extend_probe_schedule(QUERY_POSITION_CAP);
@@ -3263,16 +3141,7 @@ fn settled_plan_places_every_key_where_the_general_insert_does() {
     use alloc::collections::BTreeMap;
 
     for slots in [1_024, 1 << 15] {
-        let build = || {
-            ElasticTable::<u64, u64, FixedHashBuilder>::
-                try_with_slots_and_reserve_fraction_and_hasher_in(
-                    slots,
-                    ReserveFraction::DEFAULT,
-                    fixed_hasher(),
-                    Global,
-                )
-                .unwrap()
-        };
+        let build = || table_with_slots(slots, fixed_hasher());
         let (mut settled, mut general) = (build(), build());
         assert_ne!(settled.levels[0].index_shift(), GENERAL_REDUCTION);
         let mut model = BTreeMap::new();
@@ -3360,24 +3229,10 @@ fn settled_plan_places_every_key_where_the_general_insert_does() {
 fn late_counted_settled_inserts_read_as_counted_at_once() {
     const STEPS: u64 = if cfg!(miri) { 1_200 } else { 120_000 };
     type Table = ElasticTable<u64, u64, FixedHashBuilder>;
-    let build = || {
-        Table::try_with_slots_and_reserve_fraction_and_hasher_in(
-            64,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap()
-    };
+    let build = || table_with_slots(64, fixed_hasher());
     let (mut late, mut eager) = (build(), build());
     let mut model = alloc::collections::BTreeMap::<u64, u64>::new();
-    let mut state = 0x853c_49e6_748f_ea9b_u64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
+    let mut next = test_support::xorshift_stream(0x853c_49e6_748f_ea9b_u64);
     let uncounted = |table: &Table| table.uncounted.pending(table.placed);
     let (mut removed_under, mut cleared_under, mut copied_under) = (0_u32, 0_u32, 0_u32);
     let (mut grown, mut most_uncounted) = (0_u32, 0_u32);
@@ -3461,15 +3316,7 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
     const BLOCK: usize = 64;
     type Table = ElasticTable<u64, u64, FixedHashBuilder>;
 
-    let build = || {
-        Table::try_with_slots_and_reserve_fraction_and_hasher_in(
-            1 << 12,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap()
-    };
+    let build = || table_with_slots(1 << 12, fixed_hasher());
     let (mut settled, mut general) = (build(), build());
     let hash_of = |key: u64| fixed_hasher().hash_one(key);
     let insert = |settled: &mut Table, general: &mut Table, key: u64| {
@@ -3553,15 +3400,7 @@ fn settled_fallback_ends_where_its_level_comes_down_to_a_quarter_free() {
 fn settled_fallback_bound_holds_where_its_level_recrosses_a_quarter_free() {
     type Table = ElasticTable<u64, u64, FixedHashBuilder>;
 
-    let build = || {
-        Table::try_with_slots_and_reserve_fraction_and_hasher_in(
-            1 << 12,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap()
-    };
+    let build = || table_with_slots(1 << 12, fixed_hasher());
     let (mut settled, mut general) = (build(), build());
     let hash_of = |key: u64| fixed_hasher().hash_one(key);
     let insert = |settled: &mut Table, general: &mut Table, key: u64| {
@@ -3637,14 +3476,7 @@ fn settled_fallback_bound_holds_where_its_level_recrosses_a_quarter_free() {
 
 #[test]
 fn settled_plan_stays_readable_past_a_replaced_value() {
-    let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            1 << 8,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(1 << 8, fixed_hasher());
     for key in 0..20_u64 {
         let hash = table.hash_builder.hash_one(key);
         assert_eq!(table.insert(key, key, hash), None);
@@ -3686,14 +3518,7 @@ fn settled_plan_stays_readable_past_a_leaked_drain() {
 
 #[test]
 fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
-    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            1 << 8,
-            ReserveFraction::DEFAULT,
-            IdentityBuildHasher,
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(1 << 8, IdentityBuildHasher);
     let level_count = table.levels.len();
     let (whole, fitted) = table.probe_schedule.whole_groups();
     assert_eq!(whole, 0);
@@ -3731,14 +3556,7 @@ fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
 
 #[test]
 fn rebuild_leaves_a_group_run_that_stopped_being_whole_as_it_is() {
-    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            1 << 8,
-            ReserveFraction::DEFAULT,
-            IdentityBuildHasher,
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(1 << 8, IdentityBuildHasher);
     let fitted = table.probe_schedule.whole_groups().1;
     assert_ne!(fitted, 0);
     // Every route of the grouped levels is more than the groups' runs
@@ -3756,14 +3574,7 @@ fn rebuild_leaves_a_group_run_that_stopped_being_whole_as_it_is() {
 
 #[test]
 fn clone_has_group_runs_only_where_its_source_has_one_whole() {
-    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            1 << 8,
-            ReserveFraction::DEFAULT,
-            IdentityBuildHasher,
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(1 << 8, IdentityBuildHasher);
     let fitted = table.probe_schedule.whole_groups().1;
     assert_ne!(fitted, 0);
     table.schedule_levels_through(schedule::GROUPED_LEVELS - 2);
@@ -3800,14 +3611,7 @@ fn clone_has_group_runs_only_where_its_source_has_one_whole() {
 #[cfg_attr(miri, ignore)]
 fn every_walk_start_leads_to_the_routes_its_summary_leaves_open() {
     for slots in [16, 64, 1_024, 1 << 15] {
-        let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
-            try_with_slots_and_reserve_fraction_and_hasher_in(
-                slots,
-                ReserveFraction::DEFAULT,
-                IdentityBuildHasher,
-                Global,
-            )
-            .unwrap();
+        let mut table = table_with_slots(slots, IdentityBuildHasher);
         let level_count = table.levels.len();
         let assert_starts = |table: &ElasticTable<u64, u64, IdentityBuildHasher>| {
             let schedule = &table.probe_schedule;
@@ -3919,14 +3723,7 @@ fn every_walk_start_leads_to_the_routes_its_summary_leaves_open() {
 #[cfg_attr(miri, ignore)]
 fn group_runs_are_left_before_a_pushed_route_reaches_them() {
     for slots in [1 << 8, 1 << 11, 1 << 15] {
-        let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
-            try_with_slots_and_reserve_fraction_and_hasher_in(
-                slots,
-                ReserveFraction::DEFAULT,
-                IdentityBuildHasher,
-                Global,
-            )
-            .unwrap();
+        let mut table = table_with_slots(slots, IdentityBuildHasher);
         let level_count = table.levels.len();
         table.probe_high_water &= HIGH_WATER_FLAGS;
         table.schedule_levels_through(level_count - 1);
@@ -3977,14 +3774,7 @@ fn group_runs_are_left_before_a_pushed_route_reaches_them() {
 
 #[test]
 fn run_walk_steps_over_its_level_routes_and_stops_at_a_sentinel() {
-    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            8_193,
-            ReserveFraction::DEFAULT,
-            IdentityBuildHasher,
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(8_193, IdentityBuildHasher);
     let level_count = table.levels.len();
     table.schedule_levels_through(level_count - 1);
     table.extend_probe_schedule(1_024);
@@ -4081,14 +3871,7 @@ fn walks_speculate_on_level_zero_until_a_deeper_level_is_scheduled() {
 /// fit one has: the copy names no grouped level when it is made.
 #[test]
 fn clone_of_a_deep_schedule_without_group_runs_does_not_speculate() {
-    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            64,
-            ReserveFraction::DEFAULT,
-            IdentityBuildHasher,
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(64, IdentityBuildHasher);
     table.schedule_levels_through(schedule::GROUPED_LEVELS);
     assert_eq!(table.probe_schedule.whole_groups(), (0, 0));
     assert!(!table.probe_schedule.speculates());
@@ -4631,14 +4414,7 @@ fn churn_below_the_insertion_limit_places_where_the_walk_does() {
 /// and another target places them, in an insert and in a rebuild alike.
 #[test]
 fn rebuild_places_a_key_its_target_fails_on_another_target() {
-    let mut table = ElasticTable::<u64, u64, ConstHashBuilder>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            4_096,
-            ReserveFraction::DEFAULT,
-            ConstHashBuilder,
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(4_096, ConstHashBuilder);
     assert_ne!(table.levels[0].index_shift(), GENERAL_REDUCTION);
     let keys = LEVEL_PROBE_LIMIT[0] + 40;
     assert!(keys < table.scheduler.batch_ends[0] as u64);
@@ -4663,19 +4439,6 @@ fn rebuild_places_a_key_its_target_fails_on_another_target() {
     }
 }
 
-/// A key hashed by `hash` alone, so keys of one hash share every probe.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SharedProbeKey {
-    hash: u64,
-    id: u64,
-}
-
-impl Hash for SharedProbeKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.hash);
-    }
-}
-
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_recovery_rebuild_tries_every_target_before_placing_off_the_probes() {
@@ -4691,14 +4454,14 @@ fn a_recovery_rebuild_tries_every_target_before_placing_off_the_probes() {
         hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         hash ^ (hash >> 31)
     };
-    let shared = |id: u64| SharedProbeKey { hash: SHARED, id };
-    let mut map: ElasticHashMap<SharedProbeKey, u64, IdentityBuildHasher> =
+    let shared = |id: u64| HashedKey { hash: SHARED, id };
+    let mut map: ElasticHashMap<HashedKey, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(256, IdentityBuildHasher);
     let slots = map.table().total_slots;
     // A rebuild moves the keys of their own probes.
     for id in 0..SPREAD {
         map.insert(
-            SharedProbeKey {
+            HashedKey {
                 hash: spread_hash(id),
                 id,
             },
@@ -4707,7 +4470,7 @@ fn a_recovery_rebuild_tries_every_target_before_placing_off_the_probes() {
     }
     // Keys of the shared hash, until no target has a slot for the next.
     let prepared = PreparedElasticRoute::new(SHARED);
-    let no_slot = |table: &ElasticTable<SharedProbeKey, u64, IdentityBuildHasher>| {
+    let no_slot = |table: &ElasticTable<HashedKey, u64, IdentityBuildHasher>| {
         let target = table.scheduler.target_at(table.live());
         table.choose_slot::<false>(prepared.probe, target).is_none()
             && table
@@ -4750,7 +4513,7 @@ fn a_recovery_rebuild_tries_every_target_before_placing_off_the_probes() {
         assert_eq!(map.get(&shared(id)), Some(&id));
     }
     for id in 0..SPREAD {
-        let key = SharedProbeKey {
+        let key = HashedKey {
             hash: spread_hash(id),
             id,
         };
@@ -4761,11 +4524,11 @@ fn a_recovery_rebuild_tries_every_target_before_placing_off_the_probes() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_removal_finds_a_key_placed_off_its_probes() {
-    let shared = |id: u64| SharedProbeKey {
+    let shared = |id: u64| HashedKey {
         hash: 0x9e37_79b9_7f4a_7c15,
         id,
     };
-    let mut map: ElasticHashMap<SharedProbeKey, u64, IdentityBuildHasher> =
+    let mut map: ElasticHashMap<HashedKey, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(256, IdentityBuildHasher);
     let keys = map.capacity() as u64;
     // One hash for every key: its probes run out of slots before the
@@ -4793,14 +4556,7 @@ fn a_removal_finds_a_key_placed_off_its_probes() {
 
 #[test]
 fn a_removal_takes_an_entry_placed_off_the_schedule() {
-    let mut table =
-        ElasticTable::<u64, u64, FixedHashBuilder>::try_with_slots_and_reserve_fraction_and_hasher_in(
-            1_024,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(1_024, fixed_hasher());
     for key in 0..200_u64 {
         let hash = table.hash_builder.hash_one(key);
         table.insert_for_vacant_entry(key, !key, hash);
@@ -4938,14 +4694,7 @@ fn a_removal_forgets_only_a_bit_no_live_key_holds() {
 #[test]
 fn a_general_insert_on_the_open_plan_keeps_the_gate_end_past_removals() {
     const SLOTS: usize = if cfg!(miri) { 256 } else { 1_024 };
-    let mut table = ElasticTable::<u64, u64, FixedHashBuilder>::
-        try_with_slots_and_reserve_fraction_and_hasher_in(
-            SLOTS,
-            ReserveFraction::DEFAULT,
-            fixed_hasher(),
-            Global,
-        )
-        .unwrap();
+    let mut table = table_with_slots(SLOTS, fixed_hasher());
     let capacity = table.max_insertions as u64;
     let universe = capacity + capacity / 2;
     let mut model = alloc::collections::BTreeMap::<u64, u64>::new();
