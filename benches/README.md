@@ -35,7 +35,9 @@ filters and options after `--`.
 `3 * MAP_SIZE / 4`, remove the first `MAP_SIZE / 32` keys during setup, then
 time their `entry().or_insert()` calls. Spare capacity keeps all controls from growing.
 The small delete burst stays below Funnel cleanup and filter-refresh thresholds,
-so every removed key remains filter-positive and exercises vacant-search reuse.
+so every removed Funnel key remains filter-positive and exercises vacant-search
+reuse. A removed Elastic key stays filter-positive only where its filter bit is
+shared; the rest take the filter-negative insert.
 Measure its baseline using the same fixture on the comparison revision.
 
 Criterion IDs use `<workload>_<implementation>`, where implementation is one

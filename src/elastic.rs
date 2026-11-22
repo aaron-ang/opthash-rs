@@ -122,7 +122,7 @@ const PLACE_FRACTION_BITS: u32 = LANE_BIT_INDEX_BITS * MEMBERSHIP_BITS as u32;
 // `MetadataPlace::scale` shifts no word count out: the scale of a tail
 // with a word is not zero.
 const _: () = assert!(MAX_ELASTIC_SLOTS.leading_zeros() >= PLACE_FRACTION_BITS);
-const _: () = assert!(MEMBERSHIP_BITS >= 1 && SUMMARY_BINS <= u64::BITS as usize);
+const _: () = assert!(SUMMARY_BINS <= u64::BITS as usize);
 
 /// A key's place in the metadata tail: its word, its membership bits there
 /// and its summary bin, all from one multiply-high reduction of the
@@ -180,7 +180,7 @@ impl MetadataPlace {
     }
 
     /// [`Self::bits`] and their pairs ([`paired_bits`]), built apart from
-    /// the bits so an operation that never needs the pair builds neither.
+    /// the bits so an insert that replaces a value builds no pair.
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
     const fn bits_with_pair(self) -> u64 {
@@ -898,7 +898,8 @@ enum ScheduleSearch<R> {
 
 /// A key's place in a table's metadata tail and its word's membership lane
 /// as [`ElasticTable::route_filter`] read it, for an insert to record over
-/// without reducing the key or reading the word again.
+/// or a removal to forget from without reducing the key or reading the word
+/// again.
 #[derive(Clone, Copy)]
 struct LaneRead {
     place: MetadataPlace,
@@ -925,7 +926,7 @@ const _: () = assert!(MEMBERSHIP_BITS == 1);
 /// The metadata word of one prepared key and its membership answer.
 #[derive(Clone, Copy)]
 struct ElasticRouteFilter<'a> {
-    /// `false` proves no insert ever recorded this key's route.
+    /// `false` proves the key is absent.
     maybe_present: bool,
     read: LaneRead,
     word: &'a TailWord,
@@ -1749,8 +1750,8 @@ where
     }
 
     /// Tests the membership scalar of the key's metadata word:
-    /// `maybe_present == false` proves the key was never recorded. The
-    /// word's summary bins narrow the candidate levels.
+    /// `maybe_present == false` proves the key is absent. The word's
+    /// summary bins narrow the candidate levels.
     #[inline]
     fn route_filter(&self, prepared: PreparedElasticRoute) -> ElasticRouteFilter<'_> {
         // A zero scale reduces every signature to place zero, whose word is
@@ -1807,6 +1808,7 @@ where
     #[inline]
     unsafe fn forget_membership(&mut self, read: LaneRead) {
         let LaneRead { place, lane, bits } = read;
+        debug_assert_eq!(bits, place.bits(), "the read carries a pair mark");
         debug_assert_eq!(lane & bits, bits, "the filter did not pass the key");
         // The key's bit where the lane holds no pair for it, else nothing.
         // The lane holds the bit, so flipping it clears it.
@@ -3039,8 +3041,8 @@ where
         self.scheduler.maintenance_is_due()
     }
 
-    /// Deletes since the filter last matched the live set. They are also the
-    /// deletes the epoch has not counted yet.
+    /// Deletes since the filter was last recorded from the live entries.
+    /// They are also the deletes the epoch has not counted yet.
     fn stale_membership(&self) -> usize {
         self.scheduler
             .removed(membership::refresh_deletes(self.max_insertions))
@@ -3595,7 +3597,7 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        // A key the filter never recorded was never inserted, so neither the
+        // A key the filter does not pass is absent, so neither the
         // candidates nor the exceptional full scan can hold it.
         let filter = self.route_filter(prepared);
         if !filter.maybe_present {
