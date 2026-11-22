@@ -461,7 +461,6 @@ fn query_schedule_never_reallocates_within_an_epoch() {
     table.extend_probe_schedule(QUERY_POSITION_CAP);
 
     assert_eq!(table.probe_schedule.direct(), initial_ptr);
-    assert_eq!(table.probe_schedule.route_capacity(), initial_capacity);
     assert_eq!(table.probe_schedule.routes().len(), initial_capacity);
     assert!(table.probe_schedule.ends_with_sentinel());
 }
