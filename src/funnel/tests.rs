@@ -677,7 +677,7 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
         }
         let generation = table.epoch_snapshot().generation;
         let mut fresh = budget;
-        let (mut taken_back, mut reopened, mut refreshed) = (0, 0, 0);
+        let (mut taken_back, mut reopened, mut refreshed, mut deleted) = (0, 0, 0, 0);
         for turn in 0..3 * table.shape.max_insertions {
             let pairs = if turn % 7 == 6 { 2 } else { 1 };
             let mut removed = Vec::new();
@@ -692,6 +692,7 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
                     "n {n} turn {turn}"
                 );
                 refreshed += usize::from(table.stale_membership() < stale);
+                deleted += 1;
                 removed.push(index);
             }
             for index in removed {
@@ -738,6 +739,10 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
         );
         assert_ne!(taken_back, 0, "n {n} fill {fill}");
         assert_ne!(refreshed, 0, "n {n} fill {fill}");
+        assert!(
+            deleted > capacity::tombstone_cleanup_threshold(table.shape.n),
+            "n {n} fill {fill}"
+        );
         assert_ne!(reopened, 0, "n {n} fill {fill}");
         for (key, value) in &model {
             let slot = table.find(key, *key).unwrap();

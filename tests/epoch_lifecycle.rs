@@ -375,37 +375,60 @@ fn partial_extract_drop_finishes_deferred_tombstone_cleanup() {
 }
 
 /// A bulk removal cleans up the tombstones single removals left, even when
-/// it removes nothing itself, and rebuilds nothing once inserts have taken
-/// those tombstones back.
+/// it removes nothing itself. It rebuilds nothing once inserts have taken
+/// those tombstones back, nor once the single removals have gone on to
+/// refresh the filter, which starts their count again.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn funnel_bulk_removal_cleans_only_the_tombstones_still_in_place() {
-    for refill in [false, true] {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Then {
+        Nothing,
+        Refill,
+        RefreshFilter,
+    }
+
+    for then in [Then::Nothing, Then::Refill, Then::RefreshFilter] {
         let mut map = FunnelHashMap::<usize, usize>::with_capacity(512);
         let capacity = fill_to_capacity!(map);
         let before = map.epoch();
         for key in 1..capacity {
             assert_eq!(map.remove(&key), Some(key));
         }
-        if refill {
-            for key in 1..capacity {
-                assert_eq!(map.insert(key, key), None);
+        match then {
+            Then::Nothing => {}
+            Then::Refill => {
+                for key in 1..capacity {
+                    assert_eq!(map.insert(key, key), None);
+                }
+            }
+            // One removal short of a capacity of them so far: these take
+            // the count past it.
+            Then::RefreshFilter => {
+                for key in capacity..capacity + 8 {
+                    assert_eq!(map.insert(key, key), None);
+                    assert_eq!(map.remove(&key), Some(key));
+                }
             }
         }
-        assert_eq!(map.epoch().generation, before.generation);
+        assert_eq!(map.epoch().generation, before.generation, "{then:?}");
 
         map.retain(|_, _| true);
 
         let after = map.epoch();
-        assert_eq!(map.capacity(), capacity);
-        if refill {
-            assert_eq!(after.generation, before.generation);
-            assert_identity_present!(map, 0..capacity);
-        } else {
+        assert_eq!(map.capacity(), capacity, "{then:?}");
+        if then == Then::Nothing {
             assert_eq!(after.generation, before.generation + 1);
             assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
-            assert_eq!(map.len(), 1);
-            assert_eq!(map.get(&0), Some(&0));
+        } else {
+            assert_eq!(after.generation, before.generation, "{then:?}");
+        }
+        if then == Then::Refill {
+            assert_identity_present!(map, 0..capacity);
+        } else {
+            assert_eq!(map.len(), 1, "{then:?}");
+            assert_eq!(map.get(&0), Some(&0), "{then:?}");
+            assert_eq!(map.get(&1), None, "{then:?}");
         }
     }
 }

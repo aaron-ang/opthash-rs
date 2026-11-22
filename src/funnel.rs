@@ -1899,12 +1899,15 @@ where
     /// filter last matched the live set are past the cleanup threshold, and
     /// a count finds as many tombstones still in place. A placement that
     /// took a tombstone's lane since then is why the count can fall short.
+    /// A filter refresh starts those deletes again from zero, so tombstones
+    /// older than the last refresh make no cleanup due by themselves.
     fn cleanup_is_due(&self) -> bool {
         let threshold = capacity::tombstone_cleanup_threshold(self.shape.n);
         if self.stale_membership <= threshold {
             return false;
         }
-        // SAFETY: the storage holds `shape.slots` control bytes.
+        // SAFETY: the storage holds `shape.slots` initialized control bytes,
+        // and `&self` keeps writers out.
         let controls =
             unsafe { core::slice::from_raw_parts(self.storage.ctrl_ptr(), self.shape.slots) };
         let tombstones: usize = controls
@@ -2062,7 +2065,7 @@ where
     }
 
     /// Deletes since the counts were last settled, which the entry,
-    /// tombstone, stale-filter and epoch counts have yet to see.
+    /// stale-filter and epoch counts have yet to see.
     #[inline]
     fn uncounted_deletes(&self) -> usize {
         self.settle_armed.wrapping_sub(self.settle_left)
