@@ -110,7 +110,7 @@ const MEMBERSHIP_BITS: usize = 1;
 /// filter sparser, so it passes fewer absent keys, and leave each summary
 /// fewer keys, so a walk skips more levels; the metadata tail grows in
 /// proportion.
-const FILTER_SLOTS_PER_WORD: usize = 5;
+const FILTER_SLOTS_PER_WORD: usize = 4;
 
 /// Bits of a [`MetadataPlace`] that pick one bit of a membership lane.
 const LANE_BIT_INDEX_BITS: u32 = u64::BITS.trailing_zeros();
