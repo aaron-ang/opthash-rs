@@ -1363,16 +1363,16 @@ where
             // and occupied.
             let (lane, entry) = unsafe {
                 // Counted back from the bucket's last lane, by the mask's
-                // leading zeros scaled to each array's stride. The control
-                // byte is offset from the first bucket's last lane by a
-                // signed index, not from the group the scan read, so a scan
-                // that matches nothing has no address to form for it.
+                // leading zeros scaled to each array's stride.
                 let depth = highest_lane_depth(matches) as usize;
                 (
-                    NonNull::new_unchecked(level.ctrl.add(GROUP_SIZE - 1).offset(
-                        (bucket * GROUP_SIZE).cast_signed()
-                            - (depth / BITMASK_STRIDE as usize).cast_signed(),
-                    )),
+                    NonNull::new_unchecked(
+                        level
+                            .group(bucket)
+                            .cast::<u8>()
+                            .add(GROUP_SIZE - 1)
+                            .sub(depth / BITMASK_STRIDE as usize),
+                    ),
                     NonNull::new_unchecked(
                         level
                             .last_entry(bucket)
