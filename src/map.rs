@@ -602,6 +602,19 @@ where
         unsafe { &self.table.slot_ref(loc).key }
     }
 
+    /// Stores `key` with `value` if no equal key is present; otherwise swaps
+    /// `key` into the equal entry, leaving its value, and returns the key it
+    /// displaces. Backs set `replace`.
+    pub(crate) fn replace_key(&mut self, key: K, value: V) -> Option<K> {
+        let Some(loc) = self.find_location(&key) else {
+            self.insert(key, value);
+            return None;
+        };
+        // SAFETY: `find_location` returned a live location; `&mut self` proves exclusivity.
+        let stored = unsafe { &mut self.slot_entry_mut(loc).key };
+        Some(core::mem::replace(stored, key))
+    }
+
     /// Returns a mutable reference to the value for `key`.
     #[inline(always)]
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>

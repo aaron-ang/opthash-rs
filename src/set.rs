@@ -560,9 +560,7 @@ where
 
     /// Inserts `value`, replacing and returning any equal existing value.
     pub fn replace(&mut self, value: T) -> Option<T> {
-        let replaced = self.map.remove_entry(&value).map(|(k, ())| k);
-        self.map.insert(value, ());
-        replaced
+        self.map.replace_key(value, ())
     }
 
     /// Removes the value equal to `value`. Returns whether it was present.

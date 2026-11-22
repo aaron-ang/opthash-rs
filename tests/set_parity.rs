@@ -376,6 +376,50 @@ macro_rules! set_suite {
             }
 
             #[test]
+            fn test_replace_among_removals() {
+                use core::hash;
+
+                #[derive(Debug)]
+                struct Tagged(u32, u32);
+
+                impl PartialEq for Tagged {
+                    fn eq(&self, other: &Self) -> bool {
+                        self.0 == other.0
+                    }
+                }
+
+                impl Eq for Tagged {}
+
+                impl hash::Hash for Tagged {
+                    fn hash<H: hash::Hasher>(&self, h: &mut H) {
+                        self.0.hash(h);
+                    }
+                }
+
+                const KEYS: u32 = 2_000;
+                let mut s = HashSet::new();
+                for id in 0..KEYS {
+                    assert!(s.insert(Tagged(id, 0)));
+                }
+                for id in (0..KEYS).step_by(3) {
+                    assert!(s.remove(&Tagged(id, 0)));
+                }
+                for id in 0..KEYS {
+                    let displaced = s.replace(Tagged(id, 1));
+                    if id % 3 == 0 {
+                        assert!(displaced.is_none(), "id {id}");
+                    } else {
+                        assert_eq!(displaced.map(|old| old.1), Some(0), "id {id}");
+                    }
+                }
+                assert_eq!(s.len(), KEYS as usize);
+                for id in 0..KEYS {
+                    assert_eq!(s.get(&Tagged(id, 0)).map(|kept| kept.1), Some(1));
+                }
+                assert!(s.iter().all(|kept| kept.1 == 1));
+            }
+
+            #[test]
             fn test_extend_ref() {
                 let mut a = HashSet::new();
                 a.insert(1);
