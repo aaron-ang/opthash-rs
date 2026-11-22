@@ -966,6 +966,7 @@ where
         }
         debug_assert_eq!(self.len, 0);
         self.reset_after_clear();
+        self.epoch.start(EpochTransition::Clear);
     }
 
     /// Resets placement, lookup, and filter state once every level is empty.
@@ -974,7 +975,6 @@ where
         self.probe_high_water = 0;
         self.probe_schedule.clear();
         self.clear_membership();
-        self.epoch.start(EpochTransition::Clear);
     }
 
     /// Post-lookup insert for a key known to be absent. Returns the chosen
@@ -1288,9 +1288,9 @@ where
     }
 
     #[inline]
-    fn tombstone_slot(&mut self, (level_idx, slot_idx): (usize, usize)) {
-        // SAFETY: a live location names an in-bounds slot.
-        unsafe { self.levels[level_idx].mark_tombstone(slot_idx) };
+    unsafe fn take_next(&mut self, scan: &mut ElasticScan) -> Option<SlotEntry<K, V>> {
+        // SAFETY: the caller's scan belongs to these levels.
+        unsafe { take_next_in_levels(&mut self.levels, scan) }
     }
 
     #[inline]
@@ -1323,16 +1323,48 @@ where
 
     #[inline]
     fn scan_next(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
-        while let Some(level) = self.levels.get(scan.level_idx) {
-            if let Some(slot_idx) = scan.slots.step(level) {
-                // SAFETY: `step` yields in-bounds slots.
-                let slot = unsafe { level.slot_ptr(slot_idx) };
-                return Some((slot, (scan.level_idx, slot_idx)));
-            }
-            scan.level_idx += 1;
-            scan.slots = OccupiedIndices::new();
+        scan_levels(&self.levels, scan)
+    }
+
+    type Storage = ElasticGeneration<K, V>;
+
+    fn take_storage(&mut self) -> ElasticGeneration<K, V> {
+        let mut storage = ElasticGeneration::empty();
+        self.swap_generation(&mut storage);
+        self.epoch.start(EpochTransition::Clear);
+        storage
+    }
+
+    #[inline]
+    fn storage_scan_next(
+        storage: &ElasticGeneration<K, V>,
+        scan: &mut ElasticScan,
+    ) -> Option<ElasticScanItem<K, V>> {
+        scan_levels(&storage.levels, scan)
+    }
+
+    #[inline]
+    unsafe fn storage_take_next(
+        storage: &mut ElasticGeneration<K, V>,
+        scan: &mut ElasticScan,
+    ) -> Option<SlotEntry<K, V>> {
+        // SAFETY: the caller's scan belongs to these levels.
+        unsafe { take_next_in_levels(&mut storage.levels, scan) }
+    }
+
+    fn drop_storage_values(storage: &mut ElasticGeneration<K, V>) {
+        arena::RegionSet::drop_all_values(&mut storage.levels);
+    }
+
+    fn restore_storage(&mut self, storage: &mut ElasticGeneration<K, V>) {
+        self.swap_generation(storage);
+        for level in &mut self.levels {
+            level.clear_all_controls();
+            level.len = 0;
+            level.tombstones = 0;
         }
-        None
+        self.len = 0;
+        self.reset_after_clear();
     }
 
     #[inline]
@@ -1378,16 +1410,6 @@ where
     #[inline]
     fn clear(&mut self) {
         self.clear();
-    }
-
-    fn wipe_all(&mut self) {
-        for level in &mut self.levels {
-            level.clear_all_controls();
-            level.len = 0;
-            level.tombstones = 0;
-        }
-        self.len = 0;
-        self.reset_after_clear();
     }
 
     fn clone_table(&self) -> Self
@@ -1443,6 +1465,46 @@ where
 pub struct ElasticScan {
     level_idx: usize,
     slots: OccupiedIndices,
+}
+
+/// Advances `scan` to the next occupied slot of `levels`.
+#[inline]
+fn scan_levels<K, V>(
+    levels: &[Level<SlotEntry<K, V>>],
+    scan: &mut ElasticScan,
+) -> Option<ElasticScanItem<K, V>> {
+    while let Some(level) = levels.get(scan.level_idx) {
+        if let Some(slot_idx) = scan.slots.step(level) {
+            // SAFETY: `step` yields in-bounds slots.
+            let slot = unsafe { level.slot_ptr(slot_idx) };
+            return Some((slot, (scan.level_idx, slot_idx)));
+        }
+        scan.level_idx += 1;
+        scan.slots = OccupiedIndices::new();
+    }
+    None
+}
+
+/// Moves the next occupied entry of `levels` out and marks its slot a
+/// tombstone. Level counters are left alone.
+///
+/// # Safety
+///
+/// `scan` was made for `levels` and has stepped only them, with no insertion
+/// or resize since.
+#[inline]
+unsafe fn take_next_in_levels<K, V>(
+    levels: &mut [Level<SlotEntry<K, V>>],
+    scan: &mut ElasticScan,
+) -> Option<SlotEntry<K, V>> {
+    let (slot, (level_idx, slot_idx)) = scan_levels(levels, scan)?;
+    // SAFETY: a scan of these levels yields an occupied slot; the entry is
+    // read out once and the tombstone keeps the slot from being read or
+    // dropped again.
+    let entry = unsafe { slot.read() };
+    // SAFETY: a scan of these levels yields in-bounds slots.
+    unsafe { levels[level_idx].mark_tombstone(slot_idx) };
+    Some(entry)
 }
 
 impl<K, V, S, A> ElasticTable<K, V, S, A>
@@ -1889,8 +1951,9 @@ where
     }
 }
 
-/// The fields a resize replaces as a unit.
-pub(crate) struct ElasticGeneration<K, V> {
+/// The fields a resize replaces, and a drain detaches, as a unit. It has no
+/// `Drop`: whoever holds one hands its arena back to a table or frees it.
+pub struct ElasticGeneration<K, V> {
     levels: LevelSlice<K, V>,
     len: usize,
     total_slots: usize,
@@ -1901,6 +1964,36 @@ pub(crate) struct ElasticGeneration<K, V> {
     probe_schedule: Vec<PhiRoute>,
     membership: MembershipRegion,
     stale_membership: usize,
+}
+
+impl<K, V> fmt::Debug for ElasticGeneration<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ElasticGeneration").finish_non_exhaustive()
+    }
+}
+
+impl<K, V> Default for ElasticGeneration<K, V> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl<K, V> ElasticGeneration<K, V> {
+    /// A zero-slot generation, which owns no allocation.
+    fn empty() -> Self {
+        Self {
+            levels: Box::default(),
+            len: 0,
+            total_slots: 0,
+            max_insertions: 0,
+            scheduler: BatchScheduler::new(&[]),
+            arena: Arena::empty(),
+            probe_high_water: 0,
+            probe_schedule: Vec::new(),
+            membership: MembershipRegion::EMPTY,
+            stale_membership: 0,
+        }
+    }
 }
 
 impl<K, V, S, A> Rebuildable for ElasticTable<K, V, S, A>

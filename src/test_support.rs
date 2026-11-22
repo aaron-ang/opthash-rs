@@ -4,6 +4,7 @@ use core::hash::{BuildHasher, Hash, Hasher};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
@@ -12,6 +13,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::ReserveFraction;
 use crate::map::{HashMap, TableBackend};
 use crate::membership;
+use crate::raw::rebuild::Rebuildable;
 
 /// Hashes a `u64` to itself, so test keys double as their own hashes.
 #[derive(Clone, Copy, Default)]
@@ -42,6 +44,49 @@ where
     fn with_capacity(capacity: usize) -> Self {
         Self::with_capacity_and_hasher(capacity, fixed_hasher())
     }
+}
+
+/// Detaches a filled table's storage and checks the table then works as an
+/// empty one: the old keys are absent and new keys insert, grow it, and are
+/// found. Frees the detached storage by hand, as nothing put it back.
+pub(crate) fn assert_usable_while_storage_detached<P>()
+where
+    P: TableBackend<u64, String, Hasher = FixedHashBuilder, Alloc = Global>
+        + Rebuildable<Generation = <P as TableBackend<u64, String>>::Storage>,
+{
+    const OLD: core::ops::Range<u64> = 0..48;
+    const NEW: core::ops::Range<u64> = 100..148;
+    let insert = |table: &mut P, key: u64| {
+        let hash = table.hash(&key);
+        table.insert(key, key.to_string(), hash)
+    };
+    let contains = |table: &P, key: u64| table.find(&key, table.hash(&key)).is_some();
+
+    let mut table = P::with_capacity_and_reserve_and_hasher_in(
+        OLD.count(),
+        ReserveFraction::DEFAULT,
+        fixed_hasher(),
+        Global,
+    );
+    for key in OLD {
+        assert!(insert(&mut table, key).is_none());
+    }
+
+    let mut storage = table.take_storage();
+    assert_eq!(table.len(), 0);
+    assert_eq!(table.total_slots(), 0);
+    assert!(table.scan_next(&mut table.scan()).is_none());
+    assert!(!OLD.into_iter().any(|key| contains(&table, key)));
+
+    for key in NEW {
+        assert!(insert(&mut table, key).is_none());
+    }
+    assert_eq!(table.len(), NEW.count());
+    assert!(NEW.into_iter().all(|key| contains(&table, key)));
+    assert!(!OLD.into_iter().any(|key| contains(&table, key)));
+
+    P::drop_storage_values(&mut storage);
+    table.release(storage);
 }
 
 /// `ElasticHashMap` over [`FixedHashBuilder`]. Spelled as its own alias so

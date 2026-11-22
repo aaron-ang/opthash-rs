@@ -18,6 +18,12 @@ pub(crate) struct Arena {
     layout: Layout,
 }
 
+// SAFETY: an arena is one uniquely owned allocation of plain bytes, like
+// `Box<[u8]>`. Whoever stamps descriptors into it answers for the values there.
+unsafe impl Send for Arena {}
+// SAFETY: as above; `&Arena` exposes only the base pointer and the layout.
+unsafe impl Sync for Arena {}
+
 impl Arena {
     /// Sentinel placeholder for moved-from / zero-capacity maps.
     /// Layout size is 0 so `deallocate` is a no-op.

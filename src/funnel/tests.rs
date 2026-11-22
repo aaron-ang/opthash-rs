@@ -847,14 +847,15 @@ fn membership_filter_survives_growth_and_clone() {
 }
 
 #[test]
-fn membership_filter_is_reset_by_clear_and_wipe() {
-    for wipe in [false, true] {
+fn membership_filter_is_reset_by_clear_and_restored_storage() {
+    for restore in [false, true] {
         let mut table = raw_table(512, 3);
         for key in 0..200_u64 {
             table.insert_for_vacant_entry(key, key, key);
         }
-        if wipe {
-            <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::wipe_all(&mut table);
+        if restore {
+            let mut storage = map::TableBackend::take_storage(&mut table);
+            map::TableBackend::restore_storage(&mut table, &mut storage);
         } else {
             <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clear(&mut table);
         }
@@ -1529,4 +1530,27 @@ fn large_reserve_exponent_sizes_without_scanning_every_slot_count() {
     let shape = FunnelShape::for_insert_budget(1, reserve).unwrap();
     assert!(FunnelShape::from_slots(shape.n - 1, reserve).is_err());
     assert!(crate::FunnelHashMap::<u64, u64>::try_with_capacity_and_reserve(1, reserve).is_err());
+}
+
+#[test]
+fn table_keeps_its_probe_seed_while_its_storage_is_detached() {
+    let mut table = raw_table(512, 3);
+    for key in 0..200_u64 {
+        table.insert_for_vacant_entry(key, key, key);
+    }
+    table.resize_with_transition(512, EpochTransition::PlacementRecovery);
+    let seed = table.probe_seed;
+    assert_ne!(seed, FUNNEL_PROBE_SEED, "fixture must have reseeded");
+
+    let mut storage = map::TableBackend::take_storage(&mut table);
+    assert_eq!(table.probe_seed, seed);
+    map::TableBackend::restore_storage(&mut table, &mut storage);
+    assert_eq!(table.probe_seed, seed);
+}
+
+#[test]
+fn table_is_usable_while_its_storage_is_detached() {
+    test_support::assert_usable_while_storage_detached::<
+        FunnelTable<u64, String, test_support::FixedHashBuilder>,
+    >();
 }

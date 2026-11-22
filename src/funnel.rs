@@ -2,6 +2,7 @@
 use core::fmt;
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
+use core::ptr;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -49,6 +50,59 @@ pub struct FunnelScan {
 enum FunnelScanMode {
     Dense(usize),
     Sparse(OccupiedIndices),
+}
+
+/// Advances `scan` to the next occupied slot of `storage`, whose capacity is
+/// `n`.
+#[inline]
+fn scan_storage<K, V>(
+    storage: &FlatStorage<SlotEntry<K, V>>,
+    n: usize,
+    scan: &mut FunnelScan,
+) -> Option<(*mut SlotEntry<K, V>, usize)> {
+    match &mut scan.mode {
+        FunnelScanMode::Dense(next) => {
+            while *next < n {
+                let slot = *next;
+                *next += 1;
+                // SAFETY: `slot < n`, the storage capacity.
+                unsafe {
+                    if control::is_occupied(storage.control_at(slot)) {
+                        return Some((storage.slot_ptr(slot), slot));
+                    }
+                }
+            }
+            None
+        }
+        FunnelScanMode::Sparse(cursor) => {
+            let slot = cursor.step(storage)?;
+            // SAFETY: `step` yields in-bounds slots.
+            Some((unsafe { storage.slot_ptr(slot) }, slot))
+        }
+    }
+}
+
+/// Moves the next occupied entry of `storage`, whose capacity is `n`, out and
+/// marks its slot a tombstone. Counters are left alone.
+///
+/// # Safety
+///
+/// `scan` was made for `storage` and has stepped only it, with no insertion
+/// or resize since.
+#[inline]
+unsafe fn take_next_in_storage<K, V>(
+    storage: &mut FlatStorage<SlotEntry<K, V>>,
+    n: usize,
+    scan: &mut FunnelScan,
+) -> Option<SlotEntry<K, V>> {
+    let (ptr, slot) = scan_storage(storage, n, scan)?;
+    // SAFETY: a scan of this storage yields an occupied slot; the entry is
+    // read out once and the tombstone keeps the slot from being read or
+    // dropped again.
+    let entry = unsafe { ptr.read() };
+    // SAFETY: a scan of this storage yields in-bounds slots.
+    unsafe { storage.mark_tombstone(slot) };
+    Some(entry)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,6 +260,17 @@ pub(crate) struct FlatStorage<T> {
     capacity: usize,
 }
 
+impl<T> FlatStorage<T> {
+    /// Zero-capacity storage, which addresses no arena.
+    const fn empty() -> Self {
+        Self {
+            ctrl_ptr: ptr::NonNull::dangling().as_ptr(),
+            data_ptr: ptr::NonNull::dangling().as_ptr(),
+            capacity: 0,
+        }
+    }
+}
+
 // SAFETY: the raw pointers address slots owned solely by this descriptor's
 // table, so sending or sharing it is sending or sharing the `T` values.
 unsafe impl<T: Send> Send for FlatStorage<T> {}
@@ -217,6 +282,8 @@ unsafe impl<T: Sync> Sync for FlatStorage<T> {}
 // `capacity` slots, whose ctrl bytes `try_allocate_with_ctrl_zeroed` starts
 // EMPTY, and is re-stamped before that arena is freed. The `GROUP_SIZE - 1`
 // padding bytes are zeroed with the rest and never stamped, so they stay EMPTY.
+// Zero-capacity storage has no slot and no padding, and no scan or probe reads
+// a control byte of it.
 unsafe impl<T> ArenaSlots<T> for FlatStorage<T> {
     const PADDED_TAIL: bool = true;
 
@@ -1384,11 +1451,13 @@ where
         self.stale_membership = 0;
     }
 
-    /// Shared tail of `clear` and `wipe_all` once every slot is free.
-    fn finish_clear(&mut self) {
+    /// Resets controls, counters, and the filter once no slot holds a value.
+    fn reset_after_clear(&mut self) {
+        self.storage.clear_all_controls();
+        self.len = 0;
+        self.tombstones = 0;
         self.exceptional_placement = false;
         self.clear_membership();
-        self.epoch.start(EpochTransition::Clear);
     }
 
     /// Re-record the filter from the live entries, dropping the bits departed
@@ -1731,8 +1800,9 @@ where
     }
 }
 
-/// The fields a resize replaces as a unit.
-pub(crate) struct FunnelGeneration<K, V> {
+/// The fields a resize replaces, and a drain detaches, as a unit. It has no
+/// `Drop`: whoever holds one hands its arena back to a table or frees it.
+pub struct FunnelGeneration<K, V> {
     shape: FunnelShape,
     storage: FlatStorage<SlotEntry<K, V>>,
     len: usize,
@@ -1742,6 +1812,36 @@ pub(crate) struct FunnelGeneration<K, V> {
     probe_seed: u64,
     membership: MembershipRegion,
     stale_membership: usize,
+}
+
+impl<K, V> fmt::Debug for FunnelGeneration<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FunnelGeneration").finish_non_exhaustive()
+    }
+}
+
+impl<K, V> Default for FunnelGeneration<K, V> {
+    fn default() -> Self {
+        Self::empty(0)
+    }
+}
+
+impl<K, V> FunnelGeneration<K, V> {
+    /// A zero-slot generation, which owns no allocation. `probe_seed` is the
+    /// seed the table keeps while it holds this generation.
+    fn empty(probe_seed: u64) -> Self {
+        Self {
+            shape: FunnelShape::empty(),
+            storage: FlatStorage::empty(),
+            len: 0,
+            tombstones: 0,
+            arena: Arena::empty(),
+            exceptional_placement: false,
+            probe_seed,
+            membership: MembershipRegion::EMPTY,
+            stale_membership: 0,
+        }
+    }
 }
 
 impl<K, V, S, A> Rebuildable for FunnelTable<K, V, S, A>
@@ -1989,9 +2089,9 @@ where
     }
 
     #[inline]
-    fn tombstone_slot(&mut self, slot: usize) {
-        // SAFETY: a live location names an in-bounds slot.
-        unsafe { self.storage.mark_tombstone(slot) };
+    unsafe fn take_next(&mut self, scan: &mut FunnelScan) -> Option<SlotEntry<K, V>> {
+        // SAFETY: the caller's scan belongs to this storage.
+        unsafe { take_next_in_storage(&mut self.storage, self.shape.n, scan) }
     }
 
     #[inline]
@@ -2024,26 +2124,77 @@ where
 
     #[inline]
     fn scan_next(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, usize)> {
-        match &mut scan.mode {
-            FunnelScanMode::Dense(next) => {
-                while *next < self.shape.n {
-                    let slot = *next;
-                    *next += 1;
-                    // SAFETY: `slot < n`, the storage capacity.
-                    unsafe {
-                        if control::is_occupied(self.storage.control_at(slot)) {
-                            return Some((self.storage.slot_ptr(slot), slot));
-                        }
-                    }
+        scan_storage(&self.storage, self.shape.n, scan)
+    }
+
+    type Storage = FunnelGeneration<K, V>;
+
+    fn take_storage(&mut self) -> FunnelGeneration<K, V> {
+        let mut storage = FunnelGeneration::empty(self.probe_seed);
+        self.swap_generation(&mut storage);
+        self.epoch.start(EpochTransition::Clear);
+        storage
+    }
+
+    #[inline]
+    fn storage_scan_next(
+        storage: &FunnelGeneration<K, V>,
+        scan: &mut FunnelScan,
+    ) -> Option<(*mut SlotEntry<K, V>, usize)> {
+        scan_storage(&storage.storage, storage.shape.n, scan)
+    }
+
+    #[inline]
+    unsafe fn storage_take_next(
+        storage: &mut FunnelGeneration<K, V>,
+        scan: &mut FunnelScan,
+    ) -> Option<SlotEntry<K, V>> {
+        // SAFETY: the caller's scan belongs to this storage.
+        unsafe { take_next_in_storage(&mut storage.storage, storage.shape.n, scan) }
+    }
+
+    #[inline]
+    unsafe fn storage_take_fold<B>(
+        storage: &mut FunnelGeneration<K, V>,
+        scan: &mut FunnelScan,
+        init: B,
+        mut f: impl FnMut(B, (K, V)) -> B,
+    ) -> B {
+        let n = storage.shape.n;
+        let region = &mut storage.storage;
+        let mut take = |acc, region: &mut FlatStorage<SlotEntry<K, V>>, slot| {
+            // SAFETY: the caller's scan belongs to this storage, so `slot`
+            // is occupied and in bounds; the entry is read out once and the
+            // tombstone keeps the slot from being read or dropped again.
+            let entry = unsafe {
+                let entry = region.take(slot);
+                region.mark_tombstone(slot);
+                entry
+            };
+            f(acc, (entry.key, entry.value))
+        };
+        // The scan is exhausted up front, so it yields nothing more even if
+        // `f` unwinds partway.
+        match mem::replace(&mut scan.mode, FunnelScanMode::Dense(n)) {
+            FunnelScanMode::Dense(next) => (next..n).fold(init, |acc, slot| {
+                // SAFETY: `slot < n`, the storage capacity.
+                if control::is_occupied(unsafe { region.control_at(slot) }) {
+                    take(acc, region, slot)
+                } else {
+                    acc
                 }
-                None
-            }
-            FunnelScanMode::Sparse(cursor) => {
-                let slot = cursor.step(&self.storage)?;
-                // SAFETY: `step` yields in-bounds slots.
-                Some((unsafe { self.storage.slot_ptr(slot) }, slot))
-            }
+            }),
+            FunnelScanMode::Sparse(cursor) => cursor.fold(region, init, take),
         }
+    }
+
+    fn drop_storage_values(storage: &mut FunnelGeneration<K, V>) {
+        arena::RegionSet::drop_all_values(&mut storage.storage);
+    }
+
+    fn restore_storage(&mut self, storage: &mut FunnelGeneration<K, V>) {
+        self.swap_generation(storage);
+        self.reset_after_clear();
     }
 
     fn with_capacity_and_reserve_and_hasher_in(
@@ -2113,14 +2264,8 @@ where
                 drop(entry);
             }
         }
-        self.wipe_all();
-    }
-
-    fn wipe_all(&mut self) {
-        self.storage.clear_all_controls();
-        self.len = 0;
-        self.tombstones = 0;
-        self.finish_clear();
+        self.reset_after_clear();
+        self.epoch.start(EpochTransition::Clear);
     }
 
     fn clone_table(&self) -> Self

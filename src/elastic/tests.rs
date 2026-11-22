@@ -1474,3 +1474,32 @@ fn case_one_probe_past_the_query_cap_falls_through_to_the_next_level() {
         .expect("Case 1 falls through to the next level");
     assert_eq!(placement.level, LEVEL + 1);
 }
+
+#[test]
+fn drain_zeroes_the_level_counters_of_the_restored_storage() {
+    let mut map: FixedElasticHashMap<i32, i32> = FixedElasticHashMap::with_capacity(512);
+    let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
+    for i in 0..max {
+        map.insert(i, i);
+    }
+    for i in 0..8 {
+        assert_eq!(map.remove(&i), Some(i));
+    }
+    assert!(
+        map.table().levels.iter().any(|level| level.tombstones > 0),
+        "fixture must leave tombstones"
+    );
+
+    drop(map.drain());
+    for level in &map.table().levels {
+        assert_eq!(level.len, 0);
+        assert_eq!(level.tombstones, 0);
+    }
+}
+
+#[test]
+fn table_is_usable_while_its_storage_is_detached() {
+    test_support::assert_usable_while_storage_detached::<
+        ElasticTable<u64, String, test_support::FixedHashBuilder>,
+    >();
+}
