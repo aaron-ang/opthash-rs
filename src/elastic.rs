@@ -1846,22 +1846,6 @@ where
         };
     }
 
-    fn clear(&mut self) {
-        self.count_settled();
-        for level in &mut self.levels {
-            level.drain_reset(|entry| {
-                self.placed -= 1;
-                self.uncounted.uncover_one();
-                // Before the drop: one that panics leaves the table live
-                // with this count.
-                self.scheduler.close();
-                drop(entry);
-            });
-        }
-        debug_assert_eq!(self.live(), 0);
-        self.reset_after_clear();
-    }
-
     /// Resets placement, lookup, and filter state once every level is empty.
     fn reset_after_clear(&mut self) {
         self.scheduler.reset();
@@ -2890,19 +2874,30 @@ where
         )
     }
 
-    #[inline]
     fn resize(&mut self, new_capacity: usize) {
-        self.resize(new_capacity);
+        self.resize_with_transition(new_capacity, EpochTransition::ExplicitResize);
     }
 
-    #[inline]
     fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError> {
-        self.try_resize(new_capacity)
+        let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        self.try_resize_to(&geometry, EpochTransition::ExplicitResize)
     }
 
-    #[inline]
     fn clear(&mut self) {
-        self.clear();
+        self.count_settled();
+        for level in &mut self.levels {
+            level.drain_reset(|entry| {
+                self.placed -= 1;
+                self.uncounted.uncover_one();
+                // Before the drop: one that panics leaves the table live
+                // with this count.
+                self.scheduler.close();
+                drop(entry);
+            });
+        }
+        debug_assert_eq!(self.live(), 0);
+        self.reset_after_clear();
     }
 
     fn wipe_all(&mut self) {
@@ -3139,28 +3134,20 @@ where
 
     /// Re-record the filter from the live entries, dropping the bits departed
     /// keys left behind. Entries stay put; only the metadata tail is rewritten.
-    ///
-    /// Every key is hashed before the filter is cleared, so a hasher that
-    /// unwinds leaves it recording every live key. The hashes need scratch
-    /// memory; without it the filter stays as it was. Either way the refresh
-    /// stays owed to the next settling delete.
+    /// A refresh that [`membership::hash_live_keys`] cannot finish leaves
+    /// the filter as it was and stays owed to the next settling delete.
     #[cold]
     #[inline(never)]
     fn refresh_membership(&mut self) {
-        let live = self.live();
-        let mut hashes = allocator_api2::vec::Vec::new_in(self.alloc.clone());
-        if hashes.try_reserve_exact(live).is_err() {
+        let Some(hashes) = membership::hash_live_keys(
+            &self.levels,
+            self.live(),
+            &self.hash_builder,
+            self.alloc.clone(),
+            |_| {},
+        ) else {
             return;
-        }
-        for level in &self.levels {
-            let mut scan = OccupiedIndices::new();
-            while let Some(slot_idx) = scan.step(level) {
-                // SAFETY: `step` yields occupied in-bounds slots.
-                let entry = unsafe { level.get_ref(slot_idx) };
-                hashes.push(self.hash_builder.hash_one(&entry.key));
-            }
-        }
-        debug_assert_eq!(hashes.len(), live);
+        };
         self.epoch.note_deletes(self.stale_membership());
         self.clear_membership();
         // The same scan order as above pairs each entry with its hash.
@@ -3175,12 +3162,6 @@ where
                 self.record_membership(PreparedElasticRoute::new(hash), summary_bit);
             }
         }
-    }
-
-    /// Rebuilds levels at `new_capacity` and moves every live entry across.
-    /// Passing the current capacity flushes tombstones without growing.
-    fn resize(&mut self, new_capacity: usize) {
-        self.resize_with_transition(new_capacity, EpochTransition::ExplicitResize);
     }
 
     fn resize_with_transition(&mut self, new_capacity: usize, transition: EpochTransition) {
@@ -3240,13 +3221,6 @@ where
             transition == EpochTransition::PlacementRecovery || used_exceptional_placement,
         );
         Ok(())
-    }
-
-    /// Fallible counterpart to [`Self::resize`]; `Err` leaves the map intact.
-    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError> {
-        let geometry = ElasticGeometry::for_slots(new_capacity, self.reserve_fraction)
-            .ok_or(TryReserveError::CapacityOverflow)?;
-        self.try_resize_to(&geometry, EpochTransition::ExplicitResize)
     }
 
     /// Test constructor taking a raw slot count; public constructors take an

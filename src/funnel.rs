@@ -1838,41 +1838,38 @@ where
 
     /// Re-record the filter from the live entries, dropping the bits departed
     /// keys left behind. Entries stay put; only the filter tail is rewritten.
-    ///
-    /// Every key is hashed before the filter is cleared, so a hasher that
-    /// unwinds leaves it recording every live key. The hashes need scratch
-    /// memory; without it the filter stays as it was. Either way the refresh
-    /// stays owed to the next settling delete.
+    /// A refresh that [`membership::hash_live_keys`] cannot finish leaves
+    /// the filter as it was and stays owed to the next settling delete.
     #[cold]
     #[inline(never)]
     fn refresh_membership(&mut self) {
-        let mut hashes = allocator_api2::vec::Vec::new_in(self.alloc.clone());
-        if hashes.try_reserve_exact(self.entries()).is_err() {
-            return;
-        }
         // The scan yields slots in rising order, so the hashes of one level
         // bin are contiguous and a count per bin recovers each hash's bin.
         let mut bin_entries = [0_usize; OVERFLOW_LEVEL + 1];
         let mut bin = 0;
         let mut bin_end = self.level_bin_start(1);
         let mut in_bin = 0;
-        let mut scan = OccupiedIndices::new();
-        while let Some(slot) = scan.step(&self.storage) {
-            while slot >= bin_end {
-                bin_entries[bin] = in_bin;
-                in_bin = 0;
-                bin += 1;
-                bin_end = if bin < OVERFLOW_LEVEL {
-                    self.level_bin_start(bin + 1)
-                } else {
-                    usize::MAX
-                };
-            }
-            in_bin += 1;
-            // SAFETY: `step` yields occupied in-bounds slots.
-            let entry = unsafe { self.storage.get_ref(slot) };
-            hashes.push(self.hash_builder.hash_one(&entry.key));
-        }
+        let Some(hashes) = membership::hash_live_keys(
+            core::slice::from_ref(&self.storage),
+            self.entries(),
+            &self.hash_builder,
+            self.alloc.clone(),
+            |slot| {
+                while slot >= bin_end {
+                    bin_entries[bin] = in_bin;
+                    in_bin = 0;
+                    bin += 1;
+                    bin_end = if bin < OVERFLOW_LEVEL {
+                        self.level_bin_start(bin + 1)
+                    } else {
+                        usize::MAX
+                    };
+                }
+                in_bin += 1;
+            },
+        ) else {
+            return;
+        };
         bin_entries[bin] = in_bin;
         // The tombstones of the deletes the filter now forgets stay.
         self.refreshed_deletes = self.refreshed_deletes.wrapping_add(self.stale_membership);

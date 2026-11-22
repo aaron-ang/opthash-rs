@@ -4656,7 +4656,7 @@ fn rebuild_places_a_key_its_target_fails_on_another_target() {
     assert_eq!(off_target(&table), 40);
     assert_eq!(table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
 
-    table.resize(4_096);
+    map::TableBackend::resize(&mut table, 4_096);
     assert_eq!(off_target(&table), 40);
     assert_eq!(table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
     assert_eq!(table.epoch.snapshot(table.live()).placement_recoveries, 0);
