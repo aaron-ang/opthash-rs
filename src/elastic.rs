@@ -895,9 +895,24 @@ enum ScheduleSearch<R> {
 struct LaneRead {
     place: MetadataPlace,
     lane: u64,
-    /// The place's membership bits, which the filter tested.
+    /// The bits an insert of the key sets in the lane.
     bits: u64,
 }
+
+/// The lane bit paired with each bit of `bits`. A key recorded while its
+/// bit is already set sets the pair's too, so a bit whose pair is clear
+/// belongs to one live key at most, and the removal of that key may clear
+/// it ([`ElasticTable::forget_membership`]).
+///
+/// The pairing is an involution: a bit is cleared only while its pair is
+/// clear, when no live key has the pair for its own bit and so none counts
+/// on the cleared bit as its mark.
+#[inline]
+const fn paired_bits(bits: u64) -> u64 {
+    bits.rotate_right(u64::BITS / 2)
+}
+// One bit a key, so a key's bit and its pair are two bits of the lane.
+const _: () = assert!(MEMBERSHIP_BITS == 1);
 
 /// The metadata word of one prepared key and its membership answer.
 #[derive(Clone, Copy)]
@@ -909,6 +924,18 @@ struct ElasticRouteFilter<'a> {
 }
 
 impl ElasticRouteFilter<'_> {
+    /// The read an insert of the key records over: the key's bit, and its
+    /// pair's ([`paired_bits`]) when the lane already holds the key's.
+    #[inline]
+    fn recording(self) -> LaneRead {
+        let LaneRead { place, lane, bits } = self.read;
+        LaneRead {
+            place,
+            lane,
+            bits: bits | paired_bits(lane & bits),
+        }
+    }
+
     /// Summary bits of the levels `route`'s bin has occupied. Bit `i` covers
     /// level `i` for `i < ROUTE_SUMMARY_LEVELS - 1`; the last bit is
     /// saturating and covers every deeper level. Read apart from the
@@ -1747,7 +1774,7 @@ where
 
     #[inline]
     fn record_membership(&mut self, route: PreparedElasticRoute, summary_bit: SummaryBin) {
-        let read = self.route_filter(route).read;
+        let read = self.route_filter(route).recording();
         // SAFETY: the filter read `read` just now.
         unsafe { self.record_membership_over(summary_bit, read) };
     }
@@ -1768,6 +1795,24 @@ where
             let metadata = unsafe { &mut *self.membership_ptr().add(place.word()) };
             metadata.membership = lane | bits;
             metadata.level_bins[place.summary_bin()] &= !summary_bit;
+        }
+    }
+
+    /// Clears a removed key's membership bit where no other live key can
+    /// hold it, so the key's next lookup or insert ends at the filter.
+    ///
+    /// # Safety
+    ///
+    /// `read` is the key's, as [`Self::route_filter`] read it with the key
+    /// present, and the table's metadata is as it was then.
+    #[inline]
+    unsafe fn forget_membership(&mut self, read: LaneRead) {
+        let LaneRead { place, lane, bits } = read;
+        if lane & paired_bits(bits) == 0 {
+            // SAFETY: the filter passed the key, so its word holds a bit:
+            // it is a word of this table's tail, not the empty tail's
+            // shared one, and `&mut self` makes the write exclusive.
+            unsafe { (*self.membership_ptr().add(place.word())).membership = lane & !bits };
         }
     }
 
@@ -1890,7 +1935,7 @@ where
                 // SAFETY: the settled search returns one of this table's levels.
                 let level = unsafe { found.level.offset_from_unsigned(self.levels.as_ptr()) };
                 let slot = found.slot;
-                let read = self.route_filter(prepared).read;
+                let read = self.route_filter(prepared).recording();
                 // SAFETY: the settled search returns a free slot of that
                 // level with the level's words.
                 unsafe {
@@ -2250,7 +2295,7 @@ where
     ) {
         // SAFETY: the caller's contract.
         if let Some(found) = unsafe { self.settled_fallback_slot(prepared.probe) } {
-            let read = self.route_filter(prepared).read;
+            let read = self.route_filter(prepared).recording();
             // SAFETY: the settled search returns one of this table's levels
             // with its words, and a free slot of it with its control byte.
             unsafe { self.write_new_entry_at::<false>(key, value, key_fingerprint, found, read) };
@@ -2407,7 +2452,7 @@ where
     ) -> (usize, usize) {
         debug_assert!(level_idx < self.levels.len());
         let level = self.levels.level_ptr(level_idx);
-        let read = self.route_filter(prepared).read;
+        let read = self.route_filter(prepared).recording();
         // SAFETY: `level_ptr` checked the index, so the pointer is to a level.
         let found = unsafe {
             SettledSlot {
@@ -2721,7 +2766,7 @@ where
         // apart itself.
         'common: {
             let filter = self.route_filter(prepared);
-            let read = filter.read;
+            let mut read = filter.read;
             if filter.maybe_present {
                 let walked = self.walk_schedule(
                     &key,
@@ -2737,7 +2782,9 @@ where
                         let slot: &mut SlotEntry<K, V> = unsafe { &mut *entry };
                         return Some(mem::replace(&mut slot.value, value));
                     }
-                    ScheduleSearch::Absent => {}
+                    // The lane holds the key's bit, so the insert marks
+                    // its pair.
+                    ScheduleSearch::Absent => read.bits |= paired_bits(read.bits),
                     ScheduleSearch::Unresolved => break 'common,
                 }
             }
@@ -3014,6 +3061,7 @@ where
             unlikely_path();
             return None;
         }
+        let read = filter.read;
         let key_fingerprint = control::control_fingerprint_low(hash);
         let walked = self.walk_schedule(
             key,
@@ -3048,6 +3096,9 @@ where
                 .all(|level| level.tombstones() <= level.capacity),
             "a level counts more tombstones than it has slots"
         );
+        // SAFETY: the filter read the key's lane with the key present, and
+        // nothing has recorded a key since.
+        unsafe { self.forget_membership(read) };
         Some(project(removed.key, removed.value))
     }
 

@@ -1015,7 +1015,7 @@ fn pop_first_churn_restores_paper_placement() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn deletes_past_the_threshold_refresh_the_membership_filter() {
-    test_support::assert_deletes_past_threshold_refresh_filter::<
+    test_support::assert_deletes_past_threshold_refresh_filter_from::<
         ElasticTable<u64, u64, FixedHashBuilder>,
     >(
         |table, key| {
@@ -1024,6 +1024,9 @@ fn deletes_past_the_threshold_refresh_the_membership_filter() {
         },
         ElasticTable::stale_membership,
         |threshold| threshold,
+        // A removal drops its key's bit unless another live key may hold
+        // it.
+        |admitted, departed| assert!(admitted < departed),
     );
 }
 
@@ -1258,7 +1261,7 @@ fn prepared_route_remains_geometry_independent_across_growth() {
 }
 
 #[test]
-fn membership_filter_never_forgets_live_or_deleted_hashes() {
+fn membership_filter_holds_a_live_hash_and_forgets_a_lone_removed_one() {
     let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
         ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
     let inserted_hash = map.table().hash_builder.hash_one(7_u64);
@@ -1272,9 +1275,13 @@ fn membership_filter_never_forgets_live_or_deleted_hashes() {
     assert_eq!(map.len(), 1);
     assert!(map.table().route_filter(prepared).maybe_present);
 
+    // No other key is live, so none holds the removed key's bit.
     assert_eq!(map.remove(&7), Some(13));
-    assert!(map.table().route_filter(prepared).maybe_present);
+    assert!(!map.table().route_filter(prepared).maybe_present);
+    assert_eq!(map.get(&7), None);
+
     assert_eq!(map.insert(7, 17), None);
+    assert!(map.table().route_filter(prepared).maybe_present);
     assert_eq!(map.get(&7), Some(&17));
 }
 
@@ -5007,4 +5014,54 @@ fn a_removal_takes_an_entry_placed_off_the_schedule() {
         let hash = table.hash_builder.hash_one(key);
         assert_eq!(TableBackend::find_value(&table, &key, hash), Some(&!key));
     }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_removal_forgets_only_a_bit_no_live_key_holds() {
+    const KEYS: usize = 600;
+    // Scattered keys: the fixed hasher spreads a run of consecutive
+    // integers evenly, and evenly spread keys share no bit.
+    let key_of = |id: u64| {
+        let mixed = (id ^ (id >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed ^ (mixed >> 27)
+    };
+    let mut map: FixedElasticHashMap<u64, u64> = FixedElasticHashMap::with_capacity(512);
+    let passes = |map: &FixedElasticHashMap<u64, u64>, key: u64| {
+        let prepared = PreparedElasticRoute::new(map.table().hash_builder.hash_one(key));
+        map.table().route_filter(prepared).maybe_present
+    };
+    let mut live = [false; KEYS];
+    let mut forgotten = 0_usize;
+    let mut kept = 0_usize;
+    let mut state = 1_u64;
+    for _ in 0..6_000 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let id = (state >> 33) % KEYS as u64;
+        let key = key_of(id);
+        let slot = usize::try_from(id).unwrap();
+        if live[slot] {
+            assert_eq!(map.remove(&key), Some(id));
+            if passes(&map, key) {
+                kept += 1;
+            } else {
+                forgotten += 1;
+            }
+        } else {
+            assert_eq!(map.insert(key, id), None);
+        }
+        live[slot] = !live[slot];
+        for probe in 0..KEYS as u64 {
+            let present = live[usize::try_from(probe).unwrap()];
+            assert!(
+                !present || passes(&map, key_of(probe)),
+                "the filter lost live key {probe}"
+            );
+            assert_eq!(map.get(&key_of(probe)).is_some(), present);
+        }
+    }
+    assert!(forgotten > 0, "no removal cleared its key's bit");
+    assert!(kept > 0, "no removal met a bit it had to keep");
 }
