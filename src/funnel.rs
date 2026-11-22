@@ -1839,9 +1839,10 @@ where
     /// Re-record the filter from the live entries, dropping the bits departed
     /// keys left behind. Entries stay put; only the filter tail is rewritten.
     ///
-    /// Every key is hashed before the filter is cleared, so a panicking hasher
-    /// leaves it recording every live key. The hashes need scratch memory;
-    /// without it the refresh stays owed and the filter stays as it was.
+    /// Every key is hashed before the filter is cleared, so a hasher that
+    /// unwinds leaves it recording every live key. The hashes need scratch
+    /// memory; without it the filter stays as it was. Either way the refresh
+    /// stays owed to the next settling delete.
     #[cold]
     #[inline(never)]
     fn refresh_membership(&mut self) {

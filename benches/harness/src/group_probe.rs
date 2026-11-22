@@ -15,8 +15,7 @@ const EMPTY: u8 = 0xFF;
 /// hashbrown's SSE2 backend issues.
 #[cfg(all(
     target_feature = "sse2",
-    any(target_arch = "x86", target_arch = "x86_64"),
-    not(miri)
+    any(target_arch = "x86", target_arch = "x86_64")
 ))]
 mod group {
     pub(super) const WIDTH: usize = 16;
@@ -41,8 +40,7 @@ mod group {
 #[cfg(all(
     target_arch = "aarch64",
     target_feature = "neon",
-    target_endian = "little",
-    not(miri)
+    target_endian = "little"
 ))]
 mod group {
     use core::arch::aarch64::{vceq_u8, vcreate_u8, vdup_n_u8, vget_lane_u64, vreinterpret_u64_u8};
@@ -81,14 +79,12 @@ mod group {
 #[cfg(not(any(
     all(
         target_feature = "sse2",
-        any(target_arch = "x86", target_arch = "x86_64"),
-        not(miri)
+        any(target_arch = "x86", target_arch = "x86_64")
     ),
     all(
         target_arch = "aarch64",
         target_feature = "neon",
-        target_endian = "little",
-        not(miri)
+        target_endian = "little"
     )
 )))]
 mod group {

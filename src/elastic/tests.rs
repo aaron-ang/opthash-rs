@@ -880,6 +880,13 @@ fn level_counters_sit_ahead_of_their_control_bytes_without_overlap() {
 }
 
 #[test]
+fn interrupted_filter_refresh_keeps_every_live_key_reachable() {
+    test_support::assert_interrupted_refresh_keeps_live_keys_reachable::<
+        ElasticTable<PanicHashKey, u64, FixedHashBuilder, ToggleAllocator>,
+    >(ElasticTable::stale_membership);
+}
+
+#[test]
 fn elastic_metadata_is_appended_without_moving_control_or_data() {
     fn assert_layout<K, V>() {
         for &slots in &[0, 1, 7, 8, 31, 256] {

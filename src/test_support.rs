@@ -7,7 +7,9 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use crate::ReserveFraction;
 use crate::map::{HashMap, TableBackend};
 use crate::membership;
 
@@ -276,6 +278,94 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter_from<P>(
     }
     assert_eq!(stale_membership(map.table()), 0);
     assert!((0..live).all(|key| !gate_passes(map.table(), key)));
+}
+
+/// A key whose `Hash` panics during a filter refresh, or a refresh that finds
+/// no scratch memory, must leave every live key reachable and the refresh
+/// owed, so it runs once neither stands in its way.
+///
+/// `stale_membership` reads the backend's count of deletes since the last
+/// refresh. A refresh that ran would have zeroed it, so a count still at the
+/// threshold is a refresh still owed.
+pub(crate) fn assert_interrupted_refresh_keeps_live_keys_reachable<P>(
+    stale_membership: impl Fn(&P) -> usize,
+) where
+    P: TableBackend<PanicHashKey, u64, Hasher = FixedHashBuilder, Alloc = ToggleAllocator>,
+{
+    let armed = Arc::new(AtomicBool::new(false));
+    let never = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let fail = Arc::new(AtomicBool::new(false));
+    let mut map: HashMap<PanicHashKey, u64, P> = HashMap::with_capacity_and_reserve_and_hasher_in(
+        56,
+        ReserveFraction::DEFAULT,
+        fixed_hasher(),
+        ToggleAllocator::new(Arc::clone(&fail)),
+    );
+    let live = map.capacity() as u64 - 1;
+    let churn = live;
+    let threshold = membership::refresh_deletes(map.capacity());
+    let key = |id: u64| PanicHashKey {
+        id,
+        // The churned key is hashed by its own removal, so it never arms.
+        armed: Arc::clone(if id == churn { &never } else { &armed }),
+        drops: Arc::clone(&drops),
+    };
+    for id in 0..live {
+        assert_eq!(map.insert(key(id), id), None);
+    }
+    let generation = map.epoch().generation;
+    let assert_live_keys_reachable = |map: &HashMap<PanicHashKey, u64, P>| {
+        assert_eq!(map.len() as u64, live);
+        assert_eq!(map.iter().count() as u64, live);
+        assert!(!map.contains_key(&key(churn)));
+        for id in 0..live {
+            assert_eq!(map.get(&key(id)), Some(&id), "key {id}");
+        }
+    };
+
+    // Cycling one key re-takes its tombstone, so only the stale count grows
+    // and the removal that passes the threshold refreshes the filter, which
+    // hashes the armed live keys.
+    let mut unwound = false;
+    for _ in 0..=threshold {
+        assert_eq!(map.insert(key(churn), churn), None);
+        armed.store(true, Ordering::SeqCst);
+        let removed = catch_unwind(AssertUnwindSafe(|| map.remove(&key(churn))));
+        armed.store(false, Ordering::SeqCst);
+        if removed.is_err() {
+            unwound = true;
+            break;
+        }
+    }
+    assert!(unwound, "no refresh hashed a live key");
+    assert_eq!(map.epoch().generation, generation, "a rebuild ran");
+    assert_live_keys_reachable(&map);
+    assert!(stale_membership(map.table()) >= threshold);
+
+    // Without scratch memory the refresh is skipped and stays owed.
+    assert_eq!(map.insert(key(churn), churn), None);
+    fail.store(true, Ordering::SeqCst);
+    assert_eq!(map.remove(&key(churn)), Some(churn));
+    fail.store(false, Ordering::SeqCst);
+    assert_live_keys_reachable(&map);
+    assert!(stale_membership(map.table()) >= threshold);
+
+    // The owed refresh runs at the next settling delete.
+    assert_eq!(map.insert(key(churn), churn), None);
+    assert_eq!(map.remove(&key(churn)), Some(churn));
+    assert_eq!(stale_membership(map.table()), 0);
+    assert_eq!(map.epoch().generation, generation, "a rebuild ran");
+    assert_live_keys_reachable(&map);
+
+    for id in 0..live {
+        assert_eq!(map.remove(&key(id)), Some(id));
+    }
+    assert!(map.is_empty());
+    for id in 0..live {
+        assert_eq!(map.insert(key(id), id + 1), None);
+        assert_eq!(map.get(&key(id)), Some(&(id + 1)));
+    }
 }
 
 /// Work-queue churn at fixed capacity: pop the first key in iteration order,

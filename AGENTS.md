@@ -1,5 +1,10 @@
 # AGENTS.md
 
+`opthash` implements the Elastic and Funnel hash tables of
+[arXiv 2501.02305](https://arxiv.org/abs/2501.02305) behind one `HashMap`
+shell. The paper fixes where a key may go ([Paper Bounds](#paper-bounds));
+everything about how fast the table gets there is open to measurement.
+
 ## Commands
 
 For code refactors, run:
@@ -26,6 +31,50 @@ integration tests) so `HashMap::new()` / `with_capacity(n)` seed foldhash
 identically on every run; never use the random-seeded default except in
 constructor-surface tests that hash no key. Treat a flaky test as a
 determinism bug to fix, not a run to repeat.
+
+## Paper Bounds
+
+The paper ([arXiv 2501.02305](https://arxiv.org/abs/2501.02305)) proves its
+probe bounds for an idealised table. A refactor or optimization may change
+whatever those proofs do not use. They use structure, which the code keeps
+exactly, and randomness, which no implementation has and the code
+approximates.
+
+Structure is a hard limit, and the test oracle checks it:
+
+- Elastic: the level sizes, the batches and their fill thresholds, the three
+  insertion cases with their probe budget, first-free placement along a
+  level's probe sequence, and the lookup order over `(level, probe)` pairs.
+- Funnel: the level and bucket geometry, one bucket per key in each level,
+  levels tried in order, and the special array's bounded probing half and
+  two-choice half.
+- Both: no reordering. A placed entry moves only in a rebuild.
+
+Randomness is a matter of evidence. The proofs take every probe as a uniform
+draw from its level, independent across keys, across one key's probes in a
+level, and across levels. One 64-bit hash cannot supply that, so every
+probe-word construction relates a key's probes somehow. A construction stays
+when its PR does all of this:
+
+- Shows each probe is uniform over its range, or states and bounds the bias.
+- Names the relation it introduces between a key's probe words and the keys
+  that relation would hurt, then measures how often the key families below
+  produce such keys and what each occurrence costs.
+- Compares per-level occupancy and probe lengths (mean and tail) with the
+  construction it replaces, at partial and full load, for a mixing hasher and
+  for an identity hasher over sequential, multiplicative, and shifted keys.
+- Shows no special-array use and no exceptional placement in any of those
+  runs.
+
+A construction that fails any of these does not stay, whatever it saves.
+
+Everything else is outside the paper and free to change: deletion and
+tombstones, resizing, the membership filter, control bytes, and any path
+that only reaches the same answer sooner. The paper bounds lookups of
+present keys only, so how fast an absent key is rejected is this crate's own
+design. Such a path must return what the
+ordered walk returns and place where the placement walk places, and a
+differential test against that walk shows it.
 
 ## Benchmarks
 
@@ -96,6 +145,11 @@ Large modules keep unit tests in a sibling `<module>/tests.rs` (`mod tests;`); s
 
 Don't duplicate primitives across `src/` and `benches/`.
 
+Import types and traits, but call free functions through their owning module
+(for example, `probe::elastic_phi`). Do not re-export internal functions from
+a parent module; keep crate-root re-exports limited to the curated public
+interface.
+
 ## Comments and Docs
 
 - Every item earns its place: no dead code, self-explanatory comments, or docs restating the signature. Keep SAFETY, invariants, and non-obvious "why".
@@ -106,15 +160,13 @@ Don't duplicate primitives across `src/` and `benches/`.
 
 When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-mut-iters`) and pass the same name to `git worktree add`.
 
-## Refactoring Guidelines
+## Performance Work
 
 ### Design Priorities
 
-These lists and [Reject](#reject) are defaults to test, not prohibitions: for
-a performance experiment, build the variant and let the measurements decide.
-A change to placement or probe words is fine while it keeps the paper's
-assumptions (uniform, independent per-level choices; same geometry and probe
-order) and updates the test oracle.
+These priorities are defaults, not limits. When a measurement disagrees with
+one, build the variant and let instruction counts and `scripts/bench.sh`
+decide; name the default it departs from in the PR.
 
 - To express an invariant or precondition, first make it uncompilable to
   violate (branded lifetimes, opaque tokens, typestate), then document it,
@@ -123,22 +175,22 @@ order) and updates the test oracle.
   (for example, `probe::elastic_phi`). Do not flatten internal functions through
   `mod.rs`; keep crate-root re-exports limited to the curated public interface.
 - Prefer layout and locality wins before adding more metadata. Keep hot metadata contiguous — if fields are read together, store them together.
-- Cache routing state that's reused in hot paths; never recompute it per probe.
+- Cache routing state that's reused in hot paths instead of recomputing it per probe.
 - Preserve SIMD-friendly control-byte scans: contiguous groups, cheap bitmask iteration, early rejection before touching payloads.
-- Treat values that are constant by construction as constants. Storing them as runtime fields costs a load + mul per probe that LLVM can't fold away.
+- Keep values the compiler can fold (geometry, shifts, strides) as constants. A runtime field costs a load per probe and stops the compiler from turning a multiply or divide into a shift.
+- Measure wide constants instead of assuming. Building a 64-bit immediate can take more instructions than one load from a hot struct, and the answer differs by target.
+- Prefer a change that removes work from every operation over a fast path for one case. A fast path has to pay for its lines, its extra state, and the differential test that pins it to the general path.
 
 ### Reject
 
 - Metadata that costs work on every insert/delete unless benchmarks prove a net win.
-- Size or load thresholds picked by a sweep on one machine. Tie a threshold
-  to its mechanism (for example control-byte footprint against cache size) or
-  to a conservative documented bound, and say in the PR which machines were
-  measured.
+- Size or load thresholds taken from a sweep on one machine. Derive a threshold from a mechanism that holds on other hardware, set it to a conservative bound documented as one, or choose the variant that needs none; say in the PR which machines were measured.
 - Optimizations that improve a narrow microbenchmark but regress the public `speedup` suite. `target/criterion/` is the final gate — if the relevant benchmark regresses, the change does not stay.
 
 ### Verification
 
 - Read the asm (`objdump -d`) on hot functions before factoring shared SIMD or arithmetic primitives. LLVM already CSEs same-pointer control-byte loads and folds duplicate masks; a "cleaner" abstraction may save nothing.
+- Compare instruction counts first: they do not move with machine load, so they settle an A/B that cycles cannot. Cycles and `scripts/bench.sh` then decide whether the saved instructions were on the critical path.
 - Confirm hot-path wins with `perf stat` (cycles, instructions, cache-misses, branch-misses) on a pinned run; a real win moves the matching counter, not just wallclock.
 - Adding a field to a hot struct (`ElasticTable`/`FunnelTable`, Elastic's `Level`, Funnel's `FunnelShape`/`LevelShape`) is a layout change. Downstream fields can shift across cache lines and regress lookups with no semantic change. Measure offsets _and_ bench.
 - Pure refactors (rename, extract, no logic change) can swing results from icache and branch-predictor layout shifts. A no-op refactor should leave CodSpeed sim instr-count at ±0.

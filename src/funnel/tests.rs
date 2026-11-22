@@ -3231,6 +3231,13 @@ fn panicking_hasher_while_a_keyed_removal_settles_drops_the_removed_pair() {
 }
 
 #[test]
+fn interrupted_filter_refresh_keeps_every_live_key_reachable() {
+    test_support::assert_interrupted_refresh_keeps_live_keys_reachable::<
+        FunnelTable<PanicHashKey, u64, test_support::FixedHashBuilder, ToggleAllocator>,
+    >(|table| table.stale_membership);
+}
+
+#[test]
 fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
     let fail = Arc::new(AtomicBool::new(true));
     let allocations = Arc::new(AtomicUsize::new(0));
