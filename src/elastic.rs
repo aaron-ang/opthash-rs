@@ -3553,14 +3553,9 @@ where
         counter_base: u32,
         upper: usize,
     ) -> Option<usize> {
-        probe::unbiased_prepared_elastic_probe_index(
-            prepared,
-            counter_base,
-            upper,
-            probe::RANGE_WORD_CAP,
-        )
-        .ok()
-        .map(|probe| probe.index)
+        probe::unbiased_prepared_elastic_probe_index(prepared, counter_base, upper)
+            .ok()
+            .map(|probe| probe.index)
     }
 
     #[cfg(test)]

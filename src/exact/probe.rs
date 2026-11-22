@@ -760,19 +760,8 @@ pub(crate) fn unbiased_prepared_elastic_probe_index(
     probe: PreparedElasticProbe,
     counter_base: u32,
     upper: usize,
-    max_random_words: u32,
 ) -> Result<ProbeIndex, RangeReductionError> {
-    if max_random_words > ELASTIC_REJECTION_LIMIT {
-        return Err(RangeReductionError::RejectionLimitExceeded {
-            random_word_count: 0,
-        });
-    }
     if upper.is_power_of_two() {
-        if max_random_words == 0 {
-            return Err(RangeReductionError::RejectionLimitExceeded {
-                random_word_count: 0,
-            });
-        }
         let word = probe.word_from_counter_base(counter_base, 0);
         let index = if upper == 1 {
             0
@@ -785,7 +774,7 @@ pub(crate) fn unbiased_prepared_elastic_probe_index(
             random_word_count: 1,
         });
     }
-    reduce_prepared_elastic_non_power(probe, counter_base, upper, max_random_words)
+    reduce_prepared_elastic_non_power(probe, counter_base, upper)
 }
 
 /// Shift that reduces a random word to an index in `[0, upper)` by keeping
@@ -908,9 +897,8 @@ fn reduce_prepared_elastic_non_power(
     probe: PreparedElasticProbe,
     counter_base: u32,
     upper: usize,
-    max_random_words: u32,
 ) -> Result<ProbeIndex, RangeReductionError> {
-    reduce_probe_words(upper, max_random_words, |rejection_index| {
+    reduce_probe_words(upper, RANGE_WORD_CAP, |rejection_index| {
         probe.word_from_counter_base(counter_base, rejection_index)
     })
 }

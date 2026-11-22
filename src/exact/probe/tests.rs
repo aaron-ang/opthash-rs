@@ -79,7 +79,7 @@ fn prepared_power_of_two_reduction_is_bit_identical_to_generic_reduction() {
                 let counter_base = try_pack_elastic_counter(level, logical_probe, 0).unwrap();
                 for upper in [1, 2, 3, 4, 16, 191, 1_237, 1 << 20] {
                     assert_eq!(
-                        unbiased_prepared_elastic_probe_index(prepared, counter_base, upper, 8,),
+                        unbiased_prepared_elastic_probe_index(prepared, counter_base, upper),
                         unbiased_probe_index(&oracle, key, domain, logical_probe, upper, 8,)
                     );
                 }
@@ -287,7 +287,7 @@ fn elastic_awkward_ranges_have_no_large_fixed_seed_skew() {
     let oracle = CounterPrf::new(FIXED_SEED);
     let counter_base = try_pack_elastic_counter(7, 3, 0).unwrap();
     assert_awkward_ranges_have_no_large_skew(|key, upper| {
-        unbiased_prepared_elastic_probe_index(oracle.prepare_elastic(key), counter_base, upper, 8)
+        unbiased_prepared_elastic_probe_index(oracle.prepare_elastic(key), counter_base, upper)
             .unwrap()
             .index
     });
