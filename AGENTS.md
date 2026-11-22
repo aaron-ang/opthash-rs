@@ -154,6 +154,7 @@ interface.
 
 - Every item earns its place: no dead code, self-explanatory comments, or docs restating the signature. Keep SAFETY, invariants, and non-obvious "why".
 - No raw numbers, benchmark results, or experiment history in comments or docs; put them in commit bodies and PR descriptions.
+- A comment says what its item is. It does not compare Elastic with Funnel or justify one backend's choice against the other's; that reasoning goes in the commit body or PR description.
 
 ## Worktree Naming
 
@@ -167,6 +168,12 @@ These priorities are defaults, not limits. When a measurement disagrees with
 one, build the variant and let instruction counts and `scripts/bench.sh`
 decide; name the default it departs from in the PR.
 
+- To express an invariant or precondition, first make it uncompilable to
+  violate (branded lifetimes, opaque tokens, typestate), then document it,
+  and add `unsafe` only when the first two cost measurable performance.
+- Import types and traits, but call free functions through their owning module
+  (for example, `probe::elastic_phi`). Do not flatten internal functions through
+  `mod.rs`; keep crate-root re-exports limited to the curated public interface.
 - Prefer layout and locality wins before adding more metadata. Keep hot metadata contiguous — if fields are read together, store them together.
 - Cache routing state that's reused in hot paths instead of recomputing it per probe.
 - Preserve SIMD-friendly control-byte scans: contiguous groups, cheap bitmask iteration, early rejection before touching payloads.
