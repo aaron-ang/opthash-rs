@@ -1393,16 +1393,31 @@ where
 
     /// Re-record the filter from the live entries, dropping the bits departed
     /// keys left behind. Entries stay put; only the filter tail is rewritten.
+    ///
+    /// Every key is hashed before the filter is cleared, so a hasher that
+    /// unwinds leaves it recording every live key. The hashes need scratch
+    /// memory; without it the filter stays as it was. Either way the refresh
+    /// stays owed to the next settling delete.
     #[cold]
     #[inline(never)]
     fn refresh_membership(&mut self) {
-        self.clear_membership();
+        let mut hashes = allocator_api2::vec::Vec::new_in(self.alloc.clone());
+        if hashes.try_reserve_exact(self.len).is_err() {
+            return;
+        }
         let mut scan = OccupiedIndices::new();
         while let Some(slot) = scan.step(&self.storage) {
-            let hash = {
-                // SAFETY: `step` yields occupied in-bounds slots.
-                let entry = unsafe { self.storage.get_ref(slot) };
-                self.hash_builder.hash_one(&entry.key)
+            // SAFETY: `step` yields occupied in-bounds slots.
+            let entry = unsafe { self.storage.get_ref(slot) };
+            hashes.push(self.hash_builder.hash_one(&entry.key));
+        }
+        debug_assert_eq!(hashes.len(), self.len);
+        self.clear_membership();
+        // The same scan order as above pairs each entry with its hash.
+        let mut scan = OccupiedIndices::new();
+        for hash in hashes {
+            let Some(slot) = scan.step(&self.storage) else {
+                break;
             };
             let membership = self.membership_slot(hash);
             self.record_membership(membership, self.level_bit(slot));
