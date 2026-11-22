@@ -626,7 +626,7 @@ fn churn_places_and_counts_like_the_placement_walk() {
                 let key = index.wrapping_mul(SPREAD);
                 let slot = walked.find_location(&key, key).unwrap();
                 assert_eq!(
-                    map::TableBackend::remove_key(&mut churned, &key, key),
+                    map::TableBackend::take(&mut churned, &key, key),
                     Some((key, index))
                 );
                 assert_eq!(map::TableBackend::remove(&mut walked, slot), (key, index));
@@ -709,7 +709,7 @@ fn insert_among_tombstones_cleans_up_and_grows_like_the_placement_walk() {
         let key = index.wrapping_mul(SPREAD);
         let slot = walked.find_location(&key, key).unwrap();
         assert_eq!(
-            map::TableBackend::remove_key(inserted, &key, key),
+            map::TableBackend::take(inserted, &key, key),
             Some((key, index))
         );
         assert_eq!(map::TableBackend::remove(walked, slot), (key, index));
