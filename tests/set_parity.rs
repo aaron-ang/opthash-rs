@@ -501,7 +501,7 @@ macro_rules! set_suite {
             }
 
             /// A value that counts how often the calling thread hashes one.
-            #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+            #[derive(Clone, Copy, PartialEq, Eq)]
             struct Counted(u32);
 
             thread_local! {
@@ -581,7 +581,7 @@ macro_rules! set_suite {
                             "operator {index} of {left:?} and {right:?}"
                         );
                     }
-                    // The operands are read only.
+                    // The compound assignments worked on clones; the operands are unchanged.
                     assert_eq!(sorted(a), left);
                     assert_eq!(sorted(b), right);
                 }
@@ -661,27 +661,22 @@ macro_rules! set_suite {
             }
 
             #[test]
-            fn extract_if_size_hint_brackets_what_it_yields() {
+            fn extract_if_size_hint_is_unbounded_and_the_filter_decides_the_count() {
                 type Keep = fn(u32) -> bool;
                 let keeps: [(Keep, usize); 3] =
                     [(|_| false, 0), (|value| value % 2 == 0, 20), (|_| true, 40)];
                 for (extract, expected) in keeps {
                     let mut set: HashSet<u32> = (0..40).collect();
                     let mut extracted = set.extract_if(|value| extract(*value));
-                    let mut left = expected;
+                    let mut yielded = 0;
                     loop {
-                        let (lower, upper) = extracted.size_hint();
-                        assert!(lower <= left, "{lower} of {left}");
-                        assert!(
-                            upper.is_none_or(|upper| left <= upper),
-                            "{upper:?} of {left}"
-                        );
+                        assert_eq!(extracted.size_hint(), (0, None));
                         if extracted.next().is_none() {
                             break;
                         }
-                        left -= 1;
+                        yielded += 1;
                     }
-                    assert_eq!(left, 0);
+                    assert_eq!(yielded, expected);
                     drop(extracted);
                     assert_eq!(set.len(), 40 - expected);
                 }
@@ -700,7 +695,7 @@ macro_rules! set_suite {
             }
 
             #[test]
-            fn sets_of_one_length_compare_by_their_values() {
+            fn set_equality_follows_the_values() {
                 let model = BTreeSet::from([1, 2, 3]);
                 let base: HashSet<i32> = model.iter().copied().collect();
                 for other in [vec![1, 2, 4], vec![1, 2], vec![1, 2, 3, 4], vec![3, 1, 2]] {
