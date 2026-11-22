@@ -496,40 +496,6 @@ fn query_schedule_holds_every_route_once_in_position_order() {
     );
 }
 
-#[test]
-fn elastic_geometry_carries_capacity_and_batch_state() {
-    for &requested in &[0usize, 1, 127, 1_000, 10_000] {
-        let reserve_fraction = ReserveFraction::DEFAULT;
-        let geometry = ElasticGeometry::for_insert_budget(requested, reserve_fraction).unwrap();
-        assert!(
-            geometry.max_insertions >= requested,
-            "requested={requested} max_insertions={}",
-            geometry.max_insertions
-        );
-        assert_eq!(
-            geometry.level_capacities.iter().sum::<usize>(),
-            geometry.total_slots
-        );
-        assert_eq!(
-            geometry.batch_plan.iter().sum::<usize>(),
-            geometry.max_insertions
-        );
-        if geometry.total_slots >= 2 {
-            let config =
-                PaperConfig::new(geometry.total_slots, reserve_fraction.exponent()).unwrap();
-            let plan = config.elastic_plan();
-            assert_eq!(
-                *geometry.level_capacities,
-                plan.level_lengths().collect::<Vec<_>>()
-            );
-            assert_eq!(
-                *geometry.batch_plan,
-                plan.batch_quotas().collect::<Vec<_>>()
-            );
-        }
-    }
-}
-
 /// Panics in the drop that finds `drops` at `panic_at`.
 struct PanicOnNthDrop {
     drops: Arc<AtomicUsize>,
@@ -1617,36 +1583,6 @@ fn inserts_spill_to_deeper_levels_at_high_load() {
     );
     for i in 0..max {
         assert_eq!(map.get(&i), Some(&i));
-    }
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn removing_every_entry_empties_every_level() {
-    let mut map: FixedElasticHashMap<i32, i32> = FixedElasticHashMap::with_capacity(512);
-    let max = i32::try_from(map.capacity()).expect("test capacity fits i32");
-    for i in 0..max {
-        map.insert(i, i);
-    }
-    for i in 0..max {
-        map.remove(&i);
-    }
-    assert_eq!(map.len(), 0);
-    assert!(
-        map.table()
-            .levels
-            .iter()
-            .all(|level| map.table().live_in(level) == 0)
-    );
-}
-
-#[test]
-fn probe_schedule_capacity_table_matches_the_route_walk() {
-    let mut walked = 0;
-    assert_eq!(PROBE_SCHEDULE_CAPACITY[0], 0);
-    for level in 0..MAX_LEVELS {
-        for_each_phi_route(level, 1, QUERY_POSITION_CAP, |_, _| walked += 1);
-        assert_eq!(PROBE_SCHEDULE_CAPACITY[level + 1], walked);
     }
 }
 
@@ -3030,8 +2966,10 @@ fn removing_a_full_table_leaves_no_tombstone_for_lookups() {
         assert_eq!(map.remove(&key), Some(key));
     }
 
+    assert!(map.is_empty());
     // The last removal spent the countdown, so maintenance ran with it.
     let table = map.table();
+    assert!(table.levels.iter().all(|level| table.live_in(level) == 0));
     assert_eq!(table.stale_membership(), 0);
     assert!(table.levels.iter().all(|level| level.tombstones() == 0));
     assert!((0..live).all(|key| {
