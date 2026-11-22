@@ -586,37 +586,8 @@ struct SettledSlot<K, V> {
     /// [`Level::summary_bit`] of `level`.
     summary_bit: SummaryBin,
     slot: usize,
-    /// The slot's control byte, sign-extended.
-    control: i32,
-}
-
-/// Control byte `slot` of the bytes at `control`, sign-extended, so an
-/// occupied byte is negative. On 64-bit `AArch64` the load is opaque to the
-/// compiler, which then tests the bits of the register as it is.
-///
-/// # Safety
-///
-/// `slot` is in bounds of the control bytes at `control`.
-#[inline]
-unsafe fn signed_control(control: *const u8, slot: usize) -> i32 {
-    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64", not(miri)))]
-    {
-        let byte: i32;
-        // SAFETY: the caller's contract; the load only reads.
-        unsafe {
-            core::arch::asm!(
-                "ldrsb {byte:w}, [{control}, {slot}]",
-                control = in(reg) control,
-                slot = in(reg) slot,
-                byte = lateout(reg) byte,
-                options(pure, readonly, nostack, preserves_flags),
-            );
-        }
-        byte
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_pointer_width = "64", not(miri))))]
-    // SAFETY: the caller's contract.
-    i32::from(unsafe { control.add(slot).read() }.cast_signed())
+    /// The slot's control byte.
+    control: u8,
 }
 
 impl<K, V, S, A: Allocator + Clone> fmt::Debug for ElasticTable<K, V, S, A> {
@@ -1158,8 +1129,8 @@ unsafe fn first_settled_vacancy<K, V>(
     loop {
         let slot = probe::shifted_elastic_index(word, index_shift);
         // SAFETY: the level's shift maps the index into its capacity.
-        let byte = unsafe { signed_control(control, slot) };
-        if byte >= 0 {
+        let byte = unsafe { control.add(slot).read() };
+        if control::is_free(byte) {
             return Some(SettledSlot {
                 level,
                 control_bytes: control,
@@ -1937,7 +1908,7 @@ where
                     settled_word(level.summary_bit(), budget),
                 )
             }?;
-            Some((index, found.slot, found.control.to_le_bytes()[0]))
+            Some((index, found.slot, found.control))
         })
     }
 
@@ -2430,7 +2401,7 @@ where
                 data: (*level).data_ptr,
                 summary_bit: (*level).summary_bit(),
                 slot: slot_idx,
-                control: i32::from(prev_ctrl.cast_signed()),
+                control: prev_ctrl,
             }
         };
         // SAFETY: callers pass a free slot of the level they found it in.
@@ -2473,13 +2444,13 @@ where
         } = found;
         // SAFETY: the caller's contract.
         unsafe { self.record_membership_over(summary_bit, read) };
-        debug_assert!(control >= 0);
+        debug_assert!(control::is_free(control));
         // SAFETY: the caller's contract: the slot is a free one of the
         // level these pointers are of, whose counters sit ahead of its
         // control bytes, and `&mut self` borrows the arena alone.
         // `key_fingerprint` is an occupied control byte.
         unsafe {
-            debug_assert_eq!(control, signed_control(control_bytes, slot));
+            debug_assert_eq!(control, *control_bytes.add(slot));
             data.add(slot)
                 .write(MaybeUninit::new(SlotEntry { value, key }));
             control_bytes.add(slot).write(key_fingerprint);
@@ -2493,7 +2464,7 @@ where
         // an empty one in this bit. Last, so the call sits after every
         // store of the common path.
         const { assert!(CTRL_EMPTY & CTRL_TOMBSTONE == 0) };
-        if control & i32::from(CTRL_TOMBSTONE) != 0 {
+        if control & CTRL_TOMBSTONE != 0 {
             // SAFETY: the caller's contract.
             self.scheduler.reuse_tombstone(unsafe { &mut *level });
         }

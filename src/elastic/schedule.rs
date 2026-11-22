@@ -20,8 +20,8 @@ use crate::raw::control::CTRL_EMPTY;
 /// touches the route alone.
 ///
 /// `repr(C)` keeps the two words a step tests and multiplies adjacent, and
-/// the two a probe reduces and reads through adjacent, so each pair comes in
-/// one load.
+/// the two a probe reduces and reads through adjacent, so a target with a
+/// paired load takes each pair in one.
 ///
 /// Its alignment leaves the low bits of a route's address clear, which a
 /// [`WalkStart`] marks a run's lead in.
@@ -83,8 +83,7 @@ impl PhiRoute {
     }
 
     /// Steps `route` to the route after it and reads the two words a walk's
-    /// step takes there: the level's bit and the sequence index. On 64-bit
-    /// `AArch64` the step and both reads are one pre-indexed pair load.
+    /// step takes there: the level's bit and the sequence index.
     ///
     /// # Safety
     ///
@@ -92,41 +91,13 @@ impl PhiRoute {
     /// sentinel that closes its list.
     #[inline]
     pub(super) unsafe fn step(route: &mut *const Self) -> RouteStep {
-        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64", not(miri)))]
-        {
-            const _: () = assert!(size_of::<PhiRoute>() == 32);
-            let level_bit: u64;
-            let sequence_index: u64;
-            // SAFETY: the caller's contract: the next route holds both
-            // words, which the load only reads.
-            unsafe {
-                core::arch::asm!(
-                    "ldp {level_bit}, {sequence_index}, [{route}, #32]!",
-                    route = inout(reg) *route,
-                    level_bit = lateout(reg) level_bit,
-                    sequence_index = lateout(reg) sequence_index,
-                    options(pure, readonly, nostack, preserves_flags),
-                );
-            }
-            RouteStep {
-                level_bit,
-                sequence_index,
-            }
-        }
-        #[cfg(not(all(target_arch = "aarch64", target_pointer_width = "64", not(miri))))]
-        {
-            // SAFETY: the caller's contract.
-            *route = unsafe { route.add(1) };
-            // SAFETY: as above.
-            unsafe { (**route).as_step() }
-        }
+        // SAFETY: the caller's contract.
+        *route = unsafe { route.add(1) };
+        // SAFETY: as above.
+        unsafe { (**route).as_step() }
     }
 
     /// What [`Self::step`] reads of this route.
-    #[cfg(any(
-        test,
-        not(all(target_arch = "aarch64", target_pointer_width = "64", not(miri)))
-    ))]
     pub(super) fn as_step(&self) -> RouteStep {
         RouteStep {
             level_bit: self.level_bit,
@@ -135,10 +106,7 @@ impl PhiRoute {
     }
 
     /// The two words a walk's probe reads at `route`: the index shift, as
-    /// [`Self::index_shift`] gives it, and the level's control bytes. Where
-    /// a pointer is as wide as the reduction and the target is little-endian,
-    /// so that one wide load splits into the two in order, it reads them
-    /// together.
+    /// [`Self::index_shift`] gives it, and the level's control bytes.
     ///
     /// # Safety
     ///
@@ -146,32 +114,8 @@ impl PhiRoute {
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub(super) unsafe fn reach(route: *const Self) -> (u32, *const u8) {
-        #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
-        {
-            const _: () = assert!(
-                size_of::<*const u8>() == size_of::<u64>()
-                    && core::mem::offset_of!(PhiRoute, control)
-                        == core::mem::offset_of!(PhiRoute, reduction) + size_of::<u64>()
-                    && size_of::<PhiRoute>()
-                        == core::mem::offset_of!(PhiRoute, control) + size_of::<u64>()
-            );
-            // SAFETY: the caller's contract; the reduction and the control
-            // pointer are the route's last two words, with no padding
-            // between or after them.
-            let both = unsafe {
-                (&raw const (*route).reduction)
-                    .cast::<u128>()
-                    .read_unaligned()
-            };
-            // SAFETY: the caller's contract.
-            let control = unsafe { (*route).control }.with_addr((both >> u64::BITS) as usize);
-            (both as u32, control)
-        }
-        #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
         // SAFETY: the caller's contract.
-        unsafe {
-            ((*route).reduction as u32, (*route).control)
-        }
+        unsafe { ((*route).reduction as u32, (*route).control) }
     }
 
     /// Level the route probes; [`SENTINEL_LEVEL`] for the sentinel.
@@ -265,37 +209,17 @@ pub(super) struct RunWalk(*const u64);
 
 impl RunWalk {
     /// Steps to the route after and reads its sequence index, the one word
-    /// a step takes where no other level is left to skip. On 64-bit
-    /// `AArch64` the step and the read are one pre-indexed load.
+    /// a step takes where no other level is left to skip.
     ///
     /// # Safety
     ///
     /// The walk is ahead of the sentinel that closes its run.
     #[inline]
     pub(super) unsafe fn step(&mut self) -> u64 {
-        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64", not(miri)))]
-        {
-            const _: () = assert!(size_of::<PhiRoute>() == 32);
-            let sequence_index: u64;
-            // SAFETY: the caller's contract: the next route holds the word,
-            // which the load only reads.
-            unsafe {
-                core::arch::asm!(
-                    "ldr {sequence_index}, [{at}, #32]!",
-                    at = inout(reg) self.0,
-                    sequence_index = lateout(reg) sequence_index,
-                    options(pure, readonly, nostack, preserves_flags),
-                );
-            }
-            sequence_index
-        }
-        #[cfg(not(all(target_arch = "aarch64", target_pointer_width = "64", not(miri))))]
-        {
-            // SAFETY: the caller's contract.
-            self.0 = unsafe { self.0.byte_add(size_of::<PhiRoute>()) };
-            // SAFETY: as above.
-            unsafe { *self.0 }
-        }
+        // SAFETY: the caller's contract.
+        self.0 = unsafe { self.0.byte_add(size_of::<PhiRoute>()) };
+        // SAFETY: as above.
+        unsafe { *self.0 }
     }
 
     /// The route the walk is at, once it has stepped.
@@ -892,31 +816,9 @@ impl ProbeSchedule {
     /// [`PhiRoute::index_shift`] and [`PhiRoute::control`] of the direct
     /// route, without reading the route, and the entries of its level as
     /// [`Self::direct_entry`] takes them.
-    /// Where two pointers fill one wide load and the target is
-    /// little-endian, that load brings both pointers.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub(super) fn direct_reach(&self) -> (u32, *const u8, *mut u8) {
-        #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
-        {
-            // SAFETY: `repr(C)` puts the entries right after the control
-            // pointer, asserted above, so the read covers exactly those two
-            // initialized fields. The pointer comes from `self` whole, so it
-            // may read both.
-            let both = unsafe {
-                core::ptr::from_ref(self)
-                    .cast::<u8>()
-                    .add(core::mem::offset_of!(Self, direct_control))
-                    .cast::<u128>()
-                    .read_unaligned()
-            };
-            (
-                self.direct_reduction as u32,
-                self.direct_control.with_addr(both as usize),
-                self.direct_entries.with_addr((both >> u64::BITS) as usize),
-            )
-        }
-        #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
         (
             self.direct_reduction as u32,
             self.direct_control,
@@ -926,37 +828,13 @@ impl ProbeSchedule {
 
     /// What a walk past the direct route reads of the schedule: the entry
     /// origin [`Self::entry_at`] adds to, and where a walk under `summary`
-    /// steps on from, as [`Self::walk_start`] gives it. Where two pointers
-    /// fill one wide load and the target is little-endian, that load brings
-    /// the origin and the address of the walk starts.
+    /// steps on from, as [`Self::walk_start`] gives it.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub(super) fn walk_reach(
         &self,
         summary: SummaryBin,
     ) -> (*mut u8, Result<RunWalk, *const PhiRoute>) {
-        #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
-        let (entry_origin, zero_start) = {
-            // SAFETY: `repr(C)` puts the book, one pointer, right after the
-            // origin, asserted above, so the read covers exactly those two
-            // initialized fields. The pointer comes from `self` whole, so it
-            // may read both.
-            let both = unsafe {
-                core::ptr::from_ref(self)
-                    .cast::<u8>()
-                    .add(core::mem::offset_of!(Self, entry_origin))
-                    .cast::<u128>()
-                    .read_unaligned()
-            };
-            (
-                self.entry_origin.with_addr(both as usize),
-                self.book
-                    .zero_start
-                    .as_ptr()
-                    .with_addr((both >> u64::BITS) as usize),
-            )
-        };
-        #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
         let (entry_origin, zero_start) = (self.entry_origin, self.book.zero_start.as_ptr());
         let summary = summary.cast_signed();
         // The top bits, sign-extended as the summary is. They fit an `i32`,

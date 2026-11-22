@@ -2310,9 +2310,7 @@ fn shifted_vacancy_search_agrees_with_the_general_one() {
                         assert!(ptr::eq(found.level, region));
                         assert_eq!(found.summary_bit, region.summary_bit());
                         // SAFETY: the search returns a slot of `region`.
-                        assert_eq!(found.control, unsafe {
-                            i32::from(region.control_at(found.slot).cast_signed())
-                        });
+                        assert_eq!(found.control, unsafe { region.control_at(found.slot) });
                         found.slot
                     });
                     assert_eq!(settled, shifted.map(|(slot, _)| slot));
@@ -4380,18 +4378,6 @@ fn walks_from_their_starts_probe_what_walks_from_the_direct_route_do() {
         assert_twin_lookups_agree(&started, &direct, &model, 2 * universe);
     }
     assert_ne!(cleanups, 0);
-}
-
-#[test]
-fn signed_control_sign_extends_every_byte() {
-    let bytes: Vec<u8> = (0..=u8::MAX).collect();
-    for (slot, &byte) in bytes.iter().enumerate() {
-        // SAFETY: `slot` indexes `bytes`.
-        let signed = unsafe { signed_control(bytes.as_ptr(), slot) };
-        assert_eq!(signed, i32::from(byte.cast_signed()));
-        assert_eq!(signed >= 0, control::is_free(byte));
-        assert_eq!(signed.to_le_bytes()[0], byte);
-    }
 }
 
 /// Splitmix64 of `index`: keys with no structure in any bit.
