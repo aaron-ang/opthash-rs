@@ -246,7 +246,7 @@ impl FunnelShape {
         })
     }
 
-    /// Entries a table without tombstones may place through its head.
+    /// Entries a table may place through its head.
     fn head_insertions(&self) -> usize {
         if self.has_head() {
             self.max_insertions
@@ -432,43 +432,11 @@ impl From<ShapeError> for TryReserveError {
 const CTRL_PADDING: u8 = 0x02;
 const _: () = assert!(CTRL_PADDING != CTRL_EMPTY && CTRL_PADDING != CTRL_TOMBSTONE);
 
-/// One bit per lane of a group, which every group mask sets for a matching
-/// lane. A set of matches is then walked by clearing its lowest bit.
-const GROUP_LANES: u64 = {
-    let mut lanes = 0;
-    let mut lane = 0;
-    while lane < GROUP_SIZE {
-        lanes |= 1 << (lane * BITMASK_STRIDE as usize + BITMASK_SLOT_BIT as usize);
-        lane += 1;
-    }
-    lanes
-};
-
 /// Marks the path that calls it as rarely taken, so the paths around it are
 /// laid out to fall through.
 #[cold]
 #[inline]
 const fn rarely_taken() {}
-
-/// Lane of the lowest bit of `matches`.
-///
-/// # Safety
-///
-/// `matches` must be non-empty, with its lowest set bit at
-/// `BITMASK_SLOT_BIT` of its stride, as a group mask's is and as a subset
-/// of [`GROUP_LANES`] is.
-#[inline]
-// The stride is one where a group mask holds one bit per slot.
-#[allow(clippy::modulo_one)]
-unsafe fn lowest_lane(matches: u64) -> usize {
-    debug_assert_ne!(matches, 0);
-    let bit = matches.trailing_zeros();
-    debug_assert_eq!(bit % BITMASK_STRIDE, BITMASK_SLOT_BIT);
-    // SAFETY: the caller's contract. Stating it lets the division fold into
-    // the slot's address scaling.
-    unsafe { core::hint::assert_unchecked(bit % BITMASK_STRIDE == BITMASK_SLOT_BIT) };
-    (bit / BITMASK_STRIDE) as usize
-}
 
 /// Zero bits above the highest lane of a group mask.
 #[allow(clippy::cast_possible_truncation)]
@@ -885,16 +853,6 @@ impl<'a, K: 'a, V: 'a> FoundPart<'a, K, V> for FoundEntry {
     }
 }
 
-/// What one placement walk settles for a key the filter recorded.
-enum HeadSearch<T> {
-    /// The key's control byte.
-    Present(NonNull<u8>),
-    /// The key is absent, and this is where it goes.
-    Vacant(HeadVacancy<T>),
-    /// Neither: the lookup and the general placement decide.
-    Unsettled,
-}
-
 /// A known-absent search, retained only while the entry borrows its map.
 #[derive(Debug)]
 pub struct FunnelVacant {
@@ -908,6 +866,9 @@ pub struct FunnelVacant {
 impl FunnelVacant {
     const UNSEARCHED: usize = usize::MAX;
     const EXHAUSTED: usize = usize::MAX - 1;
+    /// What [`FunnelTable::find_recorded_for_entry`] returns in place of a
+    /// slot for a key it leaves to the exact walk. No token holds it.
+    const UNSETTLED: usize = usize::MAX - 2;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1169,10 +1130,10 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// [`FunnelShape::head_lanes`]. Next to [`Self::head_left`], which the
     /// head placement reads with it.
     head_lanes: u64,
-    /// Inserts the head placement may still make: the insertion limit less
-    /// the entry count in a table without tombstones, zero with any. Kept by
-    /// [`Self::set_entries`] and [`Self::settle_first_delete`], so that
-    /// placement tests and counts with one word.
+    /// Inserts the head placement may still make: no more than the
+    /// insertion limit less the entry count. Deletes leave it as it is, and
+    /// [`Self::reopen_head`] adds the room they made once it runs out, so
+    /// that placement tests and counts with one word.
     head_left: usize,
     /// The levels the first-match lookup and the head placement walk, with
     /// their addresses in [`Self::storage`]; see [`head_levels`]. Replaced
@@ -1188,12 +1149,12 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// Deletes since the filter last matched the live set, less
     /// [`Self::uncounted_deletes`]; see [`membership::refresh_deletes`].
     stale_membership: usize,
-    /// Tombstones, less [`Self::uncounted_deletes`].
+    /// A bound on the tombstones, less [`Self::uncounted_deletes`]: the
+    /// deletes since the controls were last reset or counted. A placement
+    /// that takes a tombstone's lane leaves it as it is.
     tombstones: usize,
     /// Deletes left before one has to look at the counters: a delete only
     /// counts this word down, and the first to exhaust it settles the rest.
-    /// One in a table without tombstones, whose first delete ends the head
-    /// placement.
     settle_left: usize,
     /// [`Self::settle_left`] as the counts were last settled with it.
     settle_armed: usize,
@@ -1338,10 +1299,10 @@ where
         alloc: A,
     ) -> Result<Self, TryReserveError> {
         let (arena, storage, head, membership) = try_allocate_storage(&shape, &alloc)?;
-        Ok(Self {
+        let mut table = Self {
             head,
-            entries_base: shape.head_insertions(),
-            head_left: shape.head_insertions(),
+            entries_base: 0,
+            head_left: 0,
             head_lanes: shape.head_lanes(),
             shape,
             storage,
@@ -1357,7 +1318,9 @@ where
             stale_membership: 0,
             settle_left: 1,
             settle_armed: 1,
-        })
+        };
+        table.set_entries(0);
+        Ok(table)
     }
 
     fn try_with_insert_budget(
@@ -1899,10 +1862,10 @@ where
     }
 
     /// [`Self::search_vacancy`] over the levels that own a level-bin bit: the
-    /// first free lane of the walk, which is an EMPTY one in a table without
-    /// tombstones. `None` hands the insert to the general walk: no vacancy
-    /// in those levels.
-    #[inline]
+    /// first free lane of the walk, EMPTY or a tombstone. `None` hands the
+    /// insert to the general walk: no vacancy in those levels. The walk of
+    /// [`Self::place_through_head`], which tests hold that placement to.
+    #[cfg(test)]
     fn first_free_in_head(
         &self,
         probe: PreparedFastFunnelProbe,
@@ -1912,107 +1875,6 @@ where
             let vacancy = self.first_free_in_head_level(word, index);
             word = word.wrapping_mul(self.prf.level_step());
             vacancy
-        })
-    }
-
-    /// The duplicate search and [`Self::first_free_in_head`] in one walk,
-    /// for a key the filter recorded with level bin `levels`.
-    ///
-    /// The walk visits the key's bucket in each head level in placement
-    /// order, compares the key against the fingerprint matches of every
-    /// level its bin recorded, and stops at the first EMPTY lane. Reaching
-    /// that lane without a match means the key is absent: the placement that
-    /// trusts this walk runs only in a table without tombstones, where every bucket a placed
-    /// key passed over is still full, so the walk meets a present key's
-    /// level before any EMPTY lane. A key in a level the head does not hold,
-    /// or outside its funnel, passed over every head bucket, so the walk
-    /// leaves it unsettled.
-    #[inline]
-    fn search_head<Q>(
-        &self,
-        key: &Q,
-        probe: PreparedFastFunnelProbe,
-        levels: u16,
-    ) -> HeadSearch<SlotEntry<K, V>>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        if self.head_left == 0 {
-            return HeadSearch::Unsettled;
-        }
-        // One copy of the step per level, as in `place_through_head`.
-        macro_rules! walk {
-            ($($index:literal)*) => {
-                const { assert!([$($index),*].len() == OVERFLOW_LEVEL) };
-                $(
-                    if let Some(settled) = self.search_head_level(key, probe, $index, levels) {
-                        return settled;
-                    }
-                )*
-            };
-        }
-        walk!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14);
-        HeadSearch::Unsettled
-    }
-
-    /// One step of [`Self::search_head`], in head entry `index`. `None`
-    /// moves the walk on to the next level.
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
-    fn search_head_level<Q>(
-        &self,
-        key: &Q,
-        probe: PreparedFastFunnelProbe,
-        index: usize,
-        levels: u16,
-    ) -> Option<HeadSearch<SlotEntry<K, V>>>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        let level = &self.head[index];
-        let bucket = probe::ordinary_funnel_bucket(probe, level.multiplier, level.buckets);
-        // SAFETY: a draw is below the level's bucket count, or zero for an
-        // entry that is no level.
-        let group = unsafe { level.group(bucket).cast::<u8>() };
-        let level_bit = level_bit_of(index);
-        if levels & level_bit != 0 {
-            // SAFETY: as in `first_free_in_head_level`, the group is
-            // readable and is the whole bucket.
-            let mut matches = unsafe { simd::eq_mask_group(group, probe.fingerprint()) }.0;
-            while matches != 0 {
-                // SAFETY: the set is a group mask or a subset of
-                // `GROUP_LANES`, and not empty.
-                let lane = unsafe { lowest_lane(matches) };
-                // SAFETY: a lane carrying a fingerprint is an occupied slot
-                // of the bucket.
-                let stored = unsafe {
-                    &(*level.entry(bucket * GROUP_SIZE + lane))
-                        .assume_init_ref()
-                        .key
-                };
-                if key.equivalent(stored) {
-                    // SAFETY: the lane is inside the bucket's group.
-                    return Some(HeadSearch::Present(unsafe {
-                        NonNull::new_unchecked(level.ctrl.add(bucket * GROUP_SIZE + lane))
-                    }));
-                }
-                matches &= GROUP_LANES;
-                matches &= matches - 1;
-            }
-        }
-        // SAFETY: as above. Neither the padding lanes nor the group past the
-        // slots are EMPTY.
-        let empty = unsafe { simd::eq_mask_group(group, CTRL_EMPTY) }.0;
-        (empty != 0).then(|| {
-            let lane = (empty.trailing_zeros() / BITMASK_STRIDE) as usize;
-            // SAFETY: an EMPTY lane of the bucket is a slot of the level.
-            HeadSearch::Vacant(unsafe {
-                HeadVacancy {
-                    lane: level.ctrl.add(bucket * GROUP_SIZE + lane),
-                    entry: level.entry(bucket * GROUP_SIZE + lane),
-                    level_bit,
-                }
-            })
         })
     }
 
@@ -2029,10 +1891,9 @@ where
     ) -> Option<HeadVacancy<SlotEntry<K, V>>> {
         let level = &self.head[index];
         let bucket = probe::ordinary_bucket_of_word(word, level.buckets);
-        // A free lane is EMPTY or a tombstone, and EMPTY in a table without
-        // tombstones. Every head entry the walk visits is a
-        // level: `FunnelShape::try_from_slots` builds no shape with fewer
-        // levels than the walk.
+        // Every head entry the walk visits is a level:
+        // `FunnelShape::try_from_slots` builds no shape with fewer levels
+        // than the walk.
         debug_assert!(index < self.shape.levels.len());
         // SAFETY: an ordinary bucket is one group, which ends at or before
         // `slots`.
@@ -2183,6 +2044,17 @@ where
         )
     }
 
+    /// First slot of level bin `bin`: the level of that index, or the start
+    /// of the special arrays for the last bin and for any bin the table has
+    /// no level for.
+    #[inline]
+    fn level_bin_start(&self, bin: usize) -> usize {
+        self.shape
+            .levels
+            .get(bin)
+            .map_or(self.shape.primary_offset, |level| level.offset)
+    }
+
     /// Records a key under a filter location derived from this epoch, at the
     /// level-bin bit of the slot it is stored in, including entries
     /// exceptional recovery places outside their funnel.
@@ -2226,20 +2098,37 @@ where
         if hashes.try_reserve_exact(self.entries()).is_err() {
             return;
         }
+        // The scan yields slots in rising order, so the hashes of one level
+        // bin are contiguous and a count per bin recovers each hash's bin.
+        let mut bin_entries = [0_usize; OVERFLOW_LEVEL + 1];
+        let mut bin = 0;
+        let mut bin_end = self.level_bin_start(1);
+        let mut in_bin = 0;
         let mut scan = OccupiedIndices::new();
         while let Some(slot) = scan.step(&self.storage) {
+            while slot >= bin_end {
+                bin_entries[bin] = in_bin;
+                in_bin = 0;
+                bin += 1;
+                bin_end = if bin < OVERFLOW_LEVEL {
+                    self.level_bin_start(bin + 1)
+                } else {
+                    usize::MAX
+                };
+            }
+            in_bin += 1;
             // SAFETY: `step` yields occupied in-bounds slots.
             let entry = unsafe { self.storage.get_ref(slot) };
             hashes.push(self.hash_builder.hash_one(&entry.key));
         }
+        bin_entries[bin] = in_bin;
         self.clear_membership();
-        let mut scan = OccupiedIndices::new();
-        for hash in hashes {
-            let Some(slot) = scan.step(&self.storage) else {
-                break;
-            };
-            let membership = self.membership_slot(hash);
-            self.record_membership(membership, self.level_bit(slot));
+        let mut hashes = hashes.into_iter();
+        for (bin, entries) in bin_entries.into_iter().enumerate() {
+            let level_bit = level_bit_of(bin);
+            for hash in hashes.by_ref().take(entries) {
+                self.record_membership(self.membership_slot(hash), level_bit);
+            }
         }
     }
 
@@ -2250,7 +2139,7 @@ where
     #[inline(never)]
     fn settle_after_deletes(&mut self) {
         self.settle_counts();
-        if self.cleanup_due() {
+        if self.cleanup_is_due() {
             self.resize_with_transition(self.shape.n, EpochTransition::TombstoneCleanup);
         } else {
             self.refresh_stale_membership();
@@ -2275,12 +2164,45 @@ where
         }
     }
 
-    /// Whether the settled tombstone count is past its threshold. The delete
-    /// that crosses it settles, so no uncounted delete hides a due cleanup.
-    fn cleanup_due(&self) -> bool {
+    /// Whether the settled tombstone bound is past the cleanup threshold,
+    /// so that a cleanup may be due. The delete that crosses it settles, so
+    /// no uncounted delete hides one.
+    fn cleanup_may_be_due(&self) -> bool {
         // No threshold is below half the capacity, which takes less to form.
         self.tombstones > self.shape.n / 2
             && self.tombstones > capacity::tombstone_cleanup_threshold(self.shape.n)
+    }
+
+    /// Whether a cleanup is due: the tombstone bound is past the threshold
+    /// and a count of the tombstones confirms it.
+    fn cleanup_is_due(&mut self) -> bool {
+        self.cleanup_may_be_due() && self.count_confirms_cleanup()
+    }
+
+    /// Counts the tombstones and reports whether a cleanup is due by the
+    /// count. A count that leaves the cleanup off becomes the bound.
+    ///
+    /// A count reads every control byte, so the cleanup comes a group's
+    /// share of the slots early: the deletes that then lie between two
+    /// counts pay for a count at one group read each.
+    #[cold]
+    #[inline(never)]
+    fn count_confirms_cleanup(&mut self) -> bool {
+        self.settle_counts();
+        // SAFETY: the storage holds `shape.slots` control bytes.
+        let controls =
+            unsafe { core::slice::from_raw_parts(self.storage.ctrl_ptr(), self.shape.slots) };
+        self.tombstones = controls
+            .iter()
+            .map(|&control| usize::from(control == CTRL_TOMBSTONE))
+            .sum();
+        let early = self.shape.slots / GROUP_SIZE;
+        let due = self.tombstones + early > capacity::tombstone_cleanup_threshold(self.shape.n);
+        if !due {
+            // The deletes left before the next settle follow the count.
+            self.settle_counts();
+        }
+        due
     }
 
     fn copy_membership_from(&mut self, source: &Self) {
@@ -2335,12 +2257,6 @@ where
         lane.as_ptr().addr() - self.storage.ctrl_ptr().addr()
     }
 
-    /// The slot of a vacancy of this table's head walk.
-    #[inline]
-    fn slot_of_vacancy(&self, vacancy: &HeadVacancy<SlotEntry<K, V>>) -> usize {
-        vacancy.lane.addr() - self.storage.ctrl_ptr().addr()
-    }
-
     /// The lookup behind a passed gate. Only the ordered walk, which decides
     /// what the first-match scan cannot, is a call.
     ///
@@ -2383,28 +2299,6 @@ where
     /// value.
     #[inline(never)]
     unsafe fn finish_removal<Q>(
-        &mut self,
-        key: &Q,
-        key_hash: u64,
-        unlinked: Option<NonNull<SlotEntry<K, V>>>,
-    ) -> Option<NonNull<SlotEntry<K, V>>>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        if unlinked.is_some() && self.settle_first_delete() {
-            return unlinked;
-        }
-        // SAFETY: the caller's contract, passed on.
-        unsafe { self.finish_removal_by_call(key, key_hash, unlinked) }
-    }
-
-    /// [`Self::finish_removal`] past the delete it settles without a call.
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::finish_removal`].
-    #[inline(never)]
-    unsafe fn finish_removal_by_call<Q>(
         &mut self,
         key: &Q,
         key_hash: u64,
@@ -2493,30 +2387,17 @@ where
         }
     }
 
-    /// Where an absent key goes in a table without tombstones and below its
-    /// insertion limit: the first EMPTY lane of the placement walk over the
-    /// levels that own a level-bin bit. `None` leaves the placement to the
-    /// general insert.
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
-    fn head_vacancy(&self, probe: PreparedFastFunnelProbe) -> Option<HeadVacancy<SlotEntry<K, V>>> {
-        debug_assert_eq!(
-            self.head_left,
-            self.head_limit().saturating_sub(self.entries())
-        );
-        if self.head_left == 0 {
-            return None;
-        }
-        self.first_free_in_head(probe)
+    /// Entry count below which the head placement may run.
+    #[inline]
+    fn head_limit(&self) -> usize {
+        self.shape.head_insertions()
     }
 
-    /// Entry count below which the head placement may run.
-    fn head_limit(&self) -> usize {
-        if self.tombstones == 0 {
-            self.shape.head_insertions()
-        } else {
-            0
-        }
+    /// The head has no more placements left than the limit less the
+    /// entries, and none on the far side of the limit.
+    #[inline]
+    fn debug_assert_head_left(&self) {
+        debug_assert!(self.head_left <= self.head_limit().saturating_sub(self.entries()));
     }
 
     #[inline]
@@ -2565,42 +2446,15 @@ where
         }
         self.head_left = self.head_limit().saturating_sub(entries);
         self.entries_base = entries + self.head_left;
-        let left = if self.tombstones == 0 {
-            0
-        } else {
-            // A due cleanup has no later delete to settle at.
-            let cleanup = capacity::tombstone_cleanup_threshold(self.shape.n)
-                .checked_sub(self.tombstones)
-                .unwrap_or(usize::MAX);
-            let refresh = membership::refresh_deletes(self.shape.max_insertions)
-                .saturating_sub(self.stale_membership);
-            cleanup.min(refresh)
-        };
+        // A bound past its threshold has no later delete to settle at.
+        let cleanup = capacity::tombstone_cleanup_threshold(self.shape.n)
+            .checked_sub(self.tombstones)
+            .unwrap_or(usize::MAX);
+        let refresh = membership::refresh_deletes(self.shape.max_insertions)
+            .saturating_sub(self.stale_membership);
+        let left = cleanup.min(refresh);
         self.settle_left = left + 1;
         self.settle_armed = left + 1;
-    }
-
-    /// Counts the delete that gives a table its first tombstone, which
-    /// closes the head, and leaves the next delete to settle in full: that
-    /// one finds the thresholds, which a tombstone taken back before it
-    /// never needs. `false`, with nothing counted, in a table that has
-    /// tombstones or whose filter this delete makes due a refresh.
-    #[inline]
-    fn settle_first_delete(&mut self) -> bool {
-        if self.tombstones != 0
-            || self.stale_membership >= membership::refresh_deletes(self.shape.max_insertions)
-        {
-            return false;
-        }
-        debug_assert_eq!(self.uncounted_deletes(), 1);
-        self.tombstones = 1;
-        self.stale_membership += 1;
-        self.epoch.note_deletes(1);
-        self.entries_base -= self.head_left + 1;
-        self.head_left = 0;
-        self.settle_left = 1;
-        self.settle_armed = 1;
-        true
     }
 
     /// [`Self::set_entries`] at the count the table has.
@@ -2608,10 +2462,11 @@ where
         self.set_entries(self.entries());
     }
 
-    /// [`Self::head_vacancy`] and [`Self::place_in_head`] in one walk: moves
-    /// an absent key and its value to the first EMPTY lane and records the
-    /// key in the filter. `false` when the head has no placement left or no
-    /// vacancy for the key, which then stays where it is. Calls nothing.
+    /// The head placement: moves an absent key and its value to the first
+    /// free lane of [`Self::first_free_in_head`]'s walk and records the
+    /// key in the filter, returning the lane it took. `None` when the head
+    /// has no placement left or no vacancy for the key, which then stays
+    /// where it is. Calls nothing.
     ///
     /// The placement is written out once per level, after that level's
     /// scan: each copy then records its own level bit as a constant. The
@@ -2622,7 +2477,7 @@ where
     ///
     /// `unit` must be the filter unit of `membership`, itself from
     /// [`Self::membership_slot`], with no write to the table since either
-    /// was read. After `true` the caller must forget `key` and `value`:
+    /// was read. After `Some` the caller must forget `key` and `value`:
     /// the table owns them.
     #[allow(clippy::inline_always)]
     #[inline(always)]
@@ -2633,14 +2488,11 @@ where
         membership: MembershipSlot,
         unit: u64,
         probe: PreparedFastFunnelProbe,
-    ) -> bool {
-        debug_assert_eq!(
-            self.head_left,
-            self.head_limit().saturating_sub(self.entries())
-        );
+    ) -> Option<NonNull<u8>> {
+        self.debug_assert_head_left();
         let head_left = self.head_left;
         if head_left == 0 {
-            return false;
+            return None;
         }
         // SAFETY: head placements are left only in a table with slots, so
         // its filter has units and `membership.index` is below their count.
@@ -2658,7 +2510,7 @@ where
                     }
                     if let Some(vacancy) = self.first_free_in_head_level(word, $index) {
                         let entry = vacancy.entry.cast::<SlotEntry<K, V>>();
-                        // SAFETY: the vacancy is an EMPTY lane read just
+                        // SAFETY: the vacancy is a free lane read just
                         // above, so its entry is writable and holds
                         // nothing; the caller gives up the pair. The
                         // caller vouches for the rest.
@@ -2669,43 +2521,14 @@ where
                                 head_left, recorded, membership, unit, probe, &vacancy,
                             );
                         }
-                        return true;
+                        // SAFETY: a lane of the storage is not null.
+                        return Some(unsafe { NonNull::new_unchecked(vacancy.lane) });
                     }
                 )*
             };
         }
         walk!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14);
-        false
-    }
-
-    /// Stores an absent key at `vacancy` and records it in the filter.
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::record_in_head`].
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
-    unsafe fn place_in_head(
-        &mut self,
-        key: K,
-        value: V,
-        membership: MembershipSlot,
-        unit: u64,
-        probe: PreparedFastFunnelProbe,
-        vacancy: &HeadVacancy<SlotEntry<K, V>>,
-    ) {
-        let head_left = self.head_left;
-        // SAFETY: a vacancy exists only in a table with slots, so its
-        // filter has units and `membership.index` is below their count.
-        let recorded = unsafe { self.membership_ptr().add(membership.index) };
-        // SAFETY: the vacancy is an EMPTY lane of an ordinary bucket, and
-        // the caller vouches for the rest.
-        unsafe {
-            vacancy
-                .entry
-                .write(MaybeUninit::new(SlotEntry { value, key }));
-            self.record_in_head(head_left, recorded, membership, unit, probe, vacancy);
-        }
+        None
     }
 
     /// Makes the entry just written at `vacancy` a live one: records its key
@@ -2715,9 +2538,9 @@ where
     ///
     /// `unit` must be the filter unit of `membership`, itself from
     /// [`Self::membership_slot`], `recorded` that unit's address, `head_left`
-    /// the table's, and `vacancy` from [`Self::first_free_in_head_level`]
-    /// or [`Self::search_head`], with no write to the table since any of
-    /// them was read but the entry's own.
+    /// the table's, and `vacancy` from [`Self::first_free_in_head_level`],
+    /// with no write to the table since any of them was read but the
+    /// entry's own.
     ///
     /// Every table word the placement needs comes as an argument, read
     /// before the entry's store, which could otherwise force each to be
@@ -2741,7 +2564,7 @@ where
             // SAFETY: a vacancy is a slot of the storage.
             assert_eq!(vacancy.entry.cast(), unsafe { self.storage.slot_ptr(slot) });
             // SAFETY: a vacancy's control is readable.
-            assert_eq!(unsafe { *vacancy.lane }, CTRL_EMPTY);
+            assert!(control::is_free(unsafe { *vacancy.lane }));
         }
         debug_assert_eq!(head_left, self.head_left);
         // SAFETY: `recorded` is this key's filter unit, and `&mut self`
@@ -2754,157 +2577,108 @@ where
         unsafe { *vacancy.lane = probe.fingerprint() };
     }
 
-    /// The whole insert: duplicate search behind the filter gate, growth, then
-    /// placement with its recovery paths. Out of line so the common insert in
-    /// [`map::TableBackend::insert`] makes no call.
+    /// Every insert but the one [`map::TableBackend::insert`] finishes
+    /// itself: the duplicate search for a key the filter recorded, then the
+    /// placement of an absent one. `unit` is the key's filter unit, read at
+    /// `index`. Out of line so the common insert makes no call.
     ///
-    /// The search runs here and calls nothing. A key it does not find is
-    /// another function's, so the search keeps nothing across a call.
+    /// The search is a lookup's. Whatever it does not settle is the last
+    /// thing this function does and another function's work, so an insert
+    /// that replaces a value keeps nothing across a call.
     #[inline(never)]
-    fn insert_general(&mut self, key: K, value: V, hash: u64) -> Option<V> {
-        // Same gate and, behind it, the same search as a lookup: a key the
-        // filter never recorded is absent, and one it did is found by the
-        // levels its bin recorded. A recorded key that is absent gets the
-        // head placement the caller already tried for an unrecorded one.
-        let membership = self.membership_slot(hash);
-        let gate = self.membership_gate_at(membership);
-        let probe = self.prf.prepare(hash);
-        if gate.passes() {
-            let found = match self.search_head(&key, probe, gate.levels()) {
-                HeadSearch::Present(lane) => Some(lane),
-                HeadSearch::Vacant(vacancy) => {
-                    // SAFETY: slot, gate and vacancy were read just above,
-                    // with no write since.
-                    unsafe {
-                        self.place_in_head(key, value, membership, gate.unit, probe, &vacancy);
-                    }
-                    return None;
-                }
-                HeadSearch::Unsettled => match self.first_match(&key, probe, gate.wide_levels()) {
-                    Ok(found) => Some(found.lane),
-                    Err(last) if self.unmatched_is_absent(last) => None,
-                    Err(_) => return self.insert_by_walk(key, value, hash),
-                },
-            };
-            if let Some(lane) = found {
-                let slot = self.slot_of(lane);
-                return Some(map::TableBackend::replace_value(self, slot, value));
-            }
-        }
-        self.insert_unfound(key, value, hash, membership, probe)
-    }
-
-    /// [`Self::insert_general`] for a key the first-match scan could not
-    /// settle: the ordered walk finds it, or it goes where an absent key
-    /// goes.
-    #[cold]
-    #[inline(never)]
-    fn insert_by_walk(&mut self, key: K, value: V, hash: u64) -> Option<V> {
-        if let Some(lane) = self.find_by_walk::<K, FoundLane>(&key, hash) {
-            let slot = self.slot_of(lane);
-            return Some(map::TableBackend::replace_value(self, slot, value));
-        }
-        let membership = self.membership_slot(hash);
-        self.insert_unfound(key, value, hash, membership, self.prf.prepare(hash))
-    }
-
-    /// Places a key the search did not find: at the first free lane of the
-    /// head walk where [`Self::places_among_tombstones`] allows, which is
-    /// where the placement walk puts it, and by that walk otherwise.
-    /// Returns `None`, the result of the insert it ends.
-    #[inline(never)]
-    fn insert_unfound(
+    fn insert_general(
         &mut self,
         key: K,
         value: V,
         hash: u64,
-        membership: MembershipSlot,
-        probe: PreparedFastFunnelProbe,
+        index: usize,
+        unit: u64,
     ) -> Option<V> {
-        if self.places_among_tombstones()
-            && let Some(vacancy) = self.first_free_in_head(probe)
-        {
-            // SAFETY: the vacancy was read just above, with no write
-            // since, and the slot is this key's.
-            unsafe { self.place_among_tombstones(key, value, membership, probe, &vacancy) };
-            return None;
+        let probe = self.prf.prepare(hash);
+        if unit_records(unit, membership_bit(hash)) {
+            match self.first_match(&key, probe, unit_wide_levels(unit)) {
+                Ok(found) => {
+                    let mut entry = found.entry;
+                    // SAFETY: a `Found` names an initialized entry of this
+                    // table, which `&mut self` makes this call's alone.
+                    let stored = unsafe { &mut entry.as_mut().value };
+                    return Some(mem::replace(stored, value));
+                }
+                Err(last) if self.unmatched_is_absent(last) => {}
+                Err(_) => return self.insert_past_head(key, value, hash, false),
+            }
+        } else if self.head_left != 0 {
+            // The caller's head walk ran and found no free lane.
+            return self.insert_past_head(key, value, hash, true);
         }
-        self.insert_absent(key, value, hash, membership);
-        None
+        self.insert_absent(key, value, hash, index, unit, probe)
     }
 
-    /// Places a key the table does not hold by the placement walk, after
-    /// the growth or cleanup the table is due. Apart from
-    /// [`Self::insert_unfound`], whose own placement then keeps nothing
-    /// across a call.
+    /// The rest of [`Self::insert_general`] for an absent key: through the
+    /// head, which the deletes since the counts were last settled may have
+    /// made room in, or else past it. `probe` is the key's.
+    ///
+    /// The head placement calls nothing, and the one call here is the last
+    /// thing a key the head does not take needs.
     #[inline(never)]
-    fn insert_absent(&mut self, key: K, value: V, hash: u64, mut membership: MembershipSlot) {
-        if self.prepare_vacant_insert() {
-            // Growth rebuilt the arena and its filter; the filter slot from
-            // before it is stale.
-            membership = self.membership_slot(hash);
-        }
-        let vacancy = self.search_vacancy(self.prf.prepare(hash));
-        self.place_absent_after_search(key, value, hash, membership, vacancy);
-    }
-
-    /// Whether an absent key may go to the first free lane of the head walk
-    /// in a table with tombstones: the table has a head, room below its
-    /// insertion limit, and no cleanup due, so
-    /// [`Self::prepare_vacant_insert`] would leave it as it is.
-    #[inline]
-    fn places_among_tombstones(&self) -> bool {
-        self.tombstones != 0
-            && self.head_lanes != 0
-            && self.entries() < self.shape.max_insertions
-            && !self.cleanup_due()
-    }
-
-    /// Stores an absent key at `vacancy` in a table with tombstones, records
-    /// it in the filter and counts it, with the tombstone it may take.
-    ///
-    /// Forced inline: with two callers LLVM outlines it, and the call costs
-    /// more than the counting it holds.
-    ///
-    /// # Safety
-    ///
-    /// [`Self::places_among_tombstones`] must hold, `vacancy` must be from
-    /// [`Self::first_free_in_head`] with no write to the table since either,
-    /// and `membership` from [`Self::membership_slot`] for the key.
-    #[allow(clippy::inline_always)]
-    #[inline(always)]
-    unsafe fn place_among_tombstones(
+    fn insert_absent(
         &mut self,
         key: K,
         value: V,
-        membership: MembershipSlot,
+        hash: u64,
+        index: usize,
+        unit: u64,
         probe: PreparedFastFunnelProbe,
-        vacancy: &HeadVacancy<SlotEntry<K, V>>,
-    ) {
-        // SAFETY: the vacancy is a free lane of an ordinary bucket, so its
-        // control is readable and writable and its entry holds nothing.
-        let reused = unsafe {
-            let reused = *vacancy.lane == CTRL_TOMBSTONE;
-            vacancy
-                .entry
-                .write(MaybeUninit::new(SlotEntry { value, key }));
-            *vacancy.lane = probe.fingerprint();
-            reused
+    ) -> Option<V> {
+        let membership = MembershipSlot {
+            index,
+            bits: membership_bit(hash),
         };
-        self.record_membership(membership, vacancy.level_bit);
-        if reused {
-            self.tombstones -= 1;
-            if self.tombstones == 0 {
-                // The last settled tombstone is gone, so the head may open.
-                self.set_entries(self.entries() + 1);
-                return;
-            }
+        if self.head_left == 0 {
+            self.reopen_head();
         }
-        // The head stays closed, so the base alone counts the entry. A
-        // tombstone fewer only moves the cleanup further off, which leaves
-        // the delete countdown early at worst.
+        // SAFETY: the caller read `unit` at `index`, with no write since.
+        if unsafe { self.place_through_head(&key, &value, membership, unit, probe) }.is_some() {
+            // The table took both.
+            mem::forget(key);
+            mem::forget(value);
+            return None;
+        }
+        self.insert_past_head(key, value, hash, true)
+    }
+
+    /// The rest of [`Self::insert_general`] for a key the head did not
+    /// take: the ordered walk finds a key the first-match scan could not
+    /// settle, and the placement walk places an `absent` one after the
+    /// growth or cleanup the table is due.
+    ///
+    /// One function for both, and the last thing its caller does, so that
+    /// caller keeps nothing across a call.
+    #[inline(never)]
+    fn insert_past_head(&mut self, key: K, value: V, hash: u64, absent: bool) -> Option<V> {
+        if !absent && let Some(lane) = self.find_by_walk::<K, FoundLane>(&key, hash) {
+            let slot = self.slot_of(lane);
+            return Some(map::TableBackend::replace_value(self, slot, value));
+        }
+        self.insert_for_vacant_by_walk(key, value, hash, FunnelVacant::UNSEARCHED);
+        None
+    }
+
+    /// Gives a head without placements left those the deletes since the
+    /// counts were last settled made room for.
+    #[inline]
+    fn reopen_head(&mut self) {
         debug_assert_eq!(self.head_left, 0);
-        self.entries_base += 1;
+        // A shape without a head has no lanes, and no placements either.
+        if self.head_lanes == 0 {
+            return;
+        }
+        // The entries are the base less the uncounted deletes.
+        let room = (self.shape.max_insertions + self.uncounted_deletes())
+            .saturating_sub(self.entries_base);
+        debug_assert_eq!(room, self.head_limit() - self.entries());
+        self.entries_base += room;
+        self.head_left = room;
     }
 
     #[allow(clippy::inline_always)]
@@ -2930,6 +2704,9 @@ where
         })
     }
 
+    /// Out of line: the rebuild loops place nearly every entry through the
+    /// head and keep nothing live for this.
+    #[inline(never)]
     fn place_new_entry(
         &mut self,
         vacancy: Vacancy,
@@ -2940,19 +2717,21 @@ where
         exceptional: bool,
     ) {
         let Vacancy { slot, level_bit } = vacancy;
-        // SAFETY: callers pass a free slot from a probe within the storage.
-        let was_tombstone = unsafe { self.storage.control_at(slot) } == CTRL_TOMBSTONE;
-        // SAFETY: as above, and `key_fingerprint` is an occupied control.
+        // SAFETY: callers pass a free slot from a probe within the storage,
+        // and `key_fingerprint` is an occupied control.
         unsafe {
             self.storage
                 .write_with_control(slot, SlotEntry { value, key }, key_fingerprint);
         }
         debug_assert_eq!(level_bit, self.level_bit(slot), "level bit of slot {slot}");
         self.record_membership(membership, level_bit);
-        if was_tombstone {
-            self.tombstones -= 1;
+        // One more entry: out of the head's placements while it has any,
+        // which keeps them within the limit less the entries.
+        if self.head_left == 0 {
+            self.entries_base += 1;
+        } else {
+            self.head_left -= 1;
         }
-        self.set_entries(self.entries() + 1);
         if exceptional {
             self.exceptional_placement = true;
         }
@@ -2976,7 +2755,7 @@ where
         if self.entries() >= self.shape.max_insertions {
             self.grow_for_next_insert();
             true
-        } else if self.cleanup_due() {
+        } else if self.cleanup_is_due() {
             self.clean_tombstones_for_next_insert();
             true
         } else {
@@ -3108,12 +2887,30 @@ where
         self.place_absent_after_search(key, value, hash, membership, vacancy)
     }
 
+    /// The first-match scan of [`map::TableBackend::find_for_entry`] for a
+    /// key the filter recorded: the slot of a present key,
+    /// [`FunnelVacant::UNSEARCHED`] for one the scan settles as absent, and
+    /// [`FunnelVacant::UNSETTLED`] otherwise. One word and no call, so a
+    /// present key is found without a frame or a store.
+    #[inline(never)]
+    fn find_recorded_for_entry<Q>(&self, key: &Q, hash: u64, levels: WideLevelBin) -> usize
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let probe = self.prf.prepare(hash);
+        match self.first_match(key, probe, levels) {
+            Ok(found) => self.slot_of(found.lane),
+            Err(last) if self.unmatched_is_absent(last) => FunnelVacant::UNSEARCHED,
+            Err(_) => FunnelVacant::UNSETTLED,
+        }
+    }
+
     /// [`map::TableBackend::find_for_entry`] by the exact walk, which
     /// settles the keys the first-match scan cannot and keeps the walk's
     /// vacancy for the insert that may follow.
     #[cold]
     #[inline(never)]
-    fn find_for_entry_by_walk<Q>(&self, key: &Q, hash: u64) -> Result<usize, FunnelVacant>
+    fn find_for_entry_by_walk<Q>(&self, key: &Q, hash: u64) -> Result<usize, usize>
     where
         Q: Equivalent<K> + ?Sized,
     {
@@ -3128,11 +2925,10 @@ where
         {
             return Ok(slot);
         }
-        let exact = match miss {
+        Err(match miss {
             SearchResult::Vacant(slot) => slot,
             _ => FunnelVacant::EXHAUSTED,
-        };
-        Err(FunnelVacant { hash, exact })
+        })
     }
 
     fn resize_with_transition(&mut self, slots: usize, transition: EpochTransition) {
@@ -3260,17 +3056,16 @@ where
     fn place_unique(&mut self, entry: SlotEntry<K, V>, key_hash: u64) -> bool {
         let probe = self.prf.prepare(key_hash);
         let membership = self.membership_slot(key_hash);
-        // A table being rebuilt has no tombstones, so until its head
-        // placements run out an entry goes where the common insert puts an
-        // absent key.
-        if let Some(vacancy) = self.head_vacancy(probe) {
-            // SAFETY: a vacancy exists only in a table with slots, so its
-            // filter has words and `membership.index` is below their count.
-            // Unit and vacancy are read here, with no write between.
-            unsafe {
-                let unit = *self.membership_ptr().add(membership.index);
-                self.place_in_head(entry.key, entry.value, membership, unit, probe, &vacancy);
-            }
+        // Until the head placements run out an entry goes where the common
+        // insert puts an absent key.
+        // SAFETY: the unit is read at the key's slot, with no write since.
+        let placed = unsafe {
+            let unit = *self.membership_ptr().add(membership.index);
+            self.place_through_head(&entry.key, &entry.value, membership, unit, probe)
+        };
+        if placed.is_some() {
+            // The table took both.
+            mem::forget(entry);
             return false;
         }
         let key_fingerprint = probe.fingerprint();
@@ -3378,27 +3173,38 @@ where
         self.find_entry_ref(key, hash)
     }
 
-    // The lookup's gate and first-match scan settle a present key and
-    // nearly every absent one, which then stays unsearched: its insert
-    // finds the vacancy. Only a key they leave open takes the exact walk.
-    #[inline]
+    // The gate settles nearly every absent key, which then stays
+    // unsearched: its insert finds the vacancy. Only a key the first-match
+    // scan leaves open takes the exact walk.
+    //
+    // Forced inline with the gate alone: an absent key's search then makes
+    // no call and leaves its answer in registers.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn find_for_entry<Q>(&self, key: &Q, hash: u64) -> Result<usize, FunnelVacant>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let gate = self.membership_gate(hash);
-        if gate.passes() {
-            let probe = self.prf.prepare(hash);
-            match self.first_match(key, probe, gate.wide_levels()) {
-                Ok(found) => return Ok(self.slot_of(found.lane)),
-                Err(last) if self.unmatched_is_absent(last) => {}
-                Err(_) => return self.find_for_entry_by_walk(key, hash),
+        let exact = if gate.passes() {
+            let found = self.find_recorded_for_entry(key, hash, gate.wide_levels());
+            // One test passes every slot: the reserved values are the
+            // largest.
+            if found < FunnelVacant::UNSETTLED {
+                return Ok(found);
             }
-        }
-        Err(FunnelVacant {
-            hash,
-            exact: FunnelVacant::UNSEARCHED,
-        })
+            if found == FunnelVacant::UNSETTLED {
+                match self.find_for_entry_by_walk(key, hash) {
+                    Ok(slot) => return Ok(slot),
+                    Err(exact) => exact,
+                }
+            } else {
+                FunnelVacant::UNSEARCHED
+            }
+        } else {
+            FunnelVacant::UNSEARCHED
+        };
+        Err(FunnelVacant { hash, exact })
     }
 
     #[inline]
@@ -3406,29 +3212,23 @@ where
         if vacant.exact == FunnelVacant::UNSEARCHED {
             // An unsearched key goes where the insert puts an absent one:
             // the first free lane of the head walk, which is the placement
-            // walk's slot, where the table's counts allow it.
+            // walk's slot, while the head has placements left.
             let probe = self.prf.prepare(vacant.hash);
             let membership = self.membership_slot(vacant.hash);
-            if let Some(vacancy) = self.head_vacancy(probe) {
-                let slot = self.slot_of_vacancy(&vacancy);
-                // SAFETY: a vacancy exists only in a table with slots, so
-                // its filter has words and `membership.index` is below
-                // their count. Unit and vacancy are read here, with no
-                // write between.
-                unsafe {
-                    let unit = *self.membership_ptr().add(membership.index);
-                    self.place_in_head(key, value, membership, unit, probe, &vacancy);
-                }
-                return slot;
+            if self.head_left == 0 {
+                self.reopen_head();
             }
-            if self.places_among_tombstones()
-                && let Some(vacancy) = self.first_free_in_head(probe)
-            {
-                let slot = self.slot_of_vacancy(&vacancy);
-                // SAFETY: the vacancy was read just above, with no write
-                // since, and the slot is this key's.
-                unsafe { self.place_among_tombstones(key, value, membership, probe, &vacancy) };
-                return slot;
+            // SAFETY: the unit is read at the key's slot, with no write
+            // since.
+            let placed = unsafe {
+                let unit = *self.membership_ptr().add(membership.index);
+                self.place_through_head(&key, &value, membership, unit, probe)
+            };
+            if let Some(lane) = placed {
+                // The table took both.
+                mem::forget(key);
+                mem::forget(value);
+                return self.slot_of(lane);
             }
         }
         self.insert_for_vacant_by_walk(key, value, vacant.hash, vacant.exact)
@@ -3452,14 +3252,14 @@ where
             let probe = self.prf.prepare(hash);
             // SAFETY: slot and unit were read just above, with no write
             // since.
-            if unsafe { self.place_through_head(&key, &value, membership, unit, probe) } {
+            if unsafe { self.place_through_head(&key, &value, membership, unit, probe) }.is_some() {
                 // The table took both.
                 mem::forget(key);
                 mem::forget(value);
                 return None;
             }
         }
-        self.insert_general(key, value, hash)
+        self.insert_general(key, value, hash, membership.index, unit)
     }
 
     // Forced inline with the shell's removal, as the lookups are.
