@@ -406,7 +406,7 @@ fn refresh_membership_rebuilds_the_recorded_filter() {
 }
 
 /// Every unit of `table`'s filter tail, level bin and membership alike.
-fn filter_tail<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> Vec<u64> {
+fn filter_tail<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> Vec<FilterUnit> {
     let units = table.membership.region.words;
     // SAFETY: the tail holds `units` initialized units from its base on; a
     // table without any reads none.
@@ -414,7 +414,9 @@ fn filter_tail<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> Vec<u64> 
 }
 
 /// Every control byte and filter word of `table`.
-fn controls_and_filter<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>) -> (Vec<u8>, Vec<u64>) {
+fn controls_and_filter<V>(
+    table: &FunnelTable<u64, V, IdentityBuildHasher>,
+) -> (Vec<u8>, Vec<FilterUnit>) {
     // SAFETY: `slot < slots`, the storage capacity.
     let controls = (0..table.shape.slots)
         .map(|slot| unsafe { table.storage.control_at(slot) })
@@ -1553,8 +1555,14 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
 fn a_wide_bin_leads_with_the_index_of_its_shallowest_level() {
     let lead = |levels: u16| {
         let wide = unit_wide_levels(unit_of(0, levels)).get();
-        assert_eq!(unit_wide_levels(unit_of(u32::MAX, levels)).get(), wide);
-        assert_eq!(unit_levels(unit_of(u32::MAX, levels)), levels);
+        assert_eq!(
+            unit_wide_levels(unit_of((1 << MEMBERSHIP_BITS) - 1, levels)).get(),
+            wide
+        );
+        assert_eq!(
+            unit_levels(unit_of((1 << MEMBERSHIP_BITS) - 1, levels)),
+            levels
+        );
         wide.leading_zeros() as usize
     };
     for level in 0..OVERFLOW_LEVEL {
@@ -3582,7 +3590,7 @@ fn first_match_walks_any_half_word_to_the_entry_of_its_lowest_bit() {
                     0 => HEAD_ENTRIES - 1,
                     _ => (u32::BITS - 1 - half.trailing_zeros()) as usize,
                 };
-                match table.first_match(&key, probe, WideLevelBin::of_unit_half(half)) {
+                match table.first_match(&key, probe, WideLevelBin::of_unit_bin(half)) {
                     Ok(found) => {
                         let slot = table.slot_of(found.lane);
                         assert_eq!(Some(slot), walk, "key {key} half {half:#x}");
