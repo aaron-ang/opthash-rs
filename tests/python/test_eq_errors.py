@@ -128,14 +128,25 @@ def test_copies_of_distinct_keys_do_not_compare(map_cls, set_cls, keys):
 )
 def test_map_op_on_key_behind_raising_key_changes_nothing(map_cls, keys, op):
     first, second = keys
-    m = map_cls({first: 1, second: 2})
-    it = iter(m)
-    arm()
-    with pytest.raises(ValueError, match="eq"):
-        op(m, second)
-    Key.armed = False
-    assert dict(m.items()) == {first: 1, second: 2}
-    assert next(it) in (first, second)
+    # Which of two colliding keys a lookup compares first is the backend's
+    # choice, so the key behind the other is the one whose lookup raises.
+    raised = 0
+    for behind in (second, first):
+        m = map_cls({first: 1, second: 2})
+        it = iter(m)
+        arm()
+        try:
+            op(m, behind)
+        except ValueError as error:
+            assert "eq" in str(error)
+        else:
+            continue
+        finally:
+            Key.armed = False
+        raised += 1
+        assert dict(m.items()) == {first: 1, second: 2}
+        assert next(it) in (first, second)
+    assert raised == 1
 
 
 @pytest.mark.parametrize(
@@ -150,11 +161,21 @@ def test_map_op_on_key_behind_raising_key_changes_nothing(map_cls, keys, op):
 )
 def test_set_op_on_element_behind_raising_element_changes_nothing(set_cls, keys, op):
     first, second = keys
-    s = set_cls([first, second])
-    it = iter(s)
-    arm()
-    with pytest.raises(ValueError, match="eq"):
-        op(s, second, set_cls)
-    Key.armed = False
-    assert set(s) == {first, second}
-    assert next(it) in (first, second)
+    # As for the map: the element behind the other is the one that raises.
+    raised = 0
+    for behind in (second, first):
+        s = set_cls([first, second])
+        it = iter(s)
+        arm()
+        try:
+            op(s, behind, set_cls)
+        except ValueError as error:
+            assert "eq" in str(error)
+        else:
+            continue
+        finally:
+            Key.armed = False
+        raised += 1
+        assert set(s) == {first, second}
+        assert next(it) in (first, second)
+    assert raised == 1
