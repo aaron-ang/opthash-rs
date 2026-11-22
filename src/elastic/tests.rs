@@ -3822,6 +3822,51 @@ fn settled_plan_stays_readable_past_a_leaked_drain() {
 }
 
 #[test]
+fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
+    let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
+        try_with_slots_and_reserve_fraction_and_hasher_in(
+            1 << 8,
+            ReserveFraction::DEFAULT,
+            IdentityBuildHasher,
+            Global,
+        )
+        .unwrap();
+    let level_count = table.levels.len();
+    let (whole, fitted) = table.probe_schedule.whole_groups();
+    assert_eq!(whole, 0);
+    assert_ne!(fitted, 0);
+    assert!(level_count > schedule::GROUPED_LEVELS + 1);
+    let unwritten = ProbeSchedule::group_appends();
+    // A rebuild that first brings a grouped level in writes the groups'
+    // runs from their start.
+    for through in 0..schedule::GROUPED_LEVELS {
+        table.schedule_levels_through(through);
+        table.extend_probe_schedule(40 * (through as u128 + 1));
+        assert!(table.probe_schedule.addresses(&table.levels));
+        if through + 1 < schedule::GROUPED_LEVELS {
+            assert_eq!(ProbeSchedule::group_appends(), unwritten);
+        }
+    }
+    assert_eq!(table.probe_schedule.whole_groups().0, fitted);
+    assert_ne!(ProbeSchedule::group_appends(), unwritten);
+    for through in schedule::GROUPED_LEVELS..level_count {
+        let held = ProbeSchedule::group_appends();
+        // One that brings a deeper level in pushes the same routes of the
+        // grouped levels, which the runs hold.
+        table.schedule_levels_through(through);
+        assert_eq!(ProbeSchedule::group_appends(), held);
+        assert!(table.probe_schedule.addresses(&table.levels));
+        // Only the routes past them are written.
+        table.extend_probe_schedule(40 * (through as u128 + 1));
+        assert!(table.probe_schedule.addresses(&table.levels));
+    }
+    assert_eq!(table.probe_schedule.whole_groups().0, fitted);
+    let held = ProbeSchedule::group_appends();
+    table.extend_probe_schedule(QUERY_POSITION_CAP);
+    assert!(ProbeSchedule::group_appends() > held);
+}
+
+#[test]
 fn rebuild_leaves_a_group_run_that_stopped_being_whole_as_it_is() {
     let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
         try_with_slots_and_reserve_fraction_and_hasher_in(
@@ -5059,7 +5104,8 @@ fn a_general_insert_on_the_open_plan_keeps_the_gate_end_past_removals() {
 /// the cached batch still covers the live count and no cleanup follows.
 #[test]
 fn reusing_a_tombstone_under_the_threshold_keeps_the_batch() {
-    let mut map = FixedElasticHashMap::<u64, u64>::with_capacity(1_024);
+    const SLOTS: usize = if cfg!(miri) { 256 } else { 1_024 };
+    let mut map = FixedElasticHashMap::<u64, u64>::with_capacity(SLOTS);
     let live = {
         let scheduler = &map.table().scheduler;
         assert_eq!(scheduler.current_batch_index, 0);
