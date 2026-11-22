@@ -616,165 +616,25 @@ fn lookups_find_every_live_entry_after_a_clear_that_panicked() {
 
 #[test]
 fn clear_tombstones_each_slot_before_dropping_its_value() {
-    let drops = Arc::new(AtomicUsize::new(0));
-    let mut map = ManuallyDrop::new(FixedElasticHashMap::<u64, PanicOnFirstDrop>::with_capacity(
-        32,
-    ));
-    for key in 0..3 {
-        map.insert(key, PanicOnFirstDrop(drops.clone()));
-    }
-    let first_occupied = map
-        .table()
-        .levels
-        .iter()
-        .enumerate()
-        .find_map(|(level_index, level)| {
-            (0..level.capacity())
-                .find(|&slot| control::is_occupied(level.checked_control(slot)))
-                .map(|slot| (level_index, slot))
-        })
-        .unwrap();
-
-    let result = catch_unwind(AssertUnwindSafe(|| map.clear()));
-    assert!(result.is_err());
-    assert_eq!(
-        map.table().levels[first_occupied.0].checked_control(first_occupied.1),
-        CTRL_TOMBSTONE
-    );
-    assert_eq!(map.table().levels[first_occupied.0].tombstones(), 1);
-    let live_controls = map
-        .table()
-        .levels
-        .iter()
-        .map(|level| {
-            (0..level.capacity())
-                .filter(|&slot| control::is_occupied(level.checked_control(slot)))
-                .count()
-        })
-        .sum::<usize>();
-    assert_eq!(map.len(), live_controls);
-    assert!(map.table().levels.iter().all(|level| {
-        map.table().live_in(level) as usize
-            == (0..level.capacity())
-                .filter(|&slot| control::is_occupied(level.checked_control(slot)))
-                .count()
-    }));
-
-    map.clear();
-    assert!(map.is_empty());
-    assert_eq!(drops.load(Ordering::SeqCst), 3);
-    // SAFETY: `map` is not used after this drop.
-    unsafe { ManuallyDrop::drop(&mut map) };
-}
-
-#[test]
-fn caught_hash_panic_during_a_filter_refresh_keeps_every_entry_reachable() {
-    const LIVE: u64 = 55;
-    const CHURNED: u64 = LIVE;
-    let armed = Arc::new(AtomicBool::new(false));
-    let never = Arc::new(AtomicBool::new(false));
-    let key_drops = Arc::new(AtomicUsize::new(0));
-    let key = |id: u64| PanicHashKey {
-        id,
-        // The churned key is hashed by its own removal, so it stays unarmed.
-        armed: if id == CHURNED {
-            never.clone()
-        } else {
-            armed.clone()
+    test_support::assert_clear_tombstones_each_slot_before_dropping_its_value::<
+        ElasticTable<u64, PanicOnFirstDrop, FixedHashBuilder>,
+    >(
+        |table| {
+            table
+                .levels
+                .iter()
+                .flat_map(|level| (0..level.capacity()).map(|slot| level.checked_control(slot)))
+                .collect()
         },
-        drops: key_drops.clone(),
-    };
-    let mut map = FixedElasticHashMap::<PanicHashKey, u64>::with_capacity(56);
-    let capacity = map.capacity();
-    for id in 0..LIVE {
-        map.insert(key(id), id);
-    }
-    let generation = map.epoch().generation;
-
-    // Churn one key until a removal refreshes the filter, which hashes the
-    // armed live keys.
-    let mut unwound = false;
-    for _ in 0..=2 * capacity {
-        map.insert(key(CHURNED), CHURNED);
-        armed.store(true, Ordering::SeqCst);
-        let result = catch_unwind(AssertUnwindSafe(|| map.remove(&key(CHURNED))));
-        armed.store(false, Ordering::SeqCst);
-        if result.is_err() {
-            unwound = true;
-            break;
-        }
-    }
-    assert!(unwound);
-    // The refresh, not a rebuild, is what unwound.
-    assert_eq!(map.epoch().generation, generation);
-
-    assert_eq!(map.len() as u64, LIVE);
-    assert!(map.get(&key(CHURNED)).is_none());
-    for id in 0..LIVE {
-        assert_eq!(map.get(&key(id)), Some(&id));
-    }
-
-    // The table keeps working: the next refresh re-records the filter.
-    for _ in 0..=2 * capacity {
-        map.insert(key(CHURNED), CHURNED);
-        assert_eq!(map.remove(&key(CHURNED)), Some(CHURNED));
-    }
-    for id in 0..LIVE {
-        assert_eq!(map.remove(&key(id)), Some(id));
-    }
-    assert!(map.is_empty());
+        assert_counters_match_controls,
+    );
 }
 
 #[test]
 fn caught_hash_panic_during_try_resize_keeps_every_entry() {
-    let panic = Arc::new(AtomicBool::new(false));
-    let drops = Arc::new(AtomicUsize::new(0));
-    let key_drops = Arc::new(AtomicUsize::new(0));
-    let key = |id: u64| PanicHashKey {
-        id,
-        armed: panic.clone(),
-        drops: key_drops.clone(),
-    };
-    let mut map = FixedElasticHashMap::<PanicHashKey, CountDrop>::with_capacity(32);
-    for id in 0..16_u64 {
-        map.insert(key(id), CountDrop(drops.clone()));
-    }
-
-    panic.store(true, Ordering::SeqCst);
-    let result = catch_unwind(AssertUnwindSafe(|| map.try_reserve(4_096)));
-    assert!(result.is_err());
-    panic.store(false, Ordering::SeqCst);
-
-    let live_controls = map
-        .table()
-        .levels
-        .iter()
-        .map(|level| {
-            (0..level.capacity())
-                .filter(|&slot| control::is_occupied(level.checked_control(slot)))
-                .count()
-        })
-        .sum::<usize>();
-    assert_eq!(map.len(), live_controls);
-    assert!(map.table().levels.iter().all(|level| {
-        map.table().live_in(level) as usize
-            == (0..level.capacity())
-                .filter(|&slot| control::is_occupied(level.checked_control(slot)))
-                .count()
-    }));
-    // The old table stays intact until every entry has been rehashed.
-    assert_eq!(map.len(), 16);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
-    assert_eq!(key_drops.load(Ordering::SeqCst), 0);
-
-    let live_keys = map.keys().map(|key| key.id).collect::<Vec<_>>();
-    map.insert(key(100), CountDrop(drops.clone()));
-    map.try_reserve(4_096).unwrap();
-    for id in live_keys.into_iter().chain([100]) {
-        assert!(map.contains_key(&key(id)));
-    }
-    drop(map);
-    assert_eq!(drops.load(Ordering::SeqCst), 17);
+    test_support::assert_hash_panic_during_resize_keeps_every_entry::<
+        ElasticTable<PanicHashKey, CountDrop, FixedHashBuilder>,
+    >(assert_counters_match_controls);
 }
 
 /// A rebuild that unwinds part way puts back levels whose settled inserts
@@ -798,17 +658,8 @@ fn caught_hash_panic_during_a_rebuild_keeps_uncounted_settled_inserts() {
     for id in 0..16_u64 {
         map.insert(key(id), id);
     }
-    let live_matches_controls = |map: &FixedElasticHashMap<PanicHashKey, u64>| {
-        let table = map.table();
-        table.levels.iter().all(|level| {
-            table.live_in(level) as usize
-                == (0..level.capacity())
-                    .filter(|&slot| control::is_occupied(level.checked_control(slot)))
-                    .count()
-        })
-    };
     assert_ne!(map.table().uncounted.pending(map.table().placed), 0);
-    assert!(live_matches_controls(&map));
+    assert_counters_match_controls(map.table());
 
     panic.store(true, Ordering::SeqCst);
     let result = catch_unwind(AssertUnwindSafe(|| map.try_reserve(4_096)));
@@ -817,11 +668,11 @@ fn caught_hash_panic_during_a_rebuild_keeps_uncounted_settled_inserts() {
 
     assert_eq!(map.len(), 16);
     assert_ne!(map.table().uncounted.pending(map.table().placed), 0);
-    assert!(live_matches_controls(&map));
+    assert_counters_match_controls(map.table());
     for id in 16..24_u64 {
         map.insert(key(id), id);
     }
-    assert!(live_matches_controls(&map));
+    assert_counters_match_controls(map.table());
     for id in 0..24_u64 {
         assert_eq!(map.get(&key(id)), Some(&id));
     }
@@ -883,7 +734,14 @@ fn level_counters_sit_ahead_of_their_control_bytes_without_overlap() {
 fn interrupted_filter_refresh_keeps_every_live_key_reachable() {
     test_support::assert_interrupted_refresh_keeps_live_keys_reachable::<
         ElasticTable<PanicHashKey, u64, FixedHashBuilder, ToggleAllocator>,
-    >(ElasticTable::stale_membership);
+    >(
+        |table, hash| {
+            table
+                .route_filter(PreparedElasticRoute::new(hash))
+                .maybe_present
+        },
+        ElasticTable::stale_membership,
+    );
 }
 
 #[test]
@@ -2790,7 +2648,7 @@ fn free_in<K: Eq + Hash, V, S: BuildHasher>(table: &ElasticTable<K, V, S>, level
 
 /// Each level's counters against its control bytes, the table's live count
 /// against the levels', and every stored route summary's sentinel bit.
-fn assert_counters_match_controls(table: &ElasticTable<u64, u64, FixedHashBuilder>) {
+fn assert_counters_match_controls<K: Eq + Hash, V>(table: &ElasticTable<K, V, FixedHashBuilder>) {
     let mut live = 0;
     for level in &table.levels {
         let (mut occupied, mut tombstones) = (0, 0);

@@ -1,5 +1,4 @@
 use core::cell::Cell;
-use core::mem::ManuallyDrop;
 use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1158,6 +1157,12 @@ fn assert_matches_model(
             );
         }
     }
+}
+
+fn occupied_controls<K, V, S>(table: &FunnelTable<K, V, S>) -> usize {
+    (0..table.shape.slots)
+        .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
+        .count()
 }
 
 fn tombstone_controls<K, V, S>(table: &FunnelTable<K, V, S>) -> usize {
@@ -2815,45 +2820,16 @@ fn tombstone_before_a_duplicate_does_not_hide_the_duplicate() {
 
 #[test]
 fn clear_tombstones_each_slot_before_dropping_its_value() {
-    let drops = Arc::new(AtomicUsize::new(0));
-    let reserve = ReserveFraction::from_exponent(3).unwrap();
-    let shape = FunnelShape::from_slots(144, reserve).unwrap();
-    let mut table = ManuallyDrop::new(
-        FunnelTable::<u64, PanicOnFirstDrop, IdentityBuildHasher>::try_from_shape(
-            shape,
-            reserve,
-            IdentityBuildHasher,
-            Global,
-        )
-        .unwrap(),
+    test_support::assert_clear_tombstones_each_slot_before_dropping_its_value::<
+        FunnelTable<u64, PanicOnFirstDrop, test_support::FixedHashBuilder>,
+    >(
+        |table| {
+            (0..table.shape.slots)
+                .map(|slot| table.storage.checked_control(slot))
+                .collect()
+        },
+        |table| assert_eq!(table.entries(), occupied_controls(table)),
     );
-    for key in 0..3 {
-        table.insert_for_vacant_by_walk(key, PanicOnFirstDrop(drops.clone()), key);
-    }
-    let first_occupied = (0..table.shape.slots)
-        .find(|&slot| control::is_occupied(table.storage.checked_control(slot)))
-        .unwrap();
-
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clear(&mut table);
-    }));
-    assert!(result.is_err());
-    assert_eq!(
-        table.storage.checked_control(first_occupied),
-        CTRL_TOMBSTONE
-    );
-    assert_eq!(
-        table.entries(),
-        (0..table.shape.slots)
-            .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
-            .count()
-    );
-
-    <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clear(&mut table);
-    assert_eq!(table.entries(), 0);
-    assert_eq!(drops.load(Ordering::SeqCst), 3);
-    // SAFETY: `table` is dropped once and not used afterward.
-    unsafe { ManuallyDrop::drop(&mut table) };
 }
 
 #[test]
@@ -2890,82 +2866,12 @@ fn clear_interrupted_by_a_panicking_drop_keeps_survivors_reachable() {
 
 #[test]
 fn panicking_hasher_during_resize_keeps_every_entry() {
-    let armed = Arc::new(AtomicBool::new(false));
-    let drops = Arc::new(AtomicUsize::new(0));
-    let reserve = ReserveFraction::from_exponent(3).unwrap();
-    let shape = FunnelShape::from_slots(144, reserve).unwrap();
-    let mut table = FunnelTable::<PanicHashKey, u64, IdentityBuildHasher>::try_from_shape(
-        shape,
-        reserve,
-        IdentityBuildHasher,
-        Global,
-    )
-    .unwrap();
-    for id in 0..3 {
-        let key = PanicHashKey {
-            id,
-            armed: armed.clone(),
-            drops: drops.clone(),
-        };
-        let hash = id;
-        assert_eq!(
-            <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::insert(&mut table, key, id, hash,),
-            None
-        );
-    }
-    let next_shape = FunnelShape::for_insert_budget(256, reserve).unwrap();
-
-    armed.store(true, Ordering::SeqCst);
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        map::TableBackend::try_resize(&mut table, next_shape.n).unwrap();
-    }));
-    assert!(result.is_err());
-    assert_eq!(table.shape.n, 144);
-    assert_eq!(table.entries(), 3);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
-    assert_head_addresses_storage(&table);
-    assert_eq!(
-        table.entries(),
-        (0..table.shape.slots)
-            .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
-            .count()
-    );
-
-    armed.store(false, Ordering::SeqCst);
-    for id in 0..3 {
-        let probe = PanicHashKey {
-            id,
-            armed: armed.clone(),
-            drops: Arc::new(AtomicUsize::new(0)),
-        };
-        assert_eq!(
-            <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::find_entry(&table, &probe, id)
-                .map(|entry| entry.value),
-            Some(id)
-        );
-    }
-    let replacement = PanicHashKey {
-        id: 99,
-        armed: armed.clone(),
-        drops: drops.clone(),
-    };
-    assert_eq!(
-        <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::insert(
-            &mut table,
-            replacement,
-            99,
-            99,
-        ),
-        None
-    );
-    assert_eq!(
-        table.entries(),
-        (0..table.shape.slots)
-            .filter(|&slot| control::is_occupied(table.storage.checked_control(slot)))
-            .count()
-    );
-    drop(table);
-    assert_eq!(drops.load(Ordering::SeqCst), 4);
+    test_support::assert_hash_panic_during_resize_keeps_every_entry::<
+        FunnelTable<PanicHashKey, CountDrop, test_support::FixedHashBuilder>,
+    >(|table| {
+        assert_head_addresses_storage(table);
+        assert_eq!(table.entries(), occupied_controls(table));
+    });
 }
 
 /// Deletes the counts have yet to see when a resize starts are settled as the
@@ -3045,86 +2951,6 @@ fn panicking_hasher_during_resize_rolls_back_uncounted_deletes() {
     assert_eq!(table.entries() as u64, INSERTED);
     assert_eq!(tombstone_controls(&table), 0);
     for id in 0..INSERTED {
-        assert_eq!(
-            map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
-            Some(id)
-        );
-    }
-}
-
-/// A filter refresh hashes every live key. A hasher that panics part way
-/// through must leave the filter recording every live key.
-#[test]
-fn panicking_hasher_during_filter_refresh_keeps_every_key_recorded() {
-    const LIVE: u64 = 12;
-    const CHURN: u64 = LIVE;
-    let armed = Arc::new(AtomicBool::new(false));
-    let drops = Arc::new(AtomicUsize::new(0));
-    let reserve = ReserveFraction::from_exponent(3).unwrap();
-    let shape = FunnelShape::from_slots(144, reserve).unwrap();
-    let mut table = FunnelTable::<PanicHashKey, u64, IdentityBuildHasher>::try_from_shape(
-        shape,
-        reserve,
-        IdentityBuildHasher,
-        Global,
-    )
-    .unwrap();
-    let key_of = |id: u64| PanicHashKey {
-        id,
-        armed: armed.clone(),
-        drops: drops.clone(),
-    };
-    for id in 0..LIVE {
-        assert_eq!(
-            map::TableBackend::insert(&mut table, key_of(id), id, id),
-            None
-        );
-    }
-
-    // Cycling one key re-takes its tombstone, so only the stale-filter count
-    // grows and the delete that passes its threshold refreshes the filter.
-    let threshold = membership::refresh_deletes(table.shape.max_insertions);
-    for cycle in 0..=threshold {
-        assert_eq!(
-            map::TableBackend::insert(&mut table, key_of(CHURN), CHURN, CHURN),
-            None
-        );
-        let slot = table.find(&key_of(CHURN), CHURN).unwrap();
-        if cycle < threshold {
-            map::TableBackend::remove(&mut table, slot);
-            assert_eq!(table.stale_membership(), cycle + 1);
-            continue;
-        }
-        armed.store(true, Ordering::SeqCst);
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            map::TableBackend::remove(&mut table, slot);
-        }));
-        armed.store(false, Ordering::SeqCst);
-        assert!(result.is_err(), "the refresh hashed no key");
-    }
-
-    assert_eq!(table.entries() as u64, LIVE);
-    for id in 0..LIVE {
-        assert!(table.membership_gate(id).passes(), "key {id} unrecorded");
-        assert_eq!(
-            map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
-            Some(id)
-        );
-    }
-    assert_eq!(
-        map::TableBackend::find_entry(&table, &key_of(CHURN), CHURN).map(|entry| entry.value),
-        None
-    );
-
-    // The refresh is still owed, and runs at the next settling delete.
-    assert_eq!(
-        map::TableBackend::insert(&mut table, key_of(CHURN), CHURN, CHURN),
-        None
-    );
-    let slot = table.find(&key_of(CHURN), CHURN).unwrap();
-    map::TableBackend::remove(&mut table, slot);
-    assert_eq!(table.stale_membership(), 0);
-    for id in 0..LIVE {
         assert_eq!(
             map::TableBackend::find_entry(&table, &key_of(id), id).map(|entry| entry.value),
             Some(id)
@@ -3234,7 +3060,10 @@ fn panicking_hasher_while_a_keyed_removal_settles_drops_the_removed_pair() {
 fn interrupted_filter_refresh_keeps_every_live_key_reachable() {
     test_support::assert_interrupted_refresh_keeps_live_keys_reachable::<
         FunnelTable<PanicHashKey, u64, test_support::FixedHashBuilder, ToggleAllocator>,
-    >(|table| table.stale_membership);
+    >(
+        |table, hash| table.membership_gate(hash).passes(),
+        FunnelTable::stale_membership,
+    );
 }
 
 #[test]
