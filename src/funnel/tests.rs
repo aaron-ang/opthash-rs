@@ -343,6 +343,50 @@ fn dense_scan_preserves_order_while_removals_make_the_table_sparse() {
     assert_eq!(table.entries(), 0);
 }
 
+/// A dense scan of a shape whose buckets are narrower than a group visits
+/// every occupied slot once, in slot order, across the padding lanes of the
+/// ordinary levels and on into the special arrays.
+#[test]
+fn dense_scan_steps_over_bucket_padding_into_the_special_arrays() {
+    let reserve = ReserveFraction::from_exponent(3).unwrap();
+    let mut table = head_table(
+        FunnelShape::for_insert_budget(4_096, reserve).unwrap(),
+        reserve,
+    );
+    assert!(table.shape.beta < GROUP_SIZE);
+    let limit = table.shape.max_insertions as u64;
+    for key in 0..limit - 2 {
+        assert_eq!(map::TableBackend::insert(&mut table, key, key, key), None);
+    }
+    let special = [table.shape.primary_offset, table.shape.slots - 1];
+    for (key, slot) in (limit - 2..).zip(special) {
+        // SAFETY: `slot < slots`, the storage capacity.
+        assert!(control::is_free(unsafe { table.storage.control_at(slot) }));
+        let hash = table.hash_builder.hash_one(key);
+        table.place_new_entry(
+            table.vacancy_at(slot),
+            key,
+            key,
+            table.membership_slot(hash),
+            table.prf.prepare(hash).fingerprint(),
+            true,
+        );
+    }
+    // SAFETY: `slot < slots`, the storage capacity.
+    let occupied = (0..table.shape.slots)
+        .filter(|&slot| control::is_occupied(unsafe { table.storage.control_at(slot) }))
+        .collect::<Vec<_>>();
+    assert_eq!(occupied.len(), table.entries());
+    let mut scan = map::TableBackend::scan(&table);
+    assert!(matches!(scan.mode, FunnelScanMode::Dense(_)));
+    let mut scanned = Vec::new();
+    while let Some((_, slot)) = map::TableBackend::scan_next(&table, &mut scan) {
+        scanned.push(slot);
+    }
+    assert_eq!(scanned, occupied);
+    assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
+}
+
 #[test]
 fn sparse_scan_visits_group_boundaries_and_tail_once_in_slot_order() {
     let mut table = raw_table(32_767, 3);

@@ -46,9 +46,22 @@ pub struct FunnelScan {
     mode: FunnelScanMode,
 }
 
+/// A slot-by-slot scan over the lanes that can hold entries. Below
+/// `padded_end` a bucket's group holds its `lanes` lanes and then padding,
+/// so the scan runs to `lane_end`, the end of the current bucket's lanes, and
+/// then steps to the next group; from `padded_end` on it runs to the end of
+/// the slots.
+#[derive(Clone, Debug)]
+struct DenseScan {
+    next: usize,
+    lane_end: usize,
+    lanes: usize,
+    padded_end: usize,
+}
+
 #[derive(Clone, Debug)]
 enum FunnelScanMode {
-    Dense(usize),
+    Dense(DenseScan),
     Sparse(OccupiedIndices),
 }
 
@@ -2930,7 +2943,23 @@ where
             mode: if self.entries() <= self.shape.slots / 4 {
                 FunnelScanMode::Sparse(OccupiedIndices::new())
             } else {
-                FunnelScanMode::Dense(0)
+                FunnelScanMode::Dense(
+                    if self.shape.beta < GROUP_SIZE && self.shape.primary_offset != 0 {
+                        DenseScan {
+                            next: 0,
+                            lane_end: self.shape.beta,
+                            lanes: self.shape.beta,
+                            padded_end: self.shape.primary_offset,
+                        }
+                    } else {
+                        DenseScan {
+                            next: 0,
+                            lane_end: self.shape.slots,
+                            lanes: 0,
+                            padded_end: 0,
+                        }
+                    },
+                )
             },
         }
     }
@@ -2938,19 +2967,29 @@ where
     #[inline]
     fn scan_next(&self, scan: &mut FunnelScan) -> Option<(*mut SlotEntry<K, V>, usize)> {
         match &mut scan.mode {
-            FunnelScanMode::Dense(next) => {
-                while *next < self.shape.slots {
-                    let slot = *next;
-                    *next += 1;
-                    // SAFETY: `slot < slots`, the storage capacity.
+            FunnelScanMode::Dense(dense) => loop {
+                while dense.next < dense.lane_end {
+                    let slot = dense.next;
+                    dense.next += 1;
+                    // SAFETY: `lane_end` is at most `slots`, the storage
+                    // capacity.
                     unsafe {
                         if control::is_occupied(self.storage.control_at(slot)) {
                             return Some((self.storage.slot_ptr(slot), slot));
                         }
                     }
                 }
-                None
-            }
+                let group_end = dense.lane_end - dense.lanes + GROUP_SIZE;
+                if group_end < dense.padded_end {
+                    dense.next = group_end;
+                    dense.lane_end = group_end + dense.lanes;
+                } else if dense.lane_end < self.shape.slots {
+                    dense.next = dense.padded_end;
+                    dense.lane_end = self.shape.slots;
+                } else {
+                    return None;
+                }
+            },
             FunnelScanMode::Sparse(cursor) => {
                 let slot = cursor.step(&self.storage)?;
                 // SAFETY: `step` yields in-bounds slots.
