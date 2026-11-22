@@ -374,6 +374,42 @@ fn partial_extract_drop_finishes_deferred_tombstone_cleanup() {
     check!(FunnelHashMap::<usize, usize>::with_capacity(512));
 }
 
+/// A bulk removal cleans up the tombstones single removals left, even when
+/// it removes nothing itself, and rebuilds nothing once inserts have taken
+/// those tombstones back.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn funnel_bulk_removal_cleans_only_the_tombstones_still_in_place() {
+    for refill in [false, true] {
+        let mut map = FunnelHashMap::<usize, usize>::with_capacity(512);
+        let capacity = fill_to_capacity!(map);
+        let before = map.epoch();
+        for key in 1..capacity {
+            assert_eq!(map.remove(&key), Some(key));
+        }
+        if refill {
+            for key in 1..capacity {
+                assert_eq!(map.insert(key, key), None);
+            }
+        }
+        assert_eq!(map.epoch().generation, before.generation);
+
+        map.retain(|_, _| true);
+
+        let after = map.epoch();
+        assert_eq!(map.capacity(), capacity);
+        if refill {
+            assert_eq!(after.generation, before.generation);
+            assert_identity_present!(map, 0..capacity);
+        } else {
+            assert_eq!(after.generation, before.generation + 1);
+            assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
+            assert_eq!(map.len(), 1);
+            assert_eq!(map.get(&0), Some(&0));
+        }
+    }
+}
+
 #[test]
 fn clear_starts_a_fresh_epoch_in_the_same_allocation() {
     let mut map = FunnelHashMap::<usize, usize>::with_capacity(64);
