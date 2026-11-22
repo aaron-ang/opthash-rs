@@ -446,6 +446,28 @@ impl ProbeScheduleRoom {
 /// Entries of a schedule's table of walk starts: one per summary value.
 const WALK_STARTS: usize = 1 << SummaryBin::BITS;
 
+/// The summary that leaves level zero alone open.
+const LEVEL_ZERO_ALONE: SummaryBin = NO_LEVELS_OCCUPIED & !(1 << level_bit(0));
+
+/// Levels a schedule holds routes of while a walk speculates on
+/// [`LEVEL_ZERO_ALONE`]. The paper's first two batches place in levels zero
+/// and one alone, and level one is half the size of level zero, so while
+/// no deeper level holds an entry most walks have level zero alone open.
+/// Once a deeper level does, the summaries spread over more levels and a
+/// branch on one of them is a guess the predictor misses.
+const SPECULATED_LEVELS: usize = 2;
+const _: () = assert!(SPECULATED_LEVELS < GROUPED_LEVELS);
+
+/// A value no summary takes as a signed byte.
+const NO_SPECULATION: i64 = i8::MAX as i64 + 1;
+
+/// Where [`ProbeSchedule::direct_reduction`] holds the summary a walk
+/// speculates on, as a signed value one bit wider than a summary so that it
+/// can also be [`NO_SPECULATION`]: its top bits, above the direct route's
+/// shift and level.
+const SPECULATED_SHIFT: u32 = u64::BITS - SummaryBin::BITS - 1;
+const _: () = assert!(LEVEL_BIT + u8::BITS <= SPECULATED_SHIFT);
+
 /// What a schedule keeps besides its slots, which only building it reads
 /// past the walk starts.
 #[repr(C)]
@@ -751,7 +773,12 @@ const fn lone_level_summary(levels: usize, level: usize) -> Option<SummaryBin> {
 pub(super) struct ProbeSchedule {
     /// The direct route's [`PhiRoute::index_shift`] word and control bytes,
     /// held beside its level's entries. [`ProbeScheduleRoom::schedule`]
-    /// alone writes them, from the route it puts first.
+    /// alone writes them, from the route it puts first, but for the top
+    /// bits of the word ([`SPECULATED_SHIFT`]), which a shift by the word
+    /// does not read: the signed summary a walk takes its start for before
+    /// its own summary arrives, [`LEVEL_ZERO_ALONE`] while the schedule
+    /// holds routes of no more than [`SPECULATED_LEVELS`] levels and
+    /// [`NO_SPECULATION`] otherwise. [`Self::open`] writes them.
     direct_reduction: u64,
     direct_control: *const u8,
     /// Level zero's first entry, or null for a table without levels.
@@ -913,8 +940,26 @@ impl ProbeSchedule {
         };
         #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
         let (entry_origin, zero_start) = (self.entry_origin, self.book.zero_start.as_ptr());
-        // SAFETY: `starts` has an entry at every signed byte's distance.
-        let start = unsafe { *zero_start.offset(isize::from(summary.cast_signed())) };
+        let summary = i64::from(summary.cast_signed());
+        // The top bits, sign-extended as the summary is.
+        let speculated = self.direct_reduction.cast_signed() >> SPECULATED_SHIFT;
+        let start = if summary == speculated {
+            // The summary is `LEVEL_ZERO_ALONE`, the one summary the top
+            // bits hold. Its entry is read at an address that does not wait
+            // for the summary: on the branch's predicted path the walk's
+            // first control-byte read is issued while the summary is still on
+            // its way. A volatile read keeps the two reads apart, so they do
+            // not merge into one read at a selected address.
+            // SAFETY: `starts` has an entry at every signed byte's distance.
+            unsafe {
+                zero_start
+                    .offset(isize::from(LEVEL_ZERO_ALONE.cast_signed()))
+                    .read_volatile()
+            }
+        } else {
+            // SAFETY: `starts` has an entry at every signed byte's distance.
+            unsafe { *zero_start.offset(summary as isize) }
+        };
         (entry_origin, start)
     }
 
@@ -954,6 +999,10 @@ impl ProbeSchedule {
             let (level, logical_probe_index) = route.coordinates();
             copy.push(levels, level as usize, logical_probe_index);
         }
+        // The copy holds the routes of the levels `self` holds them of.
+        let speculated = u64::MAX << SPECULATED_SHIFT;
+        copy.direct_reduction =
+            copy.direct_reduction & !speculated | self.direct_reduction & speculated;
         copy
     }
 
@@ -1015,8 +1064,9 @@ impl ProbeSchedule {
 
     /// Drops the pushed routes ahead of pushing those of the first `after`
     /// levels, every one of them and in the order a schedule of those
-    /// levels takes them. Only whether every grouped level is among them is
-    /// read, so [`GROUPED_LEVELS`] stands for any count from there up.
+    /// levels takes them. Only whether every grouped level is among them,
+    /// and whether more than [`SPECULATED_LEVELS`] are, is read, so
+    /// [`GROUPED_LEVELS`] stands for any count from there up.
     ///
     /// A group's run is whole only since a call that named every grouped
     /// level, and it holds no route of another level. So where one is whole
@@ -1065,6 +1115,13 @@ impl ProbeSchedule {
             }
         }
         self.set_whole(runs, groups);
+        let speculated = if after <= SPECULATED_LEVELS {
+            i64::from(LEVEL_ZERO_ALONE.cast_signed())
+        } else {
+            NO_SPECULATION
+        };
+        self.direct_reduction = self.direct_reduction & !(u64::MAX << SPECULATED_SHIFT)
+            | speculated.cast_unsigned() << SPECULATED_SHIFT;
     }
 
     /// Makes the first `runs` levels' runs and the runs of `groups` the
@@ -1324,6 +1381,14 @@ impl ProbeSchedule {
                 };
                 self.walk_start(summary) == start
             })
+    }
+
+    /// Whether a walk under the summary that leaves level zero alone open
+    /// takes its start before its summary arrives.
+    #[cfg(test)]
+    pub(super) fn speculates(&self) -> bool {
+        self.direct_reduction.cast_signed() >> SPECULATED_SHIFT
+            == i64::from(LEVEL_ZERO_ALONE.cast_signed())
     }
 
     /// Levels whose runs a walk may start at.
