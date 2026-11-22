@@ -312,10 +312,18 @@ fn shrink_of_a_full_table_drops_the_slots_its_limit_does_not_need() {
     }
 }
 
+/// Whether `slot` is a padding lane of an ordinary bucket, which no entry
+/// may occupy.
+fn is_padding<V>(table: &FunnelTable<u64, V, IdentityBuildHasher>, slot: usize) -> bool {
+    slot < table.shape.primary_offset && slot % table.shape.stride >= table.shape.beta
+}
+
 #[test]
 fn dense_scan_preserves_order_while_removals_make_the_table_sparse() {
     let mut table = raw_table(344, 4);
-    let slots = (0..320).filter(|slot| slot % 11 != 0).collect::<Vec<_>>();
+    let slots = (0..320)
+        .filter(|&slot| slot % 11 != 0 && !is_padding(&table, slot))
+        .collect::<Vec<_>>();
     for &slot in &slots {
         let key = slot as u64;
         let hash = table.hash_builder.hash_one(key);
@@ -345,7 +353,8 @@ fn dense_scan_preserves_order_while_removals_make_the_table_sparse() {
 
 /// A dense scan of a shape whose buckets are narrower than a group visits
 /// every occupied slot once, in slot order, across the padding lanes of the
-/// ordinary levels and on into the special arrays.
+/// ordinary levels and on into the special arrays, and reads no padding
+/// control: one planted to read as occupied is never reported.
 #[test]
 fn dense_scan_steps_over_bucket_padding_into_the_special_arrays() {
     let reserve = ReserveFraction::from_exponent(3).unwrap();
@@ -376,6 +385,17 @@ fn dense_scan_steps_over_bucket_padding_into_the_special_arrays() {
     let occupied = (0..table.shape.slots)
         .filter(|&slot| control::is_occupied(unsafe { table.storage.control_at(slot) }))
         .collect::<Vec<_>>();
+    let planted = (0..table.shape.slots)
+        .filter(|&slot| is_padding(&table, slot))
+        .step_by(7)
+        .collect::<Vec<_>>();
+    assert_ne!(planted, [] as [usize; 0]);
+    let occupied_control = control::control_fingerprint_low(0);
+    for &slot in &planted {
+        // SAFETY: `slot < slots`, the storage capacity; the scan below reads
+        // only the control, and the padding is restored after it.
+        unsafe { table.storage.set_control(slot, occupied_control) };
+    }
     assert_eq!(occupied.len(), table.entries());
     let mut scan = map::TableBackend::scan(&table);
     assert!(matches!(scan.mode, FunnelScanMode::Dense(_)));
@@ -385,13 +405,28 @@ fn dense_scan_steps_over_bucket_padding_into_the_special_arrays() {
     }
     assert_eq!(scanned, occupied);
     assert!(map::TableBackend::scan_next(&table, &mut scan).is_none());
+    for &slot in &planted {
+        // SAFETY: `slot < slots`; this restores the padding control.
+        unsafe { table.storage.set_control(slot, CTRL_PADDING) };
+    }
 }
 
 #[test]
 fn sparse_scan_visits_group_boundaries_and_tail_once_in_slot_order() {
     let mut table = raw_table(32_767, 3);
-    let slots = [0, GROUP_SIZE - 1, GROUP_SIZE, 3 * GROUP_SIZE + 2, 32_766];
+    // Group boundaries in the special arrays, where every lane can hold an
+    // entry.
+    let base = table.shape.primary_offset.next_multiple_of(GROUP_SIZE);
+    let slots = [
+        0,
+        base + GROUP_SIZE - 1,
+        base + GROUP_SIZE,
+        base + 3 * GROUP_SIZE + 2,
+        table.shape.slots - 1,
+    ];
+    assert!(slots.is_sorted() && slots[3] < slots[4]);
     for slot in slots {
+        assert!(!is_padding(&table, slot), "slot {slot}");
         let key = slot as u64;
         let hash = table.hash_builder.hash_one(key);
         table.place_new_entry(
@@ -404,8 +439,8 @@ fn sparse_scan_visits_group_boundaries_and_tail_once_in_slot_order() {
         );
     }
     // Include a deleted slot next to a live slot in a cached group.
-    // SAFETY: the table holds well over `GROUP_SIZE + 1` slots.
-    unsafe { table.storage.mark_tombstone(GROUP_SIZE + 1) };
+    // SAFETY: the slot lies between two placed slots.
+    unsafe { table.storage.mark_tombstone(base + GROUP_SIZE + 1) };
     let mut scan = map::TableBackend::scan(&table);
     for slot in slots {
         let (ptr, found) = map::TableBackend::scan_next(&table, &mut scan).unwrap();

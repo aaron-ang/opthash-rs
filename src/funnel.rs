@@ -602,8 +602,10 @@ mod level_bin {
     pub(super) struct WideLevelBin(u32);
 
     impl WideLevelBin {
-        /// The bin of a filter unit, in its place in a unit whose other
-        /// bits are clear.
+        /// A word whose top half is a filter unit's bin, in its place. The
+        /// walk visits the head entry of every set bit's count of leading
+        /// zeros, so bits set below the bin are allowed: each indexes an
+        /// entry that is no level.
         #[inline]
         pub(super) const fn of_unit_bin(bin: u32) -> Self {
             Self(bin)
