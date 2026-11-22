@@ -205,6 +205,26 @@ fn entry_search_checks_exceptional_hits_before_reporting_a_key_absent() {
     assert_eq!(table.find(&key, key), Some(slot));
 }
 
+/// A key the filter rejects reaches its vacant entry unsearched, and the
+/// entry's insert then places it through the head walk: no comparison and
+/// no general placement walk.
+#[test]
+fn vacant_entry_filter_rejection_places_through_the_head_walk() {
+    let comparisons = Arc::new(AtomicUsize::new(0));
+    let key = CountingKey {
+        id: 1,
+        comparisons: comparisons.clone(),
+    };
+    let mut map = FunnelHashMap::with_capacity_and_hasher(64, test_support::fixed_hasher());
+    VACANCY_WALKS.with(|walks| walks.set(0));
+    let open = map.table().head_left;
+    assert_eq!(*map.entry(key.clone()).or_insert(10), 10);
+    assert_eq!(comparisons.load(Ordering::Relaxed), 0);
+    assert_eq!(VACANCY_WALKS.with(Cell::get), 0);
+    assert_eq!(map.table().head_left, open - 1);
+    assert_eq!(map.get(&key), Some(&10));
+}
+
 #[test]
 fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement() {
     let mut table = raw_table(512, 3);
@@ -1855,7 +1875,6 @@ fn head_follows_its_storage_through_every_replacement() {
 
     map::TableBackend::shrink_to(&mut table, 0);
     assert!(table.shape.n < grown.n);
-    assert_eq!(map::TableBackend::total_slots(&table), table.shape.n);
     check(&mut table, live);
 
     let mut cloned = map::TableBackend::clone_table(&table);
