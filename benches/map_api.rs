@@ -110,8 +110,8 @@ fn bench_entry_reinsert(c: &mut Criterion) {
 
     // A small delete burst stays below the filter-refresh threshold, so the
     // Funnel filter keeps the removed keys' bits.
-    // Every absent Funnel entry therefore walks the exact search, unlike
-    // fresh-key insertion where a negative filter often skips that walk.
+    // Every absent Funnel entry therefore searches its recorded levels,
+    // unlike fresh-key insertion where a negative filter often skips that.
     macro_rules! setup {
         ($builder:expr) => {
             || {
