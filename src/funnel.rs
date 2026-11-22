@@ -66,9 +66,9 @@ enum FunnelScanMode {
 }
 
 /// Entries of [`FunnelTable::head`]: one for each count of leading zeros a
-/// [`WideLevelBin`] can have. A level-bin bit's count is its level's index,
-/// and an empty bin's is the last.
-const HEAD_ENTRIES: usize = u32::BITS as usize + 1;
+/// [`WideLevelBin`] can have, which is never zero. A level-bin bit's count is
+/// its level's index.
+const HEAD_ENTRIES: usize = u32::BITS as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LevelShape {
@@ -127,10 +127,6 @@ impl<T> Clone for HeadLevel<T> {
 impl<T> Copy for HeadLevel<T> {}
 
 impl<T> HeadLevel<T> {
-    /// Multiplier of the entry an empty level bin's walk reads. Not zero:
-    /// no key hides behind a bin that records no level.
-    const NO_LEVEL_RECORDED: u64 = 1;
-
     /// Whether this entry stands for a level the head does not hold: every
     /// level of a shape without a head, and the overflow levels.
     #[inline]
@@ -183,9 +179,8 @@ impl<T> HeadLevel<T> {
 }
 
 /// The head of a table with `shape` over `storage`: an entry for each level
-/// that owns a level-bin bit, then one for the overflow bit, absent ones
-/// for the counts no bin leads with, and a last one for the leading zeros
-/// of an empty bin. A shape without a head has no level to
+/// that owns a level-bin bit, then one for the overflow bit, and absent ones
+/// for the counts no bin leads with. A shape without a head has no level to
 /// place in or to scan for first matches, so all its level entries are
 /// absent. Every entry that is no level draws bucket zero at the group of
 /// [`CTRL_PADDING`] that ends the control array: a scan of it finds no
@@ -219,7 +214,6 @@ fn head_levels<T>(shape: &FunnelShape, storage: &FlatStorage<T>) -> [HeadLevel<T
             };
         }
     }
-    head[HEAD_ENTRIES - 1].multiplier = HeadLevel::<T>::NO_LEVEL_RECORDED;
     head
 }
 
@@ -594,26 +588,35 @@ struct MembershipSlot {
 use level_bin::WideLevelBin;
 
 mod level_bin {
-    /// A level bin in the top half of a word, where the leading zeros of
-    /// the word are the index of the bin's shallowest level. The first-match
-    /// walk steps the head by those counts; the head has an entry for every
-    /// count a word can have, so the walk needs nothing of the low half.
+    use core::num::NonZeroU32;
+
+    use super::{FilterUnit, unit_records};
+
+    /// A filter unit that records a key, as loaded: its level bin in the top
+    /// half, where the leading zeros of the unit are the index of the bin's
+    /// shallowest level, and its membership bits below. The first-match walk
+    /// steps the head by those counts; the head has an entry for every count
+    /// a unit that is not zero can have.
     #[derive(Clone, Copy)]
-    pub(super) struct WideLevelBin(u32);
+    pub(super) struct WideLevelBin(NonZeroU32);
 
     impl WideLevelBin {
-        /// A word whose top half is a filter unit's bin, in its place. The
-        /// walk visits the head entry of every set bit's count of leading
-        /// zeros, so bits set below the bin are allowed: each indexes an
-        /// entry that is no level.
+        /// `unit` if it holds a membership bit of `bits`. Such a unit is not
+        /// zero, and every insert that sets a membership bit records a level
+        /// with it, so its bin is not empty either.
         #[inline]
-        pub(super) const fn of_unit_bin(bin: u32) -> Self {
-            Self(bin)
+        pub(super) const fn of_recording_unit(unit: FilterUnit, bits: u32) -> Option<Self> {
+            if unit_records(unit, bits) {
+                // SAFETY: a unit with a set bit is not zero.
+                Some(Self(unsafe { NonZeroU32::new_unchecked(unit) }))
+            } else {
+                None
+            }
         }
 
         #[inline]
         pub(super) fn get(self) -> u32 {
-            self.0
+            self.0.get()
         }
     }
 }
@@ -631,15 +634,16 @@ struct MembershipGate {
 
 impl MembershipGate {
     /// `false` proves no insert ever recorded this key.
+    #[cfg(test)]
     #[inline]
     const fn passes(self) -> bool {
         unit_records(self.unit, self.bits)
     }
 
-    /// [`Self::levels`] as the first-match walk reads it.
+    /// The unit as the first-match walk reads it, if it passes.
     #[inline]
-    const fn wide_levels(self) -> WideLevelBin {
-        unit_wide_levels(self.unit)
+    const fn recorded(self) -> Option<WideLevelBin> {
+        WideLevelBin::of_recording_unit(self.unit, self.bits)
     }
 
     /// The unit's level bin: a set bit marks a level some key sharing the
@@ -663,12 +667,8 @@ const fn unit_levels(unit: FilterUnit) -> u16 {
     (unit >> MEMBERSHIP_BITS) as u16
 }
 
-/// The level bin of a filter unit in place, its membership half cleared, as
-/// the first-match walk reads it.
-#[inline]
-const fn unit_wide_levels(unit: FilterUnit) -> WideLevelBin {
-    WideLevelBin::of_unit_bin(unit & !((1 << MEMBERSHIP_BITS) - 1))
-}
+/// The bits of a filter unit that hold its level bin, in their place.
+const UNIT_BIN_BITS: FilterUnit = !((1 << MEMBERSHIP_BITS) - 1);
 
 /// A membership bit and a level bin, each in its half of a filter unit.
 #[inline]
@@ -1395,32 +1395,28 @@ where
         };
         // A passed gate means a recorded key, so the table has slots.
         debug_assert_ne!(self.shape.n, 0);
-        // The leading zeros of the bin are the index of its shallowest
-        // level. The overflow bit reaches an absent entry, as every scan of
-        // a shape without lanes does: it stands where the level past the
-        // last recorded one would. An empty set, which the walk tests for
-        // after a scan and not before one, has a whole word of leading
-        // zeros, and the head's last entry. Neither is a level, and each
-        // scans the group past the slots, which matches nothing.
-        let mut pending = levels.get();
+        // The leading zeros of the unit are the index of its bin's
+        // shallowest level. The overflow bit reaches an absent entry, as
+        // every scan of a shape without lanes does: it stands where the
+        // level past the last recorded one would. A unit whose bin is empty
+        // leads with a membership bit, which reaches an absent entry too.
+        // None of these is a level, and each scans the group past the slots,
+        // which matches nothing.
+        let unit = levels.get();
         // The walk steps a pointer to the table itself and reads the head
         // at its offset from there, so the head's address is never formed.
         // The first step is taken from the table and the rest from the
         // step before, so the first costs no copy of the table's address.
         let table = ptr::from_ref(self).cast::<HeadLevel<SlotEntry<K, V>>>();
-        let mut distance = pending.leading_zeros();
+        let mut distance = unit.leading_zeros();
         let mut stepped = table.wrapping_add(distance as usize);
-        // The head entry the walk stands on, with the walk's level bit
-        // moved to the top and cleared, so the rest keep their distances
-        // from the entry. An empty set shifts by its whole width, which
-        // wraps to none.
+        // The head entry the walk stands on.
         macro_rules! take_level {
             () => {{
-                pending = pending.wrapping_shl(distance) & !SHALLOWEST_LEVEL;
                 // SAFETY: the distances stepped so far add up to the index
-                // of a set bit of the bin, or to `u32::BITS` for an empty
-                // set. Either way the entry is one of the head's
-                // `HEAD_ENTRIES`, which outlive the borrow of `self`.
+                // of a set bit of the unit, which is one of the head's
+                // `HEAD_ENTRIES` entries, and they outlive the borrow of
+                // `self`.
                 unsafe { &*stepped.wrapping_byte_add(mem::offset_of!(Self, head)) }
             }};
         }
@@ -1451,9 +1447,18 @@ where
         if let Some(found) = key_in!(level) {
             return Ok(found);
         }
+        // The bin's bits after the first, which the walk visits next: moved
+        // up by the distance stepped so far, so each keeps its distance from
+        // the entry the walk stands on, and with the first cleared at the
+        // top. The membership half is dropped first, so only levels follow;
+        // the first step read through it, as a recorded unit's leading
+        // zeros are its bin's. A unit is not zero, so the distance is below
+        // its width.
+        let mut pending = ((unit & UNIT_BIN_BITS) << distance) & !SHALLOWEST_LEVEL;
         while pending != 0 {
             distance = pending.leading_zeros();
             stepped = stepped.wrapping_add(distance as usize);
+            pending = (pending << distance) & !SHALLOWEST_LEVEL;
             level = take_level!();
             if let Some(found) = key_in!(level) {
                 return Ok(found);
@@ -1466,9 +1471,9 @@ where
     /// given the head entry it scanned last. Otherwise the ordered walk
     /// decides: the key may sit outside its funnel or in a level the head
     /// does not hold. The walk ends at an absent entry exactly when the bin
-    /// records such a level: the overflow bit is the last it reaches, every
-    /// level of a shape without a head is absent, and an empty bin's entry
-    /// is not.
+    /// records such a level, or records none: the overflow bit is the last
+    /// it reaches, every level of a shape without a head is absent, and so
+    /// is the entry an empty bin's membership bit leads to.
     #[inline]
     fn unmatched_is_absent(&self, last: &HeadLevel<SlotEntry<K, V>>) -> bool {
         !last.is_absent() && !self.exceptional_placement
@@ -1959,14 +1964,11 @@ where
         Q: Equivalent<K> + ?Sized,
         P: FoundPart<'a, K, V>,
     {
-        let gate = self.membership_gate(key_hash);
-        if !gate.passes() {
-            return None;
-        }
-        // The level bin stays at register width, as the gate's load left
-        // it, so the walk does not widen it again.
+        // The unit stays at register width, as the gate's load left it, so
+        // the walk does not widen it again.
+        let levels = self.membership_gate(key_hash).recorded()?;
         let probe = self.prf.prepare(key_hash);
-        match self.first_match(key, probe, gate.wide_levels()) {
+        match self.first_match(key, probe, levels) {
             Ok(found) => Some(P::of(found)),
             Err(last) if self.unmatched_is_absent(last) => None,
             Err(_) => self.find_by_walk::<Q, P>(key, key_hash),
@@ -2279,8 +2281,8 @@ where
         unit: FilterUnit,
     ) -> Option<V> {
         let probe = self.prf.prepare(hash);
-        if unit_records(unit, membership_bit(hash)) {
-            match self.first_match(&key, probe, unit_wide_levels(unit)) {
+        if let Some(levels) = WideLevelBin::of_recording_unit(unit, membership_bit(hash)) {
+            match self.first_match(&key, probe, levels) {
                 Ok(found) => {
                     let mut entry = found.entry;
                     // SAFETY: a `Found` names an initialized entry of this
@@ -2800,9 +2802,8 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let gate = self.membership_gate(hash);
-        if gate.passes() {
-            let found = self.find_recorded_for_entry(key, hash, gate.wide_levels());
+        if let Some(levels) = self.membership_gate(hash).recorded() {
+            let found = self.find_recorded_for_entry(key, hash, levels);
             // One test passes every slot: the reserved values are the
             // largest.
             if found < ENTRY_UNSETTLED {
@@ -2875,12 +2876,9 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let gate = self.membership_gate(hash);
-        if !gate.passes() {
-            return None;
-        }
+        let levels = self.membership_gate(hash).recorded()?;
         let probe = self.prf.prepare(hash);
-        let unlinked = match self.first_match(key, probe, gate.wide_levels()) {
+        let unlinked = match self.first_match(key, probe, levels) {
             Ok(Found { lane, entry, .. }) => {
                 // SAFETY: the scan found an occupied control byte of this
                 // table's storage; `&mut self` makes the write exclusive.

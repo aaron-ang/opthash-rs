@@ -1626,30 +1626,39 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
     }
 }
 
-/// A bin's leading zeros, as the first-match walk reads it from a unit, name
-/// the head entry of its shallowest level: the level's own for a level with a
-/// bit, the absent one after them for the overflow bit, and the last for an
-/// empty bin.
+/// A recorded unit's leading zeros, as the first-match walk reads them, name
+/// the head entry of its bin's shallowest level whatever its membership bits:
+/// the level's own for a level with a bit, and the absent one after them for
+/// the overflow bit. A unit that records no key is not walked, and one whose
+/// bin is empty leads to an absent entry.
 #[test]
 fn a_wide_bin_leads_with_the_index_of_its_shallowest_level() {
     let lead = |levels: u16| {
-        let wide = unit_wide_levels(unit_of(0, levels)).get();
-        assert_eq!(
-            unit_wide_levels(unit_of((1 << MEMBERSHIP_BITS) - 1, levels)).get(),
-            wide
-        );
-        assert_eq!(
-            unit_levels(unit_of((1 << MEMBERSHIP_BITS) - 1, levels)),
-            levels
-        );
-        wide.leading_zeros() as usize
+        let leads = [1, 1 << (MEMBERSHIP_BITS - 1), (1 << MEMBERSHIP_BITS) - 1].map(|bits| {
+            let unit = unit_of(bits, levels);
+            assert_eq!(unit_levels(unit), levels);
+            WideLevelBin::of_recording_unit(unit, bits)
+                .unwrap()
+                .get()
+                .leading_zeros() as usize
+        });
+        assert!(leads.iter().all(|&lead| lead == leads[0]));
+        leads[0]
     };
     for level in 0..OVERFLOW_LEVEL {
         assert_eq!(lead(level_bit_of(level)), level);
         assert_eq!(lead(level_bit_of(level) | OVERFLOW_LEVEL_BIT), level);
     }
     assert_eq!(lead(OVERFLOW_LEVEL_BIT), OVERFLOW_LEVEL);
-    assert_eq!(lead(0), HEAD_ENTRIES - 1);
+    assert!(WideLevelBin::of_recording_unit(unit_of(0, u16::MAX), 1).is_none());
+    assert!(WideLevelBin::of_recording_unit(unit_of(1, u16::MAX), 2).is_none());
+    for bits in [1, (1 << MEMBERSHIP_BITS) - 1] {
+        let lead = WideLevelBin::of_recording_unit(unit_of(bits, 0), bits)
+            .unwrap()
+            .get()
+            .leading_zeros() as usize;
+        assert!((OVERFLOW_LEVEL..HEAD_ENTRIES).contains(&lead));
+    }
 }
 
 fn head_table(
@@ -2051,11 +2060,10 @@ fn lane_less_shapes_scan_nothing_and_keep_an_absent_head() {
                 .all(HeadLevel::is_absent)
         );
         assert!(
-            table.head[OVERFLOW_LEVEL..HEAD_ENTRIES - 1]
+            table.head[OVERFLOW_LEVEL..]
                 .iter()
                 .all(HeadLevel::is_absent)
         );
-        assert!(!table.head[HEAD_ENTRIES - 1].is_absent());
         assert!(
             table.head[recorded..]
                 .iter()
@@ -3186,12 +3194,10 @@ fn panicking_hasher_while_a_keyed_removal_settles_drops_the_removed_pair() {
             assert!(map::TableBackend::insert(&mut table, key_of(CHURN), value, CHURN).is_none());
         }
         // The head finds the key exactly on the shape that has one.
-        let gate = table.membership_gate(CHURN);
+        let levels = table.membership_gate(CHURN).recorded().unwrap();
         let prepared = table.prf.prepare(CHURN);
         assert_eq!(
-            table
-                .first_match(&probe, prepared, gate.wide_levels())
-                .is_ok(),
+            table.first_match(&probe, prepared, levels).is_ok(),
             table.shape.has_head()
         );
         let (keys_before, values_before) = (
@@ -3578,9 +3584,9 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
             for index in 0..2 * inserted {
                 let key = key_of(index);
                 let gate = table.membership_gate(key);
-                if !gate.passes() {
+                let Some(recorded) = gate.recorded() else {
                     continue;
-                }
+                };
                 let walk = table.find_location_by_walk(&key, key, gate.levels());
                 let live = index < inserted && index % 3 != 0;
                 assert_eq!(walk.is_some(), live, "n {n} d {d} index {index}");
@@ -3588,24 +3594,27 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
                 assert_eq!(table.find(&key, key), walk, "n {n} d {d} index {index}");
                 let probe = table.prf.prepare(key);
                 let scan = table
-                    .first_match(&key, probe, gate.wide_levels())
+                    .first_match(&key, probe, recorded)
                     .map(|found| table.slot_of(found.lane));
                 let found = scan.ok();
-                // An empty bin ends on the entry that is no level and the
-                // overflow bit on an absent one; neither finds anything.
-                let ends_on = |levels: u16| {
+                // An empty bin and the overflow bit each end on an absent
+                // entry, whatever the membership bits; neither finds
+                // anything.
+                let ends_on = |levels: u16, bits: u32| {
+                    let unit =
+                        WideLevelBin::of_recording_unit(unit_of(bits, levels), bits).unwrap();
                     table
-                        .first_match(&key, probe, unit_wide_levels(unit_of(0, levels)))
+                        .first_match(&key, probe, unit)
                         .map(|found| table.slot_of(found.lane))
                 };
-                assert!(
-                    ends_on(0).is_err_and(|last| !last.is_absent()),
-                    "n {n} d {d} index {index}"
-                );
-                assert!(
-                    ends_on(OVERFLOW_LEVEL_BIT).is_err_and(HeadLevel::is_absent),
-                    "n {n} d {d} index {index}"
-                );
+                for bits in [1, 1 << (MEMBERSHIP_BITS - 1)] {
+                    for levels in [0, OVERFLOW_LEVEL_BIT] {
+                        assert!(
+                            ends_on(levels, bits).is_err_and(HeadLevel::is_absent),
+                            "n {n} d {d} index {index}"
+                        );
+                    }
+                }
                 if scan.map_or_else(|last| table.unmatched_is_absent(last), |_| true) {
                     assert_eq!(found, walk, "n {n} d {d} index {index}");
                     // A bucket wider than a group is never scanned here.
@@ -3624,15 +3633,15 @@ fn first_match_lookup_agrees_with_the_ordered_walk_whenever_it_answers() {
     }
 }
 
-/// The first-match walk takes any half-word for a bin: an empty one, bits
-/// under the bin, every bit. It ends on the head entry of the lowest set
-/// bit, or on the last entry for an empty half-word; a key it finds is
-/// where the ordered walk finds it, and bits added to a key's own bin do
-/// not hide the key. On a shape with a head and on one without.
+/// The first-match walk takes any unit that is not zero: an empty bin, bits
+/// under the bin, every bit. It ends on the head entry of the bin's lowest
+/// set bit, or on the entry of the unit's leading zeros for an empty bin; a
+/// key it finds is where the ordered walk finds it, and bits added to a
+/// key's own unit do not hide the key. On a shape with a head and on one
+/// without.
 #[test]
 fn first_match_walks_any_half_word_to_the_entry_of_its_lowest_bit() {
-    const HALVES: [u32; 9] = [
-        0,
+    const HALVES: [u32; 8] = [
         1,
         1 << 15,
         1 << 16,
@@ -3666,17 +3675,18 @@ fn first_match_walks_any_half_word_to_the_entry_of_its_lowest_bit() {
             let probe = table.prf.prepare(key);
             let walk = table.find_location_by_walk(&key, key, u16::MAX);
             assert_eq!(walk.is_some(), key < inserted, "key {key}");
-            let gate = table.membership_gate(key);
-            let own = gate.wide_levels().get();
+            let recorded = table.membership_gate(key).recorded();
+            let own = recorded.map_or(0, WideLevelBin::get);
             let in_head =
-                gate.passes() && table.first_match(&key, probe, gate.wide_levels()).is_ok();
+                recorded.is_some_and(|levels| table.first_match(&key, probe, levels).is_ok());
             found_in_head += usize::from(in_head);
             for half in HALVES.into_iter().chain(HALVES.map(|half| half | own)) {
-                let lowest = match half {
-                    0 => HEAD_ENTRIES - 1,
-                    _ => (u32::BITS - 1 - half.trailing_zeros()) as usize,
+                let lowest = match half & UNIT_BIN_BITS {
+                    0 => half.leading_zeros() as usize,
+                    bin => (u32::BITS - 1 - bin.trailing_zeros()) as usize,
                 };
-                match table.first_match(&key, probe, WideLevelBin::of_unit_bin(half)) {
+                let unit = WideLevelBin::of_recording_unit(half, half).unwrap();
+                match table.first_match(&key, probe, unit) {
                     Ok(found) => {
                         let slot = table.slot_of(found.lane);
                         assert_eq!(Some(slot), walk, "key {key} half {half:#x}");
