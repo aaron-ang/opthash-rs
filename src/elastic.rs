@@ -944,7 +944,7 @@ impl ElasticRouteFilter<'_> {
         }
     }
 
-    /// Summary bits of the levels `route`'s bin has occupied. Bit `i` covers
+    /// Summary bits of the levels the key's bin has occupied. Bit `i` covers
     /// level `i` for `i < ROUTE_SUMMARY_LEVELS - 1`; the last bit is
     /// saturating and covers every deeper level. Read apart from the
     /// membership answer, so a lookup that ends before it narrows its levels
@@ -1642,15 +1642,6 @@ fn metadata_words(arena: &Arena, membership: MembershipRegion) -> *mut TailWord 
     unsafe { membership.ptr::<TailWord>(arena.as_ptr()) }
 }
 
-fn alloc_elastic_arena<K, V, A: Allocator + Clone>(
-    level_capacities: &[usize],
-    reserve_fraction: ReserveFraction,
-    alloc: &A,
-) -> ElasticArenaBuild<K, V> {
-    try_alloc_elastic_arena(level_capacities, reserve_fraction, alloc)
-        .unwrap_or_else(|_| handle_elastic_alloc_error::<K, V>(level_capacities))
-}
-
 /// Reports the failed allocation for `level_capacities`, or a placeholder
 /// layout when the geometry itself does not fit.
 #[cold]
@@ -1911,7 +1902,7 @@ where
         for level in &mut self.levels {
             level.scheduled_probes = 0;
         }
-        self.probe_schedule.clear();
+        self.probe_schedule.rewind(0);
         self.clear_membership();
         self.epoch.start(EpochTransition::Clear);
     }
@@ -2046,7 +2037,7 @@ where
         &self,
         target: BatchTarget,
     ) -> Option<(PlacementCase<'_, K, V>, u16, Option<u16>)> {
-        let case = self.placement_case(target, |_, budget| budget.unwrap_or(u64::MAX))?;
+        let case = self.placement_case(target)?;
         if case.region.index_shift() == GENERAL_REDUCTION {
             return None;
         }
@@ -2967,7 +2958,8 @@ where
         let alloc = self.alloc.clone();
         let level_capacities = PlanBuffer::from_iter(self.levels.iter().map(ArenaSlots::capacity));
         let (arena, levels, membership) =
-            alloc_elastic_arena(&level_capacities, self.reserve_fraction, &self.alloc);
+            try_alloc_elastic_arena(&level_capacities, self.reserve_fraction, &self.alloc)
+                .unwrap_or_else(|_| handle_elastic_alloc_error::<K, V>(&level_capacities));
 
         // If a user `K::clone` / `V::clone` panics, the guard drops the
         // already-cloned values and frees the arena; see `ArenaDropGuard`.
@@ -3338,17 +3330,11 @@ where
         })
     }
 
-    /// The paper's insertion case for `target`. `budget_of` turns the
-    /// case's probe bound for its level, `None` when the case sets none,
-    /// into the budget the caller searches with; resolving it per case
-    /// lets an unbounded case skip the comparison against a bound.
+    /// The paper's insertion case for `target`. A case that sets its level
+    /// no probe bound searches it with the largest budget.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn placement_case(
-        &self,
-        target: BatchTarget,
-        budget_of: impl Fn(&Level<SlotEntry<K, V>>, Option<u64>) -> u64,
-    ) -> Option<PlacementCase<'_, K, V>> {
+    fn placement_case(&self, target: BatchTarget) -> Option<PlacementCase<'_, K, V>> {
         // The paper's insertion cases, in order: Batch 0 fills level 0; then,
         // for the active pair, Case 2 (current nearly full) places in `next`,
         // Case 3 (next nearly full) in `current`, and Case 1 gives `current`
@@ -3357,7 +3343,7 @@ where
             BatchTarget::Bootstrap => PlacementCase {
                 level: 0,
                 region: self.levels.first()?,
-                budget: budget_of(self.levels.first()?, None),
+                budget: u64::MAX,
                 fallback: None,
                 full: false,
             },
@@ -3374,7 +3360,7 @@ where
                     PlacementCase {
                         level: next,
                         region: next_level,
-                        budget: budget_of(next_level, None),
+                        budget: u64::MAX,
                         fallback: None,
                         full: free_next == 0,
                     }
@@ -3382,7 +3368,7 @@ where
                     PlacementCase {
                         level: current,
                         region: current_level,
-                        budget: budget_of(current_level, None),
+                        budget: u64::MAX,
                         fallback: None,
                         full: false,
                     }
@@ -3397,7 +3383,7 @@ where
                     PlacementCase {
                         level: current,
                         region: current_level,
-                        budget: budget_of(current_level, Some(budget)),
+                        budget,
                         fallback: Some(next),
                         full: false,
                     }
@@ -3423,7 +3409,7 @@ where
             mut fallback,
             full,
             ..
-        } = self.placement_case(target, |_, budget| budget.unwrap_or(u64::MAX))?;
+        } = self.placement_case(target)?;
         if SKIP_FULL && full {
             return None;
         }

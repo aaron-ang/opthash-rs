@@ -1013,11 +1013,6 @@ impl ProbeSchedule {
         }
     }
 
-    /// Drops the pushed routes.
-    pub(super) fn clear(&mut self) {
-        self.rewind(0);
-    }
-
     /// Drops the pushed routes ahead of pushing those of the first `after`
     /// levels, every one of them and in the order a schedule of those
     /// levels takes them. Only whether every grouped level is among them is

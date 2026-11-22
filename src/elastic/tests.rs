@@ -4075,7 +4075,7 @@ fn every_walk_start_leads_to_the_routes_its_summary_leaves_open() {
             // Cleared, the schedule is empty and every run whole.
             table.probe_high_water &= HIGH_WATER_FLAGS;
             table.scheduled_levels = 0;
-            table.probe_schedule.clear();
+            table.probe_schedule.rewind(0);
             assert_eq!(table.probe_schedule.routes(), []);
             assert_eq!(table.probe_schedule.whole_runs(), named);
             assert_eq!(table.probe_schedule.whole_groups(), (0, fitted));
