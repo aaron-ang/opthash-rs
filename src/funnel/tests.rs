@@ -681,7 +681,7 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
             map::TableBackend::insert(&mut table, key, index, key);
             model.insert(key, index);
         }
-        let storage = table.storage.ctrl_ptr();
+        let generation = table.epoch_snapshot().generation;
         let threshold = capacity::tombstone_cleanup_threshold(table.shape.n);
         let mut fresh = budget;
         let (mut taken_back, mut reopened, mut refreshed, mut past_threshold) = (0, 0, 0, 0);
@@ -742,7 +742,11 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
                 assert!(tombstone_controls(&table) <= table.tombstones());
             }
         }
-        assert_eq!(table.storage.ctrl_ptr(), storage, "n {n} fill {fill}");
+        assert_eq!(
+            table.epoch_snapshot().generation,
+            generation,
+            "n {n} fill {fill}"
+        );
         assert_ne!(taken_back, 0, "n {n} fill {fill}");
         assert_ne!(refreshed, 0, "n {n} fill {fill}");
         assert_ne!(past_threshold, 0, "n {n} fill {fill}");
@@ -1122,6 +1126,24 @@ fn insert_checking_the_head_walk(
     let storage = table.storage.ctrl_ptr();
     let below_budget = table.entries() < table.shape.max_insertions;
     let walk = table.search_vacancy(probe);
+    // The scalar walk decides both: the slot of a present key, and the
+    // vacancy of an absent one. It misses only a key outside its funnel.
+    match ordered_walk(table, &key, key.hash) {
+        Walked::Hit(slot) => {
+            assert!(previous.is_some(), "{key:?}");
+            assert_eq!(table.find(&key, key.hash), Some(slot), "{key:?}");
+        }
+        missed => {
+            assert!(previous.is_none() || table.exceptional_placement, "{key:?}");
+            if previous.is_none() {
+                let vacant = match missed {
+                    Walked::Vacant(slot) => Some(slot),
+                    _ => None,
+                };
+                assert_eq!(walk.map(|vacancy| vacancy.slot), vacant, "{key:?}");
+            }
+        }
+    }
     // The head takes an absent key below the budget.
     let head = (previous.is_none() && below_budget && table.head_lanes != 0)
         .then(|| table.first_free_in_head(probe))
@@ -1985,8 +2007,8 @@ fn vacancy_walk_matches_the_ordered_walk_for_absent_keys() {
     check(&table, "tombstoned table");
 }
 
-/// With every level bit set, the read-only walk must report exactly the exact
-/// search's hits, for present and absent keys, on clean epochs and with
+/// With every level bit set, the read-only walk must report exactly the
+/// ordered walk's hits, for present and absent keys, on clean epochs and with
 /// tombstones on the walk.
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -2544,7 +2566,7 @@ fn level_masks_never_lose_a_live_key() {
     for i in (0..live).filter(|i| i % 3 != 0) {
         let key = spread(i);
         let slot = table.find(&key, key).unwrap();
-        // SAFETY: `find_location` returns occupied in-bounds slots.
+        // SAFETY: `find` returns occupied in-bounds slots.
         assert_eq!(unsafe { table.storage.get_ref(slot) }.value, i);
     }
 }

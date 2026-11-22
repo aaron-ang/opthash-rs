@@ -109,8 +109,8 @@ fn bench_entry_reinsert(c: &mut Criterion) {
     group.throughput(Throughput::Elements(removed.len() as u64));
 
     // A small delete burst leaves the original membership bits in place.
-    // Every absent Funnel entry therefore walks the exact search, unlike
-    // fresh-key insertion where a negative filter often skips that walk.
+    // Every absent Funnel entry therefore searches its recorded levels,
+    // unlike fresh-key insertion where a negative filter often skips that.
     macro_rules! setup {
         ($builder:expr) => {
             || {

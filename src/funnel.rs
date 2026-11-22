@@ -1253,9 +1253,9 @@ where
         None
     }
 
-    /// Read-only walk for `get`, `contains` and `remove`: the buckets of
-    /// [`Self::search_vacancy`] in the same order, restricted to the levels set in
-    /// the key's bin `levels`, shallowest first. It stops only at a real EMPTY
+    /// Read-only walk for every search of a key: the buckets of
+    /// [`Self::search_vacancy`] in the same order, restricted to the levels
+    /// set in the key's bin `levels`, shallowest first. It stops only at a real EMPTY
     /// and skips tombstones without recording them, since a lookup never needs
     /// the vacancy an insert would take.
     ///
@@ -1620,8 +1620,8 @@ where
         })
     }
 
-    /// One step of [`Self::first_free_in_head`]: the first free lane of the
-    /// key's bucket in head entry `index`, if it has one. `word` is the key's
+    /// One step of the head walk: the first free lane of the key's bucket in
+    /// head entry `index`, if it has one. `word` is the key's
     /// random word in that level, which the caller steps from the level
     /// before by [`FunnelPrf::level_step`].
     #[allow(clippy::inline_always)]
@@ -2140,7 +2140,7 @@ where
     }
 
     /// The head placement: moves an absent key and its value to the first
-    /// free lane of [`Self::first_free_in_head`]'s walk and records the
+    /// free lane of the head walk, EMPTY or a tombstone, and records the
     /// key in the filter, returning the lane it took. `None` when the head
     /// has no placement left or no vacancy for the key, which then stays
     /// where it is. Calls nothing.
@@ -2537,8 +2537,9 @@ where
 
     /// The first-match scan of [`map::TableBackend::find_for_entry`] for a
     /// key the filter recorded: the slot of a present key, [`ENTRY_ABSENT`]
-    /// for one the scan settles as absent, and [`ENTRY_UNSETTLED`] otherwise. One word and no call, so a
-    /// present key is found without a frame or a store.
+    /// for one the scan settles as absent, and [`ENTRY_UNSETTLED`]
+    /// otherwise. One word and no call, so a present key is found without
+    /// a frame or a store.
     #[inline(never)]
     fn find_recorded_for_entry<Q>(&self, key: &Q, hash: u64, levels: WideLevelBin) -> usize
     where
@@ -3064,9 +3065,11 @@ where
         unsafe { self.shape.reset_ordinary_controls(self.storage.ctrl_ptr()) };
         self.settle_counts();
         self.tombstones = 0;
-        self.set_entries(0);
         self.exceptional_placement = false;
+        // Before the counts, which arm the next settle from the filter's
+        // stale count.
         self.clear_membership();
+        self.set_entries(0);
         self.epoch.start(EpochTransition::Clear);
     }
 
