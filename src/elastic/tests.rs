@@ -1071,6 +1071,20 @@ fn metadata_place_from_signature(signature: u64, words: usize) -> (usize, u64, u
 }
 
 #[test]
+fn a_place_builds_its_bits_and_their_pairs_in_one_rotation() {
+    // Every lane bit index, under a word index and without one.
+    for reduction in (0..u64::from(u64::BITS)).flat_map(|bit| [bit, bit | (5 << 6)]) {
+        let place = MetadataPlace { reduction };
+        assert_eq!(
+            place.bits_with_pair(),
+            place.bits() | paired_bits(place.bits()),
+            "reduction {reduction:#x}"
+        );
+        assert_eq!(paired_bits(paired_bits(place.bits())), place.bits());
+    }
+}
+
+#[test]
 fn compact_prepared_elastic_state_is_register_sized() {
     assert_eq!(mem::size_of::<PreparedElasticRoute>(), 8);
     assert_eq!(

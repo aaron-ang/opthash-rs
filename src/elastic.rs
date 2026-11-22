@@ -179,6 +179,14 @@ impl MetadataPlace {
         bits
     }
 
+    /// [`Self::bits`] and their pairs ([`paired_bits`]), built apart from
+    /// the bits so an operation that never needs the pair builds neither.
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline]
+    const fn bits_with_pair(self) -> u64 {
+        (1 | paired_bits(1)).rotate_left(self.reduction as u32)
+    }
+
     /// The key's bin of its word's summaries.
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
@@ -1808,12 +1816,14 @@ where
     #[inline]
     unsafe fn forget_membership(&mut self, read: LaneRead) {
         let LaneRead { place, lane, bits } = read;
-        if lane & paired_bits(bits) == 0 {
-            // SAFETY: the filter passed the key, so its word holds a bit:
-            // it is a word of this table's tail, not the empty tail's
-            // shared one, and `&mut self` makes the write exclusive.
-            unsafe { (*self.membership_ptr().add(place.word())).membership = lane & !bits };
-        }
+        debug_assert_eq!(lane & bits, bits, "the filter did not pass the key");
+        // The key's bit where the lane holds no pair for it, else nothing.
+        // The lane holds the bit, so flipping it clears it.
+        let unshared = bits & !paired_bits(lane);
+        // SAFETY: the filter passed the key, so its word holds a bit: it is
+        // a word of this table's tail, not the empty tail's shared one, and
+        // `&mut self` makes the write exclusive.
+        unsafe { (*self.membership_ptr().add(place.word())).membership = lane ^ unshared };
     }
 
     fn clear_membership(&mut self) {
@@ -2784,7 +2794,7 @@ where
                     }
                     // The lane holds the key's bit, so the insert marks
                     // its pair.
-                    ScheduleSearch::Absent => read.bits |= paired_bits(read.bits),
+                    ScheduleSearch::Absent => read.bits = read.place.bits_with_pair(),
                     ScheduleSearch::Unresolved => break 'common,
                 }
             }
