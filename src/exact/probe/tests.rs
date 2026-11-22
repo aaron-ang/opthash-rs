@@ -366,7 +366,8 @@ fn fast_funnel_narrow_indices_match_checked_counter_encoding() {
 }
 
 /// The first random word of ordinary level `level`, restated without the
-/// prepared probe: the two halves of the keyed hash's product with the fold
+/// prepared probe. This pins the formula and is not an independent model: the
+/// two halves of the keyed hash's product with the fold
 /// constant, xored, times that constant once for each level up to `level`.
 #[allow(clippy::cast_possible_truncation)]
 fn scalar_ordinary_first_word(seed: u64, key: u64, level: u64) -> u64 {
@@ -517,6 +518,8 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
 fn fast_funnel_retries_and_exhaustion_use_distinct_checked_counters() {
     let oracle = FunnelPrf::new(0x1234_5678_9abc_def0);
     let range = PreparedProbeRange::new((1_usize << 63) + 1).unwrap();
+    // Restates the range reduction's acceptance test, so it pins the formula
+    // and is not an independent model.
     let accepts = |word: u64| {
         let product = u128::from(word) * u128::from(range.upper as u64);
         product as u64 >= range.rejection_threshold
