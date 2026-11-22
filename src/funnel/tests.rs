@@ -2166,6 +2166,23 @@ fn decompose_scalar_location(shape: &FunnelShape, location: ScalarFunnelLocation
     }
 }
 
+/// The oracle's number for storage slot `slot`. The oracle packs the
+/// ordinary buckets end to end; the storage starts one every whole group
+/// where a bucket is narrower, and leaves the lanes between unused. Both
+/// lay the special regions after the ordinary levels.
+fn scalar_slot_number(config: PaperConfig, slot: usize) -> usize {
+    let plan = config.funnel_plan().unwrap();
+    let beta = plan.beta();
+    let stride = beta.max(GROUP_SIZE);
+    let buckets: usize = plan.ordinary_bucket_counts().sum();
+    if slot < buckets * stride {
+        assert!(slot % stride < beta, "slot {slot} is a padding lane");
+        slot / stride * beta + slot % stride
+    } else {
+        slot - buckets * (stride - beta)
+    }
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn funnel_locations_match_the_independent_scalar_oracle() {
@@ -2193,8 +2210,14 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
                 None
             );
             let actual = table.find(&identity, identity).unwrap();
-            // The oracle numbers its slots without the padding lanes, so the
-            // two are compared by level, bucket and lane.
+            // The oracle numbers its slots without the padding lanes.
+            assert_eq!(
+                scalar_slot_number(config, actual),
+                expected.global_slot(),
+                "n={n} key={identity}"
+            );
+            // The shape's regions name the same slot by level, bucket and
+            // lane.
             assert_eq!(
                 actual,
                 decompose_scalar_location(&table.shape, expected),
