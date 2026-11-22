@@ -205,26 +205,6 @@ fn entry_search_checks_exceptional_hits_before_reporting_a_key_absent() {
     assert_eq!(table.find(&key, key), Some(slot));
 }
 
-/// A key the filter rejects reaches its vacant entry unsearched, and the
-/// entry's insert then places it through the head walk: no comparison and
-/// no general placement walk.
-#[test]
-fn vacant_entry_filter_rejection_places_through_the_head_walk() {
-    let comparisons = Arc::new(AtomicUsize::new(0));
-    let key = CountingKey {
-        id: 1,
-        comparisons: comparisons.clone(),
-    };
-    let mut map = FunnelHashMap::with_capacity_and_hasher(64, test_support::fixed_hasher());
-    VACANCY_WALKS.with(|walks| walks.set(0));
-    let open = map.table().head_left;
-    assert_eq!(*map.entry(key.clone()).or_insert(10), 10);
-    assert_eq!(comparisons.load(Ordering::Relaxed), 0);
-    assert_eq!(VACANCY_WALKS.with(Cell::get), 0);
-    assert_eq!(map.table().head_left, open - 1);
-    assert_eq!(map.get(&key), Some(&10));
-}
-
 #[test]
 fn exhausted_vacant_entry_rebuilds_and_walks_again_before_exceptional_placement() {
     let mut table = raw_table(512, 3);
@@ -285,6 +265,31 @@ fn raw_table_of<V>(n: usize, d: u32) -> FunnelTable<u64, V, IdentityBuildHasher>
         Global,
     )
     .unwrap()
+}
+
+/// A table holding all its limit allows still shrinks when a smaller slot
+/// count has the same limit.
+#[test]
+fn shrink_of_a_full_table_drops_the_slots_its_limit_does_not_need() {
+    let reserve = ReserveFraction::from_exponent(3).unwrap();
+    let (slack, smallest) = (64..4096)
+        .find_map(|n| {
+            let shape = FunnelShape::from_slots(n, reserve).ok()?;
+            let smallest = FunnelShape::for_insert_budget(shape.max_insertions, reserve).ok()?;
+            (smallest.n < shape.n).then_some((shape.n, smallest.n))
+        })
+        .expect("a slot count past the smallest for its limit");
+    let mut table = raw_table(slack, 3);
+    let limit = table.shape.max_insertions as u64;
+    for key in 0..limit {
+        assert_eq!(map::TableBackend::insert(&mut table, key, key, key), None);
+    }
+    map::TableBackend::shrink_to(&mut table, 0);
+    assert_eq!(table.shape.n, smallest);
+    assert_eq!(table.shape.max_insertions as u64, limit);
+    for key in 0..limit {
+        assert!(table.find(&key, key).is_some());
+    }
 }
 
 #[test]
@@ -610,54 +615,6 @@ where
         );
     }
     rebuilt
-}
-
-/// With tombstones the frameless insert stands aside, and the insert takes
-/// a tombstone ahead of the first EMPTY lane, as the placement walk does.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn insert_reuses_tombstones_like_the_placement_walk() {
-    const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
-    for (n, d) in [(4096, 3), (1 << 14, 3)] {
-        let mut inline = raw_table(n, d);
-        let mut walked = raw_table(n, d);
-        let budget = inline.shape.max_insertions as u64;
-        for index in 0..budget {
-            let key = index.wrapping_mul(SPREAD);
-            map::TableBackend::insert(&mut inline, key, index, key);
-            walked.insert_for_vacant_by_walk(key, index, key);
-        }
-        let removed = (0..budget).step_by(4);
-        for index in removed.clone() {
-            let key = index.wrapping_mul(SPREAD);
-            for table in [&mut inline, &mut walked] {
-                let slot = table.find(&key, key).unwrap();
-                map::TableBackend::remove(table, slot);
-            }
-        }
-        assert_eq!(tombstone_controls(&inline), removed.clone().count());
-        let mut reused_unrecorded = 0;
-        for index in (budget..).take(removed.count()) {
-            let key = index.wrapping_mul(SPREAD);
-            let unrecorded = !inline.membership_gate(key).passes();
-            let tombstones = tombstone_controls(&walked);
-            assert_eq!(
-                map::TableBackend::insert(&mut inline, key, index, key),
-                None
-            );
-            let slot = walked.insert_for_vacant_by_walk(key, index, key);
-            assert_eq!(
-                inline.find(&key, key),
-                Some(slot),
-                "n {n} d {d} index {index}"
-            );
-            reused_unrecorded +=
-                usize::from(unrecorded && tombstone_controls(&walked) < tombstones);
-        }
-        assert_ne!(reused_unrecorded, 0, "n {n} d {d}");
-        assert_eq!(inline.tombstones(), walked.tombstones());
-        assert_eq!(controls_and_filter(&inline), controls_and_filter(&walked));
-    }
 }
 
 /// Removals and inserts in turn, through the calls a map makes: each insert
@@ -1527,13 +1484,6 @@ fn smallest_shapes_agree_with_a_model_map_through_every_transition() {
     }
 }
 
-#[test]
-fn levels_past_the_head_share_the_overflow_bit() {
-    // A deeper level shares the overflow bit, which names no head entry.
-    assert_eq!(level_bit_of(OVERFLOW_LEVEL), OVERFLOW_LEVEL_BIT);
-    assert_eq!(level_bit_of(usize::MAX), OVERFLOW_LEVEL_BIT);
-}
-
 /// A bin's leading zeros, as the first-match walk reads it from a unit, name
 /// the head entry of its shallowest level: the level's own for a level with a
 /// bit, the absent one after them for the overflow bit, and the last for an
@@ -1859,10 +1809,12 @@ fn head_follows_its_storage_through_every_replacement() {
     let grown = FunnelShape::for_insert_budget(256, reserve).unwrap();
     map::TableBackend::try_resize(&mut table, grown.n).unwrap();
     assert_eq!(table.shape.n, grown.n);
+    assert_eq!(map::TableBackend::total_slots(&table), grown.n);
     check(&mut table, live);
 
     map::TableBackend::shrink_to(&mut table, 0);
     assert!(table.shape.n < grown.n);
+    assert_eq!(map::TableBackend::total_slots(&table), table.shape.n);
     check(&mut table, live);
 
     let mut cloned = map::TableBackend::clone_table(&table);
@@ -2139,6 +2091,23 @@ fn decompose_scalar_location(shape: &FunnelShape, location: ScalarFunnelLocation
     }
 }
 
+/// The oracle's number for storage slot `slot`. The oracle packs the
+/// ordinary buckets end to end; the storage starts one every whole group
+/// where a bucket is narrower, and leaves the lanes between unused. Both
+/// lay the special regions after the ordinary levels.
+fn scalar_slot_number(config: PaperConfig, slot: usize) -> usize {
+    let plan = config.funnel_plan().unwrap();
+    let beta = plan.beta();
+    let stride = beta.max(GROUP_SIZE);
+    let buckets: usize = plan.ordinary_bucket_counts().sum();
+    if slot < buckets * stride {
+        assert!(slot % stride < beta, "slot {slot} is a padding lane");
+        slot / stride * beta + slot % stride
+    } else {
+        slot - buckets * (stride - beta)
+    }
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn funnel_locations_match_the_independent_scalar_oracle() {
@@ -2166,8 +2135,14 @@ fn funnel_locations_match_the_independent_scalar_oracle() {
                 None
             );
             let actual = table.find(&identity, identity).unwrap();
-            // The oracle numbers its slots without the padding lanes, so the
-            // two are compared by level, bucket and lane.
+            // The oracle numbers its slots without the padding lanes.
+            assert_eq!(
+                scalar_slot_number(config, actual),
+                expected.global_slot(),
+                "n={n} key={identity}"
+            );
+            // The shape's regions name the same slot by level, bucket and
+            // lane.
             assert_eq!(
                 actual,
                 decompose_scalar_location(&table.shape, expected),

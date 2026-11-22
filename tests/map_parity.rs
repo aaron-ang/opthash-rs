@@ -1201,6 +1201,127 @@ macro_rules! parity_suite {
             }
 
             #[test]
+            fn consuming_iterators_report_the_std_size_hint_at_every_step() {
+                let pairs = (0..40_u32).map(|key| (key, key * 3));
+                let model: std::collections::HashMap<u32, u32> = pairs.clone().collect();
+
+                let mut map: HashMap<u32, u32> = pairs.clone().collect();
+                let mut model_drain = model.clone();
+                let (mut ours, mut theirs) = (map.drain(), model_drain.drain());
+                loop {
+                    assert_eq!(ours.size_hint(), theirs.size_hint());
+                    assert_eq!(ours.len(), theirs.len());
+                    if ours.next().is_none() {
+                        break;
+                    }
+                    theirs.next();
+                }
+                drop(ours);
+                assert!(map.is_empty());
+
+                let map: HashMap<u32, u32> = pairs.collect();
+                let (mut ours, mut theirs) = (map.into_iter(), model.into_iter());
+                loop {
+                    assert_eq!(ours.size_hint(), theirs.size_hint());
+                    if ours.next().is_none() {
+                        break;
+                    }
+                    theirs.next();
+                }
+            }
+
+            #[test]
+            fn extract_if_size_hint_brackets_what_it_yields() {
+                type Keep = fn(u32) -> bool;
+                let keeps: [(Keep, usize); 3] =
+                    [(|_| false, 0), (|key| key % 2 == 0, 20), (|_| true, 40)];
+                for (extract, expected) in keeps {
+                    let mut map: HashMap<u32, u32> = (0..40).map(|key| (key, key)).collect();
+                    let mut extracted = map.extract_if(|key, _| extract(*key));
+                    let mut left = expected;
+                    loop {
+                        let (lower, upper) = extracted.size_hint();
+                        assert!(lower <= left, "{lower} of {left}");
+                        assert!(
+                            upper.is_none_or(|upper| left <= upper),
+                            "{upper:?} of {left}"
+                        );
+                        if extracted.next().is_none() {
+                            break;
+                        }
+                        left -= 1;
+                    }
+                    assert_eq!(left, 0);
+                    drop(extracted);
+                    assert_eq!(map.len(), 40 - expected);
+                }
+            }
+
+            #[test]
+            #[allow(deprecated)]
+            fn default_hasher_constructors_keep_their_capacity_and_reserve() {
+                // Default-hasher constructor surface; no key is hashed here.
+                type HM = opthash::$TestMap<i32, i32>;
+                let reserve = opthash::ReserveFraction::from_exponent(4).unwrap();
+                assert_ne!(reserve, opthash::ReserveFraction::default());
+
+                assert!(HM::with_capacity(100).capacity() >= 100);
+                assert_eq!(HM::with_reserve(reserve).reserve_fraction(), reserve);
+                assert_eq!(HM::with_reserve(reserve).capacity(), 0);
+                assert_eq!(
+                    HM::with_reserve_fraction(0.0625).reserve_fraction(),
+                    reserve
+                );
+            }
+
+            #[test]
+            fn entry_or_default_counts_like_std() {
+                let words = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3];
+                let mut map: HashMap<i32, u32> = HashMap::new();
+                let mut model = std::collections::BTreeMap::<i32, u32>::new();
+                for word in words {
+                    *map.entry(word).or_default() += 1;
+                    *model.entry(word).or_default() += 1;
+                    assert_eq!(map.get(&word), model.get(&word));
+                }
+                assert_eq!(map.len(), model.len());
+                for (word, count) in &model {
+                    assert_eq!(map.get(word), Some(count));
+                }
+            }
+
+            #[test]
+            fn maps_of_one_length_compare_by_their_pairs() {
+                let model = std::collections::HashMap::from([(1, 2), (2, 3), (3, 4)]);
+                let base: HashMap<i32, i32> = model.iter().map(|(&k, &v)| (k, v)).collect();
+                // Another key, another value, a subset and a superset.
+                for other in [
+                    vec![(1, 2), (2, 3), (4, 4)],
+                    vec![(1, 2), (2, 3), (3, 5)],
+                    vec![(1, 2), (2, 3)],
+                    vec![(1, 2), (2, 3), (3, 4), (4, 5)],
+                    vec![(3, 4), (2, 3), (1, 2)],
+                ] {
+                    let theirs: std::collections::HashMap<i32, i32> =
+                        other.iter().copied().collect();
+                    let ours: HashMap<i32, i32> = other.into_iter().collect();
+                    assert_eq!(base == ours, model == theirs);
+                    assert_eq!(ours == base, model == theirs);
+                }
+            }
+
+            #[test]
+            fn occupied_error_displays_the_rejected_value_and_the_entry() {
+                let mut map: HashMap<i32, &str> = HashMap::new();
+                map.insert(7, "held");
+                let error = map.try_insert(7, "rejected").unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    r#"tried to insert "rejected", but key 7 was already present with "held""#
+                );
+            }
+
+            #[test]
             fn test_from_array() {
                 let map: HashMap<i32, i32> = HashMap::from_iter([(1, 10), (2, 20)]);
                 let from_array = <HashMap<i32, i32>>::from([(1, 10), (2, 20)]);
