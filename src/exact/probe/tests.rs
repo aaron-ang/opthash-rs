@@ -253,24 +253,48 @@ fn fast_funnel_prepared_words_and_reductions_match_the_generic_oracle() {
             ProbeDomain::FunnelSpecialFallbackChoiceB,
         ] {
             let prepared_domain = prepared.prepare_domain(domain).unwrap();
+            // An ordinary level draws its first word from the level multiplier
+            // and only its retries from the counter permutation.
+            let ordinary_level = match domain {
+                ProbeDomain::FunnelOrdinary { level } => Some(level),
+                _ => None,
+            };
             for logical in [0_u8, 1, 7, u8::MAX] {
+                let first_word_level = ordinary_level.filter(|_| logical == 0);
                 for retry in [0_u8, 1, 7, u8::MAX] {
+                    let word = match first_word_level {
+                        Some(level) if retry == 0 => prepared
+                            .ordinary_first_word(FunnelPrf::ordinary_multiplier(level).unwrap()),
+                        _ => prepared_domain.word(u64::from(logical), u32::from(retry)),
+                    };
                     assert_eq!(
-                        prepared_domain.word(u64::from(logical), u32::from(retry)),
+                        word,
                         oracle.word(key, domain, u64::from(logical), u32::from(retry))
                     );
                 }
                 for upper in [1, 2, 3, 16, 191, 1_237, 1 << 20] {
                     let range = PreparedProbeRange::new(upper).unwrap();
-                    assert_eq!(
-                        unbiased_prepared_funnel_probe_index_in_range(
-                            &prepared_domain,
-                            logical,
-                            range,
-                            8,
-                        ),
-                        unbiased_probe_index(&oracle, key, domain, u64::from(logical), upper, 8,)
-                    );
+                    let expected =
+                        unbiased_probe_index(&oracle, key, domain, u64::from(logical), upper, 8);
+                    if let Some(level) = first_word_level {
+                        let multiplier = FunnelPrf::ordinary_multiplier(level).unwrap();
+                        let level = usize::try_from(level).unwrap();
+                        assert_eq!(
+                            ordinary_funnel_first_index(prepared, multiplier, range)
+                                .or_else(|| ordinary_funnel_retry_index(prepared, level, range)),
+                            expected.ok().map(|probe| probe.index)
+                        );
+                    } else {
+                        assert_eq!(
+                            unbiased_prepared_funnel_probe_index_in_range(
+                                &prepared_domain,
+                                logical,
+                                range,
+                                8,
+                            ),
+                            expected
+                        );
+                    }
                 }
             }
         }
@@ -329,7 +353,6 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
             try_pack_funnel_counter(domain, logical, retry),
             Some(counter)
         );
-        assert_eq!(oracle.word(key, domain, logical, retry), word);
         assert_eq!(
             oracle
                 .prepare(key)
@@ -338,7 +361,16 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
                 .word(logical, retry),
             word
         );
+        // The oracle serves an ordinary level's first word from the level
+        // multiplier, pinned below.
+        if !matches!(domain, ProbeDomain::FunnelOrdinary { .. }) || (logical, retry) != (0, 0) {
+            assert_eq!(oracle.word(key, domain, logical, retry), word);
+        }
     }
+    assert_eq!(
+        oracle.word(0, ProbeDomain::FunnelOrdinary { level: 0 }, 0, 0),
+        0xa075_8163_8770_9699
+    );
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -505,4 +537,17 @@ fn fast_funnel_awkward_ranges_have_no_large_fixed_seed_skew() {
             .unwrap()
             .index
     });
+}
+
+/// Two levels sharing a multiplier would send every key to correlated
+/// buckets in both.
+#[test]
+fn ordinary_level_multipliers_are_odd_and_distinct() {
+    let levels = 0..4_096_u64;
+    let multipliers = levels
+        .clone()
+        .map(|level| FunnelPrf::ordinary_multiplier(level).unwrap())
+        .collect::<alloc::collections::BTreeSet<_>>();
+    assert_eq!(multipliers.len() as u64, levels.end);
+    assert!(multipliers.iter().all(|multiplier| multiplier % 2 == 1));
 }
