@@ -1018,6 +1018,11 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// Deletes since the filter last matched the live set, less
     /// [`Self::uncounted_deletes`]; see [`membership::refresh_deletes`].
     stale_membership: usize,
+    /// With [`Self::stale_membership`], a bound on the tombstones: the
+    /// deletes a filter refresh took out of that count, since the controls
+    /// were last reset or counted. A placement that takes a tombstone's
+    /// lane leaves it as it is.
+    refreshed_deletes: usize,
     /// Deletes left before one has to look at the counters: a delete only
     /// counts this word down, and the first to exhaust it settles the rest.
     settle_left: usize,
@@ -1180,6 +1185,7 @@ where
             prf: FunnelPrf::new(FUNNEL_PROBE_SEED),
             membership,
             stale_membership: 0,
+            refreshed_deletes: 0,
             settle_left: 1,
             settle_armed: 1,
         };
@@ -1852,6 +1858,8 @@ where
             hashes.push(self.hash_builder.hash_one(&entry.key));
         }
         bin_entries[bin] = in_bin;
+        // The tombstones of the deletes the filter now forgets stay.
+        self.refreshed_deletes = self.refreshed_deletes.saturating_add(self.stale_membership);
         self.clear_membership();
         let mut hashes = hashes.into_iter();
         for (bin, entries) in bin_entries.into_iter().enumerate() {
@@ -1895,25 +1903,24 @@ where
         }
     }
 
-    /// Whether a bulk delete leaves a cleanup due: the deletes since the
-    /// filter last matched the live set are past the cleanup threshold, and
-    /// a count finds as many tombstones still in place. A placement that
-    /// took a tombstone's lane since then is why the count can fall short.
-    /// A filter refresh starts those deletes again from zero, so tombstones
-    /// older than the last refresh make no cleanup due by themselves.
-    fn cleanup_is_due(&self) -> bool {
+    /// Whether a bulk delete leaves a cleanup due: the bound on the
+    /// tombstones is past the cleanup threshold and a count of them
+    /// confirms it. A count that leaves the cleanup off becomes the bound,
+    /// so the next count waits for as many deletes again.
+    fn cleanup_is_due(&mut self) -> bool {
         let threshold = capacity::tombstone_cleanup_threshold(self.shape.n);
-        if self.stale_membership <= threshold {
+        if self.refreshed_deletes.saturating_add(self.stale_membership) <= threshold {
             return false;
         }
         // SAFETY: the storage holds `shape.slots` initialized control bytes,
-        // and `&self` keeps writers out.
+        // and `&mut self` keeps writers out.
         let controls =
             unsafe { core::slice::from_raw_parts(self.storage.ctrl_ptr(), self.shape.slots) };
         let tombstones: usize = controls
             .iter()
             .map(|&control| usize::from(control == CTRL_TOMBSTONE))
             .sum();
+        self.refreshed_deletes = tombstones.saturating_sub(self.stale_membership);
         tombstones > threshold
     }
 
@@ -2069,6 +2076,12 @@ where
     #[inline]
     fn uncounted_deletes(&self) -> usize {
         self.settle_armed.wrapping_sub(self.settle_left)
+    }
+
+    /// The bound on the tombstones, with the uncounted deletes in it.
+    #[cfg(test)]
+    fn tombstone_bound(&self) -> usize {
+        self.refreshed_deletes + self.stale_membership()
     }
 
     #[cfg(test)]
@@ -2554,6 +2567,7 @@ where
                 stale_membership: 0,
             },
         );
+        self.refreshed_deletes = 0;
         self.epoch.start_epoch(transition, recovered);
         Ok(())
     }
@@ -3022,6 +3036,7 @@ where
         // entry was dropped.
         unsafe { self.shape.reset_ordinary_controls(self.storage.ctrl_ptr()) };
         self.settle_counts();
+        self.refreshed_deletes = 0;
         self.exceptional_placement = false;
         // Before the counts, which arm the next settle from the filter's
         // stale count.
@@ -3046,6 +3061,7 @@ where
         cloned.storage.clone_region_from(&self.storage);
         cloned.epoch = self.epoch;
         cloned.stale_membership = self.stale_membership;
+        cloned.refreshed_deletes = self.refreshed_deletes;
         // The uncounted deletes come along: counted here, they land in the
         // clone's own counts.
         cloned.settle_left = cloned.settle_armed.wrapping_sub(self.uncounted_deletes());

@@ -375,9 +375,9 @@ fn partial_extract_drop_finishes_deferred_tombstone_cleanup() {
 }
 
 /// A bulk removal cleans up the tombstones single removals left, even when
-/// it removes nothing itself. It rebuilds nothing once inserts have taken
-/// those tombstones back, nor once the single removals have gone on to
-/// refresh the filter, which starts their count again.
+/// it removes nothing itself and even when the single removals have gone on
+/// to refresh the filter. It rebuilds nothing once inserts have taken those
+/// tombstones back.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn funnel_bulk_removal_cleans_only_the_tombstones_still_in_place() {
@@ -417,11 +417,11 @@ fn funnel_bulk_removal_cleans_only_the_tombstones_still_in_place() {
 
         let after = map.epoch();
         assert_eq!(map.capacity(), capacity, "{then:?}");
-        if then == Then::Nothing {
-            assert_eq!(after.generation, before.generation + 1);
-            assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
+        if then == Then::Refill {
+            assert_eq!(after.generation, before.generation);
         } else {
-            assert_eq!(after.generation, before.generation, "{then:?}");
+            assert_eq!(after.generation, before.generation + 1, "{then:?}");
+            assert_eq!(after.transition, EpochTransition::TombstoneCleanup);
         }
         if then == Then::Refill {
             assert_identity_present!(map, 0..capacity);

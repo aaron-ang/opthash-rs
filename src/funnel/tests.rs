@@ -659,7 +659,7 @@ fn insert_reuses_tombstones_like_the_placement_walk() {
 /// and leaves the table holding what a model map holds. The turns take back
 /// the key just removed or a new one, alone or two at a time, at half the
 /// insertion limit and at the limit, for long enough to refresh the filter
-/// and to delete more keys than the cleanup threshold.
+/// and to carry the tombstone bound past the cleanup threshold.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn churn_places_like_the_placement_walk_and_never_rebuilds() {
@@ -677,7 +677,8 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
         }
         let generation = table.epoch_snapshot().generation;
         let mut fresh = budget;
-        let (mut taken_back, mut reopened, mut refreshed, mut deleted) = (0, 0, 0, 0);
+        let threshold = capacity::tombstone_cleanup_threshold(table.shape.n);
+        let (mut taken_back, mut reopened, mut refreshed, mut past_threshold) = (0, 0, 0, 0);
         for turn in 0..3 * table.shape.max_insertions {
             let pairs = if turn % 7 == 6 { 2 } else { 1 };
             let mut removed = Vec::new();
@@ -692,7 +693,6 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
                     "n {n} turn {turn}"
                 );
                 refreshed += usize::from(table.stale_membership() < stale);
-                deleted += 1;
                 removed.push(index);
             }
             for index in removed {
@@ -717,6 +717,7 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
                 let control = unsafe { table.storage.control_at(walk.slot) };
                 taken_back += usize::from(control == CTRL_TOMBSTONE);
                 reopened += usize::from(table.head_left == 0);
+                past_threshold += usize::from(table.tombstone_bound() > threshold);
                 assert_eq!(
                     map::TableBackend::insert(&mut table, key, index, key),
                     model.insert(key, index),
@@ -739,10 +740,7 @@ fn churn_places_like_the_placement_walk_and_never_rebuilds() {
         );
         assert_ne!(taken_back, 0, "n {n} fill {fill}");
         assert_ne!(refreshed, 0, "n {n} fill {fill}");
-        assert!(
-            deleted > capacity::tombstone_cleanup_threshold(table.shape.n),
-            "n {n} fill {fill}"
-        );
+        assert_ne!(past_threshold, 0, "n {n} fill {fill}");
         assert_ne!(reopened, 0, "n {n} fill {fill}");
         for (key, value) in &model {
             let slot = table.find(key, *key).unwrap();
@@ -1018,7 +1016,9 @@ fn assert_matches_model(
     // The head never has more placements left than the limit less the
     // entries.
     assert!(table.head_left <= table.shape.head_insertions().saturating_sub(model.len()));
-    // No delete ran past the threshold it had to settle at.
+    // The tombstone bound holds with the uncounted deletes added, and no
+    // delete ran past the threshold it had to settle at.
+    assert!(table.tombstone_bound() >= tombstone_controls(table));
     assert!(table.stale_membership() <= membership::refresh_deletes(table.shape.max_insertions));
     assert!(table.settle_left >= 1);
     coverage.uncounted_deletes += usize::from(table.uncounted_deletes() != 0);
