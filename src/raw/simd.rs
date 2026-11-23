@@ -259,8 +259,8 @@ mod swar {
     const HI: u64 = 0x8080_8080_8080_8080;
     const ONES: u64 = 0x0101_0101_0101_0101;
 
-    /// Either end is correct; the targets this fallback serves differ in
-    /// which count is cheap.
+    /// Either end is correct, and the targets this fallback serves differ in
+    /// which count is cheap, so the choice between them is arbitrary.
     pub(crate) const LEADS_FROM_LAST_LANE: bool = true;
 
     /// Load eight control bytes as one little-endian word (lane `i` = bits `[8*i, 8*i+7]`).
