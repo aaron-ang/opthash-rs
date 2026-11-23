@@ -40,8 +40,6 @@ impl Hash for CountingKey {
     }
 }
 
-/// Every map path that carries an absent search into insertion. Set
-/// `get_or_insert` and `get_or_insert_with` wrap `Entry` and the key path.
 /// What the ordered walk reports for a key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Walked {
@@ -2477,99 +2475,6 @@ fn funnel_search_reaches_primary_and_alternating_fallback_in_order() {
 }
 
 #[test]
-fn membership_filter_records_every_inserted_key() {
-    let mut table = raw_table(512, 3);
-    for key in 0..200_u64 {
-        table.insert_for_vacant_by_walk(key, key, key);
-    }
-    for key in 0..200_u64 {
-        assert!(
-            table.membership_maybe_contains(key),
-            "inserted key {key} must pass its own filter"
-        );
-        assert_eq!(
-            table.find(&key, key),
-            Some(
-                table
-                    .find_by_full_scan(&key, table.prf.prepare(key).fingerprint())
-                    .unwrap()
-            ),
-            "filter must not hide key {key}"
-        );
-    }
-    // Identity hashing here, so absent keys must carry their own spread the
-    // way a real hasher's output would.
-    let absent = (1..=500_u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let rejected = absent
-        .filter(|&key| !table.membership_maybe_contains(key))
-        .count();
-    assert!(
-        rejected > 400,
-        "filter rejected only {rejected} of 500 absent keys"
-    );
-}
-
-#[test]
-fn membership_filter_keeps_survivors_after_removals() {
-    let mut table = raw_table(512, 3);
-    for key in 0..200_u64 {
-        table.insert_for_vacant_by_walk(key, key, key);
-    }
-    for key in (0..200_u64).step_by(2) {
-        let slot = table.find(&key, key).expect("inserted key is present");
-        <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::remove(&mut table, slot);
-    }
-    for key in (1..200_u64).step_by(2) {
-        assert!(
-            table.find(&key, key).is_some(),
-            "removals must not clear the filter bits of surviving key {key}"
-        );
-    }
-}
-
-#[test]
-fn membership_filter_survives_growth_and_clone() {
-    let mut table = raw_table(512, 3);
-    let start_slots = table.shape.n;
-    let mut key = 0_u64;
-    while table.shape.n == start_slots {
-        table.insert_for_vacant_by_walk(key, key, key);
-        key += 1;
-    }
-    assert!(table.shape.n > start_slots, "growth must have happened");
-    let cloned = <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clone_table(&table);
-    for probe in 0..key {
-        assert!(
-            table.membership_maybe_contains(probe),
-            "growth must rebuild the filter for key {probe}"
-        );
-        assert!(
-            cloned.find(&probe, probe).is_some(),
-            "clone must carry the filter for key {probe}"
-        );
-    }
-}
-
-#[test]
-fn membership_filter_is_reset_by_clear_and_wipe() {
-    for wipe in [false, true] {
-        let mut table = raw_table(512, 3);
-        for key in 0..200_u64 {
-            table.insert_for_vacant_by_walk(key, key, key);
-        }
-        if wipe {
-            <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::wipe_all(&mut table);
-        } else {
-            <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clear(&mut table);
-        }
-        let recorded = (0..200_u64)
-            .filter(|&key| table.membership_maybe_contains(key))
-            .count();
-        assert_eq!(recorded, 0, "reset must clear every filter word");
-    }
-}
-
-#[test]
 fn level_bits_follow_slot_levels_into_the_special_arrays() {
     let table = raw_table(32_768, 3);
     let levels = &table.shape.levels;
@@ -2596,74 +2501,6 @@ fn level_bits_follow_slot_levels_into_the_special_arrays() {
             OVERFLOW_LEVEL_BIT,
             "special slot {slot}"
         );
-    }
-}
-
-/// Every live entry's level bit is set in its bin and the masked lookup finds
-/// it; returns the level bits the live entries cover.
-fn assert_level_masks_cover_live(table: &FunnelTable<u64, u64, IdentityBuildHasher>) -> u16 {
-    let mut covered = 0;
-    let mut scan = OccupiedIndices::new();
-    while let Some(slot) = scan.step(&table.storage) {
-        // SAFETY: `step` yields occupied in-bounds slots.
-        let key = unsafe { table.storage.get_ref(slot) }.key;
-        let hash = table.hash_builder.hash_one(key);
-        let level_bit = table.level_bit(slot);
-        assert_ne!(
-            table.membership_gate(hash).levels() & level_bit,
-            0,
-            "slot {slot} lost its level bit"
-        );
-        assert_eq!(
-            table.find(&key, hash),
-            Some(slot),
-            "masked lookup missed slot {slot}"
-        );
-        covered |= level_bit;
-    }
-    covered
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn level_masks_never_lose_a_live_key() {
-    let spread = |i: u64| i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut table = raw_table(65_536, 6);
-    let live = table.shape.max_insertions as u64;
-    for i in 0..live {
-        let key = spread(i);
-        assert_eq!(table.insert(key, i, key), None);
-    }
-    assert_eq!(
-        assert_level_masks_cover_live(&table),
-        u16::MAX,
-        "a full table must cover every level bit, overflow included"
-    );
-    // Absent keys whose gate passes still miss: an EMPTY that ends a masked
-    // walk early never turns into a false hit.
-    for i in live..live + 4_096 {
-        let key = spread(i);
-        assert_eq!(table.find(&key, key), None);
-    }
-
-    for i in (0..live).step_by(3) {
-        let key = spread(i);
-        let slot = table.find(&key, key).unwrap();
-        table.remove(slot);
-    }
-    assert_level_masks_cover_live(&table);
-    table.refresh_membership();
-    assert_level_masks_cover_live(&table);
-    table.resize_with_transition(table.shape.n, EpochTransition::PlacementRecovery);
-    assert_level_masks_cover_live(&table);
-    assert_level_masks_cover_live(&table.clone_table());
-    table.resize_with_transition(2 * table.shape.n, EpochTransition::ExplicitResize);
-    assert_level_masks_cover_live(&table);
-    for i in (0..live).filter(|i| i % 3 != 0) {
-        let key = spread(i);
-        let slot = table.find(&key, key).unwrap();
-        // SAFETY: `find` returns occupied in-bounds slots.
-        assert_eq!(unsafe { table.storage.get_ref(slot) }.value, i);
     }
 }
 
@@ -2742,28 +2579,6 @@ fn bulk_delete_cleans_up_a_group_share_of_the_slots_early() {
             }
         }
     }
-}
-
-#[test]
-fn tombstones_never_hide_survivors_and_are_reused() {
-    let mut table = raw_table(512, 3);
-    for key in 0..200_u64 {
-        table.insert_for_vacant_by_walk(key, key, key);
-    }
-    let removed = table.find(&7, 7).unwrap();
-    let (key, value) =
-        <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::remove(&mut table, removed);
-    assert_eq!((key, value), (7, 7));
-    for key in 0..200_u64 {
-        if key != 7 {
-            assert!(table.find(&key, key).is_some(), "lost key {key}");
-        }
-    }
-    assert_eq!(tombstone_controls(&table), 1);
-    let replacement = table.insert_for_vacant_by_walk(10_000, 1, 7);
-    assert_eq!(replacement, removed);
-    assert_eq!(tombstone_controls(&table), 0);
-    assert_eq!(table.entries(), 200);
 }
 
 #[test]

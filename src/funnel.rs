@@ -1834,21 +1834,6 @@ where
         self.membership.base
     }
 
-    /// `false` proves no insert ever recorded this key.
-    #[cfg(test)]
-    #[inline]
-    fn membership_maybe_contains(&self, key_hash: u64) -> bool {
-        let words = self.membership.region.words;
-        if words == 0 {
-            return false;
-        }
-        let bits = membership_bit(key_hash);
-        let word = membership::word(key_hash, words);
-        // SAFETY: `word` is a multiply-high reduction below `words`, and the
-        // arena's tail holds exactly that many zero-initialized words.
-        unsafe { unit_records(*self.membership_ptr().add(word), bits) }
-    }
-
     /// This key's filter unit index and bit for the current epoch. Only an
     /// empty geometry has no units; its index is then zero, and the gate reads
     /// the shared all-zero unit, which no key passes.
