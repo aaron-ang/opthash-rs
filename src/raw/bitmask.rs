@@ -34,21 +34,6 @@ pub(crate) const LEAD_ORIGIN: usize = if simd::LEADS_FROM_LAST_LANE {
 pub(crate) struct BitMask(pub(crate) BitMaskWord);
 
 impl BitMask {
-    /// Lowest set slot if it lies below `limit`, without iterating.
-    ///
-    /// Slots come out in ascending order, so once the lowest one is at or past
-    /// `limit` no later one can qualify. Equivalent to
-    /// `self.find(|&lane| lane < limit)` minus the loop.
-    #[inline]
-    #[must_use]
-    pub(crate) fn first_below(&self, limit: usize) -> Option<usize> {
-        if self.0 == 0 {
-            return None;
-        }
-        let slot = (self.0.trailing_zeros() / BITMASK_STRIDE) as usize;
-        (slot < limit).then_some(slot)
-    }
-
     /// How far the lead match lies from [`LEAD_ORIGIN`], in mask bits. The
     /// lead is the match at the end of the mask the group backend locates
     /// cheapest; a walk that only needs some match, not the lowest, takes it.

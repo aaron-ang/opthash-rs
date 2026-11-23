@@ -274,9 +274,7 @@ impl FunnelShape {
         if !self.places_through_head() {
             return 0;
         }
-        (0..self.beta).fold(0, |lanes, lane| {
-            lanes | 1 << (lane * BITMASK_STRIDE as usize + BITMASK_SLOT_BIT as usize)
-        })
+        low_lanes(self.beta)
     }
 
     /// Entries a table may place through its head.
@@ -882,8 +880,9 @@ unsafe fn scan_clean_funnel_group<T>(
     let group = unsafe { ctrl_ptr.add(start) };
     // SAFETY: as above, `group` is readable for one full group.
     let matches = unsafe { simd::eq_mask_group(group, fingerprint) };
-    // Iterator search on purpose: `BitMask::first_below` is the same test, but
-    // here LLVM lowers it to a select chain instead of one test-and-branch.
+    // Iterator search on purpose: a test of the lowest lane against the
+    // bound is the same test, but here LLVM lowers it to a select chain
+    // instead of one test-and-branch.
     // SAFETY: as above.
     let first_empty = unsafe { simd::eq_mask_group(group, CTRL_EMPTY) }
         .into_iter()
@@ -980,27 +979,82 @@ unsafe fn first_match_in_lanes(
     None
 }
 
-/// First free (EMPTY or TOMBSTONE) slot among `length` logical controls.
+/// The slot bits of a group mask that are its lanes.
+const ALL_LANES: u64 = {
+    let mut lanes = 0;
+    let mut lane = 0;
+    while lane < GROUP_SIZE {
+        lanes |= 1 << (lane * BITMASK_STRIDE as usize + BITMASK_SLOT_BIT as usize);
+        lane += 1;
+    }
+    lanes
+};
+
+/// The slot bits of a group mask that are its first `lanes` lanes, at most
+/// [`GROUP_SIZE`].
+#[allow(clippy::cast_possible_truncation)]
+const fn low_lanes(lanes: usize) -> u64 {
+    ALL_LANES & u64::MAX.unbounded_shr(u64::BITS - lanes as u32 * BITMASK_STRIDE)
+}
+
+/// The lanes of an ordinary bucket as [`first_free_in_bucket`] reads them:
+/// those of its head group, and the offset of its tail's last group from
+/// the tail's first with that last group's lanes, none without a tail.
+#[derive(Clone, Copy)]
+struct BucketLanes {
+    head: u64,
+    last_group: usize,
+    last: u64,
+}
+
+impl BucketLanes {
+    /// The lanes of a bucket `beta` lanes wide.
+    fn of(beta: usize) -> Self {
+        let head = beta.min(GROUP_SIZE);
+        let tail = beta - head;
+        let last_group = tail.saturating_sub(1) / GROUP_SIZE * GROUP_SIZE;
+        Self {
+            head: low_lanes(head),
+            last_group,
+            last: low_lanes(tail - last_group),
+        }
+    }
+}
+
+/// First free (EMPTY or TOMBSTONE) lane of an ordinary bucket: its head
+/// group's lanes from `head`, then its tail's from `tail`, whole groups and
+/// then the last.
 ///
 /// # Safety
 ///
-/// `ctrl_ptr.add(start)` must be readable through `length + GROUP_SIZE - 1`
-/// bytes.
+/// `ctrl_ptr` must be readable for a group from `head` and from each group
+/// of the tail, the last included even for a bucket without a tail.
 #[inline]
-unsafe fn first_free_in_bucket(ctrl_ptr: *const u8, start: usize, length: usize) -> Option<usize> {
-    let end = start + length;
-    let mut position = start;
-    while position < end {
-        let logical_lanes = GROUP_SIZE.min(end - position);
-        // SAFETY: `position < start + length`, so a full group from `position`
-        // stays within the caller's `length + GROUP_SIZE - 1` readable bytes.
-        let free = unsafe { simd::free_mask_group(ctrl_ptr.add(position)) };
-        if let Some(lane) = free.first_below(logical_lanes) {
-            return Some(position + lane);
-        }
-        position += logical_lanes;
+unsafe fn first_free_in_bucket(
+    ctrl_ptr: *const u8,
+    head: usize,
+    tail: usize,
+    lanes: BucketLanes,
+) -> Option<usize> {
+    // SAFETY: the caller keeps every group this reads readable.
+    let free_in =
+        |group: usize, mask: u64| unsafe { simd::free_lanes_group(ctrl_ptr.add(group), mask).0 };
+    let at = |group: usize, free: u64| group + (free.trailing_zeros() / BITMASK_STRIDE) as usize;
+    let free = free_in(head, lanes.head);
+    if free != 0 {
+        return Some(at(head, free));
     }
-    None
+    let last = tail + lanes.last_group;
+    let mut group = tail;
+    while group != last {
+        let free = free_in(group, ALL_LANES);
+        if free != 0 {
+            return Some(at(group, free));
+        }
+        group += GROUP_SIZE;
+    }
+    let free = free_in(last, lanes.last);
+    (free != 0).then(|| at(last, free))
 }
 
 /// Paper-exact Funnel hashing within each table epoch. Deletion, growth, and
@@ -1695,20 +1749,24 @@ where
         }
         let shape = &self.shape;
         let ctrl_ptr = self.storage.ctrl_ptr();
+        let lanes = BucketLanes::of(shape.beta);
+        // Each level's word is the level before's times the step, which
+        // is what its multiplier makes of the key's folded word.
+        let level_step = self.prf.level_step();
+        let mut word = probe.ordinary_first_word(level_step);
         for (index, level) in shape.levels.iter().enumerate() {
-            let bucket = Self::sample_ordinary(probe, level);
-            let head = FunnelShape::head_start(level, bucket);
-            // SAFETY: a head group and a tail end at or before `slots`, and
-            // the control array pads a group past them.
+            let bucket = probe::ordinary_bucket_of_word(word, level.buckets);
+            word = word.wrapping_mul(level_step);
+            // SAFETY: a head group and every group of a tail start before
+            // `slots`, as does the group after a level without tails, and
+            // the control array pads a group past `slots`.
             let free = unsafe {
-                match simd::free_mask_group(ctrl_ptr.add(head)).first_below(shape.head_width()) {
-                    Some(lane) => Some(head + lane),
-                    None => first_free_in_bucket(
-                        ctrl_ptr,
-                        shape.tail_start(level, bucket),
-                        shape.tail_width(),
-                    ),
-                }
+                first_free_in_bucket(
+                    ctrl_ptr,
+                    FunnelShape::head_start(level, bucket),
+                    shape.tail_start(level, bucket),
+                    lanes,
+                )
             };
             if let Some(slot) = free {
                 return Some(Vacancy {
@@ -2399,8 +2457,9 @@ where
                 Err(last) if self.unmatched_is_absent(last) => {}
                 Err(_) => return self.insert_past_head(key, value, hash, false),
             }
-        } else if self.head_left != 0 {
-            // The caller's head walk ran and found no free lane.
+        } else if self.head_left != 0 || self.head_lanes == 0 {
+            // The caller's head walk ran and found no free lane, or the
+            // shape has none to walk.
             return self.insert_past_head(key, value, hash, true);
         }
         self.insert_absent(key, value, hash, index, unit, probe)

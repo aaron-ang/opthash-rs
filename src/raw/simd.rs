@@ -45,9 +45,10 @@ mod neon {
         unsafe { eq_mask_group(ptr, control_fingerprint_low(word)) }
     }
 
-    #[inline]
-    #[must_use]
-    pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
+    /// The free lanes of a group, read through the vector unit: the
+    /// reference [`free_lanes_group`] is tested against.
+    #[cfg(test)]
+    unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
         // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         unsafe {
             let bytes = aarch64::vld1_u8(ptr);
@@ -218,19 +219,12 @@ mod sse2 {
         }
     }
 
-    #[inline]
-    #[must_use]
-    pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
-        // SAFETY: caller guarantees 16 readable bytes.
-        BitMask(u64::from(unsafe { occupied_bits(ptr) } ^ 0xFFFF))
-    }
-
     /// The slot bits of `lanes` whose control is free.
     #[inline]
     #[must_use]
     pub(crate) unsafe fn free_lanes_group(ptr: *const u8, lanes: u64) -> BitMask {
         // SAFETY: caller guarantees 16 readable bytes.
-        BitMask(unsafe { free_mask_group(ptr) }.0 & lanes)
+        BitMask(u64::from(unsafe { occupied_bits(ptr) } ^ 0xFFFF) & lanes)
     }
 
     /// Bitmask of occupied slots; padding and tombstones are excluded.
@@ -337,13 +331,6 @@ mod swar {
     pub(crate) unsafe fn eq_fingerprint_group(ptr: *const u8, word: u64) -> BitMask {
         // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         unsafe { eq_mask_group(ptr, control_fingerprint_low(word)) }
-    }
-
-    #[inline]
-    #[must_use]
-    pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
-        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
-        BitMask(free_mask(unsafe { word(ptr) }))
     }
 
     /// The slot bits of `lanes` whose control is free.
@@ -468,7 +455,7 @@ use sse2 as backend;
 use swar as backend;
 
 pub(crate) use backend::{
-    LEADS_FROM_LAST_LANE, eq_fingerprint_group, eq_mask_group, free_lanes_group, free_mask_group,
+    LEADS_FROM_LAST_LANE, eq_fingerprint_group, eq_mask_group, free_lanes_group,
     occupied_mask_group,
 };
 
