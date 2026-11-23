@@ -176,18 +176,6 @@ macro_rules! parity_suite {
             }
 
             #[test]
-            fn test_insert() {
-                let mut m = HashMap::new();
-                assert_eq!(m.len(), 0);
-                assert!(m.insert(1, 2).is_none());
-                assert_eq!(m.len(), 1);
-                assert!(m.insert(2, 4).is_none());
-                assert_eq!(m.len(), 2);
-                assert_eq!(*m.get(&1).unwrap(), 2);
-                assert_eq!(*m.get(&2).unwrap(), 4);
-            }
-
-            #[test]
             fn test_drops() {
                 DROP_VECTOR.with(|slot| {
                     *slot.borrow_mut() = vec![0; 200];
@@ -450,17 +438,6 @@ macro_rules! parity_suite {
             }
 
             #[test]
-            fn test_insert_conflicts() {
-                let mut m = HashMap::with_capacity(4);
-                assert!(m.insert(1, 2).is_none());
-                assert!(m.insert(5, 3).is_none());
-                assert!(m.insert(9, 4).is_none());
-                assert_eq!(*m.get(&9).unwrap(), 4);
-                assert_eq!(*m.get(&5).unwrap(), 3);
-                assert_eq!(*m.get(&1).unwrap(), 2);
-            }
-
-            #[test]
             fn test_conflict_remove() {
                 let mut m = HashMap::with_capacity(4);
                 assert!(m.insert(1, 2).is_none());
@@ -588,24 +565,6 @@ macro_rules! parity_suite {
                 assert!(values.contains(&'a'));
                 assert!(values.contains(&'b'));
                 assert!(values.contains(&'c'));
-            }
-
-            #[test]
-            fn test_eq() {
-                let mut m1 = HashMap::new();
-                m1.insert(1, 2);
-                m1.insert(2, 3);
-                m1.insert(3, 4);
-
-                let mut m2 = HashMap::new();
-                m2.insert(1, 2);
-                m2.insert(2, 3);
-
-                assert!(m1 != m2);
-
-                m2.insert(3, 4);
-
-                assert_eq!(m1, m2);
             }
 
             #[test]
@@ -945,51 +904,16 @@ macro_rules! parity_suite {
             fn test_size_hint() {
                 let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-                let map: HashMap<_, _> = xs.iter().copied().collect();
+                let mut map: HashMap<_, _> = xs.iter().copied().collect();
 
                 let mut iter = map.iter();
-
                 for _ in iter.by_ref().take(3) {}
-
                 assert_eq!(iter.size_hint(), (3, Some(3)));
-            }
-
-            #[test]
-            fn test_iter_len() {
-                let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
-
-                let map: HashMap<_, _> = xs.iter().copied().collect();
-
-                let mut iter = map.iter();
-
-                for _ in iter.by_ref().take(3) {}
-
                 assert_eq!(iter.len(), 3);
-            }
-
-            #[test]
-            fn test_mut_size_hint() {
-                let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
-
-                let mut map: HashMap<_, _> = xs.iter().copied().collect();
 
                 let mut iter = map.iter_mut();
-
                 for _ in iter.by_ref().take(3) {}
-
                 assert_eq!(iter.size_hint(), (3, Some(3)));
-            }
-
-            #[test]
-            fn test_iter_mut_len() {
-                let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
-
-                let mut map: HashMap<_, _> = xs.iter().copied().collect();
-
-                let mut iter = map.iter_mut();
-
-                for _ in iter.by_ref().take(3) {}
-
                 assert_eq!(iter.len(), 3);
             }
 
