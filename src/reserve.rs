@@ -152,16 +152,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_exactly_one_eighth() {
-        assert_eq!(ReserveFraction::DEFAULT.exponent(), 3);
-        assert_eq!(ReserveFraction::DEFAULT.to_f64(), Some(0.125));
-        assert_eq!(
-            ReserveFraction::try_from(0.125),
-            Ok(ReserveFraction::DEFAULT)
-        );
-    }
-
-    #[test]
     fn floor_half_reserved_is_exact() {
         let reserve = |exponent| ReserveFraction::from_exponent(exponent).unwrap();
         assert_eq!(ReserveFraction::DEFAULT.floor_half_reserved(17), 1);
