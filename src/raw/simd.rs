@@ -358,7 +358,7 @@ mod swar {
 
         // Representative and adversarial words: cross-byte borrow adjacencies
         // (0x00/0x01/0x80) and the full 0..=255 range, not just real control bytes.
-        fn sample_words() -> [[u8; 8]; 10] {
+        fn sample_words() -> [[u8; 8]; 11] {
             [
                 [CTRL_EMPTY; 8],
                 [CTRL_TOMBSTONE; 8],
@@ -370,6 +370,7 @@ mod swar {
                 [0x7f, 0x80, 0x00, 0x01, 0x7f, 0x80, 0x00, 0x01],
                 [0xff, 0xfe, 0xfd, 0xfc, 0x80, 0x7f, 0x01, 0x00],
                 [0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80],
+                [0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             ]
         }
 
@@ -384,17 +385,6 @@ mod swar {
                     );
                 }
             }
-        }
-
-        #[test]
-        fn eq_empty_flags_only_exact_zero() {
-            // Matching CTRL_EMPTY must never false-positive against a tombstone or
-            // occupied byte: that would terminate a present key's probe early.
-            for bytes in sample_words() {
-                assert_eq!(eq_mask(word(bytes), CTRL_EMPTY), ref_eq(bytes, CTRL_EMPTY));
-            }
-            assert_eq!(eq_mask(word([CTRL_TOMBSTONE; 8]), CTRL_EMPTY), 0);
-            assert_eq!(eq_mask(word([0x2a; 8]), CTRL_EMPTY), 0);
         }
 
         #[test]
@@ -431,28 +421,6 @@ mod swar {
                     assert_eq!(cut, free & lanes, "{bytes:02x?} lanes={lanes:#x}");
                 }
             }
-        }
-
-        #[test]
-        fn no_cross_byte_borrow() {
-            // A lone occupied byte among empties flags exactly its own lane.
-            let bytes = [0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-            assert_eq!(occupied_mask(word(bytes)), 0x80u64 << 8);
-            assert_eq!(eq_mask(word(bytes), 0x81), 0x80u64 << 8);
-            // Ascending distinct bytes: eq to byte i flags only lane i.
-            let asc = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
-            for (i, &b) in asc.iter().enumerate() {
-                assert_eq!(eq_mask(word(asc), b), 0x80u64 << (8 * i), "byte {b:#04x}");
-            }
-        }
-
-        #[test]
-        fn match_lands_in_lane_high_bit() {
-            assert_eq!(eq_mask(word([9; 8]), 9), HI);
-            assert_eq!(
-                eq_mask(word([0, 0, 0, 9, 0, 0, 0, 0]), 9),
-                0x80u64 << (8 * 3)
-            );
         }
     }
 }
