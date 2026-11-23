@@ -14,7 +14,7 @@ mod neon {
     use core::arch::aarch64;
 
     use super::BitMask;
-    use crate::raw::control::OCCUPIED_BIT;
+    use crate::raw::control::{OCCUPIED_BIT, control_fingerprint_low};
 
     /// The highest match is located by one leading-zero count; the lowest
     /// needs a bit reversal before the count.
@@ -36,6 +36,13 @@ mod neon {
             let bytes = aarch64::vld1_u8(ptr);
             lane_mask(aarch64::vceq_u8(bytes, aarch64::vdup_n_u8(target)))
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) unsafe fn eq_fingerprint_group(ptr: *const u8, word: u64) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
+        unsafe { eq_mask_group(ptr, control_fingerprint_low(word)) }
     }
 
     #[inline]
@@ -142,6 +149,7 @@ mod sse2 {
     use core::arch::x86_64::{self, __m128i};
 
     use super::BitMask;
+    use crate::raw::control::OCCUPIED_BIT;
 
     /// The lowest match is located by one trailing-zero count; the leading
     /// count of baseline x86-64 is a bit scan that needs a correction.
@@ -188,6 +196,25 @@ mod sse2 {
         unsafe {
             let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
             lane_mask(x86_64::_mm_cmpeq_epi8(data, splat(target)))
+        }
+    }
+
+    /// Lanes whose control byte is `control_fingerprint_low(word)`. The low
+    /// byte of `word` is spread to every lane first and `OCCUPIED_BIT` is set
+    /// in the spread word, so the byte needs no masking before the spread.
+    #[inline]
+    #[must_use]
+    pub(crate) unsafe fn eq_fingerprint_group(ptr: *const u8, word: u64) -> BitMask {
+        #[allow(clippy::cast_possible_truncation)]
+        let spread =
+            (u32::from(word as u8) * 0x0101_0101) | (u32::from(OCCUPIED_BIT) * 0x0101_0101);
+        // SAFETY: SSE2 is baseline on x86_64; caller guarantees 16 readable
+        // bytes and `loadu` has no alignment requirement.
+        unsafe {
+            let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
+            let target =
+                x86_64::_mm_shuffle_epi32::<0>(x86_64::_mm_cvtsi32_si128(spread.cast_signed()));
+            lane_mask(x86_64::_mm_cmpeq_epi8(data, target))
         }
     }
 
@@ -254,6 +281,7 @@ mod sse2 {
 #[cfg(opthash_scalar_group)]
 mod swar {
     use super::BitMask;
+    use crate::raw::control::control_fingerprint_low;
 
     const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     const HI: u64 = 0x8080_8080_8080_8080;
@@ -302,6 +330,13 @@ mod swar {
     pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
         // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         BitMask(eq_mask(unsafe { word(ptr) }, target))
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) unsafe fn eq_fingerprint_group(ptr: *const u8, word: u64) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
+        unsafe { eq_mask_group(ptr, control_fingerprint_low(word)) }
     }
 
     #[inline]
@@ -433,5 +468,43 @@ use sse2 as backend;
 use swar as backend;
 
 pub(crate) use backend::{
-    LEADS_FROM_LAST_LANE, eq_mask_group, free_lanes_group, free_mask_group, occupied_mask_group,
+    LEADS_FROM_LAST_LANE, eq_fingerprint_group, eq_mask_group, free_lanes_group, free_mask_group,
+    occupied_mask_group,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::{eq_fingerprint_group, eq_mask_group};
+    use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE, OCCUPIED_BIT, control_fingerprint_low};
+
+    #[test]
+    fn fingerprint_group_matches_the_byte_of_its_word() {
+        let words = [
+            0,
+            0x7f,
+            0x80,
+            0xff,
+            0x2a,
+            !0x7f,
+            u64::MAX,
+            0x1234_5678_9abc_def0,
+        ];
+        for word in words {
+            let byte = control_fingerprint_low(word);
+            let mut controls = [CTRL_EMPTY; 16];
+            controls[1] = CTRL_TOMBSTONE;
+            controls[3] = byte;
+            controls[6] = byte ^ 1;
+            controls[7] = byte & !OCCUPIED_BIT;
+            controls[15] = byte;
+            // SAFETY: `controls` holds one group of either width.
+            let (fingerprint, plain) = unsafe {
+                (
+                    eq_fingerprint_group(controls.as_ptr(), word),
+                    eq_mask_group(controls.as_ptr(), byte),
+                )
+            };
+            assert_eq!(fingerprint.0, plain.0, "word {word:#x}");
+        }
+    }
+}

@@ -522,6 +522,13 @@ impl PreparedFastFunnelProbe {
         crate::raw::control::control_fingerprint_low(self.key_out)
     }
 
+    /// The folded word `fingerprint` reads, for a group compare that forms
+    /// the occupied byte in its own lanes.
+    #[inline]
+    pub(crate) const fn fingerprint_word(self) -> u64 {
+        self.key_out
+    }
+
     #[inline]
     pub(crate) const fn ordinary_first_word(self, multiplier: u64) -> u64 {
         self.key_out.wrapping_mul(multiplier)

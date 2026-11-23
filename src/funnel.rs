@@ -1345,7 +1345,7 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let key_fingerprint = probe.fingerprint();
+        let fingerprint_word = probe.fingerprint_word();
         // Fingerprint matches of the head group of the key's bucket in one
         // level, with the bucket's index in the level. The head group is a
         // whole group, so the bucket index scales in the load.
@@ -1358,7 +1358,7 @@ where
             // lane of the group is a lane of the bucket but its padding,
             // which no fingerprint matches.
             let matches =
-                unsafe { simd::eq_mask_group(level.group(bucket).cast(), key_fingerprint) };
+                unsafe { simd::eq_fingerprint_group(level.group(bucket).cast(), fingerprint_word) };
             (bucket, matches.0)
         };
         // The entry at the lead match of bucket `bucket` of `level`, if it
