@@ -206,26 +206,6 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
 ) where
     P: TableBackend<u64, u64, Hasher = FixedHashBuilder, Alloc = Global>,
 {
-    assert_deletes_past_threshold_refresh_filter_from(
-        gate_passes,
-        stale_membership,
-        refresh_at,
-        |admitted, departed| assert_eq!(admitted, departed),
-    );
-}
-
-/// [`assert_deletes_past_threshold_refresh_filter`] for a filter that may
-/// drop a key as it departs: `admitted_before_refresh` checks how many of
-/// the departed keys the filter admits before the refresh, of how many
-/// departed.
-pub(crate) fn assert_deletes_past_threshold_refresh_filter_from<P>(
-    gate_passes: impl Fn(&P, u64) -> bool,
-    stale_membership: impl Fn(&P) -> usize,
-    refresh_at: impl Fn(u64) -> u64,
-    admitted_before_refresh: impl Fn(usize, usize),
-) where
-    P: TableBackend<u64, u64, Hasher = FixedHashBuilder, Alloc = Global>,
-{
     let mut map: HashMap<u64, u64, P> = Deterministic::with_capacity(2_048);
     let live = map.capacity() as u64;
     let threshold = membership::refresh_deletes(map.capacity()) as u64;
@@ -243,7 +223,7 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter_from<P>(
         .iter()
         .filter(|&&key| gate_passes(map.table(), key))
         .count();
-    admitted_before_refresh(admitted, departed.len());
+    assert_eq!(admitted, departed.len());
     assert_eq!(stale_membership(map.table()) as u64, departed.len() as u64);
     assert_eq!(map.epoch().generation, 0);
 
