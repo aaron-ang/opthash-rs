@@ -447,7 +447,7 @@ pub(crate) fn assert_clear_tombstones_each_slot_before_dropping_its_value<P>(
 
 /// A key whose `Hash` panics while a resize rehashes it leaves the table
 /// as it was: every entry counted, reachable and undropped. The table then
-/// takes an insert and a resize, and drops every value once.
+/// takes an insert and a resize, and drops every key and value once.
 ///
 /// `assert_counts_match_controls` checks the backend's counts against its
 /// occupied control bytes.
@@ -493,8 +493,13 @@ pub(crate) fn assert_hash_panic_during_resize_keeps_every_entry<P>(
     for id in (0..LIVE).chain([100]) {
         assert!(map.contains_key(&key(id)), "key {id}");
     }
+    let probe_key_drops = key_drops.load(Ordering::SeqCst) as u64;
     drop(map);
     assert_eq!(drops.load(Ordering::SeqCst) as u64, LIVE + 1);
+    assert_eq!(
+        key_drops.load(Ordering::SeqCst) as u64,
+        probe_key_drops + LIVE + 1
+    );
 }
 
 /// Work-queue churn at fixed capacity: pop the first key in iteration order,

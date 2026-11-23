@@ -2660,6 +2660,34 @@ fn level_masks_never_lose_a_live_key() {
     }
 }
 
+#[test]
+fn exact_geometry_sums_to_n() {
+    let mut table = raw_table(512, 3);
+    for key in 0..128_u64 {
+        table.insert_for_vacant_by_walk(key, key, key);
+    }
+    let ordinary_slots = table
+        .shape
+        .levels
+        .iter()
+        .map(|level| level.buckets * table.shape.beta)
+        .sum::<usize>();
+    assert_eq!(
+        ordinary_slots
+            + table.shape.primary_range.upper()
+            + table.shape.fallback_bucket_range.upper() * table.shape.fallback_bucket_width,
+        table.shape.n
+    );
+    let padding = table
+        .shape
+        .levels
+        .iter()
+        .map(|level| level.buckets * (table.shape.stride - table.shape.beta))
+        .sum::<usize>();
+    assert_eq!(table.storage.capacity(), table.shape.n + padding);
+    assert_eq!(table.shape.slots, table.shape.n + padding);
+}
+
 /// A bulk delete that removes nothing cleans up once the tombstones in
 /// place come within a group's share of the slots of the threshold, however
 /// many placements took a tombstone's lane since the deletes. One tombstone

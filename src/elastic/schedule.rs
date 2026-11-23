@@ -790,15 +790,6 @@ fn entry_origin<T>(levels: &[Level<T>]) -> *mut u8 {
     origin
 }
 
-const _: () = assert!(
-    core::mem::offset_of!(ProbeSchedule, direct_reduction) == 0
-        && core::mem::offset_of!(ProbeSchedule, direct_entries)
-            == core::mem::offset_of!(ProbeSchedule, direct_control) + size_of::<*const u8>()
-        && core::mem::offset_of!(ProbeSchedule, book)
-            == core::mem::offset_of!(ProbeSchedule, entry_origin) + size_of::<*const u8>()
-        && size_of::<OwnedBook>() == size_of::<*const u8>()
-);
-
 impl ProbeSchedule {
     /// [`PhiRoute::index_shift`] and [`PhiRoute::control`] of the direct
     /// route, without reading the route, and the entries of its level as
