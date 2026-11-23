@@ -169,6 +169,17 @@ mod sse2 {
         BitMask(u64::from(bits))
     }
 
+    /// `byte` in every lane. The byte is spread across one 32-bit word by a
+    /// multiply and the word across the vector by one shuffle, which baseline
+    /// SSE2 has no single broadcast for.
+    #[inline]
+    #[must_use]
+    fn splat(byte: u8) -> __m128i {
+        let word = u32::from(byte) * 0x0101_0101;
+        // SAFETY: SSE2 is baseline on x86_64.
+        unsafe { x86_64::_mm_shuffle_epi32::<0>(x86_64::_mm_cvtsi32_si128(word.cast_signed())) }
+    }
+
     #[inline]
     #[must_use]
     pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
@@ -176,8 +187,7 @@ mod sse2 {
         // bytes and `loadu` has no alignment requirement.
         unsafe {
             let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
-            let target_vec = x86_64::_mm_set1_epi8(target.cast_signed());
-            lane_mask(x86_64::_mm_cmpeq_epi8(data, target_vec))
+            lane_mask(x86_64::_mm_cmpeq_epi8(data, splat(target)))
         }
     }
 
