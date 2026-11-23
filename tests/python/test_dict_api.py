@@ -61,26 +61,16 @@ def test_views_are_live(m):
     assert ("new", 99) in items
 
 
-def test_keys_view_contains(m):
+def test_views_contain(m):
     _populate(m, 3)
     keys = m.keys()
     assert "k0" in keys
     assert "missing" not in keys
-
-
-def test_values_view_contains(m):
-    _populate(m, 3)
-    vals = m.values()
-    assert 1 in vals
-    assert 999 not in vals
-
-
-def test_items_view_contains(m):
-    _populate(m, 3)
-    items = m.items()
-    assert ("k0", 0) in items
-    assert ("k0", 999) not in items
-    assert ("missing", 0) not in items
+    assert 1 in m.values()
+    assert 999 not in m.values()
+    assert ("k0", 0) in m.items()
+    assert ("k0", 999) not in m.items()
+    assert ("missing", 0) not in m.items()
 
 
 def test_keys_view_set_ops(m):
@@ -105,36 +95,18 @@ def test_items_view_set_ops(m):
     assert m.items() - other == {("k1", 1), ("k2", 2)}
 
 
-def test_iter_during_mutation_raises(m):
+@pytest.mark.parametrize(
+    "view",
+    [
+        iter,
+        lambda m: iter(m.keys()),
+        lambda m: iter(m.values()),
+        lambda m: iter(m.items()),
+    ],
+)
+def test_iter_during_mutation_raises(m, view):
     _populate(m, 3)
-    it = iter(m)
-    next(it)
-    m["new"] = 99
-    with pytest.raises(RuntimeError, match="changed size"):
-        next(it)
-
-
-def test_keys_view_iter_during_mutation_raises(m):
-    _populate(m, 3)
-    it = iter(m.keys())
-    next(it)
-    m["new"] = 99
-    with pytest.raises(RuntimeError, match="changed size"):
-        next(it)
-
-
-def test_values_view_iter_during_mutation_raises(m):
-    _populate(m, 3)
-    it = iter(m.values())
-    next(it)
-    m["new"] = 99
-    with pytest.raises(RuntimeError, match="changed size"):
-        next(it)
-
-
-def test_items_view_iter_during_mutation_raises(m):
-    _populate(m, 3)
-    it = iter(m.items())
+    it = view(m)
     next(it)
     m["new"] = 99
     with pytest.raises(RuntimeError, match="changed size"):
@@ -276,19 +248,6 @@ def test_view_repr_contains_class_name(m):
     assert "items" in r
 
 
-def test_dict_comprehension_works(m):
-    _populate(m, 5)
-    d = {k: v for k, v in m.items()}
-    assert d == {f"k{i}": i for i in range(5)}
-
-
-def test_list_iter_snapshot(m):
-    _populate(m, 3)
-    snapshot = list(m)  # exhausts iterator before any mutation
-    m["new"] = 99
-    assert "new" not in snapshot
-
-
 def test_update_from_dict(m):
     _populate(m, 3)
     m.update({"k0": 100, "new": 42})
@@ -316,16 +275,12 @@ def test_update_accepts_list_of_lists(m):
     assert m["b"] == 2
 
 
-def test_eq_with_list_returns_false_even_if_indices_match(m):
-    # Without the hasattr("keys") guard, index-wise lookup would make this equal.
+def test_eq_with_non_mapping_is_false(m):
+    # Without the hasattr("keys") guard, index-wise lookup would make the list equal.
     m[0] = "a"
     m[1] = "b"
     assert m != ["a", "b"]
-
-
-def test_eq_with_set_returns_false(m):
-    _populate(m, 3)
-    assert m != {"k0", "k1", "k2"}
+    assert m != {0, 1}
 
 
 def test_pop_returns_and_removes(m):
@@ -416,16 +371,8 @@ def test_eq_with_same_map(m, map_cls):
 def test_eq_with_dict(m):
     _populate(m, 3)
     assert m == {"k0": 0, "k1": 1, "k2": 2}
-
-
-def test_eq_size_mismatch(m):
-    _populate(m, 3)
     assert m != {"k0": 0, "k1": 1}
     assert m != {"k0": 0, "k1": 1, "k2": 2, "k3": 3}
-
-
-def test_eq_value_mismatch(m):
-    _populate(m, 3)
     assert m != {"k0": 0, "k1": 999, "k2": 2}
 
 

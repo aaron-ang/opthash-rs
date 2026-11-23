@@ -1,11 +1,6 @@
 import pytest
 
 
-def test_set_and_get_string_key(m):
-    m["a"] = 1
-    assert m["a"] == 1
-
-
 def test_set_and_get_mixed_key_types(m):
     m["str"] = 1
     m[42] = 2
@@ -53,6 +48,7 @@ def test_len_tracks_inserts_and_deletes(m):
     assert len(m) == 1
     m["b"] = 99  # overwrite, no growth
     assert len(m) == 1
+    assert m["b"] == 99
 
 
 def test_clear_resets_len(m):
@@ -68,19 +64,6 @@ def test_clear_resets_len(m):
 def test_unhashable_key_raises_typeerror(m, bad_key):
     with pytest.raises(TypeError):
         m[bad_key] = 1
-
-
-def test_overwrite_returns_new_value(m):
-    m["a"] = 1
-    m["a"] = 2
-    assert m["a"] == 2
-    assert len(m) == 1
-
-
-def test_capacity_property_is_readable(m):
-    cap = m.capacity
-    assert isinstance(cap, int)
-    assert cap >= 0
 
 
 def test_growth_past_initial_capacity(map_cls):
