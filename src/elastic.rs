@@ -2497,24 +2497,29 @@ where
         if high_water <= u128::from(prior_high_water) {
             return;
         }
+        let high_water = u64::try_from(high_water).expect("Elastic query cap fits u64");
         // A level's positions grow with its probe, so each level offers its
         // next unscheduled probe and the lowest position among them is the
-        // next route in position order.
+        // next route in position order. A level with no probe left at or
+        // below the high-water mark offers `u64::MAX`, above every position
+        // it could offer: a coordinate the bounded encoder rejects lies past
+        // the cap too.
         let position = |level: usize, paper_probe: u64| {
-            let phi = probe::elastic_phi(level as u128 + 1, u128::from(paper_probe))
-                .expect("bounded Elastic query coordinate");
-            (phi <= high_water).then_some(phi)
+            let paper_level = u32::try_from(level + 1).expect("Elastic level count fits u32");
+            probe::elastic_phi_bounded(paper_level, paper_probe)
+                .filter(|&phi| phi <= high_water)
+                .unwrap_or(u64::MAX)
         };
         let levels = &mut self.levels[..self.scheduled_levels as usize];
-        let mut next = [None; MAX_LEVELS];
+        let mut next = [u64::MAX; MAX_LEVELS];
         for (level, region) in levels.iter().enumerate() {
             next[level] = position(level, u64::from(region.scheduled_probes) + 1);
         }
         while let Some((level, _)) = next[..levels.len()]
             .iter()
             .enumerate()
-            .filter_map(|(level, phi)| phi.map(|phi| (level, phi)))
-            .min_by_key(|&(_, phi)| phi)
+            .min_by_key(|&(_, &phi)| phi)
+            .filter(|&(_, &phi)| phi != u64::MAX)
         {
             let logical_probe_index = u64::from(levels[level].scheduled_probes);
             // Level zero's first probe is the direct slot, which every
