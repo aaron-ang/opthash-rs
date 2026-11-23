@@ -91,7 +91,7 @@ impl ExactTrace {
         let limits = ScalarElasticLimits::new(
             NonZeroUsize::new(ELASTIC_PROBE_BUDGET_C as usize).unwrap(),
             NonZeroU32::new(probe::RANGE_WORD_CAP).unwrap(),
-            NonZeroU64::new(UNIFORM_SEARCH_CAP).unwrap(),
+            NonZeroU64::new(QUERY_PROBE_LIMIT).unwrap(),
             NonZeroU128::new(QUERY_POSITION_CAP).unwrap(),
         );
         let scalar = ScalarElastic::new(config, CounterPrf::new(ELASTIC_PROBE_SEED), limits);
@@ -326,7 +326,7 @@ fn compact_query_counters_cover_every_supported_geometry() {
     assert!(probe::elastic_phi(1, 384).unwrap() > QUERY_POSITION_CAP);
     for level in 0..u32::BITS as usize {
         for_each_phi_route(level, 1, QUERY_POSITION_CAP, |paper_probe, _| {
-            assert!(usize::try_from(paper_probe - 1).unwrap() < QUERY_PROBE_LIMIT);
+            assert!(u64::try_from(paper_probe - 1).unwrap() < QUERY_PROBE_LIMIT);
         });
     }
 
@@ -350,9 +350,9 @@ fn compact_query_counters_cover_every_supported_geometry() {
 }
 
 /// Walks `level`'s probes in paper order from `from_probe`, visiting each
-/// `(paper_probe, phi)` with `phi <= position_cap` inside the uniform search
-/// cap. Level 0's first probe is skipped: it is the schedule's direct route, so
-/// no route is ever pushed for it.
+/// `(paper_probe, phi)` with `phi <= position_cap`. Level 0's first probe is
+/// skipped: it is the schedule's direct route, so no route is ever pushed for
+/// it.
 fn for_each_phi_route(
     level: usize,
     from_probe: u128,
@@ -365,7 +365,7 @@ fn for_each_phi_route(
     } else {
         from_probe
     };
-    while paper_probe <= u128::from(UNIFORM_SEARCH_CAP) {
+    loop {
         let phi =
             probe::elastic_phi(paper_level, paper_probe).expect("bounded Elastic query coordinate");
         if phi > position_cap {
@@ -1268,7 +1268,7 @@ fn finite_probe_exhaustion_uses_observable_exceptional_recovery() {
                              next_key: &mut u64| {
         for level in 0..table.levels.len() {
             let paper_level = level as u128 + 1;
-            for logical_index in 0..UNIFORM_SEARCH_CAP {
+            for logical_index in 0_u64.. {
                 let paper_probe = u128::from(logical_index) + 1;
                 if probe::elastic_phi(paper_level, paper_probe).unwrap() > QUERY_POSITION_CAP {
                     break;

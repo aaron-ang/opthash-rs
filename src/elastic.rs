@@ -43,12 +43,11 @@ const ELASTIC_PROBE_SEED: u64 = 0;
 /// `c * min(log2(1/eps)^2, log2(1/delta))`; the paper only asks that it be
 /// sufficiently large.
 const ELASTIC_PROBE_BUDGET_C: u32 = 8;
-/// Most probe indices any level's search visits. The paper's fallback search
-/// is unbounded; this caps it so the lookup schedule stays finite.
-const UNIFORM_SEARCH_CAP: u64 = 4_096;
 /// Largest paper query position a placement may take. The lookup schedule
 /// covers every position up to it, so a vacancy past it counts as a failed
-/// probe.
+/// probe. A level's positions grow with its probe, so the cap also bounds
+/// how many probes each level's search visits, which the paper's fallback
+/// search leaves unbounded.
 const QUERY_POSITION_CAP: u128 = 1_000_000;
 /// Bit of `probe_high_water` set once this epoch placed an entry outside
 /// its probe routes; lookups that miss the schedule then fall back to a full
@@ -71,9 +70,19 @@ const fn empty_high_water(settled_limit: usize) -> u32 {
         0
     }
 }
-/// Bound on a level's probe index within `QUERY_POSITION_CAP`. Level one
-/// reaches the most probes before its positions pass the cap.
-const QUERY_PROBE_LIMIT: usize = 384;
+/// Most probes any level reaches within `QUERY_POSITION_CAP`, so every
+/// level's probe index is below it.
+const QUERY_PROBE_LIMIT: u64 = {
+    let mut limit = 0;
+    let mut level = 0;
+    while level < MAX_LEVELS {
+        if LEVEL_PROBE_LIMIT[level] > limit {
+            limit = LEVEL_PROBE_LIMIT[level];
+        }
+        level += 1;
+    }
+    limit
+};
 /// Largest table: slot positions and schedule bounds are stored as `u32`.
 const MAX_ELASTIC_SLOTS: u64 = 1 << u32::BITS;
 /// A route summary: the levels the keys of one bin of a metadata word
@@ -200,7 +209,7 @@ impl MetadataPlace {
 const H11_COUNTER_BASE: u32 = probe::elastic_counter_base(0, 0);
 
 const _: () = assert!(u32::BITS as u64 <= probe::ELASTIC_LEVEL_LIMIT);
-const _: () = assert!(UNIFORM_SEARCH_CAP <= probe::ELASTIC_LOGICAL_LIMIT);
+const _: () = assert!(QUERY_PROBE_LIMIT <= probe::ELASTIC_LOGICAL_LIMIT);
 const _: () = {
     let max_case1_logical_probes = ELASTIC_PROBE_BUDGET_C as u64 * (u32::BITS as u64 - 1).pow(2);
     assert!(max_case1_logical_probes <= probe::ELASTIC_LOGICAL_LIMIT);
@@ -226,7 +235,7 @@ impl ExactPlacement {
 }
 
 const _: () = assert!(GENERAL_REDUCTION <= u8::MAX as u32);
-const _: () = assert!(UNIFORM_SEARCH_CAP <= u16::MAX as u64);
+const _: () = assert!(QUERY_PROBE_LIMIT <= u16::MAX as u64);
 const _: () = assert!(MAX_LEVELS < SENTINEL_LEVEL as usize);
 
 /// Descriptor for one sub-array `A_i`. Holds metadata + cached pointers
@@ -977,8 +986,8 @@ const PROBE_SCHEDULE_CAPACITY: [usize; MAX_LEVELS + 1] = {
 };
 
 /// Paper probes a lookup can reach in each level: those with
-/// `phi <= QUERY_POSITION_CAP`, within `UNIFORM_SEARCH_CAP`. Placement stops
-/// there, so a vacancy past the cap counts as a failed probe.
+/// `phi <= QUERY_POSITION_CAP`. Placement stops there, so a vacancy past the
+/// cap counts as a failed probe.
 const LEVEL_PROBE_LIMIT: [u64; MAX_LEVELS] = {
     let mut limits = [0; MAX_LEVELS];
     let mut level = 0;
@@ -993,13 +1002,12 @@ const LEVEL_PROBE_LIMIT: [u64; MAX_LEVELS] = {
 };
 
 /// Routes a full schedule holds for `level`: its probes at positions up to
-/// `QUERY_POSITION_CAP`, within `UNIFORM_SEARCH_CAP` probes, less level
-/// zero's first, which is the direct slot.
+/// `QUERY_POSITION_CAP`, less level zero's first, which is the direct slot.
 const fn level_route_count(level: usize) -> usize {
     let paper_level = level as u128 + 1;
     let mut paper_probe = if level == 0 { 2 } else { 1 };
     let mut count = 0;
-    while paper_probe <= UNIFORM_SEARCH_CAP as u128 {
+    loop {
         let Ok(phi) = probe::elastic_phi(paper_level, paper_probe) else {
             panic!("bounded Elastic query coordinate");
         };
@@ -2493,9 +2501,6 @@ where
         // next unscheduled probe and the lowest position among them is the
         // next route in position order.
         let position = |level: usize, paper_probe: u64| {
-            if paper_probe > UNIFORM_SEARCH_CAP {
-                return None;
-            }
             let phi = probe::elastic_phi(level as u128 + 1, u128::from(paper_probe))
                 .expect("bounded Elastic query coordinate");
             (phi <= high_water).then_some(phi)
@@ -2516,8 +2521,7 @@ where
             // lookup reads before it walks the schedule.
             if level != 0 || logical_probe_index != 0 {
                 assert!(
-                    usize::try_from(logical_probe_index)
-                        .is_ok_and(|index| index < QUERY_PROBE_LIMIT),
+                    logical_probe_index < QUERY_PROBE_LIMIT,
                     "Elastic query-probe convention exhausted"
                 );
                 self.probe_schedule.push(levels, level, logical_probe_index);
