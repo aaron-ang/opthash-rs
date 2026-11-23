@@ -3003,24 +3003,6 @@ fn rebuild_that_keeps_the_grouped_levels_writes_no_group_route_again() {
 }
 
 #[test]
-fn rebuild_leaves_a_group_run_that_stopped_being_whole_as_it_is() {
-    let mut table = table_with_slots(1 << 8, IdentityBuildHasher);
-    let fitted = table.probe_schedule.whole_groups().1;
-    assert_ne!(fitted, 0);
-    // Every route of the grouped levels is more than the groups' runs
-    // have slots for.
-    table.schedule_levels_through(schedule::GROUPED_LEVELS);
-    table.extend_probe_schedule(QUERY_POSITION_CAP);
-    let whole = table.probe_schedule.whole_groups().0;
-    assert!(whole < fitted);
-    assert!(table.probe_schedule.addresses(&table.levels));
-    // The rebuild that brings the other levels in keeps the groups' runs.
-    table.schedule_levels_through(table.levels.len() - 1);
-    assert!(table.probe_schedule.whole_groups().0 <= whole);
-    assert!(table.probe_schedule.addresses(&table.levels));
-}
-
-#[test]
 fn clone_has_group_runs_only_where_its_source_has_one_whole() {
     let mut table = table_with_slots(1 << 8, IdentityBuildHasher);
     let fitted = table.probe_schedule.whole_groups().1;
@@ -3144,10 +3126,9 @@ fn every_walk_start_leads_to_the_routes_its_summary_leaves_open() {
                 table.probe_schedule.routes().len(),
                 table.probe_schedule.route_capacity()
             );
-            // Nor does the full schedule leave a group's run whole, and
-            // each rebuild starts from all of them.
+            // The groups' runs stay whole up to the full schedule.
             assert!(
-                whole_groups_seen[0] && whole_groups_seen[fitted as usize],
+                whole_groups_seen[fitted as usize] && (fitted == 0 || !whole_groups_seen[0]),
                 "{slots} slots"
             );
         }
@@ -3162,14 +3143,11 @@ fn every_walk_start_leads_to_the_routes_its_summary_leaves_open() {
 }
 
 /// The walk starts of the summaries that leave only grouped levels open,
-/// checked after each single route the schedule takes: the pushed routes
-/// reach a group's run one slot at a time, and the run has to stop being
-/// walked before the first of them lands in it. The sizes take in both
-/// ways a run ends: full, and reached by the pushed routes while it has
-/// room.
+/// checked after each single route the schedule takes: every group's run
+/// takes each route of its levels and stays whole up to the full schedule.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn group_runs_are_left_before_a_pushed_route_reaches_them() {
+fn group_runs_stay_whole_through_every_route_the_schedule_takes() {
     for slots in [1 << 8, 1 << 11, 1 << 15] {
         let mut table = table_with_slots(slots, IdentityBuildHasher);
         let level_count = table.levels.len();
@@ -3178,7 +3156,6 @@ fn group_runs_are_left_before_a_pushed_route_reaches_them() {
         let fitted = table.probe_schedule.whole_groups().1;
         assert_ne!(fitted, 0, "{slots} slots");
         let mut pushed = 0;
-        let mut whole_seen = alloc::vec![false; fitted as usize + 1];
         for high_water in 1..=QUERY_POSITION_CAP {
             table.extend_probe_schedule(high_water);
             let schedule = &table.probe_schedule;
@@ -3209,14 +3186,10 @@ fn group_runs_are_left_before_a_pushed_route_reaches_them() {
                     assert_eq!(walked.iter().filter(open).count(), walked.len());
                 }
             }
+            assert_eq!(groups, fitted, "{slots} slots, {pushed} routes");
             assert_eq!(groups, schedule.whole_groups().0);
-            whole_seen[groups as usize] = true;
         }
         assert_eq!(pushed, table.probe_schedule.route_capacity());
-        assert!(
-            whole_seen[0] && whole_seen[fitted as usize],
-            "{slots} slots"
-        );
     }
 }
 
