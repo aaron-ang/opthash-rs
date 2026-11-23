@@ -920,13 +920,6 @@ unsafe fn scan_clean_funnel_bucket<T>(
     fingerprint: u8,
     mut inspect_match: impl FnMut(usize) -> Option<T>,
 ) -> BucketScanResult<T> {
-    if length <= GROUP_SIZE {
-        // SAFETY: `length <= GROUP_SIZE`, so the caller's readable span covers
-        // one full group.
-        return unsafe {
-            scan_clean_funnel_group(ctrl_ptr, start, length, fingerprint, &mut inspect_match)
-        };
-    }
     let end = start + length;
     let mut position = start;
     while position < end {
@@ -1539,8 +1532,9 @@ where
             )
         };
         match head {
-            // SAFETY: a tail ends at or before `slots`, as above.
-            BucketScanResult::Full if shape.tail_width() != 0 => unsafe {
+            // SAFETY: a tail ends at or before `slots`, as above; an empty
+            // one reads no control.
+            BucketScanResult::Full => unsafe {
                 scan_clean_funnel_bucket(
                     ctrl_ptr,
                     shape.tail_start(level, bucket),
