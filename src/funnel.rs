@@ -90,13 +90,41 @@ struct FunnelShape {
     fallback_offset: usize,
     fallback_bucket_width: usize,
     fallback_bucket_range: PreparedProbeRange,
-    /// Slots between the starts of two buckets of an ordinary level. A
-    /// bucket no wider than a group is padded to one, so a group read at its
-    /// start covers no other bucket; the padding lanes hold
-    /// [`CTRL_PADDING`] and no entry.
-    stride: usize,
     /// Slots of the storage, padding lanes included; `n` counts the rest.
     slots: usize,
+}
+
+// An ordinary level stores the head group of each bucket, one after another,
+// then the tail of each. A bucket's head group is a whole group holding its
+// first lanes, so the group of bucket `b` is group `b` of its level; a
+// bucket no wider than a group pads its head group with lanes that hold
+// `CTRL_PADDING` and no entry, and has no tail. The tail holds the lanes
+// past the first group's worth, packed, so a level has no padding past its
+// head groups.
+impl FunnelShape {
+    /// The lanes of an ordinary bucket that its head group holds.
+    #[inline]
+    fn head_width(&self) -> usize {
+        self.beta.min(GROUP_SIZE)
+    }
+
+    /// The lanes of an ordinary bucket past its head group.
+    #[inline]
+    fn tail_width(&self) -> usize {
+        self.beta - self.head_width()
+    }
+
+    /// The first slot of bucket `bucket`'s head group in `level`.
+    #[inline]
+    fn head_start(level: &LevelShape, bucket: usize) -> usize {
+        level.offset + bucket * GROUP_SIZE
+    }
+
+    /// The first slot of bucket `bucket`'s tail in `level`.
+    #[inline]
+    fn tail_start(&self, level: &LevelShape, bucket: usize) -> usize {
+        level.offset + level.buckets * GROUP_SIZE + bucket * self.tail_width()
+    }
 }
 
 /// One level as the first-match lookup and the head placement read it: its
@@ -128,7 +156,7 @@ impl<T> Copy for HeadLevel<T> {}
 
 impl<T> HeadLevel<T> {
     /// Whether this entry stands for a level the head does not hold: every
-    /// level of a shape without a head, and the overflow levels.
+    /// level of a shape without slots, and the overflow levels.
     #[inline]
     fn is_absent(&self) -> bool {
         self.multiplier == 0
@@ -179,11 +207,11 @@ impl<T> HeadLevel<T> {
 }
 
 /// The head of a table with `shape` over `storage`: an entry for each level
-/// that owns a level-bin bit, then one for the overflow bit, and absent ones
-/// for the counts no bin leads with. A shape without a head has no level to
-/// place in or to scan for first matches, so all its level entries are
-/// absent. Every entry that is no level draws bucket zero at the group of
-/// [`CTRL_PADDING`] that ends the control array: a scan of it finds no
+/// that owns a level-bin bit, addressing the head groups of its buckets,
+/// then one for the overflow bit, and absent ones for the counts no bin
+/// leads with. A shape without slots has no level, so all its level entries
+/// are absent. Every entry that is no level draws bucket zero at the group
+/// of [`CTRL_PADDING`] that ends the control array: a scan of it finds no
 /// entry and no EMPTY lane, so its data address is never read through.
 fn head_levels<T>(shape: &FunnelShape, storage: &FlatStorage<T>) -> [HeadLevel<T>; HEAD_ENTRIES] {
     // In bounds for a shape with slots: the control array holds a group
@@ -195,7 +223,7 @@ fn head_levels<T>(shape: &FunnelShape, storage: &FlatStorage<T>) -> [HeadLevel<T
         lead_origin: storage.data_ptr().wrapping_add(shape.slots),
     };
     let mut head = [absent; HEAD_ENTRIES];
-    if shape.has_head() {
+    if shape.n != 0 {
         for (entry, level) in head
             .iter_mut()
             .zip(shape.levels.iter().take(OVERFLOW_LEVEL))
@@ -206,8 +234,8 @@ fn head_levels<T>(shape: &FunnelShape, storage: &FlatStorage<T>) -> [HeadLevel<T
                 // In bounds: the storage holds `shape.slots` slots, and a
                 // level starts below that count.
                 ctrl: storage.ctrl_ptr().wrapping_add(level.offset),
-                // In bounds as well: a level holds whole buckets, each a
-                // group of slots.
+                // In bounds as well: a level starts with a whole group for
+                // each of its buckets.
                 lead_origin: storage.data_ptr().wrapping_add(level.offset + LEAD_ORIGIN),
             };
         }
@@ -228,22 +256,22 @@ impl FunnelShape {
             fallback_offset: 0,
             fallback_bucket_width: 0,
             fallback_bucket_range: PreparedProbeRange::empty(),
-            stride: 0,
             slots: 0,
         }
     }
 
-    /// Whether the head holds a level. It holds none in an empty shape or in
-    /// one whose buckets are wider than a group.
+    /// Whether the head placement places in this shape: one with slots
+    /// whose buckets have no tail, so a bucket's head group is all of it.
     #[inline]
-    fn has_head(&self) -> bool {
-        self.n != 0 && self.beta <= GROUP_SIZE
+    fn places_through_head(&self) -> bool {
+        self.n != 0 && self.tail_width() == 0
     }
 
-    /// The slot bits of a group mask that are lanes of a head bucket, the
-    /// rest being its padding. None in a shape without a head.
+    /// The slot bits of a group mask that are lanes of a bucket the head
+    /// placement places in, the rest being its padding. None in a shape it
+    /// does not place in.
     fn head_lanes(&self) -> u64 {
-        if !self.has_head() {
+        if !self.places_through_head() {
             return 0;
         }
         (0..self.beta).fold(0, |lanes, lane| {
@@ -253,7 +281,7 @@ impl FunnelShape {
 
     /// Entries a table may place through its head.
     fn head_insertions(&self) -> usize {
-        if self.has_head() {
+        if self.places_through_head() {
             self.max_insertions
         } else {
             0
@@ -290,9 +318,9 @@ impl FunnelShape {
         let mut bucket = [CTRL_EMPTY; GROUP_SIZE];
         bucket[self.beta..].fill(CTRL_PADDING);
         for start in (0..self.primary_offset).step_by(GROUP_SIZE) {
-            // SAFETY: a bucket narrower than a group has a stride of one
-            // group, so the ordinary levels are whole groups below
-            // `primary_offset`, itself at most `slots`.
+            // SAFETY: a bucket narrower than a group is its head group, so
+            // the ordinary levels are whole groups below `primary_offset`,
+            // itself at most `slots`.
             unsafe { ctrl_ptr.add(start).cast::<[u8; GROUP_SIZE]>().write(bucket) };
         }
     }
@@ -303,11 +331,8 @@ impl FunnelShape {
         }
         let config = PaperConfig::new(n, reserve.exponent()).map_err(|_| ShapeError::Infeasible)?;
         let plan = config.funnel_plan().map_err(|_| ShapeError::Infeasible)?;
-        let stride = if plan.beta() <= GROUP_SIZE {
-            GROUP_SIZE
-        } else {
-            plan.beta()
-        };
+        // A bucket's lanes, or its head group if that holds more.
+        let bucket_slots = plan.beta().max(GROUP_SIZE);
         let mut offset = 0_usize;
         let mut unpadded = 0_usize;
         let mut levels = Vec::new();
@@ -328,7 +353,7 @@ impl FunnelShape {
             offset = offset
                 .checked_add(
                     bucket_count
-                        .checked_mul(stride)
+                        .checked_mul(bucket_slots)
                         .ok_or(ShapeError::Oversize)?,
                 )
                 .ok_or(ShapeError::Oversize)?;
@@ -367,7 +392,6 @@ impl FunnelShape {
             fallback_bucket_width: plan.fallback_bucket_width(),
             fallback_bucket_range: PreparedProbeRange::new(plan.fallback_bucket_count())
                 .map_err(|_| ShapeError::Infeasible)?,
-            stride,
             slots,
         })
     }
@@ -783,8 +807,8 @@ impl<K, V> Clone for Found<'_, K, V> {
 impl<K, V> Copy for Found<'_, K, V> {}
 
 /// The part of a [`Found`] a lookup's caller wants. A lookup is instantiated
-/// per projection, so each builds that part alone, and the ordered walk it
-/// hands off to returns one word.
+/// per projection, so each builds that part alone, and the walk past the
+/// head it hands off to returns one word.
 trait FoundPart<'a, K, V> {
     type Part;
 
@@ -827,7 +851,7 @@ pub struct FunnelVacant {
 /// `isize::MAX`, so the two largest `usize` values name no slot.
 const ENTRY_ABSENT: usize = usize::MAX;
 /// What [`FunnelTable::find_recorded_for_entry`] returns in place of a slot
-/// for a key it leaves to the ordered walk.
+/// for a key it leaves to the walk past the head.
 const ENTRY_UNSETTLED: usize = usize::MAX - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -926,6 +950,43 @@ unsafe fn scan_clean_funnel_bucket<T>(
     BucketScanResult::Full
 }
 
+/// The first slot among `length` controls from `start` whose control is
+/// `fingerprint` and which `holds_key` accepts. Reads no other control, so
+/// it neither stops at an EMPTY lane nor looks past a tombstone.
+///
+/// # Safety
+///
+/// `ctrl_ptr.add(start)` must be readable through `length + GROUP_SIZE - 1`
+/// bytes, and every slot passed to `holds_key` must be a valid logical slot
+/// for the corresponding data arena.
+#[inline]
+unsafe fn first_match_in_lanes(
+    ctrl_ptr: *const u8,
+    start: usize,
+    length: usize,
+    fingerprint: u8,
+    mut holds_key: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    let end = start + length;
+    let mut position = start;
+    while position < end {
+        let lanes = GROUP_SIZE.min(end - position);
+        // SAFETY: `position < start + length`, so a full group from
+        // `position` stays within the caller's readable span.
+        let matches = unsafe { simd::eq_mask_group(ctrl_ptr.add(position), fingerprint) };
+        for lane in matches {
+            if lane >= lanes {
+                break;
+            }
+            if holds_key(position + lane) {
+                return Some(position + lane);
+            }
+        }
+        position += lanes;
+    }
+    None
+}
+
 /// First free (EMPTY or TOMBSTONE) slot among `length` logical controls.
 ///
 /// # Safety
@@ -966,6 +1027,12 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     /// from it before probing; see [`crate::membership`].
     membership: FilterTail,
     exceptional_placement: bool,
+    /// Whether a key [`Self::first_match`] finds in none of its recorded
+    /// levels may still be present: the buckets have tails, which that scan
+    /// does not read, or the epoch placed a key outside its funnel. Set with
+    /// [`Self::exceptional_placement`], and read alone, by
+    /// [`Self::unmatched_is_absent`].
+    walk_unmatched: bool,
     /// The lanes of a group that are slots of a head bucket; see
     /// [`FunnelShape::head_lanes`]. Next to [`Self::head_left`], which the
     /// head placement reads with it.
@@ -1154,6 +1221,7 @@ where
             arena,
             epoch: EpochState::initial(),
             exceptional_placement: false,
+            walk_unmatched: false,
             prf: FunnelPrf::new(FUNNEL_PROBE_SEED),
             membership,
             stale_membership: 0,
@@ -1162,6 +1230,7 @@ where
             settle_armed: 1,
         };
         table.set_entries(0);
+        table.set_exceptional_placement(false);
         Ok(table)
     }
 
@@ -1226,21 +1295,12 @@ where
         None
     }
 
-    /// Read-only walk for every search of a key: the buckets of
-    /// [`Self::search_vacancy`] in the same order, restricted to the levels
-    /// set in the key's bin `levels`, shallowest first. It stops only at a real EMPTY
-    /// and skips tombstones without recording them, since a lookup never needs
-    /// the vacancy an insert would take.
-    ///
-    /// An `EMPTY` lane in a visited bucket proves the key is not deeper: a
-    /// slot returns to `EMPTY` only when the epoch is rebuilt, so that lane was
-    /// free when the key was placed, and placement takes the first free slot
-    /// of the walk. The level holding a live key always has its bit set, as
-    /// bits only accumulate and a refresh re-records every live entry. Entries
-    /// placed outside their funnel are the caller's full scan's concern.
-    ///
-    /// The first-match lookup hands every key it cannot settle to
-    /// this walk, which therefore decides them all.
+    /// The ordered walk, read-only: the buckets of [`Self::search_vacancy`]
+    /// in the same order, restricted to the levels set in the key's bin
+    /// `levels`, shallowest first. It stops only at a real EMPTY and skips
+    /// tombstones. The reference [`Self::lookup_past_head`] answers as,
+    /// given the first-match scan.
+    #[cfg(test)]
     fn lookup_recorded_levels<Q>(
         &self,
         key: &Q,
@@ -1269,14 +1329,15 @@ where
     }
 
     /// Lookup over the ordinary levels the key's bin recorded, comparing the
-    /// key against each bucket's fingerprint matches. `Err` is not yet an
-    /// answer: it carries the head entry scanned last, from which
-    /// [`Self::unmatched_is_absent`] settles it or hands the lookup to the
-    /// ordered walk.
+    /// key against the fingerprint matches of each bucket's head group.
+    /// `Err` is not yet an answer: it carries the head entry scanned last,
+    /// from which [`Self::unmatched_is_absent`] settles it or hands the
+    /// lookup to [`Self::lookup_past_head`].
     ///
-    /// A level without the fingerprint cannot hold the key, so the walk moves
-    /// on without the ordered walk's `EMPTY` test, which only shortens misses
-    /// the filter let through.
+    /// A head group without the fingerprint cannot hold the key, so the walk
+    /// moves on without the ordered walk's `EMPTY` test, which only shortens
+    /// misses the filter let through. A bucket's tail is not read here: a
+    /// shape with tails hands every miss on.
     ///
     /// Calls nothing but the key comparison, so the lookup that finds its key
     /// runs wherever this is inlined without a call.
@@ -1292,17 +1353,17 @@ where
         Q: Equivalent<K> + ?Sized,
     {
         let key_fingerprint = probe.fingerprint();
-        // Fingerprint matches of the key's bucket in one level, with the
-        // bucket's index in the level. The bucket is addressed as a whole
-        // group, so its index scales in the load.
+        // Fingerprint matches of the head group of the key's bucket in one
+        // level, with the bucket's index in the level. The head group is a
+        // whole group, so the bucket index scales in the load.
         let scan = |level: &HeadLevel<SlotEntry<K, V>>| -> (usize, u64) {
             let bucket = probe::ordinary_funnel_bucket(probe, level.multiplier, level.buckets);
             // SAFETY: a draw is below the level's bucket count, an ordinary
             // bucket ends at or before `slots`, and the control array pads
             // one group past them, which is the bucket an entry that is no
-            // level draws; every shape that recorded a key has slots. The
-            // group is the whole bucket: no fingerprint matches its padding
-            // lanes.
+            // level draws; every shape that recorded a key has slots. Every
+            // lane of the group is a lane of the bucket but its padding,
+            // which no fingerprint matches.
             let matches =
                 unsafe { simd::eq_mask_group(level.group(bucket).cast(), key_fingerprint) };
             (bucket, matches.0)
@@ -1348,10 +1409,10 @@ where
         // A passed gate means a recorded key, so the table has slots.
         debug_assert_ne!(self.shape.n, 0);
         // The leading zeros of the unit are the index of its bin's
-        // shallowest level. The overflow bit reaches an absent entry, as
-        // every scan of a shape without lanes does: it stands where the
-        // level past the last recorded one would. A unit whose bin is empty
-        // leads with a membership bit, which reaches an absent entry too.
+        // shallowest level. The overflow bit reaches an absent entry: it
+        // stands where the level past the last recorded one would. A unit
+        // whose bin is empty leads with a membership bit, which reaches an
+        // absent entry too.
         // None of these is a level, and each scans the group past the slots,
         // which matches nothing.
         let unit = levels.get();
@@ -1420,21 +1481,30 @@ where
     }
 
     /// Whether a lookup [`Self::first_match`] found nothing for is absent,
-    /// given the head entry it scanned last. Otherwise the ordered walk
-    /// decides: the key may sit outside its funnel or in a level the head
-    /// does not hold. The walk ends at an absent entry exactly when the bin
-    /// records such a level, or records none: the overflow bit is the last
-    /// it reaches, every level of a shape without a head is absent, and so
-    /// is the entry an empty bin's membership bit leads to.
+    /// given the head entry it scanned last. Otherwise the walk past the
+    /// head decides: the key may sit outside its funnel, in a bucket's tail,
+    /// or in a level the head does not hold. The scan ends at an absent entry
+    /// exactly when the bin records such a level, or records none: the
+    /// overflow bit is the last it reaches, and the entry an empty bin's
+    /// membership bit leads to is absent.
     #[inline]
     fn unmatched_is_absent(&self, last: &HeadLevel<SlotEntry<K, V>>) -> bool {
-        !last.is_absent() && !self.exceptional_placement
+        !last.is_absent() && !self.walk_unmatched
     }
 
-    /// Tombstone-blind scan of the key's bucket in ordinary level `index`.
+    /// Sets [`Self::exceptional_placement`], and with it
+    /// [`Self::walk_unmatched`] for the current shape.
+    #[inline]
+    fn set_exceptional_placement(&mut self, exceptional: bool) {
+        self.exceptional_placement = exceptional;
+        self.walk_unmatched = exceptional || self.shape.tail_width() != 0;
+    }
+
+    /// Tombstone-blind scan of the key's bucket in ordinary level `index`:
+    /// its head group, then its tail.
     ///
-    /// Forced inline: with two callers LLVM outlines it, and the call per
-    /// visited level costs more than the scan.
+    /// Forced inline: the call per visited level would cost more than the
+    /// scan.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn lookup_level<Q>(
@@ -1447,27 +1517,101 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let level = &self.shape.levels[index];
+        let shape = &self.shape;
+        let level = &shape.levels[index];
         let bucket = Self::sample_ordinary(probe, level);
-        let start = level.offset + bucket * self.shape.stride;
-        // SAFETY: an ordinary bucket ends at or before `slots`, and the control
-        // array pads a group past them; matched lanes carry the
-        // fingerprint, so they are occupied.
-        unsafe {
-            scan_clean_funnel_bucket(
-                self.storage.ctrl_ptr(),
-                start,
-                self.shape.beta,
+        let ctrl_ptr = self.storage.ctrl_ptr();
+        let mut inspect = |slot: usize| {
+            // SAFETY: a matched lane lies inside the bucket and carries the
+            // fingerprint, so it is an occupied slot.
+            let entry = unsafe { self.storage.get_ref(slot) };
+            key.equivalent(&entry.key).then_some(slot)
+        };
+        // SAFETY: a head group ends at or before `slots`, and the control
+        // array pads a group past them.
+        let head = unsafe {
+            scan_clean_funnel_group(
+                ctrl_ptr,
+                FunnelShape::head_start(level, bucket),
+                shape.head_width(),
                 key_fingerprint,
-                |slot| {
-                    let entry = self.storage.get_ref(slot);
-                    key.equivalent(&entry.key).then_some(slot)
-                },
+                &mut inspect,
             )
+        };
+        match head {
+            // SAFETY: a tail ends at or before `slots`, as above.
+            BucketScanResult::Full if shape.tail_width() != 0 => unsafe {
+                scan_clean_funnel_bucket(
+                    ctrl_ptr,
+                    shape.tail_start(level, bucket),
+                    shape.tail_width(),
+                    key_fingerprint,
+                    inspect,
+                )
+            },
+            result => result,
         }
     }
 
-    /// Overflow leg of [`Self::lookup_recorded_levels`]: every ordinary level
+    /// Read-only walk for a key [`Self::first_match`] found in none of the
+    /// head groups it scanned, its bin `levels`: the tails of the key's
+    /// buckets in the levels below the overflow bit that the bin records,
+    /// shallowest first, then the overflow leg. No head group needs a second
+    /// look, and a tail without the fingerprint cannot hold the key, so the
+    /// tails are read for fingerprint matches alone, as the head groups were.
+    ///
+    /// The answer is the ordered walk's, which also stops at an `EMPTY` lane
+    /// of a visited bucket: a slot returns to `EMPTY` only when the epoch is
+    /// rebuilt, so that lane was free when the key was placed, and placement
+    /// takes the first free slot of the walk, so the key is not deeper. The
+    /// level holding a live key always has its bit set, as bits only
+    /// accumulate and a refresh re-records every live entry. Entries placed
+    /// outside their funnel are the caller's full scan's concern.
+    ///
+    /// The first-match lookup hands every key it cannot settle to this
+    /// walk, which therefore decides them all.
+    fn lookup_past_head<Q>(
+        &self,
+        key: &Q,
+        probe: PreparedFastFunnelProbe,
+        key_fingerprint: u8,
+        levels: u16,
+    ) -> Option<usize>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let shape = &self.shape;
+        if shape.tail_width() != 0 {
+            let mut ordinary = recorded_head_levels(levels);
+            while ordinary != 0 {
+                let index = ordinary.leading_zeros();
+                ordinary ^= SHALLOWEST_LEVEL >> index;
+                let level = &shape.levels[index as usize];
+                let bucket = Self::sample_ordinary(probe, level);
+                // SAFETY: a tail ends at or before `slots`, and the control
+                // array pads a group past them; a matched lane lies inside
+                // the tail and carries the fingerprint, so it is occupied.
+                let found = unsafe {
+                    first_match_in_lanes(
+                        self.storage.ctrl_ptr(),
+                        shape.tail_start(level, bucket),
+                        shape.tail_width(),
+                        key_fingerprint,
+                        |slot| key.equivalent(&self.storage.get_ref(slot).key),
+                    )
+                };
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        if levels & OVERFLOW_LEVEL_BIT == 0 {
+            return None;
+        }
+        self.lookup_overflow_levels(key, probe, key_fingerprint)
+    }
+
+    /// Overflow leg of [`Self::lookup_past_head`]: every ordinary level
     /// from `OVERFLOW_LEVEL` on, then the special arrays, as the placement
     /// walk visits them.
     ///
@@ -1555,13 +1699,24 @@ where
         if self.shape.n == 0 {
             return None;
         }
+        let shape = &self.shape;
         let ctrl_ptr = self.storage.ctrl_ptr();
-        for (index, level) in self.shape.levels.iter().enumerate() {
+        for (index, level) in shape.levels.iter().enumerate() {
             let bucket = Self::sample_ordinary(probe, level);
-            let start = level.offset + bucket * self.shape.stride;
-            // SAFETY: an ordinary bucket ends at or before `slots`, and the control
-            // array pads a group past them.
-            if let Some(slot) = unsafe { first_free_in_bucket(ctrl_ptr, start, self.shape.beta) } {
+            let head = FunnelShape::head_start(level, bucket);
+            // SAFETY: a head group and a tail end at or before `slots`, and
+            // the control array pads a group past them.
+            let free = unsafe {
+                match simd::free_mask_group(ctrl_ptr.add(head)).first_below(shape.head_width()) {
+                    Some(lane) => Some(head + lane),
+                    None => first_free_in_bucket(
+                        ctrl_ptr,
+                        shape.tail_start(level, bucket),
+                        shape.tail_width(),
+                    ),
+                }
+            };
+            if let Some(slot) = free {
                 return Some(Vacancy {
                     slot,
                     level_bit: level_bit_of(index),
@@ -1608,8 +1763,7 @@ where
         // `FunnelShape::try_from_slots` builds no shape with fewer levels
         // than the walk.
         debug_assert!(index < self.shape.levels.len());
-        // SAFETY: an ordinary bucket is one group, which ends at or before
-        // `slots`.
+        // SAFETY: a head group ends at or before `slots`.
         let empty =
             unsafe { simd::free_lanes_group(level.group(bucket).cast(), self.head_lanes) }.0;
         (empty != 0).then(|| {
@@ -1920,7 +2074,7 @@ where
         match self.first_match(key, probe, levels) {
             Ok(found) => Some(P::of(found)),
             Err(last) if self.unmatched_is_absent(last) => None,
-            Err(_) => self.find_by_walk::<Q, P>(key, key_hash),
+            Err(_) => self.find_past_head::<Q, P>(key, key_hash),
         }
     }
 
@@ -1934,7 +2088,7 @@ where
     /// The rest of a removal that [`TableBackend::take`] does not
     /// finish itself, which is every call a removal makes. `unlinked` is the
     /// entry of a key already tombstoned and counted, whose count needs
-    /// settling; `None` leaves the key to the ordered walk. Returns the
+    /// settling; `None` leaves the key to the walk past the head. Returns the
     /// removed entry, still initialized, for the caller to take.
     ///
     /// The caller reads the entry from what this returns, also when it
@@ -1960,7 +2114,7 @@ where
             (entry, true)
         } else {
             let levels = self.membership_gate(key_hash).levels();
-            let slot = self.find_location_by_walk(key, key_hash, levels)?;
+            let slot = self.find_location_past_head(key, key_hash, levels)?;
             // SAFETY: the walk returns only occupied in-bounds slots, and
             // the data base is not null.
             let entry = unsafe {
@@ -1991,22 +2145,46 @@ where
         Some(entry)
     }
 
+    /// [`Self::find_location_past_head`] for a key [`Self::first_match`]
+    /// found in none of the head groups it scanned.
+    ///
     /// Probe preparation stays next to the walk so the prepared probe never
     /// crosses a call boundary, and the level bin is loaded again so the
     /// first-match scan keeps none of its state for this walk.
     #[inline(never)]
-    fn find_by_walk<'a, Q, P>(&'a self, key: &Q, key_hash: u64) -> Option<P::Part>
+    fn find_past_head<'a, Q, P>(&'a self, key: &Q, key_hash: u64) -> Option<P::Part>
     where
         Q: Equivalent<K> + ?Sized,
         P: FoundPart<'a, K, V>,
     {
         let levels = self.membership_gate(key_hash).levels();
-        let slot = self.find_location_by_walk(key, key_hash, levels)?;
+        let slot = self.find_location_past_head(key, key_hash, levels)?;
         // SAFETY: the walk returns only occupied in-bounds slots.
         Some(P::of(unsafe { self.found_at(slot) }))
     }
 
+    /// The slot of a key [`Self::first_match`] found in none of the head
+    /// groups it scanned, its bin `levels`: [`Self::lookup_past_head`], then
+    /// the full scan in an epoch that placed a key outside its funnel.
     #[inline]
+    fn find_location_past_head<Q>(&self, key: &Q, key_hash: u64, levels: u16) -> Option<usize>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let probe = self.prf.prepare(key_hash);
+        let key_fingerprint = probe.fingerprint();
+        match self.lookup_past_head(key, probe, key_fingerprint, levels) {
+            Some(slot) => Some(slot),
+            None if self.exceptional_placement => self.find_by_full_scan(key, key_fingerprint),
+            None => None,
+        }
+    }
+
+    /// The ordered walk's slot for a key with bin `levels`:
+    /// [`Self::lookup_recorded_levels`], then the full scan in an epoch
+    /// that placed a key outside its funnel. The reference every lookup
+    /// answers as.
+    #[cfg(test)]
     fn find_location_by_walk<Q>(&self, key: &Q, key_hash: u64, levels: u16) -> Option<usize>
     where
         Q: Equivalent<K> + ?Sized,
@@ -2283,15 +2461,15 @@ where
     }
 
     /// The rest of [`Self::insert_general`] for a key the head did not
-    /// take: the ordered walk finds a key the first-match scan could not
-    /// settle, and the placement walk places an `absent` one after the
+    /// take: the walk past the head finds a key the first-match scan could
+    /// not settle, and the placement walk places an `absent` one after the
     /// growth the table is due.
     ///
     /// One function for both, and the last thing its caller does, so that
     /// caller keeps nothing across a call.
     #[inline(never)]
     fn insert_past_head(&mut self, key: K, value: V, hash: u64, absent: bool) -> Option<V> {
-        if !absent && let Some(lane) = self.find_by_walk::<K, FoundLane>(&key, hash) {
+        if !absent && let Some(lane) = self.find_past_head::<K, FoundLane>(&key, hash) {
             let slot = self.slot_of(lane);
             return Some(map::TableBackend::replace_value(self, slot, value));
         }
@@ -2304,7 +2482,8 @@ where
     #[inline]
     fn reopen_head(&mut self) {
         debug_assert_eq!(self.head_left, 0);
-        // A shape without a head has no lanes, and no placements either.
+        // A shape the head does not place in has no lanes, and no
+        // placements either.
         if self.head_lanes == 0 {
             return;
         }
@@ -2322,8 +2501,7 @@ where
     fn first_free_global(&self) -> Option<usize> {
         let shape = &self.shape;
         // A padding lane is never placed in.
-        let padding =
-            |slot: usize| slot < shape.primary_offset && slot % shape.stride >= shape.beta;
+        let padding = |slot: usize| slot < shape.primary_offset && slot % GROUP_SIZE >= shape.beta;
         (0..shape.slots).find(|&slot| {
             // SAFETY: `slot` is below the storage capacity.
             !padding(slot) && control::is_free(unsafe { self.storage.control_at(slot) })
@@ -2359,7 +2537,7 @@ where
             self.head_left -= 1;
         }
         if exceptional {
-            self.exceptional_placement = true;
+            self.set_exceptional_placement(true);
         }
     }
 
@@ -2583,6 +2761,7 @@ where
             &mut self.exceptional_placement,
             &mut other.exceptional_placement,
         );
+        self.set_exceptional_placement(self.exceptional_placement);
         mem::swap(&mut self.prf, &mut other.prf);
         mem::swap(&mut self.membership, &mut other.membership);
     }
@@ -2611,7 +2790,7 @@ where
         let probe = self.prf.prepare(key_hash);
         let bucket = Self::sample_ordinary(probe, level);
         self.storage
-            .prefetch_slot(level.offset + bucket * self.shape.stride);
+            .prefetch_slot(FunnelShape::head_start(level, bucket));
     }
 
     /// Inlined into both rebuild loops: outlining it costs a call per entry
@@ -2740,8 +2919,8 @@ where
     }
 
     // The gate settles nearly every absent key, and the first-match scan
-    // most of the rest. Only a key that scan leaves open takes the ordered
-    // walk.
+    // most of the rest. Only a key that scan leaves open takes the walk past
+    // the head.
     //
     // Forced inline with the gate alone: an absent key's search then makes
     // no call and leaves its answer in registers.
@@ -2759,7 +2938,7 @@ where
                 return Ok(found);
             }
             if found == ENTRY_UNSETTLED
-                && let Some(lane) = self.find_by_walk::<Q, FoundLane>(key, hash)
+                && let Some(lane) = self.find_past_head::<Q, FoundLane>(key, hash)
             {
                 return Ok(self.slot_of(lane));
             }
@@ -3030,7 +3209,7 @@ where
         unsafe { self.shape.reset_ordinary_controls(self.storage.ctrl_ptr()) };
         self.settle_counts();
         self.refreshed_deletes = 0;
-        self.exceptional_placement = false;
+        self.set_exceptional_placement(false);
         // Before the counts, which arm the next settle from the filter's
         // stale count.
         self.clear_membership();
@@ -3059,7 +3238,7 @@ where
         // clone's own counts.
         cloned.settle_left = cloned.settle_armed.wrapping_sub(self.uncounted_deletes());
         cloned.set_entries(self.entries());
-        cloned.exceptional_placement = self.exceptional_placement;
+        cloned.set_exceptional_placement(self.exceptional_placement);
         cloned.prf = self.prf;
         // Slots are copied rather than reinserted, so the filter comes with them.
         // SAFETY: each region belongs to its own table's arena; the source has
