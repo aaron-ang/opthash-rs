@@ -1,6 +1,7 @@
 //! Control-group scans. Exactly one backend module is compiled, selected by the
 //! `opthash_*_group` cfg that `build.rs` derives from the target architecture;
-//! the ladder at the bottom re-exports its three mask functions.
+//! the ladder at the bottom re-exports its mask functions and the end of a
+//! mask its lead walk starts from.
 //!
 //! Every mask function is `unsafe`: `ptr` must be valid to read `GROUP_SIZE`
 //! control bytes.
@@ -14,6 +15,10 @@ mod neon {
 
     use super::BitMask;
     use crate::raw::control::OCCUPIED_BIT;
+
+    /// The highest match is located by one leading-zero count; the lowest
+    /// needs a bit reversal before the count.
+    pub(crate) const LEADS_FROM_LAST_LANE: bool = true;
 
     /// Collapses an 8-lane compare into its `BitMask` bit pattern.
     #[inline]
@@ -138,6 +143,10 @@ mod sse2 {
 
     use super::BitMask;
 
+    /// The lowest match is located by one trailing-zero count; the leading
+    /// count of baseline x86-64 is a bit scan that needs a correction.
+    pub(crate) const LEADS_FROM_LAST_LANE: bool = false;
+
     /// One bit per lane, set where the control byte carries `OCCUPIED_BIT`
     /// (the sign bit `movemask` extracts).
     #[inline]
@@ -239,6 +248,10 @@ mod swar {
     const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     const HI: u64 = 0x8080_8080_8080_8080;
     const ONES: u64 = 0x0101_0101_0101_0101;
+
+    /// Either end is correct; the targets this fallback serves differ in
+    /// which count is cheap.
+    pub(crate) const LEADS_FROM_LAST_LANE: bool = true;
 
     /// Load eight control bytes as one little-endian word (lane `i` = bits `[8*i, 8*i+7]`).
     ///
@@ -441,4 +454,6 @@ use sse2 as backend;
 #[cfg(opthash_scalar_group)]
 use swar as backend;
 
-pub(crate) use backend::{eq_mask_group, free_lanes_group, free_mask_group, occupied_mask_group};
+pub(crate) use backend::{
+    LEADS_FROM_LAST_LANE, eq_mask_group, free_lanes_group, free_mask_group, occupied_mask_group,
+};

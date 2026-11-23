@@ -1663,7 +1663,7 @@ fn assert_head_addresses_storage<K, V, S>(table: &FunnelTable<K, V, S>) {
         assert_eq!(head.multiplier, derived.multiplier, "entry {index}");
         assert_eq!(head.buckets, derived.buckets, "entry {index}");
         assert_eq!(head.ctrl, derived.ctrl, "entry {index}");
-        assert_eq!(head.last, derived.last, "entry {index}");
+        assert_eq!(head.lead_origin, derived.lead_origin, "entry {index}");
     }
     assert_eq!(table.head_lanes, table.shape.head_lanes());
 }
@@ -3084,54 +3084,6 @@ fn allocator_failure_is_typed_and_leaves_populated_resize_unchanged() {
     drop(table);
     assert_eq!(allocations.load(Ordering::SeqCst), 1);
     assert_eq!(deallocations.load(Ordering::SeqCst), 1);
-}
-
-/// The first-match lookup walks a group mask from its highest lane down.
-/// For every set of matching lanes, that walk visits the lanes the mask's
-/// own iterator yields, in reverse, and each lane's depth is a whole number
-/// of lanes below the group's last.
-#[test]
-fn a_group_mask_walked_from_the_top_visits_its_lanes_in_reverse() {
-    const FP: u8 = 0x80 | 7;
-    // One bit of `chosen` per lane. Miri takes the sets of eight lanes, and
-    // repeats each in the upper half of a wider group.
-    let sets = if cfg!(miri) {
-        1 << u8::BITS
-    } else {
-        1_u32 << GROUP_SIZE
-    };
-    for set in 0..sets {
-        let chosen = if cfg!(miri) {
-            set | set << u8::BITS
-        } else {
-            set
-        };
-        let controls: [u8; GROUP_SIZE] = core::array::from_fn(|lane| {
-            if chosen >> lane & 1 == 1 {
-                FP
-            } else {
-                CTRL_EMPTY
-            }
-        });
-        // SAFETY: `controls` is one whole group.
-        let mask = unsafe { simd::eq_mask_group(controls.as_ptr(), FP) };
-        let mut ascending: Vec<usize> = mask.clone().collect();
-        ascending.reverse();
-        let mut descending = Vec::new();
-        let mut matches = mask.0;
-        while matches != 0 {
-            // SAFETY: `matches` is a group mask less whole lanes, and not
-            // empty.
-            let depth = unsafe { highest_lane_depth(matches) };
-            assert!(depth.is_multiple_of(BITMASK_STRIDE), "{controls:02x?}");
-            descending.push(GROUP_SIZE - 1 - (depth / BITMASK_STRIDE) as usize);
-            // SAFETY: as above.
-            let rest = unsafe { below_highest_lane(matches) };
-            assert!(rest < matches, "{controls:02x?}");
-            matches = rest;
-        }
-        assert_eq!(descending, ascending, "{controls:02x?}");
-    }
 }
 
 /// The tombstone-blind scan one control at a time: the result, and the

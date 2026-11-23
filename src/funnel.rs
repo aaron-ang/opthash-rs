@@ -23,7 +23,7 @@ use crate::exact::probe::{
 use crate::hasher::DefaultHashBuilder;
 use crate::membership::{self, MembershipRegion};
 use crate::raw::arena::{self, Arena, ArenaSlots, SlotEntry};
-use crate::raw::bitmask::{BITMASK_SLOT_BIT, BITMASK_STRIDE};
+use crate::raw::bitmask::{BITMASK_SLOT_BIT, BITMASK_STRIDE, BitMask, LEAD_ORIGIN};
 use crate::raw::config::GROUP_SIZE;
 use crate::raw::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE};
 use crate::raw::iter::OccupiedIndices;
@@ -112,10 +112,10 @@ struct HeadLevel<T> {
     multiplier: u64,
     buckets: usize,
     ctrl: *mut u8,
-    /// The entry of the last lane of the level's first bucket. The lookup
-    /// counts a match back from a group's last lane, and from here that
-    /// count alone is the entry's offset.
-    last: *mut MaybeUninit<T>,
+    /// The entry of lane [`LEAD_ORIGIN`] of the level's first bucket. The
+    /// lookup counts a match from a group's lane [`LEAD_ORIGIN`], and from
+    /// here that count alone is the entry's offset.
+    lead_origin: *mut MaybeUninit<T>,
 }
 
 impl<T> Clone for HeadLevel<T> {
@@ -147,17 +147,17 @@ impl<T> HeadLevel<T> {
         unsafe { self.ctrl.cast::<[u8; GROUP_SIZE]>().add(bucket) }
     }
 
-    /// The entry of bucket `bucket`'s last lane.
+    /// The entry of bucket `bucket`'s lane [`LEAD_ORIGIN`].
     ///
     /// # Safety
     ///
     /// `bucket` is below the level's bucket count, or zero for an entry
     /// that is no level.
     #[inline]
-    unsafe fn last_entry(&self, bucket: usize) -> *mut MaybeUninit<T> {
+    unsafe fn lead_origin_entry(&self, bucket: usize) -> *mut MaybeUninit<T> {
         // SAFETY: the caller keeps the bucket inside the level.
         unsafe {
-            self.last
+            self.lead_origin
                 .cast::<[MaybeUninit<T>; GROUP_SIZE]>()
                 .add(bucket)
                 .cast()
@@ -171,10 +171,10 @@ impl<T> HeadLevel<T> {
     /// `slot` is below the level's slot count.
     #[inline]
     unsafe fn entry(&self, slot: usize) -> *mut MaybeUninit<T> {
-        // SAFETY: the first bucket's last lane is `GROUP_SIZE - 1` slots
+        // SAFETY: the first bucket's lane `LEAD_ORIGIN` is that many slots
         // into the level, so stepping back that far reaches the level's
         // first slot, and the caller keeps `slot` inside the level.
-        unsafe { self.last.sub(GROUP_SIZE - 1).add(slot) }
+        unsafe { self.lead_origin.sub(LEAD_ORIGIN).add(slot) }
     }
 }
 
@@ -192,7 +192,7 @@ fn head_levels<T>(shape: &FunnelShape, storage: &FlatStorage<T>) -> [HeadLevel<T
         multiplier: 0,
         buckets: 0,
         ctrl: storage.ctrl_ptr().wrapping_add(shape.slots),
-        last: storage.data_ptr().wrapping_add(shape.slots),
+        lead_origin: storage.data_ptr().wrapping_add(shape.slots),
     };
     let mut head = [absent; HEAD_ENTRIES];
     if shape.has_head() {
@@ -208,9 +208,7 @@ fn head_levels<T>(shape: &FunnelShape, storage: &FlatStorage<T>) -> [HeadLevel<T
                 ctrl: storage.ctrl_ptr().wrapping_add(level.offset),
                 // In bounds as well: a level holds whole buckets, each a
                 // group of slots.
-                last: storage
-                    .data_ptr()
-                    .wrapping_add(level.offset + GROUP_SIZE - 1),
+                lead_origin: storage.data_ptr().wrapping_add(level.offset + LEAD_ORIGIN),
             };
         }
     }
@@ -444,45 +442,6 @@ const _: () = assert!(CTRL_PADDING != CTRL_EMPTY && CTRL_PADDING != CTRL_TOMBSTO
 #[cold]
 #[inline]
 const fn rarely_taken() {}
-
-/// Zero bits above the highest lane of a group mask.
-#[allow(clippy::cast_possible_truncation)]
-const BITMASK_UNUSED_BITS: u32 = u64::BITS - GROUP_SIZE as u32 * BITMASK_STRIDE;
-
-/// How far the highest bit of `matches` lies below the top bit of a group
-/// mask's last lane: its lane's distance from the last, in mask bits.
-///
-/// # Safety
-///
-/// `matches` must be a non-empty group mask, or what [`below_highest_lane`]
-/// leaves of one: its highest set bit is the top bit of its lane's
-/// stride.
-#[inline]
-// The stride is one where a group mask holds one bit per slot.
-#[allow(clippy::modulo_one)]
-unsafe fn highest_lane_depth(matches: u64) -> u32 {
-    debug_assert_ne!(matches, 0);
-    let depth = matches.leading_zeros() - BITMASK_UNUSED_BITS;
-    debug_assert!(depth.is_multiple_of(BITMASK_STRIDE));
-    // SAFETY: the caller's contract. Stating it lets the division by the
-    // stride fold into the scaling of whatever the lane indexes.
-    unsafe { core::hint::assert_unchecked(depth.is_multiple_of(BITMASK_STRIDE)) };
-    depth
-}
-
-/// `matches` without its highest lane.
-///
-/// # Safety
-///
-/// As for [`highest_lane_depth`].
-#[inline]
-unsafe fn below_highest_lane(matches: u64) -> u64 {
-    // SAFETY: the caller's contract.
-    let above = unsafe { highest_lane_depth(matches) } + BITMASK_UNUSED_BITS;
-    // The lane is cleared at the top of the word, where its mask is one
-    // constant for every lane.
-    ((matches << above) & (u64::MAX >> BITMASK_STRIDE)) >> above
-}
 
 pub(crate) struct FlatStorage<T> {
     ctrl_ptr: *mut u8,
@@ -1348,39 +1307,32 @@ where
                 unsafe { simd::eq_mask_group(level.group(bucket).cast(), key_fingerprint) };
             (bucket, matches.0)
         };
-        // The entry at the highest match of bucket `bucket` of `level`, if
-        // it holds the key. A bucket holds a key once, so the order the
-        // matches are compared in changes no answer; from the top, the
-        // entry's address needs no bit reversal.
+        // The entry at the lead match of bucket `bucket` of `level`, if it
+        // holds the key. A bucket holds a key once, so the order the matches
+        // are compared in changes no answer, and the walk takes them in the
+        // order the group backend locates cheapest.
         let holding_key = |level: &HeadLevel<SlotEntry<K, V>>,
                            bucket: usize,
                            matches: u64|
          -> Option<Found<'_, K, V>> {
+            let matches = BitMask(matches);
             // SAFETY: every caller passes a non-empty set: the group mask
-            // `scan` returned, or what is left of it once whole lanes are
-            // cleared from the highest down. A matched lane lies inside its
-            // bucket and carries the fingerprint, so the slot is in bounds
-            // and occupied.
+            // `scan` returned, or what is left of it once lead lanes are
+            // cleared. A matched lane lies inside its bucket and carries the
+            // fingerprint, so the slot is in bounds and occupied.
             let (lane, entry) = unsafe {
-                // Counted back from the bucket's last lane, by the mask's
-                // leading zeros scaled to each array's stride.
-                let depth = highest_lane_depth(matches) as usize;
                 (
                     NonNull::new_unchecked(
                         level
                             .group(bucket)
                             .cast::<u8>()
-                            .add(GROUP_SIZE - 1)
-                            .sub(depth / BITMASK_STRIDE as usize),
+                            .add(LEAD_ORIGIN)
+                            .offset(matches.lead_offset(1)),
                     ),
                     NonNull::new_unchecked(
                         level
-                            .last_entry(bucket)
-                            .wrapping_byte_add(
-                                (depth * mem::size_of::<SlotEntry<K, V>>()
-                                    / BITMASK_STRIDE as usize)
-                                    .wrapping_neg(),
-                            )
+                            .lead_origin_entry(bucket)
+                            .byte_offset(matches.lead_offset(mem::size_of::<SlotEntry<K, V>>()))
                             .cast::<SlotEntry<K, V>>(),
                     ),
                 )
@@ -1439,7 +1391,7 @@ where
                     rarely_taken();
                     // SAFETY: the test above: the set is not empty, and it
                     // is the scan's mask less whole lanes.
-                    matches = unsafe { below_highest_lane(matches) };
+                    matches = unsafe { BitMask(matches).without_lead() }.0;
                 }
             }};
         }
