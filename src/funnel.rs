@@ -1028,7 +1028,7 @@ impl BucketLanes {
 /// # Safety
 ///
 /// `ctrl_ptr` must be readable for a group from `head` and from each group
-/// of the tail, the last included even for a bucket without a tail.
+/// of the tail.
 #[inline]
 unsafe fn first_free_in_bucket(
     ctrl_ptr: *const u8,
@@ -1043,6 +1043,9 @@ unsafe fn first_free_in_bucket(
     let free = free_in(head, lanes.head);
     if free != 0 {
         return Some(at(head, free));
+    }
+    if lanes.last == 0 {
+        return None;
     }
     let last = tail + lanes.last_group;
     let mut group = tail;
@@ -1758,8 +1761,7 @@ where
             let bucket = probe::ordinary_bucket_of_word(word, level.buckets);
             word = word.wrapping_mul(level_step);
             // SAFETY: a head group and every group of a tail start before
-            // `slots`, as does the group after a level without tails, and
-            // the control array pads a group past `slots`.
+            // `slots`, and the control array pads a group past `slots`.
             let free = unsafe {
                 first_free_in_bucket(
                     ctrl_ptr,

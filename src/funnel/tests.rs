@@ -2978,7 +2978,7 @@ fn assert_bucket_scans_match_scalar(
         .position(|&control| control::is_free(control))
         .map(|lane| start + lane);
     // The run as one bucket: its head group, then the rest as its tail. A
-    // bucket without a tail reads its head group again for one.
+    // bucket without a tail has none to read, so its tail offset is unused.
     let tail = if width > GROUP_SIZE {
         start + GROUP_SIZE
     } else {
