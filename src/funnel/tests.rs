@@ -187,8 +187,8 @@ fn entry_search_checks_exceptional_hits_before_reporting_a_key_absent() {
         7,
         table.membership_slot(key),
         fingerprint,
-        true,
     );
+    table.set_exceptional_placement(true);
     assert_eq!(table.find_for_entry(&key, key).ok(), Some(slot));
 
     // A different key with the same hash must complete the exceptional
@@ -343,8 +343,8 @@ fn dense_scan_preserves_order_while_removals_make_the_table_sparse() {
             key + 100,
             table.membership_slot(hash),
             table.prf.prepare(hash).fingerprint(),
-            true,
         );
+        table.set_exceptional_placement(true);
     }
     let mut scan = map::TableBackend::scan(&table);
     for slot in slots {
@@ -388,8 +388,8 @@ fn dense_scan_steps_over_bucket_padding_into_the_special_arrays() {
             key,
             table.membership_slot(hash),
             table.prf.prepare(hash).fingerprint(),
-            true,
         );
+        table.set_exceptional_placement(true);
     }
     // SAFETY: `slot < slots`, the storage capacity.
     let occupied = (0..table.shape.slots)
@@ -445,8 +445,8 @@ fn sparse_scan_visits_group_boundaries_and_tail_once_in_slot_order() {
             key + 100,
             table.membership_slot(hash),
             table.prf.prepare(hash).fingerprint(),
-            true,
         );
+        table.set_exceptional_placement(true);
     }
     // Include a deleted slot next to a live slot in a cached group.
     // SAFETY: the slot lies between two placed slots.
@@ -992,8 +992,8 @@ fn lookup_finds_a_key_placed_outside_its_funnel_in_a_recorded_level() {
             index,
             table.membership_slot(key),
             table.prf.prepare(key).fingerprint(),
-            true,
         );
+        table.set_exceptional_placement(true);
     }
     assert!(table.exceptional_placement);
     for index in 1..=32_u64 {

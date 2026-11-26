@@ -990,11 +990,12 @@ const ALL_LANES: u64 = {
     lanes
 };
 
-/// The slot bits of a group mask that are its first `lanes` lanes, at most
-/// [`GROUP_SIZE`].
+/// The slot bits of a group mask that are its first `lanes` lanes, at
+/// least one and at most [`GROUP_SIZE`].
 #[allow(clippy::cast_possible_truncation)]
 const fn low_lanes(lanes: usize) -> u64 {
-    ALL_LANES & u64::MAX.unbounded_shr(u64::BITS - lanes as u32 * BITMASK_STRIDE)
+    debug_assert!(lanes != 0 && lanes <= GROUP_SIZE);
+    ALL_LANES >> ((GROUP_SIZE - lanes) as u32 * BITMASK_STRIDE)
 }
 
 /// The lanes of an ordinary bucket as [`first_free_in_bucket`] reads them:
@@ -1008,15 +1009,19 @@ struct BucketLanes {
 }
 
 impl BucketLanes {
-    /// The lanes of a bucket `beta` lanes wide.
+    /// The lanes of a bucket `beta` lanes wide, at least one.
+    #[allow(clippy::cast_possible_truncation)]
     fn of(beta: usize) -> Self {
-        let head = beta.min(GROUP_SIZE);
-        let tail = beta - head;
+        let tail = beta.saturating_sub(GROUP_SIZE);
         let last_group = tail.saturating_sub(1) / GROUP_SIZE * GROUP_SIZE;
         Self {
-            head: low_lanes(head),
+            head: ALL_LANES >> (GROUP_SIZE.saturating_sub(beta) as u32 * BITMASK_STRIDE),
             last_group,
-            last: low_lanes(tail - last_group),
+            last: if tail == 0 {
+                0
+            } else {
+                low_lanes(tail - last_group)
+            },
         }
     }
 }
@@ -2446,9 +2451,8 @@ where
         index: usize,
         unit: FilterUnit,
     ) -> Option<V> {
-        let probe = self.prf.prepare(hash);
         if let Some(levels) = WideLevelBin::of_recording_unit(unit, membership_bit(hash)) {
-            match self.first_match(&key, probe, levels) {
+            match self.first_match(&key, self.prf.prepare(hash), levels) {
                 Ok(found) => {
                     let mut entry = found.entry;
                     // SAFETY: a `Found` names an initialized entry of this
@@ -2464,7 +2468,7 @@ where
             // shape has none to walk.
             return self.insert_past_head(key, value, hash, true);
         }
-        self.insert_absent(key, value, hash, index, unit, probe)
+        self.insert_absent(key, value, hash, index, unit, self.prf.prepare(hash))
     }
 
     /// The rest of [`Self::insert_general`] for an absent key: through the
@@ -2558,9 +2562,13 @@ where
         value: V,
         membership: MembershipSlot,
         key_fingerprint: u8,
-        exceptional: bool,
     ) {
         let Vacancy { slot, level_bit } = vacancy;
+        debug_assert!(
+            // SAFETY: a vacancy is a probed in-bounds slot.
+            control::is_free(unsafe { self.storage.control_at(slot) }),
+            "stale Funnel vacancy at slot {slot}"
+        );
         // SAFETY: callers pass a free slot from a probe within the storage,
         // and `key_fingerprint` is an occupied control.
         unsafe {
@@ -2575,9 +2583,6 @@ where
             self.entries_base += 1;
         } else {
             self.head_left -= 1;
-        }
-        if exceptional {
-            self.set_exceptional_placement(true);
         }
     }
 
@@ -2627,12 +2632,6 @@ where
     #[inline(always)]
     fn resolve_vacancy(&self, vacancy: Option<Vacancy>) -> (Vacancy, bool) {
         if let Some(vacancy) = vacancy {
-            debug_assert!(
-                // SAFETY: a vacancy is a probed in-bounds slot.
-                control::is_free(unsafe { self.storage.control_at(vacancy.slot) }),
-                "stale Funnel vacancy at slot {}",
-                vacancy.slot
-            );
             (vacancy, false)
         } else {
             let slot = self
@@ -2642,45 +2641,39 @@ where
         }
     }
 
-    /// Places a known-absent key at its walk's vacancy. An exhausted walk
-    /// first rebuilds the table at the same size under a fresh probe seed,
+    /// Places a known-absent key whose placement walk found no vacancy. The
+    /// table first rebuilds at the same size under a fresh probe seed,
     /// which clears tombstones and re-places every survivor, then walks
     /// again; only a second exhaustion places the key outside its funnel.
-    fn place_absent_after_search(
+    #[cold]
+    #[inline(never)]
+    fn place_after_exhausted_walk(
         &mut self,
         key: K,
         value: V,
         key_hash: u64,
         mut membership: MembershipSlot,
-        vacancy: Option<Vacancy>,
     ) -> usize {
         // An epoch that already placed outside its funnels was either rebuilt
         // for this reason or failed in its own rebuild; another would cost
         // O(n) per insert without helping.
-        let rebuilt = vacancy.is_none() && !self.exceptional_placement;
-        let vacancy = if rebuilt {
-            let (recovered, slot) = self.rebuild_for_placement(key_hash);
-            membership = slot;
-            recovered
-        } else {
-            vacancy
-        };
+        let rebuilt = !self.exceptional_placement;
+        let mut vacancy = None;
+        if rebuilt {
+            (vacancy, membership) = self.rebuild_for_placement(key_hash);
+        }
         let (vacancy, exceptional) = self.resolve_vacancy(vacancy);
         // Derived past the rebuild, whose fresh seed changes the fingerprint.
         let key_fingerprint = self.prf.prepare(key_hash).fingerprint();
-        self.place_new_entry(
-            vacancy,
-            key,
-            value,
-            membership,
-            key_fingerprint,
-            exceptional,
-        );
-        if exceptional && rebuilt {
-            self.epoch.note_placement_recovery();
-        } else if exceptional {
-            self.epoch
-                .start_with_placement_recovery(EpochTransition::PlacementRecovery);
+        self.place_new_entry(vacancy, key, value, membership, key_fingerprint);
+        if exceptional {
+            self.set_exceptional_placement(true);
+            if rebuilt {
+                self.epoch.note_placement_recovery();
+            } else {
+                self.epoch
+                    .start_with_placement_recovery(EpochTransition::PlacementRecovery);
+            }
         }
         vacancy.slot
     }
@@ -2693,9 +2686,14 @@ where
         self.prepare_vacant_insert();
         // Past the growth, which changes the probe seed and the filter
         // geometry.
-        let vacancy = self.search_vacancy(self.prf.prepare(hash));
+        let probe = self.prf.prepare(hash);
+        let vacancy = self.search_vacancy(probe);
         let membership = self.membership_slot(hash);
-        self.place_absent_after_search(key, value, hash, membership, vacancy)
+        let Some(vacancy) = vacancy else {
+            return self.place_after_exhausted_walk(key, value, hash, membership);
+        };
+        self.place_new_entry(vacancy, key, value, membership, probe.fingerprint());
+        vacancy.slot
     }
 
     /// The first-match scan of [`map::TableBackend::find_for_entry`] for a
@@ -2854,14 +2852,10 @@ where
         }
         let key_fingerprint = probe.fingerprint();
         let (vacancy, exceptional) = self.resolve_vacancy(self.search_vacancy(probe));
-        self.place_new_entry(
-            vacancy,
-            entry.key,
-            entry.value,
-            membership,
-            key_fingerprint,
-            exceptional,
-        );
+        self.place_new_entry(vacancy, entry.key, entry.value, membership, key_fingerprint);
+        if exceptional {
+            self.set_exceptional_placement(true);
+        }
         exceptional
     }
 }
