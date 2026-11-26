@@ -2,6 +2,13 @@
 
 use core::iter::FusedIterator;
 
+/// Smallest reserve exponent with a Funnel plan: `delta <= 1/8`.
+pub(crate) const MIN_FUNNEL_RESERVE_EXPONENT: u32 = 3;
+
+/// Ordinary levels of the Funnel plan with the fewest: `alpha` at
+/// [`MIN_FUNNEL_RESERVE_EXPONENT`].
+pub(crate) const MIN_FUNNEL_LEVELS: usize = 4 * MIN_FUNNEL_RESERVE_EXPONENT as usize + 10;
+
 /// Exact fixed-size inputs shared by library placement and scalar tests.
 ///
 /// `delta` is represented as `1 / 2^reserve_exponent`; no floating-point value is
@@ -55,10 +62,10 @@ impl PaperConfig {
     /// partition. The paper's remaining preconditions are asymptotic and carry
     /// no concrete constant to check.
     pub(crate) fn funnel_plan(&self) -> Result<FunnelPlan, FunnelPlanError> {
-        if self.reserve_exponent < 3 {
+        if self.reserve_exponent < MIN_FUNNEL_RESERVE_EXPONENT {
             return Err(FunnelPlanError::ExponentBelowMinimum {
                 reserve_exponent: self.reserve_exponent,
-                minimum: 3,
+                minimum: MIN_FUNNEL_RESERVE_EXPONENT,
             });
         }
 

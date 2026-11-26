@@ -51,32 +51,6 @@ macro_rules! backend_suite {
             }
 
             #[test]
-            fn entry_occupied_get_mut_mutates() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
-                map.insert(1, 10);
-                if let Entry::Occupied(mut occ) = map.entry(1) {
-                    *occ.get_mut() = 99;
-                    assert_eq!(*occ.get(), 99);
-                } else {
-                    panic!("expected occupied");
-                }
-                assert_eq!(map.get(&1), Some(&99));
-            }
-
-            #[test]
-            fn entry_occupied_insert_returns_old_and_replaces() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
-                map.insert(1, 10);
-                if let Entry::Occupied(mut occ) = map.entry(1) {
-                    let old = occ.insert(99);
-                    assert_eq!(old, 10);
-                } else {
-                    panic!("expected occupied");
-                }
-                assert_eq!(map.get(&1), Some(&99));
-            }
-
-            #[test]
             fn entry_occupied_into_mut_outlives_entry_borrow() {
                 let mut map: HashMap<i32, i32> = HashMap::new();
                 map.insert(1, 10);
@@ -86,40 +60,6 @@ macro_rules! backend_suite {
                 };
                 *value = 123;
                 assert_eq!(map.get(&1), Some(&123));
-            }
-
-            #[test]
-            fn entry_occupied_remove_returns_value() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
-                map.insert(1, 10);
-                map.insert(2, 20);
-                if let Entry::Occupied(occ) = map.entry(1) {
-                    assert_eq!(occ.remove(), 10);
-                } else {
-                    panic!("expected occupied");
-                }
-                assert!(map.get(&1).is_none());
-                assert_eq!(map.get(&2), Some(&20));
-                assert_eq!(map.len(), 1);
-            }
-
-            #[test]
-            fn entry_or_insert_creates_when_missing() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
-                let value = map.entry(1).or_insert(10);
-                assert_eq!(*value, 10);
-                assert_eq!(map.get(&1), Some(&10));
-                assert_eq!(map.len(), 1);
-            }
-
-            #[test]
-            fn entry_or_insert_returns_existing() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
-                map.insert(1, 10);
-                let value = map.entry(1).or_insert(99);
-                assert_eq!(*value, 10);
-                assert_eq!(map.get(&1), Some(&10));
-                assert_eq!(map.len(), 1);
             }
 
             #[test]
@@ -178,7 +118,7 @@ macro_rules! backend_suite {
             }
 
             #[test]
-            fn get_disjoint_unchecked_mut_returns_all_refs_on_hits() {
+            fn get_disjoint_unchecked_mut_returns_a_ref_per_hit_and_none_per_miss() {
                 let mut map: HashMap<i32, i32> = HashMap::with_capacity(64);
                 for i in 0..16 {
                     map.insert(i, i * 10);
@@ -189,17 +129,9 @@ macro_rules! backend_suite {
                     got,
                     [Some(&mut 10), Some(&mut 30), Some(&mut 70), Some(&mut 150)]
                 );
-            }
-
-            #[test]
-            fn get_disjoint_unchecked_mut_yields_none_per_missing_key() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(32);
-                for i in 0..8 {
-                    map.insert(i, i);
-                }
                 // SAFETY: keys are distinct (one misses → None at that slot).
                 let got = unsafe { map.get_disjoint_unchecked_mut([&0, &1, &99]) };
-                assert_eq!(got, [Some(&mut 0), Some(&mut 1), None]);
+                assert_eq!(got, [Some(&mut 0), Some(&mut 10), None]);
             }
 
             #[test]
@@ -221,44 +153,6 @@ macro_rules! backend_suite {
                 let a: *const _ = map.hasher();
                 let b: *const _ = map.hasher();
                 assert!(std::ptr::eq(a, b));
-            }
-
-            #[test]
-            fn retain_with_empty_map_is_noop() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
-                let mut called = false;
-                map.retain(|_, _| {
-                    called = true;
-                    true
-                });
-                assert!(!called);
-                assert!(map.is_empty());
-            }
-
-            #[test]
-            fn try_insert_fails_with_occupied_error_when_present() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
-                map.insert(1, 10);
-                let err = map.try_insert(1, 99).expect_err("occupied must error");
-                assert_eq!(err.entry.key(), &1);
-                assert_eq!(err.entry.get(), &10);
-                assert_eq!(map.get(&1), Some(&10));
-            }
-
-            #[test]
-            fn try_insert_occupied_error_carries_rejected_value() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
-                map.insert(1, 10);
-                let err = map.try_insert(1, 99).expect_err("occupied must error");
-                assert_eq!(err.value, 99);
-            }
-
-            #[test]
-            fn try_insert_succeeds_when_missing() {
-                let mut map: HashMap<i32, i32> = HashMap::new();
-                let value = map.try_insert(1, 10).expect("vacant should succeed");
-                assert_eq!(*value, 10);
-                assert_eq!(map.get(&1), Some(&10));
             }
 
             #[test]
@@ -371,32 +265,6 @@ macro_rules! backend_suite {
             }
 
             #[test]
-            fn into_iter_skips_tombstones() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
-                for i in 0..60 {
-                    map.insert(i, i);
-                }
-                for i in (0..60).step_by(3) {
-                    map.remove(&i);
-                }
-                let expected_len = map.len();
-                let collected: Vec<(i32, i32)> = map.into_iter().collect();
-                assert_eq!(collected.len(), expected_len);
-            }
-
-            #[test]
-            fn into_iter_yields_all_entries() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
-                for i in 0..60 {
-                    map.insert(i, i * 11);
-                }
-                let mut collected: Vec<(i32, i32)> = map.into_iter().collect();
-                collected.sort_unstable();
-                let expected: Vec<(i32, i32)> = (0..60).map(|i| (i, i * 11)).collect();
-                assert_eq!(collected, expected);
-            }
-
-            #[test]
             fn into_keys_drops_values() {
                 let counter = Arc::new(AtomicUsize::new(0));
                 let n: usize = 32;
@@ -474,19 +342,6 @@ macro_rules! backend_suite {
             }
 
             #[test]
-            fn iter_mut_skips_tombstones() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(64);
-                for i in 0..40 {
-                    map.insert(i, i);
-                }
-                for i in (0..40).step_by(2) {
-                    map.remove(&i);
-                }
-                let count = map.iter_mut().count();
-                assert_eq!(count, map.len());
-            }
-
-            #[test]
             fn iter_mut_yields_each_entry_exactly_once() {
                 let mut map: HashMap<i32, i32> = HashMap::with_capacity(128);
                 for i in 0..80 {
@@ -497,19 +352,6 @@ macro_rules! backend_suite {
                 collected.sort_unstable();
                 let expected: Vec<(i32, i32)> = (0..80).map(|i| (i, i * 3)).collect();
                 assert_eq!(collected, expected);
-            }
-
-            #[test]
-            fn iter_skips_tombstones_after_remove() {
-                let mut map: HashMap<i32, i32> = HashMap::with_capacity(64);
-                for i in 0..40 {
-                    map.insert(i, i);
-                }
-                for i in (0..40).step_by(3) {
-                    map.remove(&i);
-                }
-                let keys: Vec<i32> = map.iter().map(|(&k, _)| k).collect();
-                assert_eq!(keys.len(), map.len());
             }
 
             #[test]
@@ -600,12 +442,6 @@ macro_rules! backend_suite {
                 let cap_before = map.capacity();
                 map.try_reserve(0).expect("noop");
                 assert_eq!(map.capacity(), cap_before);
-            }
-
-            #[test]
-            fn with_capacity_reports_at_least_requested_capacity() {
-                let map: HashMap<i32, i32> = HashMap::with_capacity(320);
-                assert!(map.capacity() >= 320);
             }
 
             #[test]

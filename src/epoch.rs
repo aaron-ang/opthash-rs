@@ -59,10 +59,14 @@ impl EpochState {
         }
     }
 
+    /// Counts `count` deletes at once, for a backend that counts them itself
+    /// and reports when the count is read.
     #[inline]
-    pub(crate) fn note_delete(&mut self) {
-        self.deletions = self.deletions.saturating_add(1);
-        self.lifecycle |= HAD_DELETE_MASK;
+    pub(crate) fn note_deletes(&mut self, count: usize) {
+        if count != 0 {
+            self.deletions = self.deletions.saturating_add(count);
+            self.lifecycle |= HAD_DELETE_MASK;
+        }
     }
 
     pub(crate) fn start(&mut self, transition: EpochTransition) {

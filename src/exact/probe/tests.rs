@@ -41,6 +41,22 @@ fn bounded_elastic_phi_matches_checked_encoder_for_every_hot_coordinate() {
     }
 }
 
+/// The widest image that fits a word is encoded, and one bit more is not.
+#[test]
+fn bounded_elastic_phi_encodes_up_to_a_full_word() {
+    let widest_j = u64::from(u16::MAX);
+    for i in [1 << 30, (1 << 30) + 12_345, i32::MAX.cast_unsigned()] {
+        for j in [1 << 15, widest_j] {
+            let checked = elastic_phi(u128::from(i), u128::from(j)).unwrap();
+            assert_eq!(checked.leading_zeros(), u64::BITS, "i={i}, j={j}");
+            assert_eq!(elastic_phi_bounded(i, j).map(u128::from), Some(checked));
+        }
+    }
+    let wider = elastic_phi(1 << 31, u128::from(widest_j)).unwrap();
+    assert!(wider > u128::from(u64::MAX));
+    assert_eq!(elastic_phi_bounded(1 << 31, widest_j), None);
+}
+
 #[test]
 fn bounded_elastic_phi_rejects_zero_and_unrepresentable_coordinates() {
     assert_eq!(elastic_phi_bounded(0, 1), None);
@@ -79,7 +95,7 @@ fn prepared_power_of_two_reduction_is_bit_identical_to_generic_reduction() {
                 let counter_base = try_pack_elastic_counter(level, logical_probe, 0).unwrap();
                 for upper in [1, 2, 3, 4, 16, 191, 1_237, 1 << 20] {
                     assert_eq!(
-                        unbiased_prepared_elastic_probe_index(prepared, counter_base, upper, 8,),
+                        unbiased_prepared_elastic_probe_index(prepared, counter_base, upper),
                         unbiased_probe_index(&oracle, key, domain, logical_probe, upper, 8,)
                     );
                 }
@@ -89,19 +105,107 @@ fn prepared_power_of_two_reduction_is_bit_identical_to_generic_reduction() {
 }
 
 #[test]
+fn elastic_level_runs_never_share_or_wrap_a_sequence_index() {
+    let last_probe = ELASTIC_LOGICAL_LIMIT - 1;
+    let levels = u32::try_from(ELASTIC_LEVEL_LIMIT).unwrap();
+    assert_eq!(elastic_level_run(0).0, 0);
+    let mut steps = alloc::collections::BTreeSet::new();
+    for level in 0..levels {
+        let (first, step) = elastic_level_run(level as usize);
+        // The level sits in the bits no step reaches, so two levels' runs
+        // are disjoint, and a positive step keeps one level's probes apart.
+        assert_eq!(first % levels, level);
+        assert_eq!(step % levels, 0);
+        assert_eq!((step / levels) % 2, 1);
+        assert!(steps.insert(step), "two levels share a step");
+        assert!(u32::try_from(u64::from(first) + last_probe * u64::from(step)).is_ok());
+        for logical in [0, 1, 2, 63, 64, 4_095, 4_096, last_probe] {
+            let index = elastic_sequence_index(level, logical);
+            assert_eq!(elastic_sequence_coordinates(index), (level, logical));
+        }
+    }
+}
+
+#[test]
+fn elastic_level_words_step_through_the_levels_sequence_indices() {
+    let oracle = CounterPrf::new(FIXED_SEED);
+    for key in [0, 1, u64::MAX, FIXED_SEED, ELASTIC_FOLD_MULTIPLIER] {
+        let sequence = oracle
+            .prepare_elastic(key)
+            .sequence(ELASTIC_FOLD_MULTIPLIER);
+        for level in 0..u32::try_from(ELASTIC_LEVEL_LIMIT).unwrap() {
+            let (mut word, step) = sequence.run_words(elastic_level_run(level as usize));
+            for logical in 0..512 {
+                assert_eq!(
+                    word,
+                    sequence.word(elastic_sequence_index(level, logical)),
+                    "key {key:#x} level {level} probe {logical}"
+                );
+                assert_eq!(
+                    word,
+                    oracle.specified_word(key, u64::from(level), logical, 0)
+                );
+                word = word.wrapping_add(step);
+            }
+        }
+    }
+}
+
+/// Distinct slots among a key's first 64 probes of a level of 1024 slots.
+fn distinct_slots(oracle: CounterPrf, key: u64, level: u64) -> usize {
+    let prepared = oracle.prepare_elastic(key);
+    let domain = ProbeDomain::ElasticOrdinary { level };
+    (0..64)
+        .map(|logical| prepared.word(0, domain, logical, 0) >> (u64::BITS - 10))
+        .collect::<alloc::collections::BTreeSet<_>>()
+        .len()
+}
+
+#[test]
+fn all_zero_and_all_one_signatures_probe_many_slots() {
+    // The construction's seed leaves the signature equal to the hash, which
+    // an identity hasher makes the key.
+    let oracle = CounterPrf::new(0);
+    for key in [0, u64::MAX] {
+        for level in 0..ELASTIC_LEVEL_LIMIT {
+            assert!(
+                distinct_slots(oracle, key, level) >= 48,
+                "key {key:#x} level {level}"
+            );
+        }
+    }
+}
+
+#[test]
 fn elastic_counter_permutation_has_fixed_golden_vectors() {
     let oracle = CounterPrf::new(0x1234_5678_9abc_def0);
     let cases = [
-        (0, 0, 0, 0, 0x0000_0000, 0xa672_f2f4_5fc9_0bed),
-        (1, 31, 8_191, 7, 0x001f_ffff, 0x728c_b5c3_2967_b861),
-        (u64::MAX, 17, 383, 7, 0x0011_0bff, 0x3472_0d88_ba17_9868),
+        (0, 0, 0, 0, 0x0000_0000, 0x03dc_8f3b_0012_13da),
+        (1, 31, 8_191, 7, 0x001f_ffff, 0x077e_7748_26d1_cae4),
+        (u64::MAX, 17, 383, 7, 0x0011_0bff, 0xd466_8029_2118_daf5),
         (
             0xd1b5_4a32_d192_ed03,
             7,
             7_687,
             0,
             0x0007_f038,
-            0x8778_e64f_a636_f5ca,
+            0xe8be_5676_db52_3aea,
+        ),
+        (
+            0xd1b5_4a32_d192_ed03,
+            0,
+            1,
+            0,
+            0x0000_0008,
+            0xf8b9_ef2e_58a2_6c67,
+        ),
+        (
+            0xd1b5_4a32_d192_ed03,
+            1,
+            0,
+            0,
+            0x0001_0000,
+            0xf987_7ac4_310b_9b4c,
         ),
     ];
     for (key, level, logical_probe, rejection, counter, word) in cases {
@@ -176,15 +280,36 @@ fn assert_awkward_ranges_have_no_large_skew(sample: impl Fn(u64, usize) -> usize
 #[test]
 #[cfg_attr(miri, ignore)]
 fn elastic_fixed_seed_distribution_smoke() {
+    const STEP_BITS: u32 = ELASTIC_LEVEL_COUNT.trailing_zeros();
+    const FREE_LOW_BITS: u32 = u32::BITS - STEP_BITS - 1;
+    const LOW_HALF: u64 = u32::MAX as u64;
     let oracle = CounterPrf::new(FIXED_SEED);
     let word = |key, level| oracle.word(key, ProbeDomain::ElasticOrdinary { level }, 3, 0);
+    // Consecutive probes of a level are an odd multiple of the level count
+    // apart in the sequence and the stride is odd, so their words share the
+    // bits under the level count's and differ in the next one. A slot index
+    // is drawn from the top of the word; the high half is what must differ.
+    // The low half enters the product of a level that reduces by multiply,
+    // so its bits above those the step fixes are held to the same.
     let mut cross_probe_equal_bits = 0_u64;
+    let mut cross_probe_equal_low_bits = 0_u64;
     assert_fixed_seed_word_distribution(word, |key| {
         let next_probe = oracle.word(key, ProbeDomain::ElasticOrdinary { level: 7 }, 4, 0);
-        cross_probe_equal_bits += u64::from((!(word(key, 7) ^ next_probe)).count_ones());
+        let differing = word(key, 7) ^ next_probe;
+        cross_probe_equal_bits += u64::from((!differing >> u32::BITS).count_ones());
+        let low = differing & LOW_HALF;
+        assert_eq!(low & ((2 << STEP_BITS) - 1), 1 << STEP_BITS, "key={key}");
+        let equal_low = (!low & LOW_HALF) >> (STEP_BITS + 1);
+        cross_probe_equal_low_bits += u64::from(equal_low.count_ones());
     });
     assert!(
-        (DISTRIBUTION_SAMPLES * 30..=DISTRIBUTION_SAMPLES * 34).contains(&cross_probe_equal_bits)
+        (DISTRIBUTION_SAMPLES * 15..=DISTRIBUTION_SAMPLES * 17).contains(&cross_probe_equal_bits)
+    );
+    let even = DISTRIBUTION_SAMPLES * u64::from(FREE_LOW_BITS) / 2;
+    assert!(
+        (even - DISTRIBUTION_SAMPLES..=even + DISTRIBUTION_SAMPLES)
+            .contains(&cross_probe_equal_low_bits),
+        "{cross_probe_equal_low_bits}"
     );
 }
 
@@ -194,7 +319,7 @@ fn elastic_awkward_ranges_have_no_large_fixed_seed_skew() {
     let oracle = CounterPrf::new(FIXED_SEED);
     let counter_base = try_pack_elastic_counter(7, 3, 0).unwrap();
     assert_awkward_ranges_have_no_large_skew(|key, upper| {
-        unbiased_prepared_elastic_probe_index(oracle.prepare_elastic(key), counter_base, upper, 8)
+        unbiased_prepared_elastic_probe_index(oracle.prepare_elastic(key), counter_base, upper)
             .unwrap()
             .index
     });
@@ -240,9 +365,21 @@ fn fast_funnel_narrow_indices_match_checked_counter_encoding() {
     }
 }
 
+/// The first random word of ordinary level `level`, restated without the
+/// prepared probe. This pins the formula and is not an independent model: the
+/// two halves of the keyed hash's product with the fold
+/// constant, xored, times that constant once for each level up to `level`.
+#[allow(clippy::cast_possible_truncation)]
+fn scalar_ordinary_first_word(seed: u64, key: u64, level: u64) -> u64 {
+    let keyed = key.wrapping_add(seed).wrapping_add(DOMAIN_KIND_LANE);
+    let product = u128::from(keyed) * u128::from(KEY_FOLD);
+    let folded = product as u64 ^ (product >> u64::BITS) as u64;
+    (0..=level).fold(folded, |word, _| word.wrapping_mul(KEY_FOLD))
+}
+
 #[test]
 fn fast_funnel_prepared_words_and_reductions_match_the_generic_oracle() {
-    let oracle = FunnelPrf::new(0x1234_5678_9abc_def0);
+    let oracle = FunnelPrf::new(FIXED_SEED);
     for key in [0, 1, u64::MAX, 0xd1b5_4a32_d192_ed03] {
         let prepared = oracle.prepare(key);
         for domain in [
@@ -262,27 +399,29 @@ fn fast_funnel_prepared_words_and_reductions_match_the_generic_oracle() {
             for logical in [0_u8, 1, 7, u8::MAX] {
                 let first_word_level = ordinary_level.filter(|_| logical == 0);
                 for retry in [0_u8, 1, 7, u8::MAX] {
+                    let generic = oracle.word(key, domain, u64::from(logical), u32::from(retry));
                     let word = match first_word_level {
-                        Some(level) if retry == 0 => prepared
-                            .ordinary_first_word(FunnelPrf::ordinary_multiplier(level).unwrap()),
+                        Some(level) if retry == 0 => {
+                            assert_eq!(generic, scalar_ordinary_first_word(FIXED_SEED, key, level));
+                            prepared
+                                .ordinary_first_word(FunnelPrf::ordinary_multiplier(level).unwrap())
+                        }
                         _ => prepared_domain.word(u64::from(logical), u32::from(retry)),
                     };
-                    assert_eq!(
-                        word,
-                        oracle.word(key, domain, u64::from(logical), u32::from(retry))
-                    );
+                    assert_eq!(word, generic);
                 }
                 for upper in [1, 2, 3, 16, 191, 1_237, 1 << 20] {
                     let range = PreparedProbeRange::new(upper).unwrap();
                     let expected =
                         unbiased_probe_index(&oracle, key, domain, u64::from(logical), upper, 8);
                     if let Some(level) = first_word_level {
+                        // An ordinary level reduces its word without a
+                        // rejection test.
                         let multiplier = FunnelPrf::ordinary_multiplier(level).unwrap();
-                        let level = usize::try_from(level).unwrap();
+                        let word = scalar_ordinary_first_word(FIXED_SEED, key, level);
                         assert_eq!(
-                            ordinary_funnel_first_index(prepared, multiplier, range)
-                                .or_else(|| ordinary_funnel_retry_index(prepared, level, range)),
-                            expected.ok().map(|probe| probe.index)
+                            ordinary_funnel_bucket(prepared, multiplier, upper) as u128,
+                            (u128::from(word) * upper as u128) >> u64::BITS
                         );
                     } else {
                         assert_eq!(
@@ -369,7 +508,7 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
     }
     assert_eq!(
         oracle.word(0, ProbeDomain::FunnelOrdinary { level: 0 }, 0, 0),
-        0x2ee5_d5a0_6f80_afe8
+        0xe2a7_e887_3647_55d8
     );
 }
 
@@ -379,6 +518,8 @@ fn fast_funnel_counter_permutation_has_fixed_golden_vectors() {
 fn fast_funnel_retries_and_exhaustion_use_distinct_checked_counters() {
     let oracle = FunnelPrf::new(0x1234_5678_9abc_def0);
     let range = PreparedProbeRange::new((1_usize << 63) + 1).unwrap();
+    // Restates the range reduction's acceptance test, so it pins the formula
+    // and is not an independent model.
     let accepts = |word: u64| {
         let product = u128::from(word) * u128::from(range.upper as u64);
         product as u64 >= range.rejection_threshold
@@ -406,11 +547,16 @@ fn fast_funnel_retries_and_exhaustion_use_distinct_checked_counters() {
             random_word_count: 1
         })
     );
+    // The accepted retry's word alone picks the index.
+    let accepted = u128::from(retry.word(9, 1)) * u128::from(range.upper as u64);
+    let index = (accepted >> u64::BITS) as usize;
+    assert_ne!(index, 0);
     assert_eq!(
-        unbiased_prepared_funnel_probe_index_in_range(&retry, 9, range, 2)
-            .unwrap()
-            .random_word_count,
-        2
+        unbiased_prepared_funnel_probe_index_in_range(&retry, 9, range, 2),
+        Ok(ProbeIndex {
+            index,
+            random_word_count: 2
+        })
     );
 
     let exhausted = three_rejections.expect("fixed seed must exercise bounded exhaustion");
@@ -539,6 +685,23 @@ fn fast_funnel_awkward_ranges_have_no_large_fixed_seed_skew() {
     });
 }
 
+/// A walk over consecutive levels multiplies its running word by the step
+/// where a lookup of one level multiplies the folded word by that level's
+/// multiplier, and both must draw the same bucket.
+#[test]
+fn stepping_a_level_word_reaches_the_next_level_multiplier() {
+    let oracle = FunnelPrf::new(FIXED_SEED);
+    for key in [0, 1, u64::MAX, 0x0123_4567_89ab_cdef] {
+        let probe = oracle.prepare(key);
+        let mut word = probe.ordinary_first_word(oracle.level_step());
+        for level in 0..4_096_u64 {
+            let multiplier = FunnelPrf::ordinary_multiplier(level).unwrap();
+            assert_eq!(word, probe.ordinary_first_word(multiplier), "level {level}");
+            word = word.wrapping_mul(oracle.level_step());
+        }
+    }
+}
+
 /// Two levels sharing a multiplier would send every key to correlated
 /// buckets in both.
 #[test]
@@ -553,22 +716,25 @@ fn ordinary_level_multipliers_are_odd_and_distinct() {
 }
 
 /// The fingerprint tells apart the keys sharing a bucket, so two keys of one
-/// bucket must share it about once in its number of values: for a mixing
-/// hasher, for the key families an identity hasher passes through unmixed,
-/// and for bucket counts on both sides of a power of two.
-#[test]
-#[cfg_attr(
-    miri,
-    ignore = "counts fingerprints over hundreds of thousands of keys"
-)]
-fn fingerprints_stay_spread_within_a_bucket_for_every_key_family() {
+/// bucket must share it about once in its number of values, in every level a
+/// shape can have.
+///
+/// A family that does not know the seed stays within an eighth of that rate
+/// in each level: a mixing hasher, and the key families an identity hasher
+/// passes through unmixed. A family built around the seed, whose folded
+/// words are small multiples of a power of two, lines up with single levels;
+/// it stays within an eighth over the levels of a walk taken together, and
+/// in no level does it lose more than one bit of the fingerprint.
+fn assert_fingerprints_stay_spread_within_a_bucket(buckets: usize) {
     use core::hash::BuildHasher;
-
     const KEYS: u64 = 1 << 17;
     const VALUES: usize = 128;
+    // One past the last level of the plan with the largest reserve exponent.
+    const LEVELS: u64 = 4 * (u64::BITS as u64 - 1) + 10;
     type Family = (&'static str, fn(u64) -> u64);
     let oracle = FunnelPrf::new(FIXED_SEED);
-    let families: [Family; 5] = [
+    let zero = oracle.zero_word_hash();
+    let seedless: [Family; 6] = [
         ("mixed", |index| {
             crate::test_support::fixed_hasher().hash_one(index)
         }),
@@ -578,41 +744,93 @@ fn fingerprints_stay_spread_within_a_bucket_for_every_key_family() {
         }),
         ("shifted", |index| index << 32),
         ("stepped", |index| index * VALUES as u64),
+        ("thousands", |index| index * 1_000),
     ];
-    for buckets in [8, 1_000, 4_096] {
-        let range = PreparedProbeRange::new(buckets).unwrap();
-        for (family, key_of) in families {
-            for level in [0, 1, 7] {
+    let seedless = seedless.map(|(family, key_of)| {
+        let probes = (0..KEYS).map(|index| oracle.prepare(key_of(index)));
+        (family, false, probes.collect::<alloc::vec::Vec<_>>())
+    });
+    let seed_centred = [0_u32, 7, 18, 19, 20, 21].map(|shift| {
+        let probes = (0..KEYS).map(|index| oracle.prepare((index << shift).wrapping_add(zero)));
+        ("seed-centred", true, probes.collect::<alloc::vec::Vec<_>>())
+    });
+    for (_, _, probes) in seedless.iter().chain(&seed_centred) {
+        for probe in probes {
+            assert!(crate::raw::control::is_occupied(probe.fingerprint()));
+        }
+    }
+    // Pairs of keys sharing a bucket, and those of them sharing a
+    // fingerprint as well.
+    let pairs = |count: u64| count * count.saturating_sub(1) / 2;
+    {
+        let mut counts = alloc::vec![[0_u64; VALUES]; buckets];
+        for (family, centred, probes) in seedless.iter().chain(&seed_centred) {
+            let (mut walk_bucket, mut walk_both) = (0, 0);
+            for level in 0..LEVELS {
                 let multiplier = FunnelPrf::ordinary_multiplier(level).unwrap();
-                let mut counts = alloc::vec![[0_u64; VALUES]; buckets];
-                for index in 0..KEYS {
-                    let probe = oracle.prepare(key_of(index));
-                    let (bucket, _) = ordinary_funnel_first_draw(probe, multiplier, range);
-                    let fingerprint = probe.fingerprint();
-                    assert!(crate::raw::control::is_occupied(fingerprint));
-                    counts[bucket][usize::from(fingerprint) % VALUES] += 1;
+                counts.fill([0; VALUES]);
+                for &probe in probes {
+                    let bucket = ordinary_funnel_bucket(probe, multiplier, buckets);
+                    counts[bucket][usize::from(probe.fingerprint()) % VALUES] += 1;
                 }
-                // Pairs of keys sharing a bucket, and those of them sharing a
-                // fingerprint as well.
-                let pairs = |count: u64| count * count.saturating_sub(1) / 2;
                 let sharing_bucket: u64 =
                     counts.iter().map(|bucket| pairs(bucket.iter().sum())).sum();
                 let sharing_both: u64 = counts.iter().flatten().copied().map(pairs).sum();
                 let even = sharing_bucket / VALUES as u64;
+                let allowed = if *centred {
+                    0..=2 * even
+                } else {
+                    even - even / 8..=even + even / 8
+                };
                 assert!(
-                    (even - even / 8..=even + even / 8).contains(&sharing_both),
+                    allowed.contains(&sharing_both),
                     "{family} level {level} buckets {buckets}: {sharing_both} of {sharing_bucket}"
                 );
+                walk_bucket += sharing_bucket;
+                walk_both += sharing_both;
             }
+            let even = walk_bucket / VALUES as u64;
+            assert!(
+                (even - even / 8..=even + even / 8).contains(&walk_both),
+                "{family} buckets {buckets}: {walk_both} of {walk_bucket}"
+            );
         }
     }
 }
 
-/// The bound-only acceptance answers with the exact draw's bucket whenever it
-/// answers, and leaves to the exact test every rejected word, the accepted
-/// words at or below the bound, and every word of a range with no index.
 #[test]
-fn certain_first_index_agrees_with_the_exact_draw_whenever_it_answers() {
+#[cfg_attr(
+    miri,
+    ignore = "counts fingerprints over hundreds of thousands of keys"
+)]
+fn fingerprints_stay_spread_within_a_bucket_of_few() {
+    assert_fingerprints_stay_spread_within_a_bucket(8);
+}
+
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "counts fingerprints over hundreds of thousands of keys"
+)]
+fn fingerprints_stay_spread_within_a_bucket_of_a_ragged_count() {
+    assert_fingerprints_stay_spread_within_a_bucket(1_000);
+}
+
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "counts fingerprints over hundreds of thousands of keys"
+)]
+fn fingerprints_stay_spread_within_a_bucket_of_a_power_of_two() {
+    assert_fingerprints_stay_spread_within_a_bucket(4_096);
+}
+
+/// The ordinary draw gives each bucket one run of consecutive words, the
+/// runs in bucket order from the first word to the last, and no two runs
+/// differ in length by more than one word. A level with no buckets draws
+/// bucket zero.
+#[test]
+fn ordinary_draw_gives_every_bucket_one_even_run_of_words() {
     // Inverse of an odd word modulo 2^64, by Newton's iteration.
     fn inverse(odd: u64) -> u64 {
         let mut inverse = odd;
@@ -622,51 +840,206 @@ fn certain_first_index_agrees_with_the_exact_draw_whenever_it_answers() {
         assert_eq!(odd.wrapping_mul(inverse), 1);
         inverse
     }
+    const WORDS: u128 = 1 << u64::BITS;
     let multiplier = FunnelPrf::ordinary_multiplier(3).unwrap();
-    // A probe whose first word in the level is `word`.
+    // A probe whose word in the level is `word`.
     let probe_drawing = |word: u64| PreparedFastFunnelProbe {
         keyed: 0,
         key_out: word.wrapping_mul(inverse(multiplier)),
     };
-    let (mut certain_count, mut deferred_accepted, mut deferred_rejected) = (0, 0, 0);
     for upper in [1_usize, 2, 3, 7, 1_000, (1 << 20) + 1, (1 << 31) - 1] {
-        let range = PreparedProbeRange::new(upper).unwrap();
-        let bound = upper as u64;
-        // Words whose low product lands on, just above, and just below the
-        // bound and the threshold, then words spread over the whole range.
-        let near = (0..=4).flat_map(|quotient: u64| {
-            // Words wrap, so the first word past each multiple of 2^64 does too.
-            #[allow(clippy::cast_possible_truncation)]
-            let wrap = (u128::from(quotient) << 64).div_ceil(u128::from(bound)) as u64;
-            (0..=4).flat_map(move |step| [wrap.wrapping_add(step), wrap.wrapping_sub(step)])
-        });
-        let spread = (0..4_096_u64).map(|index| index.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        for word in near.chain(spread) {
-            let probe = probe_drawing(word);
-            let (bucket, accepted) = ordinary_funnel_first_draw(probe, multiplier, range);
-            match ordinary_funnel_first_certain_index(probe, multiplier, range) {
-                Some(certain) => {
-                    assert!(accepted, "upper {upper} word {word:#x}");
-                    assert_eq!(certain, bucket, "upper {upper} word {word:#x}");
-                    certain_count += 1;
+        let draw = |word: u64| ordinary_funnel_bucket(probe_drawing(word), multiplier, upper);
+        // The word that starts a bucket's run, or the count of words for
+        // the bucket past the last.
+        let run_start = |bucket: usize| (bucket as u128 * WORDS).div_ceil(upper as u128);
+        assert_eq!(draw(0), 0);
+        assert_eq!(draw(u64::MAX), upper - 1);
+        let even = WORDS / upper as u128;
+        let near_ends = (0..upper.min(64)).chain(upper.saturating_sub(64)..upper);
+        let spread = (0..1_024_usize).map(|index| index.wrapping_mul(0x9E37_79B9) % upper);
+        for bucket in near_ends.chain(spread) {
+            let start = run_start(bucket);
+            let end = run_start(bucket + 1);
+            // Its first and last words draw the bucket, and the words on
+            // either side of the run draw its neighbours.
+            let first = u64::try_from(start).unwrap();
+            let last = u64::try_from(end - 1).unwrap();
+            assert_eq!(draw(first), bucket, "upper {upper}");
+            assert_eq!(draw(last), bucket, "upper {upper}");
+            if bucket != 0 {
+                assert_eq!(draw(first - 1), bucket - 1, "upper {upper}");
+            }
+            if bucket + 1 != upper {
+                assert_eq!(draw(last + 1), bucket + 1, "upper {upper}");
+            }
+            assert!(
+                end - start == even || end - start == even + 1,
+                "upper {upper} bucket {bucket}"
+            );
+        }
+        // A larger word never draws a lower bucket, so the runs are whole.
+        let mut words: Vec<u64> = (0..4_096_u64)
+            .map(|index| index.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        words.sort_unstable();
+        assert!(words.windows(2).all(|pair| draw(pair[0]) <= draw(pair[1])));
+    }
+    for word in [0, 1, u64::MAX, 0x9E37_79B9_7F4A_7C15] {
+        assert_eq!(
+            ordinary_funnel_bucket(probe_drawing(word), multiplier, 0),
+            0
+        );
+    }
+}
+
+/// Keys spread over an ordinary level's buckets as evenly as uniform draws
+/// would: for a mixing hasher, for the key families an identity hasher passes
+/// through unmixed, and for bucket counts on both sides of a power of two.
+#[test]
+#[cfg_attr(miri, ignore = "draws hundreds of thousands of buckets")]
+fn ordinary_draws_fill_buckets_evenly_for_every_key_family() {
+    use core::hash::BuildHasher;
+
+    const KEYS: u64 = 1 << 17;
+    type Family = (&'static str, fn(u64) -> u64);
+    let oracle = FunnelPrf::new(FIXED_SEED);
+    let families: [Family; 6] = [
+        ("mixed", |index| {
+            crate::test_support::fixed_hasher().hash_one(index)
+        }),
+        ("sequential", |index| index),
+        ("multiplicative", |index| {
+            index.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        }),
+        ("shifted", |index| index << 32),
+        ("reversed", u64::reverse_bits),
+        ("around the zero word", |index| {
+            FunnelPrf::new(FIXED_SEED)
+                .zero_word_hash()
+                .wrapping_add(index)
+        }),
+    ];
+    for buckets in [8_usize, 1_000, 4_096] {
+        for (family, key_of) in families {
+            for level in [0, 1, 7] {
+                let multiplier = FunnelPrf::ordinary_multiplier(level).unwrap();
+                let mut counts = alloc::vec![0_u64; buckets];
+                for index in 0..KEYS {
+                    let probe = oracle.prepare(key_of(index));
+                    counts[ordinary_funnel_bucket(probe, multiplier, buckets)] += 1;
                 }
-                None if accepted => {
-                    assert!(word.wrapping_mul(bound) <= bound);
-                    deferred_accepted += 1;
-                }
-                None => deferred_rejected += 1,
+                // Pearson's statistic, scaled by the expected count to stay
+                // in integers: uniform draws put it near the bucket count
+                // less one, with a deviation of the root of twice that.
+                let scaled: u64 = counts
+                    .iter()
+                    .map(|&count| (count * buckets as u64).abs_diff(KEYS).pow(2))
+                    .sum();
+                let statistic = scaled / (KEYS * buckets as u64);
+                let freedom = buckets as u64 - 1;
+                let slack = 6 * (2 * freedom).isqrt().max(1);
+                assert!(
+                    statistic <= freedom + slack,
+                    "{family} level {level} buckets {buckets}: {statistic}"
+                );
             }
         }
     }
-    assert_ne!(certain_count, 0);
-    assert_ne!(deferred_accepted, 0);
-    assert_ne!(deferred_rejected, 0);
-    for word in [0, 1, u64::MAX, 0x9E37_79B9_7F4A_7C15] {
-        let none = ordinary_funnel_first_certain_index(
-            probe_drawing(word),
-            multiplier,
-            PreparedProbeRange::rejecting(),
-        );
-        assert_eq!(none, None);
+}
+
+#[test]
+fn elastic_budget_run_counts_the_inserts_that_keep_the_budget() {
+    let exhaustive_levels: u32 = if cfg!(miri) { 70 } else { 600 };
+    let levels = (1..=exhaustive_levels).chain([1 << 15, (1 << 15) + 1, u32::MAX]);
+    for level in levels {
+        let frees: &mut dyn Iterator<Item = u32> = if level <= exhaustive_levels {
+            &mut (1..=level)
+        } else {
+            &mut [
+                1,
+                2,
+                3,
+                level / 3,
+                level / 2,
+                level / 2 + 1,
+                level - 1,
+                level,
+            ]
+            .into_iter()
+        };
+        for free in frees {
+            for exponent in [1, 3, 4, 64, u32::MAX] {
+                let budget = |free| elastic_level_probe_budget(free, level, exponent, 8);
+                let run = elastic_level_budget_run(free, level, exponent);
+                let kept = run.min(free);
+                assert_ne!(kept, 0, "free {free} of {level}");
+                // The budget only grows as the level fills, so the last
+                // insert of the run keeps it and the next one does not.
+                assert_eq!(
+                    budget(free - (kept - 1)),
+                    budget(free),
+                    "free {free} of {level}"
+                );
+                if kept < free {
+                    assert_ne!(budget(free - kept), budget(free), "free {free} of {level}");
+                }
+            }
+        }
     }
+}
+
+#[test]
+fn elastic_probe_budget_matches_the_ceiling_quotient_form() {
+    let by_quotient = |free: usize, level: usize, exponent: u32, c: usize| {
+        let ratio_ceiling = level.div_ceil(free);
+        let log_ceiling = (usize::BITS - (ratio_ceiling - 1).leading_zeros()) as usize;
+        c * (log_ceiling * log_ceiling).min(exponent as usize)
+    };
+    let check = |free: usize, level: usize| {
+        for exponent in [1, 3, 4, 64, u32::MAX] {
+            for c in [8_u32, 3] {
+                let expected = by_quotient(free, level, exponent, c as usize);
+                assert_eq!(
+                    elastic_dyadic_probe_budget(free, level, exponent, c as usize),
+                    Ok(expected),
+                    "free {free} of {level}"
+                );
+                if let (Ok(free), Ok(level)) = (u32::try_from(free), u32::try_from(level)) {
+                    assert_eq!(
+                        elastic_level_probe_budget(free, level, exponent, c),
+                        expected as u64,
+                        "free {free} of {level}"
+                    );
+                }
+            }
+        }
+    };
+    let exhaustive_levels: usize = if cfg!(miri) { 70 } else { 600 };
+    for level in 1..=exhaustive_levels {
+        for free in 1..=level {
+            check(free, level);
+        }
+    }
+    for shift in [15, 31, usize::BITS - 2, usize::BITS - 1] {
+        let power = 1_usize << shift;
+        // `u32::MAX` is the widest level the `u32` form takes.
+        for level in [power - 1, power, power + 1, u32::MAX as usize, usize::MAX] {
+            for free in [
+                1,
+                2,
+                3,
+                level / 3,
+                level / 2,
+                level / 2 + 1,
+                level - 1,
+                level,
+            ] {
+                check(free, level);
+            }
+        }
+    }
+
+    assert!(elastic_dyadic_probe_budget(0, 8, 3, 8).is_err());
+    assert!(elastic_dyadic_probe_budget(9, 8, 3, 8).is_err());
+    assert!(elastic_dyadic_probe_budget(1, 8, 3, 0).is_err());
 }

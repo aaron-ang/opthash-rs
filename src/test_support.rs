@@ -1,6 +1,7 @@
 //! Test-only fixtures shared by both backend test modules.
 
 use core::hash::{BuildHasher, Hash, Hasher};
+use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -12,6 +13,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::ReserveFraction;
 use crate::map::{HashMap, TableBackend};
 use crate::membership;
+use crate::raw::control::{self, CTRL_TOMBSTONE};
 
 /// Hashes a `u64` to itself, so test keys double as their own hashes.
 #[derive(Clone, Copy, Default)]
@@ -137,6 +139,31 @@ impl Drop for PanicOnFirstDrop {
     }
 }
 
+/// A seeded xorshift64 stream: each call yields the next word.
+pub(crate) fn xorshift_stream(seed: u64) -> impl FnMut() -> u64 {
+    let mut state = seed;
+    move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    }
+}
+
+/// A key whose hash the test chooses, so several keys can share one and
+/// with it every probe.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct HashedKey {
+    pub(crate) id: u64,
+    pub(crate) hash: u64,
+}
+
+impl Hash for HashedKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
 /// Key whose `Hash` panics while `armed` is set; counts every drop.
 pub(crate) struct PanicHashKey {
     pub(crate) id: u64,
@@ -170,16 +197,19 @@ impl Drop for PanicHashKey {
 ///
 /// `gate_passes` reports whether the backend's filter still admits `key`;
 /// `stale_membership` reads the backend's count of deletes since the last
-/// refresh.
+/// refresh; the refresh runs with delete number `refresh_at(threshold)`.
+/// Until then the filter admits every departed key.
 pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
     gate_passes: impl Fn(&P, u64) -> bool,
     stale_membership: impl Fn(&P) -> usize,
+    refresh_at: impl Fn(u64) -> u64,
 ) where
     P: TableBackend<u64, u64, Hasher = FixedHashBuilder, Alloc = Global>,
 {
     let mut map: HashMap<u64, u64, P> = Deterministic::with_capacity(2_048);
     let live = map.capacity() as u64;
     let threshold = membership::refresh_deletes(map.capacity()) as u64;
+    let refresh_at = refresh_at(threshold);
     for key in 0..live {
         map.insert(key, key);
     }
@@ -189,7 +219,11 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
     for &key in &departed {
         assert_eq!(map.remove(&key), Some(key));
     }
-    assert!(departed.iter().all(|&key| gate_passes(map.table(), key)));
+    let admitted = departed
+        .iter()
+        .filter(|&&key| gate_passes(map.table(), key))
+        .count();
+    assert_eq!(admitted, departed.len());
     assert_eq!(stale_membership(map.table()) as u64, departed.len() as u64);
     assert_eq!(map.epoch().generation, 0);
 
@@ -204,11 +238,25 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
         if stale_membership(map.table()) == 0 {
             break;
         }
-        assert!(cycles <= threshold, "refresh never ran");
+        assert!(cycles < refresh_at, "refresh never ran");
     }
-    assert_eq!(cycles + departed.len() as u64, threshold + 1);
+    assert_eq!(cycles + departed.len() as u64, refresh_at);
     assert_eq!(map.epoch().generation, 0, "no rebuild ran");
     assert_eq!(stale_membership(map.table()), 0, "refresh resets the count");
+    assert_eq!(map.len() as u64, live - departed.len() as u64);
+    // The epoch still counts every delete, on either side of the refresh.
+    let epoch = map.epoch();
+    assert!(epoch.had_delete);
+    assert_eq!(
+        epoch.distinct_insertions as u64,
+        map.len() as u64 + refresh_at
+    );
+    map.insert(churn, churn);
+    assert_eq!(map.remove(&churn), Some(churn));
+    assert_eq!(
+        map.epoch().distinct_insertions as u64,
+        map.len() as u64 + refresh_at + 1
+    );
 
     // Live keys are still recorded and found; departed keys mostly are not.
     for key in (0..live).filter(|key| key % 3 != 0) {
@@ -224,6 +272,7 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
         "{false_positives} of {} departed keys still pass",
         departed.len()
     );
+    assert!(false_positives <= admitted);
 
     // Clearing every entry and refreshing empties the filter completely.
     map.retain(|_, _| false);
@@ -242,9 +291,12 @@ pub(crate) fn assert_deletes_past_threshold_refresh_filter<P>(
 /// no scratch memory, must leave every live key reachable and the refresh
 /// owed, so it runs once neither stands in its way.
 ///
+/// `gate_passes` reports whether the backend's filter admits a key hash.
 /// `stale_membership` reads the backend's count of deletes since the last
-/// refresh.
+/// refresh. A refresh that ran would have zeroed it, so a count still at the
+/// threshold is a refresh still owed.
 pub(crate) fn assert_interrupted_refresh_keeps_live_keys_reachable<P>(
+    gate_passes: impl Fn(&P, u64) -> bool,
     stale_membership: impl Fn(&P) -> usize,
 ) where
     P: TableBackend<PanicHashKey, u64, Hasher = FixedHashBuilder, Alloc = ToggleAllocator>,
@@ -286,6 +338,7 @@ pub(crate) fn assert_interrupted_refresh_keeps_live_keys_reachable<P>(
     // hashes the armed live keys.
     let mut unwound = false;
     for _ in 0..=threshold {
+        let stale = stale_membership(map.table());
         assert_eq!(map.insert(key(churn), churn), None);
         armed.store(true, Ordering::SeqCst);
         let removed = catch_unwind(AssertUnwindSafe(|| map.remove(&key(churn))));
@@ -294,11 +347,17 @@ pub(crate) fn assert_interrupted_refresh_keeps_live_keys_reachable<P>(
             unwound = true;
             break;
         }
+        assert_eq!(stale_membership(map.table()), stale + 1);
     }
     assert!(unwound, "no refresh hashed a live key");
     assert_eq!(map.epoch().generation, generation, "a rebuild ran");
     assert_live_keys_reachable(&map);
-    assert!(stale_membership(map.table()) > threshold);
+    // The unwound refresh left the filter recording every live key.
+    for id in 0..live {
+        let hash = map.hasher().hash_one(key(id));
+        assert!(gate_passes(map.table(), hash), "key {id} unrecorded");
+    }
+    assert!(stale_membership(map.table()) >= threshold);
 
     // Without scratch memory the refresh is skipped and stays owed.
     assert_eq!(map.insert(key(churn), churn), None);
@@ -306,7 +365,7 @@ pub(crate) fn assert_interrupted_refresh_keeps_live_keys_reachable<P>(
     assert_eq!(map.remove(&key(churn)), Some(churn));
     fail.store(false, Ordering::SeqCst);
     assert_live_keys_reachable(&map);
-    assert!(stale_membership(map.table()) > threshold);
+    assert!(stale_membership(map.table()) >= threshold);
 
     // The owed refresh runs at the next settling delete.
     assert_eq!(map.insert(key(churn), churn), None);
@@ -323,6 +382,104 @@ pub(crate) fn assert_interrupted_refresh_keeps_live_keys_reachable<P>(
         assert_eq!(map.insert(key(id), id + 1), None);
         assert_eq!(map.get(&key(id)), Some(&(id + 1)));
     }
+}
+
+/// `clear` turns each slot into a tombstone before its value drops, so a
+/// value whose drop panics leaves the table counting and reaching exactly
+/// the entries not yet dropped, and a second `clear` finishes the job.
+///
+/// `controls` lists the backend's control bytes in slot order;
+/// `assert_counts_match_controls` checks its counts against them.
+pub(crate) fn assert_clear_tombstones_each_slot_before_dropping_its_value<P>(
+    controls: impl Fn(&P) -> Vec<u8>,
+    assert_counts_match_controls: impl Fn(&P),
+) where
+    P: TableBackend<u64, PanicOnFirstDrop, Hasher = FixedHashBuilder, Alloc = Global>,
+{
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut map: ManuallyDrop<HashMap<u64, PanicOnFirstDrop, P>> =
+        ManuallyDrop::new(Deterministic::with_capacity(32));
+    for key in 0..3 {
+        map.insert(key, PanicOnFirstDrop(Arc::clone(&drops)));
+    }
+    let first_occupied = controls(map.table())
+        .into_iter()
+        .position(control::is_occupied)
+        .unwrap();
+
+    assert!(catch_unwind(AssertUnwindSafe(|| map.clear())).is_err());
+    let after = controls(map.table());
+    assert_eq!(after[first_occupied], CTRL_TOMBSTONE);
+    let tombstone = after.iter().rposition(|&c| c == CTRL_TOMBSTONE);
+    assert_eq!(tombstone, Some(first_occupied), "one tombstone");
+    assert_eq!(
+        map.len(),
+        after.iter().filter(|&&c| control::is_occupied(c)).count()
+    );
+    assert_counts_match_controls(map.table());
+
+    map.clear();
+    assert!(map.is_empty());
+    assert_eq!(drops.load(Ordering::SeqCst), 3);
+    // SAFETY: `map` is not used after this drop.
+    unsafe { ManuallyDrop::drop(&mut map) };
+}
+
+/// A key whose `Hash` panics while a resize rehashes it leaves the table
+/// as it was: every entry counted, reachable and undropped. The table then
+/// takes an insert and a resize, and drops every key and value once.
+///
+/// `assert_counts_match_controls` checks the backend's counts against its
+/// occupied control bytes.
+pub(crate) fn assert_hash_panic_during_resize_keeps_every_entry<P>(
+    assert_counts_match_controls: impl Fn(&P),
+) where
+    P: TableBackend<PanicHashKey, CountDrop, Hasher = FixedHashBuilder, Alloc = Global>,
+{
+    const LIVE: u64 = 16;
+    let armed = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let key_drops = Arc::new(AtomicUsize::new(0));
+    let key = |id: u64| PanicHashKey {
+        id,
+        armed: Arc::clone(&armed),
+        drops: Arc::clone(&key_drops),
+    };
+    let mut map: HashMap<PanicHashKey, CountDrop, P> = Deterministic::with_capacity(32);
+    for id in 0..LIVE {
+        assert!(map.insert(key(id), CountDrop(Arc::clone(&drops))).is_none());
+    }
+    let capacity = map.capacity();
+
+    armed.store(true, Ordering::SeqCst);
+    let result = catch_unwind(AssertUnwindSafe(|| map.try_reserve(4_096)));
+    armed.store(false, Ordering::SeqCst);
+    assert!(result.is_err());
+    assert_eq!(map.capacity(), capacity);
+    assert_eq!(map.len() as u64, LIVE);
+    assert_counts_match_controls(map.table());
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(key_drops.load(Ordering::SeqCst), 0);
+    for id in 0..LIVE {
+        assert!(map.contains_key(&key(id)), "key {id}");
+    }
+
+    assert!(
+        map.insert(key(100), CountDrop(Arc::clone(&drops)))
+            .is_none()
+    );
+    assert_counts_match_controls(map.table());
+    map.try_reserve(4_096).unwrap();
+    for id in (0..LIVE).chain([100]) {
+        assert!(map.contains_key(&key(id)), "key {id}");
+    }
+    let probe_key_drops = key_drops.load(Ordering::SeqCst) as u64;
+    drop(map);
+    assert_eq!(drops.load(Ordering::SeqCst) as u64, LIVE + 1);
+    assert_eq!(
+        key_drops.load(Ordering::SeqCst) as u64,
+        probe_key_drops + LIVE + 1
+    );
 }
 
 /// Work-queue churn at fixed capacity: pop the first key in iteration order,

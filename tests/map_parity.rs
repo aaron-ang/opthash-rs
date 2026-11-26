@@ -176,18 +176,6 @@ macro_rules! parity_suite {
             }
 
             #[test]
-            fn test_insert() {
-                let mut m = HashMap::new();
-                assert_eq!(m.len(), 0);
-                assert!(m.insert(1, 2).is_none());
-                assert_eq!(m.len(), 1);
-                assert!(m.insert(2, 4).is_none());
-                assert_eq!(m.len(), 2);
-                assert_eq!(*m.get(&1).unwrap(), 2);
-                assert_eq!(*m.get(&2).unwrap(), 4);
-            }
-
-            #[test]
             fn test_drops() {
                 DROP_VECTOR.with(|slot| {
                     *slot.borrow_mut() = vec![0; 200];
@@ -450,17 +438,6 @@ macro_rules! parity_suite {
             }
 
             #[test]
-            fn test_insert_conflicts() {
-                let mut m = HashMap::with_capacity(4);
-                assert!(m.insert(1, 2).is_none());
-                assert!(m.insert(5, 3).is_none());
-                assert!(m.insert(9, 4).is_none());
-                assert_eq!(*m.get(&9).unwrap(), 4);
-                assert_eq!(*m.get(&5).unwrap(), 3);
-                assert_eq!(*m.get(&1).unwrap(), 2);
-            }
-
-            #[test]
             fn test_conflict_remove() {
                 let mut m = HashMap::with_capacity(4);
                 assert!(m.insert(1, 2).is_none());
@@ -588,24 +565,6 @@ macro_rules! parity_suite {
                 assert!(values.contains(&'a'));
                 assert!(values.contains(&'b'));
                 assert!(values.contains(&'c'));
-            }
-
-            #[test]
-            fn test_eq() {
-                let mut m1 = HashMap::new();
-                m1.insert(1, 2);
-                m1.insert(2, 3);
-                m1.insert(3, 4);
-
-                let mut m2 = HashMap::new();
-                m2.insert(1, 2);
-                m2.insert(2, 3);
-
-                assert!(m1 != m2);
-
-                m2.insert(3, 4);
-
-                assert_eq!(m1, m2);
             }
 
             #[test]
@@ -945,51 +904,16 @@ macro_rules! parity_suite {
             fn test_size_hint() {
                 let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-                let map: HashMap<_, _> = xs.iter().copied().collect();
+                let mut map: HashMap<_, _> = xs.iter().copied().collect();
 
                 let mut iter = map.iter();
-
                 for _ in iter.by_ref().take(3) {}
-
                 assert_eq!(iter.size_hint(), (3, Some(3)));
-            }
-
-            #[test]
-            fn test_iter_len() {
-                let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
-
-                let map: HashMap<_, _> = xs.iter().copied().collect();
-
-                let mut iter = map.iter();
-
-                for _ in iter.by_ref().take(3) {}
-
                 assert_eq!(iter.len(), 3);
-            }
-
-            #[test]
-            fn test_mut_size_hint() {
-                let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
-
-                let mut map: HashMap<_, _> = xs.iter().copied().collect();
 
                 let mut iter = map.iter_mut();
-
                 for _ in iter.by_ref().take(3) {}
-
                 assert_eq!(iter.size_hint(), (3, Some(3)));
-            }
-
-            #[test]
-            fn test_iter_mut_len() {
-                let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
-
-                let mut map: HashMap<_, _> = xs.iter().copied().collect();
-
-                let mut iter = map.iter_mut();
-
-                for _ in iter.by_ref().take(3) {}
-
                 assert_eq!(iter.len(), 3);
             }
 
@@ -1198,6 +1122,121 @@ macro_rules! parity_suite {
                 assert_eq!(format!("{into_iter:?}"), "[(1, 10)]");
                 into_iter.next();
                 assert_eq!(format!("{into_iter:?}"), "[]");
+            }
+
+            #[test]
+            fn consuming_iterators_report_the_std_size_hint_at_every_step() {
+                let pairs = (0..40_u32).map(|key| (key, key * 3));
+                let model: std::collections::BTreeMap<u32, u32> = pairs.clone().collect();
+
+                let mut map: HashMap<u32, u32> = pairs.clone().collect();
+                let (mut ours, mut theirs) = (map.drain(), model.clone().into_iter());
+                loop {
+                    assert_eq!(ours.size_hint(), theirs.size_hint());
+                    assert_eq!(ours.len(), theirs.len());
+                    if ours.next().is_none() {
+                        break;
+                    }
+                    theirs.next();
+                }
+                drop(ours);
+                assert!(map.is_empty());
+
+                let map: HashMap<u32, u32> = pairs.collect();
+                let (mut ours, mut theirs) = (map.into_iter(), model.into_iter());
+                loop {
+                    assert_eq!(ours.size_hint(), theirs.size_hint());
+                    if ours.next().is_none() {
+                        break;
+                    }
+                    theirs.next();
+                }
+            }
+
+            #[test]
+            fn extract_if_size_hint_is_unbounded_and_the_filter_decides_the_count() {
+                type Keep = fn(u32) -> bool;
+                let keeps: [(Keep, usize); 3] =
+                    [(|_| false, 0), (|key| key % 2 == 0, 20), (|_| true, 40)];
+                for (extract, expected) in keeps {
+                    let mut map: HashMap<u32, u32> = (0..40).map(|key| (key, key)).collect();
+                    let mut extracted = map.extract_if(|key, _| extract(*key));
+                    let mut yielded = 0;
+                    loop {
+                        assert_eq!(extracted.size_hint(), (0, None));
+                        if extracted.next().is_none() {
+                            break;
+                        }
+                        yielded += 1;
+                    }
+                    assert_eq!(yielded, expected);
+                    drop(extracted);
+                    assert_eq!(map.len(), 40 - expected);
+                }
+            }
+
+            #[test]
+            #[allow(deprecated)]
+            fn default_hasher_constructors_keep_their_capacity_and_reserve() {
+                // Default-hasher constructor surface; no key is hashed here.
+                type HM = opthash::$TestMap<i32, i32>;
+                let reserve = opthash::ReserveFraction::from_exponent(4).unwrap();
+                assert_ne!(reserve, opthash::ReserveFraction::default());
+
+                assert!(HM::with_capacity(100).capacity() >= 100);
+                assert_eq!(HM::with_reserve(reserve).reserve_fraction(), reserve);
+                assert_eq!(HM::with_reserve(reserve).capacity(), 0);
+                assert_eq!(
+                    HM::with_reserve_fraction(0.0625).reserve_fraction(),
+                    reserve
+                );
+            }
+
+            #[test]
+            fn entry_or_default_counts_like_std() {
+                let words = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3];
+                let mut map: HashMap<i32, u32> = HashMap::new();
+                let mut model = std::collections::BTreeMap::<i32, u32>::new();
+                for word in words {
+                    *map.entry(word).or_default() += 1;
+                    *model.entry(word).or_default() += 1;
+                    assert_eq!(map.get(&word), model.get(&word));
+                }
+                assert_eq!(map.len(), model.len());
+                for (word, count) in &model {
+                    assert_eq!(map.get(word), Some(count));
+                }
+            }
+
+            #[test]
+            fn map_equality_follows_the_pairs() {
+                let model = std::collections::BTreeMap::from([(1, 2), (2, 3), (3, 4)]);
+                let base: HashMap<i32, i32> = model.iter().map(|(&k, &v)| (k, v)).collect();
+                // Another key, another value, a subset and a superset.
+                for other in [
+                    vec![(1, 2), (2, 3), (4, 4)],
+                    vec![(1, 2), (2, 3), (3, 5)],
+                    vec![(1, 2), (2, 3)],
+                    vec![(1, 2), (2, 3), (3, 4), (4, 5)],
+                    vec![(3, 4), (2, 3), (1, 2)],
+                ] {
+                    let theirs: std::collections::BTreeMap<i32, i32> =
+                        other.iter().copied().collect();
+                    let ours: HashMap<i32, i32> = other.into_iter().collect();
+                    assert_eq!(base == ours, model == theirs);
+                    assert_eq!(ours == base, model == theirs);
+                }
+            }
+
+            #[test]
+            fn occupied_error_displays_the_rejected_value_and_the_entry() {
+                let mut map: HashMap<i32, &str> = HashMap::new();
+                map.insert(7, "held");
+                let error = map.try_insert(7, "rejected").unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    r#"tried to insert "rejected", but key 7 was already present with "held""#
+                );
             }
 
             #[test]

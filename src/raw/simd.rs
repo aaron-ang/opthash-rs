@@ -1,6 +1,7 @@
 //! Control-group scans. Exactly one backend module is compiled, selected by the
 //! `opthash_*_group` cfg that `build.rs` derives from the target architecture;
-//! the ladder at the bottom re-exports its three mask functions.
+//! the ladder at the bottom re-exports its mask functions and the end of a
+//! mask its lead walk starts from.
 //!
 //! Every mask function is `unsafe`: `ptr` must be valid to read `GROUP_SIZE`
 //! control bytes.
@@ -13,6 +14,11 @@ mod neon {
     use core::arch::aarch64;
 
     use super::BitMask;
+    use crate::raw::control::{OCCUPIED_BIT, control_fingerprint_low};
+
+    /// The highest match is located by one leading-zero count; the lowest
+    /// needs a bit reversal before the count.
+    pub(crate) const LEADS_FROM_LAST_LANE: bool = true;
 
     /// Collapses an 8-lane compare into its `BitMask` bit pattern.
     #[inline]
@@ -34,13 +40,35 @@ mod neon {
 
     #[inline]
     #[must_use]
-    pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
+    pub(crate) unsafe fn eq_fingerprint_group(ptr: *const u8, word: u64) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
+        unsafe { eq_mask_group(ptr, control_fingerprint_low(word)) }
+    }
+
+    /// The free lanes of a group, read through the vector unit: the
+    /// reference [`free_lanes_group`] is tested against.
+    #[cfg(test)]
+    unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
         // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
         unsafe {
             let bytes = aarch64::vld1_u8(ptr);
             // `OCCUPIED_BIT` is the sign bit of each lane.
             lane_mask(aarch64::vcgez_s8(aarch64::vreinterpret_s8_u8(bytes)))
         }
+    }
+
+    /// The slot bits of `lanes` whose control is free. Read as one word, so
+    /// a caller that only tests and locates the lowest free lane keeps the
+    /// group out of the vector registers.
+    #[inline]
+    #[must_use]
+    pub(crate) unsafe fn free_lanes_group(ptr: *const u8, lanes: u64) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`;
+        // a byte array has no alignment to meet.
+        let word = u64::from_le_bytes(unsafe { ptr.cast::<[u8; 8]>().read() });
+        // `OCCUPIED_BIT` is the top bit of each lane; the shift brings it to
+        // the lane's slot bit.
+        BitMask(lanes & !(word >> OCCUPIED_BIT.trailing_zeros()))
     }
 
     /// Bitmask of occupied slots; padding and tombstones are excluded.
@@ -57,7 +85,32 @@ mod neon {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE, OCCUPIED_BIT};
+        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
+
+        /// One slot bit per lane of a group.
+        const ALL_LANES: u64 = 0x0101_0101_0101_0101;
+
+        #[test]
+        fn free_lanes_are_the_free_mask_cut_to_the_asked_lanes() {
+            // Every pair of control bytes, in every pair of adjacent lanes,
+            // so a lane's answer is seen not to leak into its neighbour.
+            for low in 0..=u8::MAX {
+                for high in [CTRL_EMPTY, CTRL_TOMBSTONE, 0x7f, OCCUPIED_BIT, u8::MAX] {
+                    for lane in 0..7 {
+                        let mut controls = [OCCUPIED_BIT | 0x2a; 8];
+                        controls[lane] = low;
+                        controls[lane + 1] = high;
+                        // SAFETY: `controls` holds exactly one 8-byte group.
+                        let free = unsafe { free_mask_group(controls.as_ptr()) }.0;
+                        for lanes in [ALL_LANES, ALL_LANES >> 16, 1 << (8 * lane), 0] {
+                            // SAFETY: as above.
+                            let cut = unsafe { free_lanes_group(controls.as_ptr(), lanes) }.0;
+                            assert_eq!(cut, free & lanes, "{controls:02x?} lanes={lanes:#x}");
+                        }
+                    }
+                }
+            }
+        }
 
         #[test]
         fn eight_lane_masks_preserve_control_order() {
@@ -97,6 +150,11 @@ mod sse2 {
     use core::arch::x86_64::{self, __m128i};
 
     use super::BitMask;
+    use crate::raw::control::OCCUPIED_BIT;
+
+    /// The lowest match is located by one trailing-zero count; the leading
+    /// count of baseline x86-64 is a bit scan that needs a correction.
+    pub(crate) const LEADS_FROM_LAST_LANE: bool = false;
 
     /// One bit per lane, set where the control byte carries `OCCUPIED_BIT`
     /// (the sign bit `movemask` extracts).
@@ -120,6 +178,17 @@ mod sse2 {
         BitMask(u64::from(bits))
     }
 
+    /// `byte` in every lane. The byte is spread across one 32-bit word by a
+    /// multiply and the word across the vector by one shuffle, which baseline
+    /// SSE2 has no single broadcast for.
+    #[inline]
+    #[must_use]
+    fn splat(byte: u8) -> __m128i {
+        let word = u32::from(byte) * 0x0101_0101;
+        // SAFETY: SSE2 is baseline on x86_64.
+        unsafe { x86_64::_mm_shuffle_epi32::<0>(x86_64::_mm_cvtsi32_si128(word.cast_signed())) }
+    }
+
     #[inline]
     #[must_use]
     pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
@@ -127,16 +196,35 @@ mod sse2 {
         // bytes and `loadu` has no alignment requirement.
         unsafe {
             let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
-            let target_vec = x86_64::_mm_set1_epi8(target.cast_signed());
-            lane_mask(x86_64::_mm_cmpeq_epi8(data, target_vec))
+            lane_mask(x86_64::_mm_cmpeq_epi8(data, splat(target)))
         }
     }
 
+    /// Lanes whose control byte is `control_fingerprint_low(word)`. The low
+    /// byte of `word` is spread to every lane first and `OCCUPIED_BIT` is set
+    /// in the spread word, so the byte needs no masking before the spread.
     #[inline]
     #[must_use]
-    pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
+    pub(crate) unsafe fn eq_fingerprint_group(ptr: *const u8, word: u64) -> BitMask {
+        #[allow(clippy::cast_possible_truncation)]
+        let spread =
+            (u32::from(word as u8) * 0x0101_0101) | (u32::from(OCCUPIED_BIT) * 0x0101_0101);
+        // SAFETY: SSE2 is baseline on x86_64; caller guarantees 16 readable
+        // bytes and `loadu` has no alignment requirement.
+        unsafe {
+            let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
+            let target =
+                x86_64::_mm_shuffle_epi32::<0>(x86_64::_mm_cvtsi32_si128(spread.cast_signed()));
+            lane_mask(x86_64::_mm_cmpeq_epi8(data, target))
+        }
+    }
+
+    /// The slot bits of `lanes` whose control is free.
+    #[inline]
+    #[must_use]
+    pub(crate) unsafe fn free_lanes_group(ptr: *const u8, lanes: u64) -> BitMask {
         // SAFETY: caller guarantees 16 readable bytes.
-        BitMask(u64::from(unsafe { occupied_bits(ptr) } ^ 0xFFFF))
+        BitMask(u64::from(unsafe { occupied_bits(ptr) } ^ 0xFFFF) & lanes)
     }
 
     /// Bitmask of occupied slots; padding and tombstones are excluded.
@@ -146,6 +234,39 @@ mod sse2 {
         // SAFETY: caller guarantees 16 readable bytes.
         BitMask(u64::from(unsafe { occupied_bits(ptr) }))
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE, OCCUPIED_BIT};
+
+        /// One slot bit per lane of a group.
+        const ALL_LANES: u64 = 0xFFFF;
+
+        #[test]
+        fn free_lanes_are_the_free_lanes_among_the_asked_ones() {
+            for low in (0..=u8::MAX).step_by(if cfg!(miri) { 15 } else { 1 }) {
+                for high in [CTRL_EMPTY, CTRL_TOMBSTONE, 0x7f, OCCUPIED_BIT, u8::MAX] {
+                    for lane in 0..15 {
+                        let mut controls = [OCCUPIED_BIT | 0x2a; 16];
+                        controls[lane] = low;
+                        controls[lane + 1] = high;
+                        let free = controls
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, control)| *control & OCCUPIED_BIT == 0)
+                            .fold(0_u64, |free, (lane, _)| free | 1 << lane);
+                        for lanes in [ALL_LANES, ALL_LANES >> 6, 1 << lane, 0] {
+                            // SAFETY: `controls` holds exactly one 16-byte
+                            // group.
+                            let cut = unsafe { free_lanes_group(controls.as_ptr(), lanes) }.0;
+                            assert_eq!(cut, free & lanes, "{controls:02x?} lanes={lanes:#x}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Portable SWAR-8 fallback control scan: 8 control bytes packed into one
@@ -154,10 +275,15 @@ mod sse2 {
 #[cfg(opthash_scalar_group)]
 mod swar {
     use super::BitMask;
+    use crate::raw::control::control_fingerprint_low;
 
     const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     const HI: u64 = 0x8080_8080_8080_8080;
     const ONES: u64 = 0x0101_0101_0101_0101;
+
+    /// Either end is correct, and the targets this fallback serves differ in
+    /// which count is cheap, so the choice between them is arbitrary.
+    pub(crate) const LEADS_FROM_LAST_LANE: bool = true;
 
     /// Load eight control bytes as one little-endian word (lane `i` = bits `[8*i, 8*i+7]`).
     ///
@@ -202,9 +328,17 @@ mod swar {
 
     #[inline]
     #[must_use]
-    pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
+    pub(crate) unsafe fn eq_fingerprint_group(ptr: *const u8, word: u64) -> BitMask {
         // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
-        BitMask(free_mask(unsafe { word(ptr) }))
+        unsafe { eq_mask_group(ptr, control_fingerprint_low(word)) }
+    }
+
+    /// The slot bits of `lanes` whose control is free.
+    #[inline]
+    #[must_use]
+    pub(crate) unsafe fn free_lanes_group(ptr: *const u8, lanes: u64) -> BitMask {
+        // SAFETY: caller guarantees `GROUP_SIZE` (8) readable bytes at `ptr`.
+        BitMask(free_mask(unsafe { word(ptr) }) & lanes)
     }
 
     /// Bitmask of occupied slots; padding and tombstones are excluded.
@@ -246,7 +380,7 @@ mod swar {
 
         // Representative and adversarial words: cross-byte borrow adjacencies
         // (0x00/0x01/0x80) and the full 0..=255 range, not just real control bytes.
-        fn sample_words() -> [[u8; 8]; 10] {
+        fn sample_words() -> [[u8; 8]; 11] {
             [
                 [CTRL_EMPTY; 8],
                 [CTRL_TOMBSTONE; 8],
@@ -258,6 +392,7 @@ mod swar {
                 [0x7f, 0x80, 0x00, 0x01, 0x7f, 0x80, 0x00, 0x01],
                 [0xff, 0xfe, 0xfd, 0xfc, 0x80, 0x7f, 0x01, 0x00],
                 [0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80],
+                [0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             ]
         }
 
@@ -272,17 +407,6 @@ mod swar {
                     );
                 }
             }
-        }
-
-        #[test]
-        fn eq_empty_flags_only_exact_zero() {
-            // Matching CTRL_EMPTY must never false-positive against a tombstone or
-            // occupied byte: that would terminate a present key's probe early.
-            for bytes in sample_words() {
-                assert_eq!(eq_mask(word(bytes), CTRL_EMPTY), ref_eq(bytes, CTRL_EMPTY));
-            }
-            assert_eq!(eq_mask(word([CTRL_TOMBSTONE; 8]), CTRL_EMPTY), 0);
-            assert_eq!(eq_mask(word([0x2a; 8]), CTRL_EMPTY), 0);
         }
 
         #[test]
@@ -309,25 +433,16 @@ mod swar {
         }
 
         #[test]
-        fn no_cross_byte_borrow() {
-            // A lone occupied byte among empties flags exactly its own lane.
-            let bytes = [0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-            assert_eq!(occupied_mask(word(bytes)), 0x80u64 << 8);
-            assert_eq!(eq_mask(word(bytes), 0x81), 0x80u64 << 8);
-            // Ascending distinct bytes: eq to byte i flags only lane i.
-            let asc = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
-            for (i, &b) in asc.iter().enumerate() {
-                assert_eq!(eq_mask(word(asc), b), 0x80u64 << (8 * i), "byte {b:#04x}");
+        fn free_lanes_are_the_free_lanes_among_the_asked_ones() {
+            const ALL_LANES: u64 = HI;
+            for bytes in sample_words() {
+                let free = ref_occupied(bytes) ^ HI;
+                for lanes in [ALL_LANES, ALL_LANES >> 16, 0x80 << 24, 0] {
+                    // SAFETY: `bytes` holds exactly one 8-byte group.
+                    let cut = unsafe { free_lanes_group(bytes.as_ptr(), lanes) }.0;
+                    assert_eq!(cut, free & lanes, "{bytes:02x?} lanes={lanes:#x}");
+                }
             }
-        }
-
-        #[test]
-        fn match_lands_in_lane_high_bit() {
-            assert_eq!(eq_mask(word([9; 8]), 9), HI);
-            assert_eq!(
-                eq_mask(word([0, 0, 0, 9, 0, 0, 0, 0]), 9),
-                0x80u64 << (8 * 3)
-            );
         }
     }
 }
@@ -339,4 +454,44 @@ use sse2 as backend;
 #[cfg(opthash_scalar_group)]
 use swar as backend;
 
-pub(crate) use backend::{eq_mask_group, free_mask_group, occupied_mask_group};
+pub(crate) use backend::{
+    LEADS_FROM_LAST_LANE, eq_fingerprint_group, eq_mask_group, free_lanes_group,
+    occupied_mask_group,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::{eq_fingerprint_group, eq_mask_group};
+    use crate::raw::control::{CTRL_EMPTY, CTRL_TOMBSTONE, OCCUPIED_BIT, control_fingerprint_low};
+
+    #[test]
+    fn fingerprint_group_matches_the_byte_of_its_word() {
+        let words = [
+            0,
+            0x7f,
+            0x80,
+            0xff,
+            0x2a,
+            !0x7f,
+            u64::MAX,
+            0x1234_5678_9abc_def0,
+        ];
+        for word in words {
+            let byte = control_fingerprint_low(word);
+            let mut controls = [CTRL_EMPTY; 16];
+            controls[1] = CTRL_TOMBSTONE;
+            controls[3] = byte;
+            controls[6] = byte ^ 1;
+            controls[7] = byte & !OCCUPIED_BIT;
+            controls[15] = byte;
+            // SAFETY: `controls` holds one group of either width.
+            let (fingerprint, plain) = unsafe {
+                (
+                    eq_fingerprint_group(controls.as_ptr(), word),
+                    eq_mask_group(controls.as_ptr(), byte),
+                )
+            };
+            assert_eq!(fingerprint.0, plain.0, "word {word:#x}");
+        }
+    }
+}

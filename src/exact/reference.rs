@@ -286,6 +286,23 @@ impl<O: ProbeOracle> ScalarElastic<O> {
         panic!("scalar Elastic query failed to find its promised identity")
     }
 
+    /// Frees the slot holding `identity`.
+    pub(crate) fn remove(&mut self, identity: u64) {
+        let global_slot = self
+            .slots
+            .iter()
+            .position(|&slot| slot == Some(identity))
+            .expect("scalar Elastic removal of an absent identity");
+        let level = self
+            .offsets
+            .iter()
+            .rposition(|&offset| offset <= global_slot)
+            .expect("level zero starts at slot zero");
+        self.slots[global_slot] = None;
+        self.occupancy[level] -= 1;
+        self.len -= 1;
+    }
+
     pub(crate) fn level_occupancy(&self) -> &[usize] {
         &self.occupancy
     }
@@ -442,14 +459,17 @@ impl<O: ProbeOracle> ScalarFunnel<O> {
     ) -> Result<(ScalarFunnelSearch, u128), RangeReductionError> {
         let mut logical_probes = 0_u128;
         for (level, &(offset, bucket_count)) in self.levels.iter().enumerate() {
-            let bucket = self.sample(
+            // An ordinary level reduces one word.
+            let word = self.oracle.word(
                 identity,
                 ProbeDomain::FunnelOrdinary {
                     level: level as u64,
                 },
                 0,
-                bucket_count,
-            )?;
+                0,
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            let bucket = ((u128::from(word) * bucket_count as u128) >> u64::BITS) as usize;
             for slot_in_bucket in 0..self.plan.beta() {
                 logical_probes += 1;
                 let global_slot = offset + bucket * self.plan.beta() + slot_in_bucket;
